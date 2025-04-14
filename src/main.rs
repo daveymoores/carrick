@@ -35,11 +35,35 @@ fn main() {
         println!("Parsing: {}", file_path.display());
 
         if let Some(module) = parse_file(&file_path, &cm, &handler) {
-            let mut visitor = DependencyVisitor::new();
+            // Create visitor with file path
+            let mut visitor = DependencyVisitor::new(file_path.clone());
             module.visit_with(&mut visitor);
+            visitor.print_imported_handler_summary();
+            visitor.print_function_definitions();
             visitors.push(visitor);
         }
     }
+
+    // Print overall imported handler summary
+    println!("\n=== Overall Imported Handler Summary ===");
+    let total_imported_handlers: usize = visitors.iter().map(|v| v.imported_handlers.len()).sum();
+    println!("Total imported handlers used: {}", total_imported_handlers);
+
+    // You could also gather all imported handlers into one collection
+    let all_imported_handlers: Vec<_> = visitors
+        .iter()
+        .flat_map(|v| v.imported_handlers.clone())
+        .collect();
+
+    println!("\nAll imported handlers:");
+    for (route, handler, source) in &all_imported_handlers {
+        println!("Route: {} uses handler {} from {}", route, handler, source);
+    }
+
+    // Print overall function definitions summary
+    println!("\n=== Overall Function Definitions ===");
+    let total_functions: usize = visitors.iter().map(|v| v.function_definitions.len()).sum();
+    println!("Total function definitions found: {}", total_functions);
 
     // Analyze for inconsistencies
     let result = analyze_api_consistency(visitors);

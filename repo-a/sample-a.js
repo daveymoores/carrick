@@ -1,4 +1,6 @@
-const express = require("express");
+import express from "express";
+import { handleProductGet } from "./sample-b.js";
+
 const app = express();
 const router = express.Router();
 const adminRouter = express.Router();
@@ -51,17 +53,6 @@ app.get("/dashboard", (req, res) => {
 // ===== REGULAR ROUTER =====
 
 // Basic router endpoints
-router.post("/products", (req, res) => {
-  res.json({ id: 123, title: "Product", price: 99.99 });
-});
-
-router.get("/products", (req, res) => {
-  res.json([
-    { id: 1, name: "Product 1" },
-    { id: 2, name: "Product 2" },
-  ]);
-});
-
 router.get("/products/:id", (req, res) => {
   res.json({
     id: parseInt(req.params.id),
@@ -69,6 +60,9 @@ router.get("/products/:id", (req, res) => {
     inStock: true,
   });
 });
+
+// router with implicit function call
+router.get("/products", handleProductGet);
 
 // ===== ADMIN ROUTER =====
 
