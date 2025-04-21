@@ -208,26 +208,38 @@ impl DependencyVisitor {
         None
     }
 
+    fn extract_json_fields_from_call(&self, expr_stmt: &ExprStmt) -> Option<Json> {
+        if let Expr::Call(call) = &*expr_stmt.expr {
+            self.extract_res_json_fields(call)
+        } else {
+            None
+        }
+    }
+
+    fn extract_json_fields_from_return(&self, expr: &Box<Expr>) -> Option<Json> {
+        if let Expr::Call(call) = &**expr {
+            self.extract_res_json_fields(call)
+        } else {
+            None
+        }
+    }
+
     fn extract_fields_from_arrow(&self, arrow: &ArrowExpr) -> Json {
         match &*arrow.body {
             // For arrow functions with block bodies: (req, res) => { ... }
             BlockStmtOrExpr::BlockStmt(block) => {
                 for stmt in &block.stmts {
                     if let Stmt::Expr(expr_stmt) = stmt {
-                        if let Expr::Call(call) = &*expr_stmt.expr {
-                            if let Some(json) = self.extract_res_json_fields(call) {
-                                return json;
-                            }
+                        if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
+                            return json;
                         }
                     }
 
                     // Look for return statements
                     if let Stmt::Return(ret) = stmt {
                         if let Some(expr) = &ret.arg {
-                            if let Expr::Call(call) = &**expr {
-                                if let Some(json) = self.extract_res_json_fields(call) {
-                                    return json;
-                                }
+                            if let Some(json) = self.extract_json_fields_from_return(expr) {
+                                return json;
                             }
                         }
                     }
@@ -235,10 +247,8 @@ impl DependencyVisitor {
             }
             // For arrow functions with expression bodies: (req, res) => res.json(...)
             BlockStmtOrExpr::Expr(expr) => {
-                if let Expr::Call(call) = &**expr {
-                    if let Some(json) = self.extract_res_json_fields(call) {
-                        return json;
-                    }
+                if let Some(json) = self.extract_json_fields_from_return(expr) {
+                    return json;
                 }
             }
         }
@@ -256,19 +266,15 @@ impl DependencyVisitor {
                 match stmt {
                     // For expressions like res.json({...})
                     Stmt::Expr(expr_stmt) => {
-                        if let Expr::Call(call) = &*expr_stmt.expr {
-                            if let Some(json) = self.extract_res_json_fields(call) {
-                                return json;
-                            }
+                        if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
+                            return json;
                         }
                     }
                     // For return statements like return res.json({...})
                     Stmt::Return(return_stmt) => {
                         if let Some(expr) = &return_stmt.arg {
-                            if let Expr::Call(call) = &**expr {
-                                if let Some(json) = self.extract_res_json_fields(call) {
-                                    return json;
-                                }
+                            if let Some(json) = self.extract_json_fields_from_return(expr) {
+                                return json;
                             }
                         }
                     }
@@ -276,10 +282,8 @@ impl DependencyVisitor {
                     Stmt::Block(block) => {
                         for nested_stmt in &block.stmts {
                             if let Stmt::Expr(expr_stmt) = nested_stmt {
-                                if let Expr::Call(call) = &*expr_stmt.expr {
-                                    if let Some(json) = self.extract_res_json_fields(call) {
-                                        return json;
-                                    }
+                                if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
+                                    return json;
                                 }
                             }
                         }
@@ -294,18 +298,6 @@ impl DependencyVisitor {
         Json::Null
     }
 
-    fn extract_json_fields_from_call(&self, expr_stmt: &ExprStmt) -> Json {
-        if let Expr::Call(call) = &*expr_stmt.expr {
-            if let Some(json) = self.extract_res_json_fields(call) {
-                json
-            } else {
-                Json::Null
-            }
-        } else {
-            Json::Null
-        }
-    }
-
     // Extract response fields from a function expression
     fn extract_fields_from_function_expr(&self, fn_expr: &FnExpr) -> Json {
         // Check if the function has a body
@@ -315,8 +307,7 @@ impl DependencyVisitor {
                 match stmt {
                     // For expressions like res.json({...})
                     Stmt::Expr(expr_stmt) => {
-                        let json = self.extract_json_fields_from_call(expr_stmt);
-                        if json != Json::Null {
+                        if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
                             return json;
                         }
                     }
@@ -324,10 +315,8 @@ impl DependencyVisitor {
                     // For return statements like return res.json({...})
                     Stmt::Return(return_stmt) => {
                         if let Some(expr) = &return_stmt.arg {
-                            if let Expr::Call(call) = &**expr {
-                                if let Some(json) = self.extract_res_json_fields(call) {
-                                    return json;
-                                }
+                            if let Some(json) = self.extract_json_fields_from_return(expr) {
+                                return json;
                             }
                         }
                     }
@@ -336,8 +325,7 @@ impl DependencyVisitor {
                     Stmt::Block(block) => {
                         for nested_stmt in &block.stmts {
                             if let Stmt::Expr(expr_stmt) = nested_stmt {
-                                let json = self.extract_json_fields_from_call(expr_stmt);
-                                if json != Json::Null {
+                                if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
                                     return json;
                                 }
                             }
@@ -419,14 +407,12 @@ impl DependencyVisitor {
         let callee = call.callee.as_expr()?;
         let member = callee.as_member()?;
 
-        // Check if it's a res.json call
-        if member.obj.as_ident().map_or(false, |i| i.sym == "res")
-            && member.prop.as_ident().map_or(false, |i| i.sym == "json")
-        {
-            let arg = call.args.get(0)?;
-
-            // Extract the JSON structure from the argument
-            return Some(self.expr_to_json(&arg.expr));
+        if let Some(ident) = member.obj.as_ident() {
+            if ident.sym == "res" || ident.sym == "json" {
+                let arg = call.args.get(0)?;
+                // Extract the JSON structure from the argument
+                return Some(self.expr_to_json(&arg.expr));
+            }
         }
 
         None
