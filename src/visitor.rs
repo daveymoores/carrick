@@ -99,13 +99,29 @@ impl Visit for DependencyVisitor {
                                     println!("    Response fields: {:?}", fields);
                                     self.response_fields.insert(exported_name.clone(), fields);
                                 }
-                                // Regular function export
-                                Expr::Fn(_) => {
-                                    println!("    (Function export)");
-                                    // Track this function as defined in this file
-                                    self.response_fields
-                                        .insert(exported_name.clone(), Json::Null);
+                                // Regular function export: export const handler = function() {...}
+                                Expr::Fn(fn_expr) => {
+                                    println!("    (Function expression export)");
+
+                                    // Store the function definition for later analysis
+                                    self.function_definitions.insert(
+                                        exported_name.clone(),
+                                        FunctionDefinition {
+                                            name: exported_name.clone(),
+                                            file_path: self.current_file.clone(),
+                                            node_type: FunctionNodeType::FunctionExpression(
+                                                Box::new(fn_expr.clone()),
+                                            ),
+                                            analyzed: false,
+                                        },
+                                    );
+
+                                    // Extract response fields from the function
+                                    let fields = self.extract_fields_from_function_expr(fn_expr);
+                                    println!("    Response fields: {:?}", fields);
+                                    self.response_fields.insert(exported_name.clone(), fields);
                                 }
+
                                 _ => {
                                     println!("    (Other export type)");
                                 }
@@ -119,9 +135,19 @@ impl Visit for DependencyVisitor {
                 let exported_name = fn_decl.ident.sym.to_string();
                 println!("  - Exported function: {}", exported_name);
 
-                // Track this function as defined in this file
-                self.response_fields
-                    .insert(exported_name.clone(), Json::Null);
+                self.function_definitions.insert(
+                    exported_name.clone(),
+                    FunctionDefinition {
+                        name: exported_name.clone(),
+                        file_path: self.current_file.clone(),
+                        node_type: FunctionNodeType::FunctionDeclaration(Box::new(fn_decl.clone())),
+                        analyzed: false,
+                    },
+                );
+
+                // Extract fields
+                let fields = self.extract_fields_from_function_decl(fn_decl);
+                self.response_fields.insert(exported_name.clone(), fields);
             }
             _ => {}
         }
