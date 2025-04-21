@@ -2,10 +2,21 @@ extern crate swc_common;
 extern crate swc_ecma_parser;
 use std::{collections::HashMap, path::PathBuf};
 
+use serde::Serialize;
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 extern crate regex;
 use regex::Regex;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum Json {
+    Null,
+    Boolean(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<Json>),
+    Object(Box<HashMap<String, Json>>),
+}
 
 #[derive(Debug, Clone)]
 pub enum FunctionNodeType {
@@ -24,10 +35,10 @@ pub struct FunctionDefinition {
 
 #[derive(Debug)]
 pub struct DependencyVisitor {
-    pub endpoints: Vec<(String, String, Vec<String>)>, // (route, method, response fields)
-    pub calls: Vec<(String, String, Vec<String>)>,     // (route, method, expected fields)
-    pub current_fn: Option<String>,                    // Track current function context
-    pub response_fields: HashMap<String, Vec<String>>, // Function name -> expected fields
+    pub endpoints: Vec<(String, String, Json)>, // (route, method, response fields)
+    pub calls: Vec<(String, String, Json)>,     // (route, method, expected fields)
+    pub current_fn: Option<String>,             // Track current function context
+    pub response_fields: HashMap<String, Json>, // Function name -> expected fields
     pub imported_functions: HashMap<String, String>,
     pub current_file: PathBuf,
     pub imported_handlers: Vec<(String, String, String)>,
@@ -93,7 +104,7 @@ impl Visit for DependencyVisitor {
                                     println!("    (Function export)");
                                     // Track this function as defined in this file
                                     self.response_fields
-                                        .insert(exported_name.clone(), Vec::new());
+                                        .insert(exported_name.clone(), Json::Null);
                                 }
                                 _ => {
                                     println!("    (Other export type)");
@@ -110,7 +121,7 @@ impl Visit for DependencyVisitor {
 
                 // Track this function as defined in this file
                 self.response_fields
-                    .insert(exported_name.clone(), Vec::new());
+                    .insert(exported_name.clone(), Json::Null);
             }
             _ => {}
         }
@@ -174,7 +185,7 @@ impl Visit for DependencyVisitor {
                 // Your existing fetch detection
                 if ident.sym == "fetch" {
                     if let (Some(route), Some(method)) = self.extract_fetch_route(call) {
-                        self.calls.push((route, method, Vec::new()));
+                        self.calls.push((route, method, Json::Null));
                     }
                 }
             }
@@ -197,17 +208,26 @@ impl DependencyVisitor {
         None
     }
 
-    fn extract_fields_from_arrow(&self, arrow: &ArrowExpr) -> Vec<String> {
-        let mut fields = Vec::new();
-
+    fn extract_fields_from_arrow(&self, arrow: &ArrowExpr) -> Json {
         match &*arrow.body {
             // For arrow functions with block bodies: (req, res) => { ... }
             BlockStmtOrExpr::BlockStmt(block) => {
                 for stmt in &block.stmts {
                     if let Stmt::Expr(expr_stmt) = stmt {
                         if let Expr::Call(call) = &*expr_stmt.expr {
-                            if let Some(extracted_fields) = self.extract_res_json_fields(call) {
-                                fields.extend(extracted_fields);
+                            if let Some(json) = self.extract_res_json_fields(call) {
+                                return json;
+                            }
+                        }
+                    }
+
+                    // Look for return statements
+                    if let Stmt::Return(ret) = stmt {
+                        if let Some(expr) = &ret.arg {
+                            if let Expr::Call(call) = &**expr {
+                                if let Some(json) = self.extract_res_json_fields(call) {
+                                    return json;
+                                }
                             }
                         }
                     }
@@ -216,20 +236,19 @@ impl DependencyVisitor {
             // For arrow functions with expression bodies: (req, res) => res.json(...)
             BlockStmtOrExpr::Expr(expr) => {
                 if let Expr::Call(call) = &**expr {
-                    if let Some(extracted_fields) = self.extract_res_json_fields(call) {
-                        fields.extend(extracted_fields);
+                    if let Some(json) = self.extract_res_json_fields(call) {
+                        return json;
                     }
                 }
             }
         }
 
-        fields
+        // Default if we couldn't find any response
+        Json::Null
     }
 
     // Extract response fields from a function declaration
-    fn extract_fields_from_function_decl(&self, fn_decl: &FnDecl) -> Vec<String> {
-        let mut fields = Vec::new();
-
+    fn extract_fields_from_function_decl(&self, fn_decl: &FnDecl) -> Json {
         // Check if the function has a body
         if let Some(body) = &fn_decl.function.body {
             // Analyze each statement in the function body
@@ -238,8 +257,8 @@ impl DependencyVisitor {
                     // For expressions like res.json({...})
                     Stmt::Expr(expr_stmt) => {
                         if let Expr::Call(call) = &*expr_stmt.expr {
-                            if let Some(extracted_fields) = self.extract_res_json_fields(call) {
-                                fields.extend(extracted_fields);
+                            if let Some(json) = self.extract_res_json_fields(call) {
+                                return json;
                             }
                         }
                     }
@@ -247,8 +266,8 @@ impl DependencyVisitor {
                     Stmt::Return(return_stmt) => {
                         if let Some(expr) = &return_stmt.arg {
                             if let Expr::Call(call) = &**expr {
-                                if let Some(extracted_fields) = self.extract_res_json_fields(call) {
-                                    fields.extend(extracted_fields);
+                                if let Some(json) = self.extract_res_json_fields(call) {
+                                    return json;
                                 }
                             }
                         }
@@ -258,10 +277,8 @@ impl DependencyVisitor {
                         for nested_stmt in &block.stmts {
                             if let Stmt::Expr(expr_stmt) = nested_stmt {
                                 if let Expr::Call(call) = &*expr_stmt.expr {
-                                    if let Some(extracted_fields) =
-                                        self.extract_res_json_fields(call)
-                                    {
-                                        fields.extend(extracted_fields);
+                                    if let Some(json) = self.extract_res_json_fields(call) {
+                                        return json;
                                     }
                                 }
                             }
@@ -273,13 +290,24 @@ impl DependencyVisitor {
             }
         }
 
-        fields
+        // Default if we couldn't find any response
+        Json::Null
+    }
+
+    fn extract_json_fields_from_call(&self, expr_stmt: &ExprStmt) -> Json {
+        if let Expr::Call(call) = &*expr_stmt.expr {
+            if let Some(json) = self.extract_res_json_fields(call) {
+                json
+            } else {
+                Json::Null
+            }
+        } else {
+            Json::Null
+        }
     }
 
     // Extract response fields from a function expression
-    fn extract_fields_from_function_expr(&self, fn_expr: &FnExpr) -> Vec<String> {
-        let mut fields = Vec::new();
-
+    fn extract_fields_from_function_expr(&self, fn_expr: &FnExpr) -> Json {
         // Check if the function has a body
         if let Some(body) = &fn_expr.function.body {
             // Analyze each statement in the function body
@@ -287,63 +315,64 @@ impl DependencyVisitor {
                 match stmt {
                     // For expressions like res.json({...})
                     Stmt::Expr(expr_stmt) => {
-                        if let Expr::Call(call) = &*expr_stmt.expr {
-                            if let Some(extracted_fields) = self.extract_res_json_fields(call) {
-                                fields.extend(extracted_fields);
-                            }
+                        let json = self.extract_json_fields_from_call(expr_stmt);
+                        if json != Json::Null {
+                            return json;
                         }
                     }
+
                     // For return statements like return res.json({...})
                     Stmt::Return(return_stmt) => {
                         if let Some(expr) = &return_stmt.arg {
                             if let Expr::Call(call) = &**expr {
-                                if let Some(extracted_fields) = self.extract_res_json_fields(call) {
-                                    fields.extend(extracted_fields);
+                                if let Some(json) = self.extract_res_json_fields(call) {
+                                    return json;
                                 }
                             }
                         }
                     }
+
                     // Handle nested blocks like if/else statements
                     Stmt::Block(block) => {
                         for nested_stmt in &block.stmts {
                             if let Stmt::Expr(expr_stmt) = nested_stmt {
-                                if let Expr::Call(call) = &*expr_stmt.expr {
-                                    if let Some(extracted_fields) =
-                                        self.extract_res_json_fields(call)
-                                    {
-                                        fields.extend(extracted_fields);
-                                    }
+                                let json = self.extract_json_fields_from_call(expr_stmt);
+                                if json != Json::Null {
+                                    return json;
                                 }
                             }
                         }
                     }
+
                     // Other statement types could be handled here if needed
                     _ => {}
                 }
             }
         }
 
-        fields
+        // Default if we couldn't find any response
+        Json::Null
     }
 
     // Extract route and handler information from route definitions
-    fn extract_endpoint(&mut self, call: &CallExpr) -> Option<(String, Vec<String>)> {
+    fn extract_endpoint(&mut self, call: &CallExpr) -> Option<(String, Json)> {
         // Get the route from the first argument
         let route = call.args.get(0)?.expr.as_lit()?.as_str()?.value.to_string();
 
-        let mut response_fields = Vec::new();
+        let mut response_json = Json::Null;
 
         // Check the second argument (handler)
         if let Some(second_arg) = call.args.get(1) {
             match &*second_arg.expr {
-                // Case 1: Inline function handler (as before)
+                // Case 1: Inline function handler
                 Expr::Fn(fn_expr) => {
                     if let Some(body) = &fn_expr.function.body {
                         for stmt in &body.stmts {
                             if let Stmt::Expr(expr_stmt) = stmt {
                                 if let Expr::Call(call) = &*expr_stmt.expr {
-                                    if let Some(fields) = self.extract_res_json_fields(call) {
-                                        response_fields.extend(fields);
+                                    if let Some(json) = self.extract_res_json_fields(call) {
+                                        response_json = json;
+                                        break;
                                     }
                                 }
                             }
@@ -368,6 +397,11 @@ impl DependencyVisitor {
                             handler_name.clone(),
                             source.clone(),
                         ));
+
+                        // Look up response fields from the function definition
+                        if let Some(fields) = self.response_fields.get(&handler_name) {
+                            response_json = fields.clone();
+                        }
                     }
                 }
 
@@ -377,11 +411,11 @@ impl DependencyVisitor {
             }
         }
 
-        Some((route, response_fields))
+        Some((route, response_json))
     }
 
-    // Extract fields from res.json({ ... })
-    fn extract_res_json_fields(&self, call: &CallExpr) -> Option<Vec<String>> {
+    // Extract JSON structure from res.json(...)
+    fn extract_res_json_fields(&self, call: &CallExpr) -> Option<Json> {
         let callee = call.callee.as_expr()?;
         let member = callee.as_member()?;
 
@@ -391,56 +425,63 @@ impl DependencyVisitor {
         {
             let arg = call.args.get(0)?;
 
-            // Case 1: Object response - like res.json({ field1: value, field2: value })
-            if let Some(obj) = arg.expr.as_object() {
-                let fields = obj
-                    .props
-                    .iter()
-                    .filter_map(|prop| {
-                        prop.as_prop()?
-                            .as_key_value()?
-                            .key
-                            .as_ident()
-                            .map(|key| key.sym.to_string())
-                    })
-                    .collect();
-                return Some(fields);
-            }
-
-            // Case 2: Array response - like res.json([{ id: 1, name: 'Product' }])
-            if let Some(arr) = arg.expr.as_array() {
-                // For arrays, try to extract fields from the first item if it's an object
-                if let Some(first_elem) = arr.elems.first() {
-                    if let Some(elem) = first_elem {
-                        if let Some(obj) = elem.expr.as_object() {
-                            let fields: Vec<String> = obj
-                                .props
-                                .iter()
-                                .filter_map(|prop| {
-                                    prop.as_prop()?
-                                        .as_key_value()?
-                                        .key
-                                        .as_ident()
-                                        .map(|key| key.sym.to_string())
-                                })
-                                .collect();
-
-                            // Add a special marker to indicate it's an array of objects
-                            let mut result = vec!["[array_of_objects]".to_string()];
-                            result.extend(fields);
-                            return Some(result);
-                        }
-                    }
-                }
-                // For empty arrays or arrays of non-objects
-                return Some(vec!["[array]".to_string()]);
-            }
-
-            // Case 3: Other response types (might want to handle primitives, etc.)
-            return Some(vec!["[unknown]".to_string()]);
+            // Extract the JSON structure from the argument
+            return Some(self.expr_to_json(&arg.expr));
         }
 
         None
+    }
+
+    // Convert an expression to a Json value
+    fn expr_to_json(&self, expr: &Expr) -> Json {
+        match expr {
+            // Handle literals
+            Expr::Lit(lit) => match lit {
+                Lit::Str(str_lit) => Json::String(str_lit.value.to_string()),
+                Lit::Num(num) => Json::Number(num.value),
+                Lit::Bool(b) => Json::Boolean(b.value),
+                Lit::Null(_) => Json::Null,
+                _ => Json::Null, // Other literals
+            },
+
+            // Handle arrays
+            Expr::Array(arr) => {
+                let values: Vec<Json> = arr
+                    .elems
+                    .iter()
+                    .filter_map(|elem| elem.as_ref().map(|e| self.expr_to_json(&e.expr)))
+                    .collect();
+                Json::Array(values)
+            }
+
+            // Handle objects
+            Expr::Object(obj) => {
+                let mut map = HashMap::new();
+
+                for prop in &obj.props {
+                    if let PropOrSpread::Prop(boxed_prop) = prop {
+                        if let Prop::KeyValue(kv) = &**boxed_prop {
+                            // Extract key
+                            let key = match &kv.key {
+                                PropName::Ident(ident) => ident.sym.to_string(),
+                                PropName::Str(str) => str.value.to_string(),
+                                _ => continue, // Skip computed keys
+                            };
+
+                            // Extract value
+                            let value = self.expr_to_json(&kv.value);
+
+                            map.insert(key, value);
+                        }
+                    }
+                }
+
+                Json::Object(Box::new(map))
+            }
+
+            // Other expressions (function calls, identifiers, etc.) - treat as null for now
+            _ => Json::Null,
+        }
     }
 
     // Extract route from fetch call
@@ -538,7 +579,7 @@ impl DependencyVisitor {
         &self,
         imported_handlers: &[(String, String, String)],
         function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> HashMap<String, Json> {
         let mut route_fields = HashMap::new();
 
         for (route, handler_name, _) in imported_handlers {

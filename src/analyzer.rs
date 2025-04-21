@@ -1,9 +1,10 @@
-use crate::visitor::DependencyVisitor;
+use crate::visitor::{DependencyVisitor, Json};
+use serde_json::json;
 use std::{collections::HashMap, path::PathBuf};
 
 pub struct ApiAnalysisResult {
-    pub endpoints: Vec<(String, String, Vec<String>)>,
-    pub calls: Vec<(String, String, Vec<String>)>,
+    pub endpoints: Vec<(String, String, Json)>,
+    pub calls: Vec<(String, String, Json)>,
     pub issues: Vec<String>,
 }
 
@@ -36,7 +37,7 @@ pub fn analyze_api_consistency(visitors: Vec<DependencyVisitor>) -> ApiAnalysisR
     // Print the results of function analysis
     println!("\nResolved Response Fields for Routes:");
     for (route, fields) in &route_fields {
-        println!("Route: {} returns fields: {:?}", route, fields);
+        println!("Route: {} returns: {}", route, json!(fields));
     }
 
     // Add the resolved fields to the endpoints
