@@ -32,8 +32,9 @@ fn main() {
     // Process each file
     let mut visitors = Vec::new();
     for file_path in files {
+        println!("\n>>>>>>>>>>>>><<<<<<<<<<<<<");
         println!("Parsing: {}", file_path.display());
-
+        println!(">>>>>>>>>>>>><<<<<<<<<<<<<\n");
         if let Some(module) = parse_file(&file_path, &cm, &handler) {
             // Create visitor with file path
             let mut visitor = DependencyVisitor::new(file_path.clone());

@@ -1,5 +1,6 @@
 import express from "express";
 import { handleProductGet } from "./sample-b.js";
+import { getPost, getFriendLikes } from "./blog-service.js";
 
 const app = express();
 const router = express.Router();
@@ -48,6 +49,21 @@ app.get("/dashboard", (req, res) => {
       { url: "/about", visits: 300 },
     ],
   });
+});
+
+// From https://overreacted.io/jsx-over-the-wire/?ck_subscriber_id=2072125421
+app.get("/api/likes/:postId", async (req, res) => {
+  const postId = req.params.postId;
+  const [post, friendLikes] = await Promise.all([
+    getPost(postId),
+    getFriendLikes(postId, { limit: 2 }),
+  ]);
+  const json = {
+    totalLikeCount: post.totalLikeCount,
+    isLikedByUser: post.isLikedByUser,
+    friendLikes: friendLikes,
+  };
+  res.json(json);
 });
 
 // ===== REGULAR ROUTER =====
@@ -100,43 +116,43 @@ app.get(dynamicRoute, (req, res) => {
 
 // ===== CLIENT-SIDE API CALLS =====
 
-// Basic calls
-fetch("/users");
-fetch("/api/products");
+// // Basic calls
+// fetch("/users");
+// fetch("/api/products");
 
-// Calls with method specified
-fetch("/users", { method: "POST" });
-fetch("/api/products", { method: "POST" });
+// // Calls with method specified
+// fetch("/users", { method: "POST" });
+// fetch("/api/products", { method: "POST" });
 
-// Parameterized route calls
-fetch("/users/42");
-fetch("/api/products/512");
+// // Parameterized route calls
+// fetch("/users/42");
+// fetch("/api/products/512");
 
-// Calls with options
-fetch("/users/99", {
-  method: "PUT",
-  headers: { "Content-Type": "application/json" },
-});
+// // Calls with options
+// fetch("/users/99", {
+//   method: "PUT",
+//   headers: { "Content-Type": "application/json" },
+// });
 
-// DELETE request
-fetch("/users/123", { method: "DELETE" });
+// // DELETE request
+// fetch("/users/123", { method: "DELETE" });
 
-// Call to a non-existent endpoint (should generate warning)
-fetch("/not-found");
+// // Call to a non-existent endpoint (should generate warning)
+// fetch("/not-found");
 
-// Method mismatch (should generate warning)
-fetch("/dashboard", { method: "POST" });
+// // Method mismatch (should generate warning)
+// fetch("/dashboard", { method: "POST" });
 
-// Admin route calls
-fetch("/admin/stats");
-fetch("/admin/settings", { method: "POST" });
+// // Admin route calls
+// fetch("/admin/stats");
+// fetch("/admin/settings", { method: "POST" });
 
-// Dynamic route call
-fetch("/dynamic");
+// // Dynamic route call
+// fetch("/dynamic");
 
-// Membership tier routes
-fetch("/membership/gold");
-fetch("/membership/platinum"); // Should generate warning (platinum tier doesn't exist)
+// // Membership tier routes
+// fetch("/membership/gold");
+// fetch("/membership/platinum"); // Should generate warning (platinum tier doesn't exist)
 
-// Nested route with method mismatch (should generate warning)
-fetch("/api/products/555", { method: "DELETE" });
+// // Nested route with method mismatch (should generate warning)
+// fetch("/api/products/555", { method: "DELETE" });

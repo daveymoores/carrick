@@ -400,11 +400,6 @@ impl DependencyVisitor {
 
                     // Check if this handler is an imported function
                     if let Some(source) = self.imported_functions.get(&handler_name) {
-                        println!(
-                            "FOUND IMPORTED HANDLER: Route '{}' uses imported function '{}' from '{}'",
-                            route, handler_name, source
-                        );
-
                         // Track this imported handler usage
                         self.imported_handlers.push((
                             route.clone(),
