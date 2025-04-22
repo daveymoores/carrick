@@ -5,8 +5,9 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::Serialize;
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
+
+use crate::extractor::{CoreExtractor, RouteExtractor};
 extern crate regex;
-use regex::Regex;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Json {
@@ -58,6 +59,22 @@ impl DependencyVisitor {
             imported_handlers: Vec::new(),
             function_definitions: HashMap::new(),
         }
+    }
+}
+
+impl CoreExtractor for DependencyVisitor {}
+
+impl RouteExtractor for DependencyVisitor {
+    fn get_imported_functions(&self) -> &HashMap<String, String> {
+        &self.imported_functions
+    }
+
+    fn get_response_fields(&self) -> &HashMap<String, Json> {
+        &self.response_fields
+    }
+
+    fn add_imported_handler(&mut self, route: String, handler: String, source: String) {
+        self.imported_handlers.push((route, handler, source));
     }
 }
 
@@ -207,13 +224,6 @@ impl Visit for DependencyVisitor {
                         }
                     }
                 }
-            } else if let Expr::Ident(ident) = &**callee_expr {
-                // Your existing fetch detection
-                if ident.sym == "fetch" {
-                    if let (Some(route), Some(method)) = self.extract_fetch_route(call) {
-                        self.calls.push((route, method, Json::Null));
-                    }
-                }
             }
         }
         call.visit_children_with(self);
@@ -232,140 +242,6 @@ impl DependencyVisitor {
             }
         }
         None
-    }
-
-    fn extract_json_fields_from_call(&self, expr_stmt: &ExprStmt) -> Option<Json> {
-        if let Expr::Call(call) = &*expr_stmt.expr {
-            self.extract_res_json_fields(call)
-        } else {
-            None
-        }
-    }
-
-    fn extract_json_fields_from_return(&self, expr: &Box<Expr>) -> Option<Json> {
-        if let Expr::Call(call) = &**expr {
-            self.extract_res_json_fields(call)
-        } else {
-            None
-        }
-    }
-
-    fn extract_fields_from_arrow(&self, arrow: &ArrowExpr) -> Json {
-        match &*arrow.body {
-            // For arrow functions with block bodies: (req, res) => { ... }
-            BlockStmtOrExpr::BlockStmt(block) => {
-                for stmt in &block.stmts {
-                    if let Stmt::Expr(expr_stmt) = stmt {
-                        if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
-                            return json;
-                        }
-                    }
-
-                    // Look for return statements
-                    if let Stmt::Return(ret) = stmt {
-                        if let Some(expr) = &ret.arg {
-                            if let Some(json) = self.extract_json_fields_from_return(expr) {
-                                return json;
-                            }
-                        }
-                    }
-                }
-            }
-            // For arrow functions with expression bodies: (req, res) => res.json(...)
-            BlockStmtOrExpr::Expr(expr) => {
-                if let Some(json) = self.extract_json_fields_from_return(expr) {
-                    return json;
-                }
-            }
-        }
-
-        // Default if we couldn't find any response
-        Json::Null
-    }
-
-    // Extract response fields from a function declaration
-    fn extract_fields_from_function_decl(&self, fn_decl: &FnDecl) -> Json {
-        // Check if the function has a body
-        if let Some(body) = &fn_decl.function.body {
-            // Analyze each statement in the function body
-            for stmt in &body.stmts {
-                match stmt {
-                    // For expressions like res.json({...})
-                    Stmt::Expr(expr_stmt) => {
-                        if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
-                            return json;
-                        }
-                    }
-                    // For return statements like return res.json({...})
-                    Stmt::Return(return_stmt) => {
-                        if let Some(expr) = &return_stmt.arg {
-                            if let Some(json) = self.extract_json_fields_from_return(expr) {
-                                return json;
-                            }
-                        }
-                    }
-                    // Handle nested blocks like if/else statements
-                    Stmt::Block(block) => {
-                        for nested_stmt in &block.stmts {
-                            if let Stmt::Expr(expr_stmt) = nested_stmt {
-                                if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
-                                    return json;
-                                }
-                            }
-                        }
-                    }
-                    // Other statement types could be handled here if needed
-                    _ => {}
-                }
-            }
-        }
-
-        // Default if we couldn't find any response
-        Json::Null
-    }
-
-    // Extract response fields from a function expression
-    fn extract_fields_from_function_expr(&self, fn_expr: &FnExpr) -> Json {
-        // Check if the function has a body
-        if let Some(body) = &fn_expr.function.body {
-            // Analyze each statement in the function body
-            for stmt in &body.stmts {
-                match stmt {
-                    // For expressions like res.json({...})
-                    Stmt::Expr(expr_stmt) => {
-                        if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
-                            return json;
-                        }
-                    }
-
-                    // For return statements like return res.json({...})
-                    Stmt::Return(return_stmt) => {
-                        if let Some(expr) = &return_stmt.arg {
-                            if let Some(json) = self.extract_json_fields_from_return(expr) {
-                                return json;
-                            }
-                        }
-                    }
-
-                    // Handle nested blocks like if/else statements
-                    Stmt::Block(block) => {
-                        for nested_stmt in &block.stmts {
-                            if let Stmt::Expr(expr_stmt) = nested_stmt {
-                                if let Some(json) = self.extract_json_fields_from_call(expr_stmt) {
-                                    return json;
-                                }
-                            }
-                        }
-                    }
-
-                    // Other statement types could be handled here if needed
-                    _ => {}
-                }
-            }
-        }
-
-        // Default if we couldn't find any response
-        Json::Null
     }
 
     // Extract route and handler information from route definitions
@@ -423,137 +299,6 @@ impl DependencyVisitor {
         Some((route, response_json))
     }
 
-    // Extract JSON structure from res.json(...)
-    fn extract_res_json_fields(&self, call: &CallExpr) -> Option<Json> {
-        let callee = call.callee.as_expr()?;
-        let member = callee.as_member()?;
-
-        if let Some(ident) = member.obj.as_ident() {
-            if ident.sym == "res" || ident.sym == "json" {
-                let arg = call.args.get(0)?;
-                // Extract the JSON structure from the argument
-                return Some(self.expr_to_json(&arg.expr));
-            }
-        }
-
-        None
-    }
-
-    // Convert an expression to a Json value
-    fn expr_to_json(&self, expr: &Expr) -> Json {
-        match expr {
-            // Handle literals
-            Expr::Lit(lit) => match lit {
-                Lit::Str(str_lit) => Json::String(str_lit.value.to_string()),
-                Lit::Num(num) => Json::Number(num.value),
-                Lit::Bool(b) => Json::Boolean(b.value),
-                Lit::Null(_) => Json::Null,
-                _ => Json::Null, // Other literals
-            },
-
-            // Handle arrays
-            Expr::Array(arr) => {
-                let values: Vec<Json> = arr
-                    .elems
-                    .iter()
-                    .filter_map(|elem| elem.as_ref().map(|e| self.expr_to_json(&e.expr)))
-                    .collect();
-                Json::Array(values)
-            }
-
-            // Handle objects
-            Expr::Object(obj) => {
-                let mut map = HashMap::new();
-
-                for prop in &obj.props {
-                    if let PropOrSpread::Prop(boxed_prop) = prop {
-                        if let Prop::KeyValue(kv) = &**boxed_prop {
-                            // Extract key
-                            let key = match &kv.key {
-                                PropName::Ident(ident) => ident.sym.to_string(),
-                                PropName::Str(str) => str.value.to_string(),
-                                _ => continue, // Skip computed keys
-                            };
-
-                            // Extract value
-                            let value = self.expr_to_json(&kv.value);
-
-                            map.insert(key, value);
-                        }
-                    }
-                }
-
-                Json::Object(Box::new(map))
-            }
-
-            // Other expressions (function calls, identifiers, etc.) - treat as null for now
-            _ => Json::Null,
-        }
-    }
-
-    // Extract route from fetch call
-    fn extract_fetch_route(&self, call: &CallExpr) -> (Option<String>, Option<String>) {
-        let route = match call.args.get(0) {
-            Some(arg) => match &*arg.expr {
-                Expr::Lit(lit) => match lit {
-                    Lit::Str(str_lit) => Some(str_lit.value.to_string()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
-
-        // Extract method from second argument (if it exists)
-        let method = if call.args.len() > 1 {
-            match &*call.args[1].expr {
-                Expr::Object(obj) => {
-                    // Look for { method: 'POST' } pattern
-                    for prop in &obj.props {
-                        if let PropOrSpread::Prop(boxed_prop) = prop {
-                            if let Prop::KeyValue(kv) = &**boxed_prop {
-                                // Check if the key is "method"
-                                if let PropName::Ident(key_ident) = &kv.key {
-                                    if key_ident.sym.to_string() == "method" {
-                                        // Extract the method value
-                                        if let Expr::Lit(lit) = &*kv.value {
-                                            if let Lit::Str(str_lit) = lit {
-                                                return (route, Some(str_lit.value.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None
-                }
-                _ => None,
-            }
-        } else {
-            // No second argument, default to GET
-            Some("GET".to_string())
-        };
-
-        (route, method)
-    }
-
-    fn normalize_route(&self, route: &str) -> String {
-        let mut normalized = route.to_string();
-
-        // Remove trailing slashes
-        while normalized.ends_with('/') && normalized.len() > 1 {
-            normalized.pop();
-        }
-
-        // Ensure leading slash
-        if !normalized.starts_with('/') {
-            normalized = format!("/{}", normalized);
-        }
-
-        normalized
-    }
-
     pub fn print_imported_handler_summary(&self) {
         println!("\nImported Handler Usage:");
         println!("----------------------");
@@ -578,115 +323,5 @@ impl DependencyVisitor {
         for (name, def) in &self.function_definitions {
             println!("Function: {} in {}", name, def.file_path.display());
         }
-    }
-
-    // This function analyzes the function definitions and returns a HashMap of route fields.
-    // TODO it should probably be refactored into its own function.
-    pub fn analyze_function_definitions(
-        &self,
-        imported_handlers: &[(String, String, String)],
-        function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> HashMap<String, Json> {
-        let mut route_fields = HashMap::new();
-
-        for (route, handler_name, _) in imported_handlers {
-            if let Some(func_def) = function_definitions.get(handler_name) {
-                let fields = match &func_def.node_type {
-                    FunctionNodeType::ArrowFunction(arrow) => self.extract_fields_from_arrow(arrow),
-                    FunctionNodeType::FunctionDeclaration(decl) => {
-                        self.extract_fields_from_function_decl(decl)
-                    }
-                    FunctionNodeType::FunctionExpression(expr) => {
-                        self.extract_fields_from_function_expr(expr)
-                    }
-                };
-
-                route_fields.insert(route.clone(), fields);
-            }
-        }
-
-        route_fields
-    }
-
-    pub fn analyze_matches(&self) -> Vec<String> {
-        let mut issues = Vec::new();
-
-        // Create a map of endpoints for efficient lookups
-        let mut endpoint_map: HashMap<String, Vec<String>> = HashMap::new();
-        for (route, method, _) in &self.endpoints {
-            let normalized_route = self.normalize_route(route);
-            endpoint_map
-                .entry(normalized_route)
-                .or_insert_with(Vec::new)
-                .push(method.clone());
-        }
-
-        // Check each call against endpoints
-        for (route, method, _) in &self.calls {
-            let normalized_route = self.normalize_route(route);
-
-            // Check if route exists
-            match endpoint_map.get(&normalized_route) {
-                Some(allowed_methods) => {
-                    // Check if method is allowed
-                    if !allowed_methods.contains(method) {
-                        issues.push(format!(
-                                "Method mismatch: {} {} is called but endpoint only supports methods: {:?}",
-                                method, route, allowed_methods
-                            ));
-                    }
-                }
-                None => {
-                    // Try to find if it's a sub-route or has a parent
-                    let mut found = false;
-
-                    // Check for API base paths (simple approach)
-                    for (endpoint_route, _, _) in &self.endpoints {
-                        let norm_endpoint = self.normalize_route(endpoint_route);
-                        if normalized_route.starts_with(&norm_endpoint) {
-                            found = true;
-                            break;
-                        }
-
-                        // Check for route parameters like '/users/:id'
-                        if endpoint_route.contains(':') {
-                            // Convert route with params to regex pattern
-                            // Replace :param with a regex capture group that matches everything except slashes
-                            let pattern = norm_endpoint
-                                .split('/')
-                                .map(|segment| {
-                                    if segment.starts_with(':') {
-                                        "([^/]+)".to_string() // Match any character except /
-                                    } else {
-                                        regex::escape(segment) // Escape other segments for regex safety
-                                    }
-                                })
-                                .collect::<Vec<String>>()
-                                .join("/");
-
-                            // Ensure pattern matches the whole path
-                            let re_str = format!("^{}$", pattern);
-
-                            // Create regex and check for match
-                            if let Ok(regex) = Regex::new(&re_str) {
-                                if regex.is_match(&normalized_route) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if !found {
-                        issues.push(format!(
-                            "Missing endpoint: No endpoint defined for {} {}",
-                            method, route
-                        ));
-                    }
-                }
-            }
-        }
-
-        issues
     }
 }

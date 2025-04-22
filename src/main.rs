@@ -1,4 +1,5 @@
 mod analyzer;
+mod extractor;
 mod file_finder;
 mod parser;
 mod visitor;
