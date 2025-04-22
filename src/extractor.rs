@@ -298,7 +298,6 @@ pub trait CoreExtractor {
         fetch_calls
     }
 
-    // Helper method to extract fetch calls from a statement
     fn extract_fetch_from_stmt(&self, stmt: &Stmt, fetch_calls: &mut Vec<(String, String)>) {
         match stmt {
             Stmt::Expr(expr_stmt) => {
@@ -314,20 +313,41 @@ pub trait CoreExtractor {
                     self.extract_fetch_from_stmt(nested_stmt, fetch_calls);
                 }
             }
-            Stmt::If(if_stmt) => {
-                self.extract_fetch_from_expr(&if_stmt.test, fetch_calls);
-                self.extract_fetch_from_stmt(&*if_stmt.cons, fetch_calls);
-                if let Some(alt) = &if_stmt.alt {
-                    self.extract_fetch_from_stmt(&**alt, fetch_calls);
+            Stmt::Try(try_stmt) => {
+                // Process statements in try block directly
+                for stmt in &try_stmt.block.stmts {
+                    self.extract_fetch_from_stmt(stmt, fetch_calls);
+                }
+
+                // Process catch block if present
+                if let Some(handler) = &try_stmt.handler {
+                    for stmt in &handler.body.stmts {
+                        self.extract_fetch_from_stmt(stmt, fetch_calls);
+                    }
+                }
+
+                // Process finally block if present
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    for stmt in &finalizer.stmts {
+                        self.extract_fetch_from_stmt(stmt, fetch_calls);
+                    }
                 }
             }
-            Stmt::Try(try_stmt) => {
-                self.extract_fetch_from_stmt(&Stmt::Block(try_stmt.block.clone()), fetch_calls);
-                if let Some(handler) = &try_stmt.handler {
-                    self.extract_fetch_from_stmt(&Stmt::Block(handler.body.clone()), fetch_calls);
+            Stmt::Decl(decl) => {
+                // Handle variable declarations which might contain fetch calls
+                if let Decl::Var(var_decl) = decl {
+                    for var in &var_decl.decls {
+                        if let Some(init) = &var.init {
+                            self.extract_fetch_from_expr(init, fetch_calls);
+                        }
+                    }
                 }
-                if let Some(finalizer) = &try_stmt.finalizer {
-                    self.extract_fetch_from_stmt(&Stmt::Block(finalizer.clone()), fetch_calls);
+            }
+            Stmt::If(if_stmt) => {
+                self.extract_fetch_from_expr(&if_stmt.test, fetch_calls);
+                self.extract_fetch_from_stmt(&if_stmt.cons, fetch_calls);
+                if let Some(alt) = &if_stmt.alt {
+                    self.extract_fetch_from_stmt(alt, fetch_calls);
                 }
             }
             // Add other statement types as needed
@@ -335,7 +355,6 @@ pub trait CoreExtractor {
         }
     }
 
-    // Helper method to extract fetch calls from an expression
     fn extract_fetch_from_expr(&self, expr: &Expr, fetch_calls: &mut Vec<(String, String)>) {
         match expr {
             Expr::Call(call) => {
@@ -343,7 +362,11 @@ pub trait CoreExtractor {
                 if let Callee::Expr(callee_expr) = &call.callee {
                     if let Expr::Ident(ident) = &**callee_expr {
                         if ident.sym == "fetch" {
-                            if let (Some(route), Some(method)) = self.extract_fetch_route(call) {
+                            // Handle both string literals and template literals
+                            if let Some(route) = self.extract_route_from_call_arg(&call.args) {
+                                let method = self
+                                    .extract_method_from_call_args(call)
+                                    .unwrap_or_else(|| "GET".to_string());
                                 fetch_calls.push((route, method));
                             }
                         }
@@ -355,6 +378,12 @@ pub trait CoreExtractor {
                     self.extract_fetch_from_expr(&arg.expr, fetch_calls);
                 }
             }
+            Expr::Await(await_expr) => {
+                self.extract_fetch_from_expr(&await_expr.arg, fetch_calls);
+            }
+            Expr::Assign(assign) => {
+                self.extract_fetch_from_expr(&assign.right, fetch_calls);
+            }
             Expr::Arrow(arrow) => {
                 let nested_calls = self.extract_fetch_calls_from_arrow(arrow);
                 fetch_calls.extend(nested_calls);
@@ -363,11 +392,78 @@ pub trait CoreExtractor {
                 let nested_calls = self.extract_fetch_calls_from_function_expr(fn_expr);
                 fetch_calls.extend(nested_calls);
             }
-            Expr::Await(await_expr) => {
-                self.extract_fetch_from_expr(&await_expr.arg, fetch_calls);
-            }
-            // Add other expression types as needed
+            // Add handling for template literals and other expression types
             _ => {}
+        }
+    }
+
+    // Helper method to extract HTTP method from fetch call arguments
+    fn extract_method_from_call_args(&self, call: &CallExpr) -> Option<String> {
+        // Need at least 2 arguments to have a method
+        if call.args.len() <= 1 {
+            return Some("GET".to_string()); // Default is GET
+        }
+
+        // Check the second argument (options object)
+        match &*call.args[1].expr {
+            Expr::Object(obj) => {
+                // Look for { method: 'POST' } pattern
+                for prop in &obj.props {
+                    if let PropOrSpread::Prop(boxed_prop) = prop {
+                        if let Prop::KeyValue(kv) = &**boxed_prop {
+                            // Check if the key is "method"
+                            if let PropName::Ident(key_ident) = &kv.key {
+                                if key_ident.sym == "method" {
+                                    // Extract the method value
+                                    if let Expr::Lit(Lit::Str(str_lit)) = &*kv.value {
+                                        return Some(str_lit.value.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // No method specified in options
+                Some("GET".to_string())
+            }
+            // Second argument isn't an object
+            _ => Some("GET".to_string()),
+        }
+    }
+
+    // Helper method to extract route from call arguments (supporting template literals)
+    fn extract_route_from_call_arg(&self, args: &[ExprOrSpread]) -> Option<String> {
+        if args.is_empty() {
+            return None;
+        }
+
+        match &*args[0].expr {
+            // Regular string literal
+            Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
+
+            // Template literal
+            Expr::Tpl(tpl) => {
+                let mut route = String::new();
+                let mut param_index = 0;
+
+                // Process each part of the template
+                for (i, quasi) in tpl.quasis.iter().enumerate() {
+                    // Add the raw text part
+                    route.push_str(&quasi.raw);
+
+                    // If there's an expression after this quasi
+                    if i < tpl.exprs.len() {
+                        // Add a parameter placeholder
+                        route.push_str(&format!(":param{}", param_index));
+                        param_index += 1;
+                    }
+                }
+
+                Some(route)
+            }
+            // Add other patterns as needed
+            _ => None,
         }
     }
 }

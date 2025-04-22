@@ -40,7 +40,46 @@ impl Analyzer {
             normalized = format!("/{}", normalized);
         }
 
+        // Create a regex-based matcher for parameters
+        let param_pattern = regex::Regex::new(r":([\w\d]+)").unwrap();
+
+        // Replace all parameters with a common placeholder for comparison
+        normalized = param_pattern.replace_all(&normalized, ":param").to_string();
+
         normalized
+    }
+
+    // Strip parameters for prefix matching
+    fn strip_params(&self, route: &str) -> String {
+        let param_pattern = regex::Regex::new(r"/:[\w\d]+").unwrap();
+        let base_route = param_pattern.replace_all(route, "").to_string();
+        if base_route.is_empty() {
+            "/".to_string()
+        } else {
+            base_route
+        }
+    }
+
+    // Convert a route with parameters to a regex pattern
+    fn route_to_regex(&self, route: &str) -> Regex {
+        let pattern = route
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with(':') {
+                    "([^/]+)".to_string() // Match any character except /
+                } else if !segment.is_empty() {
+                    regex::escape(segment) // Escape other segments
+                } else {
+                    "".to_string()
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<String>>()
+            .join("/");
+
+        // Ensure pattern matches the whole path with proper anchoring
+        let re_str = format!("^/?{}/?$", pattern);
+        Regex::new(&re_str).unwrap_or_else(|_| Regex::new("^/$").unwrap())
     }
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
@@ -74,7 +113,6 @@ impl Analyzer {
                     self.extract_fetch_calls_from_function_expr(expr)
                 }
             };
-
             // Add the discovered calls
             for (route, method) in fetch_calls {
                 new_calls.push((route, method, Json::Null));
@@ -115,78 +153,53 @@ impl Analyzer {
     pub fn analyze_matches(&self) -> Vec<String> {
         let mut issues = Vec::new();
 
-        // Create a map of endpoints for efficient lookups
-        let mut endpoint_map: HashMap<String, Vec<String>> = HashMap::new();
-        for (route, method, _) in &self.endpoints {
-            let normalized_route = self.normalize_route(route);
-            endpoint_map
-                .entry(normalized_route)
-                .or_insert_with(Vec::new)
-                .push(method.clone());
-        }
-
         // Check each call against endpoints
-        for (route, method, _) in &self.calls {
-            let normalized_route = self.normalize_route(route);
+        for (call_route, call_method, _) in &self.calls {
+            let normalized_call = self.normalize_route(call_route);
+            // Try to find a matching endpoint using various strategies
+            let mut endpoint_match = None;
 
-            // Check if route exists
-            match endpoint_map.get(&normalized_route) {
-                Some(allowed_methods) => {
-                    // Check if method is allowed
-                    if !allowed_methods.contains(method) {
+            for (endpoint_route, endpoint_method, _) in &self.endpoints {
+                // Strategy 1: Direct match after normalization
+                let normalized_endpoint = self.normalize_route(endpoint_route);
+                if normalized_call == normalized_endpoint {
+                    endpoint_match = Some((endpoint_route, endpoint_method));
+                    break;
+                }
+
+                // Strategy 2: Parameter-aware regex matching
+                if endpoint_route.contains(':') {
+                    let regex = self.route_to_regex(endpoint_route);
+                    if regex.is_match(call_route) {
+                        endpoint_match = Some((endpoint_route, endpoint_method));
+                        break;
+                    }
+                }
+
+                // Strategy 3: Check if it's a sub-route
+                if call_route.starts_with(&self.strip_params(endpoint_route))
+                    && !endpoint_route.contains(':')
+                {
+                    endpoint_match = Some((endpoint_route, endpoint_method));
+                    break;
+                }
+            }
+
+            // Check if we found a match and if methods are compatible
+            match endpoint_match {
+                Some((_, endpoint_method)) => {
+                    if call_method != endpoint_method {
                         issues.push(format!(
-                            "Method mismatch: {} {} is called but endpoint only supports methods: {:?}",
-                            method, route, allowed_methods
+                            "Method mismatch: {} {} is called but endpoint only supports {}",
+                            call_method, call_route, endpoint_method
                         ));
                     }
                 }
                 None => {
-                    // Try to find if it's a sub-route or has a parent
-                    let mut found = false;
-
-                    // Check for API base paths (simple approach)
-                    for (endpoint_route, _, _) in &self.endpoints {
-                        let norm_endpoint = self.normalize_route(endpoint_route);
-                        if normalized_route.starts_with(&norm_endpoint) {
-                            found = true;
-                            break;
-                        }
-
-                        // Check for route parameters like '/users/:id'
-                        if endpoint_route.contains(':') {
-                            // Convert route with params to regex pattern
-                            // Replace :param with a regex capture group that matches everything except slashes
-                            let pattern = norm_endpoint
-                                .split('/')
-                                .map(|segment| {
-                                    if segment.starts_with(':') {
-                                        "([^/]+)".to_string() // Match any character except /
-                                    } else {
-                                        regex::escape(segment) // Escape other segments for regex safety
-                                    }
-                                })
-                                .collect::<Vec<String>>()
-                                .join("/");
-
-                            // Ensure pattern matches the whole path
-                            let re_str = format!("^{}$", pattern);
-
-                            // Create regex and check for match
-                            if let Ok(regex) = Regex::new(&re_str) {
-                                if regex.is_match(&normalized_route) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if !found {
-                        issues.push(format!(
-                            "Missing endpoint: No endpoint defined for {} {}",
-                            method, route
-                        ));
-                    }
+                    issues.push(format!(
+                        "Missing endpoint: No endpoint defined for {} {}",
+                        call_method, call_route
+                    ));
                 }
             }
         }
@@ -211,7 +224,6 @@ pub fn analyze_api_consistency(visitors: Vec<DependencyVisitor>) -> ApiAnalysisR
     for visitor in visitors {
         analyzer.add_visitor_data(visitor);
     }
-
     // Second pass - analyze function definitions for response fields
     println!("\n=== Second Pass: Analyzing Function Implementations ===");
     let route_fields = analyzer
@@ -225,6 +237,7 @@ pub fn analyze_api_consistency(visitors: Vec<DependencyVisitor>) -> ApiAnalysisR
 
     // Third pass - look for fetch calls inside functions
     println!("\n=== Third Pass: Analyzing Fetch Calls in Functions ===");
+
     analyzer.analyze_functions_for_fetch_calls();
 
     // Get and return the final analysis results

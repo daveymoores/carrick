@@ -66,6 +66,12 @@ app.get("/api/likes/:postId", async (req, res) => {
   res.json(json);
 });
 
+app.get("/api/likes", async (req, res) => {
+  res.json({
+    totalLikeCount: 10,
+  });
+});
+
 // ===== REGULAR ROUTER =====
 
 // Basic router endpoints
