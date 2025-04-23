@@ -80,11 +80,21 @@ fn main() {
     println!("Found {} API calls across all files", result.calls.len());
 
     if result.issues.is_empty() {
-        println!("\n✅ No API inconsistencies detected!");
+        println!("\n✅  No API inconsistencies detected!");
     } else {
-        println!("\n⚠️ Found {} API issues:", result.issues.len());
-        for (i, issue) in result.issues.iter().enumerate() {
-            println!("{}. {}", i + 1, issue);
+        println!("\n⚠️  Found {} API issues:", result.issues.len());
+        let call_issues = result.issues.call_issues;
+        let endpoint_issues = result.issues.endpoint_issues;
+        let mut issue_number: usize = 0;
+
+        for (i, issue) in call_issues.iter().enumerate() {
+            issue_number = i + 1;
+            println!("\n{}. {}", &issue_number, issue);
+        }
+
+        for (_, issue) in endpoint_issues.iter().enumerate() {
+            issue_number = issue_number + 1;
+            print!("\n{}. {}", &issue_number, issue);
         }
     }
 }

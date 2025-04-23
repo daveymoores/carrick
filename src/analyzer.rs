@@ -5,11 +5,27 @@ use crate::{
 use regex::Regex;
 use serde_json::json;
 use std::collections::HashMap;
+use std::collections::HashSet;
+
+pub struct ApiIssues {
+    pub call_issues: Vec<String>,
+    pub endpoint_issues: Vec<String>,
+}
+
+impl ApiIssues {
+    pub fn is_empty(&self) -> bool {
+        self.call_issues.is_empty() && self.endpoint_issues.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.call_issues.len() + self.endpoint_issues.len()
+    }
+}
 
 pub struct ApiAnalysisResult {
     pub endpoints: Vec<(String, String, Json)>,
     pub calls: Vec<(String, String, Json)>,
-    pub issues: Vec<String>,
+    pub issues: ApiIssues,
 }
 
 #[derive(Default)]
@@ -150,8 +166,16 @@ impl Analyzer {
         route_fields
     }
 
-    pub fn analyze_matches(&self) -> Vec<String> {
-        let mut issues = Vec::new();
+    pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>) {
+        let mut call_issues = Vec::new();
+        let mut endpoint_issues = Vec::new();
+
+        // Initialize with all endpoints as potentially orphaned - use cloned strings for owned values
+        let mut orphaned_endpoints: HashSet<(String, String)> = self
+            .endpoints
+            .iter()
+            .map(|(route, method, _)| (route.clone(), method.clone()))
+            .collect();
 
         // Check each call against endpoints
         for (call_route, call_method, _) in &self.calls {
@@ -164,6 +188,7 @@ impl Analyzer {
                 let normalized_endpoint = self.normalize_route(endpoint_route);
                 if normalized_call == normalized_endpoint {
                     endpoint_match = Some((endpoint_route, endpoint_method));
+                    orphaned_endpoints.remove(&(endpoint_route.clone(), endpoint_method.clone()));
                     break;
                 }
 
@@ -172,6 +197,8 @@ impl Analyzer {
                     let regex = self.route_to_regex(endpoint_route);
                     if regex.is_match(call_route) {
                         endpoint_match = Some((endpoint_route, endpoint_method));
+                        orphaned_endpoints
+                            .remove(&(endpoint_route.clone(), endpoint_method.clone()));
                         break;
                     }
                 }
@@ -181,6 +208,7 @@ impl Analyzer {
                     && !endpoint_route.contains(':')
                 {
                     endpoint_match = Some((endpoint_route, endpoint_method));
+                    orphaned_endpoints.remove(&(endpoint_route.clone(), endpoint_method.clone()));
                     break;
                 }
             }
@@ -189,14 +217,14 @@ impl Analyzer {
             match endpoint_match {
                 Some((_, endpoint_method)) => {
                     if call_method != endpoint_method {
-                        issues.push(format!(
+                        call_issues.push(format!(
                             "Method mismatch: {} {} is called but endpoint only supports {}",
                             call_method, call_route, endpoint_method
                         ));
                     }
                 }
                 None => {
-                    issues.push(format!(
+                    call_issues.push(format!(
                         "Missing endpoint: No endpoint defined for {} {}",
                         call_method, call_route
                     ));
@@ -204,14 +232,27 @@ impl Analyzer {
             }
         }
 
-        issues
+        // After checking all calls, anything left in orphaned_endpoints has no matching call
+        for (orphaned_endpoint, orphaned_method) in orphaned_endpoints {
+            endpoint_issues.push(format!(
+                "Orphaned endpoint: No call matching endpoint {} {}",
+                orphaned_method, orphaned_endpoint
+            ));
+        }
+
+        (call_issues, endpoint_issues)
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
+        let (call_issues, endpoint_issues) = self.analyze_matches();
+
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
             calls: self.calls.clone(),
-            issues: self.analyze_matches(),
+            issues: ApiIssues {
+                call_issues,
+                endpoint_issues,
+            },
         }
     }
 }
