@@ -28,27 +28,62 @@ export async function fetchPostLikes(postId) {
   }
 }
 
-// Example usage
-async function displayPostLikes() {
-  try {
-    const postId = "post123";
-    const likeInfo = await fetchPostLikes(postId);
+export async function createOrder(orderData) {
+  return fetch("/orders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      customerId: orderData.customerId,
+      items: orderData.items,
+      shippingAddress: orderData.shippingAddress,
+    }),
+  });
+}
 
-    console.log(`This post has ${likeInfo.totalLikes} likes`);
+export async function addComment(postId, comment) {
+  return fetch(`/blog/${postId}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      author: comment.author,
+      content: comment.content,
+    }),
+  });
+}
 
-    if (likeInfo.likedByUser) {
-      console.log("You liked this post");
-    }
+export async function registerForEvent(eventId, userData) {
+  return fetch(`/events/${eventId}/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      attendeeName: userData.name,
+      email: userData.email,
+      // Missing ticketType field!
+    }),
+  });
+}
 
-    if (likeInfo.friendCount > 0) {
-      console.log(
-        `Friends who liked this: ${likeInfo.friendsWhoLiked.join(", ")}`,
-      );
-    }
+export async function subscribe(userData) {
+  return fetch("/newsletter/subscribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      emailAddress: userData.email, // Wrong field name!
+      format: userData.format, // Wrong field name!
+      interests: userData.topics, // Wrong field name!
+    }),
+  });
+}
 
-    return likeInfo;
-  } catch (error) {
-    console.log("Could not display like information");
-    return null;
-  }
+export async function processPayment(paymentData) {
+  return fetch("/payments/process", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      amount: paymentData.amount,
+      currency: paymentData.currency,
+      // Missing nested structure for paymentMethod.type
+      paymentMethod: paymentData.method,
+    }),
+  });
 }

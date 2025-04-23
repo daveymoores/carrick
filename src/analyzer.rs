@@ -181,12 +181,14 @@ impl Analyzer {
         &self,
         imported_handlers: &[(String, String, String)],
         function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> HashMap<String, Json> {
-        let mut route_fields = HashMap::new();
+    ) -> (HashMap<String, Json>, HashMap<String, Json>) {
+        let mut response_fields = HashMap::new();
+        let mut request_fields = HashMap::new();
 
         for (route, handler_name, _) in imported_handlers {
             if let Some(func_def) = function_definitions.get(handler_name) {
-                let fields = match &func_def.node_type {
+                // Extract response fields from the handler function
+                let resp_json = match &func_def.node_type {
                     FunctionNodeType::ArrowFunction(arrow) => self.extract_fields_from_arrow(arrow),
                     FunctionNodeType::FunctionDeclaration(decl) => {
                         self.extract_fields_from_function_decl(decl)
@@ -196,11 +198,40 @@ impl Analyzer {
                     }
                 };
 
-                route_fields.insert(route.clone(), fields);
+                // Extract request body fields from the handler function
+                let req_json = match &func_def.node_type {
+                    FunctionNodeType::ArrowFunction(arrow) => {
+                        if let swc_ecma_ast::BlockStmtOrExpr::BlockStmt(block) = &*arrow.body {
+                            self.extract_req_body_fields(block)
+                        } else {
+                            None
+                        }
+                    }
+                    FunctionNodeType::FunctionDeclaration(decl) => {
+                        if let Some(body) = &decl.function.body {
+                            self.extract_req_body_fields(body)
+                        } else {
+                            None
+                        }
+                    }
+                    FunctionNodeType::FunctionExpression(expr) => {
+                        if let Some(body) = &expr.function.body {
+                            self.extract_req_body_fields(body)
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                // Store the extracted fields
+                response_fields.insert(route.clone(), resp_json);
+                if let Some(req) = req_json {
+                    request_fields.insert(route.clone(), req);
+                }
             }
         }
 
-        route_fields
+        (response_fields, request_fields)
     }
 
     pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>) {
@@ -322,13 +353,18 @@ pub fn analyze_api_consistency(visitors: Vec<DependencyVisitor>) -> ApiAnalysisR
     }
     // Second pass - analyze function definitions for response fields
     println!("\n=== Second Pass: Analyzing Function Implementations ===");
-    let route_fields = analyzer
+    let (response_fields, request_fields) = analyzer
         .analyze_function_definitions(&analyzer.imported_handlers, &analyzer.function_definitions);
 
     // Print the results of function analysis
     println!("\nResolved Response Fields for Routes:");
-    for (route, fields) in &route_fields {
+    for (route, fields) in &response_fields {
         println!("Route: {} returns: {}", route, json!(fields));
+    }
+
+    println!("\nResolved Request Fields for Routes:");
+    for (route, fields) in &request_fields {
+        println!("Route: {} expects: {}", route, json!(fields));
     }
 
     // Third pass - look for fetch calls inside functions

@@ -72,6 +72,85 @@ app.get("/api/likes", async (req, res) => {
   });
 });
 
+app.post("/orders", (req, res) => {
+  const { customerId, items, shippingAddress } = req.body;
+
+  if (!customerId || !items || !shippingAddress) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  res.json({
+    orderId: "12345",
+    status: "pending",
+    estimatedDelivery: "2023-08-15",
+  });
+});
+
+app.post("/blog/:postId/comments", (req, res) => {
+  const postId = req.params.postId;
+  const { author, content } = req.body;
+
+  if (!content) {
+    return res.status(400).json({ error: "Comment content is required" });
+  }
+
+  const authorName = author || "Anonymous";
+
+  res.json({
+    commentId: "c789",
+    postId: postId,
+    author: authorName,
+    content: content,
+    createdAt: new Date().toISOString(),
+  });
+});
+
+app.post("/events/:eventId/register", (req, res) => {
+  const eventId = req.params.eventId;
+  const { attendeeName, email, ticketType } = req.body;
+
+  if (!attendeeName || !email || !ticketType) {
+    return res.status(400).json({ error: "All fields are required" });
+  }
+
+  res.json({
+    registrationId: "reg456",
+    eventId: eventId,
+    confirmed: true,
+  });
+});
+
+app.post("/newsletter/subscribe", (req, res) => {
+  const { email, preferredFormat, topics } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: "Email is required" });
+  }
+
+  res.json({
+    subscribed: true,
+    message: "Successfully subscribed to newsletter",
+  });
+});
+
+app.post("/payments/process", (req, res) => {
+  const { amount, currency, paymentMethod } = req.body;
+
+  if (!amount || typeof amount !== "number") {
+    return res.status(400).json({ error: "Amount must be a number" });
+  }
+
+  if (!paymentMethod || !paymentMethod.type) {
+    return res.status(400).json({ error: "Invalid payment method" });
+  }
+
+  res.json({
+    transactionId: "txn123",
+    status: "processing",
+    timestamp: Date.now(),
+  });
+});
+
 // ===== REGULAR ROUTER =====
 
 // Basic router endpoints

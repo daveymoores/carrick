@@ -477,6 +477,129 @@ pub trait CoreExtractor {
             _ => None,
         }
     }
+
+    fn extract_req_body_fields(&self, function_body: &BlockStmt) -> Option<Json> {
+        // Examine each statement in the function body
+        for stmt in &function_body.stmts {
+            // Look for variable declarations that extract from req.body
+            if let Stmt::Decl(Decl::Var(var_decl)) = stmt {
+                if let Some(json) = self.extract_req_body_from_var_decl(var_decl) {
+                    return Some(json);
+                }
+            }
+
+            // Look for direct req.body usage
+            if let Stmt::Expr(expr_stmt) = stmt {
+                if let Some(json) = self.extract_req_body_from_expr(&expr_stmt.expr) {
+                    return Some(json);
+                }
+            }
+
+            // Check if statements for validation logic
+            if let Stmt::If(if_stmt) = stmt {
+                if let Some(json) = self.extract_req_body_from_condition(&if_stmt.test) {
+                    return Some(json);
+                }
+            }
+        }
+
+        None
+    }
+
+    // Handle destructuring patterns: const { field1, field2 } = req.body
+    fn extract_req_body_from_var_decl(&self, var_decl: &VarDecl) -> Option<Json> {
+        for decl in &var_decl.decls {
+            // Check if initialization is from req.body
+            if let Some(init) = &decl.init {
+                if let Expr::Member(member) = &**init {
+                    if let Expr::Ident(obj) = &*member.obj {
+                        if obj.sym == "req" {
+                            if let MemberProp::Ident(prop) = &member.prop {
+                                if prop.sym == "body" {
+                                    // Found req.body assignment
+
+                                    // Extract fields from destructuring pattern
+                                    if let Pat::Object(obj_pat) = &decl.name {
+                                        let mut fields = HashMap::new();
+
+                                        for prop in &obj_pat.props {
+                                            if let ObjectPatProp::Assign(assign_prop) = prop {
+                                                let field_name = assign_prop.key.sym.to_string();
+                                                fields.insert(field_name, Json::Null); // We don't know types yet
+                                            } else if let ObjectPatProp::KeyValue(kv_prop) = prop {
+                                                if let PropName::Ident(key) = &kv_prop.key {
+                                                    let field_name = key.sym.to_string();
+                                                    fields.insert(field_name, Json::Null);
+                                                }
+                                            }
+                                        }
+
+                                        if !fields.is_empty() {
+                                            return Some(Json::Object(Box::new(fields)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    // Handle direct access: if(req.body.field)
+    fn extract_req_body_from_expr(&self, expr: &Expr) -> Option<Json> {
+        if let Expr::Member(member) = expr {
+            if let Expr::Member(inner_member) = &*member.obj {
+                if let Expr::Ident(obj) = &*inner_member.obj {
+                    if obj.sym == "req" {
+                        if let MemberProp::Ident(body_prop) = &inner_member.prop {
+                            if body_prop.sym == "body" {
+                                // Found req.body.something
+                                if let MemberProp::Ident(field_prop) = &member.prop {
+                                    let field_name = field_prop.sym.to_string();
+                                    let mut fields = HashMap::new();
+                                    fields.insert(field_name, Json::Null);
+                                    return Some(Json::Object(Box::new(fields)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    // Handle validation conditions: if(!req.body.field)
+    fn extract_req_body_from_condition(&self, expr: &Expr) -> Option<Json> {
+        match expr {
+            // Handle negation: if(!req.body.field)
+            Expr::Unary(unary) => {
+                if unary.op == UnaryOp::Bang {
+                    return self.extract_req_body_from_expr(&unary.arg);
+                }
+            }
+
+            // Handle binary operations: if(req.body.field === undefined)
+            Expr::Bin(bin) => {
+                if let Some(left_json) = self.extract_req_body_from_expr(&bin.left) {
+                    return Some(left_json);
+                }
+                if let Some(right_json) = self.extract_req_body_from_expr(&bin.right) {
+                    return Some(right_json);
+                }
+            }
+
+            // Direct field access
+            _ => return self.extract_req_body_from_expr(expr),
+        }
+
+        None
+    }
 }
 
 pub trait RouteExtractor: CoreExtractor {
