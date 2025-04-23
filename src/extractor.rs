@@ -3,6 +3,17 @@ use std::collections::HashMap;
 use swc_ecma_ast::*;
 
 pub trait CoreExtractor {
+    fn extract_params_from_route(&self, route: &str) -> Vec<String> {
+        let param_pattern = regex::Regex::new(r":(\w+)").unwrap();
+        let mut params = Vec::new();
+
+        for cap in param_pattern.captures_iter(route) {
+            params.push(cap[1].to_string());
+        }
+
+        params
+    }
+
     fn extract_json_fields_from_call(&self, expr_stmt: &ExprStmt) -> Option<Json> {
         if let Expr::Call(call) = &*expr_stmt.expr {
             self.extract_res_json_fields(call)

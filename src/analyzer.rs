@@ -22,9 +22,18 @@ impl ApiIssues {
     }
 }
 
+#[derive(Clone)]
+pub struct ApiEndpointDetails {
+    pub route: String,
+    pub method: String,
+    pub params: Vec<String>,
+    pub request_body: Option<Json>,
+    pub response_body: Option<Json>,
+}
+
 pub struct ApiAnalysisResult {
-    pub endpoints: Vec<(String, String, Json)>,
-    pub calls: Vec<(String, String, Json)>,
+    pub endpoints: Vec<ApiEndpointDetails>,
+    pub calls: Vec<ApiEndpointDetails>,
     pub issues: ApiIssues,
 }
 
@@ -32,8 +41,8 @@ pub struct ApiAnalysisResult {
 struct Analyzer {
     imported_handlers: Vec<(String, String, String)>,
     function_definitions: HashMap<String, FunctionDefinition>,
-    endpoints: Vec<(String, String, Json)>,
-    calls: Vec<(String, String, Json)>,
+    endpoints: Vec<ApiEndpointDetails>,
+    calls: Vec<ApiEndpointDetails>,
 }
 
 impl CoreExtractor for Analyzer {}
@@ -99,8 +108,29 @@ impl Analyzer {
     }
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
-        self.endpoints.extend(visitor.endpoints);
-        self.calls.extend(visitor.calls);
+        for (route, method, response) in visitor.endpoints {
+            let params = self.extract_params_from_route(&route);
+            self.endpoints.push(ApiEndpointDetails {
+                route,
+                method,
+                params,
+                response_body: Some(response),
+                request_body: None,
+            })
+        }
+
+        // expected_fields being returned data from all CRUD calls
+        for (route, method, expected_fields) in visitor.calls {
+            let params = self.extract_params_from_route(&route);
+            self.calls.push(ApiEndpointDetails {
+                route,
+                method,
+                params,
+                response_body: None,
+                request_body: None,
+            })
+        }
+
         self.imported_handlers
             .extend(visitor.imported_handlers.clone());
 
@@ -131,7 +161,14 @@ impl Analyzer {
             };
             // Add the discovered calls
             for (route, method) in fetch_calls {
-                new_calls.push((route, method, Json::Null));
+                let params = self.extract_params_from_route(&route);
+                new_calls.push(ApiEndpointDetails {
+                    route,
+                    method,
+                    params,
+                    request_body: Some(Json::Null),
+                    response_body: Some(Json::Null),
+                });
             }
         }
 
@@ -174,41 +211,59 @@ impl Analyzer {
         let mut orphaned_endpoints: HashSet<(String, String)> = self
             .endpoints
             .iter()
-            .map(|(route, method, _)| (route.clone(), method.clone()))
+            .map(|api_endpoint_details| {
+                (
+                    api_endpoint_details.route.clone(),
+                    api_endpoint_details.method.clone(),
+                )
+            })
             .collect();
 
         // Check each call against endpoints
-        for (call_route, call_method, _) in &self.calls {
-            let normalized_call = self.normalize_route(call_route);
+        for api_call_details in &self.calls {
+            let normalized_call = self.normalize_route(&api_call_details.route);
             // Try to find a matching endpoint using various strategies
             let mut endpoint_match = None;
 
-            for (endpoint_route, endpoint_method, _) in &self.endpoints {
+            for api_endpoint_details in &self.endpoints {
                 // Strategy 1: Direct match after normalization
-                let normalized_endpoint = self.normalize_route(endpoint_route);
+                let normalized_endpoint = self.normalize_route(&api_endpoint_details.route);
                 if normalized_call == normalized_endpoint {
-                    endpoint_match = Some((endpoint_route, endpoint_method));
-                    orphaned_endpoints.remove(&(endpoint_route.clone(), endpoint_method.clone()));
+                    endpoint_match =
+                        Some((&api_endpoint_details.route, &api_endpoint_details.method));
+                    orphaned_endpoints.remove(&(
+                        api_endpoint_details.route.clone(),
+                        api_endpoint_details.method.clone(),
+                    ));
                     break;
                 }
 
                 // Strategy 2: Parameter-aware regex matching
-                if endpoint_route.contains(':') {
-                    let regex = self.route_to_regex(endpoint_route);
-                    if regex.is_match(call_route) {
-                        endpoint_match = Some((endpoint_route, endpoint_method));
-                        orphaned_endpoints
-                            .remove(&(endpoint_route.clone(), endpoint_method.clone()));
+                if api_endpoint_details.route.contains(':') {
+                    let regex = self.route_to_regex(&api_endpoint_details.route);
+                    if regex.is_match(&api_call_details.route) {
+                        endpoint_match =
+                            Some((&api_endpoint_details.route, &api_endpoint_details.method));
+                        orphaned_endpoints.remove(&(
+                            api_endpoint_details.route.clone(),
+                            api_endpoint_details.method.clone(),
+                        ));
                         break;
                     }
                 }
 
                 // Strategy 3: Check if it's a sub-route
-                if call_route.starts_with(&self.strip_params(endpoint_route))
-                    && !endpoint_route.contains(':')
+                if api_call_details
+                    .route
+                    .starts_with(&self.strip_params(&api_endpoint_details.route))
+                    && !api_endpoint_details.route.contains(':')
                 {
-                    endpoint_match = Some((endpoint_route, endpoint_method));
-                    orphaned_endpoints.remove(&(endpoint_route.clone(), endpoint_method.clone()));
+                    endpoint_match =
+                        Some((&api_endpoint_details.route, &api_endpoint_details.method));
+                    orphaned_endpoints.remove(&(
+                        api_endpoint_details.route.clone(),
+                        api_endpoint_details.method.clone(),
+                    ));
                     break;
                 }
             }
@@ -216,17 +271,17 @@ impl Analyzer {
             // Check if we found a match and if methods are compatible
             match endpoint_match {
                 Some((_, endpoint_method)) => {
-                    if call_method != endpoint_method {
+                    if &api_call_details.method != endpoint_method {
                         call_issues.push(format!(
                             "Method mismatch: {} {} is called but endpoint only supports {}",
-                            call_method, call_route, endpoint_method
+                            api_call_details.method, api_call_details.route, endpoint_method
                         ));
                     }
                 }
                 None => {
                     call_issues.push(format!(
                         "Missing endpoint: No endpoint defined for {} {}",
-                        call_method, call_route
+                        api_call_details.method, api_call_details.route
                     ));
                 }
             }
