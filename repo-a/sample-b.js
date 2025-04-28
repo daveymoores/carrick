@@ -6,6 +6,19 @@ export const handleProductGet = (req, res) => {
   ]);
 };
 
+export const handleNewsletterSubscribe = (req, res) => {
+  const { email, preferredFormat, topics } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: "Email is required" });
+  }
+
+  res.json({
+    subscribed: true,
+    message: "Successfully subscribed to newsletter",
+  });
+};
+
 // Function expression export
 export const handleProductPost = function (req, res) {
   res.json({

@@ -2,14 +2,15 @@ use crate::{
     extractor::CoreExtractor,
     visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json},
 };
+use core::fmt;
 use regex::Regex;
-use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
     pub endpoint_issues: Vec<String>,
+    pub mismatches: Vec<String>,
 }
 
 impl ApiIssues {
@@ -22,13 +23,32 @@ impl ApiIssues {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ApiEndpointDetails {
     pub route: String,
     pub method: String,
+    #[allow(dead_code)]
     pub params: Vec<String>,
+    // - For endpoints, `request_body` is what the server expects to receive
+    // - For calls, `request_body` is what the client is sending
+    // - For endpoints, `response_body` is what the server sends back
+    // - For calls, `response_body` is what the client expects to receive
     pub request_body: Option<Json>,
     pub response_body: Option<Json>,
+}
+
+impl fmt::Display for FieldMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FieldMismatch::MissingField(field) => write!(f, "Missing field: {}", field),
+            FieldMismatch::ExtraField(field) => write!(f, "Extra field: {}", field),
+            FieldMismatch::TypeMismatch(path, call_type, endpoint_type) => write!(
+                f,
+                "Type mismatch at {}: call has type {}, endpoint expects type {}",
+                path, call_type, endpoint_type
+            ),
+        }
+    }
 }
 
 pub struct ApiAnalysisResult {
@@ -39,10 +59,18 @@ pub struct ApiAnalysisResult {
 
 #[derive(Default)]
 struct Analyzer {
-    imported_handlers: Vec<(String, String, String)>,
+    // <Route, http_method, handler_name, source>
+    imported_handlers: Vec<(String, String, String, String)>,
     function_definitions: HashMap<String, FunctionDefinition>,
     endpoints: Vec<ApiEndpointDetails>,
     calls: Vec<ApiEndpointDetails>,
+}
+
+#[derive(Debug)]
+pub enum FieldMismatch {
+    MissingField(String),
+    ExtraField(String),
+    TypeMismatch(String, String, String), // (path, call_type, endpoint_type)
 }
 
 impl CoreExtractor for Analyzer {}
@@ -108,26 +136,26 @@ impl Analyzer {
     }
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
-        for (route, method, response) in visitor.endpoints {
+        for (route, method, response, request) in visitor.endpoints {
             let params = self.extract_params_from_route(&route);
             self.endpoints.push(ApiEndpointDetails {
                 route,
                 method,
                 params,
                 response_body: Some(response),
-                request_body: None,
-            })
+                request_body: request, // Now we're using the extracted request body
+            });
         }
 
         // expected_fields being returned data from all CRUD calls
-        for (route, method, expected_fields) in visitor.calls {
+        for (route, method, response, request) in visitor.calls {
             let params = self.extract_params_from_route(&route);
             self.calls.push(ApiEndpointDetails {
                 route,
                 method,
                 params,
-                response_body: None,
-                request_body: None,
+                response_body: Some(response),
+                request_body: request,
             })
         }
 
@@ -159,14 +187,15 @@ impl Analyzer {
                     self.extract_fetch_calls_from_function_expr(expr)
                 }
             };
+
             // Add the discovered calls
-            for (route, method) in fetch_calls {
+            for (route, method, request_body) in fetch_calls {
                 let params = self.extract_params_from_route(&route);
                 new_calls.push(ApiEndpointDetails {
                     route,
                     method,
                     params,
-                    request_body: Some(Json::Null),
+                    request_body,
                     response_body: Some(Json::Null),
                 });
             }
@@ -177,15 +206,18 @@ impl Analyzer {
     }
 
     // This function analyzes the function definitions and returns a HashMap of route fields.
-    pub fn analyze_function_definitions(
+    pub fn resolve_imported_handler_route_fields(
         &self,
-        imported_handlers: &[(String, String, String)],
+        imported_handlers: &[(String, String, String, String)],
         function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> (HashMap<String, Json>, HashMap<String, Json>) {
+    ) -> (
+        HashMap<(String, String), Json>,
+        HashMap<(String, String), Json>,
+    ) {
         let mut response_fields = HashMap::new();
         let mut request_fields = HashMap::new();
 
-        for (route, handler_name, _) in imported_handlers {
+        for (route, method, handler_name, _) in imported_handlers {
             if let Some(func_def) = function_definitions.get(handler_name) {
                 // Extract response fields from the handler function
                 let resp_json = match &func_def.node_type {
@@ -223,15 +255,34 @@ impl Analyzer {
                     }
                 };
 
-                // Store the extracted fields
-                response_fields.insert(route.clone(), resp_json);
+                // Store with composite key
+                response_fields.insert((route.clone(), method.clone()), resp_json);
                 if let Some(req) = req_json {
-                    request_fields.insert(route.clone(), req);
+                    request_fields.insert((route.clone(), method.clone()), req);
                 }
             }
         }
 
         (response_fields, request_fields)
+    }
+
+    // We know endpoints will exist for each imported handler
+    fn update_endpoints_with_resolved_fields(
+        &mut self,
+        response_fields: HashMap<(String, String), Json>,
+        request_fields: HashMap<(String, String), Json>,
+    ) -> &mut Self {
+        for endpoint in &mut self.endpoints {
+            let key = (endpoint.route.clone(), endpoint.method.clone());
+            if let Some(response) = response_fields.get(&key) {
+                endpoint.response_body = Some(response.clone());
+            }
+            if let Some(request) = request_fields.get(&key) {
+                endpoint.request_body = Some(request.clone());
+            }
+        }
+
+        self
     }
 
     pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>) {
@@ -329,8 +380,110 @@ impl Analyzer {
         (call_issues, endpoint_issues)
     }
 
+    pub fn compare_calls_to_endpoints(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        for call in &self.calls {
+            // Find matching endpoint by route and method
+            let endpoint = self.endpoints.iter().find(|ep| {
+                self.normalize_route(&ep.route) == self.normalize_route(&call.route)
+                    && ep.method == call.method
+            });
+
+            if let Some(ep) = endpoint {
+                // Compare request bodies if both exist
+                if let (Some(call_req), Some(ep_req)) = (&call.request_body, &ep.request_body) {
+                    let mismatches = self.compare_json_fields(call_req, ep_req, "");
+                    for mismatch in mismatches {
+                        issues.push(format!(
+                            "Request body mismatch for {} {} -> {}",
+                            call.method, call.route, mismatch
+                        ));
+                    }
+                }
+                // Optionally, compare response bodies
+                // if let (Some(call_resp), Some(ep_resp)) = (&call.response_body, &ep.response_body) {
+                //     let mismatches = compare_json_fields(call_resp, ep_resp, "");
+                //     for mismatch in mismatches {
+                //         issues.push(format!(
+                //             "Response body mismatch for {} {}: {:?}",
+                //             call.method, call.route, mismatch
+                //         ));
+                //     }
+                // }
+            } else {
+                issues.push(format!(
+                    "No matching endpoint for call: {} {}",
+                    call.method, call.route
+                ));
+            }
+        }
+
+        issues
+    }
+
+    pub fn compare_json_fields(
+        &self,
+        call_json: &Json,
+        endpoint_json: &Json,
+        path: &str,
+    ) -> Vec<FieldMismatch> {
+        let mut mismatches = Vec::new();
+
+        match (call_json, endpoint_json) {
+            (Json::Object(call_map), Json::Object(endpoint_map)) => {
+                let call_keys: HashSet<_> = call_map.keys().collect();
+                let endpoint_keys: HashSet<_> = endpoint_map.keys().collect();
+
+                // Fields required by endpoint but missing in call
+                for key in endpoint_keys.difference(&call_keys) {
+                    let field_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{}.{}", path, key)
+                    };
+                    mismatches.push(FieldMismatch::MissingField(field_path));
+                }
+                // Fields present in call but not expected by endpoint
+                for key in call_keys.difference(&endpoint_keys) {
+                    let field_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{}.{}", path, key)
+                    };
+                    mismatches.push(FieldMismatch::ExtraField(field_path));
+                }
+                // Compare common fields recursively
+                for key in call_keys.intersection(&endpoint_keys) {
+                    let sub_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{}.{}", path, key)
+                    };
+                    let sub_mismatches =
+                        self.compare_json_fields(&call_map[*key], &endpoint_map[*key], &sub_path);
+                    mismatches.extend(sub_mismatches);
+                }
+            }
+            (Json::Array(_), Json::Array(_)) => {
+                // You could compare element types here if desired
+            }
+            (a, b) if std::mem::discriminant(a) != std::mem::discriminant(b) => {
+                mismatches.push(FieldMismatch::TypeMismatch(
+                    path.to_string(),
+                    format!("{:?}", a),
+                    format!("{:?}", b),
+                ));
+            }
+            _ => {}
+        }
+
+        mismatches
+    }
+
     pub fn get_results(&self) -> ApiAnalysisResult {
         let (call_issues, endpoint_issues) = self.analyze_matches();
+        let mismatches = self.compare_calls_to_endpoints();
 
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
@@ -338,6 +491,7 @@ impl Analyzer {
             issues: ApiIssues {
                 call_issues,
                 endpoint_issues,
+                mismatches,
             },
         }
     }
@@ -351,27 +505,16 @@ pub fn analyze_api_consistency(visitors: Vec<DependencyVisitor>) -> ApiAnalysisR
     for visitor in visitors {
         analyzer.add_visitor_data(visitor);
     }
+
     // Second pass - analyze function definitions for response fields
-    println!("\n=== Second Pass: Analyzing Function Implementations ===");
-    let (response_fields, request_fields) = analyzer
-        .analyze_function_definitions(&analyzer.imported_handlers, &analyzer.function_definitions);
+    let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
+        &analyzer.imported_handlers,
+        &analyzer.function_definitions,
+    );
 
-    // Print the results of function analysis
-    println!("\nResolved Response Fields for Routes:");
-    for (route, fields) in &response_fields {
-        println!("Route: {} returns: {}", route, json!(fields));
-    }
+    analyzer
+        .update_endpoints_with_resolved_fields(response_fields, request_fields)
+        .analyze_functions_for_fetch_calls();
 
-    println!("\nResolved Request Fields for Routes:");
-    for (route, fields) in &request_fields {
-        println!("Route: {} expects: {}", route, json!(fields));
-    }
-
-    // Third pass - look for fetch calls inside functions
-    println!("\n=== Third Pass: Analyzing Fetch Calls in Functions ===");
-
-    analyzer.analyze_functions_for_fetch_calls();
-
-    // Get and return the final analysis results
     analyzer.get_results()
 }

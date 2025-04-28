@@ -1,5 +1,5 @@
 import express from "express";
-import { handleProductGet } from "./sample-b.js";
+import { handleProductGet, handleNewsletterSubscribe } from "./sample-b.js";
 import { getPost, getFriendLikes } from "./blog-service.js";
 
 const app = express();
@@ -120,18 +120,7 @@ app.post("/events/:eventId/register", (req, res) => {
   });
 });
 
-app.post("/newsletter/subscribe", (req, res) => {
-  const { email, preferredFormat, topics } = req.body;
-
-  if (!email) {
-    return res.status(400).json({ error: "Email is required" });
-  }
-
-  res.json({
-    subscribed: true,
-    message: "Successfully subscribed to newsletter",
-  });
-});
+app.post("/newsletter/subscribe", handleNewsletterSubscribe);
 
 app.post("/payments/process", (req, res) => {
   const { amount, currency, paymentMethod } = req.body;

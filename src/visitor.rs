@@ -28,22 +28,25 @@ pub enum FunctionNodeType {
 
 #[derive(Debug, Clone)]
 pub struct FunctionDefinition {
+    #[allow(dead_code)]
     pub name: String,
+    #[allow(dead_code)]
     pub file_path: PathBuf,
     pub node_type: FunctionNodeType,
-    pub analyzed: bool,
 }
 
 #[derive(Debug)]
 pub struct DependencyVisitor {
-    pub endpoints: Vec<(String, String, Json)>, // (route, method, response fields)
-    pub calls: Vec<(String, String, Json)>,     // (route, method, expected fields)
-    pub current_fn: Option<String>,             // Track current function context
-    pub response_fields: HashMap<String, Json>, // Function name -> expected fields
+    pub endpoints: Vec<(String, String, Json, Option<Json>)>, // (route, method, response fields, request fields)
+    pub calls: Vec<(String, String, Json, Option<Json>)>,     // (route, method, expected fields)
+    pub response_fields: HashMap<String, Json>,               // Function name -> expected fields
+    // Maps function names to their source modules to find functon_definitions in second pass analysis
     pub imported_functions: HashMap<String, String>,
     pub current_file: PathBuf,
-    pub imported_handlers: Vec<(String, String, String)>,
-    // Store function definitions for second pass analysis
+    // <Route, http_method, handler_name, source>
+    pub imported_handlers: Vec<(String, String, String, String)>,
+    // Store local function definitions found in this file, which may be
+    // referenced from other files via imports
     pub function_definitions: HashMap<String, FunctionDefinition>,
 }
 
@@ -52,7 +55,6 @@ impl DependencyVisitor {
         Self {
             endpoints: Vec::new(),
             calls: Vec::new(),
-            current_fn: None,
             response_fields: HashMap::new(),
             imported_functions: HashMap::new(),
             current_file: file_path,
@@ -73,16 +75,21 @@ impl RouteExtractor for DependencyVisitor {
         &self.response_fields
     }
 
-    fn add_imported_handler(&mut self, route: String, handler: String, source: String) {
-        self.imported_handlers.push((route, handler, source));
+    fn add_imported_handler(
+        &mut self,
+        route: String,
+        method: String,
+        handler: String,
+        source: String,
+    ) {
+        self.imported_handlers
+            .push((route, method, handler, source));
     }
 }
 
 impl Visit for DependencyVisitor {
     // Track ES Module exports
     fn visit_export_decl(&mut self, export: &ExportDecl) {
-        println!("Found export declaration");
-
         // Handle different export types
         match &export.decl {
             // For "export const x = ..."
@@ -90,14 +97,11 @@ impl Visit for DependencyVisitor {
                 for decl in &var_decl.decls {
                     if let Pat::Ident(ident) = &decl.name {
                         let exported_name = ident.id.sym.to_string();
-                        println!("  - Exported variable: {}", exported_name);
 
                         // Check what's being exported
                         if let Some(init) = &decl.init {
                             match &**init {
                                 Expr::Arrow(arrow) => {
-                                    println!("    (Arrow function export)");
-
                                     // Store the function definition for later analysis
                                     self.function_definitions.insert(
                                         exported_name.clone(),
@@ -107,19 +111,15 @@ impl Visit for DependencyVisitor {
                                             node_type: FunctionNodeType::ArrowFunction(Box::new(
                                                 arrow.clone(),
                                             )),
-                                            analyzed: false,
                                         },
                                     );
 
                                     // You can still extract fields here if you want
                                     let fields = self.extract_fields_from_arrow(arrow);
-                                    println!("    Response fields: {:?}", fields);
                                     self.response_fields.insert(exported_name.clone(), fields);
                                 }
                                 // Regular function export: export const handler = function() {...}
                                 Expr::Fn(fn_expr) => {
-                                    println!("    (Function expression export)");
-
                                     // Store the function definition for later analysis
                                     self.function_definitions.insert(
                                         exported_name.clone(),
@@ -129,19 +129,15 @@ impl Visit for DependencyVisitor {
                                             node_type: FunctionNodeType::FunctionExpression(
                                                 Box::new(fn_expr.clone()),
                                             ),
-                                            analyzed: false,
                                         },
                                     );
 
                                     // Extract response fields from the function
                                     let fields = self.extract_fields_from_function_expr(fn_expr);
-                                    println!("    Response fields: {:?}", fields);
                                     self.response_fields.insert(exported_name.clone(), fields);
                                 }
-
-                                _ => {
-                                    println!("    (Other export type)");
-                                }
+                                // Other export type
+                                _ => {}
                             }
                         }
                     }
@@ -150,7 +146,6 @@ impl Visit for DependencyVisitor {
             // For "export function x() {...}"
             Decl::Fn(fn_decl) => {
                 let exported_name = fn_decl.ident.sym.to_string();
-                println!("  - Exported function: {}", exported_name);
 
                 self.function_definitions.insert(
                     exported_name.clone(),
@@ -158,7 +153,6 @@ impl Visit for DependencyVisitor {
                         name: exported_name.clone(),
                         file_path: self.current_file.clone(),
                         node_type: FunctionNodeType::FunctionDeclaration(Box::new(fn_decl.clone())),
-                        analyzed: false,
                     },
                 );
 
@@ -173,31 +167,24 @@ impl Visit for DependencyVisitor {
     // Track ES Module imports
     fn visit_import_decl(&mut self, import: &ImportDecl) {
         let source = import.src.value.to_string();
-        println!("Found import from: {}", source);
 
         for specifier in &import.specifiers {
             match specifier {
                 ImportSpecifier::Named(named) => {
                     // Handle named imports: import { func } from './module'
                     let local_name = named.local.sym.to_string();
-                    println!("  - Named import: {}", local_name);
-
                     // Track this imported function
                     self.imported_functions.insert(local_name, source.clone());
                 }
                 ImportSpecifier::Default(default) => {
                     // Handle default imports: import func from './module'
                     let local_name = default.local.sym.to_string();
-                    println!("  - Default import: {}", local_name);
-
                     // Track this imported function
                     self.imported_functions.insert(local_name, source.clone());
                 }
                 ImportSpecifier::Namespace(namespace) => {
                     // Handle namespace imports: import * as mod from './module'
-                    let local_name = namespace.local.sym.to_string();
-                    println!("  - Namespace import: {}", local_name);
-
+                    let _local_name = namespace.local.sym.to_string();
                     // Not tracking these directly as they're not individual functions
                 }
             }
@@ -218,8 +205,15 @@ impl Visit for DependencyVisitor {
                         // Accept common Express variable names
                         if ["app", "router", "route", "apiRouter", "r"].contains(&var_name.as_str())
                         {
-                            if let Some((route, response_fields)) = self.extract_endpoint(call) {
-                                self.endpoints.push((route, http_method, response_fields));
+                            if let Some((route, response_fields, request_fields)) =
+                                self.extract_endpoint(call, &http_method)
+                            {
+                                self.endpoints.push((
+                                    route,
+                                    http_method,
+                                    response_fields,
+                                    request_fields,
+                                ));
                             }
                         }
                     }
@@ -242,86 +236,5 @@ impl DependencyVisitor {
             }
         }
         None
-    }
-
-    // Extract route and handler information from route definitions
-    fn extract_endpoint(&mut self, call: &CallExpr) -> Option<(String, Json)> {
-        // Get the route from the first argument
-        let route = call.args.get(0)?.expr.as_lit()?.as_str()?.value.to_string();
-
-        let mut response_json = Json::Null;
-
-        // Check the second argument (handler)
-        if let Some(second_arg) = call.args.get(1) {
-            match &*second_arg.expr {
-                // Case 1: Inline function handler
-                Expr::Fn(fn_expr) => {
-                    if let Some(body) = &fn_expr.function.body {
-                        for stmt in &body.stmts {
-                            if let Stmt::Expr(expr_stmt) = stmt {
-                                if let Expr::Call(call) = &*expr_stmt.expr {
-                                    if let Some(json) = self.extract_res_json_fields(call) {
-                                        response_json = json;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Case 2: Imported function handler
-                Expr::Ident(ident) => {
-                    let handler_name = ident.sym.to_string();
-
-                    // Check if this handler is an imported function
-                    if let Some(source) = self.imported_functions.get(&handler_name) {
-                        // Track this imported handler usage
-                        self.imported_handlers.push((
-                            route.clone(),
-                            handler_name.clone(),
-                            source.clone(),
-                        ));
-
-                        // Look up response fields from the function definition
-                        if let Some(fields) = self.response_fields.get(&handler_name) {
-                            response_json = fields.clone();
-                        }
-                    }
-                }
-
-                _ => {
-                    // Other handler types (arrow functions, etc.)
-                }
-            }
-        }
-
-        Some((route, response_json))
-    }
-
-    pub fn print_imported_handler_summary(&self) {
-        println!("\nImported Handler Usage:");
-        println!("----------------------");
-        if self.imported_handlers.is_empty() {
-            println!("No routes using imported handlers.");
-            return;
-        }
-
-        for (route, handler, source) in &self.imported_handlers {
-            println!("Route: {} uses handler {} from {}", route, handler, source);
-        }
-    }
-
-    pub fn print_function_definitions(&self) {
-        println!("\nStored Function Definitions:");
-        println!("--------------------------");
-        if self.function_definitions.is_empty() {
-            println!("No function definitions stored.");
-            return;
-        }
-
-        for (name, def) in &self.function_definitions {
-            println!("Function: {} in {}", name, def.file_path.display());
-        }
     }
 }

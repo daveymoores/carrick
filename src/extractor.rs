@@ -216,55 +216,11 @@ pub trait CoreExtractor {
         }
     }
 
-    // Extract route from fetch call
-    fn extract_fetch_route(&self, call: &CallExpr) -> (Option<String>, Option<String>) {
-        let route = match call.args.get(0) {
-            Some(arg) => match &*arg.expr {
-                Expr::Lit(lit) => match lit {
-                    Lit::Str(str_lit) => Some(str_lit.value.to_string()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
-
-        // Extract method from second argument (if it exists)
-        let method = if call.args.len() > 1 {
-            match &*call.args[1].expr {
-                Expr::Object(obj) => {
-                    // Look for { method: 'POST' } pattern
-                    for prop in &obj.props {
-                        if let PropOrSpread::Prop(boxed_prop) = prop {
-                            if let Prop::KeyValue(kv) = &**boxed_prop {
-                                // Check if the key is "method"
-                                if let PropName::Ident(key_ident) = &kv.key {
-                                    if key_ident.sym.to_string() == "method" {
-                                        // Extract the method value
-                                        if let Expr::Lit(lit) = &*kv.value {
-                                            if let Lit::Str(str_lit) = lit {
-                                                return (route, Some(str_lit.value.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None
-                }
-                _ => None,
-            }
-        } else {
-            // No second argument, default to GET
-            Some("GET".to_string())
-        };
-
-        (route, method)
-    }
-
     // Extract fetch calls from an arrow function
-    fn extract_fetch_calls_from_arrow(&self, arrow: &ArrowExpr) -> Vec<(String, String)> {
+    fn extract_fetch_calls_from_arrow(
+        &self,
+        arrow: &ArrowExpr,
+    ) -> Vec<(String, String, Option<Json>)> {
         let mut fetch_calls = Vec::new();
 
         match &*arrow.body {
@@ -284,7 +240,10 @@ pub trait CoreExtractor {
     }
 
     // Extract fetch calls from a function declaration
-    fn extract_fetch_calls_from_function_decl(&self, fn_decl: &FnDecl) -> Vec<(String, String)> {
+    fn extract_fetch_calls_from_function_decl(
+        &self,
+        fn_decl: &FnDecl,
+    ) -> Vec<(String, String, Option<Json>)> {
         let mut fetch_calls = Vec::new();
 
         if let Some(body) = &fn_decl.function.body {
@@ -297,7 +256,10 @@ pub trait CoreExtractor {
     }
 
     // Extract fetch calls from a function expression
-    fn extract_fetch_calls_from_function_expr(&self, fn_expr: &FnExpr) -> Vec<(String, String)> {
+    fn extract_fetch_calls_from_function_expr(
+        &self,
+        fn_expr: &FnExpr,
+    ) -> Vec<(String, String, Option<Json>)> {
         let mut fetch_calls = Vec::new();
 
         if let Some(body) = &fn_expr.function.body {
@@ -309,7 +271,11 @@ pub trait CoreExtractor {
         fetch_calls
     }
 
-    fn extract_fetch_from_stmt(&self, stmt: &Stmt, fetch_calls: &mut Vec<(String, String)>) {
+    fn extract_fetch_from_stmt(
+        &self,
+        stmt: &Stmt,
+        fetch_calls: &mut Vec<(String, String, Option<Json>)>,
+    ) {
         match stmt {
             Stmt::Expr(expr_stmt) => {
                 self.extract_fetch_from_expr(&expr_stmt.expr, fetch_calls);
@@ -366,7 +332,11 @@ pub trait CoreExtractor {
         }
     }
 
-    fn extract_fetch_from_expr(&self, expr: &Expr, fetch_calls: &mut Vec<(String, String)>) {
+    fn extract_fetch_from_expr(
+        &self,
+        expr: &Expr,
+        fetch_calls: &mut Vec<(String, String, Option<Json>)>,
+    ) {
         match expr {
             Expr::Call(call) => {
                 // Check if this is a fetch call
@@ -378,7 +348,11 @@ pub trait CoreExtractor {
                                 let method = self
                                     .extract_method_from_call_args(call)
                                     .unwrap_or_else(|| "GET".to_string());
-                                fetch_calls.push((route, method));
+
+                                // Extract request body if present
+                                let request_body = self.extract_request_body_from_fetch(call);
+
+                                fetch_calls.push((route, method, request_body));
                             }
                         }
                     }
@@ -406,6 +380,68 @@ pub trait CoreExtractor {
             // Add handling for template literals and other expression types
             _ => {}
         }
+    }
+
+    // New function to extract request body from fetch calls
+    fn extract_request_body_from_fetch(&self, call: &CallExpr) -> Option<Json> {
+        // Fetch calls have format: fetch(url, options)
+        if call.args.len() < 2 {
+            return None; // No options object
+        }
+
+        // Get the options object (second argument)
+        match &*call.args[1].expr {
+            Expr::Object(obj) => {
+                // Look for body property in options
+                for prop in &obj.props {
+                    if let PropOrSpread::Prop(boxed_prop) = prop {
+                        if let Prop::KeyValue(kv) = &**boxed_prop {
+                            // Check if the property is "body"
+                            if let PropName::Ident(key_ident) = &kv.key {
+                                if key_ident.sym == "body" {
+                                    // Extract the body value
+                                    match &*kv.value {
+                                        // Handle JSON.stringify(...) case
+                                        Expr::Call(body_call) => {
+                                            if let Callee::Expr(callee_expr) = &body_call.callee {
+                                                if let Expr::Member(member) = &**callee_expr {
+                                                    if let Expr::Ident(obj) = &*member.obj {
+                                                        if obj.sym == "JSON" {
+                                                            if let MemberProp::Ident(method) =
+                                                                &member.prop
+                                                            {
+                                                                if method.sym == "stringify" {
+                                                                    // Get the object being stringified
+                                                                    if let Some(arg) =
+                                                                        body_call.args.get(0)
+                                                                    {
+                                                                        // Convert the argument to Json
+                                                                        return Some(
+                                                                            self.expr_to_json(
+                                                                                &arg.expr,
+                                                                            ),
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Direct object literal case (unlikely but possible)
+                                        _ => return Some(self.expr_to_json(&kv.value)),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        None
     }
 
     // Helper method to extract HTTP method from fetch call arguments
@@ -605,21 +641,59 @@ pub trait CoreExtractor {
 pub trait RouteExtractor: CoreExtractor {
     fn get_imported_functions(&self) -> &HashMap<String, String>;
     fn get_response_fields(&self) -> &HashMap<String, Json>;
-    fn add_imported_handler(&mut self, route: String, handler: String, source: String);
+    fn add_imported_handler(
+        &mut self,
+        route: String,
+        method: String,
+        handler: String,
+        source: String,
+    );
 
-    // Extract route and handler information from route definitions
-    fn extract_endpoint(&mut self, call: &CallExpr) -> Option<(String, Json)> {
+    fn extract_endpoint(
+        &mut self,
+        call: &CallExpr,
+        method: &String,
+    ) -> Option<(String, Json, Option<Json>)> {
+        // Implementation using the existing methods from CoreExtractor
         // Get the route from the first argument
         let route = call.args.get(0)?.expr.as_lit()?.as_str()?.value.to_string();
 
         let mut response_json = Json::Null;
+        let mut request_json = None;
 
         // Check the second argument (handler)
         if let Some(second_arg) = call.args.get(1) {
             match &*second_arg.expr {
-                // Case 1: Inline function handler
+                // Arrow function handler
+                Expr::Arrow(arrow_expr) => {
+                    match &*arrow_expr.body {
+                        BlockStmtOrExpr::BlockStmt(block) => {
+                            // Extract request body fields using existing method
+                            request_json = self.extract_req_body_fields(block);
+
+                            // Extract response fields (using existing logic)
+                            for stmt in &block.stmts {
+                                if let Stmt::Expr(expr_stmt) = stmt {
+                                    if let Expr::Call(call) = &*expr_stmt.expr {
+                                        if let Some(json) = self.extract_res_json_fields(call) {
+                                            response_json = json;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Regular function handler
                 Expr::Fn(fn_expr) => {
                     if let Some(body) = &fn_expr.function.body {
+                        // Extract request body fields using existing method
+                        request_json = self.extract_req_body_fields(body);
+
+                        // Extract response fields (existing logic)
                         for stmt in &body.stmts {
                             if let Stmt::Expr(expr_stmt) = stmt {
                                 if let Expr::Call(call) = &*expr_stmt.expr {
@@ -633,13 +707,16 @@ pub trait RouteExtractor: CoreExtractor {
                     }
                 }
 
+                // Imported handler
                 Expr::Ident(ident) => {
                     let handler_name = ident.sym.to_string();
 
-                    // Use the helper methods instead of direct field access
+                    // Check if this handler is an imported function
                     if let Some(source) = self.get_imported_functions().get(&handler_name) {
+                        // Track this imported handler usage
                         self.add_imported_handler(
                             route.clone(),
+                            method.clone(),
                             handler_name.clone(),
                             source.clone(),
                         );
@@ -650,12 +727,10 @@ pub trait RouteExtractor: CoreExtractor {
                     }
                 }
 
-                _ => {
-                    // Other handler types (arrow functions, etc.)
-                }
+                _ => {}
             }
         }
 
-        Some((route, response_json))
+        Some((route, response_json, request_json))
     }
 }

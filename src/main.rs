@@ -33,39 +33,14 @@ fn main() {
     // Process each file
     let mut visitors = Vec::new();
     for file_path in files {
-        println!("\n>>>>>>>>>>>>><<<<<<<<<<<<<");
         println!("Parsing: {}", file_path.display());
-        println!(">>>>>>>>>>>>><<<<<<<<<<<<<\n");
         if let Some(module) = parse_file(&file_path, &cm, &handler) {
             // Create visitor with file path
             let mut visitor = DependencyVisitor::new(file_path.clone());
             module.visit_with(&mut visitor);
-            visitor.print_imported_handler_summary();
-            visitor.print_function_definitions();
             visitors.push(visitor);
         }
     }
-
-    // Print overall imported handler summary
-    println!("\n=== Overall Imported Handler Summary ===");
-    let total_imported_handlers: usize = visitors.iter().map(|v| v.imported_handlers.len()).sum();
-    println!("Total imported handlers used: {}", total_imported_handlers);
-
-    // You could also gather all imported handlers into one collection
-    let all_imported_handlers: Vec<_> = visitors
-        .iter()
-        .flat_map(|v| v.imported_handlers.clone())
-        .collect();
-
-    println!("\nAll imported handlers:");
-    for (route, handler, source) in &all_imported_handlers {
-        println!("Route: {} uses handler {} from {}", route, handler, source);
-    }
-
-    // Print overall function definitions summary
-    println!("\n=== Overall Function Definitions ===");
-    let total_functions: usize = visitors.iter().map(|v| v.function_definitions.len()).sum();
-    println!("Total function definitions found: {}", total_functions);
 
     // Analyze for inconsistencies
     let result = analyze_api_consistency(visitors);
@@ -85,6 +60,7 @@ fn main() {
         println!("\n⚠️  Found {} API issues:", result.issues.len());
         let call_issues = result.issues.call_issues;
         let endpoint_issues = result.issues.endpoint_issues;
+        let mismatches = result.issues.mismatches;
         let mut issue_number: usize = 0;
 
         for (i, issue) in call_issues.iter().enumerate() {
@@ -93,6 +69,11 @@ fn main() {
         }
 
         for (_, issue) in endpoint_issues.iter().enumerate() {
+            issue_number = issue_number + 1;
+            print!("\n{}. {}", &issue_number, issue);
+        }
+
+        for (_, issue) in mismatches.iter().enumerate() {
             issue_number = issue_number + 1;
             print!("\n{}. {}", &issue_number, issue);
         }
