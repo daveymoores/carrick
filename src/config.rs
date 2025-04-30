@@ -5,12 +5,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
+    #[serde(rename = "internalEnvVars")]
     pub internal_env_vars: HashSet<String>,
     #[serde(default)]
+    #[serde(rename = "internalDomains")]
     pub internal_domains: HashSet<String>,
     #[serde(default)]
+    #[serde(rename = "externalEnvVars")]
     pub external_env_vars: HashSet<String>,
     #[serde(default)]
+    #[serde(rename = "externalDomains")]
     pub external_domains: HashSet<String>,
 }
 
