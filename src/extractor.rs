@@ -491,27 +491,91 @@ pub trait CoreExtractor {
 
             // Template literal
             Expr::Tpl(tpl) => {
-                let mut route = String::new();
-                let mut param_index = 0;
+                // Check if the template starts with an env var (first quasi is empty and has at least one expression)
+                if tpl.quasis[0].raw.is_empty() && tpl.exprs.len() > 0 {
+                    // Check if first expression is process.env.X
+                    if let Expr::Member(member_expr) = &*tpl.exprs[0] {
+                        // Check for nested member expression pattern (process.env.X)
+                        if let Expr::Member(process_env) = &*member_expr.obj {
+                            // Check if obj is "process"
+                            if let Expr::Ident(process) = &*process_env.obj {
+                                if process.sym != *"process" {
+                                    // Not "process", use normal processing
+                                    return self.process_normal_template(tpl);
+                                }
 
-                // Process each part of the template
-                for (i, quasi) in tpl.quasis.iter().enumerate() {
-                    // Add the raw text part
-                    route.push_str(&quasi.raw);
+                                // Check if prop is "env"
+                                match &process_env.prop {
+                                    MemberProp::Ident(env) => {
+                                        if env.sym != *"env" {
+                                            // Not "env", use normal processing
+                                            return self.process_normal_template(tpl);
+                                        }
 
-                    // If there's an expression after this quasi
-                    if i < tpl.exprs.len() {
-                        // Add a parameter placeholder
-                        route.push_str(&format!(":param{}", param_index));
-                        param_index += 1;
+                                        // It's process.env, now extract the variable name
+                                        match &member_expr.prop {
+                                            MemberProp::Ident(var_name) => {
+                                                let env_var = var_name.sym.to_string();
+
+                                                // Build the remainder path from the rest of the template
+                                                let mut path = String::new();
+                                                for i in 1..tpl.quasis.len() {
+                                                    path.push_str(&tpl.quasis[i].raw);
+
+                                                    // Add param placeholders for any remaining expressions
+                                                    if i < tpl.exprs.len() {
+                                                        path.push_str(&format!(":param{}", i - 1));
+                                                    }
+                                                }
+
+                                                // Return special ENV_VAR format
+                                                return Some(format!(
+                                                    "ENV_VAR:{}:{}",
+                                                    env_var, path
+                                                ));
+                                            }
+                                            _ => {
+                                                // Not a simple identifier, use normal processing
+                                                return self.process_normal_template(tpl);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        // Not a simple identifier, use normal processing
+                                        return self.process_normal_template(tpl);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
-                Some(route)
+                // Regular template processing (no env var at the start)
+                self.process_normal_template(tpl)
             }
             // Add other patterns as needed
             _ => None,
         }
+    }
+
+    fn process_normal_template(&self, tpl: &Tpl) -> Option<String> {
+        let mut route = String::new();
+        let mut param_index = 0;
+
+        // Process each part of the template
+        for (i, quasi) in tpl.quasis.iter().enumerate() {
+            // Add the raw text part
+            route.push_str(&quasi.raw);
+
+            // If there's an expression after this quasi
+            if i < tpl.exprs.len() {
+                // Add a parameter placeholder
+                route.push_str(&format!(":param{}", param_index));
+                param_index += 1;
+            }
+        }
+
+        Some(route)
     }
 
     fn extract_req_body_fields(&self, function_body: &BlockStmt) -> Option<Json> {

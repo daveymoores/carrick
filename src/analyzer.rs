@@ -1,4 +1,5 @@
 use crate::{
+    config::Config,
     extractor::CoreExtractor,
     visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json},
 };
@@ -10,6 +11,7 @@ use std::collections::HashSet;
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
     pub endpoint_issues: Vec<String>,
+    pub env_var_calls: Vec<String>,
     pub mismatches: Vec<String>,
 }
 
@@ -64,6 +66,7 @@ struct Analyzer {
     function_definitions: HashMap<String, FunctionDefinition>,
     endpoints: Vec<ApiEndpointDetails>,
     calls: Vec<ApiEndpointDetails>,
+    config: Config,
 }
 
 #[derive(Debug)]
@@ -76,8 +79,11 @@ pub enum FieldMismatch {
 impl CoreExtractor for Analyzer {}
 
 impl Analyzer {
-    pub fn new() -> Self {
-        Default::default()
+    pub fn new(config: Config) -> Self {
+        Analyzer {
+            config,
+            ..Default::default()
+        }
     }
 
     fn normalize_route(&self, route: &str) -> String {
@@ -285,9 +291,10 @@ impl Analyzer {
         self
     }
 
-    pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>) {
+    pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut call_issues = Vec::new();
         let mut endpoint_issues = Vec::new();
+        let mut env_var_calls = Vec::new();
 
         // Initialize with all endpoints as potentially orphaned - use cloned strings for owned values
         let mut orphaned_endpoints: HashSet<(String, String)> = self
@@ -303,6 +310,34 @@ impl Analyzer {
 
         // Check each call against endpoints
         for api_call_details in &self.calls {
+            // Check if this is an env var call
+            if api_call_details.route.starts_with("ENV_VAR:") {
+                let parts: Vec<&str> = api_call_details.route.split(':').collect();
+                if parts.len() >= 3 {
+                    let env_var = parts[1];
+                    let path = parts[2..].join(":");
+
+                    if self.config.is_external_call(&api_call_details.route) {
+                        // This is a known external API call - don't report as an issue
+                        continue;
+                    } else if self.config.is_internal_call(&api_call_details.route) {
+                        // This is a known internal service call
+                        // For internal calls, we might still need to check if the endpoint exists
+                        // but we'd need more context about the service structure
+                        continue;
+                    } else {
+                        // This is an unknown env var
+                        env_var_calls.push(format!(
+                            "Environment variable endpoint: {} ${{process.env.{}}}{}",
+                            api_call_details.method, env_var, path
+                        ));
+                    }
+
+                    // Skip the rest of the loop for env var calls
+                    continue;
+                }
+            }
+
             let normalized_call = self.normalize_route(&api_call_details.route);
             // Try to find a matching endpoint using various strategies
             let mut endpoint_match = None;
@@ -377,7 +412,7 @@ impl Analyzer {
             ));
         }
 
-        (call_issues, endpoint_issues)
+        (call_issues, endpoint_issues, env_var_calls)
     }
 
     pub fn compare_calls_to_endpoints(&self) -> Vec<String> {
@@ -411,11 +446,6 @@ impl Analyzer {
                 //         ));
                 //     }
                 // }
-            } else {
-                issues.push(format!(
-                    "No matching endpoint for call: {} {}",
-                    call.method, call.route
-                ));
             }
         }
 
@@ -482,7 +512,7 @@ impl Analyzer {
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
-        let (call_issues, endpoint_issues) = self.analyze_matches();
+        let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
         let mismatches = self.compare_calls_to_endpoints();
 
         ApiAnalysisResult {
@@ -491,15 +521,19 @@ impl Analyzer {
             issues: ApiIssues {
                 call_issues,
                 endpoint_issues,
+                env_var_calls,
                 mismatches,
             },
         }
     }
 }
 
-pub fn analyze_api_consistency(visitors: Vec<DependencyVisitor>) -> ApiAnalysisResult {
+pub fn analyze_api_consistency(
+    visitors: Vec<DependencyVisitor>,
+    config: Config,
+) -> ApiAnalysisResult {
     // Create and populate our analyzer
-    let mut analyzer = Analyzer::new();
+    let mut analyzer = Analyzer::new(config);
 
     // First pass - collect all data from visitors
     for visitor in visitors {
