@@ -1,4 +1,5 @@
 use crate::{
+    config::Config,
     extractor::CoreExtractor,
     visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json},
 };
@@ -10,6 +11,7 @@ use std::collections::HashSet;
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
     pub endpoint_issues: Vec<String>,
+    pub env_var_calls: Vec<String>,
     pub mismatches: Vec<String>,
 }
 
@@ -64,6 +66,7 @@ struct Analyzer {
     function_definitions: HashMap<String, FunctionDefinition>,
     endpoints: Vec<ApiEndpointDetails>,
     calls: Vec<ApiEndpointDetails>,
+    config: Config,
 }
 
 #[derive(Debug)]
@@ -76,8 +79,11 @@ pub enum FieldMismatch {
 impl CoreExtractor for Analyzer {}
 
 impl Analyzer {
-    pub fn new() -> Self {
-        Default::default()
+    pub fn new(config: Config) -> Self {
+        Analyzer {
+            config,
+            ..Default::default()
+        }
     }
 
     fn normalize_route(&self, route: &str) -> String {
@@ -285,11 +291,12 @@ impl Analyzer {
         self
     }
 
-    pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>) {
+    pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut call_issues = Vec::new();
         let mut endpoint_issues = Vec::new();
+        let mut env_var_calls = Vec::new();
 
-        // Initialize with all endpoints as potentially orphaned - use cloned strings for owned values
+        // Initialize with all endpoints as potentially orphaned
         let mut orphaned_endpoints: HashSet<(String, String)> = self
             .endpoints
             .iter()
@@ -303,52 +310,46 @@ impl Analyzer {
 
         // Check each call against endpoints
         for api_call_details in &self.calls {
-            let normalized_call = self.normalize_route(&api_call_details.route);
-            // Try to find a matching endpoint using various strategies
-            let mut endpoint_match = None;
+            // Process the call based on its type
+            let path_to_match = if api_call_details.route.starts_with("ENV_VAR:") {
+                // Handle environment variable calls
+                let parts: Vec<&str> = api_call_details.route.split(':').collect();
+                if parts.len() < 3 {
+                    // Invalid format, treat as regular call
+                    api_call_details.route.clone()
+                } else {
+                    let env_var = parts[1];
+                    let path = parts[2..].join(":");
 
-            for api_endpoint_details in &self.endpoints {
-                // Strategy 1: Direct match after normalization
-                let normalized_endpoint = self.normalize_route(&api_endpoint_details.route);
-                if normalized_call == normalized_endpoint {
-                    endpoint_match =
-                        Some((&api_endpoint_details.route, &api_endpoint_details.method));
-                    orphaned_endpoints.remove(&(
-                        api_endpoint_details.route.clone(),
-                        api_endpoint_details.method.clone(),
-                    ));
-                    break;
-                }
-
-                // Strategy 2: Parameter-aware regex matching
-                if api_endpoint_details.route.contains(':') {
-                    let regex = self.route_to_regex(&api_endpoint_details.route);
-                    if regex.is_match(&api_call_details.route) {
-                        endpoint_match =
-                            Some((&api_endpoint_details.route, &api_endpoint_details.method));
-                        orphaned_endpoints.remove(&(
-                            api_endpoint_details.route.clone(),
-                            api_endpoint_details.method.clone(),
+                    // Check the type of env var call
+                    if self.config.is_external_call(&api_call_details.route) {
+                        // Skip external API calls entirely
+                        continue;
+                    } else if self.config.is_internal_call(&api_call_details.route) {
+                        // For internal calls, use the path portion for matching
+                        path
+                    } else {
+                        // This is an unknown env var
+                        env_var_calls.push(format!(
+                            "Environment variable endpoint: {} ${{process.env.{}}}{}",
+                            api_call_details.method, env_var, path
                         ));
-                        break;
+                        // Skip further processing
+                        continue;
                     }
                 }
+            } else {
+                // Regular call - use the full route
+                api_call_details.route.clone()
+            };
 
-                // Strategy 3: Check if it's a sub-route
-                if api_call_details
-                    .route
-                    .starts_with(&self.strip_params(&api_endpoint_details.route))
-                    && !api_endpoint_details.route.contains(':')
-                {
-                    endpoint_match =
-                        Some((&api_endpoint_details.route, &api_endpoint_details.method));
-                    orphaned_endpoints.remove(&(
-                        api_endpoint_details.route.clone(),
-                        api_endpoint_details.method.clone(),
-                    ));
-                    break;
-                }
-            }
+            // Try to find a matching endpoint using the determined path
+            let endpoint_match = self.find_matching_endpoint(
+                &path_to_match,
+                &api_call_details.method,
+                &self.endpoints,
+                &mut orphaned_endpoints,
+            );
 
             // Check if we found a match and if methods are compatible
             match endpoint_match {
@@ -377,7 +378,87 @@ impl Analyzer {
             ));
         }
 
-        (call_issues, endpoint_issues)
+        (call_issues, endpoint_issues, env_var_calls)
+    }
+
+    // Helper method to find a matching endpoint using our various matching strategies
+    fn find_matching_endpoint<'a>(
+        &self,
+        route: &str,
+        method: &str,
+        endpoints: &'a [ApiEndpointDetails],
+        orphaned_endpoints: &mut HashSet<(String, String)>,
+    ) -> Option<(&'a String, &'a String)> {
+        let normalized_call = self.normalize_route(route);
+
+        // First try to find an exact match with both route and method
+        for api_endpoint_details in endpoints {
+            // Only consider endpoints with matching methods for first-pass matching
+            if api_endpoint_details.method != method {
+                continue;
+            }
+
+            // Strategy 1: Direct match after normalization
+            let normalized_endpoint = self.normalize_route(&api_endpoint_details.route);
+            if normalized_call == normalized_endpoint {
+                orphaned_endpoints.remove(&(
+                    api_endpoint_details.route.clone(),
+                    api_endpoint_details.method.clone(),
+                ));
+                return Some((&api_endpoint_details.route, &api_endpoint_details.method));
+            }
+
+            // Strategy 2: Parameter-aware regex matching
+            if api_endpoint_details.route.contains(':') {
+                let regex = self.route_to_regex(&api_endpoint_details.route);
+                if regex.is_match(route) {
+                    orphaned_endpoints.remove(&(
+                        api_endpoint_details.route.clone(),
+                        api_endpoint_details.method.clone(),
+                    ));
+                    return Some((&api_endpoint_details.route, &api_endpoint_details.method));
+                }
+            }
+
+            // Strategy 3: Check if it's a sub-route
+            if route.starts_with(&self.strip_params(&api_endpoint_details.route))
+                && !api_endpoint_details.route.contains(':')
+            {
+                orphaned_endpoints.remove(&(
+                    api_endpoint_details.route.clone(),
+                    api_endpoint_details.method.clone(),
+                ));
+                return Some((&api_endpoint_details.route, &api_endpoint_details.method));
+            }
+        }
+
+        // If no exact method match was found, look for a route match with any method
+        // This is useful for reporting method mismatches rather than missing endpoints
+        for api_endpoint_details in endpoints {
+            // Strategy 1: Direct match after normalization
+            let normalized_endpoint = self.normalize_route(&api_endpoint_details.route);
+            if normalized_call == normalized_endpoint {
+                orphaned_endpoints.remove(&(
+                    api_endpoint_details.route.clone(),
+                    api_endpoint_details.method.clone(),
+                ));
+                return Some((&api_endpoint_details.route, &api_endpoint_details.method));
+            }
+
+            // Strategy 2: Parameter-aware regex matching
+            if api_endpoint_details.route.contains(':') {
+                let regex = self.route_to_regex(&api_endpoint_details.route);
+                if regex.is_match(route) {
+                    orphaned_endpoints.remove(&(
+                        api_endpoint_details.route.clone(),
+                        api_endpoint_details.method.clone(),
+                    ));
+                    return Some((&api_endpoint_details.route, &api_endpoint_details.method));
+                }
+            }
+        }
+
+        None
     }
 
     pub fn compare_calls_to_endpoints(&self) -> Vec<String> {
@@ -411,11 +492,6 @@ impl Analyzer {
                 //         ));
                 //     }
                 // }
-            } else {
-                issues.push(format!(
-                    "No matching endpoint for call: {} {}",
-                    call.method, call.route
-                ));
             }
         }
 
@@ -482,7 +558,7 @@ impl Analyzer {
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
-        let (call_issues, endpoint_issues) = self.analyze_matches();
+        let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
         let mismatches = self.compare_calls_to_endpoints();
 
         ApiAnalysisResult {
@@ -491,15 +567,19 @@ impl Analyzer {
             issues: ApiIssues {
                 call_issues,
                 endpoint_issues,
+                env_var_calls,
                 mismatches,
             },
         }
     }
 }
 
-pub fn analyze_api_consistency(visitors: Vec<DependencyVisitor>) -> ApiAnalysisResult {
+pub fn analyze_api_consistency(
+    visitors: Vec<DependencyVisitor>,
+    config: Config,
+) -> ApiAnalysisResult {
     // Create and populate our analyzer
-    let mut analyzer = Analyzer::new();
+    let mut analyzer = Analyzer::new(config);
 
     // First pass - collect all data from visitors
     for visitor in visitors {
