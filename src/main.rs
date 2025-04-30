@@ -3,6 +3,7 @@ mod config;
 mod extractor;
 mod file_finder;
 mod parser;
+mod router_context;
 mod visitor;
 use analyzer::analyze_api_consistency;
 use config::Config;

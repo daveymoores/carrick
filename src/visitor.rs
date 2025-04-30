@@ -1,12 +1,18 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use serde::Serialize;
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::extractor::{CoreExtractor, RouteExtractor};
+use crate::{
+    extractor::{CoreExtractor, RouteExtractor},
+    router_context::RouterContext,
+};
 extern crate regex;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -48,6 +54,9 @@ pub struct DependencyVisitor {
     // Store local function definitions found in this file, which may be
     // referenced from other files via imports
     pub function_definitions: HashMap<String, FunctionDefinition>,
+    pub router_imports: HashSet<String>,
+    pub routers: HashMap<String, RouterContext>,
+    pub has_express_import: bool,
 }
 
 impl DependencyVisitor {
@@ -60,6 +69,9 @@ impl DependencyVisitor {
             current_file: file_path,
             imported_handlers: Vec::new(),
             function_definitions: HashMap::new(),
+            router_imports: HashSet::new(),
+            routers: HashMap::new(),
+            has_express_import: false,
         }
     }
 }
@@ -168,6 +180,19 @@ impl Visit for DependencyVisitor {
     fn visit_import_decl(&mut self, import: &ImportDecl) {
         let source = import.src.value.to_string();
 
+        // Check if the import is from 'express'
+        if source == "express" {
+            self.has_express_import = true;
+
+            // Check for named imports like { Router } or { Router as MyRouter }
+            for specifier in &import.specifiers {
+                if let ImportSpecifier::Named(named) = specifier {
+                    let local_name = named.local.sym.to_string(); // The name used in the file
+                    self.router_imports.insert(local_name); // Track the imported name
+                }
+            }
+        }
+
         for specifier in &import.specifiers {
             match specifier {
                 ImportSpecifier::Named(named) => {
@@ -191,35 +216,95 @@ impl Visit for DependencyVisitor {
         }
     }
 
+    fn visit_var_decl(&mut self, var_decl: &VarDecl) {
+        for decl in &var_decl.decls {
+            if let Some(init) = &decl.init {
+                // Check if the initializer is a call expression (e.g., Router() or express.Router())
+                if let Expr::Call(call_expr) = &**init {
+                    // Check if this is a router creation
+                    if self.is_router_creation(call_expr) {
+                        // Get the variable name being declared
+                        if let Pat::Ident(ident) = &decl.name {
+                            let router_name = ident.id.sym.to_string();
+
+                            // Add the router to the `routers` map with an initial context
+                            self.routers.insert(
+                                router_name.clone(),
+                                RouterContext {
+                                    prefix: "".to_string(), // No prefix yet
+                                    parent: None,           // No parent yet
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn visit_call_expr(&mut self, call: &CallExpr) {
         // Check the callee (what's being called)
         if let Callee::Expr(callee_expr) = &call.callee {
             if let Expr::Member(member) = &**callee_expr {
                 // Check if the method is a valid HTTP method (GET, POST, etc.)
                 if let Some(http_method) = self.is_express_route_method(member) {
-                    // Check if it looks like an Express app or router
-                    // This is still simple but better than checking just for "app"
+                    // Check if the object is a known router or app
                     if let Expr::Ident(obj_ident) = &*member.obj {
                         let var_name = obj_ident.sym.to_string();
 
-                        // Accept common Express variable names
-                        if ["app", "router", "route", "apiRouter", "r"].contains(&var_name.as_str())
-                        {
-                            if let Some((route, response_fields, request_fields)) =
-                                self.extract_endpoint(call, &http_method)
-                            {
+                        // Extract endpoint data first (immutable borrow)
+                        let endpoint_data = self.extract_endpoint(call, &http_method);
+
+                        // Handle routes defined on routers
+                        if let Some(router_ctx) = self.routers.get(&var_name) {
+                            if let Some((route, response_fields, request_fields)) = endpoint_data {
+                                // Resolve the full path using the router context
+                                let full_path = router_ctx.resolve_full_path(&route);
+
+                                // Now modify self (mutable borrow)
                                 self.endpoints.push((
-                                    route,
-                                    http_method,
+                                    full_path.clone(),
+                                    http_method.clone(),
                                     response_fields,
                                     request_fields,
                                 ));
+
+                                println!(
+                                    "Detected router endpoint: {} {}",
+                                    &http_method, &full_path
+                                );
+                            }
+                        }
+                        // Handle routes defined on the main app instance
+                        else if var_name == "app" {
+                            if let Some((route, response_fields, request_fields)) = endpoint_data {
+                                // Now modify self (mutable borrow)
+                                self.endpoints.push((
+                                    route.clone(),
+                                    http_method.clone(),
+                                    response_fields,
+                                    request_fields,
+                                ));
+
+                                println!("Detected app endpoint: {} {}", &http_method, &route);
                             }
                         }
                     }
                 }
+
+                // Check for router.use() to handle nested routers
+                if self.is_router_use_method(member) {
+                    if let Expr::Ident(obj_ident) = &*member.obj {
+                        let parent_router_name = obj_ident.sym.to_string();
+
+                        // Process router.use('/prefix', childRouter)
+                        self.process_router_use(parent_router_name, &call.args);
+                    }
+                }
             }
         }
+
+        // Continue visiting children
         call.visit_children_with(self);
     }
 }
@@ -236,5 +321,90 @@ impl DependencyVisitor {
             }
         }
         None
+    }
+
+    fn is_router_creation(&self, call_expr: &CallExpr) -> bool {
+        match &call_expr.callee {
+            // Check for express.Router()
+            Callee::Expr(expr) => {
+                if let Expr::Member(member) = &**expr {
+                    if let (Expr::Ident(obj), MemberProp::Ident(prop)) =
+                        (&*member.obj, &member.prop)
+                    {
+                        if obj.sym == *"express" && prop.sym == *"Router" {
+                            return true; // Detected express.Router()
+                        }
+                    }
+                }
+
+                // Check for Router() after import { Router } from 'express'
+                if let Expr::Ident(callee) = &**expr {
+                    if self.router_imports.contains(&callee.sym.to_string()) {
+                        return true; // Detected Router()
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        false
+    }
+
+    fn is_router_use_method(&self, member: &MemberExpr) -> bool {
+        if let MemberProp::Ident(method_ident) = &member.prop {
+            if method_ident.sym == *"use" {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn extract_string_from_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
+            Expr::Tpl(tpl) if tpl.exprs.is_empty() => {
+                // Handle simple template literals with no expressions
+                Some(tpl.quasis.iter().map(|q| q.raw.to_string()).collect())
+            }
+            _ => None,
+        }
+    }
+
+    fn process_router_use(&mut self, parent_router_name: String, args: &[ExprOrSpread]) {
+        // Determine if the first argument is a path or a middleware/router
+        let (path_prefix, router_arg_idx) = if args.len() >= 2 {
+            if let Some(path) = self.extract_string_from_expr(&args[0].expr) {
+                (path, 1) // First arg is path, second is router
+            } else {
+                ("".to_string(), 0) // First arg is middleware or router
+            }
+        } else if args.len() == 1 {
+            ("".to_string(), 0) // Only one arg, must be middleware or router
+        } else {
+            return; // Not enough arguments
+        };
+
+        // Check if the argument at router_arg_idx is a router reference
+        if let Expr::Ident(router_ident) = &*args[router_arg_idx].expr {
+            let child_router_name = router_ident.sym.to_string();
+
+            // Extract the parent context (immutable borrow)
+            let parent_context = self.routers.get(&parent_router_name).cloned();
+
+            // Remove the child router from the HashMap temporarily (mutable borrow)
+            if let Some(mut child_ctx) = self.routers.remove(&child_router_name) {
+                // Update the child router's context
+                child_ctx.prefix = path_prefix.clone();
+                child_ctx.parent = parent_context.map(Box::new);
+
+                // Insert the updated child router back into the HashMap
+                self.routers.insert(child_router_name.clone(), child_ctx);
+
+                println!(
+                    "Updated router context: {} -> prefix: {}, parent: {}",
+                    child_router_name, path_prefix, parent_router_name
+                );
+            }
+        }
     }
 }
