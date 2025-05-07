@@ -716,7 +716,7 @@ pub trait RouteExtractor: CoreExtractor {
     fn extract_endpoint(
         &mut self,
         call: &CallExpr,
-        method: &String,
+        method: &str,
     ) -> Option<(String, Json, Option<Json>)> {
         // Implementation using the existing methods from CoreExtractor
         // Get the route from the first argument
@@ -780,7 +780,7 @@ pub trait RouteExtractor: CoreExtractor {
                         // Track this imported handler usage
                         self.add_imported_handler(
                             route.clone(),
-                            method.clone(),
+                            method.to_string(),
                             handler_name.clone(),
                             source.clone(),
                         );
