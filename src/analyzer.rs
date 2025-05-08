@@ -142,26 +142,26 @@ impl Analyzer {
     }
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
-        for (route, method, response, request) in visitor.endpoints {
-            let params = self.extract_params_from_route(&route);
+        for endpoint in visitor.endpoints {
+            let params = self.extract_params_from_route(&endpoint.route);
             self.endpoints.push(ApiEndpointDetails {
-                route,
-                method,
+                route: endpoint.route.to_string(),
+                method: endpoint.method.to_string(),
                 params,
-                response_body: Some(response),
-                request_body: request, // Now we're using the extracted request body
+                response_body: Some(endpoint.response),
+                request_body: endpoint.request,
             });
         }
 
         // expected_fields being returned data from all CRUD calls
-        for (route, method, response, request) in visitor.calls {
-            let params = self.extract_params_from_route(&route);
+        for call in visitor.calls {
+            let params = self.extract_params_from_route(&call.route);
             self.calls.push(ApiEndpointDetails {
-                route,
-                method,
+                route: call.route.to_string(),
+                method: call.method.to_string(),
                 params,
-                response_body: Some(response),
-                request_body: request,
+                response_body: Some(call.response),
+                request_body: call.request,
             })
         }
 
