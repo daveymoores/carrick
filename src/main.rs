@@ -60,6 +60,7 @@ fn main() {
             if let Some(module) = parse_file(&file_path, &cm, &handler) {
                 let mut visitor = DependencyVisitor::new(file_path.clone());
                 module.visit_with(&mut visitor);
+                visitor.resolve_all_endpoint_paths();
                 visitors.push(visitor);
             }
         }

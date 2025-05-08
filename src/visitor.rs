@@ -14,6 +14,7 @@ use crate::{
     app_context::AppContext,
     extractor::{CoreExtractor, RouteExtractor},
     router_context::RouterContext,
+    utils::join_path_segments,
 };
 extern crate regex;
 
@@ -43,11 +44,42 @@ pub struct FunctionDefinition {
     pub node_type: FunctionNodeType,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnerType {
+    App(String),
+    Router(String),
+}
+
+#[derive(Debug)]
+pub struct Mount {
+    pub parent: OwnerType, // App or Router doing the .use
+    pub child: OwnerType,  // Router being mounted
+    pub prefix: String,    // Path prefix for this mount
+}
+
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    pub owner: OwnerType,
+    pub route: String,
+    pub method: String,
+    pub response: Json,
+    pub request: Option<Json>,
+}
+
+#[derive(Debug)]
+pub struct Call {
+    pub route: String,
+    pub method: String,
+    pub response: Json,
+    pub request: Option<Json>,
+}
+
 #[derive(Debug)]
 pub struct DependencyVisitor {
-    pub endpoints: Vec<(String, String, Json, Option<Json>)>, // (route, method, response fields, request fields)
-    pub calls: Vec<(String, String, Json, Option<Json>)>,     // (route, method, expected fields)
-    pub response_fields: HashMap<String, Json>,               // Function name -> expected fields
+    pub endpoints: Vec<Endpoint>, // (route, method, response fields, request fields)
+    pub calls: Vec<Call>,         // (route, method, expected fields)
+    pub mounts: Vec<Mount>,
+    pub response_fields: HashMap<String, Json>, // Function name -> expected fields
     // Maps function names to their source modules to find functon_definitions in second pass analysis
     pub imported_functions: HashMap<String, String>,
     pub current_file: PathBuf,
@@ -63,7 +95,6 @@ pub struct DependencyVisitor {
     pub express_apps: HashMap<String, AppContext>, // app_name -> AppContext
     // Track routers with their full context
     pub routers: HashMap<String, RouterContext>, // router_name -> RouterContext
-    pub endpoint_owners: HashMap<(String, String), String>, // (path, method) -> owner_name
 }
 
 impl DependencyVisitor {
@@ -71,6 +102,7 @@ impl DependencyVisitor {
         Self {
             endpoints: Vec::new(),
             calls: Vec::new(),
+            mounts: Vec::new(),
             response_fields: HashMap::new(),
             imported_functions: HashMap::new(),
             current_file: file_path,
@@ -81,7 +113,6 @@ impl DependencyVisitor {
             express_import_name: None,
             express_apps: HashMap::new(),
             has_express_import: false,
-            endpoint_owners: HashMap::new(),
         }
     }
 }
@@ -256,9 +287,6 @@ impl Visit for DependencyVisitor {
                                 var_name.clone(),
                                 RouterContext {
                                     name: var_name.clone(),
-                                    prefix: "".to_string(),
-                                    parent_app: None,
-                                    parent_router: None,
                                 },
                             );
 
@@ -272,8 +300,6 @@ impl Visit for DependencyVisitor {
                                     var_name.clone(),
                                     AppContext {
                                         name: var_name.clone(),
-                                        mount_path: "".to_string(),
-                                        parent_app: None,
                                     },
                                 );
 
@@ -411,34 +437,12 @@ impl DependencyVisitor {
                 let target_name = target_ident.sym.to_string();
 
                 println!("App use: {}({}) -> {}", app_name, path_prefix, target_name);
-
-                // Get the parent app context
-                let parent_app = self.express_apps.get(app_name).cloned().map(Box::new);
-
-                // Check if we're mounting another app
-                if let Some(mounted_app) = self.express_apps.get_mut(&target_name) {
-                    // Update the mounted app's context
-                    mounted_app.mount_path = path_prefix;
-                    mounted_app.parent_app = parent_app;
-                    self.update_endpoints_for_owner(&target_name);
-
-                    println!(
-                        "Updated app context: {} with parent: {}",
-                        target_name, app_name
-                    );
-                }
-                // Check if we're mounting a router
-                else if let Some(router) = self.routers.get_mut(&target_name) {
-                    // Update router's context
-                    router.prefix = path_prefix;
-                    router.parent_app = parent_app;
-                    self.update_endpoints_for_owner(&target_name);
-
-                    println!(
-                        "Updated router: {} mounted on app: {}",
-                        target_name, app_name
-                    );
-                }
+                // Save Mount to track Router relationship to App via Route
+                self.mounts.push(Mount {
+                    parent: OwnerType::App(app_name.to_string()),
+                    child: OwnerType::Router(target_name),
+                    prefix: path_prefix,
+                });
             }
         }
     }
@@ -477,96 +481,34 @@ impl DependencyVisitor {
                     parent_router_name, path_prefix, target_name
                 );
 
-                // First, get and clone the parent router (without boxing yet)
-                if let Some(parent_router) = self.routers.get(parent_router_name).cloned() {
-                    // Get any parent app from the parent router
-                    let parent_app = parent_router.parent_app.clone();
-
-                    // Now box the parent router for the parent_router field
-                    let boxed_parent = Some(Box::new(parent_router));
-
-                    // Check if we're mounting a router
-                    if let Some(mounted_router) = self.routers.get_mut(&target_name) {
-                        // Update the mounted router's context
-                        mounted_router.prefix = path_prefix;
-                        mounted_router.parent_router = boxed_parent;
-
-                        // Set parent app if available
-                        if parent_app.is_some() {
-                            mounted_router.parent_app = parent_app;
-                        }
-
-                        self.update_endpoints_for_owner(&target_name);
-
-                        println!(
-                            "Updated router: {} with parent router: {}",
-                            target_name, parent_router_name
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn update_endpoints_for_owner(&mut self, owner_name: &str) {
-        // Find all endpoints owned by this router/app
-        let mut endpoints_to_update = Vec::new();
-
-        for ((old_path, method), owner) in &self.endpoint_owners {
-            if owner == owner_name {
-                endpoints_to_update.push((old_path.clone(), method.clone()));
-            }
-        }
-
-        // Update each endpoint with the new full path
-        for (old_path, method) in endpoints_to_update {
-            // Find the endpoint in our endpoints vector
-            let position = self
-                .endpoints
-                .iter()
-                .position(|(path, m, _, _)| path == &old_path && m == &method);
-
-            if let Some(pos) = position {
-                let (_, method, response, request) = self.endpoints[pos].clone();
-
-                // Resolve the full path using the updated router/app context
-                let new_full_path = if let Some(router) = self.routers.get(owner_name) {
-                    router.resolve_full_path(&old_path)
-                } else if let Some(app) = self.express_apps.get(owner_name) {
-                    app.resolve_full_path(&old_path)
-                } else {
-                    old_path.clone()
-                };
-
-                // Update the endpoint
-                self.endpoints[pos] = (new_full_path.clone(), method.clone(), response, request);
-
-                // Update the ownership tracker to use the new path
-                self.endpoint_owners.remove(&(old_path, method.clone()));
-                self.endpoint_owners
-                    .insert((new_full_path.clone(), method), owner_name.to_string());
+                // Save Mount to track Router relationship to App via Route
+                self.mounts.push(Mount {
+                    parent: OwnerType::Router(parent_router_name.to_string()),
+                    child: OwnerType::Router(target_name),
+                    prefix: path_prefix,
+                });
             }
         }
     }
 
     // Process route handlers on routers
     fn process_route_handler(&mut self, var_name: &str, http_method: &str, call: &CallExpr) {
+        // find whether this is an app or router
+        let owner = match self.express_apps.get(var_name) {
+            Some(_) => OwnerType::App(var_name.to_string()),
+            None => OwnerType::Router(var_name.to_string()),
+        };
         if let Some(endpoint_data) = self.extract_endpoint(call, http_method) {
             let (route, response_fields, request_fields) = endpoint_data;
 
             // Store the endpoint with its initial path
-            self.endpoints.push((
-                route.clone(),
-                http_method.to_string(),
-                response_fields.clone(),
-                request_fields.clone(),
-            ));
-
-            // Record ownership
-            self.endpoint_owners.insert(
-                (route.clone(), http_method.to_string()),
-                var_name.to_string(),
-            );
+            self.endpoints.push(Endpoint {
+                owner,
+                route: route.clone(),
+                method: http_method.to_string(),
+                response: response_fields.clone(),
+                request: request_fields.clone(),
+            });
 
             println!(
                 "Detected endpoint: {} {} on {}",
@@ -588,5 +530,60 @@ impl DependencyVisitor {
             _ => {}
         }
         false
+    }
+
+    pub fn compute_full_paths_for_endpoint(
+        &self,
+        endpoint: &Endpoint,
+        mounts: &[Mount],
+        apps: &HashMap<String, AppContext>,
+    ) -> Vec<String> {
+        let mut results = Vec::new();
+
+        // For each app, try to find all mounting chains to endpoint.owner
+        for app_name in apps.keys() {
+            let app_owner = OwnerType::App(app_name.clone());
+            let mut stack = Vec::new();
+            let mut visited = Vec::new();
+            // Each stack entry: (current_owner, prefixes_so_far)
+            stack.push((app_owner.clone(), Vec::<String>::new()));
+
+            while let Some((current, mut prefixes)) = stack.pop() {
+                if &current == &endpoint.owner {
+                    // Found a chain! Build the full path
+                    prefixes.push(endpoint.route.clone());
+                    let path_refs: Vec<&str> = prefixes.iter().map(|s| s.as_str()).collect();
+                    results.push(join_path_segments(&path_refs));
+                    continue;
+                }
+                // Prevent cycles (shouldn't happen in Express, but just in case)
+                if visited.contains(&current) {
+                    continue;
+                }
+                visited.push(current.clone());
+
+                // For each mount where parent == current, follow to child
+                for mount in mounts.iter().filter(|m| m.parent == current) {
+                    let mut new_prefixes = prefixes.clone();
+                    new_prefixes.push(mount.prefix.clone());
+                    stack.push((mount.child.clone(), new_prefixes));
+                }
+            }
+        }
+        results
+    }
+
+    pub fn resolve_all_endpoint_paths(&mut self) {
+        let mut new_endpoints = Vec::new();
+        for endpoint in &self.endpoints {
+            let full_paths =
+                self.compute_full_paths_for_endpoint(endpoint, &self.mounts, &self.express_apps);
+            for path in full_paths {
+                let mut ep = endpoint.clone();
+                ep.route = path;
+                new_endpoints.push(ep);
+            }
+        }
+        self.endpoints = new_endpoints;
     }
 }
