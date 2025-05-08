@@ -9,6 +9,7 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn resolve_full_path(&self, path: &str) -> String {
+        println!("app resolve_full_path {:?}", self);
         let mut path_segments = Vec::new();
 
         // Add the specific endpoint path
@@ -29,7 +30,7 @@ impl AppContext {
             }
             current_app = app.parent_app.as_deref();
         }
-
+        println!("AppContext --> {:?}", path_segments);
         join_path_segments(path_segments)
     }
 }

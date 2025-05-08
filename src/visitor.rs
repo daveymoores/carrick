@@ -414,9 +414,9 @@ impl DependencyVisitor {
 
                 // Get the parent app context
                 let parent_app = self.express_apps.get(app_name).cloned().map(Box::new);
-
                 // Check if we're mounting another app
                 if let Some(mounted_app) = self.express_apps.get_mut(&target_name) {
+                    println!("mounted_app ---> {:?}", parent_app);
                     // Update the mounted app's context
                     mounted_app.mount_path = path_prefix;
                     mounted_app.parent_app = parent_app;
@@ -429,6 +429,7 @@ impl DependencyVisitor {
                 }
                 // Check if we're mounting a router
                 else if let Some(router) = self.routers.get_mut(&target_name) {
+                    println!("path_prefix --> {:?}", path_prefix);
                     // Update router's context
                     router.prefix = path_prefix;
                     router.parent_app = parent_app;
@@ -538,6 +539,10 @@ impl DependencyVisitor {
                     old_path.clone()
                 };
 
+                println!(
+                    "update_endpoints_for_owner --> {:?} {:?}",
+                    new_full_path, owner_name
+                );
                 // Update the endpoint
                 self.endpoints[pos] = (new_full_path.clone(), method.clone(), response, request);
 

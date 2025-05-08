@@ -1,7 +1,4 @@
-pub fn join_path_segments(mut segments: Vec<String>) -> String {
-    // Reverse the segments to get them in order from root to leaf
-    segments.reverse();
-
+pub fn join_path_segments(segments: Vec<String>) -> String {
     // Join all segments, ensuring correct handling of slashes
     let mut result = String::new();
     for segment in segments {

@@ -11,6 +11,7 @@ pub struct RouterContext {
 
 impl RouterContext {
     pub fn resolve_full_path(&self, path: &str) -> String {
+        println!("router resolve_full_path {:?}", self);
         let mut path_segments = Vec::new();
 
         // First, add the specific endpoint path
@@ -35,7 +36,7 @@ impl RouterContext {
         // Add parent app paths if this router is mounted on an app
         if let Some(app) = self.parent_app.as_deref() {
             let app_path = app.resolve_full_path("");
-            if !app_path.is_empty() && app_path != "/" {
+            if !app_path.is_empty() {
                 path_segments.insert(0, app_path);
             }
         }
