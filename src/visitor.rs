@@ -76,6 +76,7 @@ pub struct Call {
 
 #[derive(Debug)]
 pub struct DependencyVisitor {
+    pub repo_prefix: String,
     pub endpoints: Vec<Endpoint>, // (route, method, response fields, request fields)
     pub calls: Vec<Call>,         // (route, method, expected fields)
     pub mounts: Vec<Mount>,
@@ -98,8 +99,9 @@ pub struct DependencyVisitor {
 }
 
 impl DependencyVisitor {
-    pub fn new(file_path: PathBuf) -> Self {
+    pub fn new(file_path: PathBuf, repo_prefix: &str) -> Self {
         Self {
+            repo_prefix: repo_prefix.to_owned(),
             endpoints: Vec::new(),
             calls: Vec::new(),
             mounts: Vec::new(),
@@ -278,15 +280,16 @@ impl Visit for DependencyVisitor {
                 // Check if the initializer is a call expression
                 if let Expr::Call(call_expr) = &**init {
                     if let Pat::Ident(ident) = &decl.name {
-                        let var_name = ident.id.sym.to_string().clone();
+                        let var_name = ident.id.sym.as_str();
+                        let prefixed_var_name = self.prefix_owner_type(var_name);
 
                         // Check if this is a router creation
                         if self.is_router_creation(call_expr) {
                             // Add the router to the `routers` map with an initial context
                             self.routers.insert(
-                                var_name.clone(),
+                                prefixed_var_name.clone(),
                                 RouterContext {
-                                    name: var_name.clone(),
+                                    name: prefixed_var_name.clone(),
                                 },
                             );
 
@@ -295,11 +298,12 @@ impl Visit for DependencyVisitor {
                         // Check if this is an express app creation
                         else if let Some(express_name) = &self.express_import_name {
                             if self.is_express_app_creation(call_expr, express_name) {
+                                let express_app_name = self.prefix_owner_type(var_name);
                                 // Add to express_apps map
                                 self.express_apps.insert(
-                                    var_name.clone(),
+                                    express_app_name.to_owned(),
                                     AppContext {
-                                        name: var_name.clone(),
+                                        name: express_app_name,
                                     },
                                 );
 
@@ -319,7 +323,7 @@ impl Visit for DependencyVisitor {
                 // Check if the object is a known router or app
                 if let Expr::Ident(obj_ident) = &*member.obj {
                     // object identifier being the app in app.get
-                    let var_name = obj_ident.sym.to_string();
+                    let var_name = self.prefix_owner_type(obj_ident.sym.as_str());
 
                     // Check if the method is a valid HTTP method (GET, POST, etc.)
                     if let Some(http_method) = self.is_express_route_method(member) {
@@ -347,6 +351,18 @@ impl Visit for DependencyVisitor {
 }
 
 impl DependencyVisitor {
+    fn prefix_owner_type(&self, name: &str) -> String {
+        format!("{}:{}", self.repo_prefix, name)
+    }
+
+    fn get_owner_type(&self, name: &str) -> String {
+        name.split(":")
+            .filter(|x| !x.is_empty())
+            .last()
+            .unwrap()
+            .to_string()
+    }
+
     fn is_express_route_method(&self, member: &MemberExpr) -> Option<String> {
         // Get the method name (the property part of the member expression)
         if let MemberProp::Ident(method_ident) = &member.prop {
@@ -358,6 +374,21 @@ impl DependencyVisitor {
             }
         }
         None
+    }
+
+    fn is_express_app_creation(&self, call_expr: &CallExpr, express_name: &str) -> bool {
+        match &call_expr.callee {
+            // Check for express()
+            Callee::Expr(expr) => {
+                if let Expr::Ident(ident) = &expr.deref() {
+                    if ident.sym == *express_name {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     fn is_router_creation(&self, call_expr: &CallExpr) -> bool {
@@ -407,12 +438,7 @@ impl DependencyVisitor {
         }
     }
 
-    // Process app.use() - mounting routers or other apps
-    fn process_app_use(&mut self, app_name: &str, args: &[ExprOrSpread]) {
-        if args.is_empty() {
-            return;
-        }
-
+    fn get_path_prefix_from_use_call(&self, args: &[ExprOrSpread]) -> (String, usize) {
         // Determine if the first argument is a path or a middleware/router
         let (path_prefix, target_arg_idx) = if args.len() >= 2 {
             if let Some(path) = self.extract_string_from_expr(&args[0].expr) {
@@ -431,16 +457,28 @@ impl DependencyVisitor {
             path_prefix
         };
 
+        (path_prefix, target_arg_idx)
+    }
+
+    // Process app.use() - mounting routers or other apps
+    fn process_app_use(&mut self, app_name: &str, args: &[ExprOrSpread]) {
+        if args.is_empty() {
+            return;
+        }
+
+        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(&args);
+
         // Check if the argument at target_arg_idx is a router or app reference
         if target_arg_idx < args.len() {
             if let Expr::Ident(target_ident) = &*args[target_arg_idx].expr {
-                let target_name = target_ident.sym.to_string();
+                let target_name = target_ident.sym.as_str();
+                let prefixed_target_name = self.prefix_owner_type(target_name);
 
                 println!("App use: {}({}) -> {}", app_name, path_prefix, target_name);
                 // Save Mount to track Router relationship to App via Route
                 self.mounts.push(Mount {
                     parent: OwnerType::App(app_name.to_string()),
-                    child: OwnerType::Router(target_name),
+                    child: OwnerType::Router(prefixed_target_name),
                     prefix: path_prefix,
                 });
             }
@@ -453,28 +491,13 @@ impl DependencyVisitor {
             return;
         }
 
-        // Determine if the first argument is a path or a middleware/router
-        let (path_prefix, target_arg_idx) = if args.len() >= 2 {
-            if let Some(path) = self.extract_string_from_expr(&args[0].expr) {
-                (path, 1) // First arg is path, second is router
-            } else {
-                ("/".to_string(), 0) // First arg is middleware or router
-            }
-        } else {
-            ("/".to_string(), 0) // Only one arg, must be middleware or router
-        };
-
-        // Normalize path prefix
-        let path_prefix = if !path_prefix.starts_with('/') {
-            format!("/{}", path_prefix)
-        } else {
-            path_prefix
-        };
+        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(&args);
 
         // Check if the argument at target_arg_idx is a router reference
         if target_arg_idx < args.len() {
             if let Expr::Ident(target_ident) = &*args[target_arg_idx].expr {
-                let target_name = target_ident.sym.to_string();
+                let target_name = target_ident.sym.as_str();
+                let prefixed_target_name = self.prefix_owner_type(target_name);
 
                 println!(
                     "Router use: {}({}) -> {}",
@@ -484,7 +507,7 @@ impl DependencyVisitor {
                 // Save Mount to track Router relationship to App via Route
                 self.mounts.push(Mount {
                     parent: OwnerType::Router(parent_router_name.to_string()),
-                    child: OwnerType::Router(target_name),
+                    child: OwnerType::Router(prefixed_target_name),
                     prefix: path_prefix,
                 });
             }
@@ -512,24 +535,11 @@ impl DependencyVisitor {
 
             println!(
                 "Detected endpoint: {} {} on {}",
-                http_method, route, var_name
+                http_method,
+                route,
+                self.get_owner_type(var_name)
             );
         }
-    }
-
-    fn is_express_app_creation(&self, call_expr: &CallExpr, express_name: &str) -> bool {
-        match &call_expr.callee {
-            // Check for express()
-            Callee::Expr(expr) => {
-                if let Expr::Ident(ident) = &expr.deref() {
-                    if ident.sym == *express_name {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-        false
     }
 
     pub fn compute_full_paths_for_endpoint(
@@ -538,6 +548,7 @@ impl DependencyVisitor {
         mounts: &[Mount],
         apps: &HashMap<String, AppContext>,
     ) -> Vec<String> {
+        println!("{:?} {:?} {:?}", endpoint, mounts, apps);
         let mut results = Vec::new();
 
         // For each app, try to find all mounting chains to endpoint.owner
@@ -578,6 +589,8 @@ impl DependencyVisitor {
         for endpoint in &self.endpoints {
             let full_paths =
                 self.compute_full_paths_for_endpoint(endpoint, &self.mounts, &self.express_apps);
+
+            println!("FULL_PATHS ------> {:?}", full_paths);
             for path in full_paths {
                 let mut ep = endpoint.clone();
                 ep.route = path;

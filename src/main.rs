@@ -37,6 +37,10 @@ fn main() {
     for dir in repo_dirs {
         println!("---> Analyzing JavaScript/TypeScript files in: {}", dir);
 
+        // As we create a visitor per file, we need to distinguish between apps and routers run per repository
+        let dir_paths = dir.split("/").filter(|s| !s.is_empty());
+        let repo_prefix = dir_paths.last().unwrap();
+
         // Files to ignore - if possible use existing tooling to build this list
         let ignore_patterns = ["node_modules", "dist", "build", ".next"];
 
@@ -58,7 +62,7 @@ fn main() {
         for file_path in files {
             println!("Parsing: {}", file_path.display());
             if let Some(module) = parse_file(&file_path, &cm, &handler) {
-                let mut visitor = DependencyVisitor::new(file_path.clone());
+                let mut visitor = DependencyVisitor::new(file_path.clone(), repo_prefix);
                 module.visit_with(&mut visitor);
                 visitor.resolve_all_endpoint_paths();
                 visitors.push(visitor);
