@@ -11,6 +11,8 @@ use analyzer::analyze_api_consistency;
 use config::Config;
 use file_finder::find_files;
 use parser::parse_file;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use swc_common::{
     SourceMap,
     errors::{ColorConfig, Handler},
@@ -19,6 +21,51 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 use visitor::DependencyVisitor;
 
+/// Resolves a relative import path to an absolute file path
+fn resolve_import_path(base_file: &Path, import_path: &str) -> Option<PathBuf> {
+    if import_path.starts_with('.') {
+        // It's a relative import
+        let base_dir = base_file.parent()?;
+
+        // Remove leading "./" or "../" but keep the path structure
+        let normalized_path = if import_path.starts_with("./") {
+            &import_path[2..]
+        } else if import_path.starts_with("../") {
+            let mut dir_path = base_dir.to_path_buf();
+            dir_path.pop(); // Go up one directory for ../
+            return resolve_import_path(&dir_path.join("dummy.js"), &import_path[3..]);
+        } else {
+            import_path
+        };
+        // Try different extensions and index files
+        let extensions = ["", ".js", ".ts", ".jsx", ".tsx"];
+        let index_extensions = ["/index.js", "/index.ts", "/index.jsx", "/index.tsx"];
+
+        for ext in &extensions {
+            let full_path = base_dir.join(format!("{}{}", normalized_path, ext));
+            if full_path.exists() {
+                return Some(full_path);
+            }
+        }
+
+        // Try as directory with index file
+        for index_ext in &index_extensions {
+            let full_path = base_dir.join(format!("{}{}", normalized_path, index_ext));
+            println!("{:?}", full_path);
+            if full_path.exists() {
+                return Some(full_path);
+            }
+        }
+
+        // If we couldn't find the file with extensions, return the base path anyway
+        // The file might be in a different format or require more complex resolution
+        Some(base_dir.join(normalized_path))
+    } else {
+        // Non-relative imports (e.g., 'express', 'cors') - not local files
+        None
+    }
+}
+
 fn main() {
     // Create shared source map and error handler
     let cm: Lrc<SourceMap> = Default::default();
@@ -26,26 +73,29 @@ fn main() {
     let mut configs = Vec::new();
 
     // Extract directories from args if they exist. If no args are given then default to the current directory.
-    let repositories = std::env::args();
-    let repo_dirs = match repositories.len() == 0 {
-        true => vec![".".to_string()],
-        false => repositories.collect(),
+    let repositories = std::env::args().skip(1); // Skip program name
+    let repo_dirs = if repositories.len() == 0 {
+        vec![".".to_string()]
+    } else {
+        repositories.collect()
     };
 
-    // Create Visitors vec for each file in every repo
-    let mut visitors = Vec::new();
+    // Track processed files to avoid duplicates
+    let mut processed_file_paths = HashSet::new();
+
+    // Queue to store files for processing [file_path, repo_prefix]
+    let mut file_queue = VecDeque::new();
+
+    // Find all files to process initially and queue them
     for dir in repo_dirs {
         println!("---> Analyzing JavaScript/TypeScript files in: {}", dir);
 
-        // As we create a visitor per file, we need to distinguish between apps and routers run per repository
-        let dir_paths = dir.split("/").filter(|s| !s.is_empty());
-        let repo_prefix = dir_paths.last().unwrap();
+        let dir_paths: Vec<_> = dir.split("/").filter(|s| !s.is_empty()).collect();
+        let repo_prefix = dir_paths.last().unwrap_or(&"default").to_string();
 
-        // Files to ignore - if possible use existing tooling to build this list
         let ignore_patterns = ["node_modules", "dist", "build", ".next"];
-
-        // Find all JS/TS files and the config file
         let (files, config_file_path) = find_files(&dir, &ignore_patterns);
+
         println!(
             "Found {} files to analyze in directory {}",
             files.len(),
@@ -58,18 +108,78 @@ fn main() {
             configs.push(config_path);
         }
 
-        // Process each JS/TS file
+        // Queue all discovered files for processing
         for file_path in files {
-            println!("Parsing: {}", file_path.display());
-            if let Some(module) = parse_file(&file_path, &cm, &handler) {
-                let mut visitor = DependencyVisitor::new(file_path.clone(), repo_prefix);
-                module.visit_with(&mut visitor);
-                visitor.resolve_all_endpoint_paths();
-                visitors.push(visitor);
-            }
+            file_queue.push_back((file_path, repo_prefix.clone(), None));
         }
     }
 
+    // Process all files in the queue (including newly discovered imports)
+    let mut visitors = Vec::new();
+
+    while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
+        // Skip if already processed
+        let path_str = file_path.to_string_lossy().to_string();
+        if processed_file_paths.contains(&path_str) {
+            continue;
+        }
+
+        // Mark as processed
+        processed_file_paths.insert(path_str);
+
+        println!("Parsing: {}", file_path.display());
+
+        if let Some(module) = parse_file(&file_path, &cm, &handler) {
+            // Create visitor with the imported router name if this file was imported as a router
+            let mut visitor =
+                DependencyVisitor::new(file_path.clone(), &repo_prefix, imported_router_name);
+            module.visit_with(&mut visitor);
+
+            // Queue imported router files that might be used with app.use or router.use
+            for (name, source_path) in &visitor.imported_functions {
+                // Check if this import is used as a router in a mount
+                let is_router = visitor.mounts.iter().any(|mount| {
+                    match &mount.child {
+                        visitor::OwnerType::Router(router_name) => {
+                            // Extract just the local name without the repo prefix
+                            let parts: Vec<_> = router_name.split(':').collect();
+                            let local_name = parts.last().unwrap_or(&"");
+                            local_name == name
+                        }
+                        _ => false,
+                    }
+                });
+
+                if is_router {
+                    println!("Following import '{}' from '{}'", name, source_path);
+
+                    // Try to resolve the relative import path
+                    if let Some(resolved_path) = resolve_import_path(&file_path, source_path) {
+                        println!("Resolved to: {}", resolved_path.display());
+
+                        // Queue for processing with the imported router name
+                        // This will be used by the visitor to correctly name the router
+                        file_queue.push_back((
+                            resolved_path,
+                            repo_prefix.clone(),
+                            Some(name.clone()),
+                        ));
+                    }
+                }
+            }
+
+            // Store the visitor for later path resolution
+            visitors.push(visitor);
+        }
+    }
+
+    // Now that we've processed all files and their dependencies,
+    // resolve all endpoint paths for each visitor
+    // for visitor in &mut visitors {
+    //     visitor.resolve_all_endpoint_paths();
+    // }
+
+    // Load config
     let config = match Config::new(configs) {
         Ok(config) => config,
         Err(error) => {

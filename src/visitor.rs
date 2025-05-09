@@ -90,6 +90,7 @@ pub struct DependencyVisitor {
     // referenced from other files via imports
     pub function_definitions: HashMap<String, FunctionDefinition>,
     pub router_imports: HashSet<String>,
+    pub imported_router_name: Option<String>,
     pub has_express_import: bool,
     pub express_import_name: Option<String>, // The local name for the express import
     // Track Express app instances
@@ -99,7 +100,11 @@ pub struct DependencyVisitor {
 }
 
 impl DependencyVisitor {
-    pub fn new(file_path: PathBuf, repo_prefix: &str) -> Self {
+    pub fn new(
+        file_path: PathBuf,
+        repo_prefix: &str,
+        imported_router_name: Option<String>,
+    ) -> Self {
         Self {
             repo_prefix: repo_prefix.to_owned(),
             endpoints: Vec::new(),
@@ -111,6 +116,7 @@ impl DependencyVisitor {
             imported_handlers: Vec::new(),
             function_definitions: HashMap::new(),
             router_imports: HashSet::new(),
+            imported_router_name,
             routers: HashMap::new(),
             express_import_name: None,
             express_apps: HashMap::new(),
@@ -281,19 +287,36 @@ impl Visit for DependencyVisitor {
                 if let Expr::Call(call_expr) = &**init {
                     if let Pat::Ident(ident) = &decl.name {
                         let var_name = ident.id.sym.as_str();
-                        let prefixed_var_name = self.prefix_owner_type(var_name);
 
                         // Check if this is a router creation
                         if self.is_router_creation(call_expr) {
+                            // If this is the 'router' variable and we have an imported name,
+                            // use the imported name instead
+                            let router_name =
+                                if var_name == "router" && self.imported_router_name.is_some() {
+                                    self.imported_router_name.as_ref().unwrap().as_str()
+                                } else {
+                                    var_name
+                                };
+
+                            let prefixed_router_name = self.prefix_owner_type(router_name);
+
                             // Add the router to the `routers` map with an initial context
                             self.routers.insert(
-                                prefixed_var_name.clone(),
+                                prefixed_router_name.clone(),
                                 RouterContext {
-                                    name: prefixed_var_name.clone(),
+                                    name: prefixed_router_name.clone(),
                                 },
                             );
 
-                            println!("Detected Router: {}", var_name);
+                            if router_name != var_name {
+                                println!(
+                                    "Detected Router: {} (imported as: {})",
+                                    var_name, router_name
+                                );
+                            } else {
+                                println!("Detected Router: {}", var_name);
+                            }
                         }
                         // Check if this is an express app creation
                         else if let Some(express_name) = &self.express_import_name {
@@ -468,19 +491,37 @@ impl DependencyVisitor {
 
         let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(&args);
 
-        // Check if the argument at target_arg_idx is a router or app reference
+        // Check if the argument at target_arg_idx is a router or middleware reference
         if target_arg_idx < args.len() {
             if let Expr::Ident(target_ident) = &*args[target_arg_idx].expr {
                 let target_name = target_ident.sym.as_str();
                 let prefixed_target_name = self.prefix_owner_type(target_name);
 
                 println!("App use: {}({}) -> {}", app_name, path_prefix, target_name);
-                // Save Mount to track Router relationship to App via Route
+
+                // For ALL identifiers used with app.use, assume they could be routers
+                // and create the mount relationship
                 self.mounts.push(Mount {
                     parent: OwnerType::App(app_name.to_string()),
-                    child: OwnerType::Router(prefixed_target_name),
+                    child: OwnerType::Router(prefixed_target_name.clone()),
                     prefix: path_prefix,
                 });
+
+                // Add the router to our tracking if it's not already there
+                // This is important both for locally defined routers AND imported ones
+                if !self.routers.contains_key(&prefixed_target_name) {
+                    self.routers.insert(
+                        prefixed_target_name,
+                        RouterContext {
+                            name: target_name.to_string(),
+                        },
+                    );
+
+                    // If this is an import, log it specially
+                    if self.imported_functions.contains_key(target_name) {
+                        println!("Detected use of imported router: {}", target_name);
+                    }
+                }
             }
         }
     }
@@ -504,23 +545,48 @@ impl DependencyVisitor {
                     parent_router_name, path_prefix, target_name
                 );
 
-                // Save Mount to track Router relationship to App via Route
+                // Create mount relationship
                 self.mounts.push(Mount {
                     parent: OwnerType::Router(parent_router_name.to_string()),
-                    child: OwnerType::Router(prefixed_target_name),
+                    child: OwnerType::Router(prefixed_target_name.clone()),
                     prefix: path_prefix,
                 });
+
+                // Add the router to our tracking if it's not already there
+                if !self.routers.contains_key(&prefixed_target_name) {
+                    self.routers.insert(
+                        prefixed_target_name,
+                        RouterContext {
+                            name: target_name.to_string(),
+                        },
+                    );
+
+                    // If this is an import, log it specially
+                    if self.imported_functions.contains_key(target_name) {
+                        println!("Detected use of imported router: {}", target_name);
+                    }
+                }
             }
         }
     }
 
     // Process route handlers on routers
     fn process_route_handler(&mut self, var_name: &str, http_method: &str, call: &CallExpr) {
-        // find whether this is an app or router
-        let owner = match self.express_apps.get(var_name) {
-            Some(_) => OwnerType::App(var_name.to_string()),
-            None => OwnerType::Router(var_name.to_string()),
+        // If this is the generic "router" variable and we have an imported name
+        let effective_name = if var_name == self.prefix_owner_type("router")
+            && self.imported_router_name.is_some()
+        {
+            self.prefix_owner_type(self.imported_router_name.as_ref().unwrap())
+        } else {
+            var_name.to_string()
         };
+
+        // Find whether this is an app or router
+        let owner = match self.express_apps.get(&effective_name) {
+            Some(_) => OwnerType::App(effective_name.to_string()),
+            None => OwnerType::Router(effective_name.to_string()),
+        };
+
         if let Some(endpoint_data) = self.extract_endpoint(call, http_method) {
             let (route, response_fields, request_fields) = endpoint_data;
 
@@ -537,7 +603,7 @@ impl DependencyVisitor {
                 "Detected endpoint: {} {} on {}",
                 http_method,
                 route,
-                self.get_owner_type(var_name)
+                self.get_owner_type(&effective_name)
             );
         }
     }
@@ -548,7 +614,6 @@ impl DependencyVisitor {
         mounts: &[Mount],
         apps: &HashMap<String, AppContext>,
     ) -> Vec<String> {
-        println!("{:?} {:?} {:?}", endpoint, mounts, apps);
         let mut results = Vec::new();
 
         // For each app, try to find all mounting chains to endpoint.owner
