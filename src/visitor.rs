@@ -14,7 +14,6 @@ use crate::{
     app_context::AppContext,
     extractor::{CoreExtractor, RouteExtractor},
     router_context::RouterContext,
-    utils::join_path_segments,
 };
 extern crate regex;
 
@@ -44,13 +43,13 @@ pub struct FunctionDefinition {
     pub node_type: FunctionNodeType,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OwnerType {
     App(String),
     Router(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub parent: OwnerType, // App or Router doing the .use
     pub child: OwnerType,  // Router being mounted
@@ -76,6 +75,7 @@ pub struct Call {
 
 #[derive(Debug)]
 pub struct DependencyVisitor {
+    pub repo_prefix: String,
     pub endpoints: Vec<Endpoint>, // (route, method, response fields, request fields)
     pub calls: Vec<Call>,         // (route, method, expected fields)
     pub mounts: Vec<Mount>,
@@ -89,6 +89,7 @@ pub struct DependencyVisitor {
     // referenced from other files via imports
     pub function_definitions: HashMap<String, FunctionDefinition>,
     pub router_imports: HashSet<String>,
+    pub imported_router_name: Option<String>,
     pub has_express_import: bool,
     pub express_import_name: Option<String>, // The local name for the express import
     // Track Express app instances
@@ -98,8 +99,13 @@ pub struct DependencyVisitor {
 }
 
 impl DependencyVisitor {
-    pub fn new(file_path: PathBuf) -> Self {
+    pub fn new(
+        file_path: PathBuf,
+        repo_prefix: &str,
+        imported_router_name: Option<String>,
+    ) -> Self {
         Self {
+            repo_prefix: repo_prefix.to_owned(),
             endpoints: Vec::new(),
             calls: Vec::new(),
             mounts: Vec::new(),
@@ -109,6 +115,7 @@ impl DependencyVisitor {
             imported_handlers: Vec::new(),
             function_definitions: HashMap::new(),
             router_imports: HashSet::new(),
+            imported_router_name,
             routers: HashMap::new(),
             express_import_name: None,
             express_apps: HashMap::new(),
@@ -278,28 +285,47 @@ impl Visit for DependencyVisitor {
                 // Check if the initializer is a call expression
                 if let Expr::Call(call_expr) = &**init {
                     if let Pat::Ident(ident) = &decl.name {
-                        let var_name = ident.id.sym.to_string().clone();
+                        let var_name = ident.id.sym.as_str();
 
                         // Check if this is a router creation
                         if self.is_router_creation(call_expr) {
+                            // If this is the 'router' variable and we have an imported name,
+                            // use the imported name instead
+                            let router_name =
+                                if var_name == "router" && self.imported_router_name.is_some() {
+                                    self.imported_router_name.as_ref().unwrap().as_str()
+                                } else {
+                                    var_name
+                                };
+
+                            let prefixed_router_name = self.prefix_owner_type(router_name);
+
                             // Add the router to the `routers` map with an initial context
                             self.routers.insert(
-                                var_name.clone(),
+                                prefixed_router_name.clone(),
                                 RouterContext {
-                                    name: var_name.clone(),
+                                    name: prefixed_router_name.clone(),
                                 },
                             );
 
-                            println!("Detected Router: {}", var_name);
+                            if router_name != var_name {
+                                println!(
+                                    "Detected Router: {} (imported as: {})",
+                                    var_name, router_name
+                                );
+                            } else {
+                                println!("Detected Router: {}", var_name);
+                            }
                         }
                         // Check if this is an express app creation
                         else if let Some(express_name) = &self.express_import_name {
                             if self.is_express_app_creation(call_expr, express_name) {
+                                let express_app_name = self.prefix_owner_type(var_name);
                                 // Add to express_apps map
                                 self.express_apps.insert(
-                                    var_name.clone(),
+                                    express_app_name.to_owned(),
                                     AppContext {
-                                        name: var_name.clone(),
+                                        name: express_app_name,
                                     },
                                 );
 
@@ -319,7 +345,7 @@ impl Visit for DependencyVisitor {
                 // Check if the object is a known router or app
                 if let Expr::Ident(obj_ident) = &*member.obj {
                     // object identifier being the app in app.get
-                    let var_name = obj_ident.sym.to_string();
+                    let var_name = self.prefix_owner_type(obj_ident.sym.as_str());
 
                     // Check if the method is a valid HTTP method (GET, POST, etc.)
                     if let Some(http_method) = self.is_express_route_method(member) {
@@ -347,6 +373,18 @@ impl Visit for DependencyVisitor {
 }
 
 impl DependencyVisitor {
+    fn prefix_owner_type(&self, name: &str) -> String {
+        format!("{}:{}", self.repo_prefix, name)
+    }
+
+    fn get_owner_type(&self, name: &str) -> String {
+        name.split(":")
+            .filter(|x| !x.is_empty())
+            .last()
+            .unwrap()
+            .to_string()
+    }
+
     fn is_express_route_method(&self, member: &MemberExpr) -> Option<String> {
         // Get the method name (the property part of the member expression)
         if let MemberProp::Ident(method_ident) = &member.prop {
@@ -358,6 +396,21 @@ impl DependencyVisitor {
             }
         }
         None
+    }
+
+    fn is_express_app_creation(&self, call_expr: &CallExpr, express_name: &str) -> bool {
+        match &call_expr.callee {
+            // Check for express()
+            Callee::Expr(expr) => {
+                if let Expr::Ident(ident) = &expr.deref() {
+                    if ident.sym == *express_name {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     fn is_router_creation(&self, call_expr: &CallExpr) -> bool {
@@ -407,12 +460,7 @@ impl DependencyVisitor {
         }
     }
 
-    // Process app.use() - mounting routers or other apps
-    fn process_app_use(&mut self, app_name: &str, args: &[ExprOrSpread]) {
-        if args.is_empty() {
-            return;
-        }
-
+    fn get_path_prefix_from_use_call(&self, args: &[ExprOrSpread]) -> (String, usize) {
         // Determine if the first argument is a path or a middleware/router
         let (path_prefix, target_arg_idx) = if args.len() >= 2 {
             if let Some(path) = self.extract_string_from_expr(&args[0].expr) {
@@ -431,18 +479,48 @@ impl DependencyVisitor {
             path_prefix
         };
 
-        // Check if the argument at target_arg_idx is a router or app reference
+        (path_prefix, target_arg_idx)
+    }
+
+    // Process app.use() - mounting routers or other apps
+    fn process_app_use(&mut self, app_name: &str, args: &[ExprOrSpread]) {
+        if args.is_empty() {
+            return;
+        }
+
+        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(&args);
+
+        // Check if the argument at target_arg_idx is a router or middleware reference
         if target_arg_idx < args.len() {
             if let Expr::Ident(target_ident) = &*args[target_arg_idx].expr {
-                let target_name = target_ident.sym.to_string();
+                let target_name = target_ident.sym.as_str();
+                let prefixed_target_name = self.prefix_owner_type(target_name);
 
                 println!("App use: {}({}) -> {}", app_name, path_prefix, target_name);
-                // Save Mount to track Router relationship to App via Route
+
+                // For ALL identifiers used with app.use, assume they could be routers
+                // and create the mount relationship
                 self.mounts.push(Mount {
                     parent: OwnerType::App(app_name.to_string()),
-                    child: OwnerType::Router(target_name),
+                    child: OwnerType::Router(prefixed_target_name.clone()),
                     prefix: path_prefix,
                 });
+
+                // Add the router to our tracking if it's not already there
+                // This is important both for locally defined routers AND imported ones
+                if !self.routers.contains_key(&prefixed_target_name) {
+                    self.routers.insert(
+                        prefixed_target_name,
+                        RouterContext {
+                            name: target_name.to_string(),
+                        },
+                    );
+
+                    // If this is an import, log it specially
+                    if self.imported_functions.contains_key(target_name) {
+                        println!("Detected use of imported router: {}", target_name);
+                    }
+                }
             }
         }
     }
@@ -453,51 +531,61 @@ impl DependencyVisitor {
             return;
         }
 
-        // Determine if the first argument is a path or a middleware/router
-        let (path_prefix, target_arg_idx) = if args.len() >= 2 {
-            if let Some(path) = self.extract_string_from_expr(&args[0].expr) {
-                (path, 1) // First arg is path, second is router
-            } else {
-                ("/".to_string(), 0) // First arg is middleware or router
-            }
-        } else {
-            ("/".to_string(), 0) // Only one arg, must be middleware or router
-        };
-
-        // Normalize path prefix
-        let path_prefix = if !path_prefix.starts_with('/') {
-            format!("/{}", path_prefix)
-        } else {
-            path_prefix
-        };
+        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(&args);
 
         // Check if the argument at target_arg_idx is a router reference
         if target_arg_idx < args.len() {
             if let Expr::Ident(target_ident) = &*args[target_arg_idx].expr {
-                let target_name = target_ident.sym.to_string();
+                let target_name = target_ident.sym.as_str();
+                let prefixed_target_name = self.prefix_owner_type(target_name);
 
                 println!(
                     "Router use: {}({}) -> {}",
                     parent_router_name, path_prefix, target_name
                 );
 
-                // Save Mount to track Router relationship to App via Route
+                // Create mount relationship
                 self.mounts.push(Mount {
                     parent: OwnerType::Router(parent_router_name.to_string()),
-                    child: OwnerType::Router(target_name),
+                    child: OwnerType::Router(prefixed_target_name.clone()),
                     prefix: path_prefix,
                 });
+
+                // Add the router to our tracking if it's not already there
+                if !self.routers.contains_key(&prefixed_target_name) {
+                    self.routers.insert(
+                        prefixed_target_name,
+                        RouterContext {
+                            name: target_name.to_string(),
+                        },
+                    );
+
+                    // If this is an import, log it specially
+                    if self.imported_functions.contains_key(target_name) {
+                        println!("Detected use of imported router: {}", target_name);
+                    }
+                }
             }
         }
     }
 
     // Process route handlers on routers
     fn process_route_handler(&mut self, var_name: &str, http_method: &str, call: &CallExpr) {
-        // find whether this is an app or router
-        let owner = match self.express_apps.get(var_name) {
-            Some(_) => OwnerType::App(var_name.to_string()),
-            None => OwnerType::Router(var_name.to_string()),
+        // If this is the generic "router" variable and we have an imported name
+        let effective_name = if var_name == self.prefix_owner_type("router")
+            && self.imported_router_name.is_some()
+        {
+            self.prefix_owner_type(self.imported_router_name.as_ref().unwrap())
+        } else {
+            var_name.to_string()
         };
+
+        // Find whether this is an app or router
+        let owner = match self.express_apps.get(&effective_name) {
+            Some(_) => OwnerType::App(effective_name.to_string()),
+            None => OwnerType::Router(effective_name.to_string()),
+        };
+
         if let Some(endpoint_data) = self.extract_endpoint(call, http_method) {
             let (route, response_fields, request_fields) = endpoint_data;
 
@@ -512,78 +600,10 @@ impl DependencyVisitor {
 
             println!(
                 "Detected endpoint: {} {} on {}",
-                http_method, route, var_name
+                http_method,
+                route,
+                self.get_owner_type(&effective_name)
             );
         }
-    }
-
-    fn is_express_app_creation(&self, call_expr: &CallExpr, express_name: &str) -> bool {
-        match &call_expr.callee {
-            // Check for express()
-            Callee::Expr(expr) => {
-                if let Expr::Ident(ident) = &expr.deref() {
-                    if ident.sym == *express_name {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-        false
-    }
-
-    pub fn compute_full_paths_for_endpoint(
-        &self,
-        endpoint: &Endpoint,
-        mounts: &[Mount],
-        apps: &HashMap<String, AppContext>,
-    ) -> Vec<String> {
-        let mut results = Vec::new();
-
-        // For each app, try to find all mounting chains to endpoint.owner
-        for app_name in apps.keys() {
-            let app_owner = OwnerType::App(app_name.clone());
-            let mut stack = Vec::new();
-            let mut visited = Vec::new();
-            // Each stack entry: (current_owner, prefixes_so_far)
-            stack.push((app_owner.clone(), Vec::<String>::new()));
-
-            while let Some((current, mut prefixes)) = stack.pop() {
-                if &current == &endpoint.owner {
-                    // Found a chain! Build the full path
-                    prefixes.push(endpoint.route.clone());
-                    let path_refs: Vec<&str> = prefixes.iter().map(|s| s.as_str()).collect();
-                    results.push(join_path_segments(&path_refs));
-                    continue;
-                }
-                // Prevent cycles (shouldn't happen in Express, but just in case)
-                if visited.contains(&current) {
-                    continue;
-                }
-                visited.push(current.clone());
-
-                // For each mount where parent == current, follow to child
-                for mount in mounts.iter().filter(|m| m.parent == current) {
-                    let mut new_prefixes = prefixes.clone();
-                    new_prefixes.push(mount.prefix.clone());
-                    stack.push((mount.child.clone(), new_prefixes));
-                }
-            }
-        }
-        results
-    }
-
-    pub fn resolve_all_endpoint_paths(&mut self) {
-        let mut new_endpoints = Vec::new();
-        for endpoint in &self.endpoints {
-            let full_paths =
-                self.compute_full_paths_for_endpoint(endpoint, &self.mounts, &self.express_apps);
-            for path in full_paths {
-                let mut ep = endpoint.clone();
-                ep.route = path;
-                new_endpoints.push(ep);
-            }
-        }
-        self.endpoints = new_endpoints;
     }
 }

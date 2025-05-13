@@ -1,7 +1,9 @@
 use crate::{
+    app_context::AppContext,
     config::Config,
     extractor::CoreExtractor,
-    visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json},
+    utils::join_prefix_and_path,
+    visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType},
 };
 use core::fmt;
 use regex::Regex;
@@ -27,6 +29,9 @@ impl ApiIssues {
 
 #[derive(Clone, Debug)]
 pub struct ApiEndpointDetails {
+    // owner is Option as we store both call ands endpoints in this data structure.
+    // It might make sense to split this out into its own type
+    pub owner: Option<OwnerType>,
     pub route: String,
     pub method: String,
     #[allow(dead_code)]
@@ -66,6 +71,8 @@ struct Analyzer {
     function_definitions: HashMap<String, FunctionDefinition>,
     endpoints: Vec<ApiEndpointDetails>,
     calls: Vec<ApiEndpointDetails>,
+    mounts: Vec<Mount>,
+    apps: HashMap<String, AppContext>,
     config: Config,
 }
 
@@ -142,9 +149,13 @@ impl Analyzer {
     }
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
+        self.mounts.extend(visitor.mounts);
+        self.apps.extend(visitor.express_apps);
+
         for endpoint in visitor.endpoints {
             let params = self.extract_params_from_route(&endpoint.route);
             self.endpoints.push(ApiEndpointDetails {
+                owner: Some(endpoint.owner.clone()),
                 route: endpoint.route.to_string(),
                 method: endpoint.method.to_string(),
                 params,
@@ -157,6 +168,7 @@ impl Analyzer {
         for call in visitor.calls {
             let params = self.extract_params_from_route(&call.route);
             self.calls.push(ApiEndpointDetails {
+                owner: None,
                 route: call.route.to_string(),
                 method: call.method.to_string(),
                 params,
@@ -198,6 +210,7 @@ impl Analyzer {
             for (route, method, request_body) in fetch_calls {
                 let params = self.extract_params_from_route(&route);
                 new_calls.push(ApiEndpointDetails {
+                    owner: None,
                     route,
                     method,
                     params,
@@ -557,6 +570,71 @@ impl Analyzer {
         mismatches
     }
 
+    pub fn compute_full_paths_for_endpoint(
+        endpoint: &ApiEndpointDetails,
+        mounts: &[Mount],
+        _apps: &std::collections::HashMap<String, AppContext>,
+    ) -> Vec<String> {
+        let mut results = Vec::new();
+
+        // Defensive: skip endpoints with no owner
+        let mut owner = match &endpoint.owner {
+            Some(owner) => owner.clone(),
+            None => return results,
+        };
+
+        let mut path = endpoint.route.clone();
+        let mut visited = std::collections::HashSet::new();
+
+        // Walk up the mount chain, prepending prefixes
+        loop {
+            // Prevent cycles
+            if !visited.insert(owner.clone()) {
+                break;
+            }
+
+            // Find the mount where this owner is the child
+            if let Some(mount) = mounts.iter().find(|m| m.child == owner) {
+                // Prepend the prefix
+                path = join_prefix_and_path(&mount.prefix, &path);
+                // Move up to the parent
+                owner = mount.parent.clone();
+                // If the parent is an app, we're done
+                if let OwnerType::App(_) = owner {
+                    results.push(path.clone());
+                    break;
+                }
+            } else {
+                // If owner is an app, just push the path
+                if let OwnerType::App(_) = owner {
+                    results.push(path.clone());
+                }
+                // No more parents, stop
+                break;
+            }
+        }
+
+        results
+    }
+
+    pub fn resolve_all_endpoint_paths(
+        &self,
+        endpoints: &[ApiEndpointDetails],
+        mounts: &[Mount],
+        apps: &std::collections::HashMap<String, AppContext>,
+    ) -> Vec<ApiEndpointDetails> {
+        let mut new_endpoints = Vec::new();
+        for endpoint in endpoints {
+            let full_paths = Self::compute_full_paths_for_endpoint(endpoint, mounts, apps);
+            for path in full_paths {
+                let mut ep = endpoint.clone();
+                ep.route = path;
+                new_endpoints.push(ep);
+            }
+        }
+        new_endpoints
+    }
+
     pub fn get_results(&self) -> ApiAnalysisResult {
         let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
         let mismatches = self.compare_calls_to_endpoints();
@@ -585,6 +663,11 @@ pub fn analyze_api_consistency(
     for visitor in visitors {
         analyzer.add_visitor_data(visitor);
     }
+
+    let endpoints =
+        analyzer.resolve_all_endpoint_paths(&analyzer.endpoints, &analyzer.mounts, &analyzer.apps);
+
+    analyzer.endpoints = endpoints;
 
     // Second pass - analyze function definitions for response fields
     let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
