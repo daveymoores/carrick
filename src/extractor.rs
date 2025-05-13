@@ -524,7 +524,7 @@ pub trait CoreExtractor {
 
                                                     // Add param placeholders for any remaining expressions
                                                     if i < tpl.exprs.len() {
-                                                        path.push_str(&format!(":param{}", i - 1));
+                                                        path.push_str("/:id"); // Use a consistent param name
                                                     }
                                                 }
 
@@ -560,18 +560,17 @@ pub trait CoreExtractor {
 
     fn process_normal_template(&self, tpl: &Tpl) -> Option<String> {
         let mut route = String::new();
-        let mut param_index = 0;
 
-        // Process each part of the template
+        // Just concatenate the raw parts of the template
+        // We don't need specific parameter names for matching with matchit
         for (i, quasi) in tpl.quasis.iter().enumerate() {
             // Add the raw text part
             route.push_str(&quasi.raw);
 
             // If there's an expression after this quasi
             if i < tpl.exprs.len() {
-                // Add a parameter placeholder
-                route.push_str(&format!(":param{}", param_index));
-                param_index += 1;
+                // Add a simple parameter placeholder
+                route.push_str(":id");
             }
         }
 

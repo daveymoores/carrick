@@ -6,7 +6,6 @@ use crate::{
     visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType},
 };
 use core::fmt;
-use regex::Regex;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -74,6 +73,7 @@ struct Analyzer {
     mounts: Vec<Mount>,
     apps: HashMap<String, AppContext>,
     config: Config,
+    endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
 }
 
 #[derive(Debug)]
@@ -91,61 +91,6 @@ impl Analyzer {
             config,
             ..Default::default()
         }
-    }
-
-    fn normalize_route(&self, route: &str) -> String {
-        let mut normalized = route.to_string();
-
-        // Remove trailing slashes
-        while normalized.ends_with('/') && normalized.len() > 1 {
-            normalized.pop();
-        }
-
-        // Ensure leading slash
-        if !normalized.starts_with('/') {
-            normalized = format!("/{}", normalized);
-        }
-
-        // Create a regex-based matcher for parameters
-        let param_pattern = regex::Regex::new(r":([\w\d]+)").unwrap();
-
-        // Replace all parameters with a common placeholder for comparison
-        normalized = param_pattern.replace_all(&normalized, ":param").to_string();
-
-        normalized
-    }
-
-    // Strip parameters for prefix matching
-    fn strip_params(&self, route: &str) -> String {
-        let param_pattern = regex::Regex::new(r"/:[\w\d]+").unwrap();
-        let base_route = param_pattern.replace_all(route, "").to_string();
-        if base_route.is_empty() {
-            "/".to_string()
-        } else {
-            base_route
-        }
-    }
-
-    // Convert a route with parameters to a regex pattern
-    fn route_to_regex(&self, route: &str) -> Regex {
-        let pattern = route
-            .split('/')
-            .map(|segment| {
-                if segment.starts_with(':') {
-                    "([^/]+)".to_string() // Match any character except /
-                } else if !segment.is_empty() {
-                    regex::escape(segment) // Escape other segments
-                } else {
-                    "".to_string()
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<String>>()
-            .join("/");
-
-        // Ensure pattern matches the whole path with proper anchoring
-        let re_str = format!("^/?{}/?$", pattern);
-        Regex::new(&re_str).unwrap_or_else(|_| Regex::new("^/$").unwrap())
     }
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
@@ -402,72 +347,52 @@ impl Analyzer {
         endpoints: &'a [ApiEndpointDetails],
         orphaned_endpoints: &mut HashSet<(String, String)>,
     ) -> Option<(&'a String, &'a String)> {
-        let normalized_call = self.normalize_route(route);
+        // Safety check
+        let router = match &self.endpoint_router {
+            Some(r) => r,
+            None => return None,
+        };
 
-        // First try to find an exact match with both route and method
-        for api_endpoint_details in endpoints {
-            // Only consider endpoints with matching methods for first-pass matching
-            if api_endpoint_details.method != method {
-                continue;
-            }
+        // Try to match the route with matchit
+        match router.at(route) {
+            Ok(matched) => {
+                // Now we get back a Vec<(String, String)> of route-method pairs
+                let route_methods = matched.value;
 
-            // Strategy 1: Direct match after normalization
-            let normalized_endpoint = self.normalize_route(&api_endpoint_details.route);
-            if normalized_call == normalized_endpoint {
-                orphaned_endpoints.remove(&(
-                    api_endpoint_details.route.clone(),
-                    api_endpoint_details.method.clone(),
-                ));
-                return Some((&api_endpoint_details.route, &api_endpoint_details.method));
-            }
+                // First look for an exact method match
+                for (endpoint_route, endpoint_method) in route_methods {
+                    if endpoint_method == method {
+                        // Find the actual endpoint for this route+method
+                        if let Some(endpoint) = endpoints
+                            .iter()
+                            .find(|ep| &ep.route == endpoint_route && &ep.method == endpoint_method)
+                        {
+                            // Remove from orphaned endpoints
+                            orphaned_endpoints
+                                .remove(&(endpoint.route.clone(), endpoint.method.clone()));
 
-            // Strategy 2: Parameter-aware regex matching
-            if api_endpoint_details.route.contains(':') {
-                let regex = self.route_to_regex(&api_endpoint_details.route);
-                if regex.is_match(route) {
-                    orphaned_endpoints.remove(&(
-                        api_endpoint_details.route.clone(),
-                        api_endpoint_details.method.clone(),
-                    ));
-                    return Some((&api_endpoint_details.route, &api_endpoint_details.method));
+                            return Some((&endpoint.route, &endpoint.method));
+                        }
+                    }
+                }
+
+                // If we didn't find an exact method match, return the first endpoint with this route
+                // (this is for reporting method mismatches)
+                if let Some((endpoint_route, endpoint_method)) = route_methods.first() {
+                    if let Some(endpoint) = endpoints
+                        .iter()
+                        .find(|ep| &ep.route == endpoint_route && &ep.method == endpoint_method)
+                    {
+                        // Remove from orphaned endpoints
+                        orphaned_endpoints
+                            .remove(&(endpoint.route.clone(), endpoint.method.clone()));
+
+                        return Some((&endpoint.route, &endpoint.method));
+                    }
                 }
             }
-
-            // Strategy 3: Check if it's a sub-route
-            if route.starts_with(&self.strip_params(&api_endpoint_details.route))
-                && !api_endpoint_details.route.contains(':')
-            {
-                orphaned_endpoints.remove(&(
-                    api_endpoint_details.route.clone(),
-                    api_endpoint_details.method.clone(),
-                ));
-                return Some((&api_endpoint_details.route, &api_endpoint_details.method));
-            }
-        }
-
-        // If no exact method match was found, look for a route match with any method
-        // This is useful for reporting method mismatches rather than missing endpoints
-        for api_endpoint_details in endpoints {
-            // Strategy 1: Direct match after normalization
-            let normalized_endpoint = self.normalize_route(&api_endpoint_details.route);
-            if normalized_call == normalized_endpoint {
-                orphaned_endpoints.remove(&(
-                    api_endpoint_details.route.clone(),
-                    api_endpoint_details.method.clone(),
-                ));
-                return Some((&api_endpoint_details.route, &api_endpoint_details.method));
-            }
-
-            // Strategy 2: Parameter-aware regex matching
-            if api_endpoint_details.route.contains(':') {
-                let regex = self.route_to_regex(&api_endpoint_details.route);
-                if regex.is_match(route) {
-                    orphaned_endpoints.remove(&(
-                        api_endpoint_details.route.clone(),
-                        api_endpoint_details.method.clone(),
-                    ));
-                    return Some((&api_endpoint_details.route, &api_endpoint_details.method));
-                }
+            Err(_) => {
+                // No match found via matchit
             }
         }
 
@@ -477,34 +402,47 @@ impl Analyzer {
     pub fn compare_calls_to_endpoints(&self) -> Vec<String> {
         let mut issues = Vec::new();
 
-        for call in &self.calls {
-            // Find matching endpoint by route and method
-            let endpoint = self.endpoints.iter().find(|ep| {
-                self.normalize_route(&ep.route) == self.normalize_route(&call.route)
-                    && ep.method == call.method
-            });
+        // Safety check
+        let router = match &self.endpoint_router {
+            Some(r) => r,
+            None => return issues,
+        };
 
-            if let Some(ep) = endpoint {
-                // Compare request bodies if both exist
-                if let (Some(call_req), Some(ep_req)) = (&call.request_body, &ep.request_body) {
-                    let mismatches = self.compare_json_fields(call_req, ep_req, "");
-                    for mismatch in mismatches {
-                        issues.push(format!(
-                            "Request body mismatch for {} {} -> {}",
-                            call.method, call.route, mismatch
-                        ));
+        for call in &self.calls {
+            match router.at(&call.route) {
+                Ok(matched) => {
+                    // Get the endpoint routes and methods
+                    let route_methods = &matched.value;
+
+                    // Look for a method match
+                    let matching_endpoint = route_methods
+                        .iter()
+                        .filter(|(_, endpoint_method)| endpoint_method == &call.method)
+                        .find_map(|(endpoint_route, endpoint_method)| {
+                            self.endpoints.iter().find(|ep| {
+                                &ep.route == endpoint_route && &ep.method == endpoint_method
+                            })
+                        });
+
+                    if let Some(ep) = matching_endpoint {
+                        // Compare request bodies if both exist
+                        if let (Some(call_req), Some(ep_req)) =
+                            (&call.request_body, &ep.request_body)
+                        {
+                            let mismatches = self.compare_json_fields(call_req, ep_req, "");
+                            for mismatch in mismatches {
+                                issues.push(format!(
+                                    "Request body mismatch for {} {} -> {}",
+                                    call.method, call.route, mismatch
+                                ));
+                            }
+                        }
                     }
                 }
-                // Optionally, compare response bodies
-                // if let (Some(call_resp), Some(ep_resp)) = (&call.response_body, &ep.response_body) {
-                //     let mismatches = compare_json_fields(call_resp, ep_resp, "");
-                //     for mismatch in mismatches {
-                //         issues.push(format!(
-                //             "Response body mismatch for {} {}: {:?}",
-                //             call.method, call.route, mismatch
-                //         ));
-                //     }
-                // }
+                Err(_) => {
+                    // No matching endpoint found via matchit
+                    // Already reported by analyze_matches()
+                }
             }
         }
 
@@ -635,6 +573,31 @@ impl Analyzer {
         new_endpoints
     }
 
+    fn build_endpoint_router(&mut self) {
+        let mut router = matchit::Router::new();
+
+        // Use a HashMap to collect all endpoints by path before inserting into router
+        let mut path_to_endpoints: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+        for endpoint in &self.endpoints {
+            path_to_endpoints
+                .entry(endpoint.route.clone())
+                .or_insert_with(Vec::new)
+                .push((endpoint.route.clone(), endpoint.method.clone()));
+        }
+
+        println!("Unique endpoint paths: {}", path_to_endpoints.len());
+
+        // Now insert each unique path once, with a collection of route-method pairs
+        for (path, route_methods) in path_to_endpoints {
+            if let Err(e) = router.insert(&path, route_methods) {
+                println!("Warning: Could not add route to router: {}", e);
+            }
+        }
+
+        self.endpoint_router = Some(router);
+    }
+
     pub fn get_results(&self) -> ApiAnalysisResult {
         let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
         let mismatches = self.compare_calls_to_endpoints();
@@ -668,6 +631,9 @@ pub fn analyze_api_consistency(
         analyzer.resolve_all_endpoint_paths(&analyzer.endpoints, &analyzer.mounts, &analyzer.apps);
 
     analyzer.endpoints = endpoints;
+
+    // Build the router after resolving endpoints
+    analyzer.build_endpoint_router();
 
     // Second pass - analyze function definitions for response fields
     let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
