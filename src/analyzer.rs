@@ -30,7 +30,7 @@ impl ApiIssues {
 #[derive(Clone, Debug)]
 pub struct ApiEndpointDetails {
     // owner is Option as we store both call ands endpoints in this data structure.
-    // It might make sens to split this out into its own type
+    // It might make sense to split this out into its own type
     pub owner: Option<OwnerType>,
     pub route: String,
     pub method: String,
