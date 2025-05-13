@@ -81,7 +81,7 @@ fn main() {
     };
 
     // Track processed files to avoid duplicates
-    let mut processed_file_paths = HashSet::new();
+    let mut processed_file_paths = HashSet::new(); // HashSet<(String, Option<String>)>
 
     // Queue to store files for processing [file_path, repo_prefix]
     let mut file_queue = VecDeque::new();
@@ -118,14 +118,12 @@ fn main() {
     let mut visitors = Vec::new();
 
     while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
-        // Skip if already processed
         let path_str = file_path.to_string_lossy().to_string();
-        if processed_file_paths.contains(&path_str) {
+        let key = (path_str.clone(), imported_router_name.clone());
+        if processed_file_paths.contains(&key) {
             continue;
         }
-
-        // Mark as processed
-        processed_file_paths.insert(path_str);
+        processed_file_paths.insert(key);
 
         println!("Parsing: {}", file_path.display());
 
@@ -172,12 +170,6 @@ fn main() {
             visitors.push(visitor);
         }
     }
-
-    // Now that we've processed all files and their dependencies,
-    // resolve all endpoint paths for each visitor
-    // for visitor in &mut visitors {
-    //     visitor.resolve_all_endpoint_paths();
-    // }
 
     // Load config
     let config = match Config::new(configs) {

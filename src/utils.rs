@@ -1,20 +1,12 @@
-pub fn join_path_segments(segments: &[&str]) -> String {
-    let mut result = String::new();
-    for seg in segments {
-        if seg.is_empty() {
-            continue;
-        }
-        if !result.ends_with('/') && !result.is_empty() && !seg.starts_with('/') {
-            result.push('/');
-        }
-        if result.ends_with('/') && seg.starts_with('/') {
-            result.push_str(&seg[1..]);
-        } else {
-            result.push_str(seg);
-        }
+pub fn join_prefix_and_path(prefix: &str, path: &str) -> String {
+    let prefix = prefix.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+
+    if prefix.is_empty() || prefix == "/" {
+        format!("/{}", path)
+    } else if path.is_empty() {
+        format!("{}", prefix)
+    } else {
+        format!("{}/{}", prefix, path)
     }
-    if !result.starts_with('/') {
-        result.insert(0, '/');
-    }
-    result
 }

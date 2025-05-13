@@ -14,7 +14,6 @@ use crate::{
     app_context::AppContext,
     extractor::{CoreExtractor, RouteExtractor},
     router_context::RouterContext,
-    utils::join_path_segments,
 };
 extern crate regex;
 
@@ -44,13 +43,13 @@ pub struct FunctionDefinition {
     pub node_type: FunctionNodeType,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OwnerType {
     App(String),
     Router(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub parent: OwnerType, // App or Router doing the .use
     pub child: OwnerType,  // Router being mounted
@@ -606,62 +605,5 @@ impl DependencyVisitor {
                 self.get_owner_type(&effective_name)
             );
         }
-    }
-
-    pub fn compute_full_paths_for_endpoint(
-        &self,
-        endpoint: &Endpoint,
-        mounts: &[Mount],
-        apps: &HashMap<String, AppContext>,
-    ) -> Vec<String> {
-        let mut results = Vec::new();
-
-        // For each app, try to find all mounting chains to endpoint.owner
-        for app_name in apps.keys() {
-            let app_owner = OwnerType::App(app_name.clone());
-            let mut stack = Vec::new();
-            let mut visited = Vec::new();
-            // Each stack entry: (current_owner, prefixes_so_far)
-            stack.push((app_owner.clone(), Vec::<String>::new()));
-
-            while let Some((current, mut prefixes)) = stack.pop() {
-                if &current == &endpoint.owner {
-                    // Found a chain! Build the full path
-                    prefixes.push(endpoint.route.clone());
-                    let path_refs: Vec<&str> = prefixes.iter().map(|s| s.as_str()).collect();
-                    results.push(join_path_segments(&path_refs));
-                    continue;
-                }
-                // Prevent cycles (shouldn't happen in Express, but just in case)
-                if visited.contains(&current) {
-                    continue;
-                }
-                visited.push(current.clone());
-
-                // For each mount where parent == current, follow to child
-                for mount in mounts.iter().filter(|m| m.parent == current) {
-                    let mut new_prefixes = prefixes.clone();
-                    new_prefixes.push(mount.prefix.clone());
-                    stack.push((mount.child.clone(), new_prefixes));
-                }
-            }
-        }
-        results
-    }
-
-    pub fn resolve_all_endpoint_paths(&mut self) {
-        let mut new_endpoints = Vec::new();
-        for endpoint in &self.endpoints {
-            let full_paths =
-                self.compute_full_paths_for_endpoint(endpoint, &self.mounts, &self.express_apps);
-
-            println!("FULL_PATHS ------> {:?}", full_paths);
-            for path in full_paths {
-                let mut ep = endpoint.clone();
-                ep.route = path;
-                new_endpoints.push(ep);
-            }
-        }
-        self.endpoints = new_endpoints;
     }
 }
