@@ -1,4 +1,4 @@
-use crate::visitor::Json;
+use crate::visitor::{ImportedSymbol, Json, SymbolKind};
 use std::collections::HashMap;
 use swc_ecma_ast::*;
 
@@ -702,7 +702,10 @@ pub trait CoreExtractor {
 }
 
 pub trait RouteExtractor: CoreExtractor {
-    fn get_imported_functions(&self) -> &HashMap<String, String>;
+    fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
+    fn resolve_variable(&self, name: &str) -> Option<&Expr>;
+    fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;
+    fn get_imported_symbols(&self) -> &HashMap<String, ImportedSymbol>;
     fn get_response_fields(&self) -> &HashMap<String, Json>;
     fn add_imported_handler(
         &mut self,
@@ -712,6 +715,56 @@ pub trait RouteExtractor: CoreExtractor {
         source: String,
     );
 
+    fn extract_string_from_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
+            Expr::Tpl(tpl) => self.resolve_template_string(tpl),
+            Expr::Ident(ident) => {
+                // Try to resolve the variable
+                let var_name = ident.sym.to_string();
+                if let Some(resolved_expr) = self.resolve_variable(&var_name) {
+                    return self.extract_string_from_expr(resolved_expr);
+                }
+                None
+            }
+            // Handle other expression types that could resolve to strings
+            // For example, member expressions like config.API_URL
+            Expr::Member(member) => self.extract_string_from_member_expr(member),
+            _ => None,
+        }
+    }
+
+    fn extract_string_from_member_expr(&self, member: &MemberExpr) -> Option<String> {
+        // For simple cases like obj.prop where obj is a variable
+        if let Expr::Ident(obj_ident) = &*member.obj {
+            let obj_name = obj_ident.sym.to_string();
+
+            // Try to resolve the object
+            if let Some(resolved_obj) = self.resolve_variable(&obj_name) {
+                // If it's an object literal, extract the property
+                if let Expr::Object(obj_lit) = resolved_obj {
+                    if let MemberProp::Ident(prop_ident) = &member.prop {
+                        let prop_name = prop_ident.sym.to_string();
+
+                        // Find the property in the object
+                        for prop in &obj_lit.props {
+                            if let PropOrSpread::Prop(box_prop) = prop {
+                                if let Prop::KeyValue(kv) = &**box_prop {
+                                    if let PropName::Ident(key_ident) = &kv.key {
+                                        if key_ident.sym.to_string() == prop_name {
+                                            return self.extract_string_from_expr(&kv.value);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn extract_endpoint(
         &mut self,
         call: &CallExpr,
@@ -719,13 +772,36 @@ pub trait RouteExtractor: CoreExtractor {
     ) -> Option<(String, Json, Option<Json>)> {
         // Implementation using the existing methods from CoreExtractor
         // Get the route from the first argument
-        let route = call.args.get(0)?.expr.as_lit()?.as_str()?.value.to_string();
+        // Get the first argument (route path)
+        let first_arg = call.args.get(0)?;
+        let route = self.extract_string_from_expr(&first_arg.expr)?;
 
         let mut response_json = Json::Null;
         let mut request_json = None;
 
         // Check the second argument (handler)
         if let Some(second_arg) = call.args.get(1) {
+            if let Some(handler_name) = self.get_route_handler_name(&second_arg.expr) {
+                // Check if this handler is an imported function
+                if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
+                    // Track this imported handler usage
+                    self.add_imported_handler(
+                        route.clone(),
+                        method.to_string(),
+                        handler_name.clone(),
+                        symbol.source.clone(),
+                    );
+
+                    // Look up the response fields for this handler
+                    if let Some(fields) = self.get_response_fields().get(&handler_name) {
+                        response_json = fields.clone();
+                    }
+
+                    // We've handled this case, so we can return early
+                    return Some((route, response_json, request_json));
+                }
+            }
+
             match &*second_arg.expr {
                 // Arrow function handler
                 Expr::Arrow(arrow_expr) => {
@@ -775,13 +851,13 @@ pub trait RouteExtractor: CoreExtractor {
                     let handler_name = ident.sym.to_string();
 
                     // Check if this handler is an imported function
-                    if let Some(source) = self.get_imported_functions().get(&handler_name) {
+                    if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
                         // Track this imported handler usage
                         self.add_imported_handler(
                             route.clone(),
                             method.to_string(),
                             handler_name.clone(),
-                            source.clone(),
+                            symbol.source.clone(),
                         );
 
                         if let Some(fields) = self.get_response_fields().get(&handler_name) {
