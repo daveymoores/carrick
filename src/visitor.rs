@@ -143,7 +143,24 @@ impl DependencyVisitor {
     }
 }
 
-impl CoreExtractor for DependencyVisitor {}
+impl CoreExtractor for DependencyVisitor {
+    fn resolve_variable(&self, name: &str) -> Option<&Expr> {
+        // First check if it's a local variable
+        if let Some(expr) = self.variable_values.get(name) {
+            return Some(expr);
+        }
+
+        // If not local, check if it's an imported symbol
+        if let Some(imported) = self.imported_symbols.get(name) {
+            // Check if we have the exported value from the source module
+            if let Some(expr) = self.exported_variables.get(&imported.imported_name) {
+                return Some(expr);
+            }
+        }
+
+        None
+    }
+}
 
 impl RouteExtractor for DependencyVisitor {
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String> {
@@ -168,23 +185,6 @@ impl RouteExtractor for DependencyVisitor {
             // Try to resolve the expression to a handler name
             _ => None,
         }
-    }
-
-    fn resolve_variable(&self, name: &str) -> Option<&Expr> {
-        // First check if it's a local variable
-        if let Some(expr) = self.variable_values.get(name) {
-            return Some(expr);
-        }
-
-        // If not local, check if it's an imported symbol
-        if let Some(imported) = self.imported_symbols.get(name) {
-            // Check if we have the exported value from the source module
-            if let Some(expr) = self.exported_variables.get(&imported.imported_name) {
-                return Some(expr);
-            }
-        }
-
-        None
     }
 
     fn resolve_template_string(&self, tpl: &Tpl) -> Option<String> {
@@ -393,7 +393,7 @@ impl Visit for DependencyVisitor {
                             local_name: local_name.clone(),
                             imported_name: local_name,
                             source: source.clone(),
-                            kind: SymbolKind::Named,
+                            kind: SymbolKind::Namespace,
                         },
                     );
                 }

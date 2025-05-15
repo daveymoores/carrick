@@ -1,8 +1,35 @@
-use crate::visitor::{ImportedSymbol, Json, SymbolKind};
+use crate::visitor::{ImportedSymbol, Json};
 use std::collections::HashMap;
 use swc_ecma_ast::*;
 
 pub trait CoreExtractor {
+    fn resolve_variable(&self, name: &str) -> Option<&Expr> {
+        None
+    }
+
+    fn extract_env_var_from_expr(&self, expr: &Expr) -> Option<String> {
+        // Check if expression is process.env.X
+        if let Expr::Member(member_expr) = expr {
+            if let Expr::Member(process_env) = &*member_expr.obj {
+                // Check if obj is "process"
+                if let Expr::Ident(process) = &*process_env.obj {
+                    if process.sym == *"process" {
+                        // Check if prop is "env"
+                        if let MemberProp::Ident(env) = &process_env.prop {
+                            if env.sym == *"env" {
+                                // It's process.env, extract the variable name
+                                if let MemberProp::Ident(var_name) = &member_expr.prop {
+                                    return Some(var_name.sym.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn extract_params_from_route(&self, route: &str) -> Vec<String> {
         let param_pattern = regex::Regex::new(r":(\w+)").unwrap();
         let mut params = Vec::new();
@@ -489,88 +516,61 @@ pub trait CoreExtractor {
             // Regular string literal
             Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
 
-            // Template literal
-            Expr::Tpl(tpl) => {
-                // Check if the template starts with an env var (first quasi is empty and has at least one expression)
-                if tpl.quasis[0].raw.is_empty() && tpl.exprs.len() > 0 {
-                    // Check if first expression is process.env.X
-                    if let Expr::Member(member_expr) = &*tpl.exprs[0] {
-                        // Check for nested member expression pattern (process.env.X)
-                        if let Expr::Member(process_env) = &*member_expr.obj {
-                            // Check if obj is "process"
-                            if let Expr::Ident(process) = &*process_env.obj {
-                                if process.sym != *"process" {
-                                    // Not "process", use normal processing
-                                    return self.process_normal_template(tpl);
-                                }
+            // Template literal - use our improved template processor
+            Expr::Tpl(tpl) => self.process_template(tpl),
 
-                                // Check if prop is "env"
-                                match &process_env.prop {
-                                    MemberProp::Ident(env) => {
-                                        if env.sym != *"env" {
-                                            // Not "env", use normal processing
-                                            return self.process_normal_template(tpl);
-                                        }
-
-                                        // It's process.env, now extract the variable name
-                                        match &member_expr.prop {
-                                            MemberProp::Ident(var_name) => {
-                                                let env_var = var_name.sym.to_string();
-
-                                                // Build the remainder path from the rest of the template
-                                                let mut path = String::new();
-                                                for i in 1..tpl.quasis.len() {
-                                                    path.push_str(&tpl.quasis[i].raw);
-
-                                                    // Add param placeholders for any remaining expressions
-                                                    if i < tpl.exprs.len() {
-                                                        path.push_str("/:id"); // Use a consistent param name
-                                                    }
-                                                }
-
-                                                // Return special ENV_VAR format
-                                                return Some(format!(
-                                                    "ENV_VAR:{}:{}",
-                                                    env_var, path
-                                                ));
-                                            }
-                                            _ => {
-                                                // Not a simple identifier, use normal processing
-                                                return self.process_normal_template(tpl);
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        // Not a simple identifier, use normal processing
-                                        return self.process_normal_template(tpl);
-                                    }
-                                }
-                            }
-                        }
+            // Variable reference - try to resolve it
+            Expr::Ident(ident) => {
+                if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                    match resolved {
+                        Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
+                        Expr::Tpl(tpl) => self.process_template(tpl),
+                        // Add other cases as needed
+                        _ => None,
                     }
+                } else {
+                    None
                 }
-
-                // Regular template processing (no env var at the start)
-                self.process_normal_template(tpl)
             }
+
             // Add other patterns as needed
             _ => None,
         }
     }
 
-    fn process_normal_template(&self, tpl: &Tpl) -> Option<String> {
+    fn process_template(&self, tpl: &Tpl) -> Option<String> {
         let mut route = String::new();
 
-        // Just concatenate the raw parts of the template
-        // We don't need specific parameter names for matching with matchit
+        // Concatenate the raw parts of the template with appropriate placeholders
         for (i, quasi) in tpl.quasis.iter().enumerate() {
             // Add the raw text part
             route.push_str(&quasi.raw);
 
             // If there's an expression after this quasi
             if i < tpl.exprs.len() {
-                // Add a simple parameter placeholder
-                route.push_str(":id");
+                // Check if it's an environment variable
+                if let Some(env_var) = self.extract_env_var_from_expr(&tpl.exprs[i]) {
+                    // Use a special format for env vars
+                    route.push_str(&format!("ENV_VAR:{}:", env_var));
+                }
+                // Check if it's a variable reference
+                else if let Expr::Ident(ident) = &*tpl.exprs[i] {
+                    // For variables, check if they're from environment variables
+                    if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                        if let Some(env_var) = self.extract_env_var_from_expr(resolved) {
+                            route.push_str(&format!("ENV_VAR:{}:", env_var));
+                        } else {
+                            // Regular variable, use parameter placeholder
+                            route.push_str("{param}");
+                        }
+                    } else {
+                        // Can't resolve, use generic parameter
+                        route.push_str("{param}");
+                    }
+                } else {
+                    // For other expressions, use generic parameter placeholder
+                    route.push_str("{param}");
+                }
             }
         }
 
@@ -703,7 +703,6 @@ pub trait CoreExtractor {
 
 pub trait RouteExtractor: CoreExtractor {
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
-    fn resolve_variable(&self, name: &str) -> Option<&Expr>;
     fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;
     fn get_imported_symbols(&self) -> &HashMap<String, ImportedSymbol>;
     fn get_response_fields(&self) -> &HashMap<String, Json>;
