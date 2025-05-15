@@ -61,7 +61,7 @@ impl Config {
     }
 
     pub fn is_external_call(&self, route: &str) -> bool {
-        // Check if route starts with any internal env var
+        // Check if route starts with any external env var
         if route.starts_with("ENV_VAR:") {
             let parts: Vec<&str> = route.split(':').collect();
             if parts.len() >= 2 {
@@ -70,7 +70,7 @@ impl Config {
             }
         }
 
-        // Check if route starts with any internal domain
+        // Check if route starts with any external domain
         self.external_domains
             .iter()
             .any(|domain| route.starts_with(domain))
