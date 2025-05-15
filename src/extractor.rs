@@ -561,15 +561,15 @@ pub trait CoreExtractor {
                             route.push_str(&format!("ENV_VAR:{}:", env_var));
                         } else {
                             // Regular variable, use parameter placeholder
-                            route.push_str("{param}");
+                            route.push_str(":param");
                         }
                     } else {
                         // Can't resolve, use generic parameter
-                        route.push_str("{param}");
+                        route.push_str(":param");
                     }
                 } else {
                     // For other expressions, use generic parameter placeholder
-                    route.push_str("{param}");
+                    route.push_str(":param");
                 }
             }
         }

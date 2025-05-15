@@ -378,6 +378,7 @@ impl Analyzer {
         // Try to match the route with matchit
         match router.at(route) {
             Ok(matched) => {
+                //println!("{:?}", matched);
                 // Now we get back a Vec<(String, String)> of route-method pairs
                 let route_methods = matched.value;
 
@@ -595,6 +596,12 @@ impl Analyzer {
         new_endpoints
     }
 
+    fn normalize_route_params(&self, route: &str) -> String {
+        // Use a regex to replace all parameter placeholders with a consistent name
+        let param_regex = regex::Regex::new(r":([\w]+)").unwrap();
+        param_regex.replace_all(route, ":param").to_string()
+    }
+
     fn build_endpoint_router(&mut self) {
         let mut router = matchit::Router::new();
 
@@ -602,8 +609,10 @@ impl Analyzer {
         let mut path_to_endpoints: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for endpoint in &self.endpoints {
+            let normalized_route = self.normalize_route_params(&endpoint.route);
+
             path_to_endpoints
-                .entry(endpoint.route.clone())
+                .entry(normalized_route)
                 .or_insert_with(Vec::new)
                 .push((endpoint.route.clone(), endpoint.method.clone()));
         }
