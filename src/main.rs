@@ -134,7 +134,7 @@ fn main() {
             module.visit_with(&mut visitor);
 
             // Queue imported router files that might be used with app.use or router.use
-            for (name, source_path) in &visitor.imported_functions {
+            for (name, symbol) in &visitor.imported_symbols {
                 // Check if this import is used as a router in a mount
                 let is_router = visitor.mounts.iter().any(|mount| {
                     match &mount.child {
@@ -149,10 +149,10 @@ fn main() {
                 });
 
                 if is_router {
-                    println!("Following import '{}' from '{}'", name, source_path);
+                    println!("Following import '{}' from '{}'", name, symbol.source);
 
                     // Try to resolve the relative import path
-                    if let Some(resolved_path) = resolve_import_path(&file_path, source_path) {
+                    if let Some(resolved_path) = resolve_import_path(&file_path, &symbol.source) {
                         println!("Resolved to: {}", resolved_path.display());
 
                         // Queue for processing with the imported router name

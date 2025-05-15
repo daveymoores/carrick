@@ -269,32 +269,54 @@ impl Analyzer {
         // Check each call against endpoints
         for api_call_details in &self.calls {
             // Process the call based on its type
-            let path_to_match = if api_call_details.route.starts_with("ENV_VAR:") {
-                // Handle environment variable calls
-                let parts: Vec<&str> = api_call_details.route.split(':').collect();
-                if parts.len() < 3 {
-                    // Invalid format, treat as regular call
-                    api_call_details.route.clone()
-                } else {
-                    let env_var = parts[1];
-                    let path = parts[2..].join(":");
+            let path_to_match = if api_call_details.route.contains("ENV_VAR:") {
+                // First check if this is a known external API call
+                if self.config.is_external_call(&api_call_details.route) {
+                    // Skip external API calls entirely
+                    continue;
+                }
+                // Then check if it's a known internal API call
+                else if self.config.is_internal_call(&api_call_details.route) {
+                    // For internal calls, extract the path portion without the ENV_VAR prefix
+                    let mut clean_path = String::new();
+                    let segments: Vec<&str> = api_call_details.route.split("ENV_VAR:").collect();
 
-                    // Check the type of env var call
-                    if self.config.is_external_call(&api_call_details.route) {
-                        // Skip external API calls entirely
-                        continue;
-                    } else if self.config.is_internal_call(&api_call_details.route) {
-                        // For internal calls, use the path portion for matching
-                        path
-                    } else {
-                        // This is an unknown env var
-                        env_var_calls.push(format!(
-                            "Environment variable endpoint: {} ${{process.env.{}}}{}",
-                            api_call_details.method, env_var, path
-                        ));
-                        // Skip further processing
-                        continue;
+                    // Add the part before any ENV_VAR marker
+                    clean_path.push_str(segments[0]);
+
+                    // Process each segment with an ENV_VAR marker
+                    for i in 1..segments.len() {
+                        let subparts: Vec<&str> = segments[i].splitn(2, ':').collect();
+                        if subparts.len() == 2 {
+                            clean_path.push_str(subparts[1]);
+                        }
                     }
+
+                    clean_path
+                }
+                // Otherwise it's an unknown env var
+                else {
+                    // Extract the env var names for the error message
+                    let mut env_vars = Vec::new();
+                    let segments = api_call_details.route.split("ENV_VAR:");
+
+                    for segment in segments.skip(1) {
+                        // Skip the first segment (before any ENV_VAR)
+                        let parts: Vec<&str> = segment.splitn(2, ':').collect();
+                        if !parts.is_empty() {
+                            env_vars.push(parts[0].to_string());
+                        }
+                    }
+
+                    // Format the error message
+                    let env_var_list = env_vars.join(", ");
+                    env_var_calls.push(format!(
+                        "Environment variable endpoint: {} using env vars [{}] in {}",
+                        api_call_details.method, env_var_list, api_call_details.route
+                    ));
+
+                    // Skip further processing
+                    continue;
                 }
             } else {
                 // Regular call - use the full route
@@ -356,6 +378,7 @@ impl Analyzer {
         // Try to match the route with matchit
         match router.at(route) {
             Ok(matched) => {
+                //println!("{:?}", matched);
                 // Now we get back a Vec<(String, String)> of route-method pairs
                 let route_methods = matched.value;
 
@@ -573,6 +596,12 @@ impl Analyzer {
         new_endpoints
     }
 
+    fn normalize_route_params(&self, route: &str) -> String {
+        // Use a regex to replace all parameter placeholders with a consistent name
+        let param_regex = regex::Regex::new(r":([\w]+)").unwrap();
+        param_regex.replace_all(route, ":param").to_string()
+    }
+
     fn build_endpoint_router(&mut self) {
         let mut router = matchit::Router::new();
 
@@ -580,8 +609,10 @@ impl Analyzer {
         let mut path_to_endpoints: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for endpoint in &self.endpoints {
+            let normalized_route = self.normalize_route_params(&endpoint.route);
+
             path_to_endpoints
-                .entry(endpoint.route.clone())
+                .entry(normalized_route)
                 .or_insert_with(Vec::new)
                 .push((endpoint.route.clone(), endpoint.method.clone()));
         }

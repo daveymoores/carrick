@@ -1,8 +1,35 @@
-use crate::visitor::Json;
+use crate::visitor::{ImportedSymbol, Json};
 use std::collections::HashMap;
 use swc_ecma_ast::*;
 
 pub trait CoreExtractor {
+    fn resolve_variable(&self, name: &str) -> Option<&Expr> {
+        None
+    }
+
+    fn extract_env_var_from_expr(&self, expr: &Expr) -> Option<String> {
+        // Check if expression is process.env.X
+        if let Expr::Member(member_expr) = expr {
+            if let Expr::Member(process_env) = &*member_expr.obj {
+                // Check if obj is "process"
+                if let Expr::Ident(process) = &*process_env.obj {
+                    if process.sym == *"process" {
+                        // Check if prop is "env"
+                        if let MemberProp::Ident(env) = &process_env.prop {
+                            if env.sym == *"env" {
+                                // It's process.env, extract the variable name
+                                if let MemberProp::Ident(var_name) = &member_expr.prop {
+                                    return Some(var_name.sym.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn extract_params_from_route(&self, route: &str) -> Vec<String> {
         let param_pattern = regex::Regex::new(r":(\w+)").unwrap();
         let mut params = Vec::new();
@@ -489,88 +516,61 @@ pub trait CoreExtractor {
             // Regular string literal
             Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
 
-            // Template literal
-            Expr::Tpl(tpl) => {
-                // Check if the template starts with an env var (first quasi is empty and has at least one expression)
-                if tpl.quasis[0].raw.is_empty() && tpl.exprs.len() > 0 {
-                    // Check if first expression is process.env.X
-                    if let Expr::Member(member_expr) = &*tpl.exprs[0] {
-                        // Check for nested member expression pattern (process.env.X)
-                        if let Expr::Member(process_env) = &*member_expr.obj {
-                            // Check if obj is "process"
-                            if let Expr::Ident(process) = &*process_env.obj {
-                                if process.sym != *"process" {
-                                    // Not "process", use normal processing
-                                    return self.process_normal_template(tpl);
-                                }
+            // Template literal - use our improved template processor
+            Expr::Tpl(tpl) => self.process_template(tpl),
 
-                                // Check if prop is "env"
-                                match &process_env.prop {
-                                    MemberProp::Ident(env) => {
-                                        if env.sym != *"env" {
-                                            // Not "env", use normal processing
-                                            return self.process_normal_template(tpl);
-                                        }
-
-                                        // It's process.env, now extract the variable name
-                                        match &member_expr.prop {
-                                            MemberProp::Ident(var_name) => {
-                                                let env_var = var_name.sym.to_string();
-
-                                                // Build the remainder path from the rest of the template
-                                                let mut path = String::new();
-                                                for i in 1..tpl.quasis.len() {
-                                                    path.push_str(&tpl.quasis[i].raw);
-
-                                                    // Add param placeholders for any remaining expressions
-                                                    if i < tpl.exprs.len() {
-                                                        path.push_str("/:id"); // Use a consistent param name
-                                                    }
-                                                }
-
-                                                // Return special ENV_VAR format
-                                                return Some(format!(
-                                                    "ENV_VAR:{}:{}",
-                                                    env_var, path
-                                                ));
-                                            }
-                                            _ => {
-                                                // Not a simple identifier, use normal processing
-                                                return self.process_normal_template(tpl);
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        // Not a simple identifier, use normal processing
-                                        return self.process_normal_template(tpl);
-                                    }
-                                }
-                            }
-                        }
+            // Variable reference - try to resolve it
+            Expr::Ident(ident) => {
+                if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                    match resolved {
+                        Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
+                        Expr::Tpl(tpl) => self.process_template(tpl),
+                        // Add other cases as needed
+                        _ => None,
                     }
+                } else {
+                    None
                 }
-
-                // Regular template processing (no env var at the start)
-                self.process_normal_template(tpl)
             }
+
             // Add other patterns as needed
             _ => None,
         }
     }
 
-    fn process_normal_template(&self, tpl: &Tpl) -> Option<String> {
+    fn process_template(&self, tpl: &Tpl) -> Option<String> {
         let mut route = String::new();
 
-        // Just concatenate the raw parts of the template
-        // We don't need specific parameter names for matching with matchit
+        // Concatenate the raw parts of the template with appropriate placeholders
         for (i, quasi) in tpl.quasis.iter().enumerate() {
             // Add the raw text part
             route.push_str(&quasi.raw);
 
             // If there's an expression after this quasi
             if i < tpl.exprs.len() {
-                // Add a simple parameter placeholder
-                route.push_str(":id");
+                // Check if it's an environment variable
+                if let Some(env_var) = self.extract_env_var_from_expr(&tpl.exprs[i]) {
+                    // Use a special format for env vars
+                    route.push_str(&format!("ENV_VAR:{}:", env_var));
+                }
+                // Check if it's a variable reference
+                else if let Expr::Ident(ident) = &*tpl.exprs[i] {
+                    // For variables, check if they're from environment variables
+                    if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                        if let Some(env_var) = self.extract_env_var_from_expr(resolved) {
+                            route.push_str(&format!("ENV_VAR:{}:", env_var));
+                        } else {
+                            // Regular variable, use parameter placeholder
+                            route.push_str(":param");
+                        }
+                    } else {
+                        // Can't resolve, use generic parameter
+                        route.push_str(":param");
+                    }
+                } else {
+                    // For other expressions, use generic parameter placeholder
+                    route.push_str(":param");
+                }
             }
         }
 
@@ -702,7 +702,9 @@ pub trait CoreExtractor {
 }
 
 pub trait RouteExtractor: CoreExtractor {
-    fn get_imported_functions(&self) -> &HashMap<String, String>;
+    fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
+    fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;
+    fn get_imported_symbols(&self) -> &HashMap<String, ImportedSymbol>;
     fn get_response_fields(&self) -> &HashMap<String, Json>;
     fn add_imported_handler(
         &mut self,
@@ -712,6 +714,56 @@ pub trait RouteExtractor: CoreExtractor {
         source: String,
     );
 
+    fn extract_string_from_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
+            Expr::Tpl(tpl) => self.resolve_template_string(tpl),
+            Expr::Ident(ident) => {
+                // Try to resolve the variable
+                let var_name = ident.sym.to_string();
+                if let Some(resolved_expr) = self.resolve_variable(&var_name) {
+                    return self.extract_string_from_expr(resolved_expr);
+                }
+                None
+            }
+            // Handle other expression types that could resolve to strings
+            // For example, member expressions like config.API_URL
+            Expr::Member(member) => self.extract_string_from_member_expr(member),
+            _ => None,
+        }
+    }
+
+    fn extract_string_from_member_expr(&self, member: &MemberExpr) -> Option<String> {
+        // For simple cases like obj.prop where obj is a variable
+        if let Expr::Ident(obj_ident) = &*member.obj {
+            let obj_name = obj_ident.sym.to_string();
+
+            // Try to resolve the object
+            if let Some(resolved_obj) = self.resolve_variable(&obj_name) {
+                // If it's an object literal, extract the property
+                if let Expr::Object(obj_lit) = resolved_obj {
+                    if let MemberProp::Ident(prop_ident) = &member.prop {
+                        let prop_name = prop_ident.sym.to_string();
+
+                        // Find the property in the object
+                        for prop in &obj_lit.props {
+                            if let PropOrSpread::Prop(box_prop) = prop {
+                                if let Prop::KeyValue(kv) = &**box_prop {
+                                    if let PropName::Ident(key_ident) = &kv.key {
+                                        if key_ident.sym.to_string() == prop_name {
+                                            return self.extract_string_from_expr(&kv.value);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn extract_endpoint(
         &mut self,
         call: &CallExpr,
@@ -719,13 +771,36 @@ pub trait RouteExtractor: CoreExtractor {
     ) -> Option<(String, Json, Option<Json>)> {
         // Implementation using the existing methods from CoreExtractor
         // Get the route from the first argument
-        let route = call.args.get(0)?.expr.as_lit()?.as_str()?.value.to_string();
+        // Get the first argument (route path)
+        let first_arg = call.args.get(0)?;
+        let route = self.extract_string_from_expr(&first_arg.expr)?;
 
         let mut response_json = Json::Null;
         let mut request_json = None;
 
         // Check the second argument (handler)
         if let Some(second_arg) = call.args.get(1) {
+            if let Some(handler_name) = self.get_route_handler_name(&second_arg.expr) {
+                // Check if this handler is an imported function
+                if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
+                    // Track this imported handler usage
+                    self.add_imported_handler(
+                        route.clone(),
+                        method.to_string(),
+                        handler_name.clone(),
+                        symbol.source.clone(),
+                    );
+
+                    // Look up the response fields for this handler
+                    if let Some(fields) = self.get_response_fields().get(&handler_name) {
+                        response_json = fields.clone();
+                    }
+
+                    // We've handled this case, so we can return early
+                    return Some((route, response_json, request_json));
+                }
+            }
+
             match &*second_arg.expr {
                 // Arrow function handler
                 Expr::Arrow(arrow_expr) => {
@@ -775,13 +850,13 @@ pub trait RouteExtractor: CoreExtractor {
                     let handler_name = ident.sym.to_string();
 
                     // Check if this handler is an imported function
-                    if let Some(source) = self.get_imported_functions().get(&handler_name) {
+                    if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
                         // Track this imported handler usage
                         self.add_imported_handler(
                             route.clone(),
                             method.to_string(),
                             handler_name.clone(),
-                            source.clone(),
+                            symbol.source.clone(),
                         );
 
                         if let Some(fields) = self.get_response_fields().get(&handler_name) {

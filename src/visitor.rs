@@ -74,6 +74,21 @@ pub struct Call {
 }
 
 #[derive(Debug)]
+pub enum SymbolKind {
+    Named,
+    Default,
+    Namespace,
+}
+
+#[derive(Debug)]
+pub struct ImportedSymbol {
+    pub local_name: String,
+    pub imported_name: String,
+    pub source: String,
+    pub kind: SymbolKind,
+}
+
+#[derive(Debug)]
 pub struct DependencyVisitor {
     pub repo_prefix: String,
     pub endpoints: Vec<Endpoint>, // (route, method, response fields, request fields)
@@ -81,7 +96,6 @@ pub struct DependencyVisitor {
     pub mounts: Vec<Mount>,
     pub response_fields: HashMap<String, Json>, // Function name -> expected fields
     // Maps function names to their source modules to find functon_definitions in second pass analysis
-    pub imported_functions: HashMap<String, String>,
     pub current_file: PathBuf,
     // <Route, http_method, handler_name, source>
     pub imported_handlers: Vec<(String, String, String, String)>,
@@ -96,6 +110,9 @@ pub struct DependencyVisitor {
     pub express_apps: HashMap<String, AppContext>, // app_name -> AppContext
     // Track routers with their full context
     pub routers: HashMap<String, RouterContext>, // router_name -> RouterContext
+    pub exported_variables: HashMap<String, Expr>,
+    pub imported_symbols: HashMap<String, ImportedSymbol>,
+    pub variable_values: HashMap<String, Expr>,
 }
 
 impl DependencyVisitor {
@@ -110,7 +127,6 @@ impl DependencyVisitor {
             calls: Vec::new(),
             mounts: Vec::new(),
             response_fields: HashMap::new(),
-            imported_functions: HashMap::new(),
             current_file: file_path,
             imported_handlers: Vec::new(),
             function_definitions: HashMap::new(),
@@ -120,15 +136,107 @@ impl DependencyVisitor {
             express_import_name: None,
             express_apps: HashMap::new(),
             has_express_import: false,
+            exported_variables: HashMap::new(),
+            imported_symbols: HashMap::new(),
+            variable_values: HashMap::new(),
         }
     }
 }
 
-impl CoreExtractor for DependencyVisitor {}
+impl CoreExtractor for DependencyVisitor {
+    fn resolve_variable(&self, name: &str) -> Option<&Expr> {
+        // First check if it's a local variable
+        if let Some(expr) = self.variable_values.get(name) {
+            return Some(expr);
+        }
+
+        // If not local, check if it's an imported symbol
+        if let Some(imported) = self.imported_symbols.get(name) {
+            // Check if we have the exported value from the source module
+            if let Some(expr) = self.exported_variables.get(&imported.imported_name) {
+                return Some(expr);
+            }
+        }
+
+        None
+    }
+}
 
 impl RouteExtractor for DependencyVisitor {
-    fn get_imported_functions(&self) -> &HashMap<String, String> {
-        &self.imported_functions
+    fn get_route_handler_name(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(ident) => Some(ident.sym.to_string()),
+            Expr::Member(member) => {
+                // Handle cases like module.handler
+                if let (Expr::Ident(obj), MemberProp::Ident(prop)) = (&*member.obj, &member.prop) {
+                    let obj_name = obj.sym.to_string();
+                    let prop_name = prop.sym.to_string();
+
+                    // Check if this is an imported namespace
+                    if let Some(imported) = self.imported_symbols.get(&obj_name) {
+                        if let SymbolKind::Namespace = imported.kind {
+                            // Return the qualified name
+                            return Some(format!("{}:{}", imported.source, prop_name));
+                        }
+                    }
+                }
+                None
+            }
+            // Try to resolve the expression to a handler name
+            _ => None,
+        }
+    }
+
+    fn resolve_template_string(&self, tpl: &Tpl) -> Option<String> {
+        // Only handle simple cases for now
+        if tpl.exprs.len() > 0 {
+            let mut result = String::new();
+
+            // Iterate through quasis and expressions
+            let mut quasi_iter = tpl.quasis.iter();
+
+            // Always start with a quasi (could be empty)
+            if let Some(first_quasi) = quasi_iter.next() {
+                result.push_str(&first_quasi.raw.to_string());
+            }
+
+            // Then alternate between expressions and quasis
+            for expr in &tpl.exprs {
+                // Try to resolve the expression
+                match &**expr {
+                    Expr::Ident(ident) => {
+                        if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                            // For now, just handle string literals in template expressions
+                            if let Expr::Lit(Lit::Str(str_lit)) = resolved {
+                                result.push_str(&str_lit.value.to_string());
+                            } else {
+                                // Can't fully resolve - return None
+                                return None;
+                            }
+                        } else {
+                            // Can't resolve this variable
+                            return None;
+                        }
+                    }
+                    // Add more expression types as needed
+                    _ => return None,
+                }
+
+                // Add the next quasi if available
+                if let Some(quasi) = quasi_iter.next() {
+                    result.push_str(&quasi.raw.to_string());
+                }
+            }
+
+            return Some(result);
+        }
+
+        // Simple template with no expressions
+        Some(tpl.quasis.iter().map(|q| q.raw.to_string()).collect())
+    }
+
+    fn get_imported_symbols(&self) -> &HashMap<String, ImportedSymbol> {
+        &self.imported_symbols
     }
 
     fn get_response_fields(&self) -> &HashMap<String, Json> {
@@ -150,19 +258,20 @@ impl RouteExtractor for DependencyVisitor {
 impl Visit for DependencyVisitor {
     // Track ES Module exports
     fn visit_export_decl(&mut self, export: &ExportDecl) {
-        // Handle different export types
         match &export.decl {
             // For "export const x = ..."
             Decl::Var(var_decl) => {
                 for decl in &var_decl.decls {
                     if let Pat::Ident(ident) = &decl.name {
                         let exported_name = ident.id.sym.to_string();
-
-                        // Check what's being exported
                         if let Some(init) = &decl.init {
+                            // Always store the initializer for variable exports
+                            self.exported_variables
+                                .insert(exported_name.clone(), *init.clone());
+
+                            // If it's a function, also store in function_definitions/response_fields
                             match &**init {
                                 Expr::Arrow(arrow) => {
-                                    // Store the function definition for later analysis
                                     self.function_definitions.insert(
                                         exported_name.clone(),
                                         FunctionDefinition {
@@ -173,14 +282,11 @@ impl Visit for DependencyVisitor {
                                             )),
                                         },
                                     );
-
-                                    // You can still extract fields here if you want
                                     let fields = self.extract_fields_from_arrow(arrow);
                                     self.response_fields.insert(exported_name.clone(), fields);
                                 }
                                 // Regular function export: export const handler = function() {...}
                                 Expr::Fn(fn_expr) => {
-                                    // Store the function definition for later analysis
                                     self.function_definitions.insert(
                                         exported_name.clone(),
                                         FunctionDefinition {
@@ -191,12 +297,9 @@ impl Visit for DependencyVisitor {
                                             ),
                                         },
                                     );
-
-                                    // Extract response fields from the function
                                     let fields = self.extract_fields_from_function_expr(fn_expr);
                                     self.response_fields.insert(exported_name.clone(), fields);
                                 }
-                                // Other export type
                                 _ => {}
                             }
                         }
@@ -206,7 +309,6 @@ impl Visit for DependencyVisitor {
             // For "export function x() {...}"
             Decl::Fn(fn_decl) => {
                 let exported_name = fn_decl.ident.sym.to_string();
-
                 self.function_definitions.insert(
                     exported_name.clone(),
                     FunctionDefinition {
@@ -215,8 +317,6 @@ impl Visit for DependencyVisitor {
                         node_type: FunctionNodeType::FunctionDeclaration(Box::new(fn_decl.clone())),
                     },
                 );
-
-                // Extract fields
                 let fields = self.extract_fields_from_function_decl(fn_decl);
                 self.response_fields.insert(exported_name.clone(), fields);
             }
@@ -261,19 +361,41 @@ impl Visit for DependencyVisitor {
                 ImportSpecifier::Named(named) => {
                     // Handle named imports: import { func } from './module'
                     let local_name = named.local.sym.to_string();
-                    // Track this imported function
-                    self.imported_functions.insert(local_name, source.clone());
+                    self.imported_symbols.insert(
+                        local_name.to_string(),
+                        ImportedSymbol {
+                            local_name: local_name.clone(),
+                            imported_name: local_name,
+                            source: source.clone(),
+                            kind: SymbolKind::Named,
+                        },
+                    );
                 }
                 ImportSpecifier::Default(default) => {
                     // Handle default imports: import func from './module'
                     let local_name = default.local.sym.to_string();
-                    // Track this imported function
-                    self.imported_functions.insert(local_name, source.clone());
+                    self.imported_symbols.insert(
+                        local_name.to_string(),
+                        ImportedSymbol {
+                            local_name: local_name.clone(),
+                            imported_name: local_name,
+                            source: source.clone(),
+                            kind: SymbolKind::Default,
+                        },
+                    );
                 }
                 ImportSpecifier::Namespace(namespace) => {
                     // Handle namespace imports: import * as mod from './module'
-                    let _local_name = namespace.local.sym.to_string();
-                    // Not tracking these directly as they're not individual functions
+                    let local_name = namespace.local.sym.to_string();
+                    self.imported_symbols.insert(
+                        local_name.to_string(),
+                        ImportedSymbol {
+                            local_name: local_name.clone(),
+                            imported_name: local_name,
+                            source: source.clone(),
+                            kind: SymbolKind::Namespace,
+                        },
+                    );
                 }
             }
         }
@@ -282,11 +404,14 @@ impl Visit for DependencyVisitor {
     fn visit_var_decl(&mut self, var_decl: &VarDecl) {
         for decl in &var_decl.decls {
             if let Some(init) = &decl.init {
+                if let Pat::Ident(ident) = &decl.name {
+                    self.variable_values
+                        .insert(ident.id.sym.to_string(), *init.clone());
+                }
                 // Check if the initializer is a call expression
                 if let Expr::Call(call_expr) = &**init {
                     if let Pat::Ident(ident) = &decl.name {
                         let var_name = ident.id.sym.as_str();
-
                         // Check if this is a router creation
                         if self.is_router_creation(call_expr) {
                             // If this is the 'router' variable and we have an imported name,
@@ -449,17 +574,6 @@ impl DependencyVisitor {
         false
     }
 
-    fn extract_string_from_expr(&self, expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
-            Expr::Tpl(tpl) if tpl.exprs.is_empty() => {
-                // Handle simple template literals with no expressions
-                Some(tpl.quasis.iter().map(|q| q.raw.to_string()).collect())
-            }
-            _ => None,
-        }
-    }
-
     fn get_path_prefix_from_use_call(&self, args: &[ExprOrSpread]) -> (String, usize) {
         // Determine if the first argument is a path or a middleware/router
         let (path_prefix, target_arg_idx) = if args.len() >= 2 {
@@ -496,7 +610,19 @@ impl DependencyVisitor {
                 let target_name = target_ident.sym.as_str();
                 let prefixed_target_name = self.prefix_owner_type(target_name);
 
-                println!("App use: {}({}) -> {}", app_name, path_prefix, target_name);
+                // Check if this is an imported symbol
+                if let Some(imported) = self.imported_symbols.get(target_name) {
+                    println!(
+                        "App use: {}({}) -> {} (imported from {})",
+                        app_name, path_prefix, target_name, imported.source
+                    );
+
+                    // This is the important part - record that we need to
+                    // analyze the module this router was imported from
+                    // The caller would need to handle this information
+                } else {
+                    println!("App use: {}({}) -> {}", app_name, path_prefix, target_name);
+                }
 
                 // For ALL identifiers used with app.use, assume they could be routers
                 // and create the mount relationship
@@ -517,7 +643,7 @@ impl DependencyVisitor {
                     );
 
                     // If this is an import, log it specially
-                    if self.imported_functions.contains_key(target_name) {
+                    if self.imported_symbols.contains_key(target_name) {
                         println!("Detected use of imported router: {}", target_name);
                     }
                 }
@@ -561,7 +687,7 @@ impl DependencyVisitor {
                     );
 
                     // If this is an import, log it specially
-                    if self.imported_functions.contains_key(target_name) {
+                    if self.imported_symbols.contains_key(target_name) {
                         println!("Detected use of imported router: {}", target_name);
                     }
                 }
