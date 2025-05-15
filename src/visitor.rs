@@ -17,6 +17,19 @@ use crate::{
 };
 extern crate regex;
 
+#[derive(Debug, Clone)]
+pub struct FunctionArgument {
+    pub name: String,
+    pub type_ann: Option<TsTypeAnn>, // swc_ecma_ast::TsTypeAnn
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeReference {
+    pub type_name: String,
+    pub file_path: PathBuf,
+    pub type_ann: Option<Box<TsType>>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Json {
     Null,
@@ -41,6 +54,7 @@ pub struct FunctionDefinition {
     #[allow(dead_code)]
     pub file_path: PathBuf,
     pub node_type: FunctionNodeType,
+    pub arguments: Vec<FunctionArgument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,6 +77,9 @@ pub struct Endpoint {
     pub method: String,
     pub response: Json,
     pub request: Option<Json>,
+    pub response_type: Option<TypeReference>,
+    pub request_type: Option<TypeReference>,
+    pub handler_file: PathBuf,
 }
 
 #[derive(Debug)]
@@ -71,6 +88,9 @@ pub struct Call {
     pub method: String,
     pub response: Json,
     pub request: Option<Json>,
+    pub response_type: Option<TypeReference>,
+    pub request_type: Option<TypeReference>,
+    pub call_file: PathBuf,
 }
 
 #[derive(Debug)]
@@ -163,6 +183,9 @@ impl CoreExtractor for DependencyVisitor {
 }
 
 impl RouteExtractor for DependencyVisitor {
+    fn get_function_definition(&self, str: &str) -> Option<&FunctionDefinition> {
+        self.function_definitions.get(str)
+    }
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Ident(ident) => Some(ident.sym.to_string()),
@@ -272,6 +295,8 @@ impl Visit for DependencyVisitor {
                             // If it's a function, also store in function_definitions/response_fields
                             match &**init {
                                 Expr::Arrow(arrow) => {
+                                    let arguments =
+                                        self.extract_function_arguments_from_pats(&arrow.params);
                                     self.function_definitions.insert(
                                         exported_name.clone(),
                                         FunctionDefinition {
@@ -280,6 +305,7 @@ impl Visit for DependencyVisitor {
                                             node_type: FunctionNodeType::ArrowFunction(Box::new(
                                                 arrow.clone(),
                                             )),
+                                            arguments,
                                         },
                                     );
                                     let fields = self.extract_fields_from_arrow(arrow);
@@ -287,6 +313,9 @@ impl Visit for DependencyVisitor {
                                 }
                                 // Regular function export: export const handler = function() {...}
                                 Expr::Fn(fn_expr) => {
+                                    let arguments = self.extract_function_arguments_from_params(
+                                        &fn_expr.function.params,
+                                    );
                                     self.function_definitions.insert(
                                         exported_name.clone(),
                                         FunctionDefinition {
@@ -295,6 +324,7 @@ impl Visit for DependencyVisitor {
                                             node_type: FunctionNodeType::FunctionExpression(
                                                 Box::new(fn_expr.clone()),
                                             ),
+                                            arguments,
                                         },
                                     );
                                     let fields = self.extract_fields_from_function_expr(fn_expr);
@@ -308,6 +338,8 @@ impl Visit for DependencyVisitor {
             }
             // For "export function x() {...}"
             Decl::Fn(fn_decl) => {
+                let arguments =
+                    self.extract_function_arguments_from_params(&fn_decl.function.params);
                 let exported_name = fn_decl.ident.sym.to_string();
                 self.function_definitions.insert(
                     exported_name.clone(),
@@ -315,6 +347,7 @@ impl Visit for DependencyVisitor {
                         name: exported_name.clone(),
                         file_path: self.current_file.clone(),
                         node_type: FunctionNodeType::FunctionDeclaration(Box::new(fn_decl.clone())),
+                        arguments,
                     },
                 );
                 let fields = self.extract_fields_from_function_decl(fn_decl);
@@ -498,6 +531,32 @@ impl Visit for DependencyVisitor {
 }
 
 impl DependencyVisitor {
+    fn extract_function_arguments_from_pats(&self, params: &[Pat]) -> Vec<FunctionArgument> {
+        params
+            .iter()
+            .filter_map(|pat| match pat {
+                Pat::Ident(ident) => Some(FunctionArgument {
+                    name: ident.id.sym.to_string(),
+                    type_ann: ident.type_ann.clone().map(|b| *b),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn extract_function_arguments_from_params(&self, params: &[Param]) -> Vec<FunctionArgument> {
+        params
+            .iter()
+            .filter_map(|param| match &param.pat {
+                Pat::Ident(ident) => Some(FunctionArgument {
+                    name: ident.id.sym.to_string(),
+                    type_ann: ident.type_ann.clone().map(|b| *b),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn prefix_owner_type(&self, name: &str) -> String {
         format!("{}:{}", self.repo_prefix, name)
     }
@@ -713,22 +772,38 @@ impl DependencyVisitor {
         };
 
         if let Some(endpoint_data) = self.extract_endpoint(call, http_method) {
-            let (route, response_fields, request_fields) = endpoint_data;
+            println!("ENDPOINT ---> {:?}", endpoint_data);
+            let (route, response_fields, request_fields, request_type, response_type) =
+                endpoint_data;
 
-            // Store the endpoint with its initial path
+            // Log additional information about types if available
+            let type_info = match (&request_type, &response_type) {
+                (Some(req), Some(res)) => {
+                    format!(" (req: {}, res: {})", req.type_name, res.type_name)
+                }
+                (Some(req), None) => format!(" (req: {})", req.type_name),
+                (None, Some(res)) => format!(" (res: {})", res.type_name),
+                (None, None) => String::new(),
+            };
+
+            // Store the endpoint with its initial path and type information
             self.endpoints.push(Endpoint {
                 owner,
                 route: route.clone(),
                 method: http_method.to_string(),
                 response: response_fields.clone(),
                 request: request_fields.clone(),
+                response_type, // Add the new fields
+                request_type,
+                handler_file: self.current_file.clone(), // Assuming this is appropriate
             });
 
             println!(
-                "Detected endpoint: {} {} on {}",
+                "Detected endpoint: {} {} on {}{}",
                 http_method,
                 route,
-                self.get_owner_type(&effective_name)
+                self.get_owner_type(&effective_name),
+                type_info
             );
         }
     }

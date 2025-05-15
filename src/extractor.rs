@@ -1,4 +1,4 @@
-use crate::visitor::{ImportedSymbol, Json};
+use crate::visitor::{FunctionDefinition, ImportedSymbol, Json, TypeReference};
 use std::collections::HashMap;
 use swc_ecma_ast::*;
 
@@ -702,6 +702,7 @@ pub trait CoreExtractor {
 }
 
 pub trait RouteExtractor: CoreExtractor {
+    fn get_function_definition(&self, expr: &str) -> Option<&FunctionDefinition>;
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
     fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;
     fn get_imported_symbols(&self) -> &HashMap<String, ImportedSymbol>;
@@ -768,19 +769,49 @@ pub trait RouteExtractor: CoreExtractor {
         &mut self,
         call: &CallExpr,
         method: &str,
-    ) -> Option<(String, Json, Option<Json>)> {
-        // Implementation using the existing methods from CoreExtractor
+    ) -> Option<(
+        String,
+        Json,
+        Option<Json>,
+        Option<TypeReference>,
+        Option<TypeReference>,
+    )> {
         // Get the route from the first argument
-        // Get the first argument (route path)
         let first_arg = call.args.get(0)?;
         let route = self.extract_string_from_expr(&first_arg.expr)?;
 
         let mut response_json = Json::Null;
         let mut request_json = None;
+        let mut request_type = None;
+        let mut response_type = None;
 
         // Check the second argument (handler)
         if let Some(second_arg) = call.args.get(1) {
             if let Some(handler_name) = self.get_route_handler_name(&second_arg.expr) {
+                // Look up function definition for this handler
+                if let Some(func_def) = self.get_function_definition(handler_name.as_str()) {
+                    // Extract request and response types from the function arguments
+                    if func_def.arguments.len() >= 2 {
+                        // First argument is typically the request
+                        if let Some(type_ann) = &func_def.arguments[0].type_ann {
+                            request_type = Some(TypeReference {
+                                type_name: format!("{:?}", type_ann.type_ann),
+                                file_path: func_def.file_path.clone(),
+                                type_ann: Some(Box::new(*type_ann.type_ann.clone())),
+                            });
+                        }
+
+                        // Second argument is typically the response
+                        if let Some(type_ann) = &func_def.arguments[1].type_ann {
+                            response_type = Some(TypeReference {
+                                type_name: format!("{:?}", type_ann.type_ann),
+                                file_path: func_def.file_path.clone(),
+                                type_ann: Some(Box::new(*type_ann.type_ann.clone())),
+                            });
+                        }
+                    }
+                }
+
                 // Check if this handler is an imported function
                 if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
                     // Track this imported handler usage
@@ -797,7 +828,13 @@ pub trait RouteExtractor: CoreExtractor {
                     }
 
                     // We've handled this case, so we can return early
-                    return Some((route, response_json, request_json));
+                    return Some((
+                        route,
+                        response_json,
+                        request_json,
+                        request_type,
+                        response_type,
+                    ));
                 }
             }
 
@@ -869,6 +906,12 @@ pub trait RouteExtractor: CoreExtractor {
             }
         }
 
-        Some((route, response_json, request_json))
+        Some((
+            route,
+            response_json,
+            request_json,
+            request_type,
+            response_type,
+        ))
     }
 }

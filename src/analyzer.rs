@@ -6,8 +6,8 @@ use crate::{
     visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType},
 };
 use core::fmt;
-use std::collections::HashMap;
 use std::collections::HashSet;
+use std::{collections::HashMap, process::Command};
 
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
@@ -627,6 +627,21 @@ impl Analyzer {
         }
 
         self.endpoint_router = Some(router);
+    }
+
+    fn check_types_assignable(file_a: &str, type_a: &str, file_b: &str, type_b: &str) -> bool {
+        let output = Command::new("node")
+            .arg("ts_morph_helper/index.js")
+            .arg(file_a)
+            .arg(type_a)
+            .arg(file_b)
+            .arg(type_b)
+            .output()
+            .expect("Failed to run ts-morph helper");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        result["isAssignable"].as_bool().unwrap()
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
