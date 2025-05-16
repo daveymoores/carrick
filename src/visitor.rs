@@ -80,6 +80,7 @@ pub struct Endpoint {
     pub response_type: Option<TypeReference>,
     pub request_type: Option<TypeReference>,
     pub handler_file: PathBuf,
+    pub handler_name: String,
 }
 
 #[derive(Debug)]
@@ -183,9 +184,7 @@ impl CoreExtractor for DependencyVisitor {
 }
 
 impl RouteExtractor for DependencyVisitor {
-    fn get_function_definition(&self, str: &str) -> Option<&FunctionDefinition> {
-        self.function_definitions.get(str)
-    }
+    // Gets the name of the handler used on a router (possibly another router)
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Ident(ident) => Some(ident.sym.to_string()),
@@ -279,6 +278,32 @@ impl RouteExtractor for DependencyVisitor {
 }
 
 impl Visit for DependencyVisitor {
+    fn visit_fn_decl(&mut self, fn_decl: &FnDecl) {
+        // Get the function name
+        let fn_name = fn_decl.ident.sym.to_string();
+
+        // Extract arguments
+        let arguments = self.extract_function_arguments_from_params(&fn_decl.function.params);
+
+        // Store in function_definitions
+        self.function_definitions.insert(
+            fn_name.clone(),
+            FunctionDefinition {
+                name: fn_name.clone(),
+                file_path: self.current_file.clone(),
+                node_type: FunctionNodeType::FunctionDeclaration(Box::new(fn_decl.clone())),
+                arguments,
+            },
+        );
+
+        // Extract fields as you do for exported functions
+        let fields = self.extract_fields_from_function_decl(fn_decl);
+        self.response_fields.insert(fn_name.clone(), fields);
+
+        // Visit the function body
+        fn_decl.function.visit_children_with(self);
+    }
+
     // Track ES Module exports
     fn visit_export_decl(&mut self, export: &ExportDecl) {
         match &export.decl {
@@ -438,62 +463,116 @@ impl Visit for DependencyVisitor {
         for decl in &var_decl.decls {
             if let Some(init) = &decl.init {
                 if let Pat::Ident(ident) = &decl.name {
-                    self.variable_values
-                        .insert(ident.id.sym.to_string(), *init.clone());
-                }
-                // Check if the initializer is a call expression
-                if let Expr::Call(call_expr) = &**init {
-                    if let Pat::Ident(ident) = &decl.name {
-                        let var_name = ident.id.sym.as_str();
-                        // Check if this is a router creation
-                        if self.is_router_creation(call_expr) {
-                            // If this is the 'router' variable and we have an imported name,
-                            // use the imported name instead
-                            let router_name =
-                                if var_name == "router" && self.imported_router_name.is_some() {
-                                    self.imported_router_name.as_ref().unwrap().as_str()
-                                } else {
-                                    var_name
-                                };
+                    let var_name = ident.id.sym.to_string();
 
-                            let prefixed_router_name = self.prefix_owner_type(router_name);
+                    // Store variable value for later reference
+                    self.variable_values.insert(var_name.clone(), *init.clone());
 
-                            // Add the router to the `routers` map with an initial context
-                            self.routers.insert(
-                                prefixed_router_name.clone(),
-                                RouterContext {
-                                    name: prefixed_router_name.clone(),
+                    // Now check different expression types
+                    match &**init {
+                        // Arrow function
+                        Expr::Arrow(arrow) => {
+                            let arguments =
+                                self.extract_function_arguments_from_pats(&arrow.params);
+                            self.function_definitions.insert(
+                                var_name.clone(),
+                                FunctionDefinition {
+                                    name: var_name.clone(),
+                                    file_path: self.current_file.clone(),
+                                    node_type: FunctionNodeType::ArrowFunction(Box::new(
+                                        arrow.clone(),
+                                    )),
+                                    arguments,
                                 },
                             );
-
-                            if router_name != var_name {
-                                println!(
-                                    "Detected Router: {} (imported as: {})",
-                                    var_name, router_name
-                                );
-                            } else {
-                                println!("Detected Router: {}", var_name);
-                            }
+                            let fields = self.extract_fields_from_arrow(arrow);
+                            self.response_fields.insert(var_name.clone(), fields);
                         }
-                        // Check if this is an express app creation
-                        else if let Some(express_name) = &self.express_import_name {
-                            if self.is_express_app_creation(call_expr, express_name) {
-                                let express_app_name = self.prefix_owner_type(var_name);
-                                // Add to express_apps map
-                                self.express_apps.insert(
-                                    express_app_name.to_owned(),
-                                    AppContext {
-                                        name: express_app_name,
+
+                        // Function expression
+                        Expr::Fn(fn_expr) => {
+                            let arguments = self
+                                .extract_function_arguments_from_params(&fn_expr.function.params);
+                            self.function_definitions.insert(
+                                var_name.clone(),
+                                FunctionDefinition {
+                                    name: var_name.clone(),
+                                    file_path: self.current_file.clone(),
+                                    node_type: FunctionNodeType::FunctionExpression(Box::new(
+                                        fn_expr.clone(),
+                                    )),
+                                    arguments,
+                                },
+                            );
+                            let fields = self.extract_fields_from_function_expr(fn_expr);
+                            self.response_fields.insert(var_name.clone(), fields);
+                        }
+
+                        // Call expression (could be a router/app creation or other call)
+                        Expr::Call(call_expr) => {
+                            // Your existing router and express app detection logic
+                            let var_name_str = var_name.as_str();
+
+                            // Check if this is a router creation
+                            if self.is_router_creation(call_expr) {
+                                // If this is the 'router' variable and we have an imported name,
+                                // use the imported name instead
+                                let router_name = if var_name_str == "router"
+                                    && self.imported_router_name.is_some()
+                                {
+                                    self.imported_router_name.as_ref().unwrap().as_str()
+                                } else {
+                                    var_name_str
+                                };
+
+                                let prefixed_router_name = self.prefix_owner_type(router_name);
+
+                                // Add the router to the `routers` map with an initial context
+                                self.routers.insert(
+                                    prefixed_router_name.clone(),
+                                    RouterContext {
+                                        name: prefixed_router_name.clone(),
                                     },
                                 );
 
-                                println!("Detected Express app: {}", var_name);
+                                if router_name != var_name_str {
+                                    println!(
+                                        "Detected Router: {} (imported as: {})",
+                                        var_name_str, router_name
+                                    );
+                                } else {
+                                    println!("Detected Router: {}", var_name_str);
+                                }
                             }
+                            // Check if this is an express app creation
+                            else if let Some(express_name) = &self.express_import_name {
+                                if self.is_express_app_creation(call_expr, express_name) {
+                                    let express_app_name = self.prefix_owner_type(var_name_str);
+                                    // Add to express_apps map
+                                    self.express_apps.insert(
+                                        express_app_name.to_owned(),
+                                        AppContext {
+                                            name: express_app_name,
+                                        },
+                                    );
+
+                                    println!("Detected Express app: {}", var_name_str);
+                                }
+                            }
+
+                            // Check if the call contains callback functions
+                            self.extract_callbacks_from_call(call_expr, &var_name);
                         }
+
+                        // Other expression types don't need special handling for function detection
+                        _ => {}
                     }
                 }
             }
         }
+
+        // Make sure to visit children to catch nested definitions
+        var_decl.visit_children_with(self);
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
@@ -555,6 +634,72 @@ impl DependencyVisitor {
                 _ => None,
             })
             .collect()
+    }
+
+    // New helper method to extract callbacks from call expressions
+    fn extract_callbacks_from_call(&mut self, call: &CallExpr, context_name: &str) {
+        // Check if this is a routing method call like app.get('/route', function...)
+        if let Callee::Expr(callee_expr) = &call.callee {
+            if let Expr::Member(member) = &**callee_expr {
+                // Check if the method could be a route handler (get, post, etc.)
+                if let MemberProp::Ident(method_ident) = &member.prop {
+                    let method_name = method_ident.sym.to_string().to_lowercase();
+
+                    if ["get", "post", "put", "delete", "patch"].contains(&method_name.as_str()) {
+                        // This is likely a route definition, check for callback in the second arg
+                        if call.args.len() >= 2 {
+                            self.extract_function_from_arg(
+                                &call.args[1].expr,
+                                &format!("{}_{}_callback", context_name, method_name),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check each argument for function expressions (callbacks)
+        for (i, arg) in call.args.iter().enumerate() {
+            self.extract_function_from_arg(&arg.expr, &format!("{}_{}", context_name, i));
+        }
+    }
+
+    // Helper to extract function from an expression argument
+    fn extract_function_from_arg(&mut self, expr: &Expr, default_name: &str) {
+        match expr {
+            Expr::Arrow(arrow) => {
+                let arguments = self.extract_function_arguments_from_pats(&arrow.params);
+                self.function_definitions.insert(
+                    default_name.to_string(),
+                    FunctionDefinition {
+                        name: default_name.to_string(),
+                        file_path: self.current_file.clone(),
+                        node_type: FunctionNodeType::ArrowFunction(Box::new(arrow.clone())),
+                        arguments,
+                    },
+                );
+            }
+            Expr::Fn(fn_expr) => {
+                let arguments =
+                    self.extract_function_arguments_from_params(&fn_expr.function.params);
+                let fn_name = if let Some(ident) = &fn_expr.ident {
+                    ident.sym.to_string()
+                } else {
+                    default_name.to_string()
+                };
+
+                self.function_definitions.insert(
+                    fn_name.clone(),
+                    FunctionDefinition {
+                        name: fn_name.clone(),
+                        file_path: self.current_file.clone(),
+                        node_type: FunctionNodeType::FunctionExpression(Box::new(fn_expr.clone())),
+                        arguments,
+                    },
+                );
+            }
+            _ => {}
+        }
     }
 
     fn prefix_owner_type(&self, name: &str) -> String {
@@ -772,19 +917,7 @@ impl DependencyVisitor {
         };
 
         if let Some(endpoint_data) = self.extract_endpoint(call, http_method) {
-            println!("ENDPOINT ---> {:?}", endpoint_data);
-            let (route, response_fields, request_fields, request_type, response_type) =
-                endpoint_data;
-
-            // Log additional information about types if available
-            let type_info = match (&request_type, &response_type) {
-                (Some(req), Some(res)) => {
-                    format!(" (req: {}, res: {})", req.type_name, res.type_name)
-                }
-                (Some(req), None) => format!(" (req: {})", req.type_name),
-                (None, Some(res)) => format!(" (res: {})", res.type_name),
-                (None, None) => String::new(),
-            };
+            let (route, response_fields, request_fields, handler_name) = endpoint_data;
 
             // Store the endpoint with its initial path and type information
             self.endpoints.push(Endpoint {
@@ -793,17 +926,17 @@ impl DependencyVisitor {
                 method: http_method.to_string(),
                 response: response_fields.clone(),
                 request: request_fields.clone(),
-                response_type, // Add the new fields
-                request_type,
-                handler_file: self.current_file.clone(), // Assuming this is appropriate
+                request_type: None,
+                response_type: None,
+                handler_file: self.current_file.clone(),
+                handler_name,
             });
 
             println!(
-                "Detected endpoint: {} {} on {}{}",
+                "Detected endpoint: {} {} on {}",
                 http_method,
                 route,
                 self.get_owner_type(&effective_name),
-                type_info
             );
         }
     }

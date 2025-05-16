@@ -3,7 +3,10 @@ use crate::{
     config::Config,
     extractor::CoreExtractor,
     utils::join_prefix_and_path,
-    visitor::{DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType},
+    visitor::{
+        DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType,
+        TypeReference,
+    },
 };
 use core::fmt;
 use std::collections::HashSet;
@@ -41,6 +44,9 @@ pub struct ApiEndpointDetails {
     // - For calls, `response_body` is what the client expects to receive
     pub request_body: Option<Json>,
     pub response_body: Option<Json>,
+    pub handler_name: Option<String>,
+    pub request_type: Option<TypeReference>,
+    pub response_type: Option<TypeReference>,
 }
 
 impl fmt::Display for FieldMismatch {
@@ -106,6 +112,9 @@ impl Analyzer {
                 params,
                 response_body: Some(endpoint.response),
                 request_body: endpoint.request,
+                handler_name: Some(endpoint.handler_name), // Add this line
+                request_type: endpoint.request_type,       // Add these lines too
+                response_type: endpoint.response_type,
             });
         }
 
@@ -119,6 +128,9 @@ impl Analyzer {
                 params,
                 response_body: Some(call.response),
                 request_body: call.request,
+                handler_name: None, // Calls don't typically have handlers
+                request_type: call.request_type,
+                response_type: call.response_type,
             })
         }
 
@@ -161,12 +173,69 @@ impl Analyzer {
                     params,
                     request_body,
                     response_body: Some(Json::Null),
+                    handler_name: None,
+                    request_type: None,
+                    response_type: None,
                 });
             }
         }
 
         // Add all newly discovered calls to our collection
         self.calls.extend(new_calls);
+    }
+
+    pub fn resolve_types_for_endpoints(&mut self) -> &mut Self {
+        let mut request_types = HashMap::new();
+        let mut response_types = HashMap::new();
+
+        // First handle directly defined handlers in endpoints
+        for endpoint in &self.endpoints {
+            // Skip endpoints without a handler name
+            if let Some(handler_name) = &endpoint.handler_name {
+                // Direct lookup using the handler_name we already stored
+                if let Some(func_def) = self.function_definitions.get(handler_name) {
+                    // Extract request and response types
+                    if func_def.arguments.len() >= 2 {
+                        // First argument is request
+                        if let Some(type_ann) = &func_def.arguments[0].type_ann {
+                            request_types.insert(
+                                (endpoint.route.clone(), endpoint.method.clone()),
+                                TypeReference {
+                                    type_name: format!("{:?}", type_ann.type_ann),
+                                    file_path: func_def.file_path.clone(),
+                                    type_ann: Some(Box::new(*type_ann.type_ann.clone())),
+                                },
+                            );
+                        }
+
+                        // Second argument is response
+                        if let Some(type_ann) = &func_def.arguments[1].type_ann {
+                            response_types.insert(
+                                (endpoint.route.clone(), endpoint.method.clone()),
+                                TypeReference {
+                                    type_name: format!("{:?}", type_ann.type_ann),
+                                    file_path: func_def.file_path.clone(),
+                                    type_ann: Some(Box::new(*type_ann.type_ann.clone())),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update all endpoints with the resolved types
+        for endpoint in &mut self.endpoints {
+            let key = (endpoint.route.clone(), endpoint.method.clone());
+            if let Some(req_type) = request_types.get(&key) {
+                endpoint.request_type = Some(req_type.clone());
+            }
+            if let Some(resp_type) = response_types.get(&key) {
+                endpoint.response_type = Some(resp_type.clone());
+            }
+        }
+
+        self
     }
 
     // This function analyzes the function definitions and returns a HashMap of route fields.
@@ -689,7 +758,10 @@ pub fn analyze_api_consistency(
 
     analyzer
         .update_endpoints_with_resolved_fields(response_fields, request_fields)
+        .resolve_types_for_endpoints()
         .analyze_functions_for_fetch_calls();
+
+    println!("ApiEndpoints >>>> \n{:?}", analyzer.endpoints);
 
     analyzer.get_results()
 }
