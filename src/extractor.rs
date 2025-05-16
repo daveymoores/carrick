@@ -1,9 +1,9 @@
-use crate::visitor::{FunctionDefinition, ImportedSymbol, Json};
+use crate::visitor::{ImportedSymbol, Json};
 use std::collections::HashMap;
 use swc_ecma_ast::*;
 
 pub trait CoreExtractor {
-    fn resolve_variable(&self, name: &str) -> Option<&Expr> {
+    fn resolve_variable(&self, _name: &str) -> Option<&Expr> {
         None
     }
 
