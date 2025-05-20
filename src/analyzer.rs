@@ -194,6 +194,10 @@ impl Analyzer {
             if let Some(handler_name) = &endpoint.handler_name {
                 // Direct lookup using the handler_name we already stored
                 if let Some(func_def) = self.function_definitions.get(handler_name) {
+                    // println!(
+                    //     ">>>>> {:?} {:?} {:?}",
+                    //     handler_name, endpoint.route, func_def.arguments[1].type_ann
+                    // );
                     // Extract request and response types
                     if func_def.arguments.len() >= 2 {
                         // First argument is request
@@ -744,7 +748,6 @@ pub fn analyze_api_consistency(
 
     let endpoints =
         analyzer.resolve_all_endpoint_paths(&analyzer.endpoints, &analyzer.mounts, &analyzer.apps);
-
     analyzer.endpoints = endpoints;
 
     // Build the router after resolving endpoints
@@ -761,7 +764,12 @@ pub fn analyze_api_consistency(
         .resolve_types_for_endpoints()
         .analyze_functions_for_fetch_calls();
 
-    println!("ApiEndpoints >>>> \n{:?}", analyzer.endpoints);
+    analyzer.endpoints.iter().for_each(|f| {
+        println!(
+            "\nEndpoint: {:?}, RequestType: {:?}, ResponseType: {:?}\n",
+            f.route, f.response_type, f.request_type
+        )
+    });
 
     analyzer.get_results()
 }

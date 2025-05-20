@@ -919,6 +919,42 @@ impl DependencyVisitor {
         if let Some(endpoint_data) = self.extract_endpoint(call, http_method) {
             let (route, response_fields, request_fields, handler_name) = endpoint_data;
 
+            if let Some(second_arg) = call.args.get(1) {
+                // println!("{:?}", second_arg);
+                match &*second_arg.expr {
+                    Expr::Arrow(arrow) => {
+                        // Store arrow function definition
+                        let arguments = self.extract_function_arguments_from_pats(&arrow.params);
+                        self.function_definitions.insert(
+                            handler_name.clone(),
+                            FunctionDefinition {
+                                name: handler_name.clone(),
+                                file_path: self.current_file.clone(),
+                                node_type: FunctionNodeType::ArrowFunction(Box::new(arrow.clone())),
+                                arguments,
+                            },
+                        );
+                    }
+                    Expr::Fn(fn_expr) => {
+                        // Store function expression definition
+                        let arguments =
+                            self.extract_function_arguments_from_params(&fn_expr.function.params);
+                        self.function_definitions.insert(
+                            handler_name.clone(),
+                            FunctionDefinition {
+                                name: handler_name.clone(),
+                                file_path: self.current_file.clone(),
+                                node_type: FunctionNodeType::FunctionExpression(Box::new(
+                                    fn_expr.clone(),
+                                )),
+                                arguments,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
             // Store the endpoint with its initial path and type information
             self.endpoints.push(Endpoint {
                 owner,
