@@ -183,8 +183,8 @@ fn main() {
         }
     };
 
-    // Analyze for inconsistencies
-    let result = analyze_api_consistency(visitors, config);
+    // Analyze for inconsistencies. Pass the sourcemap to allow relative byte positions to be calculated
+    let result = analyze_api_consistency(visitors, config, cm);
 
     // Print results
     println!("\nAPI Analysis Results:");

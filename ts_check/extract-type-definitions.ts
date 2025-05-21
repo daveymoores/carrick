@@ -11,68 +11,85 @@ import {
 } from "ts-morph";
 
 // --- Argument Parsing ---
-// inputFile: The .ts file containing the target type.
-// targetTypeName: The name of the type/interface/enum/class to extract.
+// Format: JSON string containing array of type information objects
 // outputFile: Optional path for the output .ts file.
+// tsconfigPath: Optional path to the tsconfig.json file for the project
 const [
   ,
   ,
-  inputFile,
-  targetTypeName,
+  inputTypesJson,
   outputFile = "out/all-types-recursive.ts",
+  tsconfigPath,
 ] = process.argv;
 
-if (!inputFile || !targetTypeName) {
+interface TypeInfo {
+  filePath: string;
+  startPosition: number;
+}
+
+let typeInfos: TypeInfo[] = [];
+
+try {
+  typeInfos = JSON.parse(inputTypesJson);
+} catch (error) {
   console.error(
-    "Usage: ts-node extract-type-definitions.ts <inputFile> <targetTypeName> [outputFile]",
+    'Usage: ts-node extract-type-definitions.ts \'[{"filePath":"path/to/file.ts","typeName":"TypeName","startPosition":123},...]\' [outputFile] [tsconfigPath]',
   );
+  console.error("Error:", error);
+  process.exit(1);
+}
+
+if (typeInfos.length === 0) {
+  console.error("No type information provided");
   process.exit(1);
 }
 
 // --- Project Setup ---
 const project = new Project({
-  tsConfigFilePath:
-    "../../../optaxe/optaxe-ts-monorepo/apps/event-api/tsconfig.json", // Ensure this points to your project's tsconfig
+  tsConfigFilePath: tsconfigPath, // Use the provided tsconfig path
   skipAddingFilesFromTsConfig: false, // Allow loading files from tsconfig paths
 });
 
-const sourceFile =
-  project.getSourceFile(inputFile) || project.addSourceFileAtPath(inputFile);
-if (!sourceFile) {
-  console.error(`Input file '${inputFile}' could not be found or loaded.`);
-  process.exit(1);
-}
-
-// --- Find Initial Target Declaration ---
-function findInitialDeclaration(
+// Function to find declaration by position
+function findTypeDeclarationByPosition(
   sf: SourceFile,
-  name: string,
+  position: number,
 ): Node | undefined {
-  // Search for the type by name across different kinds of declarations
-  const declarations = [
-    ...sf.getTypeAliases().filter((ta) => ta.getName() === name),
-    ...sf.getInterfaces().filter((i) => i.getName() === name),
-    ...sf.getEnums().filter((e) => e.getName() === name),
-    ...sf.getClasses().filter((c) => c.getName() === name),
-  ];
-  if (declarations.length > 1) {
-    console.warn(
-      `Multiple declarations found for '${name}'. Using the first one found.`,
+  const identifierNode = sf.getDescendantAtPos(position);
+  if (!identifierNode) {
+    const fileText = sf.getFullText();
+    console.error(
+      `No node found at position ${position} in ${sf.getFilePath()}`,
     );
+    // Print a snippet around the position for debugging
+    const snippet = fileText.slice(Math.max(0, position - 20), position + 20);
+    console.error(`File snippet: ...${snippet}...`);
+    return undefined;
   }
-  return declarations[0];
-}
 
-const initialDeclarationNode = findInitialDeclaration(
-  sourceFile,
-  targetTypeName,
-);
+  // Get the symbol for the identifier
+  const symbol = identifierNode.getSymbol();
+  console.log({ symbol, identifierNode: identifierNode.getKindName() });
+  if (!symbol) {
+    console.error(`No symbol found for node at position ${position}`);
+    return undefined;
+  }
 
-if (!initialDeclarationNode) {
-  console.error(
-    `Type '${targetTypeName}' not found in '${sourceFile.getFilePath()}'.`,
-  );
-  process.exit(1);
+  // Find a declaration that is a type/interface/enum/class
+  const decl = symbol
+    .getDeclarations()
+    .find(
+      (d) =>
+        Node.isTypeAliasDeclaration(d) ||
+        Node.isInterfaceDeclaration(d) ||
+        Node.isEnumDeclaration(d) ||
+        Node.isClassDeclaration(d),
+    );
+
+  if (decl) return decl;
+
+  // Fallback: return the first declaration (as before)
+  return symbol.getDeclarations()[0];
 }
 
 // --- Dependency Collection Logic ---
@@ -80,6 +97,48 @@ if (!initialDeclarationNode) {
 const collectedDeclarations = new Set<Node>();
 // `seenNodesForRecursion`: Prevents infinite loops and re-processing during the traversal of any Node.
 const seenNodesForRecursion = new Set<Node>();
+
+// Function to get or add a source file to the project
+const sourceFileCache = new Map<string, SourceFile>();
+function getSourceFile(filePath: string): SourceFile | undefined {
+  if (sourceFileCache.has(filePath)) {
+    return sourceFileCache.get(filePath);
+  }
+
+  const sf =
+    project.getSourceFile(filePath) || project.addSourceFileAtPath(filePath);
+  if (sf) {
+    sourceFileCache.set(filePath, sf);
+  }
+  return sf;
+}
+
+// Process each type info and collect declarations
+console.log(`Processing ${typeInfos.length} types from input`);
+
+for (const typeInfo of typeInfos) {
+  const { filePath, startPosition } = typeInfo;
+
+  const sourceFile = getSourceFile(filePath);
+  if (!sourceFile) {
+    console.error(`Input file '${filePath}' could not be found or loaded.`);
+    continue;
+  }
+
+  let declarationNode: Node | undefined;
+
+  declarationNode = findTypeDeclarationByPosition(sourceFile, startPosition);
+
+  if (!declarationNode) {
+    console.error(
+      `Type not found in '${sourceFile.getFilePath()}' at position ${startPosition}`,
+    );
+    continue;
+  }
+
+  console.log(`Found declaration at ${startPosition} in ${filePath}`);
+  collectDeclarationsRecursively(declarationNode);
+}
 
 /**
  * Processes a TypeNode (AST representation of a type, e.g., string, MyInterface, TypeA | TypeB)
@@ -222,7 +281,7 @@ function processTypeNode(typeNode: TypeNode | undefined): void {
         try {
           const resolvedType = typeNode.getType();
           if (resolvedType) {
-            collectFromTypeObject(resolvedType);
+            collectFromTypeObject(resolvedType, typeNode);
           }
         } catch (typeError) {
           console.warn(`Error resolving import type: ${typeError}`);
@@ -322,7 +381,10 @@ const seenTypeObjects = new WeakSet<Type>();
 /**
  * Processes a ts-morph Type object to find and collect declarations of types it refers to.
  */
-function collectFromTypeObject(type: Type | undefined): void {
+function collectFromTypeObject(
+  type: Type | undefined,
+  contextNode: Node,
+): void {
   if (!type || seenTypeObjects.has(type)) return;
   seenTypeObjects.add(type);
 
@@ -338,27 +400,34 @@ function collectFromTypeObject(type: Type | undefined): void {
     // Process type arguments (for generics)
     type
       .getTypeArguments()
-      .forEach((argType) => collectFromTypeObject(argType));
+      .forEach((argType) => collectFromTypeObject(argType, contextNode));
 
     // Process union and intersection types
     if (type.isUnion()) {
-      type.getUnionTypes().forEach((ut) => collectFromTypeObject(ut));
+      type
+        .getUnionTypes()
+        .forEach((ut) => collectFromTypeObject(ut, contextNode));
     }
     if (type.isIntersection()) {
-      type.getIntersectionTypes().forEach((it) => collectFromTypeObject(it));
+      type
+        .getIntersectionTypes()
+        .forEach((it) => collectFromTypeObject(it, contextNode));
     }
 
     // Process array and tuple element types
-    if (type.isArray()) collectFromTypeObject(type.getArrayElementType());
+    if (type.isArray())
+      collectFromTypeObject(type.getArrayElementType(), contextNode);
     if (type.isTuple())
-      type.getTupleElements().forEach((te) => collectFromTypeObject(te));
+      type
+        .getTupleElements()
+        .forEach((te) => collectFromTypeObject(te, contextNode));
 
     // For object/interface types, process the types of their properties.
     // This is crucial for anonymous object types within type aliases (e.g., type X = { a: TypeA };)
 
     // IMPORTANT: Add depth limit for property traversal to prevent infinite recursion
     const MAX_PROPERTY_DEPTH = 5; // Adjust this value as needed
-    traversePropertiesWithDepthLimit(type, MAX_PROPERTY_DEPTH);
+    traversePropertiesWithDepthLimit(type, MAX_PROPERTY_DEPTH, contextNode);
   } catch (error) {
     console.warn(`Error processing type: ${error}`);
   }
@@ -368,6 +437,7 @@ function collectFromTypeObject(type: Type | undefined): void {
 function traversePropertiesWithDepthLimit(
   type: Type,
   depthRemaining: number,
+  contextNode: Node,
 ): void {
   if (depthRemaining <= 0) {
     console.warn("Maximum property traversal depth reached");
@@ -384,9 +454,7 @@ function traversePropertiesWithDepthLimit(
       properties.slice(0, 50).forEach((prop) => {
         try {
           // Get the type of the property
-          const propType = prop.getTypeAtLocation(
-            initialDeclarationNode as Node,
-          );
+          const propType = prop.getTypeAtLocation(contextNode as Node);
 
           // Only process the immediate symbol of the property type, don't go deeper
           const symbol = propType.getAliasSymbol() || propType.getSymbol();
@@ -398,7 +466,7 @@ function traversePropertiesWithDepthLimit(
 
           // Only recurse to property types with decreased depth
           if (depthRemaining > 1) {
-            collectFromTypeObject(propType);
+            collectFromTypeObject(propType, contextNode);
           }
         } catch (propError) {
           console.warn(`Error processing property: ${propError}`);
@@ -407,10 +475,8 @@ function traversePropertiesWithDepthLimit(
     } else {
       properties.forEach((prop) => {
         try {
-          const propType = prop.getTypeAtLocation(
-            initialDeclarationNode as Node,
-          );
-          collectFromTypeObject(propType);
+          const propType = prop.getTypeAtLocation(contextNode as Node);
+          collectFromTypeObject(propType, contextNode);
         } catch (propError) {
           console.warn(`Error processing property: ${propError}`);
         }
@@ -655,11 +721,11 @@ function collectDeclarationsRecursively(node: Node | undefined): void {
 
     // Also, get the general Type object for the declaration and explore it.
     // This can catch dependencies not easily found by AST walking alone (e.g. complex conditional types).
-    collectFromTypeObject(node.getType());
+    collectFromTypeObject(node.getType(), node);
   } else if (Node.isVariableDeclaration(node)) {
     // If we encounter a variable declaration (e.g., from `typeof X` where X is a const),
     // try to get its type and collect dependencies from that type.
-    collectFromTypeObject(node.getType());
+    collectFromTypeObject(node.getType(), node);
   }
   // If 'node' is not a primary declaration type but might be a constituent part (like an ImportSpecifier),
   // its symbol should lead to the actual declaration, which will then be processed.
@@ -667,8 +733,6 @@ function collectDeclarationsRecursively(node: Node | undefined): void {
 }
 
 // --- Start Dependency Collection ---
-console.log(`Starting dependency collection for type: ${targetTypeName}`);
-collectDeclarationsRecursively(initialDeclarationNode);
 collectUtilityTypesWithInnerTypes();
 console.log(
   `After utility collection: ${collectedDeclarations.size} declarations.`,
@@ -685,14 +749,19 @@ const newSourceFile = outputProject.createSourceFile(outputFile, "", {
 });
 
 // Sort declarations to potentially improve readability and handle some ordering issues.
-// A simple sort: declarations from the original target file first, then by file path, then by position.
+// Sort by file path, then by position.
 // This is NOT a full topological sort, which would be more robust for complex inter-dependencies.
 const sortedDeclarations = Array.from(collectedDeclarations).sort((a, b) => {
-  const aIsFromInputFile = a.getSourceFile() === sourceFile;
-  const bIsFromInputFile = b.getSourceFile() === sourceFile;
+  // Get the file paths of the first file in typeInfos for prioritization
+  const primaryFilePath = typeInfos.length > 0 ? typeInfos[0].filePath : "";
 
-  if (aIsFromInputFile && !bIsFromInputFile) return -1;
-  if (!aIsFromInputFile && bIsFromInputFile) return 1;
+  const aIsFromPrimaryFile =
+    a.getSourceFile().getFilePath() === primaryFilePath;
+  const bIsFromPrimaryFile =
+    b.getSourceFile().getFilePath() === primaryFilePath;
+
+  if (aIsFromPrimaryFile && !bIsFromPrimaryFile) return -1;
+  if (!aIsFromPrimaryFile && bIsFromPrimaryFile) return 1;
 
   const pathA = a.getSourceFile().getFilePath();
   const pathB = b.getSourceFile().getFilePath();
@@ -710,11 +779,24 @@ try {
   newSourceFile.formatText(); // Apply standard formatting
   newSourceFile.saveSync();
   console.log(
-    `All recursively required type/interface/enum/class declarations for '${targetTypeName}' written to ${outputFile}`,
+    `All recursively aquired type/interface/enum/class declarations written to ${outputFile}`,
+  );
+
+  // Output a success message in JSON format for easy parsing by the calling process
+  console.log(
+    JSON.stringify({
+      success: true,
+      output: outputFile,
+      typeCount: collectedDeclarations.size,
+    }),
   );
 } catch (e: any) {
   console.error("Error saving or formatting the output file:", e.message);
-  // As a fallback, you could try writing the raw text without formatting
-  // fs.writeFileSync(outputFile, sortedDeclarations.map(d => d.getText()).join('\n\n'));
-  // console.log(`Collected types (unformatted due to error) written to ${outputFile}`);
+  // Output error in JSON format
+  console.log(
+    JSON.stringify({
+      success: false,
+      error: e.message,
+    }),
+  );
 }

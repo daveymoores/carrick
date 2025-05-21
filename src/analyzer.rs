@@ -1,3 +1,6 @@
+use serde_json::Value;
+use swc_common::{FileName, SourceMap, sync::Lrc};
+
 use crate::{
     app_context::AppContext,
     config::Config,
@@ -9,8 +12,8 @@ use crate::{
     },
 };
 use core::fmt;
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::{collections::HashMap, process::Command};
 
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
@@ -184,42 +187,67 @@ impl Analyzer {
         self.calls.extend(new_calls);
     }
 
-    pub fn resolve_types_for_endpoints(&mut self) -> &mut Self {
+    fn byte_offset_to_utf16_offset(source: &str, byte_offset: usize) -> usize {
+        source[..byte_offset].encode_utf16().count()
+    }
+
+    pub fn resolve_types_for_endpoints(&mut self, cm: Lrc<SourceMap>) -> &mut Self {
         let mut request_types = HashMap::new();
         let mut response_types = HashMap::new();
 
         // First handle directly defined handlers in endpoints
         for endpoint in &self.endpoints {
-            // Skip endpoints without a handler name
             if let Some(handler_name) = &endpoint.handler_name {
-                // Direct lookup using the handler_name we already stored
                 if let Some(func_def) = self.function_definitions.get(handler_name) {
-                    // println!(
-                    //     ">>>>> {:?} {:?} {:?}",
-                    //     handler_name, endpoint.route, func_def.arguments[1].type_ann
-                    // );
-                    // Extract request and response types
+                    let file_content =
+                        std::fs::read_to_string(&func_def.file_path).expect("Failed to read file");
+
                     if func_def.arguments.len() >= 2 {
-                        // First argument is request
                         if let Some(type_ann) = &func_def.arguments[0].type_ann {
+                            let loc = cm.lookup_char_pos(type_ann.span.lo);
+                            let file_start = loc.file.start_pos.0;
+                            let file_relative_offset = type_ann.span.lo.0 - file_start;
+                            let path = match &*loc.file.name {
+                                FileName::Real(pathbuf) => pathbuf.as_path(),
+                                other => panic!("Not a real file: {:?}", other),
+                            };
+                            let file_content =
+                                std::fs::read_to_string(path).expect("Failed to read file");
+                            let utf16_offset = Self::byte_offset_to_utf16_offset(
+                                &file_content,
+                                file_relative_offset as usize,
+                            );
+                            println!(">>>>>>>>>>>>>>> {:?}", utf16_offset);
                             request_types.insert(
                                 (endpoint.route.clone(), endpoint.method.clone()),
                                 TypeReference {
-                                    type_name: format!("{:?}", type_ann.type_ann),
                                     file_path: func_def.file_path.clone(),
                                     type_ann: Some(Box::new(*type_ann.type_ann.clone())),
+                                    start_position: utf16_offset,
                                 },
                             );
                         }
-
-                        // Second argument is response
                         if let Some(type_ann) = &func_def.arguments[1].type_ann {
+                            let loc = cm.lookup_char_pos(type_ann.span.lo);
+                            let file_start = loc.file.start_pos.0;
+                            let file_relative_offset = type_ann.span.lo.0 - file_start;
+                            let path = match &*loc.file.name {
+                                FileName::Real(pathbuf) => pathbuf.as_path(),
+                                other => panic!("Not a real file: {:?}", other),
+                            };
+                            let file_content =
+                                std::fs::read_to_string(path).expect("Failed to read file");
+                            let utf16_offset = Self::byte_offset_to_utf16_offset(
+                                &file_content,
+                                file_relative_offset as usize,
+                            );
+                            println!(">>>>>>>>>>>>>>> {:?}", utf16_offset);
                             response_types.insert(
                                 (endpoint.route.clone(), endpoint.method.clone()),
                                 TypeReference {
-                                    type_name: format!("{:?}", type_ann.type_ann),
                                     file_path: func_def.file_path.clone(),
                                     type_ann: Some(Box::new(*type_ann.type_ann.clone())),
+                                    start_position: utf16_offset,
                                 },
                             );
                         }
@@ -702,19 +730,85 @@ impl Analyzer {
         self.endpoint_router = Some(router);
     }
 
-    fn check_types_assignable(file_a: &str, type_a: &str, file_b: &str, type_b: &str) -> bool {
-        let output = Command::new("node")
-            .arg("ts_morph_helper/index.js")
-            .arg(file_a)
-            .arg(type_a)
-            .arg(file_b)
-            .arg(type_b)
+    // fn check_types_assignable(
+    //     file_a: &str,
+    //     type_a: &str,
+    //     file_b: &str,
+    //     type_b: &str,
+    //     pos_a: Option<u32>,
+    //     pos_b: Option<u32>,
+    // ) -> bool {
+    //     let mut cmd = Command::new("node");
+    //     cmd.arg("ts_morph_helper/index.js")
+    //         .arg(file_a)
+    //         .arg(type_a)
+    //         .arg(file_b)
+    //         .arg(type_b);
+
+    //     // Add start positions if they exist
+    //     if let Some(p) = pos_a {
+    //         cmd.arg(p.to_string());
+    //     } else {
+    //         cmd.arg(""); // Empty string for no position
+    //     }
+
+    //     if let Some(p) = pos_b {
+    //         cmd.arg(p.to_string());
+    //     } else {
+    //         cmd.arg(""); // Empty string for no position
+    //     }
+
+    //     let output = cmd.output().expect("Failed to run ts-morph helper");
+
+    //     let stdout = String::from_utf8_lossy(&output.stdout);
+    //     let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    //     result["isAssignable"].as_bool().unwrap()
+    // }
+
+    pub fn extract_types_for_repo(&self, repo_path: &str, type_infos: Vec<Value>) {
+        use std::process::Command;
+
+        // Skip if no types to extract
+        if type_infos.is_empty() {
+            return;
+        }
+
+        // Prepare JSON input with type information
+        let json_input = serde_json::to_string(&type_infos).unwrap();
+        let repo_suffix = repo_path.split('/').last().expect("repo_suffix not found");
+        let output_path = format!("ts_check/output/{}_types.ts", repo_suffix);
+
+        // Ensure the `ts_check/output` directory exists
+        std::fs::create_dir_all("ts_check/output").expect("Failed to create output directory");
+
+        // Determine tsconfig path based on repo
+        let tsconfig_path = format!("{}/tsconfig.json", repo_path);
+
+        println!("Extracting {} types from {}", type_infos.len(), repo_path);
+
+        // Run the extract-type-definitions script with all types at once
+        let script_path = std::fs::canonicalize("ts_check/extract-type-definitions.ts")
+            .expect("Script not found");
+        let ts_config = std::fs::canonicalize(&tsconfig_path).expect("tsconfig.json not found");
+
+        //println!("{:?}", json_input);
+
+        let output = Command::new("npx")
+            .arg("ts-node")
+            .arg(script_path)
+            .arg(&json_input)
+            .arg(&output_path)
+            .arg(ts_config)
             .output()
-            .expect("Failed to run ts-morph helper");
+            .expect("Failed to run type extraction");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        result["isAssignable"].as_bool().unwrap()
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        println!("Type extraction output: {}", stdout);
+        if !stderr.is_empty() {
+            eprintln!("Type extraction errors: {}", stderr);
+        }
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
@@ -737,7 +831,10 @@ impl Analyzer {
 pub fn analyze_api_consistency(
     visitors: Vec<DependencyVisitor>,
     config: Config,
+    cm: Lrc<SourceMap>,
 ) -> ApiAnalysisResult {
+    use std::collections::HashMap;
+    use std::path::Path;
     // Create and populate our analyzer
     let mut analyzer = Analyzer::new(config);
 
@@ -761,15 +858,62 @@ pub fn analyze_api_consistency(
 
     analyzer
         .update_endpoints_with_resolved_fields(response_fields, request_fields)
-        .resolve_types_for_endpoints()
+        .resolve_types_for_endpoints(cm)
         .analyze_functions_for_fetch_calls();
 
-    analyzer.endpoints.iter().for_each(|f| {
+    // Extract types for each repository
+    let mut repo_type_map: HashMap<String, Vec<Value>> = HashMap::new();
+
+    // Group type information by repository
+    for endpoint in &analyzer.endpoints {
+        if let Some(req_type) = &endpoint.request_type {
+            let repo_path = req_type
+                .file_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .to_string();
+            let file_path = req_type.file_path.to_string_lossy().to_string();
+            let canonical_path =
+                std::fs::canonicalize(file_path).expect("Cannot extract full file path");
+            if let Some(path) = canonical_path.to_str() {
+                let entry = serde_json::json!({
+                    "filePath": path.to_string(),
+                    "startPosition": req_type.start_position
+                });
+                repo_type_map.entry(repo_path).or_default().push(entry);
+            }
+        }
+
+        if let Some(resp_type) = &endpoint.response_type {
+            let repo_path = resp_type
+                .file_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .to_string();
+            let file_path = resp_type.file_path.to_string_lossy().to_string();
+            let canonical_path =
+                std::fs::canonicalize(file_path).expect("Cannot extract full file path");
+            if let Some(path) = canonical_path.to_str() {
+                let entry = serde_json::json!({
+                    "filePath": path.to_string(),
+                    "startPosition": resp_type.start_position
+                });
+                repo_type_map.entry(repo_path).or_default().push(entry);
+            }
+        }
+    }
+
+    // Process types for each repository
+    for (repo_path, type_infos) in repo_type_map {
         println!(
-            "\nEndpoint: {:?}, RequestType: {:?}, ResponseType: {:?}\n",
-            f.route, f.response_type, f.request_type
-        )
-    });
+            "Processing {} types from repository: {}",
+            type_infos.len(),
+            &repo_path
+        );
+        analyzer.extract_types_for_repo(&repo_path, type_infos);
+    }
 
     analyzer.get_results()
 }

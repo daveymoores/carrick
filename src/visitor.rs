@@ -25,9 +25,9 @@ pub struct FunctionArgument {
 
 #[derive(Debug, Clone)]
 pub struct TypeReference {
-    pub type_name: String,
     pub file_path: PathBuf,
     pub type_ann: Option<Box<TsType>>,
+    pub start_position: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
