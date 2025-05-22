@@ -1,5 +1,6 @@
 use serde_json::Value;
-use swc_common::{FileName, SourceMap, sync::Lrc};
+use swc_common::{FileName, SourceMap, SourceMapper, Spanned, sync::Lrc};
+use swc_ecma_ast::TsTypeAnn;
 
 use crate::{
     app_context::AppContext,
@@ -12,8 +13,8 @@ use crate::{
     },
 };
 use core::fmt;
-use std::collections::HashMap;
 use std::collections::HashSet;
+use std::{collections::HashMap, path::PathBuf};
 
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
@@ -191,65 +192,164 @@ impl Analyzer {
         source[..byte_offset].encode_utf16().count()
     }
 
-    pub fn resolve_types_for_endpoints(&mut self, cm: Lrc<SourceMap>) -> &mut Self {
-        let mut request_types = HashMap::new();
-        let mut response_types = HashMap::new();
+    fn sanitize_route_for_alias(route: &str) -> String {
+        route
+            .split('/')
+            .filter(|s| !s.is_empty() && !s.starts_with(':')) // Remove empty segments and param names
+            .map(|segment| {
+                // Capitalize first letter of each segment part
+                segment
+                    .split(|c: char| !c.is_alphanumeric()) // Split by non-alphanumeric
+                    .filter(|p| !p.is_empty())
+                    .map(|part| {
+                        let mut c = part.chars();
+                        match c.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .collect::<String>()
+    }
 
-        // First handle directly defined handlers in endpoints
+    fn generate_type_alias_name(route: &str, method: &str, is_request_type: bool) -> String {
+        let prefix = if is_request_type { "Req" } else { "Res" };
+
+        // Sanitize method: Make it PascalCase (e.g., "GET" -> "Get", "post" -> "Post")
+        let method_pascal = if method.is_empty() {
+            "UnknownMethod".to_string()
+        } else {
+            let lowercase_method = method.to_lowercase(); // Store the String
+            let mut m = lowercase_method.chars();
+            match m.next() {
+                None => "UnknownMethod".to_string(),
+                Some(f) => f.to_uppercase().collect::<String>() + m.as_str(), // m.as_str() now borrows from lowercase_method
+            }
+        };
+
+        let sanitized_route = Self::sanitize_route_for_alias(route);
+
+        // Filter out any non-alphanumeric characters from the final route part
+        let final_sanitized_route = sanitized_route
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>();
+
+        format!("{}{}{}", prefix, final_sanitized_route, method_pascal)
+    }
+
+    /// Helper to process a TsTypeAnn and produce a TypeReference.
+    /// This function encapsulates the logic to find the correct span,
+    /// calculate the UTF-16 offset, and build the TypeReference struct.
+    fn create_type_reference_from_swc(
+        type_ann_swc: &TsTypeAnn,
+        cm: &Lrc<SourceMap>,
+        func_def_file_path: &PathBuf,
+        alias: String,
+    ) -> Option<TypeReference> {
+        let type_ref_span = match &*type_ann_swc.type_ann {
+            swc_ecma_ast::TsType::TsTypeRef(type_ref) => type_ref.span,
+            _ => type_ann_swc.span, // fallback
+        };
+
+        let loc = cm.lookup_char_pos(type_ref_span.lo);
+        let file_start_bytepos = loc.file.start_pos;
+        if type_ref_span.lo < file_start_bytepos {
+            eprintln!(
+                "Warning: Span `lo` ({:?}) is before its supposed file's start_pos ({:?}) for file {:?}. This indicates a SourceMap or span issue.",
+                type_ref_span.lo, file_start_bytepos, loc.file.name
+            );
+            return None; // Or handle as an error appropriately
+        }
+        let file_relative_byte_offset_u32 = (type_ref_span.lo - file_start_bytepos).0;
+
+        let actual_span_file_path = match &*loc.file.name {
+            FileName::Real(pathbuf) => pathbuf.clone(), // Clone to own PathBuf
+            other => {
+                eprintln!(
+                    "Span found in a non-real file: {:?}. Cannot process.",
+                    other
+                );
+                return None;
+            }
+        };
+
+        let file_content = match std::fs::read_to_string(&actual_span_file_path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!(
+                    "Failed to read file {:?} for offset calculation: {}. Skipping.",
+                    actual_span_file_path, e
+                );
+                return None;
+            }
+        };
+
+        let utf16_offset = Self::byte_offset_to_utf16_offset(
+            &file_content,
+            file_relative_byte_offset_u32 as usize,
+        );
+
+        let composite_type_string = cm
+            .span_to_snippet(type_ann_swc.type_ann.span())
+            .unwrap_or_else(|_| "UnknownType".to_string());
+
+        Some(TypeReference {
+            file_path: func_def_file_path.clone(), // Use the function's file path
+            type_ann: Some(Box::new(*type_ann_swc.type_ann.clone())), // Store the SWC AST node
+            start_position: utf16_offset,
+            composite_type_string,
+            alias,
+        })
+    }
+
+    pub fn resolve_types_for_endpoints(&mut self, cm: Lrc<SourceMap>) -> &mut Self {
+        let mut request_types_map = HashMap::new();
+        let mut response_types_map = HashMap::new();
+
         for endpoint in &self.endpoints {
             if let Some(handler_name) = &endpoint.handler_name {
                 if let Some(func_def) = self.function_definitions.get(handler_name) {
-                    let file_content =
-                        std::fs::read_to_string(&func_def.file_path).expect("Failed to read file");
-
                     if func_def.arguments.len() >= 2 {
-                        if let Some(type_ann) = &func_def.arguments[0].type_ann {
-                            let loc = cm.lookup_char_pos(type_ann.span.lo);
-                            let file_start = loc.file.start_pos.0;
-                            let file_relative_offset = type_ann.span.lo.0 - file_start;
-                            let path = match &*loc.file.name {
-                                FileName::Real(pathbuf) => pathbuf.as_path(),
-                                other => panic!("Not a real file: {:?}", other),
-                            };
-                            let file_content =
-                                std::fs::read_to_string(path).expect("Failed to read file");
-                            let utf16_offset = Self::byte_offset_to_utf16_offset(
-                                &file_content,
-                                file_relative_offset as usize,
+                        // Process Request Type (argument 0)
+                        if let Some(req_type_ann_swc) = &func_def.arguments[0].type_ann {
+                            let alias = Self::generate_type_alias_name(
+                                &endpoint.route,
+                                &endpoint.method,
+                                true, // is_request_type
                             );
-                            println!(">>>>>>>>>>>>>>> {:?}", utf16_offset);
-                            request_types.insert(
-                                (endpoint.route.clone(), endpoint.method.clone()),
-                                TypeReference {
-                                    file_path: func_def.file_path.clone(),
-                                    type_ann: Some(Box::new(*type_ann.type_ann.clone())),
-                                    start_position: utf16_offset,
-                                },
-                            );
+                            if let Some(type_ref) = Self::create_type_reference_from_swc(
+                                req_type_ann_swc,
+                                &cm,
+                                &func_def.file_path,
+                                alias,
+                            ) {
+                                request_types_map.insert(
+                                    (endpoint.route.clone(), endpoint.method.clone()),
+                                    type_ref,
+                                );
+                            }
                         }
-                        if let Some(type_ann) = &func_def.arguments[1].type_ann {
-                            let loc = cm.lookup_char_pos(type_ann.span.lo);
-                            let file_start = loc.file.start_pos.0;
-                            let file_relative_offset = type_ann.span.lo.0 - file_start;
-                            let path = match &*loc.file.name {
-                                FileName::Real(pathbuf) => pathbuf.as_path(),
-                                other => panic!("Not a real file: {:?}", other),
-                            };
-                            let file_content =
-                                std::fs::read_to_string(path).expect("Failed to read file");
-                            let utf16_offset = Self::byte_offset_to_utf16_offset(
-                                &file_content,
-                                file_relative_offset as usize,
+
+                        // Process Response Type (argument 1)
+                        if let Some(res_type_ann_swc) = &func_def.arguments[1].type_ann {
+                            let alias = Self::generate_type_alias_name(
+                                &endpoint.route,
+                                &endpoint.method,
+                                false, // is_request_type = false
                             );
-                            println!(">>>>>>>>>>>>>>> {:?}", utf16_offset);
-                            response_types.insert(
-                                (endpoint.route.clone(), endpoint.method.clone()),
-                                TypeReference {
-                                    file_path: func_def.file_path.clone(),
-                                    type_ann: Some(Box::new(*type_ann.type_ann.clone())),
-                                    start_position: utf16_offset,
-                                },
-                            );
+                            if let Some(type_ref) = Self::create_type_reference_from_swc(
+                                res_type_ann_swc,
+                                &cm,
+                                &func_def.file_path,
+                                alias,
+                            ) {
+                                response_types_map.insert(
+                                    (endpoint.route.clone(), endpoint.method.clone()),
+                                    type_ref,
+                                );
+                            }
                         }
                     }
                 }
@@ -259,14 +359,13 @@ impl Analyzer {
         // Update all endpoints with the resolved types
         for endpoint in &mut self.endpoints {
             let key = (endpoint.route.clone(), endpoint.method.clone());
-            if let Some(req_type) = request_types.get(&key) {
+            if let Some(req_type) = request_types_map.get(&key) {
                 endpoint.request_type = Some(req_type.clone());
             }
-            if let Some(resp_type) = response_types.get(&key) {
+            if let Some(resp_type) = response_types_map.get(&key) {
                 endpoint.response_type = Some(resp_type.clone());
             }
         }
-
         self
     }
 
@@ -730,41 +829,6 @@ impl Analyzer {
         self.endpoint_router = Some(router);
     }
 
-    // fn check_types_assignable(
-    //     file_a: &str,
-    //     type_a: &str,
-    //     file_b: &str,
-    //     type_b: &str,
-    //     pos_a: Option<u32>,
-    //     pos_b: Option<u32>,
-    // ) -> bool {
-    //     let mut cmd = Command::new("node");
-    //     cmd.arg("ts_morph_helper/index.js")
-    //         .arg(file_a)
-    //         .arg(type_a)
-    //         .arg(file_b)
-    //         .arg(type_b);
-
-    //     // Add start positions if they exist
-    //     if let Some(p) = pos_a {
-    //         cmd.arg(p.to_string());
-    //     } else {
-    //         cmd.arg(""); // Empty string for no position
-    //     }
-
-    //     if let Some(p) = pos_b {
-    //         cmd.arg(p.to_string());
-    //     } else {
-    //         cmd.arg(""); // Empty string for no position
-    //     }
-
-    //     let output = cmd.output().expect("Failed to run ts-morph helper");
-
-    //     let stdout = String::from_utf8_lossy(&output.stdout);
-    //     let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    //     result["isAssignable"].as_bool().unwrap()
-    // }
-
     pub fn extract_types_for_repo(&self, repo_path: &str, type_infos: Vec<Value>) {
         use std::process::Command;
 
@@ -790,8 +854,6 @@ impl Analyzer {
         let script_path = std::fs::canonicalize("ts_check/extract-type-definitions.ts")
             .expect("Script not found");
         let ts_config = std::fs::canonicalize(&tsconfig_path).expect("tsconfig.json not found");
-
-        //println!("{:?}", json_input);
 
         let output = Command::new("npx")
             .arg("ts-node")
@@ -879,7 +941,9 @@ pub fn analyze_api_consistency(
             if let Some(path) = canonical_path.to_str() {
                 let entry = serde_json::json!({
                     "filePath": path.to_string(),
-                    "startPosition": req_type.start_position
+                    "startPosition": req_type.start_position,
+                    "compositeTypeString": req_type.composite_type_string,
+                    "alias": req_type.alias
                 });
                 repo_type_map.entry(repo_path).or_default().push(entry);
             }
@@ -898,7 +962,9 @@ pub fn analyze_api_consistency(
             if let Some(path) = canonical_path.to_str() {
                 let entry = serde_json::json!({
                     "filePath": path.to_string(),
-                    "startPosition": resp_type.start_position
+                    "startPosition": resp_type.start_position,
+                    "compositeTypeString": resp_type.composite_type_string,
+                    "alias": resp_type.alias
                 });
                 repo_type_map.entry(repo_path).or_default().push(entry);
             }

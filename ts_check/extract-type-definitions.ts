@@ -8,6 +8,7 @@ import {
   SourceFile,
   NamedTupleMember,
   RestTypeNode,
+  ts,
 } from "ts-morph";
 
 // --- Argument Parsing ---
@@ -23,8 +24,15 @@ const [
 ] = process.argv;
 
 interface TypeInfo {
-  filePath: string;
-  startPosition: number;
+  filePath: string; // Path to the file where the type usage occurs
+  startPosition: number; // UTF-16 offset of the main identifier in the composite type
+  compositeTypeString: string; // The full text, e.g., "Response<User[]>"
+  alias: string; // The generated alias name, e.g., "ResUsersGet"
+}
+
+interface CompositeAliasInfo {
+  aliasName: string;
+  typeString: string;
 }
 
 let typeInfos: TypeInfo[] = [];
@@ -50,45 +58,167 @@ const project = new Project({
   skipAddingFilesFromTsConfig: false, // Allow loading files from tsconfig paths
 });
 
+function isLocalType(node: Node): boolean {
+  const filePath = node.getSourceFile().getFilePath();
+  return !filePath.includes("node_modules");
+}
+
+function findTypeReferenceAtPosition(
+  sf: SourceFile,
+  position: number,
+): Node | undefined {
+  const node = sf.getDescendantAtPos(position);
+  if (!node) return undefined;
+
+  // If we landed on an identifier, check if it's part of a type reference
+  if (Node.isIdentifier(node)) {
+    // Look for a TypeReference parent
+    let current: Node | undefined = node;
+    while (current) {
+      if (Node.isTypeReference(current)) {
+        return current; // Found the TypeReference
+      }
+      current = current.getParent();
+      if (!current) break;
+    }
+  }
+
+  return node;
+}
+
+function processTypeReference(typeRef: Node): void {
+  if (!Node.isTypeReference(typeRef)) return;
+
+  const typeName = typeRef.getTypeName().getText();
+  console.log(`Processing type reference: ${typeName}`);
+  console.log("--------> " + typeRef.getSourceFile().getFilePath());
+
+  // Get the symbol for the main type (e.g., Request, Response)
+  const symbol = typeRef.getTypeName().getSymbol();
+  if (symbol) {
+    // Collect the main type (as an import if it's from node_modules)
+    for (const decl of symbol.getDeclarations()) {
+      const isNodeModule = decl
+        .getSourceFile()
+        .getFilePath()
+        .includes("node_modules");
+      if (isNodeModule) {
+        // Add to imports, but don't recurse deeply
+        addImportForExternalType(decl);
+      } else {
+        // Local type - recurse deeply
+        collectDeclarationsRecursively(decl, true);
+      }
+    }
+  }
+
+  // Process type arguments (whether local or external)
+  for (const typeArg of typeRef.getTypeArguments()) {
+    console.log(`  - Type argument: ${typeArg.getText()}`);
+    console.log("--------> " + typeArg.getSourceFile().getFilePath());
+
+    // Process type arguments recursively
+    processTypeArgument(typeArg);
+  }
+}
+
+// Helper function to add import for external types
+function addImportForExternalType(node: Node): void {
+  const sourceFilePath = node.getSourceFile().getFilePath();
+
+  // Try to get the module specifier (e.g. "express")
+  const importDecl = node.getFirstAncestorByKind?.(
+    ts.SyntaxKind.ImportDeclaration,
+  );
+  let moduleSpecifier: string | undefined;
+  if (importDecl) {
+    moduleSpecifier = importDecl.getModuleSpecifierValue();
+  } else {
+    moduleSpecifier = getModuleSpecifierFromNodeModulesPath(sourceFilePath);
+  }
+
+  // Get the type name
+  const typeName =
+    Node.isInterfaceDeclaration(node) ||
+    Node.isClassDeclaration(node) ||
+    Node.isTypeAliasDeclaration(node) ||
+    Node.isEnumDeclaration(node)
+      ? node.getName?.()
+      : undefined;
+
+  if (typeName && moduleSpecifier) {
+    // Prevent imports from "typescript" (standard library) and "@types/node" (Node.js globals)
+    if (moduleSpecifier === "typescript" || moduleSpecifier === "@types/node") {
+      return; // Do not add to externalTypeImports
+    }
+
+    if (!externalTypeImports.has(moduleSpecifier)) {
+      externalTypeImports.set(moduleSpecifier, new Set());
+    }
+    externalTypeImports.get(moduleSpecifier)!.add(typeName);
+  }
+}
+
 // Function to find declaration by position
 function findTypeDeclarationByPosition(
   sf: SourceFile,
   position: number,
 ): Node | undefined {
-  const identifierNode = sf.getDescendantAtPos(position);
-  if (!identifierNode) {
-    const fileText = sf.getFullText();
-    console.error(
-      `No node found at position ${position} in ${sf.getFilePath()}`,
-    );
-    // Print a snippet around the position for debugging
-    const snippet = fileText.slice(Math.max(0, position - 20), position + 20);
-    console.error(`File snippet: ...${snippet}...`);
-    return undefined;
-  }
+  const identifierNode = findTypeReferenceAtPosition(sf, position);
 
-  // Get the symbol for the identifier
+  console.log("Node text:", identifierNode?.getText());
+  console.log("Node kind:", identifierNode?.getKindName());
+  console.log("Node file:", identifierNode?.getSourceFile().getFilePath());
+
+  if (!identifierNode) return undefined;
   const symbol = identifierNode.getSymbol();
-  console.log({ symbol, identifierNode: identifierNode.getKindName() });
-  if (!symbol) {
-    console.error(`No symbol found for node at position ${position}`);
-    return undefined;
-  }
+  if (!symbol) return undefined;
 
-  // Find a declaration that is a type/interface/enum/class
-  const decl = symbol
-    .getDeclarations()
-    .find(
-      (d) =>
+  function resolveTypeSymbol(
+    symbol: import("ts-morph").Symbol,
+    depth = 0,
+  ): Node | undefined {
+    if (depth > 10) return undefined;
+    for (const d of symbol.getDeclarations()) {
+      if (
         Node.isTypeAliasDeclaration(d) ||
         Node.isInterfaceDeclaration(d) ||
         Node.isEnumDeclaration(d) ||
-        Node.isClassDeclaration(d),
-    );
+        Node.isClassDeclaration(d)
+      ) {
+        return d;
+      }
+      // Parameter/variable/property: follow type reference
+      if (
+        Node.isParameterDeclaration(d) ||
+        Node.isVariableDeclaration(d) ||
+        Node.isPropertySignature(d) ||
+        Node.isPropertyDeclaration(d)
+      ) {
+        const typeNode = d.getTypeNode();
+        if (typeNode && Node.isTypeReference(typeNode)) {
+          const typeName = typeNode.getTypeName();
+          const typeSymbol = typeName.getSymbol();
+          if (typeSymbol) {
+            const resolved = resolveTypeSymbol(typeSymbol, depth + 1);
+            if (resolved) return resolved;
+          }
+        }
+      }
+      // Import: follow aliased symbol
+      if (Node.isImportSpecifier(d)) {
+        const aliasedSymbol = d.getSymbol()?.getAliasedSymbol();
+        if (aliasedSymbol) {
+          const resolved = resolveTypeSymbol(aliasedSymbol, depth + 1);
+          if (resolved) return resolved;
+        }
+      }
+    }
+    return undefined;
+  }
 
+  const decl = resolveTypeSymbol(symbol);
   if (decl) return decl;
-
-  // Fallback: return the first declaration (as before)
   return symbol.getDeclarations()[0];
 }
 
@@ -97,6 +227,12 @@ function findTypeDeclarationByPosition(
 const collectedDeclarations = new Set<Node>();
 // `seenNodesForRecursion`: Prevents infinite loops and re-processing during the traversal of any Node.
 const seenNodesForRecursion = new Set<Node>();
+// Add tracking for type objects to prevent infinite recursion
+const seenTypeObjects = new WeakSet<Type>();
+// Track node_module imports for types
+const externalTypeImports = new Map<string, Set<string>>();
+
+const compositeAliasesToGenerate = new Set<CompositeAliasInfo>();
 
 // Function to get or add a source file to the project
 const sourceFileCache = new Map<string, SourceFile>();
@@ -117,7 +253,7 @@ function getSourceFile(filePath: string): SourceFile | undefined {
 console.log(`Processing ${typeInfos.length} types from input`);
 
 for (const typeInfo of typeInfos) {
-  const { filePath, startPosition } = typeInfo;
+  const { filePath, startPosition, compositeTypeString, alias } = typeInfo;
 
   const sourceFile = getSourceFile(filePath);
   if (!sourceFile) {
@@ -125,19 +261,31 @@ for (const typeInfo of typeInfos) {
     continue;
   }
 
-  let declarationNode: Node | undefined;
+  const typeRefNode = findTypeReferenceAtPosition(sourceFile, startPosition);
 
-  declarationNode = findTypeDeclarationByPosition(sourceFile, startPosition);
-
-  if (!declarationNode) {
+  if (!typeRefNode) {
     console.error(
       `Type not found in '${sourceFile.getFilePath()}' at position ${startPosition}`,
     );
     continue;
   }
 
-  console.log(`Found declaration at ${startPosition} in ${filePath}`);
-  collectDeclarationsRecursively(declarationNode);
+  console.log(
+    `Found type reference at ${startPosition} in ${filePath}: ${typeRefNode.getText()}`,
+  );
+
+  // Process the type reference
+  processTypeReference(typeRefNode);
+
+  if (compositeTypeString && alias) {
+    compositeAliasesToGenerate.add({
+      aliasName: alias,
+      typeString: compositeTypeString,
+    });
+    console.log(
+      `Queued composite alias: export type ${alias} = ${compositeTypeString};`,
+    );
+  }
 }
 
 /**
@@ -375,9 +523,6 @@ function processTypeNode(typeNode: TypeNode | undefined): void {
   }
 }
 
-// Add tracking for type objects to prevent infinite recursion
-const seenTypeObjects = new WeakSet<Type>();
-
 /**
  * Processes a ts-morph Type object to find and collect declarations of types it refers to.
  */
@@ -586,20 +731,108 @@ function collectUtilityTypesWithInnerTypes(): void {
   }
 }
 
+function getModuleSpecifierFromNodeModulesPath(
+  filePath: string,
+): string | undefined {
+  // Handles both scoped and unscoped packages
+  // e.g. node_modules/express/...
+  //      node_modules/@types/express/...
+  const nodeModulesIdx = filePath.lastIndexOf("node_modules/");
+  if (nodeModulesIdx === -1) return undefined;
+  const afterNodeModules = filePath.slice(
+    nodeModulesIdx + "node_modules/".length,
+  );
+  const parts = afterNodeModules.split(/[\\/]/); // split on / or \
+  if (parts[0].startsWith("@")) {
+    // Scoped package
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : undefined;
+  } else {
+    // Unscoped package
+    return parts[0];
+  }
+}
+
+function processTypeArgument(typeArg: TypeNode): void {
+  if (Node.isTypeReference(typeArg)) {
+    const argTypeName = typeArg.getTypeName().getText();
+    const argSymbol = typeArg.getTypeName().getSymbol();
+
+    if (argSymbol) {
+      // Find declarations for this type argument
+      for (const argDecl of argSymbol.getDeclarations()) {
+        const isNodeModule = argDecl
+          .getSourceFile()
+          .getFilePath()
+          .includes("node_modules");
+        if (isNodeModule) {
+          // Add to imports, but don't recurse deeply
+          addImportForExternalType(argDecl);
+        } else {
+          // Local type - recurse deeply
+          console.log(`  - Found local type argument: ${argTypeName}`);
+          collectDeclarationsRecursively(argDecl, true);
+        }
+      }
+    }
+
+    // Also process any type arguments of this type argument (nested generics)
+    for (const innerArg of typeArg.getTypeArguments()) {
+      processTypeArgument(innerArg);
+    }
+  }
+  // Handle array types
+  else if (Node.isArrayTypeNode(typeArg)) {
+    processTypeArgument(typeArg.getElementTypeNode());
+  }
+  // Add handling for other type constructs as needed
+}
+
 /**
  * Main recursive function to collect declarations.
  * Starts from a Node (typically a declaration), adds it if relevant,
  * and then explores its structure and associated Type for further dependencies.
  */
-function collectDeclarationsRecursively(node: Node | undefined): void {
+function collectDeclarationsRecursively(
+  node: Node | undefined,
+  isRoot = false, // isRoot helps decide if we should deeply explore a local type
+): void {
   if (!node || seenNodesForRecursion.has(node)) {
     return;
   }
+  // Add to seen *before* any recursive calls to prevent loops, especially with imports
   seenNodesForRecursion.add(node);
 
+  // If node is an import specifier, resolve it and recurse on its actual declaration(s)
+  if (Node.isImportSpecifier(node)) {
+    const aliasedSymbol = node.getSymbol()?.getAliasedSymbol(); // Get the symbol of what's being imported
+    if (aliasedSymbol) {
+      console.log(
+        `CDR: Resolving import specifier "${node.getName()}" to its original symbol.`,
+      );
+      for (const aliasedDecl of aliasedSymbol.getDeclarations()) {
+        // Recurse on the actual declaration.
+        // Treat it as a new "root" type we want to process fully if it's local.
+        console.log(
+          `CDR:   ↳ Found aliased declaration: ${aliasedDecl.getKindName()} in ${aliasedDecl.getSourceFile().getFilePath()}`,
+        );
+        collectDeclarationsRecursively(aliasedDecl, true); // Pass true for isRoot
+      }
+    } else {
+      console.warn(
+        `CDR: Could not get aliased symbol for import specifier "${node.getName()}"`,
+      );
+    }
+    return; // We've handled the import specifier by recursing on its target.
+  }
+
   const sourceFilePath = node.getSourceFile().getFilePath();
-  // Avoid collecting built-in TypeScript library types (lib.d.ts)
-  if (sourceFilePath.includes("node_modules/typescript/lib/")) {
+
+  if (sourceFilePath.includes("node_modules")) {
+    addImportForExternalType(node); // This function should only add if it's a named exportable type
+    // We might still want to process its type arguments if this 'node' is a TypeReference itself
+    // This was handled by processExternalTypeReference, let's ensure it's called if needed.
+    // For now, addImportForExternalType is the main action.
+    // If 'node' is a TypeReference from node_modules, its type args are handled by processTypeReference.
     return;
   }
 
@@ -610,74 +843,47 @@ function collectDeclarationsRecursively(node: Node | undefined): void {
     Node.isEnumDeclaration(node) ||
     Node.isClassDeclaration(node)
   ) {
+    console.log(
+      `CDR: Adding to collectedDeclarations: ${node.getKindName()} "${node.getName?.()}" from ${sourceFilePath}`,
+    );
     collectedDeclarations.add(node); // Add this declaration to our output set
 
-    // For these declarations, also explore their internal structure for type references
+    // If it's a local type, we always want to explore its structure.
+    // The `isRoot` flag was mainly to ensure that initial types from TypeInfo are explored.
+    // Since we've passed the node_modules check, this node is local.
+    // So, we should explore its structure.
 
-    // 1. Process type parameters - replaces isGenericableNode
+    // 1. Process type parameters
     if (
       Node.isClassDeclaration(node) ||
       Node.isInterfaceDeclaration(node) ||
       Node.isTypeAliasDeclaration(node) ||
-      Node.isFunctionDeclaration(node) ||
-      Node.isMethodDeclaration(node)
+      Node.isFunctionDeclaration(node) || // Added FunctionDeclaration for completeness
+      Node.isMethodDeclaration(node) // Added MethodDeclaration for completeness
     ) {
-      try {
-        // Safe access to type parameters
-        if (typeof (node as any).getTypeParameters === "function") {
-          const typeParams = (node as any).getTypeParameters();
-
-          if (Array.isArray(typeParams)) {
-            typeParams.forEach((tp) => {
-              // Process constraint
-              if (typeof tp.getConstraint === "function") {
-                const constraint = tp.getConstraint();
-                if (constraint) processTypeNode(constraint);
-              }
-
-              // Process default
-              if (typeof tp.getDefault === "function") {
-                const defaultType = tp.getDefault();
-                if (defaultType) processTypeNode(defaultType);
-              }
-            });
-          }
+      // Check if getTypeParameters method exists
+      if (typeof (node as any).getTypeParameters === "function") {
+        const typeParams = (node as any).getTypeParameters() as Node[]; // Assuming it returns Node[] or similar
+        if (Array.isArray(typeParams)) {
+          typeParams.forEach((tpNode) => {
+            // tpNode is likely a TypeParameterDeclaration
+            // A TypeParameterDeclaration has .getConstraint() and .getDefault()
+            // which return TypeNode | undefined
+            const tp = tpNode as import("ts-morph").TypeParameterDeclaration;
+            const constraint = tp.getConstraint();
+            if (constraint) processTypeNode(constraint);
+            const defaultType = tp.getDefault();
+            if (defaultType) processTypeNode(defaultType);
+          });
         }
-      } catch (e) {
-        console.warn(`Error processing type parameters: ${e}`);
       }
     }
 
     // 2. Heritage Clauses (extends, implements)
     if (Node.isInterfaceDeclaration(node) || Node.isClassDeclaration(node)) {
-      try {
-        const heritageClauses = node.getHeritageClauses();
-
-        heritageClauses.forEach((hc) => {
-          // In ts-morph 25.0.1, we should use getTypeNodes()
-          // If that doesn't exist, try alternatives
-          let typeNodes: TypeNode[] = [];
-
-          // Try different methods that might exist based on the API version
-          if (typeof hc.getTypeNodes === "function") {
-            typeNodes = hc.getTypeNodes();
-          } else if (typeof hc.getType === "function") {
-            typeNodes = hc.getTypeNodes();
-          } else if (typeof hc.getChildren === "function") {
-            // Fallback: try to get all TypeNode children
-            typeNodes = hc.getChildren().filter(Node.isTypeNode) as TypeNode[];
-          }
-
-          // Process all found type nodes
-          typeNodes.forEach((typeNode) => {
-            if (typeNode) {
-              processTypeNode(typeNode);
-            }
-          });
-        });
-      } catch (e) {
-        console.warn(`Error processing heritage clauses: ${e}`);
-      }
+      node.getHeritageClauses().forEach((hc) => {
+        hc.getTypeNodes().forEach((typeNode) => processTypeNode(typeNode));
+      });
     }
 
     // 3. Members (properties, methods - their types, parameter types, return types)
@@ -691,23 +897,17 @@ function collectDeclarationsRecursively(node: Node | undefined): void {
         } else if (
           Node.isMethodSignature(member) ||
           Node.isMethodDeclaration(member) ||
-          Node.isConstructorDeclaration(member) ||
+          Node.isConstructorDeclaration(member) || // Added ConstructorDeclaration
           Node.isGetAccessorDeclaration(member) ||
           Node.isSetAccessorDeclaration(member)
         ) {
-          if (typeof member.getParameters === "function") {
-            // Check if getParameters exists
-            member
+          if (typeof (member as any).getParameters === "function") {
+            (member as any)
               .getParameters()
-              .forEach((param) => processTypeNode(param.getTypeNode()));
+              .forEach((param: any) => processTypeNode(param.getTypeNode()));
           }
-          if (
-            (Node.isMethodSignature(member) ||
-              Node.isMethodDeclaration(member) ||
-              Node.isGetAccessorDeclaration(member)) &&
-            typeof member.getReturnTypeNode === "function"
-          ) {
-            processTypeNode(member.getReturnTypeNode());
+          if (typeof (member as any).getReturnTypeNode === "function") {
+            processTypeNode((member as any).getReturnTypeNode());
           }
         }
       });
@@ -716,20 +916,15 @@ function collectDeclarationsRecursively(node: Node | undefined): void {
     if (Node.isTypeAliasDeclaration(node)) {
       processTypeNode(node.getTypeNode());
     }
-    // For Enums, members usually don't define further type dependencies we need to process via TypeNodes here.
-    // The enum declaration itself is the collected item.
 
     // Also, get the general Type object for the declaration and explore it.
-    // This can catch dependencies not easily found by AST walking alone (e.g. complex conditional types).
     collectFromTypeObject(node.getType(), node);
   } else if (Node.isVariableDeclaration(node)) {
     // If we encounter a variable declaration (e.g., from `typeof X` where X is a const),
     // try to get its type and collect dependencies from that type.
     collectFromTypeObject(node.getType(), node);
   }
-  // If 'node' is not a primary declaration type but might be a constituent part (like an ImportSpecifier),
-  // its symbol should lead to the actual declaration, which will then be processed.
-  // The `collectFromTypeObject` and `processTypeNode` functions handle resolving symbols to declarations.
+  // Other node types (like ImportSpecifier) are handled at the top or not directly collected.
 }
 
 // --- Start Dependency Collection ---
@@ -773,6 +968,20 @@ const sortedDeclarations = Array.from(collectedDeclarations).sort((a, b) => {
 
 for (const decl of sortedDeclarations) {
   newSourceFile.addStatements(decl.getText());
+}
+
+let importStatements = "";
+for (const [moduleSpecifier, typeNames] of externalTypeImports.entries()) {
+  importStatements += `import { ${Array.from(typeNames).join(", ")} } from "${moduleSpecifier}";\n`;
+}
+newSourceFile.insertText(0, importStatements);
+
+const sortedCompositeAliases = Array.from(compositeAliasesToGenerate).sort(
+  (a, b) => a.aliasName.localeCompare(b.aliasName),
+);
+
+for (const { aliasName, typeString } of sortedCompositeAliases) {
+  newSourceFile.addStatements(`export type ${aliasName} = ${typeString};\n`);
 }
 
 try {

@@ -28,6 +28,8 @@ pub struct TypeReference {
     pub file_path: PathBuf,
     pub type_ann: Option<Box<TsType>>,
     pub start_position: usize,
+    pub composite_type_string: String,
+    pub alias: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
