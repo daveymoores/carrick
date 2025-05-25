@@ -6,6 +6,7 @@ use crate::{
     app_context::AppContext,
     config::Config,
     extractor::CoreExtractor,
+    packages::Packages,
     utils::join_prefix_and_path,
     visitor::{
         DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType,
@@ -829,7 +830,12 @@ impl Analyzer {
         self.endpoint_router = Some(router);
     }
 
-    pub fn extract_types_for_repo(&self, repo_path: &str, type_infos: Vec<Value>) {
+    pub fn extract_types_for_repo(
+        &self,
+        repo_path: &str,
+        type_infos: Vec<Value>,
+        packages: &Packages,
+    ) {
         use std::process::Command;
 
         // Skip if no types to extract
@@ -844,6 +850,10 @@ impl Analyzer {
 
         // Ensure the `ts_check/output` directory exists
         std::fs::create_dir_all("ts_check/output").expect("Failed to create output directory");
+
+        let dependencies = packages.get_dependencies();
+        // Serialize dependencies as JSON
+        let dependencies_json = serde_json::to_string(dependencies).unwrap();
 
         // Determine tsconfig path based on repo
         let tsconfig_path = format!("{}/tsconfig.json", repo_path);
@@ -861,6 +871,7 @@ impl Analyzer {
             .arg(&json_input)
             .arg(&output_path)
             .arg(ts_config)
+            .arg(&dependencies_json)
             .output()
             .expect("Failed to run type extraction");
 
@@ -893,6 +904,7 @@ impl Analyzer {
 pub fn analyze_api_consistency(
     visitors: Vec<DependencyVisitor>,
     config: Config,
+    packages: Packages,
     cm: Lrc<SourceMap>,
 ) -> ApiAnalysisResult {
     use std::collections::HashMap;
@@ -978,7 +990,7 @@ pub fn analyze_api_consistency(
             type_infos.len(),
             &repo_path
         );
-        analyzer.extract_types_for_repo(&repo_path, type_infos);
+        analyzer.extract_types_for_repo(&repo_path, type_infos, &packages);
     }
 
     analyzer.get_results()

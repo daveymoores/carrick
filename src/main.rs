@@ -3,6 +3,7 @@ mod app_context;
 mod config;
 mod extractor;
 mod file_finder;
+mod packages;
 mod parser;
 mod router_context;
 mod utils;
@@ -10,6 +11,7 @@ mod visitor;
 use analyzer::analyze_api_consistency;
 use config::Config;
 use file_finder::find_files;
+use packages::Packages;
 use parser::parse_file;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -71,6 +73,7 @@ fn main() {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let mut configs = Vec::new();
+    let mut package_jsons = Vec::new();
 
     // Extract directories from args if they exist. If no args are given then default to the current directory.
     let repositories = std::env::args().skip(1); // Skip program name
@@ -94,7 +97,7 @@ fn main() {
         let repo_prefix = dir_paths.last().unwrap_or(&"default").to_string();
 
         let ignore_patterns = ["node_modules", "dist", "build", ".next"];
-        let (files, config_file_path) = find_files(&dir, &ignore_patterns);
+        let (files, config_file_path, package_json_path) = find_files(&dir, &ignore_patterns);
 
         println!(
             "Found {} files to analyze in directory {}",
@@ -103,8 +106,14 @@ fn main() {
         );
 
         // Process the config file if found
+        if let Some(package_json) = package_json_path {
+            println!("Found package.json: {}", package_json.display());
+            package_jsons.push(package_json);
+        }
+
+        // Process the config file if found
         if let Some(config_path) = config_file_path {
-            println!("Found configuration file: {}", config_path.display());
+            println!("Found carrick.json file: {}", config_path.display());
             configs.push(config_path);
         }
 
@@ -183,8 +192,18 @@ fn main() {
         }
     };
 
+    // Load packages
+    let packages = match Packages::new(package_jsons) {
+        Ok(packages) => packages,
+        Err(error) => {
+            eprintln!("Error parsing package.json files: {}", error);
+            eprintln!("Please ensure your package.json files are valid JSON.");
+            std::process::exit(1);
+        }
+    };
+
     // Analyze for inconsistencies. Pass the sourcemap to allow relative byte positions to be calculated
-    let result = analyze_api_consistency(visitors, config, cm);
+    let result = analyze_api_consistency(visitors, config, packages, cm);
 
     // Print results
     println!("\nAPI Analysis Results:");

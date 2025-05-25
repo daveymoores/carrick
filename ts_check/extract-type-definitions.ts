@@ -15,12 +15,14 @@ import {
 // Format: JSON string containing array of type information objects
 // outputFile: Optional path for the output .ts file.
 // tsconfigPath: Optional path to the tsconfig.json file for the project
+// dependenciesJson: String of combined dependencies hashmap
 const [
   ,
   ,
   inputTypesJson,
   outputFile = "out/all-types-recursive.ts",
   tsconfigPath,
+  dependenciesJson,
 ] = process.argv;
 
 interface TypeInfo {
@@ -37,11 +39,23 @@ interface CompositeAliasInfo {
 
 let typeInfos: TypeInfo[] = [];
 
+let allDependencies: Record<
+  string,
+  { name: string; version: string; source_path: string }
+> = {};
+try {
+  if (dependenciesJson) {
+    allDependencies = JSON.parse(dependenciesJson);
+  }
+} catch (error) {
+  console.error("Error parsing dependencies JSON:", error);
+}
+
 try {
   typeInfos = JSON.parse(inputTypesJson);
 } catch (error) {
   console.error(
-    'Usage: ts-node extract-type-definitions.ts \'[{"filePath":"path/to/file.ts","typeName":"TypeName","startPosition":123},...]\' [outputFile] [tsconfigPath]',
+    'Usage: ts-node extract-type-definitions.ts \'[{"filePath":"path/to/file.ts","typeName":"TypeName","startPosition":123},...]\' [outputFile] [tsconfigPath] [dependencies]',
   );
   console.error("Error:", error);
   process.exit(1);
@@ -933,6 +947,79 @@ console.log(
   `After utility collection: ${collectedDeclarations.size} declarations.`,
 );
 
+const usedDependencies: Record<string, string> = {};
+
+// Extract package names from module specifiers in externalTypeImports
+for (const [moduleSpecifier] of externalTypeImports.entries()) {
+  let packageName = moduleSpecifier;
+
+  // Handle scoped packages
+  if (moduleSpecifier.startsWith("@")) {
+    const parts = moduleSpecifier.split("/");
+    if (parts.length >= 2) {
+      packageName = `${parts[0]}/${parts[1]}`;
+    }
+  } else {
+    // Regular package - take first part before any slash
+    const parts = moduleSpecifier.split("/");
+    packageName = parts[0];
+  }
+
+  // Add the main package if it exists in allDependencies
+  if (allDependencies[packageName]) {
+    usedDependencies[packageName] = allDependencies[packageName].version;
+    console.log(`Added main package: ${packageName}`);
+  } else if (allDependencies[moduleSpecifier]) {
+    // Try exact match for the module specifier
+    usedDependencies[moduleSpecifier] =
+      allDependencies[moduleSpecifier].version;
+    console.log(`Added exact match: ${moduleSpecifier}`);
+  }
+
+  // Check if a corresponding @types package exists and add it ONLY if it exists
+  const typesPackageName = packageName.startsWith("@types/")
+    ? packageName
+    : `@types/${packageName}`;
+
+  if (allDependencies[typesPackageName]) {
+    usedDependencies[typesPackageName] =
+      allDependencies[typesPackageName].version;
+    console.log(`Added types package: ${typesPackageName}`);
+  }
+
+  // If we started with a @types package, check if the main package exists
+  if (packageName.startsWith("@types/")) {
+    const mainPackageName = packageName.replace("@types/", "");
+    if (allDependencies[mainPackageName]) {
+      usedDependencies[mainPackageName] =
+        allDependencies[mainPackageName].version;
+      console.log(`Added main package for types: ${mainPackageName}`);
+    }
+  }
+}
+
+// Create package.json content
+const packageJsonContent = {
+  name: "extracted-types",
+  version: "1.0.0",
+  type: "module",
+  dependencies: usedDependencies,
+};
+
+// Write package.json to the output directory
+const outputDir = outputFile.substring(0, outputFile.lastIndexOf("/"));
+const packageJsonPath = `${outputDir}/package.json`;
+
+try {
+  const packageJsonString = JSON.stringify(packageJsonContent, null, 2);
+  require("fs").writeFileSync(packageJsonPath, packageJsonString);
+  console.log(
+    `Package.json created at ${packageJsonPath} with ${Object.keys(usedDependencies).length} dependencies`,
+  );
+} catch (error) {
+  console.error("Error creating package.json:", error);
+}
+
 // --- Create Output File ---
 const outputProject = new Project({
   // It can be beneficial to initialize the output project with compiler options
@@ -971,8 +1058,37 @@ for (const decl of sortedDeclarations) {
 }
 
 let importStatements = "";
+const externalPackages = new Set<string>();
+
 for (const [moduleSpecifier, typeNames] of externalTypeImports.entries()) {
-  importStatements += `import { ${Array.from(typeNames).join(", ")} } from "${moduleSpecifier}";\n`;
+  // Determine the correct import source
+  let importFrom = moduleSpecifier;
+
+  // If this is a @types package, try to import from the main package instead
+  if (moduleSpecifier.startsWith("@types/")) {
+    const mainPackage = moduleSpecifier.replace("@types/", "");
+    // Check if the main package exists in our dependencies
+    if (usedDependencies[mainPackage]) {
+      importFrom = mainPackage;
+    }
+  }
+
+  importStatements += `import { ${Array.from(typeNames).join(", ")} } from "${importFrom}";\n`;
+
+  // Extract package name from module specifier for tracking
+  if (importFrom.startsWith("@types/")) {
+    externalPackages.add(importFrom);
+  } else if (importFrom.startsWith("@")) {
+    // Scoped package
+    const parts = importFrom.split("/");
+    if (parts.length >= 2) {
+      externalPackages.add(`${parts[0]}/${parts[1]}`);
+    }
+  } else {
+    // Regular package
+    const parts = importFrom.split("/");
+    externalPackages.add(parts[0]);
+  }
 }
 newSourceFile.insertText(0, importStatements);
 
@@ -996,7 +1112,7 @@ try {
     JSON.stringify({
       success: true,
       output: outputFile,
-      typeCount: collectedDeclarations.size,
+      typeCount: collectedDeclarations.size + sortedCompositeAliases.length,
     }),
   );
 } catch (e: any) {

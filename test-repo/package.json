@@ -10,6 +10,7 @@
   "description": "",
   "dependencies": {
     "@types/express": "^5.0.2",
+    "d3": "^7.9.0",
     "express": "^5.1.0",
     "typescript": "^5.8.3"
   },
