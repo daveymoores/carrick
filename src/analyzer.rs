@@ -845,7 +845,11 @@ impl Analyzer {
 
         // Prepare JSON input with type information
         let json_input = serde_json::to_string(&type_infos).unwrap();
-        let repo_suffix = repo_path.split('/').last().expect("repo_suffix not found");
+        let repo_suffix = repo_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .last()
+            .expect("repo_suffix not found");
         let output_path = format!("ts_check/output/{}_types.ts", repo_suffix);
 
         // Ensure the `ts_check/output` directory exists
@@ -856,14 +860,15 @@ impl Analyzer {
         let dependencies_json = serde_json::to_string(dependencies).unwrap();
 
         // Determine tsconfig path based on repo
-        let tsconfig_path = format!("{}/tsconfig.json", repo_path);
+        use std::path::Path;
+        let tsconfig_path = Path::new(repo_path).join("tsconfig.json");
 
         println!("Extracting {} types from {}", type_infos.len(), repo_path);
 
         // Run the extract-type-definitions script with all types at once
         let script_path = std::fs::canonicalize("ts_check/extract-type-definitions.ts")
             .expect("Script not found");
-        let ts_config = std::fs::canonicalize(&tsconfig_path).expect("tsconfig.json not found");
+        let ts_config = std::fs::canonicalize(tsconfig_path).expect("tsconfig.json not found");
 
         let output = Command::new("npx")
             .arg("ts-node")
@@ -906,11 +911,22 @@ pub fn analyze_api_consistency(
     config: Config,
     packages: Packages,
     cm: Lrc<SourceMap>,
+    repo_paths: Vec<String>,
 ) -> ApiAnalysisResult {
     use std::collections::HashMap;
-    use std::path::Path;
     // Create and populate our analyzer
     let mut analyzer = Analyzer::new(config);
+
+    // Collect endpoint to repo_prefix mapping before consuming visitors
+    let mut endpoint_to_repo: HashMap<(String, String), String> = HashMap::new();
+    for visitor in &visitors {
+        for endpoint in &visitor.endpoints {
+            endpoint_to_repo.insert(
+                (endpoint.route.clone(), endpoint.method.clone()),
+                visitor.repo_prefix.clone(),
+            );
+        }
+    }
 
     // First pass - collect all data from visitors
     for visitor in visitors {
@@ -938,15 +954,15 @@ pub fn analyze_api_consistency(
     // Extract types for each repository
     let mut repo_type_map: HashMap<String, Vec<Value>> = HashMap::new();
 
-    // Group type information by repository
+    // Group type information by repository using repo_prefix from visitors
     for endpoint in &analyzer.endpoints {
+        // Find the repo_prefix for this endpoint using our pre-built mapping
+        let repo_prefix = endpoint_to_repo
+            .get(&(endpoint.route.clone(), endpoint.method.clone()))
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+
         if let Some(req_type) = &endpoint.request_type {
-            let repo_path = req_type
-                .file_path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_string_lossy()
-                .to_string();
             let file_path = req_type.file_path.to_string_lossy().to_string();
             let canonical_path =
                 std::fs::canonicalize(file_path).expect("Cannot extract full file path");
@@ -957,17 +973,14 @@ pub fn analyze_api_consistency(
                     "compositeTypeString": req_type.composite_type_string,
                     "alias": req_type.alias
                 });
-                repo_type_map.entry(repo_path).or_default().push(entry);
+                repo_type_map
+                    .entry(repo_prefix.clone())
+                    .or_default()
+                    .push(entry);
             }
         }
 
         if let Some(resp_type) = &endpoint.response_type {
-            let repo_path = resp_type
-                .file_path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_string_lossy()
-                .to_string();
             let file_path = resp_type.file_path.to_string_lossy().to_string();
             let canonical_path =
                 std::fs::canonicalize(file_path).expect("Cannot extract full file path");
@@ -978,19 +991,29 @@ pub fn analyze_api_consistency(
                     "compositeTypeString": resp_type.composite_type_string,
                     "alias": resp_type.alias
                 });
-                repo_type_map.entry(repo_path).or_default().push(entry);
+                repo_type_map
+                    .entry(repo_prefix.clone())
+                    .or_default()
+                    .push(entry);
             }
         }
     }
 
-    // Process types for each repository
-    for (repo_path, type_infos) in repo_type_map {
-        println!(
-            "Processing {} types from repository: {}",
-            type_infos.len(),
-            &repo_path
-        );
-        analyzer.extract_types_for_repo(&repo_path, type_infos, &packages);
+    // Process types for each repository using the original repo paths
+    for repo_path in repo_paths {
+        let repo_name = repo_path
+            .split("/")
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or("default");
+        if let Some(type_infos) = repo_type_map.get(repo_name) {
+            println!(
+                "Processing {} types from repository: {}",
+                type_infos.len(),
+                &repo_path
+            );
+            analyzer.extract_types_for_repo(&repo_path, type_infos.clone(), &packages);
+        }
     }
 
     analyzer.get_results()

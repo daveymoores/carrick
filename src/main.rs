@@ -90,7 +90,7 @@ fn main() {
     let mut file_queue = VecDeque::new();
 
     // Find all files to process initially and queue them
-    for dir in repo_dirs {
+    for dir in &repo_dirs {
         println!("---> Analyzing JavaScript/TypeScript files in: {}", dir);
 
         let dir_paths: Vec<_> = dir.split("/").filter(|s| !s.is_empty()).collect();
@@ -203,7 +203,7 @@ fn main() {
     };
 
     // Analyze for inconsistencies. Pass the sourcemap to allow relative byte positions to be calculated
-    let result = analyze_api_consistency(visitors, config, packages, cm);
+    let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs);
 
     // Print results
     println!("\nAPI Analysis Results:");
