@@ -917,16 +917,7 @@ pub fn analyze_api_consistency(
     // Create and populate our analyzer
     let mut analyzer = Analyzer::new(config);
 
-    // Collect endpoint to repo_prefix mapping before consuming visitors
-    let mut endpoint_to_repo: HashMap<(String, String), String> = HashMap::new();
-    for visitor in &visitors {
-        for endpoint in &visitor.endpoints {
-            endpoint_to_repo.insert(
-                (endpoint.route.clone(), endpoint.method.clone()),
-                visitor.repo_prefix.clone(),
-            );
-        }
-    }
+
 
     // First pass - collect all data from visitors
     for visitor in visitors {
@@ -954,13 +945,19 @@ pub fn analyze_api_consistency(
     // Extract types for each repository
     let mut repo_type_map: HashMap<String, Vec<Value>> = HashMap::new();
 
-    // Group type information by repository using repo_prefix from visitors
+    // Group type information by repository using endpoint owner information
     for endpoint in &analyzer.endpoints {
-        // Find the repo_prefix for this endpoint using our pre-built mapping
-        let repo_prefix = endpoint_to_repo
-            .get(&(endpoint.route.clone(), endpoint.method.clone()))
-            .cloned()
-            .unwrap_or_else(|| "default".to_string());
+        // Extract repo_prefix from the endpoint owner
+        let repo_prefix = if let Some(owner) = &endpoint.owner {
+            match owner {
+                OwnerType::App(name) | OwnerType::Router(name) => {
+                    // Extract repo prefix from owner name (format: "repo_prefix:name")
+                    name.split(':').next().unwrap_or("default").to_string()
+                }
+            }
+        } else {
+            "default".to_string()
+        };
 
         if let Some(req_type) = &endpoint.request_type {
             let file_path = req_type.file_path.to_string_lossy().to_string();
