@@ -27,6 +27,7 @@ export class TypeProcessor {
       if (Node.isTypeReference(typeNode)) {
         const nameNode = typeNode.getTypeName();
         const symbol = nameNode.getSymbol();
+
         if (symbol) {
           symbol
             .getDeclarations()
@@ -274,6 +275,10 @@ export class TypeProcessor {
   }
 
   processTypeArgument(typeArg: TypeNode): void {
+    console.log(
+      `processTypeNode: ${typeArg.getKindName()} - ${typeArg.getText()}`,
+    );
+
     if (Node.isTypeReference(typeArg)) {
       const argTypeName = typeArg.getTypeName().getText();
       const argSymbol = typeArg.getTypeName().getSymbol();
@@ -284,7 +289,6 @@ export class TypeProcessor {
             argDecl.getSourceFile().getFilePath(),
           );
           if (isNodeModule) {
-            // This would need to be handled by ImportHandler
             console.log(`External type argument: ${argTypeName}`);
           } else {
             console.log(`Found local type argument: ${argTypeName}`);
@@ -296,8 +300,44 @@ export class TypeProcessor {
       for (const innerArg of typeArg.getTypeArguments()) {
         this.processTypeArgument(innerArg);
       }
+    } else if (Node.isUnionTypeNode(typeArg)) {
+      console.log(`Processing union type argument: ${typeArg.getText()}`);
+      typeArg.getTypeNodes().forEach((unionMember) => {
+        console.log(
+          `  Union member: ${unionMember.getKindName()} - ${unionMember.getText()}`,
+        );
+        this.processTypeArgument(unionMember); // Recursively process each union member
+      });
+    } else if (Node.isIntersectionTypeNode(typeArg)) {
+      console.log(
+        `Processing intersection type argument: ${typeArg.getText()}`,
+      );
+      typeArg.getTypeNodes().forEach((intersectionMember) => {
+        console.log(
+          `  Intersection member: ${intersectionMember.getKindName()} - ${intersectionMember.getText()}`,
+        );
+        this.processTypeArgument(intersectionMember); // Use processTypeArgument, not processTypeNode
+      });
     } else if (Node.isArrayTypeNode(typeArg)) {
       this.processTypeArgument(typeArg.getElementTypeNode());
+    } else if (Node.isParenthesizedTypeNode(typeArg)) {
+      console.log(`Processing parenthesized type: ${typeArg.getText()}`);
+      this.processTypeArgument(typeArg.getTypeNode()); // Use processTypeArgument, not processTypeNode
+    } else if (Node.isTypeLiteral(typeArg)) {
+      console.log(`Processing type literal: ${typeArg.getText()}`);
+      typeArg.getProperties().forEach((prop) => {
+        if (Node.isPropertySignature(prop)) {
+          const propTypeNode = prop.getTypeNode();
+          if (propTypeNode) {
+            this.processTypeArgument(propTypeNode); // Use processTypeArgument consistently
+          }
+        }
+      });
+    } else {
+      console.log(
+        `Delegating complex type argument to main processor: ${typeArg.getKindName()}`,
+      );
+      this.processTypeNode(typeArg);
     }
   }
 
