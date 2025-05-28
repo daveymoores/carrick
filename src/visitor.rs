@@ -922,7 +922,6 @@ impl DependencyVisitor {
             let (route, response_fields, request_fields, handler_name) = endpoint_data;
 
             if let Some(second_arg) = call.args.get(1) {
-                // println!("{:?}", second_arg);
                 match &*second_arg.expr {
                     Expr::Arrow(arrow) => {
                         // Store arrow function definition

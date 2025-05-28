@@ -917,8 +917,6 @@ pub fn analyze_api_consistency(
     // Create and populate our analyzer
     let mut analyzer = Analyzer::new(config);
 
-
-
     // First pass - collect all data from visitors
     for visitor in visitors {
         analyzer.add_visitor_data(visitor);

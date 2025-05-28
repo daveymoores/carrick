@@ -512,30 +512,30 @@ pub trait CoreExtractor {
             return None;
         }
 
-        match &*args[0].expr {
-            // Regular string literal
+        let mut route = match &*args[0].expr {
             Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
-
-            // Template literal - use our improved template processor
             Expr::Tpl(tpl) => self.process_template(tpl),
-
-            // Variable reference - try to resolve it
             Expr::Ident(ident) => {
                 if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
                     match resolved {
                         Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
                         Expr::Tpl(tpl) => self.process_template(tpl),
-                        // Add other cases as needed
                         _ => None,
                     }
                 } else {
                     None
                 }
             }
-
-            // Add other patterns as needed
             _ => None,
+        }?;
+
+        // Strip query parameters - only keep the path portion
+        // This can be handled with type checking and doesn't ultimately affect the route path
+        if let Some(query_start) = route.find('?') {
+            route = route[..query_start].to_string();
         }
+
+        Some(route)
     }
 
     fn process_template(&self, tpl: &Tpl) -> Option<String> {
