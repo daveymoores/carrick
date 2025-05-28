@@ -7,7 +7,6 @@ async function main() {
   try {
     // Parse command line arguments
     const args = parseArguments();
-
     // Create type extractor instance
     const typeExtractor = new TypeExtractor(
       args.tsconfigPath,

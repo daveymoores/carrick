@@ -193,27 +193,6 @@ impl Analyzer {
         source[..byte_offset].encode_utf16().count()
     }
 
-    fn sanitize_route_for_alias(route: &str) -> String {
-        route
-            .split('/')
-            .filter(|s| !s.is_empty() && !s.starts_with(':')) // Remove empty segments and param names
-            .map(|segment| {
-                // Capitalize first letter of each segment part
-                segment
-                    .split(|c: char| !c.is_alphanumeric()) // Split by non-alphanumeric
-                    .filter(|p| !p.is_empty())
-                    .map(|part| {
-                        let mut c = part.chars();
-                        match c.next() {
-                            None => String::new(),
-                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                        }
-                    })
-                    .collect::<String>()
-            })
-            .collect::<String>()
-    }
-
     fn generate_type_alias_name(route: &str, method: &str, is_request_type: bool) -> String {
         let prefix = if is_request_type { "Req" } else { "Res" };
 
@@ -221,23 +200,60 @@ impl Analyzer {
         let method_pascal = if method.is_empty() {
             "UnknownMethod".to_string()
         } else {
-            let lowercase_method = method.to_lowercase(); // Store the String
+            let lowercase_method = method.to_lowercase();
             let mut m = lowercase_method.chars();
             match m.next() {
                 None => "UnknownMethod".to_string(),
-                Some(f) => f.to_uppercase().collect::<String>() + m.as_str(), // m.as_str() now borrows from lowercase_method
+                Some(f) => f.to_uppercase().collect::<String>() + m.as_str(),
             }
         };
 
-        let sanitized_route = Self::sanitize_route_for_alias(route);
+        let sanitized_route = Self::sanitize_route_for_dynamic_paths(route);
 
-        // Filter out any non-alphanumeric characters from the final route part
-        let final_sanitized_route = sanitized_route
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect::<String>();
+        format!("{}{}{}", prefix, method_pascal, sanitized_route)
+    }
 
-        format!("{}{}{}", prefix, final_sanitized_route, method_pascal)
+    fn sanitize_route_for_dynamic_paths(route: &str) -> String {
+        route
+            .split('/')
+            .filter(|segment| !segment.is_empty()) // Remove empty segments
+            .map(|segment| {
+                if segment.starts_with(':') {
+                    // Convert :id -> ById, :userId -> ByUserId, :eventId -> ByEventId
+                    let param_name = &segment[1..]; // Remove the ':'
+                    format!("By{}", Self::to_pascal_case(param_name))
+                } else {
+                    // Convert regular segments to PascalCase
+                    Self::to_pascal_case(segment)
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    fn to_pascal_case(input: &str) -> String {
+        if input.is_empty() {
+            return String::new();
+        }
+
+        let mut result = String::new();
+        let mut capitalize_next = true;
+
+        for ch in input.chars() {
+            if ch.is_alphanumeric() {
+                if capitalize_next {
+                    result.push(ch.to_uppercase().next().unwrap_or(ch));
+                    capitalize_next = false;
+                } else {
+                    result.push(ch.to_lowercase().next().unwrap_or(ch));
+                }
+            } else {
+                // Non-alphanumeric characters trigger capitalization of next char
+                capitalize_next = true;
+            }
+        }
+
+        result
     }
 
     /// Helper to process a TsTypeAnn and produce a TypeReference.
@@ -308,6 +324,19 @@ impl Analyzer {
     pub fn resolve_types_for_endpoints(&mut self, cm: Lrc<SourceMap>) -> &mut Self {
         let mut request_types_map = HashMap::new();
         let mut response_types_map = HashMap::new();
+        let mut seen = HashSet::new();
+
+        // Routers that are mounted on routers can cause duplicate endpoints
+        // Lets fix this through dedupe rather than editing the mounting
+        self.endpoints.retain(|endpoint| {
+            let key = (
+                endpoint.route.clone(),
+                endpoint.method.clone(),
+                endpoint.handler_name.clone(),
+            );
+            // returns true or false if the value in the set already exists
+            seen.insert(key)
+        });
 
         for endpoint in &self.endpoints {
             if let Some(handler_name) = &endpoint.handler_name {
