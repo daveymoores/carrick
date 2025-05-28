@@ -52,6 +52,7 @@ pub struct ApiEndpointDetails {
     pub handler_name: Option<String>,
     pub request_type: Option<TypeReference>,
     pub response_type: Option<TypeReference>,
+    pub file_path: PathBuf,
 }
 
 impl fmt::Display for FieldMismatch {
@@ -74,8 +75,7 @@ pub struct ApiAnalysisResult {
     pub issues: ApiIssues,
 }
 
-#[derive(Default)]
-struct Analyzer {
+pub struct Analyzer {
     // <Route, http_method, handler_name, source>
     imported_handlers: Vec<(String, String, String, String)>,
     function_definitions: HashMap<String, FunctionDefinition>,
@@ -85,6 +85,7 @@ struct Analyzer {
     apps: HashMap<String, AppContext>,
     config: Config,
     endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
+    source_map: Lrc<SourceMap>,
 }
 
 #[derive(Debug)]
@@ -94,13 +95,24 @@ pub enum FieldMismatch {
     TypeMismatch(String, String, String), // (path, call_type, endpoint_type)
 }
 
-impl CoreExtractor for Analyzer {}
+impl CoreExtractor for Analyzer {
+    fn get_source_map(&self) -> &Lrc<SourceMap> {
+        &self.source_map
+    }
+}
 
 impl Analyzer {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, source_map: Lrc<SourceMap>) -> Self {
         Analyzer {
+            imported_handlers: Vec::new(),
+            function_definitions: HashMap::new(),
+            endpoints: Vec::new(),
+            calls: Vec::new(),
+            mounts: Vec::new(),
+            apps: HashMap::new(),
             config,
-            ..Default::default()
+            endpoint_router: None,
+            source_map,
         }
     }
 
@@ -117,9 +129,10 @@ impl Analyzer {
                 params,
                 response_body: Some(endpoint.response),
                 request_body: endpoint.request,
-                handler_name: Some(endpoint.handler_name), // Add this line
-                request_type: endpoint.request_type,       // Add these lines too
+                handler_name: Some(endpoint.handler_name),
+                request_type: endpoint.request_type,
                 response_type: endpoint.response_type,
+                file_path: endpoint.handler_file,
             });
         }
 
@@ -136,6 +149,7 @@ impl Analyzer {
                 handler_name: None, // Calls don't typically have handlers
                 request_type: call.request_type,
                 response_type: call.response_type,
+                file_path: call.call_file,
             })
         }
 
@@ -158,29 +172,35 @@ impl Analyzer {
             // Extract fetch calls based on function type
             let fetch_calls = match &def.node_type {
                 FunctionNodeType::ArrowFunction(arrow) => {
-                    self.extract_fetch_calls_from_arrow(arrow)
+                    self.extract_fetch_calls_from_arrow_with_file(arrow, &def.file_path)
                 }
                 FunctionNodeType::FunctionDeclaration(decl) => {
-                    self.extract_fetch_calls_from_function_decl(decl)
+                    self.extract_fetch_calls_from_function_decl_with_file(decl, &def.file_path)
                 }
                 FunctionNodeType::FunctionExpression(expr) => {
-                    self.extract_fetch_calls_from_function_expr(expr)
+                    self.extract_fetch_calls_from_function_expr_with_file(expr, &def.file_path)
                 }
             };
 
             // Add the discovered calls
-            for (route, method, request_body) in fetch_calls {
-                let params = self.extract_params_from_route(&route);
+            for mut call in fetch_calls {
+                // Set the file path from the function definition if it's empty
+                if call.call_file.as_os_str().is_empty() {
+                    call.call_file = def.file_path.clone();
+                }
+
+                let params = self.extract_params_from_route(&call.route);
                 new_calls.push(ApiEndpointDetails {
                     owner: None,
-                    route,
-                    method,
+                    route: call.route.clone(),
+                    method: call.method.clone(),
                     params,
-                    request_body,
+                    request_body: call.request.clone(),
                     response_body: Some(Json::Null),
                     handler_name: None,
-                    request_type: None,
-                    response_type: None,
+                    request_type: call.request_type.clone(),
+                    response_type: call.response_type.clone(),
+                    file_path: call.call_file.clone(),
                 });
             }
         }
@@ -193,7 +213,7 @@ impl Analyzer {
         source[..byte_offset].encode_utf16().count()
     }
 
-    fn generate_type_alias_name(route: &str, method: &str, is_request_type: bool) -> String {
+    pub fn generate_type_alias_name(route: &str, method: &str, is_request_type: bool) -> String {
         let prefix = if is_request_type { "Req" } else { "Res" };
 
         // Sanitize method: Make it PascalCase (e.g., "GET" -> "Get", "post" -> "Post")
@@ -259,7 +279,7 @@ impl Analyzer {
     /// Helper to process a TsTypeAnn and produce a TypeReference.
     /// This function encapsulates the logic to find the correct span,
     /// calculate the UTF-16 offset, and build the TypeReference struct.
-    fn create_type_reference_from_swc(
+    pub fn create_type_reference_from_swc(
         type_ann_swc: &TsTypeAnn,
         cm: &Lrc<SourceMap>,
         func_def_file_path: &PathBuf,
@@ -933,6 +953,75 @@ impl Analyzer {
             },
         }
     }
+
+    /// Extract repository prefix from endpoint owner information
+    fn extract_repo_prefix_from_owner(&self, owner: &Option<OwnerType>) -> String {
+        if let Some(owner) = owner {
+            match owner {
+                OwnerType::App(name) | OwnerType::Router(name) => {
+                    // Extract repo prefix from owner name (format: "repo_prefix:name")
+                    name.split(':').next().unwrap_or("default").to_string()
+                }
+            }
+        } else {
+            "default".to_string()
+        }
+    }
+
+    /// Extract repository prefix from file path by matching against repository paths
+    fn extract_repo_prefix_from_file_path(
+        &self,
+        file_path: &PathBuf,
+        repo_paths: &[String],
+    ) -> String {
+        let file_path_str = file_path.to_string_lossy();
+        repo_paths
+            .iter()
+            .find(|repo_path| file_path_str.starts_with(*repo_path))
+            .and_then(|repo_path| repo_path.split("/").filter(|s| !s.is_empty()).last())
+            .unwrap_or("default")
+            .to_string()
+    }
+
+    /// Add a TypeReference to the repository type map
+    fn add_type_to_repo_map(
+        &self,
+        type_ref: &TypeReference,
+        repo_prefix: String,
+        repo_type_map: &mut HashMap<String, Vec<Value>>,
+    ) {
+        let file_path = type_ref.file_path.to_string_lossy().to_string();
+
+        let canonical_path =
+            std::fs::canonicalize(file_path).expect("Cannot extract full file path");
+        if let Some(path) = canonical_path.to_str() {
+            let entry = serde_json::json!({
+                "filePath": path.to_string(),
+                "startPosition": type_ref.start_position,
+                "compositeTypeString": type_ref.composite_type_string,
+                "alias": type_ref.alias
+            });
+            repo_type_map.entry(repo_prefix).or_default().push(entry);
+        }
+    }
+
+    /// Process both request and response types for an ApiEndpointDetails
+    fn process_api_detail_types(
+        &self,
+        api_detail: &ApiEndpointDetails,
+        repo_prefix: String,
+        repo_type_map: &mut HashMap<String, Vec<Value>>,
+    ) {
+        if let Some(req_type) = &api_detail.request_type {
+            println!("REQ_TYPE >>>> {:?}", req_type.file_path);
+            self.add_type_to_repo_map(req_type, repo_prefix.clone(), repo_type_map);
+        }
+
+        if let Some(resp_type) = &api_detail.response_type {
+            println!("RES_TYPE >>>> {:?}", resp_type.file_path);
+            self.add_type_to_repo_map(resp_type, repo_prefix, repo_type_map);
+        }
+    }
 }
 
 pub fn analyze_api_consistency(
@@ -944,7 +1033,7 @@ pub fn analyze_api_consistency(
 ) -> ApiAnalysisResult {
     use std::collections::HashMap;
     // Create and populate our analyzer
-    let mut analyzer = Analyzer::new(config);
+    let mut analyzer = Analyzer::new(config, cm.clone());
 
     // First pass - collect all data from visitors
     for visitor in visitors {
@@ -974,53 +1063,15 @@ pub fn analyze_api_consistency(
 
     // Group type information by repository using endpoint owner information
     for endpoint in &analyzer.endpoints {
-        // Extract repo_prefix from the endpoint owner
-        let repo_prefix = if let Some(owner) = &endpoint.owner {
-            match owner {
-                OwnerType::App(name) | OwnerType::Router(name) => {
-                    // Extract repo prefix from owner name (format: "repo_prefix:name")
-                    name.split(':').next().unwrap_or("default").to_string()
-                }
-            }
-        } else {
-            "default".to_string()
-        };
+        let repo_prefix = analyzer.extract_repo_prefix_from_owner(&endpoint.owner);
+        analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
+    }
 
-        if let Some(req_type) = &endpoint.request_type {
-            let file_path = req_type.file_path.to_string_lossy().to_string();
-            let canonical_path =
-                std::fs::canonicalize(file_path).expect("Cannot extract full file path");
-            if let Some(path) = canonical_path.to_str() {
-                let entry = serde_json::json!({
-                    "filePath": path.to_string(),
-                    "startPosition": req_type.start_position,
-                    "compositeTypeString": req_type.composite_type_string,
-                    "alias": req_type.alias
-                });
-                repo_type_map
-                    .entry(repo_prefix.clone())
-                    .or_default()
-                    .push(entry);
-            }
-        }
-
-        if let Some(resp_type) = &endpoint.response_type {
-            let file_path = resp_type.file_path.to_string_lossy().to_string();
-            let canonical_path =
-                std::fs::canonicalize(file_path).expect("Cannot extract full file path");
-            if let Some(path) = canonical_path.to_str() {
-                let entry = serde_json::json!({
-                    "filePath": path.to_string(),
-                    "startPosition": resp_type.start_position,
-                    "compositeTypeString": resp_type.composite_type_string,
-                    "alias": resp_type.alias
-                });
-                repo_type_map
-                    .entry(repo_prefix.clone())
-                    .or_default()
-                    .push(entry);
-            }
-        }
+    // Group type information by repository using call file information
+    for call in &analyzer.calls {
+        println!("CALL >>>> {:?}", call);
+        let repo_prefix = analyzer.extract_repo_prefix_from_file_path(&call.file_path, &repo_paths);
+        analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
     }
 
     // Process types for each repository using the original repo paths

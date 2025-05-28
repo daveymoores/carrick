@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.97"
+derivative = "2.2.0"
 matchit = "0.8.6"
 regex = "1.11.1"
 semver = "1.0"

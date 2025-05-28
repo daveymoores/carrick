@@ -1,12 +1,13 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
+use derivative::Derivative;
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
     path::PathBuf,
 };
-
-use serde::Serialize;
+use swc_common::{SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -19,6 +20,7 @@ extern crate regex;
 
 #[derive(Debug, Clone)]
 pub struct FunctionArgument {
+    #[allow(dead_code)]
     pub name: String,
     pub type_ann: Option<TsTypeAnn>, // swc_ecma_ast::TsTypeAnn
 }
@@ -26,6 +28,7 @@ pub struct FunctionArgument {
 #[derive(Debug, Clone)]
 pub struct TypeReference {
     pub file_path: PathBuf,
+    #[allow(dead_code)]
     pub type_ann: Option<Box<TsType>>,
     pub start_position: usize,
     pub composite_type_string: String,
@@ -81,6 +84,7 @@ pub struct Endpoint {
     pub request: Option<Json>,
     pub response_type: Option<TypeReference>,
     pub request_type: Option<TypeReference>,
+    #[allow(dead_code)]
     pub handler_file: PathBuf,
     pub handler_name: String,
 }
@@ -105,13 +109,15 @@ pub enum SymbolKind {
 
 #[derive(Debug)]
 pub struct ImportedSymbol {
+    #[allow(dead_code)]
     pub local_name: String,
     pub imported_name: String,
     pub source: String,
     pub kind: SymbolKind,
 }
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct DependencyVisitor {
     pub repo_prefix: String,
     pub endpoints: Vec<Endpoint>, // (route, method, response fields, request fields)
@@ -136,6 +142,8 @@ pub struct DependencyVisitor {
     pub exported_variables: HashMap<String, Expr>,
     pub imported_symbols: HashMap<String, ImportedSymbol>,
     pub variable_values: HashMap<String, Expr>,
+    #[derivative(Debug = "ignore")]
+    pub source_map: Lrc<SourceMap>,
 }
 
 impl DependencyVisitor {
@@ -143,6 +151,7 @@ impl DependencyVisitor {
         file_path: PathBuf,
         repo_prefix: &str,
         imported_router_name: Option<String>,
+        cm: Lrc<SourceMap>,
     ) -> Self {
         Self {
             repo_prefix: repo_prefix.to_owned(),
@@ -162,11 +171,15 @@ impl DependencyVisitor {
             exported_variables: HashMap::new(),
             imported_symbols: HashMap::new(),
             variable_values: HashMap::new(),
+            source_map: cm,
         }
     }
 }
 
 impl CoreExtractor for DependencyVisitor {
+    fn get_source_map(&self) -> &Lrc<SourceMap> {
+        &self.source_map
+    }
     fn resolve_variable(&self, name: &str) -> Option<&Expr> {
         // First check if it's a local variable
         if let Some(expr) = self.variable_values.get(name) {

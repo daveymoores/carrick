@@ -151,41 +151,4 @@ impl Packages {
     pub fn get_dependencies(&self) -> &HashMap<String, PackageInfo> {
         &self.merged_dependencies
     }
-
-    /// Creates packages data structure for TypeScript processing
-    pub fn create_packages_data_for_typescript(
-        &self,
-        project_name: &str,
-    ) -> PackagesDataForTypeScript {
-        let mut all_dependencies = HashMap::new();
-
-        for (name, package_info) in &self.merged_dependencies {
-            all_dependencies.insert(name.clone(), package_info.version.clone());
-        }
-
-        PackagesDataForTypeScript {
-            name: project_name.to_string(),
-            dependencies: all_dependencies,
-        }
-    }
-
-    /// Gets package information for a specific package name
-    pub fn get_package_info(&self, name: &str) -> Option<&PackageInfo> {
-        self.merged_dependencies.get(name)
-    }
-
-    /// Lists all package names
-    pub fn get_package_names(&self) -> Vec<String> {
-        self.merged_dependencies.keys().cloned().collect()
-    }
-
-    /// Gets count of total packages
-    pub fn len(&self) -> usize {
-        self.merged_dependencies.len()
-    }
-
-    /// Checks if packages collection is empty
-    pub fn is_empty(&self) -> bool {
-        self.merged_dependencies.is_empty()
-    }
 }

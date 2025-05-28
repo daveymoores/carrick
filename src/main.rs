@@ -139,7 +139,7 @@ fn main() {
         if let Some(module) = parse_file(&file_path, &cm, &handler) {
             // Create visitor with the imported router name if this file was imported as a router
             let mut visitor =
-                DependencyVisitor::new(file_path.clone(), &repo_prefix, imported_router_name);
+                DependencyVisitor::new(file_path.clone(), &repo_prefix, imported_router_name, cm.clone());
             module.visit_with(&mut visitor);
 
             // Queue imported router files that might be used with app.use or router.use
