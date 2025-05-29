@@ -355,7 +355,6 @@ pub trait CoreExtractor {
         fetch_calls
     }
 
-    /// Extract calls from block statement with file context
     fn extract_calls_from_block_with_file(
         &self,
         block: &swc_ecma_ast::BlockStmt,
@@ -367,51 +366,51 @@ pub trait CoreExtractor {
         let cm = self.get_source_map();
 
         for stmt in &block.stmts {
-            match stmt {
-                Stmt::Decl(Decl::Var(var_decl)) => {
-                    for decl_item in &var_decl.decls {
-                        if let Some(init) = &decl_item.init {
-                            if let Some(mut call) = self.extract_call_from_expr(init) {
-                                call.call_file = file_path.clone();
-                                if let Some(prev_fetch) = pending_fetch.take() {
-                                    calls.push(prev_fetch);
-                                }
-                                pending_fetch = Some(call);
+            // First, recursively extract calls from nested statements
+            self.extract_calls_from_stmt_recursive(stmt, calls, file_path);
+
+            // Then handle the special case of variable declarations with type annotations
+            if let Stmt::Decl(Decl::Var(var_decl)) = stmt {
+                for decl_item in &var_decl.decls {
+                    if let Some(init) = &decl_item.init {
+                        if let Some(mut call) = self.extract_call_from_expr(init) {
+                            call.call_file = file_path.clone();
+                            if let Some(prev_fetch) = pending_fetch.take() {
+                                calls.push(prev_fetch);
                             }
+                            pending_fetch = Some(call);
                         }
+                    }
 
-                        if let Pat::Ident(ident) = &decl_item.name {
-                            if let Some(type_ann) = &ident.type_ann {
-                                if let Some(init_expr) = &decl_item.init {
-                                    let is_json_await_or_call = match &**init_expr {
-                                        Expr::Await(await_expr) => {
-                                            if let Expr::Call(call_expr) = &*await_expr.arg {
-                                                self.is_json_method_call(call_expr)
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Expr::Call(call_expr) => {
+                    if let Pat::Ident(ident) = &decl_item.name {
+                        if let Some(type_ann) = &ident.type_ann {
+                            if let Some(init_expr) = &decl_item.init {
+                                let is_json_await_or_call = match &**init_expr {
+                                    Expr::Await(await_expr) => {
+                                        if let Expr::Call(call_expr) = &*await_expr.arg {
                                             self.is_json_method_call(call_expr)
+                                        } else {
+                                            false
                                         }
-                                        _ => false,
-                                    };
+                                    }
+                                    Expr::Call(call_expr) => self.is_json_method_call(call_expr),
+                                    _ => false,
+                                };
 
-                                    if is_json_await_or_call {
-                                        if let Some(ref mut fetch) = pending_fetch {
-                                            let alias =
-                                                crate::analyzer::Analyzer::generate_type_alias_name(
-                                                    &fetch.route,
-                                                    &fetch.method,
-                                                    false,
-                                                );
-                                            if let Some(type_ref) =
-                                                crate::analyzer::Analyzer::create_type_reference_from_swc(
-                                                    type_ann, cm, file_path, alias,
-                                                )
-                                            {
-                                                fetch.response_type = Some(type_ref);
-                                            }
+                                if is_json_await_or_call {
+                                    if let Some(ref mut fetch) = pending_fetch {
+                                        let alias =
+                                            crate::analyzer::Analyzer::generate_type_alias_name(
+                                                &fetch.route,
+                                                &fetch.method,
+                                                false,
+                                            );
+                                        if let Some(type_ref) =
+                                            crate::analyzer::Analyzer::create_type_reference_from_swc(
+                                                type_ann, cm, file_path, alias,
+                                            )
+                                        {
+                                            fetch.response_type = Some(type_ref);
                                         }
                                     }
                                 }
@@ -419,16 +418,156 @@ pub trait CoreExtractor {
                         }
                     }
                 }
-                _ => {
-                    if let Some(fetch) = pending_fetch.take() {
-                        calls.push(fetch);
-                    }
-                }
             }
         }
 
         if let Some(fetch) = pending_fetch.take() {
             calls.push(fetch);
+        }
+    }
+
+    // Add this new helper method to recursively extract calls from all statement types
+    fn extract_calls_from_stmt_recursive(
+        &self,
+        stmt: &swc_ecma_ast::Stmt,
+        calls: &mut Vec<crate::visitor::Call>,
+        file_path: &PathBuf,
+    ) {
+        use swc_ecma_ast::*;
+
+        match stmt {
+            Stmt::Expr(expr_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&expr_stmt.expr) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+            }
+            Stmt::Return(return_stmt) => {
+                if let Some(expr) = &return_stmt.arg {
+                    if let Some(mut call) = self.extract_call_from_expr(expr) {
+                        call.call_file = file_path.clone();
+                        calls.push(call);
+                    }
+                }
+            }
+            Stmt::Block(block) => {
+                self.extract_calls_from_block_with_file(block, calls, file_path);
+            }
+            Stmt::Try(try_stmt) => {
+                // Process statements in try block
+                self.extract_calls_from_block_with_file(&try_stmt.block, calls, file_path);
+
+                // Process catch block if present
+                if let Some(handler) = &try_stmt.handler {
+                    self.extract_calls_from_block_with_file(&handler.body, calls, file_path);
+                }
+
+                // Process finally block if present
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    self.extract_calls_from_block_with_file(finalizer, calls, file_path);
+                }
+            }
+            Stmt::Decl(Decl::Var(var_decl)) => {
+                // Handle variable declarations which might contain fetch calls
+                for var in &var_decl.decls {
+                    if let Some(init) = &var.init {
+                        if let Some(mut call) = self.extract_call_from_expr(init) {
+                            call.call_file = file_path.clone();
+                            calls.push(call);
+                        }
+                    }
+                }
+            }
+            Stmt::If(if_stmt) => {
+                // Check condition for fetch calls
+                if let Some(mut call) = self.extract_call_from_expr(&if_stmt.test) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+
+                // Process consequent
+                self.extract_calls_from_stmt_recursive(&if_stmt.cons, calls, file_path);
+
+                // Process alternate if present
+                if let Some(alt) = &if_stmt.alt {
+                    self.extract_calls_from_stmt_recursive(alt, calls, file_path);
+                }
+            }
+            Stmt::While(while_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&while_stmt.test) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                self.extract_calls_from_stmt_recursive(&while_stmt.body, calls, file_path);
+            }
+            Stmt::For(for_stmt) => {
+                if let Some(init) = &for_stmt.init {
+                    match init {
+                        VarDeclOrExpr::VarDecl(var_decl) => {
+                            for var in &var_decl.decls {
+                                if let Some(init_expr) = &var.init {
+                                    if let Some(mut call) = self.extract_call_from_expr(init_expr) {
+                                        call.call_file = file_path.clone();
+                                        calls.push(call);
+                                    }
+                                }
+                            }
+                        }
+                        VarDeclOrExpr::Expr(expr) => {
+                            if let Some(mut call) = self.extract_call_from_expr(expr) {
+                                call.call_file = file_path.clone();
+                                calls.push(call);
+                            }
+                        }
+                    }
+                }
+                if let Some(test) = &for_stmt.test {
+                    if let Some(mut call) = self.extract_call_from_expr(test) {
+                        call.call_file = file_path.clone();
+                        calls.push(call);
+                    }
+                }
+                if let Some(update) = &for_stmt.update {
+                    if let Some(mut call) = self.extract_call_from_expr(update) {
+                        call.call_file = file_path.clone();
+                        calls.push(call);
+                    }
+                }
+                self.extract_calls_from_stmt_recursive(&for_stmt.body, calls, file_path);
+            }
+            Stmt::ForIn(for_in_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&for_in_stmt.right) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                self.extract_calls_from_stmt_recursive(&for_in_stmt.body, calls, file_path);
+            }
+            Stmt::ForOf(for_of_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&for_of_stmt.right) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                self.extract_calls_from_stmt_recursive(&for_of_stmt.body, calls, file_path);
+            }
+            Stmt::Switch(switch_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&switch_stmt.discriminant) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                for case in &switch_stmt.cases {
+                    if let Some(test) = &case.test {
+                        if let Some(mut call) = self.extract_call_from_expr(test) {
+                            call.call_file = file_path.clone();
+                            calls.push(call);
+                        }
+                    }
+                    for stmt in &case.cons {
+                        self.extract_calls_from_stmt_recursive(stmt, calls, file_path);
+                    }
+                }
+            }
+            // Add other statement types as needed
+            _ => {}
         }
     }
 

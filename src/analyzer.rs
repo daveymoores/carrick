@@ -1013,12 +1013,10 @@ impl Analyzer {
         repo_type_map: &mut HashMap<String, Vec<Value>>,
     ) {
         if let Some(req_type) = &api_detail.request_type {
-            println!("REQ_TYPE >>>> {:?}", req_type.file_path);
             self.add_type_to_repo_map(req_type, repo_prefix.clone(), repo_type_map);
         }
 
         if let Some(resp_type) = &api_detail.response_type {
-            println!("RES_TYPE >>>> {:?}", resp_type.file_path);
             self.add_type_to_repo_map(resp_type, repo_prefix, repo_type_map);
         }
     }
@@ -1069,7 +1067,6 @@ pub fn analyze_api_consistency(
 
     // Group type information by repository using call file information
     for call in &analyzer.calls {
-        println!("CALL >>>> {:?}", call);
         let repo_prefix = analyzer.extract_repo_prefix_from_file_path(&call.file_path, &repo_paths);
         analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
     }
