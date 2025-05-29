@@ -628,7 +628,6 @@ impl Analyzer {
         // Try to match the route with matchit
         match router.at(route) {
             Ok(matched) => {
-                //println!("{:?}", matched);
                 // Now we get back a Vec<(String, String)> of route-method pairs
                 let route_methods = matched.value;
 
@@ -672,6 +671,24 @@ impl Analyzer {
         None
     }
 
+    fn normalize_call_route(&self, route: &str) -> String {
+        // Remove ENV_VAR prefix if present
+        if route.starts_with("ENV_VAR:") {
+            // Find the second colon and take everything after it
+            if let Some(second_colon) = route.find(':').and_then(|first| {
+                route[first + 1..]
+                    .find(':')
+                    .map(|second| first + 1 + second)
+            }) {
+                route[second_colon + 1..].to_string()
+            } else {
+                route.to_string()
+            }
+        } else {
+            route.to_string()
+        }
+    }
+
     pub fn compare_calls_to_endpoints(&self) -> Vec<String> {
         let mut issues = Vec::new();
 
@@ -682,7 +699,9 @@ impl Analyzer {
         };
 
         for call in &self.calls {
-            match router.at(&call.route) {
+            let normalized_route = self.normalize_call_route(&call.route);
+
+            match router.at(&normalized_route) {
                 Ok(matched) => {
                     // Get the endpoint routes and methods
                     let route_methods = &matched.value;
@@ -849,7 +868,7 @@ impl Analyzer {
     fn normalize_route_params(&self, route: &str) -> String {
         // Use a regex to replace all parameter placeholders with a consistent name
         let param_regex = regex::Regex::new(r":([\w]+)").unwrap();
-        param_regex.replace_all(route, ":param").to_string()
+        param_regex.replace_all(route, "{param}").to_string()
     }
 
     fn build_endpoint_router(&mut self) {
