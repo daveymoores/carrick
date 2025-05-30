@@ -89,7 +89,7 @@ pub struct Endpoint {
     pub handler_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Call {
     pub route: String,
     pub method: String,
@@ -98,6 +98,9 @@ pub struct Call {
     pub response_type: Option<TypeReference>,
     pub request_type: Option<TypeReference>,
     pub call_file: PathBuf,
+    pub call_id: Option<String>, // Unique identifier for this specific call instance
+    pub call_number: Option<u32>, // Sequential number for this route+method combination
+    pub common_type_name: Option<String>, // Common interface name for type comparison
 }
 
 #[derive(Debug)]

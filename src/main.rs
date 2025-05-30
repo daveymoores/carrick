@@ -1,8 +1,10 @@
 mod analyzer;
 mod app_context;
 mod config;
+mod demo_naming;
 mod extractor;
 mod file_finder;
+mod naming_test;
 mod packages;
 mod parser;
 mod router_context;
@@ -10,6 +12,7 @@ mod utils;
 mod visitor;
 use analyzer::analyze_api_consistency;
 use config::Config;
+use demo_naming::demo_naming_strategy;
 use file_finder::find_files;
 use packages::Packages;
 use parser::parse_file;
@@ -69,6 +72,13 @@ fn resolve_import_path(base_file: &Path, import_path: &str) -> Option<PathBuf> {
 }
 
 fn main() {
+    // Check for demo mode
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--demo-naming" {
+        demo_naming_strategy();
+        return;
+    }
+
     // Create shared source map and error handler
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));

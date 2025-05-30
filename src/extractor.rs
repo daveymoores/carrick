@@ -260,6 +260,9 @@ pub trait CoreExtractor {
             response_type: None, // Will be populated when we find the type annotation
             request_type: None,  // Could be extracted from fetch body
             call_file: PathBuf::new(), // Will be set by caller
+            call_id: None, // Will be set by caller with unique identifier
+            call_number: None, // Will be set by caller
+            common_type_name: None, // Will be set by caller
         })
     }
 
@@ -400,7 +403,7 @@ pub trait CoreExtractor {
                                 if is_json_await_or_call {
                                     if let Some(ref mut fetch) = pending_fetch {
                                         let alias =
-                                            crate::analyzer::Analyzer::generate_type_alias_name(
+                                            crate::analyzer::Analyzer::generate_common_type_alias_name(
                                                 &fetch.route,
                                                 &fetch.method,
                                                 false,
