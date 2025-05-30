@@ -87,8 +87,6 @@ pub struct Analyzer {
     config: Config,
     endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
     source_map: Lrc<SourceMap>,
-    // Counter for generating unique call IDs per route+method combination
-    call_counters: HashMap<(String, String), u32>, // (route, method) -> counter
 }
 
 #[derive(Debug)]
@@ -117,7 +115,6 @@ impl Analyzer {
             config,
             endpoint_router: None,
             source_map,
-            call_counters: HashMap::new(),
         }
     }
 
@@ -167,7 +164,6 @@ impl Analyzer {
     }
 
     pub fn analyze_functions_for_fetch_calls(&mut self) {
-        let mut new_calls = Vec::new();
         let mut raw_fetch_calls = Vec::new();
 
         // Clone the function_definitions to avoid borrowing issues
@@ -196,77 +192,76 @@ impl Analyzer {
                 }
 
                 // Store raw fetch call for processing
-                raw_fetch_calls.push(call.clone());
-
-                let params = self.extract_params_from_route(&call.route);
-                new_calls.push(ApiEndpointDetails {
-                    owner: None,
-                    route: call.route.clone(),
-                    method: call.method.clone(),
-                    params,
-                    request_body: call.request.clone(),
-                    response_body: Some(Json::Null),
-                    handler_name: None,
-                    request_type: call.request_type.clone(),
-                    response_type: call.response_type.clone(),
-                    file_path: call.call_file.clone(),
-                });
+                raw_fetch_calls.push(call);
             }
         }
 
         // Process fetch calls with unique identifiers for tracking
         let processed_calls = self.process_fetch_calls(raw_fetch_calls);
-        self.fetch_calls.extend(processed_calls);
+        self.fetch_calls.extend(processed_calls.clone());
 
-        // Add all newly discovered calls to our collection
-        self.calls.extend(new_calls);
+        // Create ApiEndpointDetails from processed calls with unique type references
+        for call in processed_calls {
+            let params = self.extract_params_from_route(&call.route);
+            self.calls.push(ApiEndpointDetails {
+                owner: None,
+                route: call.route.clone(),
+                method: call.method.clone(),
+                params,
+                request_body: call.request.clone(),
+                response_body: Some(Json::Null),
+                handler_name: None,
+                request_type: call.request_type.clone(),
+                response_type: call.response_type.clone(),
+                file_path: call.call_file.clone(),
+            });
+        }
     }
 
     fn byte_offset_to_utf16_offset(source: &str, byte_offset: usize) -> usize {
         source[..byte_offset].encode_utf16().count()
     }
 
-    pub fn generate_type_alias_name(route: &str, method: &str, is_request_type: bool) -> String {
-        let prefix = if is_request_type { "Req" } else { "Res" };
-
-        // Sanitize method: Make it PascalCase (e.g., "GET" -> "Get", "post" -> "Post")
-        let method_pascal = if method.is_empty() {
-            "UnknownMethod".to_string()
-        } else {
-            let lowercase_method = method.to_lowercase();
-            let mut m = lowercase_method.chars();
-            match m.next() {
-                None => "UnknownMethod".to_string(),
-                Some(f) => f.to_uppercase().collect::<String>() + m.as_str(),
-            }
-        };
-
-        let sanitized_route = Self::sanitize_route_for_dynamic_paths(route);
-
-        format!("{}{}{}", prefix, method_pascal, sanitized_route)
-    }
-
     /// Generate common type alias name for producer/consumer comparison
     /// This creates matching names that can be compared via ts-morph
-    pub fn generate_common_type_alias_name(route: &str, method: &str, is_request_type: bool) -> String {
-        let suffix = if is_request_type { "Request" } else { "Response" };
+    pub fn generate_common_type_alias_name(
+        route: &str,
+        method: &str,
+        is_request_type: bool,
+        is_consumer: bool,
+    ) -> String {
+        let suffix = if is_request_type {
+            "Request"
+        } else {
+            "Response"
+        };
+        let role = if is_consumer { "Consumer" } else { "Producer" };
         let method_pascal = Self::method_to_pascal_case(method);
         let sanitized_route = Self::sanitize_route_for_dynamic_paths(route);
-        format!("{}{}{}", method_pascal, sanitized_route, suffix)
+        format!("{}{}{}{}", method_pascal, sanitized_route, suffix, role)
     }
 
     /// Generate unique type alias name for tracking individual calls
     /// This is used internally for analysis but not for type comparison
     pub fn generate_unique_call_alias_name(
-        route: &str, 
-        method: &str, 
+        route: &str,
+        method: &str,
         is_request_type: bool,
-        call_number: u32
+        call_number: u32,
+        is_consumer: bool,
     ) -> String {
-        let suffix = if is_request_type { "Request" } else { "Response" };
+        let suffix = if is_request_type {
+            "Request"
+        } else {
+            "Response"
+        };
+        let role = if is_consumer { "Consumer" } else { "Producer" };
         let method_pascal = Self::method_to_pascal_case(method);
         let sanitized_route = Self::sanitize_route_for_dynamic_paths(route);
-        format!("{}{}{}Call{}", method_pascal, sanitized_route, suffix, call_number)
+        format!(
+            "{}{}{}{}Call{}",
+            method_pascal, sanitized_route, suffix, role, call_number
+        )
     }
 
     /// Helper method to convert HTTP method to PascalCase
@@ -283,112 +278,70 @@ impl Analyzer {
         }
     }
 
-    /// Generate next unique call number for a route+method combination
-    pub fn get_next_call_number(&mut self, route: &str, method: &str) -> u32 {
-        let key = (route.to_string(), method.to_string());
-        let counter = self.call_counters.entry(key).or_insert(0);
-        *counter += 1;
-        *counter
-    }
+
 
     /// Process fetch calls and assign unique identifiers and common type names
     pub fn process_fetch_calls(&mut self, mut calls: Vec<Call>) -> Vec<Call> {
-        for call in &mut calls {
-            // Get unique call number for this route+method combination
-            let call_number = self.get_next_call_number(&call.route, &call.method);
-            
-            // Set unique call ID for tracking
-            call.call_id = Some(Self::generate_unique_call_alias_name(
-                &call.route,
-                &call.method, 
-                false, // is_request_type = false (for response)
-                call_number
-            ));
-            
-            // Set call number
-            call.call_number = Some(call_number);
-            
-            // Set common type name for comparison with producer
-            call.common_type_name = Some(Self::generate_common_type_alias_name(
-                &call.route,
-                &call.method,
-                false // is_request_type = false (for response)
-            ));
-        }
-        calls
-    }
-
-    /// Get all fetch calls with their type information for comparison
-    pub fn get_fetch_calls_for_type_comparison(&self) -> Vec<&Call> {
-        self.fetch_calls.iter().collect()
-    }
-
-    /// Generate type comparison mapping showing producer vs consumer names
-    /// This demonstrates how multiple fetch calls map to the same producer interface
-    pub fn generate_type_comparison_mapping(&self) -> HashMap<String, Vec<String>> {
-        let mut mapping: HashMap<String, Vec<String>> = HashMap::new();
+        // Group calls by route+method to ensure consecutive numbering
+        let mut grouped_calls: std::collections::HashMap<(String, String), Vec<usize>> = std::collections::HashMap::new();
         
-        // Add producers (endpoints)
-        for endpoint in &self.endpoints {
-            if let Some(_) = &endpoint.response_type {
-                let producer_name = Self::generate_common_type_alias_name(
-                    &endpoint.route,
-                    &endpoint.method,
-                    false // is_request_type = false (for response)
-                );
-                mapping.entry(producer_name).or_insert_with(Vec::new);
+        // Group call indices by route+method, but only for calls that have response_type
+        for (index, call) in calls.iter().enumerate() {
+            if call.response_type.is_some() {
+                let key = (call.route.clone(), call.method.clone());
+                grouped_calls.entry(key).or_insert_with(Vec::new).push(index);
             }
         }
-        
-        // Add consumers (fetch calls)
-        for call in &self.fetch_calls {
-            if let Some(common_name) = &call.common_type_name {
-                if let Some(call_id) = &call.call_id {
-                    mapping.entry(common_name.clone())
-                        .or_insert_with(Vec::new)
-                        .push(call_id.clone());
+
+        // Process each group and assign consecutive numbers
+        for ((route, method), indices) in grouped_calls {
+            for (position, &call_index) in indices.iter().enumerate() {
+                let call_number = (position + 1) as u32; // Start from 1
+                let call = &mut calls[call_index];
+
+                // Set unique call ID for tracking
+                call.call_id = Some(Self::generate_unique_call_alias_name(
+                    &route,
+                    &method,
+                    false, // is_request_type = false (for response)
+                    call_number,
+                    true, // is_consumer = true (fetch calls are consumers)
+                ));
+
+                // Set call number
+                call.call_number = Some(call_number);
+
+                // Set common type name for comparison with producer
+                call.common_type_name = Some(Self::generate_common_type_alias_name(
+                    &route,
+                    &method,
+                    false, // is_request_type = false (for response)
+                    true,  // is_consumer = true (fetch calls are consumers)
+                ));
+
+                // Update TypeReference objects with unique aliases
+                if let Some(ref mut response_type) = call.response_type {
+                    response_type.alias = Self::generate_unique_call_alias_name(
+                        &route,
+                        &method,
+                        false, // is_request_type = false (for response)
+                        call_number,
+                        true, // is_consumer = true (fetch calls are consumers)
+                    );
+                }
+
+                if let Some(ref mut request_type) = call.request_type {
+                    request_type.alias = Self::generate_unique_call_alias_name(
+                        &route,
+                        &method,
+                        true, // is_request_type = true (for request)
+                        call_number,
+                        true, // is_consumer = true (fetch calls are consumers)
+                    );
                 }
             }
         }
-        
-        mapping
-    }
-
-    /// Example method demonstrating the naming strategy
-    /// For route "/api/comments" with method "GET":
-    /// - Producer: GetApiCommentsResponse (from endpoint)  
-    /// - Consumers: GetApiCommentsResponse (from call 1), GetApiCommentsResponse (from call 2), etc.
-    /// - Call tracking: GetApiCommentsResponseCall1, GetApiCommentsResponseCall2, etc.
-    pub fn example_naming_strategy() -> String {
-        let route = "/api/comments";
-        let method = "GET";
-        
-        // Common interface name for type comparison
-        let common_name = Self::generate_common_type_alias_name(route, method, false);
-        
-        // Unique call tracking names
-        let call1_name = Self::generate_unique_call_alias_name(route, method, false, 1);
-        let call2_name = Self::generate_unique_call_alias_name(route, method, false, 2);
-        let call3_name = Self::generate_unique_call_alias_name(route, method, false, 3);
-        
-        format!(
-            "Type Comparison Strategy:\n\
-             Route: {} {}\n\
-             \n\
-             Common Interface Name (for ts-morph comparison):\n\
-             - Producer: interface {} = Comment[]\n\
-             - Consumer 1: interface {} = Comment[] // from fetch call 1\n\
-             - Consumer 2: interface {} = Comment[] // from fetch call 2\n\
-             - Consumer 3: interface {} = Comment[] // from fetch call 3\n\
-             \n\
-             Call Tracking Names (for error reporting):\n\
-             - Call 1: {}\n\
-             - Call 2: {}\n\
-             - Call 3: {}",
-            method, route,
-            common_name, common_name, common_name, common_name,
-            call1_name, call2_name, call3_name
-        )
+        calls
     }
 
     fn sanitize_route_for_dynamic_paths(route: &str) -> String {
@@ -525,7 +478,8 @@ impl Analyzer {
                             let alias = Self::generate_common_type_alias_name(
                                 &endpoint.route,
                                 &endpoint.method,
-                                true, // is_request_type
+                                true,  // is_request_type
+                                false, // is_consumer = false (endpoints are producers)
                             );
                             if let Some(type_ref) = Self::create_type_reference_from_swc(
                                 req_type_ann_swc,
@@ -546,6 +500,7 @@ impl Analyzer {
                                 &endpoint.route,
                                 &endpoint.method,
                                 false, // is_request_type = false
+                                false, // is_consumer = false (endpoints are producers)
                             );
                             if let Some(type_ref) = Self::create_type_reference_from_swc(
                                 res_type_ann_swc,
@@ -677,14 +632,14 @@ impl Analyzer {
         // Deduplicate calls based on route, method, and file_path
         let mut unique_calls = Vec::new();
         let mut seen_calls = std::collections::HashSet::new();
-        
+
         for api_call_details in &self.calls {
             let call_key = (
                 api_call_details.route.clone(),
                 api_call_details.method.clone(),
                 api_call_details.file_path.clone(),
             );
-            
+
             if seen_calls.insert(call_key) {
                 unique_calls.push(api_call_details);
             }
@@ -1188,24 +1143,30 @@ impl Analyzer {
         let canonical_path =
             std::fs::canonicalize(file_path).expect("Cannot extract full file path");
         if let Some(path) = canonical_path.to_str() {
-            // Check if this is a consumer type (has Response/Request suffix)
             let base_alias = &type_ref.alias;
-            let final_alias = if base_alias.ends_with("Response") || base_alias.ends_with("Request") {
-                // Count existing types with the same base name
+
+            // For consumer types (calls), we need to ensure unique names
+            let final_alias = if base_alias.ends_with("Response") || base_alias.ends_with("Request")
+            {
                 let repo_entries = repo_type_map.entry(repo_prefix.clone()).or_default();
-                let count = repo_entries.iter().filter(|existing_entry| {
-                    if let Some(existing_alias) = existing_entry.get("alias").and_then(|v| v.as_str()) {
-                        // Check if this is a numbered variant of the same base type
-                        existing_alias.starts_with(base_alias) && 
-                        (existing_alias == base_alias || 
-                         existing_alias.chars().nth(base_alias.len()).map_or(false, |c| c.is_ascii_digit()))
-                    } else {
-                        false
+
+                // Find all existing aliases that match this base pattern
+                let existing_aliases: std::collections::HashSet<String> = repo_entries
+                    .iter()
+                    .filter_map(|entry| entry.get("alias").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string())
+                    .collect();
+
+                // If the base alias already exists, find the next available number
+                if existing_aliases.contains(base_alias) {
+                    let mut counter = 2;
+                    loop {
+                        let candidate = format!("{}{}", base_alias, counter);
+                        if !existing_aliases.contains(&candidate) {
+                            break candidate;
+                        }
+                        counter += 1;
                     }
-                }).count();
-                
-                if count > 0 {
-                    format!("{}{}", base_alias, count + 1)
                 } else {
                     base_alias.clone()
                 }
@@ -1219,7 +1180,7 @@ impl Analyzer {
                 "compositeTypeString": type_ref.composite_type_string,
                 "alias": final_alias
             });
-            
+
             repo_type_map.entry(repo_prefix).or_default().push(entry);
         }
     }

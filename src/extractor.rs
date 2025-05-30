@@ -407,6 +407,7 @@ pub trait CoreExtractor {
                                                 &fetch.route,
                                                 &fetch.method,
                                                 false,
+                                                true, // is_consumer = true (fetch calls are consumers)
                                             );
                                         if let Some(type_ref) =
                                             crate::analyzer::Analyzer::create_type_reference_from_swc(
