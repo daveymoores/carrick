@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "check-types": "ts-node check-types.ts",
+    "check-types": "ts-node simple-type-checker.ts",
     "extract": "ts-node extract-type-definitions.ts"
   },
   "keywords": [],

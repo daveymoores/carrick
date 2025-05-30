@@ -1116,26 +1116,48 @@ impl Analyzer {
     }
 
     pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
+        use std::fs;
+        use std::path::Path;
         use std::process::Command;
 
         // Ensure the output directory exists
-        if !std::path::Path::new("ts_check/output").exists() {
+        if !Path::new("ts_check/output").exists() {
             return Err("Output directory ts_check/output does not exist".to_string());
         }
 
-        // Run the type checking script
-        let script_path = match std::fs::canonicalize("ts_check/check-types.ts") {
+        // Generate type comparisons from our analysis
+        let comparisons = self.generate_type_comparisons();
+
+        // Write comparisons to temporary file
+        let comparisons_json = serde_json::to_string_pretty(&comparisons)
+            .map_err(|e| format!("Failed to serialize comparisons: {}", e))?;
+
+        let temp_file = std::fs::canonicalize(".")
+            .map_err(|e| format!("Failed to get current directory: {}", e))?
+            .join("ts_check")
+            .join("comparisons.json");
+        
+        fs::write(&temp_file, comparisons_json)
+            .map_err(|e| format!("Failed to write comparisons file: {}", e))?;
+
+
+
+        // Run the simplified type checking script
+        let script_path = match std::fs::canonicalize("ts_check/simple-type-checker.ts") {
             Ok(path) => path,
-            Err(_) => return Err("Type checking script not found".to_string()),
+            Err(_) => return Err("Simple type checking script not found".to_string()),
         };
 
         let output = Command::new("npx")
             .arg("ts-node")
             .arg(script_path)
-            .arg("output")
+            .arg("comparisons.json")
             .current_dir("ts_check")
             .output()
             .map_err(|e| format!("Failed to run type checking: {}", e))?;
+
+        // Clean up temp file after TypeScript script runs
+        let _ = fs::remove_file(&temp_file);
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1161,17 +1183,112 @@ impl Analyzer {
             )
         })?;
 
-        // Check if there were any errors
-        if !output.status.success() {
-            if let Some(error_msg) = result.get("message") {
-                return Err(error_msg
-                    .as_str()
-                    .unwrap_or("Type checking failed")
-                    .to_string());
+        // Transform result to match expected format
+        self.transform_type_check_result(result)
+    }
+
+    fn generate_type_comparisons(&self) -> Vec<serde_json::Value> {
+        let mut comparisons = Vec::new();
+
+
+
+        // Iterate through all endpoints and their corresponding calls
+        for endpoint in &self.endpoints {
+            // Find matching calls for this endpoint
+            for call in &self.calls {
+                if self.endpoints_match(endpoint, call) {
+                    let endpoint_route = format!("{} {}", endpoint.method, endpoint.route);
+
+                    // Get producer type alias (from endpoint)
+                    let producer_type = endpoint
+                        .response_type
+                        .as_ref()
+                        .map(|tr| tr.alias.clone())
+                        .unwrap_or_else(|| "any".to_string());
+
+                    // Get consumer type alias (from call)
+                    let consumer_type = call
+                        .response_type
+                        .as_ref()
+                        .map(|tr| tr.alias.clone())
+                        .unwrap_or_else(|| "any".to_string());
+
+
+                    
+                    comparisons.push(serde_json::json!({
+                        "endpoint": endpoint_route,
+                        "producerType": producer_type,
+                        "consumerType": consumer_type
+                    }));
+                }
             }
         }
 
-        Ok(result)
+
+        comparisons
+    }
+
+    fn endpoints_match(&self, endpoint: &ApiEndpointDetails, call: &ApiEndpointDetails) -> bool {
+        let endpoint_norm = self.normalize_route_for_comparison(&endpoint.route);
+        let call_norm = self.extract_route_from_call(&call.route);
+        
+        let method_match = endpoint.method == call.method;
+        let route_match = endpoint_norm == call_norm;
+        
+        method_match && route_match
+    }
+
+    fn normalize_route_for_comparison(&self, route: &str) -> String {
+        // Remove dynamic segments for comparison
+        route
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with(':') {
+                    ":param"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    fn extract_route_from_call(&self, call_route: &str) -> String {
+        // Handle environment variable URLs like ENV_VAR:USER_SERVICE_URL:/users/:param
+        if call_route.contains("ENV_VAR:") {
+            if let Some(route_part) = call_route.split(':').last() {
+                return self.normalize_route_for_comparison(route_part);
+            }
+        }
+        
+        // For regular routes, just normalize
+        self.normalize_route_for_comparison(call_route)
+    }
+
+    fn transform_type_check_result(
+        &self,
+        result: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let mismatches = result.get("mismatches")
+            .and_then(|m| m.as_array())
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|mismatch| {
+                serde_json::json!({
+                    "endpoint": mismatch.get("endpoint").unwrap_or(&serde_json::Value::Null),
+                    "producerType": mismatch.get("producerType").unwrap_or(&serde_json::Value::Null),
+                    "consumerType": mismatch.get("consumerType").unwrap_or(&serde_json::Value::Null),
+                    "errorDetails": mismatch.get("error").unwrap_or(&serde_json::Value::Null)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(serde_json::json!({
+            "mismatches": mismatches,
+            "totalChecked": result.get("totalChecked").unwrap_or(&serde_json::Value::Number(serde_json::Number::from(0))),
+            "compatiblePairs": result.get("compatibleCount").unwrap_or(&serde_json::Value::Number(serde_json::Number::from(0))),
+            "incompatiblePairs": mismatches.len()
+        }))
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
