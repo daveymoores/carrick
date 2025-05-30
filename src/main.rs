@@ -70,9 +70,6 @@ fn resolve_import_path(base_file: &Path, import_path: &str) -> Option<PathBuf> {
 }
 
 fn main() {
-    // Check for demo mode
-    let args: Vec<String> = std::env::args().collect();
-
     // Create shared source map and error handler
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -211,8 +208,6 @@ fn main() {
 
     // Analyze for inconsistencies. Pass the sourcemap to allow relative byte positions to be calculated
     let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs);
-
-
 
     // Print results
     println!("\nAPI Analysis Results:");

@@ -222,6 +222,31 @@ impl Analyzer {
         source[..byte_offset].encode_utf16().count()
     }
 
+    /// Normalize route by removing ENV_VAR prefixes and extracting the actual path
+    fn normalize_route_for_type_name(route: &str) -> String {
+        if route.contains("ENV_VAR:") {
+            // Extract the actual path from ENV_VAR constructs
+            // "ENV_VAR:COMMENT_SERVICE_URL:/api/comments" -> "/api/comments"
+            let segments: Vec<&str> = route.split("ENV_VAR:").collect();
+            let mut clean_path = String::new();
+
+            // Add the part before any ENV_VAR marker
+            clean_path.push_str(segments[0]);
+
+            // Process each segment with an ENV_VAR marker
+            for i in 1..segments.len() {
+                let subparts: Vec<&str> = segments[i].splitn(2, ':').collect();
+                if subparts.len() == 2 {
+                    clean_path.push_str(subparts[1]);
+                }
+            }
+
+            clean_path
+        } else {
+            route.to_string()
+        }
+    }
+
     /// Generate common type alias name for producer/consumer comparison
     /// This creates matching names that can be compared via ts-morph
     pub fn generate_common_type_alias_name(
@@ -237,7 +262,11 @@ impl Analyzer {
         };
         let role = if is_consumer { "Consumer" } else { "Producer" };
         let method_pascal = Self::method_to_pascal_case(method);
-        let sanitized_route = Self::sanitize_route_for_dynamic_paths(route);
+
+        // Normalize the route to handle env vars consistently
+        let normalized_route = Self::normalize_route_for_type_name(route);
+        let sanitized_route = Self::sanitize_route_for_dynamic_paths(&normalized_route);
+
         format!("{}{}{}{}", method_pascal, sanitized_route, suffix, role)
     }
 
@@ -1109,10 +1138,28 @@ impl Analyzer {
             .map_err(|e| format!("Failed to run type checking: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Debug: Print the raw output
+        println!("TypeScript script stdout: '{}'", stdout);
+        println!("TypeScript script stderr: '{}'", stderr);
+        println!("TypeScript script exit code: {:?}", output.status.code());
+
+        // Check if stdout is empty
+        if stdout.trim().is_empty() {
+            return Err(format!(
+                "Type checking script produced no output. stderr: {}",
+                stderr
+            ));
+        }
 
         // Parse the JSON output
-        let result: serde_json::Value = serde_json::from_str(&stdout)
-            .map_err(|e| format!("Failed to parse type checking result: {}", e))?;
+        let result: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+            format!(
+                "Failed to parse type checking result: {}. Raw output: '{}'",
+                e, stdout
+            )
+        })?;
 
         // Check if there were any errors
         if !output.status.success() {
@@ -1311,33 +1358,37 @@ pub fn analyze_api_consistency(
 
     // Run type checking before returning results
     let type_check_result = analyzer.check_type_compatibility();
+
     match &type_check_result {
         Ok(result) => {
-            println!("\nType Compatibility Check:");
-            println!("========================");
-
-            if let Some(total_producers) = result.get("totalProducers") {
-                println!("Total producers: {}", total_producers);
-            }
-            if let Some(total_consumers) = result.get("totalConsumers") {
-                println!("Total consumers: {}", total_consumers);
-            }
-            if let Some(compatible) = result.get("compatiblePairs") {
-                println!("Compatible pairs: {}", compatible);
-            }
-            if let Some(incompatible) = result.get("incompatiblePairs") {
-                println!("Incompatible pairs: {}", incompatible);
-            }
-
             if let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) {
                 if !mismatches.is_empty() {
-                    println!("\n⚠️  Type mismatches found:");
+                    println!("\n🚨 TYPE MISMATCHES DETECTED:");
+                    println!("============================");
                     for mismatch in mismatches {
                         if let (Some(endpoint), Some(error)) = (
                             mismatch.get("endpoint").and_then(|e| e.as_str()),
                             mismatch.get("errorDetails").and_then(|e| e.as_str()),
                         ) {
-                            println!("  {} - {}", endpoint, error);
+                            println!("\nEndpoint: {}", endpoint);
+                            println!(
+                                "   Producer type: {}",
+                                mismatch
+                                    .get("producerType")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("unknown")
+                            );
+                            println!(
+                                "   Consumer type: {}",
+                                mismatch
+                                    .get("consumerType")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("unknown")
+                            );
+                            println!("   Error: {}", error);
+                            println!(
+                                "   💡 Fix: Ensure the API producer and consumer have matching type definitions"
+                            );
                         }
                     }
                 } else {

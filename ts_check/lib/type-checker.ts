@@ -1,4 +1,10 @@
-import { Project, SourceFile, InterfaceDeclaration, TypeAliasDeclaration, Type } from 'ts-morph';
+import {
+  Project,
+  SourceFile,
+  InterfaceDeclaration,
+  TypeAliasDeclaration,
+  Type,
+} from "ts-morph";
 
 export interface TypeMismatch {
   endpoint: string;
@@ -23,7 +29,7 @@ export interface TypeCheckResult {
 
 export interface ParsedTypeName {
   endpoint: string;
-  type: 'producer' | 'consumer';
+  type: "producer" | "consumer";
   callId?: string;
 }
 
@@ -34,14 +40,14 @@ export class TypeCompatibilityChecker {
    * Parse type name to extract endpoint and type info
    * Examples:
    * - "GetApiCommentsResponseProducer" -> { endpoint: "GET /api/comments", type: "producer" }
-   * - "GetApiCommentsResponseConsumerCall1" -> { endpoint: "GET /api/comments", type: "consumer", callId: "Call1" }
+   * - "GetEnvVarCommentServiceUrlApiCommentsResponseConsumerCall1" -> { endpoint: "GET /api/comments", type: "consumer", callId: "Call1" }
    */
   parseTypeName(typeName: string): ParsedTypeName | null {
     // Handle producer pattern
-    if (typeName.endsWith('Producer')) {
+    if (typeName.endsWith("Producer")) {
       const withoutProducer = typeName.slice(0, -8); // Remove "Producer"
       const endpoint = this.convertToEndpoint(withoutProducer);
-      return { endpoint, type: 'producer' };
+      return { endpoint, type: "producer" };
     }
 
     // Handle consumer pattern
@@ -49,10 +55,148 @@ export class TypeCompatibilityChecker {
     if (consumerMatch) {
       const [, baseType, callId] = consumerMatch;
       const endpoint = this.convertToEndpoint(baseType);
-      return { endpoint, type: 'consumer', callId };
+      return { endpoint, type: "consumer", callId };
     }
 
     return null;
+  }
+
+  /**
+   * Unwrap Response<T> wrapper types to get the inner type
+   */
+  private unwrapResponseType(type: Type): Type {
+    const typeText = type.getText();
+    console.error(`🔍 Checking type for unwrapping: ${typeText}`);
+
+    // Check if it's a Response<T> type by text pattern
+    if (typeText.includes("Response<")) {
+      console.error(`📦 Found Response wrapper, attempting to unwrap...`);
+
+      // Try getTypeArguments first
+      const typeArgs = type.getTypeArguments();
+      console.error(`📊 Type arguments found: ${typeArgs.length}`);
+
+      if (typeArgs.length > 0) {
+        const unwrapped = typeArgs[0];
+        console.error(
+          `✂️  Unwrapped via getTypeArguments: ${unwrapped.getText()}`,
+        );
+        return unwrapped;
+      }
+
+      // Fallback: try to extract from the text manually
+      const match = typeText.match(/^Response<(.+)>$/);
+      if (match) {
+        const innerTypeText = match[1];
+        console.error(`✂️  Attempting text-based unwrapping: ${innerTypeText}`);
+
+        // Create a temporary type to resolve the inner type
+        try {
+          const tempFile = this.project.createSourceFile(
+            `__temp_unwrap_${Date.now()}.ts`,
+            `type TempType = ${innerTypeText};`,
+            { overwrite: true },
+          );
+
+          const tempTypeAlias = tempFile.getTypeAliases()[0];
+          const resolvedType = tempTypeAlias.getType();
+
+          tempFile.delete();
+
+          console.error(
+            `✂️  Text-based unwrapping successful: ${resolvedType.getText()}`,
+          );
+          return resolvedType;
+        } catch (error) {
+          console.error(`❌ Text-based unwrapping failed: ${error}`);
+        }
+      }
+    }
+
+    console.error(`⚡ No unwrapping needed, returning original type`);
+    return type;
+  }
+
+  /**
+   * Resolve type if it's showing as an import reference
+   */
+  private resolveTypeReference(type: Type, node: any): Type {
+    const typeText = type.getText();
+
+    if (typeText.includes("import(")) {
+      console.error(`🔗 Consumer type is an import reference, resolving...`);
+
+      // For type alias declarations, get the actual type from the type node
+      if (node.getKind && node.getKind() === 255) {
+        // TypeAliasDeclaration
+        const typeNode = node.getTypeNode();
+        if (typeNode) {
+          const resolvedType = typeNode.getType();
+          console.error(`🎯 Resolved consumer type: ${resolvedType.getText()}`);
+          return resolvedType;
+        }
+      }
+
+      // Alternative: try to get the aliased type
+      const aliasedType = type.getAliasTypeArguments();
+      if (aliasedType.length > 0) {
+        console.error(`🎯 Found aliased type: ${aliasedType[0].getText()}`);
+        return aliasedType[0];
+      }
+    }
+
+    return type;
+  }
+
+  /**
+   * Get TypeScript's actual diagnostic message for type incompatibility
+   */
+  private getTypeCompatibilityError(
+    producerType: Type,
+    consumerType: Type,
+  ): string {
+    try {
+      // Create a test assignment to get TypeScript's diagnostic
+      const testCode = `
+        declare const producer: ${producerType.getText()};
+        declare const consumer: ${consumerType.getText()};
+
+        // This assignment should fail and give us the diagnostic
+        const test: ${consumerType.getText()} = producer;
+      `;
+
+      // Create a temporary source file to get diagnostics
+      const tempFile = this.project.createSourceFile(
+        `__temp_${Date.now()}.ts`,
+        testCode,
+        { overwrite: true },
+      );
+
+      // Get the diagnostics
+      const diagnostics = tempFile.getPreEmitDiagnostics();
+
+      // Clean up
+      tempFile.delete();
+
+      // Find the assignment error
+      const assignmentError = diagnostics.find((d) => {
+        const message = d.getMessageText();
+        const messageStr =
+          typeof message === "string" ? message : message.getMessageText();
+        return (
+          messageStr.includes("not assignable") || messageStr.includes("Type ")
+        );
+      });
+
+      if (assignmentError) {
+        const message = assignmentError.getMessageText();
+        return typeof message === "string" ? message : message.getMessageText();
+      }
+
+      return `Types are incompatible but no specific diagnostic available`;
+    } catch (error) {
+      return `Type compatibility check failed: ${error}`;
+    }
   }
 
   /**
@@ -63,29 +207,43 @@ export class TypeCompatibilityChecker {
   private convertToEndpoint(typeName: string): string {
     // Remove "Response" or "Request" suffix if present
     let withoutSuffix = typeName;
-    if (withoutSuffix.endsWith('Response')) {
+    if (withoutSuffix.endsWith("Response")) {
       withoutSuffix = withoutSuffix.slice(0, -8);
-    } else if (withoutSuffix.endsWith('Request')) {
+    } else if (withoutSuffix.endsWith("Request")) {
       withoutSuffix = withoutSuffix.slice(0, -7);
     }
-    
-    // Check for env var pattern and extract the actual endpoint path
-    const envVarMatch = withoutSuffix.match(/^GetEnvVar(.+)Url(.+)$/);
-    if (envVarMatch) {
-      const [, , pathPart] = envVarMatch;
-      const path = this.camelCaseToPath(pathPart);
-      return `GET ${path}`;
+
+    // Handle env var patterns more flexibly
+    if (withoutSuffix.includes("EnvVar")) {
+      // For "GetEnvVarCommentServiceUrlApiComments", we want "ApiComments"
+      const urlIndex = withoutSuffix.lastIndexOf("Url");
+
+      if (urlIndex !== -1) {
+        const pathPart = withoutSuffix.slice(urlIndex + 3); // +3 for "Url"
+
+        const path = this.camelCaseToPath(pathPart);
+
+        const result = `GET ${path}`;
+
+        return result;
+      }
     }
-    
+
     // Extract HTTP method (Get, Post, Put, Delete, etc.)
-    const methodMatch = withoutSuffix.match(/^(Get|Post|Put|Delete|Patch|Head|Options)/);
-    if (!methodMatch) return withoutSuffix;
-    
+    const methodMatch = withoutSuffix.match(
+      /^(Get|Post|Put|Delete|Patch|Head|Options)/,
+    );
+    if (!methodMatch) {
+      return withoutSuffix;
+    }
+
     const method = methodMatch[1].toUpperCase();
     const pathPart = withoutSuffix.slice(methodMatch[1].length);
-    
+
     const path = this.camelCaseToPath(pathPart);
-    return `${method} ${path}`;
+    const result = `${method} ${path}`;
+
+    return result;
   }
 
   /**
@@ -95,32 +253,37 @@ export class TypeCompatibilityChecker {
    * "UsersByParamComments" -> "/users/:param/comments"
    */
   private camelCaseToPath(camelCase: string): string {
-    if (!camelCase) return '/';
-    
+    if (!camelCase) return "/";
+
     // Handle patterns like "UsersByIdComments" -> "/users/:id/comments"
     // Also handle "UsersByParamComments" -> "/users/:param/comments"
     let withParams = camelCase.replace(/By([A-Z][a-z]+)/g, (match, param) => {
       return `/:${param.toLowerCase()}`;
     });
-    
+
     // Convert remaining camelCase to kebab-case with slashes
     const path = withParams
-      .replace(/([A-Z])/g, '/$1')
+      .replace(/([A-Z])/g, "/$1")
       .toLowerCase()
-      .replace(/^\//, '/');
-    
-    return path || '/';
+      .replace(/^\//, "/");
+
+    return path || "/";
   }
 
   /**
    * Extract type definitions from source files
    */
-  extractTypeDefinitions(sourceFiles: SourceFile[]): Map<string, { file: string; node: InterfaceDeclaration | TypeAliasDeclaration }> {
+  extractTypeDefinitions(
+    sourceFiles: SourceFile[],
+  ): Map<
+    string,
+    { file: string; node: InterfaceDeclaration | TypeAliasDeclaration }
+  > {
     const types = new Map();
 
     for (const sourceFile of sourceFiles) {
       const fileName = sourceFile.getBaseName();
-      
+
       // Get interfaces
       const interfaces = sourceFile.getInterfaces();
       for (const iface of interfaces) {
@@ -142,24 +305,33 @@ export class TypeCompatibilityChecker {
   /**
    * Group types by endpoint into producers and consumers
    */
-  groupTypesByEndpoint(typeDefinitions: Map<string, { file: string; node: any }>) {
-    const producers = new Map<string, { name: string; file: string; node: any }>();
-    const consumers = new Map<string, { name: string; file: string; node: any; callId: string }[]>();
+  groupTypesByEndpoint(
+    typeDefinitions: Map<string, { file: string; node: any }>,
+  ) {
+    const producers = new Map<
+      string,
+      { name: string; file: string; node: any }
+    >();
+    const consumers = new Map<
+      string,
+      { name: string; file: string; node: any; callId: string }[]
+    >();
 
     for (const [typeName, typeInfo] of typeDefinitions) {
       const parsed = this.parseTypeName(typeName);
+
       if (!parsed) continue;
 
-      if (parsed.type === 'producer') {
+      if (parsed.type === "producer") {
         producers.set(parsed.endpoint, { name: typeName, ...typeInfo });
-      } else if (parsed.type === 'consumer') {
+      } else if (parsed.type === "consumer") {
         if (!consumers.has(parsed.endpoint)) {
           consumers.set(parsed.endpoint, []);
         }
-        consumers.get(parsed.endpoint)!.push({ 
-          name: typeName, 
-          callId: parsed.callId!, 
-          ...typeInfo 
+        consumers.get(parsed.endpoint)!.push({
+          name: typeName,
+          callId: parsed.callId!,
+          ...typeInfo,
         });
       }
     }
@@ -171,28 +343,52 @@ export class TypeCompatibilityChecker {
    * Compare producer and consumer types for compatibility
    */
   async compareTypes(
-    endpoint: string, 
-    producer: { name: string; file: string; node: any }, 
-    consumer: { name: string; file: string; node: any; callId: string }
+    endpoint: string,
+    producer: { name: string; file: string; node: any },
+    consumer: { name: string; file: string; node: any; callId: string },
   ): Promise<TypeMismatch | null> {
     try {
-      const producerType = producer.node.getType();
-      const consumerType = consumer.node.getType();
+      let producerType = producer.node.getType();
+      let consumerType = consumer.node.getType();
 
-      // Check if producer type is assignable to consumer type
+      console.error(`\n🔍 Comparing types for ${endpoint}`);
+      console.error(`📤 Producer: ${producer.name}`);
+      console.error(`📤 Producer type: ${producerType.getText()}`);
+      console.error(`📥 Consumer: ${consumer.name}`);
+      console.error(`📥 Consumer type: ${consumerType.getText()}`);
+
+      // Unwrap Response<T> wrapper from producer
+      const originalProducerType = producerType;
+      producerType = this.unwrapResponseType(producerType);
+
+      if (producerType !== originalProducerType) {
+        console.error(
+          `🎁 Producer type after unwrapping: ${producerType.getText()}`,
+        );
+      }
+
+      // Resolve consumer type if it's an import reference
+      const originalConsumerType = consumerType;
+      consumerType = this.resolveTypeReference(consumerType, consumer.node);
+
+      if (consumerType !== originalConsumerType) {
+        console.error(
+          `🎯 Consumer type after resolving: ${consumerType.getText()}`,
+        );
+      }
+
+      // Check compatibility
       const isAssignable = producerType.isAssignableTo(consumerType);
-      
+      console.error(`✅ Is assignable: ${isAssignable}`);
+
       if (!isAssignable) {
-        // Try the reverse to provide more detailed error information
-        const reverseAssignable = consumerType.isAssignableTo(producerType);
-        
-        let errorDetails = `Producer type '${producerType.getText()}' is not assignable to consumer type '${consumerType.getText()}'`;
-        
-        if (reverseAssignable) {
-          errorDetails += ' (consumer type is more restrictive than producer)';
-        } else {
-          errorDetails += ' (types are incompatible)';
-        }
+        // Get TypeScript's diagnostic message
+        const diagnosticMessage = this.getTypeCompatibilityError(
+          producerType,
+          consumerType,
+        );
+
+        console.error(`❌ Type mismatch detected: ${diagnosticMessage}`);
 
         return {
           endpoint,
@@ -200,75 +396,115 @@ export class TypeCompatibilityChecker {
           consumerCall: consumer.callId,
           consumerType: consumerType.getText(),
           isAssignable: false,
-          errorDetails,
+          errorDetails: diagnosticMessage,
           producerLocation: producer.file,
-          consumerLocation: consumer.file
+          consumerLocation: consumer.file,
         };
       }
 
+      console.error(`✅ Types are compatible`);
       return null; // Types are compatible
     } catch (error) {
+      console.error(`💥 Type comparison failed: ${error}`);
       throw new Error(`Type comparison failed: ${error}`);
     }
   }
 
   /**
-   * Perform the actual type checking on source files
+   * Enhanced compareTypes that tries path matching if exact endpoint match fails
    */
-  async checkCompatibility(sourceFiles: SourceFile[]): Promise<TypeCheckResult> {
+  async checkCompatibility(
+    sourceFiles: SourceFile[],
+  ): Promise<TypeCheckResult> {
     const typeDefinitions = this.extractTypeDefinitions(sourceFiles);
     const { producers, consumers } = this.groupTypesByEndpoint(typeDefinitions);
 
     const result: TypeCheckResult = {
       totalProducers: producers.size,
-      totalConsumers: Array.from(consumers.values()).reduce((sum, group) => sum + group.length, 0),
+      totalConsumers: Array.from(consumers.values()).reduce(
+        (sum, group) => sum + group.length,
+        0,
+      ),
       compatiblePairs: 0,
       incompatiblePairs: 0,
       mismatches: [],
       orphanedProducers: [],
-      orphanedConsumers: []
+      orphanedConsumers: [],
     };
 
-    // Check each producer against its consumers
-    for (const [endpoint, producer] of producers) {
-      const endpointConsumers = consumers.get(endpoint) || [];
-      
-      if (endpointConsumers.length === 0) {
-        result.orphanedProducers.push(`${endpoint} (${producer.name})`);
-        continue;
+    // Check each consumer against all producers using flexible path matching
+    for (const [consumerEndpoint, consumerList] of consumers) {
+      let foundMatch = false;
+
+      for (const consumer of consumerList) {
+        let matchedProducer = null;
+
+        // First try exact match
+        if (producers.has(consumerEndpoint)) {
+          matchedProducer = producers.get(consumerEndpoint)!;
+        } else {
+          // Try flexible path matching
+          for (const [producerEndpoint, producer] of producers) {
+            if (this.pathsMatch(consumerEndpoint, producerEndpoint)) {
+              matchedProducer = producer;
+              break;
+            }
+          }
+        }
+
+        if (matchedProducer) {
+          foundMatch = true;
+          try {
+            const mismatch = await this.compareTypes(
+              consumerEndpoint,
+              matchedProducer,
+              consumer,
+            );
+            if (mismatch) {
+              result.mismatches.push(mismatch);
+              result.incompatiblePairs++;
+            } else {
+              result.compatiblePairs++;
+            }
+          } catch (error) {
+            result.mismatches.push({
+              endpoint: consumerEndpoint,
+              producerType: matchedProducer.name,
+              consumerCall: consumer.name,
+              consumerType: "UNKNOWN",
+              isAssignable: false,
+              errorDetails: `Failed to compare types: ${error}`,
+              producerLocation: matchedProducer.file,
+              consumerLocation: consumer.file,
+            });
+            result.incompatiblePairs++;
+          }
+        }
       }
 
-      for (const consumer of endpointConsumers) {
-        try {
-          const mismatch = await this.compareTypes(endpoint, producer, consumer);
-          if (mismatch) {
-            result.mismatches.push(mismatch);
-            result.incompatiblePairs++;
-          } else {
-            result.compatiblePairs++;
-          }
-        } catch (error) {
-          result.mismatches.push({
-            endpoint,
-            producerType: producer.name,
-            consumerCall: consumer.name,
-            consumerType: 'UNKNOWN',
-            isAssignable: false,
-            errorDetails: `Failed to compare types: ${error}`,
-            producerLocation: producer.file,
-            consumerLocation: consumer.file
-          });
-          result.incompatiblePairs++;
-        }
+      if (!foundMatch) {
+        result.orphanedConsumers.push(
+          ...consumerList.map((c) => `${consumerEndpoint} (${c.name})`),
+        );
       }
     }
 
-    // Find orphaned consumers
-    for (const [endpoint, endpointConsumers] of consumers) {
-      if (!producers.has(endpoint)) {
-        result.orphanedConsumers.push(
-          ...endpointConsumers.map(c => `${endpoint} (${c.name})`)
-        );
+    // Find orphaned producers
+    for (const [producerEndpoint, producer] of producers) {
+      let hasMatch = false;
+
+      for (const consumerEndpoint of consumers.keys()) {
+        if (
+          producerEndpoint === consumerEndpoint ||
+          this.pathsMatch(producerEndpoint, consumerEndpoint)
+        ) {
+          hasMatch = true;
+          break;
+        }
+      }
+
+      if (!hasMatch) {
+        result.orphanedProducers.push(`${producerEndpoint} (${producer.name})`);
       }
     }
 
@@ -276,22 +512,45 @@ export class TypeCompatibilityChecker {
   }
 
   /**
+   * Normalize path parameters to a consistent format for matching
+   * Examples:
+   * "/users/:id" -> "/users/{param}"
+   * "/users/:param" -> "/users/{param}"
+   * "/users/:userId" -> "/users/{param}"
+   * "/events/:eventid/register" -> "/events/{param}/register"
+   */
+  private normalizePathForMatching(path: string): string {
+    // Replace any parameter (starting with :) with a generic {param} placeholder
+    return path.replace(/:[\w]+/g, "{param}");
+  }
+
+  /**
+   * Check if two paths match, accounting for parameter differences
+   */
+  private pathsMatch(path1: string, path2: string): boolean {
+    const normalized1 = this.normalizePathForMatching(path1);
+    const normalized2 = this.normalizePathForMatching(path2);
+    return normalized1 === normalized2;
+  }
+
+  /**
    * Load generated TypeScript files from output directory and perform type checking
    */
   async checkGeneratedTypes(outputDir: string): Promise<TypeCheckResult> {
-    const fs = await import('fs');
-    const path = await import('path');
+    const fs = await import("fs");
+    const path = await import("path");
 
     if (!fs.existsSync(outputDir)) {
       throw new Error(`Output directory ${outputDir} does not exist`);
     }
 
-    const tsFiles = fs.readdirSync(outputDir)
-      .filter(file => file.endsWith('_types.ts'))
-      .map(file => path.join(outputDir, file));
+    const tsFiles = fs
+      .readdirSync(outputDir)
+      .filter((file) => file.endsWith("_types.ts"))
+      .map((file) => path.join(outputDir, file));
 
     const sourceFiles: SourceFile[] = [];
-    
+
     for (const filePath of tsFiles) {
       try {
         const sourceFile = this.project.addSourceFileAtPath(filePath);
@@ -302,7 +561,7 @@ export class TypeCompatibilityChecker {
     }
 
     if (sourceFiles.length === 0) {
-      throw new Error('No TypeScript files found in output directory');
+      throw new Error("No TypeScript files found in output directory");
     }
 
     return await this.checkCompatibility(sourceFiles);
