@@ -84,7 +84,7 @@ fn main() {
     };
 
     // Track processed files to avoid duplicates
-    let mut processed_file_paths = HashSet::new(); // HashSet<(String, Option<String>)>
+    let mut processed_file_paths = HashSet::new(); // HashSet<String>
 
     // Queue to store files for processing [file_path, repo_prefix]
     let mut file_queue = VecDeque::new();
@@ -128,11 +128,10 @@ fn main() {
 
     while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
         let path_str = file_path.to_string_lossy().to_string();
-        let key = (path_str.clone(), imported_router_name.clone());
-        if processed_file_paths.contains(&key) {
+        if processed_file_paths.contains(&path_str) {
             continue;
         }
-        processed_file_paths.insert(key);
+        processed_file_paths.insert(path_str.clone());
 
         println!("Parsing: {}", file_path.display());
 

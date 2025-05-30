@@ -516,8 +516,24 @@ impl Analyzer {
             })
             .collect();
 
-        // Check each call against endpoints
+        // Deduplicate calls based on route, method, and file_path
+        let mut unique_calls = Vec::new();
+        let mut seen_calls = std::collections::HashSet::new();
+        
         for api_call_details in &self.calls {
+            let call_key = (
+                api_call_details.route.clone(),
+                api_call_details.method.clone(),
+                api_call_details.file_path.clone(),
+            );
+            
+            if seen_calls.insert(call_key) {
+                unique_calls.push(api_call_details);
+            }
+        }
+
+        // Check each call against endpoints
+        for api_call_details in &unique_calls {
             // Process the call based on its type
             let path_to_match = if api_call_details.route.contains("ENV_VAR:") {
                 // First check if this is a known external API call
