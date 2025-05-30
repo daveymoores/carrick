@@ -18,6 +18,12 @@ export { DeclarationCollector } from "./declaration-collector";
 export { DependencyManager } from "./dependency-manager";
 export { OutputGenerator } from "./output-generator";
 export { TypeExtractor } from "./type-extractor";
+export { 
+  TypeCompatibilityChecker, 
+  TypeCheckResult, 
+  TypeMismatch, 
+  ParsedTypeName 
+} from "./type-checker";
 export {
   MAX_PROPERTY_DEPTH,
   MAX_PROPERTIES_LIMIT,

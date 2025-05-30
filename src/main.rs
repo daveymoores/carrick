@@ -212,6 +212,8 @@ fn main() {
     // Analyze for inconsistencies. Pass the sourcemap to allow relative byte positions to be calculated
     let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs);
 
+
+
     // Print results
     println!("\nAPI Analysis Results:");
     println!("=====================");

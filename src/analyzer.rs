@@ -278,18 +278,20 @@ impl Analyzer {
         }
     }
 
-
-
     /// Process fetch calls and assign unique identifiers and common type names
     pub fn process_fetch_calls(&mut self, mut calls: Vec<Call>) -> Vec<Call> {
         // Group calls by route+method to ensure consecutive numbering
-        let mut grouped_calls: std::collections::HashMap<(String, String), Vec<usize>> = std::collections::HashMap::new();
-        
+        let mut grouped_calls: std::collections::HashMap<(String, String), Vec<usize>> =
+            std::collections::HashMap::new();
+
         // Group call indices by route+method, but only for calls that have response_type
         for (index, call) in calls.iter().enumerate() {
             if call.response_type.is_some() {
                 let key = (call.route.clone(), call.method.clone());
-                grouped_calls.entry(key).or_insert_with(Vec::new).push(index);
+                grouped_calls
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .push(index);
             }
         }
 
@@ -313,9 +315,7 @@ impl Analyzer {
 
                 // Set common type name for comparison with producer
                 call.common_type_name = Some(Self::generate_common_type_alias_name(
-                    &route,
-                    &method,
-                    false, // is_request_type = false (for response)
+                    &route, &method, false, // is_request_type = false (for response)
                     true,  // is_consumer = true (fetch calls are consumers)
                 ));
 
@@ -1086,6 +1086,47 @@ impl Analyzer {
         }
     }
 
+    pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
+        use std::process::Command;
+
+        // Ensure the output directory exists
+        if !std::path::Path::new("ts_check/output").exists() {
+            return Err("Output directory ts_check/output does not exist".to_string());
+        }
+
+        // Run the type checking script
+        let script_path = match std::fs::canonicalize("ts_check/check-types.ts") {
+            Ok(path) => path,
+            Err(_) => return Err("Type checking script not found".to_string()),
+        };
+
+        let output = Command::new("npx")
+            .arg("ts-node")
+            .arg(script_path)
+            .arg("output")
+            .current_dir("ts_check")
+            .output()
+            .map_err(|e| format!("Failed to run type checking: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Parse the JSON output
+        let result: serde_json::Value = serde_json::from_str(&stdout)
+            .map_err(|e| format!("Failed to parse type checking result: {}", e))?;
+
+        // Check if there were any errors
+        if !output.status.success() {
+            if let Some(error_msg) = result.get("message") {
+                return Err(error_msg
+                    .as_str()
+                    .unwrap_or("Type checking failed")
+                    .to_string());
+            }
+        }
+
+        Ok(result)
+    }
+
     pub fn get_results(&self) -> ApiAnalysisResult {
         let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
         let mismatches = self.compare_calls_to_endpoints();
@@ -1265,6 +1306,49 @@ pub fn analyze_api_consistency(
                 &repo_path
             );
             analyzer.extract_types_for_repo(&repo_path, type_infos.clone(), &packages);
+        }
+    }
+
+    // Run type checking before returning results
+    let type_check_result = analyzer.check_type_compatibility();
+    match &type_check_result {
+        Ok(result) => {
+            println!("\nType Compatibility Check:");
+            println!("========================");
+
+            if let Some(total_producers) = result.get("totalProducers") {
+                println!("Total producers: {}", total_producers);
+            }
+            if let Some(total_consumers) = result.get("totalConsumers") {
+                println!("Total consumers: {}", total_consumers);
+            }
+            if let Some(compatible) = result.get("compatiblePairs") {
+                println!("Compatible pairs: {}", compatible);
+            }
+            if let Some(incompatible) = result.get("incompatiblePairs") {
+                println!("Incompatible pairs: {}", incompatible);
+            }
+
+            if let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) {
+                if !mismatches.is_empty() {
+                    println!("\n⚠️  Type mismatches found:");
+                    for mismatch in mismatches {
+                        if let (Some(endpoint), Some(error)) = (
+                            mismatch.get("endpoint").and_then(|e| e.as_str()),
+                            mismatch.get("errorDetails").and_then(|e| e.as_str()),
+                        ) {
+                            println!("  {} - {}", endpoint, error);
+                        }
+                    }
+                } else {
+                    println!("✅ All types are compatible!");
+                }
+            }
+        }
+        Err(e) => {
+            println!("\nType Compatibility Check:");
+            println!("========================");
+            println!("❌ Type checking failed: {}", e);
         }
     }
 
