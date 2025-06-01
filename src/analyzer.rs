@@ -1199,6 +1199,40 @@ impl Analyzer {
         }
     }
 
+    fn run_final_type_checking(&self) -> Result<(), String> {
+        use std::process::Command;
+        
+        // Check if we have the type checking script
+        let script_path = "ts_check/run-type-checking.ts";
+        if !std::path::Path::new(script_path).exists() {
+            return Err("Type checking script not found".to_string());
+        }
+
+        // Run the type checking script
+        let output = Command::new("npx")
+            .arg("ts-node")
+            .arg(script_path)
+            .output()
+            .map_err(|e| format!("Failed to run type checking: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Print the output from the type checking script
+        if !stdout.trim().is_empty() {
+            print!("{}", stdout);
+        }
+        if !stderr.trim().is_empty() && !output.status.success() {
+            print!("{}", stderr);
+        }
+
+        if !output.status.success() {
+            return Err(format!("Type checking script failed with exit code: {:?}", output.status.code()));
+        }
+
+        Ok(())
+    }
+
     fn get_type_mismatches(&self) -> Vec<String> {
         match self.check_type_compatibility() {
             Ok(result) => {
@@ -1433,6 +1467,12 @@ pub fn analyze_api_consistency(
             );
             analyzer.extract_types_for_repo(&repo_path, type_infos.clone(), &packages);
         }
+    }
+
+    // Run type checking once after all repositories have been processed
+    println!("\n🔍 Running type compatibility checking...");
+    if let Err(e) = analyzer.run_final_type_checking() {
+        println!("⚠️  Warning: Type checking failed: {}", e);
     }
 
     analyzer.get_results()

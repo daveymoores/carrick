@@ -74,8 +74,34 @@ export class DependencyManager {
       console.log(
         `Package.json created at ${packageJsonPath} with ${Object.keys(this.usedDependencies).length} dependencies`,
       );
+
+      // Also copy tsconfig.json to output directory
+      const tsconfigPath = `${outputDir}/tsconfig.json`;
+      const tsconfigContent = {
+        "compilerOptions": {
+          "target": "ES2020",
+          "module": "commonjs",
+          "strict": true,
+          "esModuleInterop": true,
+          "skipLibCheck": true,
+          "forceConsistentCasingInFileNames": true,
+          "resolveJsonModule": true,
+          "declaration": true,
+          "outDir": "./dist"
+        },
+        "include": [
+          "*.ts",
+          "**/*.ts"
+        ],
+        "exclude": [
+          "node_modules",
+          "dist"
+        ]
+      };
+      require("fs").writeFileSync(tsconfigPath, JSON.stringify(tsconfigContent, null, 2));
+      console.log(`tsconfig.json created at ${tsconfigPath}`);
     } catch (error) {
-      console.error("Error creating package.json:", error);
+      console.error("Error creating package.json or tsconfig.json:", error);
     }
   }
 
