@@ -101,6 +101,10 @@ export class TypeExtractor {
     return result;
   }
 
+  getProject() {
+    return this.projectManager.getProject();
+  }
+
   clear(): void {
     this.projectManager.clearCache();
     this.importHandler.clear();

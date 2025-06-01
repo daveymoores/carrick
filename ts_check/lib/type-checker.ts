@@ -4,6 +4,7 @@ import {
   InterfaceDeclaration,
   TypeAliasDeclaration,
   Type,
+  SyntaxKind,
 } from "ts-morph";
 
 export interface TypeMismatch {
@@ -66,54 +67,54 @@ export class TypeCompatibilityChecker {
    */
   private unwrapResponseType(type: Type): Type {
     const typeText = type.getText();
-    console.error(`🔍 Checking type for unwrapping: ${typeText}`);
 
-    // Check if it's a Response<T> type by text pattern
-    if (typeText.includes("Response<")) {
-      console.error(`📦 Found Response wrapper, attempting to unwrap...`);
-
-      // Try getTypeArguments first
-      const typeArgs = type.getTypeArguments();
-      console.error(`📊 Type arguments found: ${typeArgs.length}`);
-
-      if (typeArgs.length > 0) {
-        const unwrapped = typeArgs[0];
-        console.error(
-          `✂️  Unwrapped via getTypeArguments: ${unwrapped.getText()}`,
-        );
-        return unwrapped;
-      }
-
-      // Fallback: try to extract from the text manually
-      const match = typeText.match(/^Response<(.+)>$/);
+    // For import references like "import(...).TypeName", extract the TypeName
+    if (typeText.startsWith("import(")) {
+      const match = typeText.match(/import\("([^"]+)"\)\.(\w+)/);
       if (match) {
-        const innerTypeText = match[1];
-        console.error(`✂️  Attempting text-based unwrapping: ${innerTypeText}`);
+        const [, filePath, typeName] = match;
 
-        // Create a temporary type to resolve the inner type
-        try {
-          const tempFile = this.project.createSourceFile(
-            `__temp_unwrap_${Date.now()}.ts`,
-            `type TempType = ${innerTypeText};`,
-            { overwrite: true },
-          );
+        // Get the source file for the import (add .ts extension if not present)
+        const fullFilePath = filePath.endsWith(".ts")
+          ? filePath
+          : `${filePath}.ts`;
+        const sourceFile = this.project.getSourceFile(fullFilePath);
 
-          const tempTypeAlias = tempFile.getTypeAliases()[0];
-          const resolvedType = tempTypeAlias.getType();
+        if (sourceFile) {
+          // Find the type alias in the source file
+          const typeAlias = sourceFile.getTypeAlias(typeName);
 
-          tempFile.delete();
+          if (typeAlias) {
+            const typeNode = typeAlias.getTypeNode();
+            if (typeNode) {
+              const nodeText = typeNode.getText();
 
-          console.error(
-            `✂️  Text-based unwrapping successful: ${resolvedType.getText()}`,
-          );
-          return resolvedType;
-        } catch (error) {
-          console.error(`❌ Text-based unwrapping failed: ${error}`);
+              // Check if it's Response<T>
+              if (nodeText.startsWith("Response<")) {
+                // Parse the type arguments from the node
+                const typeRef = typeNode as any;
+                const typeArgs = typeRef.getTypeArguments?.();
+
+                if (typeArgs && typeArgs.length > 0) {
+                  const firstArgType = typeArgs[0].getType();
+                  return firstArgType;
+                }
+              }
+            }
+          }
         }
       }
     }
 
-    console.error(`⚡ No unwrapping needed, returning original type`);
+    // Direct check for Response pattern
+    if (typeText.includes("Response<")) {
+      const typeArgs = type.getTypeArguments();
+
+      if (typeArgs.length > 0) {
+        const unwrapped = typeArgs[0];
+        return unwrapped;
+      }
+    }
     return type;
   }
 
@@ -132,7 +133,6 @@ export class TypeCompatibilityChecker {
         const typeNode = node.getTypeNode();
         if (typeNode) {
           const resolvedType = typeNode.getType();
-          console.error(`🎯 Resolved consumer type: ${resolvedType.getText()}`);
           return resolvedType;
         }
       }
@@ -351,35 +351,14 @@ export class TypeCompatibilityChecker {
       let producerType = producer.node.getType();
       let consumerType = consumer.node.getType();
 
-      console.error(`\n🔍 Comparing types for ${endpoint}`);
-      console.error(`📤 Producer: ${producer.name}`);
-      console.error(`📤 Producer type: ${producerType.getText()}`);
-      console.error(`📥 Consumer: ${consumer.name}`);
-      console.error(`📥 Consumer type: ${consumerType.getText()}`);
-
       // Unwrap Response<T> wrapper from producer
-      const originalProducerType = producerType;
       producerType = this.unwrapResponseType(producerType);
 
-      if (producerType !== originalProducerType) {
-        console.error(
-          `🎁 Producer type after unwrapping: ${producerType.getText()}`,
-        );
-      }
-
       // Resolve consumer type if it's an import reference
-      const originalConsumerType = consumerType;
       consumerType = this.resolveTypeReference(consumerType, consumer.node);
-
-      if (consumerType !== originalConsumerType) {
-        console.error(
-          `🎯 Consumer type after resolving: ${consumerType.getText()}`,
-        );
-      }
 
       // Check compatibility
       const isAssignable = producerType.isAssignableTo(consumerType);
-      console.error(`✅ Is assignable: ${isAssignable}`);
 
       if (!isAssignable) {
         // Get TypeScript's diagnostic message
@@ -387,8 +366,6 @@ export class TypeCompatibilityChecker {
           producerType,
           consumerType,
         );
-
-        console.error(`❌ Type mismatch detected: ${diagnosticMessage}`);
 
         return {
           endpoint,
@@ -402,10 +379,8 @@ export class TypeCompatibilityChecker {
         };
       }
 
-      console.error(`✅ Types are compatible`);
       return null; // Types are compatible
     } catch (error) {
-      console.error(`💥 Type comparison failed: ${error}`);
       throw new Error(`Type comparison failed: ${error}`);
     }
   }

@@ -1118,152 +1118,41 @@ impl Analyzer {
     pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
         use std::fs;
         use std::path::Path;
-        use std::process::Command;
 
         // Ensure the output directory exists
         if !Path::new("ts_check/output").exists() {
             return Err("Output directory ts_check/output does not exist".to_string());
         }
 
-        // Generate type comparisons from our analysis
-        let comparisons = self.generate_type_comparisons();
-
-        // Write comparisons to temporary file
-        let comparisons_json = serde_json::to_string_pretty(&comparisons)
-            .map_err(|e| format!("Failed to serialize comparisons: {}", e))?;
-
-        let temp_file = std::fs::canonicalize(".")
-            .map_err(|e| format!("Failed to get current directory: {}", e))?
-            .join("ts_check")
-            .join("comparisons.json");
+        // Check for type-check-results.json file created by the integrated type checker
+        let results_file = Path::new("ts_check/output/type-check-results.json");
         
-        fs::write(&temp_file, comparisons_json)
-            .map_err(|e| format!("Failed to write comparisons file: {}", e))?;
-
-
-
-        // Run the simplified type checking script
-        let script_path = match std::fs::canonicalize("ts_check/simple-type-checker.ts") {
-            Ok(path) => path,
-            Err(_) => return Err("Simple type checking script not found".to_string()),
-        };
-
-        let output = Command::new("npx")
-            .arg("ts-node")
-            .arg(script_path)
-            .arg("comparisons.json")
-            .current_dir("ts_check")
-            .output()
-            .map_err(|e| format!("Failed to run type checking: {}", e))?;
-
-        // Clean up temp file after TypeScript script runs
-        let _ = fs::remove_file(&temp_file);
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Debug: Print the raw output
-        println!("TypeScript script stdout: '{}'", stdout);
-        println!("TypeScript script stderr: '{}'", stderr);
-        println!("TypeScript script exit code: {:?}", output.status.code());
-
-        // Check if stdout is empty
-        if stdout.trim().is_empty() {
-            return Err(format!(
-                "Type checking script produced no output. stderr: {}",
-                stderr
-            ));
+        if !results_file.exists() {
+            return Err("Type check results file not found. Type checking may have failed during extraction.".to_string());
         }
 
+        // Read the type check results
+        let contents = fs::read_to_string(results_file)
+            .map_err(|e| format!("Failed to read type check results: {}", e))?;
+
         // Parse the JSON output
-        let result: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        let result: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
             format!(
-                "Failed to parse type checking result: {}. Raw output: '{}'",
-                e, stdout
+                "Failed to parse type checking result: {}. Raw content: '{}'",
+                e, contents
             )
         })?;
+
+        // Check for error in the result
+        if let Some(error) = result.get("error") {
+            return Err(format!("Type checking failed: {}", error));
+        }
 
         // Transform result to match expected format
         self.transform_type_check_result(result)
     }
 
-    fn generate_type_comparisons(&self) -> Vec<serde_json::Value> {
-        let mut comparisons = Vec::new();
 
-
-
-        // Iterate through all endpoints and their corresponding calls
-        for endpoint in &self.endpoints {
-            // Find matching calls for this endpoint
-            for call in &self.calls {
-                if self.endpoints_match(endpoint, call) {
-                    let endpoint_route = format!("{} {}", endpoint.method, endpoint.route);
-
-                    // Get producer type alias (from endpoint)
-                    let producer_type = endpoint
-                        .response_type
-                        .as_ref()
-                        .map(|tr| tr.alias.clone())
-                        .unwrap_or_else(|| "any".to_string());
-
-                    // Get consumer type alias (from call)
-                    let consumer_type = call
-                        .response_type
-                        .as_ref()
-                        .map(|tr| tr.alias.clone())
-                        .unwrap_or_else(|| "any".to_string());
-
-
-                    
-                    comparisons.push(serde_json::json!({
-                        "endpoint": endpoint_route,
-                        "producerType": producer_type,
-                        "consumerType": consumer_type
-                    }));
-                }
-            }
-        }
-
-
-        comparisons
-    }
-
-    fn endpoints_match(&self, endpoint: &ApiEndpointDetails, call: &ApiEndpointDetails) -> bool {
-        let endpoint_norm = self.normalize_route_for_comparison(&endpoint.route);
-        let call_norm = self.extract_route_from_call(&call.route);
-        
-        let method_match = endpoint.method == call.method;
-        let route_match = endpoint_norm == call_norm;
-        
-        method_match && route_match
-    }
-
-    fn normalize_route_for_comparison(&self, route: &str) -> String {
-        // Remove dynamic segments for comparison
-        route
-            .split('/')
-            .map(|segment| {
-                if segment.starts_with(':') {
-                    ":param"
-                } else {
-                    segment
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("/")
-    }
-
-    fn extract_route_from_call(&self, call_route: &str) -> String {
-        // Handle environment variable URLs like ENV_VAR:USER_SERVICE_URL:/users/:param
-        if call_route.contains("ENV_VAR:") {
-            if let Some(route_part) = call_route.split(':').last() {
-                return self.normalize_route_for_comparison(route_part);
-            }
-        }
-        
-        // For regular routes, just normalize
-        self.normalize_route_for_comparison(call_route)
-    }
 
     fn transform_type_check_result(
         &self,
