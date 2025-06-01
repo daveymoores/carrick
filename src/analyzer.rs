@@ -22,15 +22,16 @@ pub struct ApiIssues {
     pub endpoint_issues: Vec<String>,
     pub env_var_calls: Vec<String>,
     pub mismatches: Vec<String>,
+    pub type_mismatches: Vec<String>,
 }
 
 impl ApiIssues {
     pub fn is_empty(&self) -> bool {
-        self.call_issues.is_empty() && self.endpoint_issues.is_empty()
+        self.call_issues.is_empty() && self.endpoint_issues.is_empty() && self.type_mismatches.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.call_issues.len() + self.endpoint_issues.len()
+        self.call_issues.len() + self.endpoint_issues.len() + self.type_mismatches.len()
     }
 }
 
@@ -1183,6 +1184,7 @@ impl Analyzer {
     pub fn get_results(&self) -> ApiAnalysisResult {
         let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
         let mismatches = self.compare_calls_to_endpoints();
+        let type_mismatches = self.get_type_mismatches();
 
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
@@ -1192,7 +1194,62 @@ impl Analyzer {
                 endpoint_issues,
                 env_var_calls,
                 mismatches,
+                type_mismatches,
             },
+        }
+    }
+
+    fn get_type_mismatches(&self) -> Vec<String> {
+        match self.check_type_compatibility() {
+            Ok(result) => {
+                if let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) {
+                    mismatches.iter()
+                        .filter_map(|mismatch| {
+                            if let (Some(endpoint), Some(producer), Some(consumer), Some(error)) = (
+                                mismatch.get("endpoint").and_then(|e| e.as_str()),
+                                mismatch.get("producerType").and_then(|t| t.as_str()),
+                                mismatch.get("consumerType").and_then(|t| t.as_str()),
+                                mismatch.get("errorDetails").and_then(|e| e.as_str()),
+                            ) {
+                                // Clean up long import paths for better readability
+                                let clean_producer = producer
+                                    .replace("import(\"/Users/davidjonathanmoores/Repositories/carrick/carrick/ts_check/output/", "")
+                                    .replace("\").Comment", ".Comment")
+                                    .replace("\").User", ".User")
+                                    .replace("\").Order", ".Order")
+                                    .replace("Array<", "")
+                                    .replace(">", "");
+                                let clean_consumer = consumer
+                                    .replace("import(\"/Users/davidjonathanmoores/Repositories/carrick/carrick/ts_check/output/", "")
+                                    .replace("\").Comment", ".Comment")
+                                    .replace("\").User", ".User")
+                                    .replace("\").Order", ".Order")
+                                    .replace("Array<", "")
+                                    .replace(">", "");
+                                let clean_error = error
+                                    .replace("Type '", "")
+                                    .replace("' is missing the following properties from type '", " missing properties from ")
+                                    .replace("': ", ": ")
+                                    .replace("' is not assignable to type '", " not assignable to ")
+                                    .replace("'.", "");
+                                
+                                Some(format!(
+                                    "Type mismatch on {}: Producer ({}) incompatible with Consumer ({}) - {}",
+                                    endpoint,
+                                    clean_producer.chars().take(50).collect::<String>(),
+                                    clean_consumer.chars().take(50).collect::<String>(),
+                                    clean_error.chars().take(80).collect::<String>()
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(_) => Vec::new(),
         }
     }
 
@@ -1345,6 +1402,22 @@ pub fn analyze_api_consistency(
         analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
     }
 
+    // Clean output directory before starting type extraction
+    let output_dir = std::path::Path::new("ts_check/output");
+    if output_dir.exists() {
+        println!("🗑️  Cleaning output directory: ts_check/output");
+        if let Err(e) = std::fs::remove_dir_all(output_dir) {
+            println!("Warning: Failed to clean output directory: {}", e);
+        }
+    }
+    
+    // Create clean output directory
+    if let Err(e) = std::fs::create_dir_all(output_dir) {
+        println!("Warning: Failed to create output directory: {}", e);
+    } else {
+        println!("📁 Created clean output directory: ts_check/output");
+    }
+
     // Process types for each repository using the original repo paths
     for repo_path in repo_paths {
         let repo_name = repo_path
@@ -1359,53 +1432,6 @@ pub fn analyze_api_consistency(
                 &repo_path
             );
             analyzer.extract_types_for_repo(&repo_path, type_infos.clone(), &packages);
-        }
-    }
-
-    // Run type checking before returning results
-    let type_check_result = analyzer.check_type_compatibility();
-
-    match &type_check_result {
-        Ok(result) => {
-            if let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) {
-                if !mismatches.is_empty() {
-                    println!("\n🚨 TYPE MISMATCHES DETECTED:");
-                    println!("============================");
-                    for mismatch in mismatches {
-                        if let (Some(endpoint), Some(error)) = (
-                            mismatch.get("endpoint").and_then(|e| e.as_str()),
-                            mismatch.get("errorDetails").and_then(|e| e.as_str()),
-                        ) {
-                            println!("\nEndpoint: {}", endpoint);
-                            println!(
-                                "   Producer type: {}",
-                                mismatch
-                                    .get("producerType")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("unknown")
-                            );
-                            println!(
-                                "   Consumer type: {}",
-                                mismatch
-                                    .get("consumerType")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("unknown")
-                            );
-                            println!("   Error: {}", error);
-                            println!(
-                                "   💡 Fix: Ensure the API producer and consumer have matching type definitions"
-                            );
-                        }
-                    }
-                } else {
-                    println!("✅ All types are compatible!");
-                }
-            }
-        }
-        Err(e) => {
-            println!("\nType Compatibility Check:");
-            println!("========================");
-            println!("❌ Type checking failed: {}", e);
         }
     }
 

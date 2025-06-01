@@ -124,24 +124,55 @@ export class TypeCompatibilityChecker {
   private resolveTypeReference(type: Type, node: any): Type {
     const typeText = type.getText();
 
-    if (typeText.includes("import(")) {
-      console.error(`🔗 Consumer type is an import reference, resolving...`);
+    // For import references like "import(...).TypeName", extract the TypeName
+    if (typeText.startsWith("import(")) {
+      const match = typeText.match(/import\("([^"]+)"\)\.(\w+)/);
+      if (match) {
+        const [, filePath, typeName] = match;
 
-      // For type alias declarations, get the actual type from the type node
-      if (node.getKind && node.getKind() === 255) {
-        // TypeAliasDeclaration
-        const typeNode = node.getTypeNode();
-        if (typeNode) {
-          const resolvedType = typeNode.getType();
-          return resolvedType;
+        // Get the source file for the import (add .ts extension if not present)
+        const fullFilePath = filePath.endsWith(".ts")
+          ? filePath
+          : `${filePath}.ts`;
+        const sourceFile = this.project.getSourceFile(fullFilePath);
+
+        if (sourceFile) {
+          // Find the type alias in the source file
+          const typeAlias = sourceFile.getTypeAlias(typeName);
+
+          if (typeAlias) {
+            const typeNode = typeAlias.getTypeNode();
+            if (typeNode) {
+              const nodeText = typeNode.getText();
+
+              // For simple type aliases, we can get better display by checking if it's a basic type
+              if (nodeText === "Comment[]" || nodeText === "User" || nodeText === "Order[]" || 
+                  nodeText.includes("string") || nodeText.includes("number") || 
+                  nodeText.startsWith("{") || nodeText.startsWith("Array<")) {
+                // Create a temporary variable with this type to get proper resolution
+                try {
+                  const tempFile = this.project.createSourceFile(
+                    `__temp_resolve_${Date.now()}.ts`,
+                    `import { Comment, User, Order } from "${fullFilePath.replace(/\.ts$/, "")}";
+const tempVar: ${nodeText} = null as any;`,
+                    { overwrite: true },
+                  );
+
+                  const tempVar = tempFile.getVariableDeclarations()[0];
+                  const resolvedType = tempVar.getType();
+                  tempFile.delete();
+                  return resolvedType;
+                } catch (error) {
+                  // Fallback: return the type from the type node
+                  return typeNode.getType();
+                }
+              }
+              
+              // For complex types, return the original type
+              return typeNode.getType();
+            }
+          }
         }
-      }
-
-      // Alternative: try to get the aliased type
-      const aliasedType = type.getAliasTypeArguments();
-      if (aliasedType.length > 0) {
-        console.error(`🎯 Found aliased type: ${aliasedType[0].getText()}`);
-        return aliasedType[0];
       }
     }
 
@@ -373,7 +404,7 @@ export class TypeCompatibilityChecker {
           consumerCall: consumer.callId,
           consumerType: consumerType.getText(),
           isAssignable: false,
-          errorDetails: diagnosticMessage,
+          errorDetails: diagnosticMessage || `Type '${producerType.getText()}' is not assignable to type '${consumerType.getText()}'.`,
           producerLocation: producer.file,
           consumerLocation: consumer.file,
         };

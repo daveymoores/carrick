@@ -9,6 +9,9 @@ async function main() {
   try {
     // Parse command line arguments
     const args = parseArguments();
+    
+    // Get the output directory
+    const outputDir = path.dirname(args.outputFile);
     // Create type extractor instance
     const typeExtractor = new TypeExtractor(
       args.tsconfigPath,
@@ -23,17 +26,34 @@ async function main() {
 
     // Perform type checking if extraction was successful
     if (result.success) {
-      console.log("\n🔍 Starting type compatibility checking...");
+      console.log("\n📦 Installing dependencies for type checking...");
 
       try {
+        // Install dependencies in the output directory
+        const outputDir = path.dirname(args.outputFile);
+        const { execSync } = await import("child_process");
+        
+        try {
+          execSync("npm install", { 
+            cwd: outputDir, 
+            stdio: "inherit",
+            timeout: 60000 // 60 second timeout
+          });
+          console.log("✅ Dependencies installed successfully");
+        } catch (installError) {
+          console.warn("⚠️  Warning: Failed to install dependencies:", (installError as Error).message);
+          console.warn("Type checking may not work correctly without dependencies");
+        }
+
+        console.log("\n🔍 Starting type compatibility checking...");
+
         // Get the ts-morph project from the type extractor
         const project = typeExtractor.getProject();
 
         // Create type checker instance
         const typeChecker = new TypeCompatibilityChecker(project);
 
-        // Get the output directory
-        const outputDir = path.dirname(args.outputFile);
+        // Use the same output directory
 
         // Perform type checking
         const typeCheckResult = await typeChecker.checkGeneratedTypes(outputDir);
@@ -79,6 +99,8 @@ async function main() {
           console.log(`  Orphaned consumers: ${typeCheckResult.orphanedConsumers.join(", ")}`);
         }
 
+
+
       } catch (error) {
         console.error("Type checking failed:", error);
         // Write error result
@@ -91,6 +113,8 @@ async function main() {
           error: (error as Error).message
         };
         fs.writeFileSync(typeCheckOutputPath, JSON.stringify(errorResult, null, 2));
+        
+
       }
     }
 

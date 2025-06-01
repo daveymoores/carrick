@@ -226,6 +226,7 @@ fn main() {
         let endpoint_issues = result.issues.endpoint_issues;
         let env_var_calls = result.issues.env_var_calls;
         let mismatches = result.issues.mismatches;
+        let type_mismatches = result.issues.type_mismatches;
         let mut issue_number: usize = 0;
 
         if !call_issues.is_empty() {
@@ -245,6 +246,13 @@ fn main() {
         for issue in mismatches.iter() {
             issue_number = issue_number + 1;
             print!("\n{}. {}", &issue_number, issue);
+        }
+
+        if !type_mismatches.is_empty() {
+            for issue in type_mismatches.iter() {
+                issue_number = issue_number + 1;
+                print!("\n{}. {}", &issue_number, issue);
+            }
         }
 
         if !env_var_calls.is_empty() {
