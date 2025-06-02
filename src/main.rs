@@ -3,13 +3,16 @@ mod app_context;
 mod config;
 mod extractor;
 mod file_finder;
+mod packages;
 mod parser;
 mod router_context;
 mod utils;
 mod visitor;
 use analyzer::analyze_api_consistency;
 use config::Config;
+
 use file_finder::find_files;
+use packages::Packages;
 use parser::parse_file;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -71,6 +74,7 @@ fn main() {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let mut configs = Vec::new();
+    let mut package_jsons = Vec::new();
 
     // Extract directories from args if they exist. If no args are given then default to the current directory.
     let repositories = std::env::args().skip(1); // Skip program name
@@ -81,20 +85,20 @@ fn main() {
     };
 
     // Track processed files to avoid duplicates
-    let mut processed_file_paths = HashSet::new(); // HashSet<(String, Option<String>)>
+    let mut processed_file_paths = HashSet::new(); // HashSet<String>
 
     // Queue to store files for processing [file_path, repo_prefix]
     let mut file_queue = VecDeque::new();
 
     // Find all files to process initially and queue them
-    for dir in repo_dirs {
+    for dir in &repo_dirs {
         println!("---> Analyzing JavaScript/TypeScript files in: {}", dir);
 
         let dir_paths: Vec<_> = dir.split("/").filter(|s| !s.is_empty()).collect();
         let repo_prefix = dir_paths.last().unwrap_or(&"default").to_string();
 
         let ignore_patterns = ["node_modules", "dist", "build", ".next"];
-        let (files, config_file_path) = find_files(&dir, &ignore_patterns);
+        let (files, config_file_path, package_json_path) = find_files(&dir, &ignore_patterns);
 
         println!(
             "Found {} files to analyze in directory {}",
@@ -103,8 +107,14 @@ fn main() {
         );
 
         // Process the config file if found
+        if let Some(package_json) = package_json_path {
+            println!("Found package.json: {}", package_json.display());
+            package_jsons.push(package_json);
+        }
+
+        // Process the config file if found
         if let Some(config_path) = config_file_path {
-            println!("Found configuration file: {}", config_path.display());
+            println!("Found carrick.json file: {}", config_path.display());
             configs.push(config_path);
         }
 
@@ -119,18 +129,21 @@ fn main() {
 
     while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
         let path_str = file_path.to_string_lossy().to_string();
-        let key = (path_str.clone(), imported_router_name.clone());
-        if processed_file_paths.contains(&key) {
+        if processed_file_paths.contains(&path_str) {
             continue;
         }
-        processed_file_paths.insert(key);
+        processed_file_paths.insert(path_str.clone());
 
         println!("Parsing: {}", file_path.display());
 
         if let Some(module) = parse_file(&file_path, &cm, &handler) {
             // Create visitor with the imported router name if this file was imported as a router
-            let mut visitor =
-                DependencyVisitor::new(file_path.clone(), &repo_prefix, imported_router_name);
+            let mut visitor = DependencyVisitor::new(
+                file_path.clone(),
+                &repo_prefix,
+                imported_router_name,
+                cm.clone(),
+            );
             module.visit_with(&mut visitor);
 
             // Queue imported router files that might be used with app.use or router.use
@@ -183,8 +196,18 @@ fn main() {
         }
     };
 
-    // Analyze for inconsistencies
-    let result = analyze_api_consistency(visitors, config);
+    // Load packages
+    let packages = match Packages::new(package_jsons) {
+        Ok(packages) => packages,
+        Err(error) => {
+            eprintln!("Error parsing package.json files: {}", error);
+            eprintln!("Please ensure your package.json files are valid JSON.");
+            std::process::exit(1);
+        }
+    };
+
+    // Analyze for inconsistencies. Pass the sourcemap to allow relative byte positions to be calculated
+    let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs);
 
     // Print results
     println!("\nAPI Analysis Results:");
@@ -203,6 +226,7 @@ fn main() {
         let endpoint_issues = result.issues.endpoint_issues;
         let env_var_calls = result.issues.env_var_calls;
         let mismatches = result.issues.mismatches;
+        let type_mismatches = result.issues.type_mismatches;
         let mut issue_number: usize = 0;
 
         if !call_issues.is_empty() {
@@ -222,6 +246,13 @@ fn main() {
         for issue in mismatches.iter() {
             issue_number = issue_number + 1;
             print!("\n{}. {}", &issue_number, issue);
+        }
+
+        if !type_mismatches.is_empty() {
+            for issue in type_mismatches.iter() {
+                issue_number = issue_number + 1;
+                print!("\n{}. {}", &issue_number, issue);
+            }
         }
 
         if !env_var_calls.is_empty() {

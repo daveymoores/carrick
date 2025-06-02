@@ -1,9 +1,11 @@
-use crate::visitor::{ImportedSymbol, Json};
-use std::collections::HashMap;
+use crate::visitor::{Call, ImportedSymbol, Json};
+use std::{collections::HashMap, path::PathBuf};
+use swc_common::{SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 
 pub trait CoreExtractor {
-    fn resolve_variable(&self, name: &str) -> Option<&Expr> {
+    fn get_source_map(&self) -> &Lrc<SourceMap>;
+    fn resolve_variable(&self, _name: &str) -> Option<&Expr> {
         None
     }
 
@@ -243,168 +245,332 @@ pub trait CoreExtractor {
         }
     }
 
-    // Extract fetch calls from an arrow function
-    fn extract_fetch_calls_from_arrow(
+    fn create_call_from_fetch(&self, call: &CallExpr) -> Option<Call> {
+        let route = self.extract_route_from_call_arg(&call.args)?;
+        let method = self
+            .extract_method_from_call_args(call)
+            .unwrap_or_else(|| "GET".to_string());
+        let request_body = self.extract_request_body_from_fetch(call);
+
+        Some(Call {
+            route,
+            method,
+            response: Json::Null, // Will be populated later if needed
+            request: request_body,
+            response_type: None, // Will be populated when we find the type annotation
+            request_type: None,  // Could be extracted from fetch body
+            call_file: PathBuf::new(), // Will be set by caller
+            call_id: None, // Will be set by caller with unique identifier
+            call_number: None, // Will be set by caller
+            common_type_name: None, // Will be set by caller
+        })
+    }
+
+    fn extract_call_from_expr(&self, expr: &Expr) -> Option<Call> {
+        match expr {
+            Expr::Await(await_expr) => {
+                if let Expr::Call(call) = &*await_expr.arg {
+                    if let Callee::Expr(callee_expr) = &call.callee {
+                        if let Expr::Ident(ident) = &**callee_expr {
+                            if ident.sym == "fetch" {
+                                return self.create_call_from_fetch(call);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Call(call) => {
+                if let Callee::Expr(callee_expr) = &call.callee {
+                    if let Expr::Ident(ident) = &**callee_expr {
+                        if ident.sym == "fetch" {
+                            return self.create_call_from_fetch(call);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn is_json_method_call(&self, call: &CallExpr) -> bool {
+        if let Callee::Expr(callee_expr) = &call.callee {
+            if let Expr::Member(member) = &**callee_expr {
+                if let MemberProp::Ident(method) = &member.prop {
+                    return method.sym == "json";
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract fetch calls from arrow function with file context
+    fn extract_fetch_calls_from_arrow_with_file(
         &self,
-        arrow: &ArrowExpr,
-    ) -> Vec<(String, String, Option<Json>)> {
+        arrow: &swc_ecma_ast::ArrowExpr,
+        file_path: &PathBuf,
+    ) -> Vec<crate::visitor::Call> {
+        use swc_ecma_ast::*;
         let mut fetch_calls = Vec::new();
 
         match &*arrow.body {
-            // For arrow functions with block bodies: (req, res) => { ... }
             BlockStmtOrExpr::BlockStmt(block) => {
-                for stmt in &block.stmts {
-                    self.extract_fetch_from_stmt(stmt, &mut fetch_calls);
-                }
+                self.extract_calls_from_block_with_file(block, &mut fetch_calls, file_path);
             }
-            // For arrow functions with expression bodies: (req, res) => fetch(...)
             BlockStmtOrExpr::Expr(expr) => {
-                self.extract_fetch_from_expr(expr, &mut fetch_calls);
+                if let Some(mut call) = self.extract_call_from_expr(expr) {
+                    call.call_file = file_path.clone();
+                    fetch_calls.push(call);
+                }
             }
         }
 
         fetch_calls
     }
 
-    // Extract fetch calls from a function declaration
-    fn extract_fetch_calls_from_function_decl(
+    /// Extract fetch calls from function declaration with file context
+    fn extract_fetch_calls_from_function_decl_with_file(
         &self,
-        fn_decl: &FnDecl,
-    ) -> Vec<(String, String, Option<Json>)> {
+        fn_decl: &swc_ecma_ast::FnDecl,
+        file_path: &PathBuf,
+    ) -> Vec<crate::visitor::Call> {
         let mut fetch_calls = Vec::new();
 
         if let Some(body) = &fn_decl.function.body {
-            for stmt in &body.stmts {
-                self.extract_fetch_from_stmt(stmt, &mut fetch_calls);
-            }
+            self.extract_calls_from_block_with_file(body, &mut fetch_calls, file_path);
         }
 
         fetch_calls
     }
 
-    // Extract fetch calls from a function expression
-    fn extract_fetch_calls_from_function_expr(
+    /// Extract fetch calls from function expression with file context
+    fn extract_fetch_calls_from_function_expr_with_file(
         &self,
-        fn_expr: &FnExpr,
-    ) -> Vec<(String, String, Option<Json>)> {
+        fn_expr: &swc_ecma_ast::FnExpr,
+        file_path: &PathBuf,
+    ) -> Vec<crate::visitor::Call> {
         let mut fetch_calls = Vec::new();
 
         if let Some(body) = &fn_expr.function.body {
-            for stmt in &body.stmts {
-                self.extract_fetch_from_stmt(stmt, &mut fetch_calls);
-            }
+            self.extract_calls_from_block_with_file(body, &mut fetch_calls, file_path);
         }
 
         fetch_calls
     }
 
-    fn extract_fetch_from_stmt(
+    fn extract_calls_from_block_with_file(
         &self,
-        stmt: &Stmt,
-        fetch_calls: &mut Vec<(String, String, Option<Json>)>,
+        block: &swc_ecma_ast::BlockStmt,
+        calls: &mut Vec<crate::visitor::Call>,
+        file_path: &PathBuf,
     ) {
+        use swc_ecma_ast::*;
+        let mut pending_fetch: Option<crate::visitor::Call> = None;
+        let cm = self.get_source_map();
+
+        for stmt in &block.stmts {
+            // First, recursively extract calls from nested statements
+            self.extract_calls_from_stmt_recursive(stmt, calls, file_path);
+
+            // Then handle the special case of variable declarations with type annotations
+            if let Stmt::Decl(Decl::Var(var_decl)) = stmt {
+                for decl_item in &var_decl.decls {
+                    if let Some(init) = &decl_item.init {
+                        if let Some(mut call) = self.extract_call_from_expr(init) {
+                            call.call_file = file_path.clone();
+                            if let Some(prev_fetch) = pending_fetch.take() {
+                                calls.push(prev_fetch);
+                            }
+                            pending_fetch = Some(call);
+                        }
+                    }
+
+                    if let Pat::Ident(ident) = &decl_item.name {
+                        if let Some(type_ann) = &ident.type_ann {
+                            if let Some(init_expr) = &decl_item.init {
+                                let is_json_await_or_call = match &**init_expr {
+                                    Expr::Await(await_expr) => {
+                                        if let Expr::Call(call_expr) = &*await_expr.arg {
+                                            self.is_json_method_call(call_expr)
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    Expr::Call(call_expr) => self.is_json_method_call(call_expr),
+                                    _ => false,
+                                };
+
+                                if is_json_await_or_call {
+                                    if let Some(ref mut fetch) = pending_fetch {
+                                        let alias =
+                                            crate::analyzer::Analyzer::generate_common_type_alias_name(
+                                                &fetch.route,
+                                                &fetch.method,
+                                                false,
+                                                true, // is_consumer = true (fetch calls are consumers)
+                                            );
+                                        if let Some(type_ref) =
+                                            crate::analyzer::Analyzer::create_type_reference_from_swc(
+                                                type_ann, cm, file_path, alias,
+                                            )
+                                        {
+                                            fetch.response_type = Some(type_ref);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(fetch) = pending_fetch.take() {
+            calls.push(fetch);
+        }
+    }
+
+    // Add this new helper method to recursively extract calls from all statement types
+    fn extract_calls_from_stmt_recursive(
+        &self,
+        stmt: &swc_ecma_ast::Stmt,
+        calls: &mut Vec<crate::visitor::Call>,
+        file_path: &PathBuf,
+    ) {
+        use swc_ecma_ast::*;
+
         match stmt {
             Stmt::Expr(expr_stmt) => {
-                self.extract_fetch_from_expr(&expr_stmt.expr, fetch_calls);
+                if let Some(mut call) = self.extract_call_from_expr(&expr_stmt.expr) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
             }
             Stmt::Return(return_stmt) => {
                 if let Some(expr) = &return_stmt.arg {
-                    self.extract_fetch_from_expr(expr, fetch_calls);
+                    if let Some(mut call) = self.extract_call_from_expr(expr) {
+                        call.call_file = file_path.clone();
+                        calls.push(call);
+                    }
                 }
             }
             Stmt::Block(block) => {
-                for nested_stmt in &block.stmts {
-                    self.extract_fetch_from_stmt(nested_stmt, fetch_calls);
-                }
+                self.extract_calls_from_block_with_file(block, calls, file_path);
             }
             Stmt::Try(try_stmt) => {
-                // Process statements in try block directly
-                for stmt in &try_stmt.block.stmts {
-                    self.extract_fetch_from_stmt(stmt, fetch_calls);
-                }
+                // Process statements in try block
+                self.extract_calls_from_block_with_file(&try_stmt.block, calls, file_path);
 
                 // Process catch block if present
                 if let Some(handler) = &try_stmt.handler {
-                    for stmt in &handler.body.stmts {
-                        self.extract_fetch_from_stmt(stmt, fetch_calls);
-                    }
+                    self.extract_calls_from_block_with_file(&handler.body, calls, file_path);
                 }
 
                 // Process finally block if present
                 if let Some(finalizer) = &try_stmt.finalizer {
-                    for stmt in &finalizer.stmts {
-                        self.extract_fetch_from_stmt(stmt, fetch_calls);
-                    }
+                    self.extract_calls_from_block_with_file(finalizer, calls, file_path);
                 }
             }
-            Stmt::Decl(decl) => {
+            Stmt::Decl(Decl::Var(var_decl)) => {
                 // Handle variable declarations which might contain fetch calls
-                if let Decl::Var(var_decl) = decl {
-                    for var in &var_decl.decls {
-                        if let Some(init) = &var.init {
-                            self.extract_fetch_from_expr(init, fetch_calls);
+                for var in &var_decl.decls {
+                    if let Some(init) = &var.init {
+                        if let Some(mut call) = self.extract_call_from_expr(init) {
+                            call.call_file = file_path.clone();
+                            calls.push(call);
                         }
                     }
                 }
             }
             Stmt::If(if_stmt) => {
-                self.extract_fetch_from_expr(&if_stmt.test, fetch_calls);
-                self.extract_fetch_from_stmt(&if_stmt.cons, fetch_calls);
+                // Check condition for fetch calls
+                if let Some(mut call) = self.extract_call_from_expr(&if_stmt.test) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+
+                // Process consequent
+                self.extract_calls_from_stmt_recursive(&if_stmt.cons, calls, file_path);
+
+                // Process alternate if present
                 if let Some(alt) = &if_stmt.alt {
-                    self.extract_fetch_from_stmt(alt, fetch_calls);
+                    self.extract_calls_from_stmt_recursive(alt, calls, file_path);
                 }
             }
-            // Add other statement types as needed
-            _ => {}
-        }
-    }
-
-    fn extract_fetch_from_expr(
-        &self,
-        expr: &Expr,
-        fetch_calls: &mut Vec<(String, String, Option<Json>)>,
-    ) {
-        match expr {
-            Expr::Call(call) => {
-                // Check if this is a fetch call
-                if let Callee::Expr(callee_expr) = &call.callee {
-                    if let Expr::Ident(ident) = &**callee_expr {
-                        if ident.sym == "fetch" {
-                            // Handle both string literals and template literals
-                            if let Some(route) = self.extract_route_from_call_arg(&call.args) {
-                                let method = self
-                                    .extract_method_from_call_args(call)
-                                    .unwrap_or_else(|| "GET".to_string());
-
-                                // Extract request body if present
-                                let request_body = self.extract_request_body_from_fetch(call);
-
-                                fetch_calls.push((route, method, request_body));
+            Stmt::While(while_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&while_stmt.test) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                self.extract_calls_from_stmt_recursive(&while_stmt.body, calls, file_path);
+            }
+            Stmt::For(for_stmt) => {
+                if let Some(init) = &for_stmt.init {
+                    match init {
+                        VarDeclOrExpr::VarDecl(var_decl) => {
+                            for var in &var_decl.decls {
+                                if let Some(init_expr) = &var.init {
+                                    if let Some(mut call) = self.extract_call_from_expr(init_expr) {
+                                        call.call_file = file_path.clone();
+                                        calls.push(call);
+                                    }
+                                }
+                            }
+                        }
+                        VarDeclOrExpr::Expr(expr) => {
+                            if let Some(mut call) = self.extract_call_from_expr(expr) {
+                                call.call_file = file_path.clone();
+                                calls.push(call);
                             }
                         }
                     }
                 }
-
-                // Check args for nested fetch calls
-                for arg in &call.args {
-                    self.extract_fetch_from_expr(&arg.expr, fetch_calls);
+                if let Some(test) = &for_stmt.test {
+                    if let Some(mut call) = self.extract_call_from_expr(test) {
+                        call.call_file = file_path.clone();
+                        calls.push(call);
+                    }
+                }
+                if let Some(update) = &for_stmt.update {
+                    if let Some(mut call) = self.extract_call_from_expr(update) {
+                        call.call_file = file_path.clone();
+                        calls.push(call);
+                    }
+                }
+                self.extract_calls_from_stmt_recursive(&for_stmt.body, calls, file_path);
+            }
+            Stmt::ForIn(for_in_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&for_in_stmt.right) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                self.extract_calls_from_stmt_recursive(&for_in_stmt.body, calls, file_path);
+            }
+            Stmt::ForOf(for_of_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&for_of_stmt.right) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                self.extract_calls_from_stmt_recursive(&for_of_stmt.body, calls, file_path);
+            }
+            Stmt::Switch(switch_stmt) => {
+                if let Some(mut call) = self.extract_call_from_expr(&switch_stmt.discriminant) {
+                    call.call_file = file_path.clone();
+                    calls.push(call);
+                }
+                for case in &switch_stmt.cases {
+                    if let Some(test) = &case.test {
+                        if let Some(mut call) = self.extract_call_from_expr(test) {
+                            call.call_file = file_path.clone();
+                            calls.push(call);
+                        }
+                    }
+                    for stmt in &case.cons {
+                        self.extract_calls_from_stmt_recursive(stmt, calls, file_path);
+                    }
                 }
             }
-            Expr::Await(await_expr) => {
-                self.extract_fetch_from_expr(&await_expr.arg, fetch_calls);
-            }
-            Expr::Assign(assign) => {
-                self.extract_fetch_from_expr(&assign.right, fetch_calls);
-            }
-            Expr::Arrow(arrow) => {
-                let nested_calls = self.extract_fetch_calls_from_arrow(arrow);
-                fetch_calls.extend(nested_calls);
-            }
-            Expr::Fn(fn_expr) => {
-                let nested_calls = self.extract_fetch_calls_from_function_expr(fn_expr);
-                fetch_calls.extend(nested_calls);
-            }
-            // Add handling for template literals and other expression types
+            // Add other statement types as needed
             _ => {}
         }
     }
@@ -512,30 +678,30 @@ pub trait CoreExtractor {
             return None;
         }
 
-        match &*args[0].expr {
-            // Regular string literal
+        let mut route = match &*args[0].expr {
             Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
-
-            // Template literal - use our improved template processor
             Expr::Tpl(tpl) => self.process_template(tpl),
-
-            // Variable reference - try to resolve it
             Expr::Ident(ident) => {
                 if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
                     match resolved {
                         Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
                         Expr::Tpl(tpl) => self.process_template(tpl),
-                        // Add other cases as needed
                         _ => None,
                     }
                 } else {
                     None
                 }
             }
-
-            // Add other patterns as needed
             _ => None,
+        }?;
+
+        // Strip query parameters - only keep the path portion
+        // This can be handled with type checking and doesn't ultimately affect the route path
+        if let Some(query_start) = route.find('?') {
+            route = route[..query_start].to_string();
         }
+
+        Some(route)
     }
 
     fn process_template(&self, tpl: &Tpl) -> Option<String> {
@@ -768,19 +934,20 @@ pub trait RouteExtractor: CoreExtractor {
         &mut self,
         call: &CallExpr,
         method: &str,
-    ) -> Option<(String, Json, Option<Json>)> {
-        // Implementation using the existing methods from CoreExtractor
+    ) -> Option<(String, Json, Option<Json>, String)> {
         // Get the route from the first argument
-        // Get the first argument (route path)
         let first_arg = call.args.get(0)?;
         let route = self.extract_string_from_expr(&first_arg.expr)?;
 
         let mut response_json = Json::Null;
         let mut request_json = None;
+        let mut handler_name = String::from("anonymous_handler");
 
         // Check the second argument (handler)
         if let Some(second_arg) = call.args.get(1) {
-            if let Some(handler_name) = self.get_route_handler_name(&second_arg.expr) {
+            if let Some(name) = self.get_route_handler_name(&second_arg.expr) {
+                handler_name = name.clone();
+
                 // Check if this handler is an imported function
                 if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
                     // Track this imported handler usage
@@ -797,13 +964,20 @@ pub trait RouteExtractor: CoreExtractor {
                     }
 
                     // We've handled this case, so we can return early
-                    return Some((route, response_json, request_json));
+                    return Some((route, response_json, request_json, handler_name));
                 }
             }
 
             match &*second_arg.expr {
                 // Arrow function handler
                 Expr::Arrow(arrow_expr) => {
+                    handler_name = format!(
+                        "{}_{}_{}",
+                        route.replace('/', "_"),
+                        method.to_lowercase(),
+                        "arrow"
+                    );
+
                     match &*arrow_expr.body {
                         BlockStmtOrExpr::BlockStmt(block) => {
                             // Extract request body fields using existing method
@@ -827,6 +1001,17 @@ pub trait RouteExtractor: CoreExtractor {
 
                 // Regular function handler
                 Expr::Fn(fn_expr) => {
+                    handler_name = if let Some(ident) = &fn_expr.ident {
+                        ident.sym.to_string()
+                    } else {
+                        format!(
+                            "{}_{}_{}",
+                            route.replace('/', "_"),
+                            method.to_lowercase(),
+                            "fn"
+                        )
+                    };
+
                     if let Some(body) = &fn_expr.function.body {
                         // Extract request body fields using existing method
                         request_json = self.extract_req_body_fields(body);
@@ -869,6 +1054,6 @@ pub trait RouteExtractor: CoreExtractor {
             }
         }
 
-        Some((route, response_json, request_json))
+        Some((route, response_json, request_json, handler_name))
     }
 }
