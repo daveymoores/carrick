@@ -1168,7 +1168,7 @@ impl Analyzer {
                     "endpoint": mismatch.get("endpoint").unwrap_or(&serde_json::Value::Null),
                     "producerType": mismatch.get("producerType").unwrap_or(&serde_json::Value::Null),
                     "consumerType": mismatch.get("consumerType").unwrap_or(&serde_json::Value::Null),
-                    "errorDetails": mismatch.get("error").unwrap_or(&serde_json::Value::Null)
+                    "error": mismatch.get("error").unwrap_or(&serde_json::Value::Null)
                 })
             })
             .collect::<Vec<_>>();
@@ -1243,36 +1243,19 @@ impl Analyzer {
                                 mismatch.get("endpoint").and_then(|e| e.as_str()),
                                 mismatch.get("producerType").and_then(|t| t.as_str()),
                                 mismatch.get("consumerType").and_then(|t| t.as_str()),
-                                mismatch.get("errorDetails").and_then(|e| e.as_str()),
+                                mismatch.get("error").and_then(|e| e.as_str()),
                             ) {
-                                // Clean up long import paths for better readability
-                                let clean_producer = producer
-                                    .replace("import(\"/Users/davidjonathanmoores/Repositories/carrick/carrick/ts_check/output/", "")
-                                    .replace("\").Comment", ".Comment")
-                                    .replace("\").User", ".User")
-                                    .replace("\").Order", ".Order")
-                                    .replace("Array<", "")
-                                    .replace(">", "");
-                                let clean_consumer = consumer
-                                    .replace("import(\"/Users/davidjonathanmoores/Repositories/carrick/carrick/ts_check/output/", "")
-                                    .replace("\").Comment", ".Comment")
-                                    .replace("\").User", ".User")
-                                    .replace("\").Order", ".Order")
-                                    .replace("Array<", "")
-                                    .replace(">", "");
-                                let clean_error = error
-                                    .replace("Type '", "")
-                                    .replace("' is missing the following properties from type '", " missing properties from ")
-                                    .replace("': ", ": ")
-                                    .replace("' is not assignable to type '", " not assignable to ")
-                                    .replace("'.", "");
+                                // Clean up import paths for better readability
+                                let clean_producer = self.clean_type_string(producer);
+                                let clean_consumer = self.clean_type_string(consumer);
+                                let clean_error = self.clean_error_message(error);
                                 
                                 Some(format!(
                                     "Type mismatch on {}: Producer ({}) incompatible with Consumer ({}) - {}",
                                     endpoint,
-                                    clean_producer.chars().take(50).collect::<String>(),
-                                    clean_consumer.chars().take(50).collect::<String>(),
-                                    clean_error.chars().take(80).collect::<String>()
+                                    clean_producer,
+                                    clean_consumer,
+                                    clean_error
                                 ))
                             } else {
                                 None
@@ -1285,6 +1268,38 @@ impl Analyzer {
             }
             Err(_) => Vec::new(),
         }
+    }
+
+    fn clean_type_string(&self, type_str: &str) -> String {
+        use regex::Regex;
+        
+        // Remove absolute paths from import statements, keeping only the relative part
+        let import_regex = Regex::new(r#"import\("([^"]+)"\)\.(\w+)"#).unwrap();
+        let mut cleaned = import_regex.replace_all(type_str, |caps: &regex::Captures| {
+            let path = &caps[1];
+            let type_name = &caps[2];
+            // Extract just the filename without path for readability
+            if let Some(filename) = path.split('/').last() {
+                format!("{}.{}", filename, type_name)
+            } else {
+                format!("{}.{}", path, type_name)
+            }
+        }).to_string();
+        
+        // Simplify Array<T> to T[]
+        let array_regex = Regex::new(r"Array<([^>]+)>").unwrap();
+        cleaned = array_regex.replace_all(&cleaned, "$1[]").to_string();
+        
+        cleaned
+    }
+
+    fn clean_error_message(&self, error: &str) -> String {
+        error
+            .replace("Type '", "")
+            .replace("' is missing the following properties from type '", " missing properties from ")
+            .replace("': ", ": ")
+            .replace("' is not assignable to type '", " not assignable to ")
+            .replace("'.", "")
     }
 
     /// Extract repository prefix from endpoint owner information
