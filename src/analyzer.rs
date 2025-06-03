@@ -27,7 +27,9 @@ pub struct ApiIssues {
 
 impl ApiIssues {
     pub fn is_empty(&self) -> bool {
-        self.call_issues.is_empty() && self.endpoint_issues.is_empty() && self.type_mismatches.is_empty()
+        self.call_issues.is_empty()
+            && self.endpoint_issues.is_empty()
+            && self.type_mismatches.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -35,7 +37,7 @@ impl ApiIssues {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApiEndpointDetails {
     // owner is Option as we store both call ands endpoints in this data structure.
     // It might make sense to split this out into its own type
@@ -78,13 +80,13 @@ pub struct ApiAnalysisResult {
 
 pub struct Analyzer {
     // <Route, http_method, handler_name, source>
-    imported_handlers: Vec<(String, String, String, String)>,
-    function_definitions: HashMap<String, FunctionDefinition>,
-    endpoints: Vec<ApiEndpointDetails>,
-    calls: Vec<ApiEndpointDetails>,
+    pub imported_handlers: Vec<(String, String, String, String)>,
+    pub function_definitions: HashMap<String, FunctionDefinition>,
+    pub endpoints: Vec<ApiEndpointDetails>,
+    pub calls: Vec<ApiEndpointDetails>,
     fetch_calls: Vec<Call>, // Store processed fetch calls with unique IDs
-    mounts: Vec<Mount>,
-    apps: HashMap<String, AppContext>,
+    pub mounts: Vec<Mount>,
+    pub apps: HashMap<String, AppContext>,
     config: Config,
     endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
     source_map: Lrc<SourceMap>,
@@ -182,6 +184,10 @@ impl Analyzer {
                 }
                 FunctionNodeType::FunctionExpression(expr) => {
                     self.extract_fetch_calls_from_function_expr_with_file(expr, &def.file_path)
+                }
+                FunctionNodeType::Placeholder => {
+                    // In CI mode, AST is not available, skip fetch call extraction
+                    Vec::new()
                 }
             };
 
@@ -585,6 +591,10 @@ impl Analyzer {
                     FunctionNodeType::FunctionExpression(expr) => {
                         self.extract_fields_from_function_expr(expr)
                     }
+                    FunctionNodeType::Placeholder => {
+                        // In CI mode, AST is not available, skip field extraction
+                        Json::Null
+                    }
                 };
 
                 // Extract request body fields from the handler function
@@ -610,6 +620,10 @@ impl Analyzer {
                             None
                         }
                     }
+                    FunctionNodeType::Placeholder => {
+                        // In CI mode, AST is not available, skip request body extraction
+                        None
+                    }
                 };
 
                 // Store with composite key
@@ -624,7 +638,7 @@ impl Analyzer {
     }
 
     // We know endpoints will exist for each imported handler
-    fn update_endpoints_with_resolved_fields(
+    pub fn update_endpoints_with_resolved_fields(
         &mut self,
         response_fields: HashMap<(String, String), Json>,
         request_fields: HashMap<(String, String), Json>,
@@ -1030,7 +1044,7 @@ impl Analyzer {
         param_regex.replace_all(route, "{param}").to_string()
     }
 
-    fn build_endpoint_router(&mut self) {
+    pub fn build_endpoint_router(&mut self) {
         let mut router = matchit::Router::new();
 
         // Use a HashMap to collect all endpoints by path before inserting into router
@@ -1127,7 +1141,7 @@ impl Analyzer {
 
         // Check for type-check-results.json file created by the integrated type checker
         let results_file = Path::new("ts_check/output/type-check-results.json");
-        
+
         if !results_file.exists() {
             return Err("Type check results file not found. Type checking may have failed during extraction.".to_string());
         }
@@ -1152,8 +1166,6 @@ impl Analyzer {
         // Transform result to match expected format
         self.transform_type_check_result(result)
     }
-
-
 
     fn transform_type_check_result(
         &self,
@@ -1199,9 +1211,9 @@ impl Analyzer {
         }
     }
 
-    fn run_final_type_checking(&self) -> Result<(), String> {
+    pub fn run_final_type_checking(&self) -> Result<(), String> {
         use std::process::Command;
-        
+
         // Check if we have the type checking script
         let script_path = "ts_check/run-type-checking.ts";
         if !std::path::Path::new(script_path).exists() {
@@ -1227,7 +1239,10 @@ impl Analyzer {
         }
 
         if !output.status.success() {
-            return Err(format!("Type checking script failed with exit code: {:?}", output.status.code()));
+            return Err(format!(
+                "Type checking script failed with exit code: {:?}",
+                output.status.code()
+            ));
         }
 
         Ok(())
@@ -1249,7 +1264,7 @@ impl Analyzer {
                                 let clean_producer = self.clean_type_string(producer);
                                 let clean_consumer = self.clean_type_string(consumer);
                                 let clean_error = self.clean_error_message(error);
-                                
+
                                 Some(format!(
                                     "Type mismatch on {}: Producer ({}) incompatible with Consumer ({}) - {}",
                                     endpoint,
@@ -1272,38 +1287,43 @@ impl Analyzer {
 
     fn clean_type_string(&self, type_str: &str) -> String {
         use regex::Regex;
-        
+
         // Remove absolute paths from import statements, keeping only the relative part
         let import_regex = Regex::new(r#"import\("([^"]+)"\)\.(\w+)"#).unwrap();
-        let mut cleaned = import_regex.replace_all(type_str, |caps: &regex::Captures| {
-            let path = &caps[1];
-            let type_name = &caps[2];
-            // Extract just the filename without path for readability
-            if let Some(filename) = path.split('/').last() {
-                format!("{}.{}", filename, type_name)
-            } else {
-                format!("{}.{}", path, type_name)
-            }
-        }).to_string();
-        
+        let mut cleaned = import_regex
+            .replace_all(type_str, |caps: &regex::Captures| {
+                let path = &caps[1];
+                let type_name = &caps[2];
+                // Extract just the filename without path for readability
+                if let Some(filename) = path.split('/').last() {
+                    format!("{}.{}", filename, type_name)
+                } else {
+                    format!("{}.{}", path, type_name)
+                }
+            })
+            .to_string();
+
         // Simplify Array<T> to T[]
         let array_regex = Regex::new(r"Array<([^>]+)>").unwrap();
         cleaned = array_regex.replace_all(&cleaned, "$1[]").to_string();
-        
+
         cleaned
     }
 
     fn clean_error_message(&self, error: &str) -> String {
         error
             .replace("Type '", "")
-            .replace("' is missing the following properties from type '", " missing properties from ")
+            .replace(
+                "' is missing the following properties from type '",
+                " missing properties from ",
+            )
             .replace("': ", ": ")
             .replace("' is not assignable to type '", " not assignable to ")
             .replace("'.", "")
     }
 
     /// Extract repository prefix from endpoint owner information
-    fn extract_repo_prefix_from_owner(&self, owner: &Option<OwnerType>) -> String {
+    pub fn extract_repo_prefix_from_owner(&self, owner: &Option<OwnerType>) -> String {
         if let Some(owner) = owner {
             match owner {
                 OwnerType::App(name) | OwnerType::Router(name) => {
@@ -1317,7 +1337,7 @@ impl Analyzer {
     }
 
     /// Extract repository prefix from file path by matching against repository paths
-    fn extract_repo_prefix_from_file_path(
+    pub fn extract_repo_prefix_from_file_path(
         &self,
         file_path: &PathBuf,
         repo_paths: &[String],
@@ -1386,7 +1406,7 @@ impl Analyzer {
     }
 
     /// Process both request and response types for an ApiEndpointDetails
-    fn process_api_detail_types(
+    pub fn process_api_detail_types(
         &self,
         api_detail: &ApiEndpointDetails,
         repo_prefix: String,
@@ -1454,17 +1474,17 @@ pub fn analyze_api_consistency(
     // Clean output directory before starting type extraction
     let output_dir = std::path::Path::new("ts_check/output");
     if output_dir.exists() {
-        println!("🗑️  Cleaning output directory: ts_check/output");
+        println!("Cleaning output directory: ts_check/output");
         if let Err(e) = std::fs::remove_dir_all(output_dir) {
             println!("Warning: Failed to clean output directory: {}", e);
         }
     }
-    
+
     // Create clean output directory
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         println!("Warning: Failed to create output directory: {}", e);
     } else {
-        println!("📁 Created clean output directory: ts_check/output");
+        println!("Created clean output directory: ts_check/output");
     }
 
     // Process types for each repository using the original repo paths
@@ -1485,7 +1505,7 @@ pub fn analyze_api_consistency(
     }
 
     // Run type checking once after all repositories have been processed
-    println!("\n🔍 Running type compatibility checking...");
+    println!("\nRunning type compatibility checking...");
     if let Err(e) = analyzer.run_final_type_checking() {
         println!("⚠️  Warning: Type checking failed: {}", e);
     }

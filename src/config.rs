@@ -2,7 +2,7 @@ use std::{collections::HashSet, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Config {
     #[serde(default)]
     #[serde(rename = "internalEnvVars")]

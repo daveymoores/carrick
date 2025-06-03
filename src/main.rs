@@ -1,5 +1,7 @@
 mod analyzer;
 mod app_context;
+mod ci_mode;
+mod cloud_storage;
 mod config;
 mod extractor;
 mod file_finder;
@@ -9,6 +11,8 @@ mod router_context;
 mod utils;
 mod visitor;
 use analyzer::analyze_api_consistency;
+use ci_mode::run_ci_mode;
+use cloud_storage::MongoStorage;
 use config::Config;
 
 use file_finder::find_files;
@@ -69,7 +73,34 @@ fn resolve_import_path(base_file: &Path, import_path: &str) -> Option<PathBuf> {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    let is_ci_mode = std::env::var("CI").is_ok();
+    
+    if is_ci_mode {
+        if let Err(e) = run_ci_mode_wrapper().await {
+            eprintln!("CI mode failed: {}", e);
+            std::process::exit(1);
+        }
+    } else {
+        run_local_mode();
+    }
+}
+
+async fn run_ci_mode_wrapper() -> Result<(), Box<dyn std::error::Error>> {
+    // Extract repository path from args if they exist. If no args are given then default to the current directory.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let repo_path = if args.is_empty() {
+        "."
+    } else {
+        &args[0]
+    };
+    
+    let storage = MongoStorage::new().await?;
+    run_ci_mode(storage, repo_path).await
+}
+
+fn run_local_mode() {
     // Create shared source map and error handler
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -210,6 +241,10 @@ fn main() {
     let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs);
 
     // Print results
+    print_local_results(result);
+}
+
+fn print_local_results(result: crate::analyzer::ApiAnalysisResult) {
     println!("\nAPI Analysis Results:");
     println!("=====================");
     println!(
@@ -219,9 +254,9 @@ fn main() {
     println!("Found {} API calls across all files", result.calls.len());
 
     if result.issues.is_empty() {
-        println!("\n✅  No API inconsistencies detected!");
+        println!("\nNo API inconsistencies detected!");
     } else {
-        println!("\n⚠️  Found {} API issues:", result.issues.len());
+        println!("\nFound {} API issues:", result.issues.len());
         let call_issues = result.issues.call_issues;
         let endpoint_issues = result.issues.endpoint_issues;
         let env_var_calls = result.issues.env_var_calls;
@@ -259,7 +294,7 @@ fn main() {
             for issue in env_var_calls.iter() {
                 issue_number = issue_number + 1;
                 print!(
-                    "\n{}. {}\n     • Consider adding to known external APIs configuration",
+                    "\n{}. {}\n     - Consider adding to known external APIs configuration",
                     &issue_number, issue
                 );
             }

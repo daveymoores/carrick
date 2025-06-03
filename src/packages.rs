@@ -22,14 +22,14 @@ pub struct PackageJson {
     pub peer_dependencies: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageInfo {
     pub name: String,
     pub version: String,
     pub source_path: PathBuf,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Packages {
     package_jsons: Vec<PackageJson>,
     source_paths: Vec<PathBuf>,
