@@ -53,6 +53,7 @@ impl Error for StorageError {}
 pub trait CloudStorage {
     async fn upload_repo_data(&self, token: &str, data: &CloudRepoData) -> Result<(), StorageError>;
     async fn download_all_repo_data(&self, token: &str) -> Result<Vec<CloudRepoData>, StorageError>;
+    async fn upload_type_file(&self, token: &str, repo_name: &str, file_name: &str, content: &str) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
 }
 

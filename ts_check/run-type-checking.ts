@@ -6,29 +6,34 @@ import * as path from "path";
 
 async function main() {
   try {
-    console.log("📦 Installing dependencies for type checking...");
+    console.log("Installing dependencies for type checking...");
 
     // Install dependencies in the output directory
     const outputDir = "ts_check/output";
     const { execSync } = await import("child_process");
-    
+
     try {
-      execSync("npm install", { 
-        cwd: outputDir, 
+      execSync("npm install", {
+        cwd: outputDir,
         stdio: "inherit",
-        timeout: 60000 // 60 second timeout
+        timeout: 60000, // 60 second timeout
       });
-      console.log("✅ Dependencies installed successfully");
+      console.log("Dependencies installed successfully");
     } catch (installError) {
-      console.warn("⚠️  Warning: Failed to install dependencies:", (installError as Error).message);
+      console.warn(
+        "⚠️  Warning: Failed to install dependencies:",
+        (installError as Error).message,
+      );
       console.warn("Type checking may not work correctly without dependencies");
     }
 
     console.log("\n🔍 Starting type compatibility checking...");
 
+    console.log(`outputDir -> ${outputDir}`);
+
     // Create ts-morph project
     const project = new Project({
-      tsConfigFilePath: path.join(outputDir, "tsconfig.json")
+      tsConfigFilePath: process.argv[2], // The tsconfig path is passed as the first argument
     });
 
     // Create type checker instance
@@ -39,28 +44,34 @@ async function main() {
 
     // Create a simplified result format for the Rust analyzer
     const simplifiedResult = {
-      mismatches: typeCheckResult.mismatches.map(mismatch => ({
+      mismatches: typeCheckResult.mismatches.map((mismatch) => ({
         endpoint: mismatch.endpoint,
         producerType: mismatch.producerType,
         consumerType: mismatch.consumerType,
         error: mismatch.errorDetails,
-        isCompatible: mismatch.isAssignable
+        isCompatible: mismatch.isAssignable,
       })),
       compatibleCount: typeCheckResult.compatiblePairs,
-      totalChecked: typeCheckResult.compatiblePairs + typeCheckResult.incompatiblePairs
+      totalChecked:
+        typeCheckResult.compatiblePairs + typeCheckResult.incompatiblePairs,
     };
 
     // Write type check results to a file that the Rust analyzer can read
     const typeCheckOutputPath = path.join(outputDir, "type-check-results.json");
     const fs = await import("fs");
-    fs.writeFileSync(typeCheckOutputPath, JSON.stringify(simplifiedResult, null, 2));
+    fs.writeFileSync(
+      typeCheckOutputPath,
+      JSON.stringify(simplifiedResult, null, 2),
+    );
 
     // Log summary
     if (typeCheckResult.mismatches.length === 0) {
       console.log("\n✅ All types are compatible!");
     } else {
-      console.log(`\n❌ Found ${typeCheckResult.mismatches.length} type compatibility issues:`);
-      typeCheckResult.mismatches.forEach(mismatch => {
+      console.log(
+        `\n❌ Found ${typeCheckResult.mismatches.length} type compatibility issues:`,
+      );
+      typeCheckResult.mismatches.forEach((mismatch) => {
         console.log(`  - ${mismatch.endpoint}: ${mismatch.errorDetails}`);
       });
     }
@@ -68,20 +79,28 @@ async function main() {
     console.log(`\nType checking summary:`);
     console.log(`  Compatible pairs: ${typeCheckResult.compatiblePairs}`);
     console.log(`  Incompatible pairs: ${typeCheckResult.incompatiblePairs}`);
-    console.log(`  Orphaned producers: ${typeCheckResult.orphanedProducers.length}`);
-    console.log(`  Orphaned consumers: ${typeCheckResult.orphanedConsumers.length}`);
+    console.log(
+      `  Orphaned producers: ${typeCheckResult.orphanedProducers.length}`,
+    );
+    console.log(
+      `  Orphaned consumers: ${typeCheckResult.orphanedConsumers.length}`,
+    );
 
     if (typeCheckResult.orphanedProducers.length > 0) {
-      console.log(`  Orphaned producers: ${typeCheckResult.orphanedProducers.join(", ")}`);
+      console.log(
+        `  Orphaned producers: ${typeCheckResult.orphanedProducers.join(", ")}`,
+      );
     }
     if (typeCheckResult.orphanedConsumers.length > 0) {
-      console.log(`  Orphaned consumers: ${typeCheckResult.orphanedConsumers.join(", ")}`);
+      console.log(
+        `  Orphaned consumers: ${typeCheckResult.orphanedConsumers.join(", ")}`,
+      );
     }
 
     process.exit(0);
   } catch (error) {
     console.error("Type checking failed:", error);
-    
+
     // Write error result
     const typeCheckOutputPath = "ts_check/output/type-check-results.json";
     const fs = await import("fs");
@@ -89,10 +108,10 @@ async function main() {
       mismatches: [],
       compatibleCount: 0,
       totalChecked: 0,
-      error: (error as Error).message
+      error: (error as Error).message,
     };
     fs.writeFileSync(typeCheckOutputPath, JSON.stringify(errorResult, null, 2));
-    
+
     process.exit(1);
   }
 }

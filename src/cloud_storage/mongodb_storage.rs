@@ -40,10 +40,28 @@ impl CloudStorage for MongoStorage {
         
         self.collection
             .replace_one(filter, doc_data)
-            .upsert(true)
             .await
             .map_err(|e| StorageError::DatabaseError(format!("Failed to upload data: {}", e)))?;
             
+        Ok(())
+    }
+
+    async fn upload_type_file(&self, token: &str, repo_name: &str, file_name: &str, content: &str) -> Result<(), StorageError> {
+        let filter = doc! {
+            "token": token,
+            "repo_name": repo_name,
+            "type_file_name": file_name
+        };
+        let doc_data = doc! {
+            "token": token,
+            "repo_name": repo_name,
+            "type_file_name": file_name,
+            "type_file_content": content
+        };
+        self.collection
+            .replace_one(filter, doc_data)
+            .await
+            .map_err(|e| StorageError::DatabaseError(format!("Failed to upload type file: {}", e)))?;
         Ok(())
     }
     
@@ -62,9 +80,12 @@ impl CloudStorage for MongoStorage {
         
         let mut results = Vec::new();
         for doc in docs {
-            let repo_data: CloudRepoData = bson::from_document(doc)
-                .map_err(|e| StorageError::SerializationError(format!("Failed to deserialize data: {}", e)))?;
-            results.push(repo_data);
+            // Only deserialize documents that have CloudRepoData fields (not type files)
+            if doc.contains_key("endpoints") && doc.contains_key("calls") {
+                let repo_data: CloudRepoData = bson::from_document(doc)
+                    .map_err(|e| StorageError::SerializationError(format!("Failed to deserialize data: {}", e)))?;
+                results.push(repo_data);
+            }
         }
         
         Ok(results)

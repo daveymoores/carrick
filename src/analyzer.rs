@@ -1212,18 +1212,42 @@ impl Analyzer {
     }
 
     pub fn run_final_type_checking(&self) -> Result<(), String> {
+        use std::fs;
+        use std::path::Path;
         use std::process::Command;
 
         // Check if we have the type checking script
         let script_path = "ts_check/run-type-checking.ts";
-        if !std::path::Path::new(script_path).exists() {
+        if !Path::new(script_path).exists() {
             return Err("Type checking script not found".to_string());
         }
 
-        // Run the type checking script
+        // Create minimal tsconfig.json in output directory
+        let output_dir = Path::new("ts_check/output");
+        fs::create_dir_all(output_dir)
+            .map_err(|e| format!("Failed to create output directory: {}", e))?;
+
+        let tsconfig_path = output_dir.join("tsconfig.json");
+        let minimal_tsconfig = r#"{
+  "compilerOptions": {
+    "target": "es2016",
+    "module": "commonjs",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["*.ts"]
+}"#;
+
+        fs::write(&tsconfig_path, minimal_tsconfig)
+            .map_err(|e| format!("Failed to create tsconfig.json: {}", e))?;
+
+        // Run the type checking script with the minimal tsconfig
         let output = Command::new("npx")
             .arg("ts-node")
             .arg(script_path)
+            .arg(tsconfig_path)
             .output()
             .map_err(|e| format!("Failed to run type checking: {}", e))?;
 
@@ -1488,6 +1512,7 @@ pub fn analyze_api_consistency(
     }
 
     // Process types for each repository using the original repo paths
+
     for repo_path in repo_paths {
         let repo_name = repo_path
             .split("/")
