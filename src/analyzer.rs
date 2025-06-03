@@ -1103,13 +1103,64 @@ impl Analyzer {
         // Determine tsconfig path based on repo
         use std::path::Path;
         let tsconfig_path = Path::new(repo_path).join("tsconfig.json");
+        
+        // Create a default tsconfig.json if it doesn't exist
+        let ts_config = if !tsconfig_path.exists() {
+            println!("No tsconfig.json found in repo, creating default one in ts_check/output");
+            
+            // Ensure the output directory exists
+            let output_dir = Path::new("ts_check/output");
+            if !output_dir.exists() {
+                std::fs::create_dir_all(output_dir).expect("Failed to create output directory");
+            }
+            
+            let default_tsconfig_path = Path::new("ts_check/output/tsconfig.json");
+            
+            // Create a basic tsconfig.json content
+            let tsconfig_content = serde_json::json!({
+                "compilerOptions": {
+                    "target": "ES2020",
+                    "module": "commonjs",
+                    "strict": true,
+                    "esModuleInterop": true,
+                    "skipLibCheck": true,
+                    "forceConsistentCasingInFileNames": true,
+                    "resolveJsonModule": true,
+                    "declaration": true,
+                    "outDir": "./dist"
+                },
+                "include": [
+                    "*.ts",
+                    "**/*.ts"
+                ],
+                "exclude": [
+                    "node_modules",
+                    "dist"
+                ]
+            });
+            
+            std::fs::write(
+                default_tsconfig_path,
+                serde_json::to_string_pretty(&tsconfig_content).unwrap()
+            ).expect("Failed to write default tsconfig.json");
+            
+            default_tsconfig_path.to_path_buf()
+        } else {
+            tsconfig_path
+        };
 
         println!("Extracting {} types from {}", type_infos.len(), repo_path);
 
         // Run the extract-type-definitions script with all types at once
-        let script_path = std::fs::canonicalize("ts_check/extract-type-definitions.ts")
-            .expect("Script not found");
-        let ts_config = std::fs::canonicalize(tsconfig_path).expect("tsconfig.json not found");
+        let script_path = match std::fs::canonicalize("ts_check/extract-type-definitions.ts") {
+            Ok(path) => path,
+            Err(e) => panic!("Script not found: {}", e),
+        };
+        
+        let ts_config = match std::fs::canonicalize(&ts_config) {
+            Ok(path) => path,
+            Err(e) => panic!("tsconfig.json not found: {}", e),
+        };
 
         let output = Command::new("npx")
             .arg("ts-node")
