@@ -10,7 +10,9 @@ use crate::{
 };
 
 mod mongodb_storage;
+mod mock_storage;
 pub use mongodb_storage::MongoStorage;
+pub use mock_storage::MockStorage;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {

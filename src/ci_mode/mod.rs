@@ -46,17 +46,25 @@ pub async fn run_ci_mode<T: CloudStorage>(
 
     // 2b. Upload generated TypeScript file to MongoDB
     if let Some(ts_file_path) = find_generated_typescript_file(repo_path) {
-        if let Ok(ts_content) = std::fs::read_to_string(&ts_file_path) {
-            storage
-                .upload_type_file(
-                    &carrick_token,
-                    &cloud_data_serialized.repo_name,
-                    &ts_file_path,
-                    &ts_content,
-                )
-                .await
-                .map_err(|e| format!("Failed to upload TypeScript file: {}", e))?;
-            println!("Uploaded generated TypeScript file to MongoDB");
+        match std::fs::read_to_string(&ts_file_path) {
+            Ok(ts_content) => {
+                storage
+                    .upload_type_file(
+                        &carrick_token,
+                        &cloud_data_serialized.repo_name,
+                        &ts_file_path,
+                        &ts_content,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to upload TypeScript file: {}", e))?;
+                println!("Uploaded generated TypeScript file to MongoDB");
+            }
+            Err(e) => {
+                println!(
+                    "DEBUG: WARNING - Failed to read TypeScript file {}: {}",
+                    ts_file_path, e
+                );
+            }
         }
     }
 
@@ -82,6 +90,23 @@ pub async fn run_ci_mode<T: CloudStorage>(
 
 /// Serialize CloudRepoData without AST nodes in ApiEndpointDetails
 fn serialize_cloud_repo_data_without_ast(data: &CloudRepoData) -> CloudRepoData {
+    CloudRepoData {
+        repo_name: data.repo_name.clone(),
+        endpoints: strip_ast_from_endpoints(data.endpoints.clone()),
+        calls: strip_ast_from_endpoints(data.calls.clone()),
+        mounts: data.mounts.clone(),
+        apps: data.apps.clone(),
+        imported_handlers: data.imported_handlers.clone(),
+        function_definitions: data.function_definitions.clone(),
+        config_json: data.config_json.clone(),
+        package_json: data.package_json.clone(),
+        extracted_types: data.extracted_types.clone(),
+        last_updated: data.last_updated,
+        commit_hash: data.commit_hash.clone(),
+    }
+}
+
+fn strip_ast_from_endpoints(endpoints: Vec<ApiEndpointDetails>) -> Vec<ApiEndpointDetails> {
     fn strip_ast_from_endpoint(endpoint: &ApiEndpointDetails) -> ApiEndpointDetails {
         ApiEndpointDetails {
             owner: endpoint.owner.clone(),
@@ -90,27 +115,15 @@ fn serialize_cloud_repo_data_without_ast(data: &CloudRepoData) -> CloudRepoData 
             params: endpoint.params.clone(),
             request_body: endpoint.request_body.clone(),
             response_body: endpoint.response_body.clone(),
-            handler_name: endpoint.handler_name.clone(),
-            request_type: None,  // Remove AST nodes
-            response_type: None, // Remove AST nodes
             file_path: endpoint.file_path.clone(),
+            // Strip AST nodes - set to None for serialization
+            request_type: None,
+            response_type: None,
+            handler_name: endpoint.handler_name.clone(),
         }
     }
 
-    CloudRepoData {
-        repo_name: data.repo_name.clone(),
-        endpoints: data.endpoints.iter().map(strip_ast_from_endpoint).collect(),
-        calls: data.calls.iter().map(strip_ast_from_endpoint).collect(),
-        mounts: data.mounts.clone(),
-        apps: data.apps.clone(),
-        imported_handlers: data.imported_handlers.clone(),
-        function_definitions: Default::default(), // Remove function_definitions (contains AST)
-        config_json: data.config_json.clone(),
-        package_json: data.package_json.clone(),
-        extracted_types: data.extracted_types.clone(),
-        last_updated: data.last_updated,
-        commit_hash: data.commit_hash.clone(),
-    }
+    endpoints.iter().map(strip_ast_from_endpoint).collect()
 }
 
 /// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
@@ -121,7 +134,9 @@ fn find_generated_typescript_file(_repo_path: &str) -> Option<String> {
     let output_dir = Path::new("ts_check/output");
     if output_dir.exists() {
         if let Ok(entries) = fs::read_dir(output_dir) {
-            for entry in entries.flatten() {
+            let all_entries: Vec<_> = entries.flatten().collect();
+
+            for entry in all_entries {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
                     if ext == "ts" {
@@ -249,14 +264,20 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
         analyzer.add_visitor_data(visitor);
     }
 
-    // Extract type information for current repo
+    // Resolve endpoint paths and types (this populates request_type and response_type fields)
+    let endpoints =
+        analyzer.resolve_all_endpoint_paths(&analyzer.endpoints, &analyzer.mounts, &analyzer.apps);
+    analyzer.endpoints = endpoints;
+    analyzer.resolve_types_for_endpoints(cm.clone());
+
+    // Extract type information for current repo (now that types are resolved)
     let extracted_types = extract_types_for_current_repo(&analyzer, repo_path, &packages_clone)?;
 
-    // Build CloudRepoData
+    // Build CloudRepoData (strip AST information for serialization)
     let cloud_data = CloudRepoData {
         repo_name: repo_name.clone(),
-        endpoints: analyzer.endpoints.clone(),
-        calls: analyzer.calls.clone(),
+        endpoints: strip_ast_from_endpoints(analyzer.endpoints.clone()),
+        calls: strip_ast_from_endpoints(analyzer.calls.clone()),
         mounts: analyzer.mounts.clone(),
         apps: analyzer.apps.clone(),
         imported_handlers: analyzer.imported_handlers.clone(),
@@ -283,6 +304,7 @@ fn extract_types_for_current_repo(
     // Group type information by repository using endpoint owner information
     for endpoint in &analyzer.endpoints {
         let repo_prefix = analyzer.extract_repo_prefix_from_owner(&endpoint.owner);
+
         analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
     }
 
@@ -308,7 +330,7 @@ fn extract_types_for_current_repo(
             repo_path
         );
         analyzer.extract_types_for_repo(repo_path, type_infos.clone(), packages);
-    }
+}
 
     Ok(type_infos)
 }
