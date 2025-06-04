@@ -189,10 +189,16 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
 
     while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
         let path_str = file_path.to_string_lossy().to_string();
-        if processed_file_paths.contains(&path_str) {
+        // Create a unique key that includes the imported router name to allow
+        // the same file to be processed multiple times with different contexts
+        let processing_key = match &imported_router_name {
+            Some(name) => format!("{}#{}", path_str, name),
+            None => path_str.clone(),
+        };
+        if processed_file_paths.contains(&processing_key) {
             continue;
         }
-        processed_file_paths.insert(path_str.clone());
+        processed_file_paths.insert(processing_key);
 
         println!("Parsing: {}", file_path.display());
 
