@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+          cache-dependency-path: |
+            test-repo/package.json
+            test-multiple/package.json
+            tests/fixtures/imported-routers/package.json
+
+      - name: Install test dependencies
+        run: |
+          cd test-repo && npm install
+          cd ../test-multiple && npm install
+          cd ../tests/fixtures/imported-routers && npm install
+
+      - name: Run tests
+        run: cargo test --verbose
+        env:
+          FORCE_LOCAL_MODE: "1"
+
+      - name: Run integration tests
+        run: cargo test --test integration_test --verbose
+        env:
+          FORCE_LOCAL_MODE: "1"
+
+  lint:
+    name: Linting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        continue-on-error: true
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Build release
+        run: cargo build --release --verbose
+
+  endpoint-regression-test:
+    name: Endpoint Detection Regression Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install test-repo dependencies
+        run: cd test-repo && npm install
+
+      - name: Install imported-routers test dependencies
+        run: cd tests/fixtures/imported-routers && npm install
+
+      - name: Build carrick
+        run: cargo build --release
+
+      - name: Test basic endpoint detection (test-repo)
+        run: |
+          ./target/release/carrick ./test-repo/ > test_output.txt 2>&1
+          echo "=== Test-repo output ==="
+          cat test_output.txt
+          # Check that we find the expected 4 endpoints
+          if ! grep -q "Found 4 endpoints across all files" test_output.txt; then
+            echo "ERROR: Expected to find 4 endpoints in test-repo"
+            exit 1
+          fi
+          echo "✅ Basic endpoint detection working correctly"
+        env:
+          FORCE_LOCAL_MODE: "1"
+
+      - name: Test imported router resolution
+        run: |
+          ./target/release/carrick ./tests/fixtures/imported-routers/ > imported_test_output.txt 2>&1
+          echo "=== Imported routers test output ==="
+          cat imported_test_output.txt
+          # Check that we don't have the regression bug
+          if grep -q "Unique endpoint paths: 0" imported_test_output.txt; then
+            echo "ERROR: Found 'Unique endpoint paths: 0' - imported router resolution bug has regressed!"
+            exit 1
+          fi
+          # Check that we find a reasonable number of endpoints (at least 10)
+          if ! grep -E "Found [0-9]+ endpoints across all files" imported_test_output.txt; then
+            echo "ERROR: No endpoints found message detected"
+            exit 1
+          fi
+          ENDPOINT_COUNT=$(grep -E "Found [0-9]+ endpoints across all files" imported_test_output.txt | sed -E 's/.*Found ([0-9]+) endpoints.*/\1/')
+          if [ "$ENDPOINT_COUNT" -lt 10 ]; then
+            echo "ERROR: Expected at least 10 endpoints, but found $ENDPOINT_COUNT"
+            exit 1
+          fi
+          echo "✅ Imported router resolution working correctly ($ENDPOINT_COUNT endpoints found)"
+        env:
+          FORCE_LOCAL_MODE: "1"
+
+      - name: Upload test outputs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-outputs
+          path: |
+            test_output.txt
+            imported_test_output.txt
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit

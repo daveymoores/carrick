@@ -70,8 +70,12 @@ impl serde::Serialize for FunctionNodeType {
     {
         match self {
             FunctionNodeType::ArrowFunction(_) => serializer.serialize_str("ArrowFunction"),
-            FunctionNodeType::FunctionDeclaration(_) => serializer.serialize_str("FunctionDeclaration"),
-            FunctionNodeType::FunctionExpression(_) => serializer.serialize_str("FunctionExpression"),
+            FunctionNodeType::FunctionDeclaration(_) => {
+                serializer.serialize_str("FunctionDeclaration")
+            }
+            FunctionNodeType::FunctionExpression(_) => {
+                serializer.serialize_str("FunctionExpression")
+            }
             FunctionNodeType::Placeholder => serializer.serialize_str("Placeholder"),
         }
     }

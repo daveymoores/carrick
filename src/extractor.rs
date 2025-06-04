@@ -260,8 +260,8 @@ pub trait CoreExtractor {
             response_type: None, // Will be populated when we find the type annotation
             request_type: None,  // Could be extracted from fetch body
             call_file: PathBuf::new(), // Will be set by caller
-            call_id: None, // Will be set by caller with unique identifier
-            call_number: None, // Will be set by caller
+            call_id: None,       // Will be set by caller with unique identifier
+            call_number: None,   // Will be set by caller
             common_type_name: None, // Will be set by caller
         })
     }

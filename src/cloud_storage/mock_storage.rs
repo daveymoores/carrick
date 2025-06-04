@@ -24,9 +24,15 @@ impl CloudStorage for MockStorage {
         token: &str,
         data: &CloudRepoData,
     ) -> Result<(), StorageError> {
-        println!("MOCK: Uploading repo data for token: {}, repo: {}", token, data.repo_name);
+        println!(
+            "MOCK: Uploading repo data for token: {}, repo: {}",
+            token, data.repo_name
+        );
         let mut storage = self.data.lock().unwrap();
-        storage.entry(token.to_string()).or_insert_with(Vec::new).push(data.clone());
+        storage
+            .entry(token.to_string())
+            .or_insert_with(Vec::new)
+            .push(data.clone());
         Ok(())
     }
 
@@ -37,7 +43,10 @@ impl CloudStorage for MockStorage {
         file_name: &str,
         content: &str,
     ) -> Result<(), StorageError> {
-        println!("MOCK: Uploading type file for token: {}, repo: {}, file: {}", token, repo_name, file_name);
+        println!(
+            "MOCK: Uploading type file for token: {}, repo: {}, file: {}",
+            token, repo_name, file_name
+        );
         let key = format!("{}:{}:{}", token, repo_name, file_name);
         let mut type_files = self.type_files.lock().unwrap();
         type_files.insert(key, content.to_string());

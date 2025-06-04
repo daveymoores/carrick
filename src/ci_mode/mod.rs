@@ -336,7 +336,7 @@ fn extract_types_for_current_repo(
             repo_path
         );
         analyzer.extract_types_for_repo(repo_path, type_infos.clone(), packages);
-}
+    }
 
     Ok(type_infos)
 }

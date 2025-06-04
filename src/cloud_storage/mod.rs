@@ -1,18 +1,18 @@
+use crate::{
+    analyzer::ApiEndpointDetails,
+    app_context::AppContext,
+    visitor::{FunctionDefinition, Mount},
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
-use crate::{
-    analyzer::ApiEndpointDetails,
-    app_context::AppContext,
-    visitor::{Mount, FunctionDefinition}
-};
 
-mod mongodb_storage;
 mod mock_storage;
-pub use mongodb_storage::MongoStorage;
+mod mongodb_storage;
 pub use mock_storage::MockStorage;
+pub use mongodb_storage::MongoStorage;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
@@ -53,9 +53,17 @@ impl Error for StorageError {}
 
 #[async_trait]
 pub trait CloudStorage {
-    async fn upload_repo_data(&self, token: &str, data: &CloudRepoData) -> Result<(), StorageError>;
-    async fn download_all_repo_data(&self, token: &str) -> Result<Vec<CloudRepoData>, StorageError>;
-    async fn upload_type_file(&self, token: &str, repo_name: &str, file_name: &str, content: &str) -> Result<(), StorageError>;
+    async fn upload_repo_data(&self, token: &str, data: &CloudRepoData)
+    -> Result<(), StorageError>;
+    async fn download_all_repo_data(&self, token: &str)
+    -> Result<Vec<CloudRepoData>, StorageError>;
+    async fn upload_type_file(
+        &self,
+        token: &str,
+        repo_name: &str,
+        file_name: &str,
+        content: &str,
+    ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
 }
 

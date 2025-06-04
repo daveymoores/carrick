@@ -12,7 +12,7 @@ mod utils;
 mod visitor;
 use analyzer::analyze_api_consistency;
 use ci_mode::run_ci_mode;
-use cloud_storage::{MongoStorage, MockStorage};
+use cloud_storage::{MockStorage, MongoStorage};
 use config::Config;
 
 use file_finder::find_files;
@@ -78,8 +78,9 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let is_ci_env = std::env::var("CI").is_ok();
     let is_ci_arg = args.len() > 1 && args[1] == "ci";
-    
-    if is_ci_env || is_ci_arg {
+    let force_local_mode = std::env::var("FORCE_LOCAL_MODE").is_ok();
+
+    if (is_ci_env || is_ci_arg) && !force_local_mode {
         if let Err(e) = run_ci_mode_wrapper().await {
             eprintln!("CI mode failed: {}", e);
             std::process::exit(1);
@@ -96,18 +97,14 @@ async fn run_ci_mode_wrapper() -> Result<(), Box<dyn std::error::Error>> {
         "."
     } else if args[0] == "ci" {
         // If first arg is "ci", use second arg as repo path or default to "."
-        if args.len() > 1 {
-            &args[1]
-        } else {
-            "."
-        }
+        if args.len() > 1 { &args[1] } else { "." }
     } else {
         &args[0]
     };
-    
+
     // Use MockStorage if MOCK_STORAGE env var is set, otherwise use MongoDB
     let use_mock = std::env::var("MOCK_STORAGE").is_ok();
-    
+
     if use_mock {
         println!("Using MockStorage (MOCK_STORAGE environment variable detected)");
         let storage = MockStorage::new();
