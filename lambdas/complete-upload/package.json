@@ -1,0 +1,17 @@
+{
+  "name": "carrick-complete-upload",
+  "version": "1.0.0",
+  "description": "Lambda function to complete the upload process and save metadata",
+  "main": "index.js",
+  "scripts": {
+    "build": "zip -r ../complete-upload.zip ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.490.0",
+    "@aws-sdk/client-s3": "^3.490.0",
+    "@aws-sdk/lib-dynamodb": "^3.490.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

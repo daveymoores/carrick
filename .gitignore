@@ -18,3 +18,29 @@ target/
 
 **/*/node_modules
 **/ts_check/output
+
+# Lambda build artifacts
+lambdas/*.zip
+
+# Terraform state files
+*.tfstate
+*.tfstate.backup
+
+# Crash logs
+crash.log
+
+# Terraform CLI working directory
+.terraform/
+
+# Variable files (with potential secrets)
+*.tfvars
+*.tfvars.json
+
+# Override files (used for local-only config overrides)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Plan output files
+*.tfplan
