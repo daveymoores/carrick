@@ -24,6 +24,7 @@ resource "aws_iam_policy" "lambda_policy" {
         Action: [
           "s3:PutObject",
           "s3:GetObject",
+          "s3:HeadObject",
           "s3:ListBucket"
         ],
         Effect: "Allow",
