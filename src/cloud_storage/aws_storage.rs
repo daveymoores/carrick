@@ -47,6 +47,8 @@ struct AdjacentRepo {
     s3Url: String,
     filename: String,
     metadata: Option<CloudRepoData>, // Now includes full metadata!
+    #[serde(rename = "lastUpdated")]
+    last_updated: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -126,12 +128,6 @@ impl AwsStorage {
         Req: serde::Serialize,
         Resp: for<'de> serde::Deserialize<'de>,
     {
-        // Debug: Print what we're sending
-        let request_json = serde_json::to_string(request).map_err(|e| {
-            StorageError::SerializationError(format!("Failed to serialize request: {}", e))
-        })?;
-        println!("🚀 Sending request: {}", request_json);
-
         let response = self
             .http_client
             .post(&self.lambda_url)
@@ -157,8 +153,6 @@ impl AwsStorage {
         let response_text = response.text().await.map_err(|e| {
             StorageError::ConnectionError(format!("Failed to read response: {}", e))
         })?;
-
-        println!("📥 Raw Lambda response: {}", response_text);
 
         let lambda_response: Resp = serde_json::from_str(&response_text).map_err(|e| {
             StorageError::SerializationError(format!("Failed to parse lambda response: {}", e))
@@ -188,25 +182,24 @@ impl AwsStorage {
     }
 
     async fn download_from_s3(&self, s3Url: &str) -> Result<String, StorageError> {
-        let response = self
-            .http_client
-            .get(s3Url)
-            .send()
-            .await
-            .map_err(|e| StorageError::ConnectionError(format!("S3 download failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(StorageError::ConnectionError(format!(
-                "S3 download returned error: {}",
-                response.status()
-            )));
+        #[derive(Serialize)]
+        struct DownloadRequest {
+            action: String,
+            s3Url: String,
         }
 
-        let content = response.text().await.map_err(|e| {
-            StorageError::SerializationError(format!("Failed to read S3 content: {}", e))
-        })?;
+        #[derive(Deserialize)]
+        struct DownloadResponse {
+            content: String,
+        }
 
-        Ok(content)
+        let request = DownloadRequest {
+            action: "download-file".to_string(),
+            s3Url: s3Url.to_string(),
+        };
+
+        let response: DownloadResponse = self.call_lambda_generic(&request).await?;
+        Ok(response.content)
     }
 
     fn extract_org_and_repo(&self, repo_name: &str) -> (String, String) {

@@ -37,7 +37,8 @@ resource "aws_iam_policy" "lambda_policy" {
         Action: [
           "dynamodb:GetItem",
           "dynamodb:PutItem",
-          "dynamodb:Query"
+          "dynamodb:Query",
+          "dynamodb:Scan"
         ],
         Effect: "Allow",
         Resource: aws_dynamodb_table.type_metadata.arn

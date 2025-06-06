@@ -2,13 +2,14 @@ const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const {
   DynamoDBDocumentClient,
   GetCommand,
-  QueryCommand,
+  ScanCommand,
   PutCommand, // Add this
 } = require("@aws-sdk/lib-dynamodb");
 const {
   S3Client,
   HeadObjectCommand,
   PutObjectCommand,
+  GetObjectCommand,
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
@@ -55,6 +56,8 @@ exports.handler = async (event) => {
       return await handleCompleteUpload(payload, apiKey);
     case "get-cross-repo-data":
       return await handleGetCrossRepoData(payload, apiKey);
+    case "download-file":
+      return await handleDownloadFile(payload, apiKey);
     default:
       // Default behavior - backward compatibility
       return await handleCheckOrUpload(body);
@@ -109,10 +112,9 @@ async function handleCheckOrUpload(payload) {
   let adjacent = [];
   try {
     const adjacentResults = await docClient.send(
-      new QueryCommand({
+      new ScanCommand({
         TableName: TABLE_NAME,
-        ExpressionAttributeNames: { "#pk": "pk" },
-        KeyConditionExpression: "begins_with(#pk, :orgPrefix)",
+        FilterExpression: "begins_with(pk, :orgPrefix)",
         ExpressionAttributeValues: {
           ":orgPrefix": `repo#${org}/`,
         },
@@ -198,7 +200,7 @@ async function handleGetCrossRepoData(payload, apiKey) {
 
   try {
     const results = await docClient.send(
-      new QueryCommand({
+      new ScanCommand({
         TableName: TABLE_NAME,
         FilterExpression: "begins_with(pk, :orgPrefix) AND apiKey = :apiKey",
         ExpressionAttributeValues: {
@@ -307,6 +309,47 @@ async function handleCompleteUpload(payload, apiKey) {
   } catch (error) {
     console.error("Error storing metadata:", error);
     return response(500, { error: "Failed to store metadata" });
+  }
+}
+
+async function handleDownloadFile(payload, apiKey) {
+  const { s3Url } = payload;
+
+  if (!s3Url) {
+    return response(400, { error: "Missing required field: s3Url" });
+  }
+
+  // Validate s3Url format
+  const expectedS3UrlPattern = new RegExp(
+    `^https://${BUCKET_NAME}\\.s3\\.amazonaws\\.com/(.+)$`,
+  );
+  const match = s3Url.match(expectedS3UrlPattern);
+
+  if (!match) {
+    return response(400, { error: "Invalid s3Url format" });
+  }
+
+  const s3Key = match[1];
+
+  try {
+    // Use S3 GetObject to download the file content
+    const getObjectResponse = await s3Client.send(
+      new GetObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: s3Key,
+      }),
+    );
+
+    // Convert the stream to string
+    const content = await getObjectResponse.Body.transformToString();
+
+    return response(200, { content });
+  } catch (error) {
+    console.error("Error downloading file from S3:", error);
+    if (error.name === "NoSuchKey" || error.$metadata?.httpStatusCode === 404) {
+      return response(404, { error: "File not found" });
+    }
+    return response(500, { error: "Failed to download file" });
   }
 }
 
