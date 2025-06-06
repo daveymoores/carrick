@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub struct MockStorage {
+    // Group data by org, then store repos
     data: Mutex<HashMap<String, Vec<CloudRepoData>>>,
     type_files: Mutex<HashMap<String, String>>,
 }
@@ -19,18 +20,22 @@ impl MockStorage {
 
 #[async_trait]
 impl CloudStorage for MockStorage {
-    async fn upload_repo_data(
-        &self,
-        token: &str,
-        data: &CloudRepoData,
-    ) -> Result<(), StorageError> {
+    async fn download_type_file_content(&self, s3Url: &str) -> Result<String, StorageError> {
+        println!("MOCK: Downloading type file from S3 URL: {}", s3Url);
+        // Return some mock TypeScript content
+        Ok(format!(
+            "// Mock TypeScript content for {}\nexport interface MockType {{ id: string; }}",
+            s3Url
+        ))
+    }
+    async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError> {
         println!(
-            "MOCK: Uploading repo data for token: {}, repo: {}",
-            token, data.repo_name
+            "MOCK: Uploading repo data for org: {}, repo: {}",
+            org, data.repo_name
         );
         let mut storage = self.data.lock().unwrap();
         storage
-            .entry(token.to_string())
+            .entry(org.to_string())
             .or_insert_with(Vec::new)
             .push(data.clone());
         Ok(())
@@ -38,16 +43,15 @@ impl CloudStorage for MockStorage {
 
     async fn upload_type_file(
         &self,
-        token: &str,
         repo_name: &str,
         file_name: &str,
         content: &str,
     ) -> Result<(), StorageError> {
         println!(
-            "MOCK: Uploading type file for token: {}, repo: {}, file: {}",
-            token, repo_name, file_name
+            "MOCK: Uploading type file for repo: {}, file: {}",
+            repo_name, file_name
         );
-        let key = format!("{}:{}:{}", token, repo_name, file_name);
+        let key = format!("{}:{}", repo_name, file_name);
         let mut type_files = self.type_files.lock().unwrap();
         type_files.insert(key, content.to_string());
         Ok(())
@@ -55,13 +59,23 @@ impl CloudStorage for MockStorage {
 
     async fn download_all_repo_data(
         &self,
-        token: &str,
-    ) -> Result<Vec<CloudRepoData>, StorageError> {
-        println!("MOCK: Downloading all repo data for token: {}", token);
+        org: &str,
+    ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
+        println!("MOCK: Downloading all repo data for org: {}", org);
         let storage = self.data.lock().unwrap();
-        let result = storage.get(token).cloned().unwrap_or_default();
-        println!("MOCK: Found {} repos for token {}", result.len(), token);
-        Ok(result)
+        let result = storage.get(org).cloned().unwrap_or_default();
+
+        // Create mock S3 URLs
+        let mut mock_s3_urls = HashMap::new();
+        for repo_data in &result {
+            mock_s3_urls.insert(
+                repo_data.repo_name.clone(),
+                format!("https://mock-s3.com/{}", repo_data.repo_name),
+            );
+        }
+
+        println!("MOCK: Found {} repos for org {}", result.len(), org);
+        Ok((result, mock_s3_urls))
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {

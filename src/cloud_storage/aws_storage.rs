@@ -27,9 +27,10 @@ struct LambdaRequest {
 #[derive(Deserialize)]
 struct LambdaResponse {
     exists: bool,
-    s3_url: String,
-    upload_url: Option<String>,
+    s3Url: String,
+    uploadUrl: Option<String>,
     hash: String,
+    #[serde(default)]
     adjacent: Vec<AdjacentRepo>,
 }
 
@@ -43,7 +44,7 @@ struct StoreMetadataResponse {
 struct AdjacentRepo {
     repo: String,
     hash: String,
-    s3_url: String,
+    s3Url: String,
     filename: String,
     metadata: Option<CloudRepoData>, // Now includes full metadata!
 }
@@ -51,6 +52,12 @@ struct AdjacentRepo {
 #[derive(Deserialize)]
 struct CrossRepoResponse {
     repos: Vec<AdjacentRepo>,
+}
+
+#[derive(Serialize)]
+struct GetCrossRepoRequest {
+    action: String,
+    org: String,
 }
 
 impl AwsStorage {
@@ -87,6 +94,8 @@ impl AwsStorage {
             .await
             .map_err(|e| StorageError::ConnectionError(format!("Lambda request failed: {}", e)))?;
 
+        let status = response.status();
+
         if !response.status().is_success() {
             let error_text = response
                 .text()
@@ -94,12 +103,64 @@ impl AwsStorage {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(StorageError::ConnectionError(format!(
                 "Lambda returned error {}: {}",
-                response.status(),
-                error_text
+                status, error_text
             )));
         }
 
-        let lambda_response: T = response.json().await.map_err(|e| {
+        let response_text = response.text().await.map_err(|e| {
+            StorageError::ConnectionError(format!("Failed to read response: {}", e))
+        })?;
+
+        let lambda_response: T = serde_json::from_str(&response_text).map_err(|e| {
+            StorageError::SerializationError(format!(
+                "Failed to parse lambda response for action '{}': {}. Raw response: {}",
+                request.action, e, response_text
+            ))
+        })?;
+
+        Ok(lambda_response)
+    }
+
+    async fn call_lambda_generic<Req, Resp>(&self, request: &Req) -> Result<Resp, StorageError>
+    where
+        Req: serde::Serialize,
+        Resp: for<'de> serde::Deserialize<'de>,
+    {
+        // Debug: Print what we're sending
+        let request_json = serde_json::to_string(request).map_err(|e| {
+            StorageError::SerializationError(format!("Failed to serialize request: {}", e))
+        })?;
+        println!("🚀 Sending request: {}", request_json);
+
+        let response = self
+            .http_client
+            .post(&self.lambda_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| StorageError::ConnectionError(format!("Lambda request failed: {}", e)))?;
+
+        let status = response.status();
+
+        if !response.status().is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(StorageError::ConnectionError(format!(
+                "Lambda returned error {}: {}",
+                status, error_text
+            )));
+        }
+
+        let response_text = response.text().await.map_err(|e| {
+            StorageError::ConnectionError(format!("Failed to read response: {}", e))
+        })?;
+
+        println!("📥 Raw Lambda response: {}", response_text);
+
+        let lambda_response: Resp = serde_json::from_str(&response_text).map_err(|e| {
             StorageError::SerializationError(format!("Failed to parse lambda response: {}", e))
         })?;
 
@@ -126,10 +187,10 @@ impl AwsStorage {
         Ok(())
     }
 
-    async fn download_from_s3(&self, s3_url: &str) -> Result<String, StorageError> {
+    async fn download_from_s3(&self, s3Url: &str) -> Result<String, StorageError> {
         let response = self
             .http_client
-            .get(s3_url)
+            .get(s3Url)
             .send()
             .await
             .map_err(|e| StorageError::ConnectionError(format!("S3 download failed: {}", e)))?;
@@ -156,16 +217,20 @@ impl AwsStorage {
         }
     }
 
-    async fn store_repo_metadata(&self, data: &CloudRepoData) -> Result<(), StorageError> {
-        let (org, repo) = self.extract_org_and_repo(&data.repo_name);
-
+    async fn store_repo_metadata(
+        &self,
+        data: &CloudRepoData,
+        s3Url: &str,
+        org: &str, // Add org parameter
+    ) -> Result<(), StorageError> {
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
-            repo,
-            org,
+            repo: data.repo_name.clone(), // Use repo name as-is
+            org: org.to_string(),         // Use passed org
             hash: data.commit_hash.clone(),
             filename: "types.ts".to_string(),
             cloudRepoData: Some(data.clone()),
+            s3Url: Some(s3Url.to_string()),
         };
 
         let _response: StoreMetadataResponse = self.call_lambda(&request).await?;
@@ -177,18 +242,17 @@ impl AwsStorage {
 
 #[async_trait]
 impl CloudStorage for AwsStorage {
-    async fn upload_repo_data(
-        &self,
-        _token: &str,
-        data: &CloudRepoData,
-    ) -> Result<(), StorageError> {
-        let (org, repo) = self.extract_org_and_repo(&data.repo_name);
+    async fn download_type_file_content(&self, s3Url: &str) -> Result<String, StorageError> {
+        self.download_from_s3(s3Url).await
+    }
+    async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError> {
+        let repo = &data.repo_name;
 
         // Step 1: Check if we need to upload type file
         let check_request = LambdaRequest {
             action: "check-or-upload".to_string(),
             repo: repo.clone(),
-            org: org.clone(),
+            org: org.to_string(),
             hash: data.commit_hash.clone(),
             filename: "types.ts".to_string(),
             cloudRepoData: None,
@@ -198,7 +262,7 @@ impl CloudStorage for AwsStorage {
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
 
         // Step 2: Upload type file if needed
-        if let Some(upload_url) = lambda_response.upload_url {
+        if let Some(upload_url) = lambda_response.uploadUrl {
             if let Some(ts_file_path) = find_generated_typescript_file(".") {
                 let type_file_content = std::fs::read_to_string(&ts_file_path).map_err(|e| {
                     StorageError::SerializationError(format!(
@@ -213,12 +277,12 @@ impl CloudStorage for AwsStorage {
                 // Step 3: Complete the upload by storing metadata
                 let complete_request = LambdaRequest {
                     action: "complete-upload".to_string(),
-                    repo,
-                    org,
+                    repo: repo.clone(),
+                    org: org.to_string(),
                     hash: data.commit_hash.clone(),
                     filename: "types.ts".to_string(),
                     cloudRepoData: Some(data.clone()),
-                    s3Url: Some(lambda_response.s3_url), // Provide the s3_url
+                    s3Url: Some(lambda_response.s3Url),
                 };
 
                 let _complete_response: serde_json::Value =
@@ -227,8 +291,8 @@ impl CloudStorage for AwsStorage {
             }
         } else {
             println!("Type file already exists, just updating metadata");
-            // Use store-metadata instead of complete-upload for existing files
-            self.store_repo_metadata(data).await?;
+            self.store_repo_metadata(data, &lambda_response.s3Url, org)
+                .await?;
         }
 
         Ok(())
@@ -236,7 +300,6 @@ impl CloudStorage for AwsStorage {
 
     async fn upload_type_file(
         &self,
-        _token: &str,
         repo_name: &str,
         file_name: &str,
         content: &str,
@@ -251,11 +314,12 @@ impl CloudStorage for AwsStorage {
             hash: commit_hash,
             filename: file_name.to_string(),
             cloudRepoData: None,
+            s3Url: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
 
-        if let Some(upload_url) = lambda_response.upload_url {
+        if let Some(upload_url) = lambda_response.uploadUrl {
             self.upload_to_s3(&upload_url, content).await?;
         }
 
@@ -264,41 +328,24 @@ impl CloudStorage for AwsStorage {
 
     async fn download_all_repo_data(
         &self,
-        _token: &str,
-    ) -> Result<Vec<CloudRepoData>, StorageError> {
-        // Get current repo info to determine org
-        let current_repo_name = std::env::current_dir()
-            .map_err(|_| {
-                StorageError::ConnectionError("Could not determine current directory".to_string())
-            })?
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let (org, _) = self.extract_org_and_repo(&current_repo_name);
-
-        // Use the new get-cross-repo-data action
-        let request = LambdaRequest {
+        org: &str,
+    ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
+        let request = GetCrossRepoRequest {
             action: "get-cross-repo-data".to_string(),
-            repo: "".to_string(), // Not needed for this action
-            org,
-            hash: "".to_string(),     // Not needed for this action
-            filename: "".to_string(), // Not needed for this action
-            cloudRepoData: None,
+            org: org.to_string(),
         };
 
-        let response: CrossRepoResponse = self.call_lambda(&request).await?;
+        let response: CrossRepoResponse = self.call_lambda_generic(&request).await?;
 
         let mut all_repo_data = Vec::new();
+        let mut repo_s3_urls = HashMap::new();
 
         for adjacent in response.repos {
             if let Some(metadata) = adjacent.metadata {
-                // We have the full metadata! Just need to download type file if needed
                 println!("Processing repo: {} with full metadata", adjacent.repo);
+                repo_s3_urls.insert(metadata.repo_name.clone(), adjacent.s3Url);
                 all_repo_data.push(metadata);
             } else {
-                // Fallback: create minimal CloudRepoData (shouldn't happen with new implementation)
                 println!("Warning: No metadata found for repo: {}", adjacent.repo);
                 let repo_data = CloudRepoData {
                     repo_name: adjacent.repo.clone(),
@@ -310,15 +357,15 @@ impl CloudStorage for AwsStorage {
                     function_definitions: HashMap::new(),
                     config_json: None,
                     package_json: None,
-                    extracted_types: Vec::new(),
                     last_updated: chrono::Utc::now(),
                     commit_hash: adjacent.hash,
                 };
+                repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3Url);
                 all_repo_data.push(repo_data);
             }
         }
 
-        Ok(all_repo_data)
+        Ok((all_repo_data, repo_s3_urls))
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
@@ -329,9 +376,9 @@ impl CloudStorage for AwsStorage {
             hash: "health-check".to_string(),
             filename: "health.ts".to_string(),
             cloudRepoData: None,
+            s3Url: None,
         };
 
-        // We expect this to fail with 401/403, but not a connection error
         match self.call_lambda::<LambdaResponse>(&request).await {
             Ok(_) => Ok(()),
             Err(StorageError::ConnectionError(msg))

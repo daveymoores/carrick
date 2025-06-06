@@ -7,7 +7,7 @@ use crate::parser::parse_file;
 use crate::resolve_import_path;
 use crate::visitor::DependencyVisitor;
 use chrono::Utc;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use swc_common::{
     SourceMap,
@@ -20,17 +20,17 @@ pub async fn run_ci_mode<T: CloudStorage>(
     storage: T,
     repo_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let carrick_token =
-        env::var("CARRICK_TOKEN").map_err(|_| "CARRICK_TOKEN must be set in CI mode")?;
+    // TODO we have no way of finding unique org names, so I think this will need to be a token
+    let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
 
-    println!("Running Carrick in CI mode with token: {}", &carrick_token);
+    println!("Running Carrick in CI mode with org: {}", &carrick_org);
 
     // Verify MongoDB connectivity early
     storage
         .health_check()
         .await
-        .map_err(|e| format!("Failed to connect to MongoDB: {}", e))?;
-    println!("MongoDB connection verified");
+        .map_err(|e| format!("Failed to connect to AWS services: {}", e))?;
+    println!("AWS connectivity verified");
 
     // 1. Analyze current repo only
     let current_repo_data = analyze_current_repo(repo_path)?;
@@ -39,50 +39,26 @@ pub async fn run_ci_mode<T: CloudStorage>(
     // 2. Upload current repo data to cloud storage (without AST nodes)
     let cloud_data_serialized = serialize_cloud_repo_data_without_ast(&current_repo_data);
     storage
-        .upload_repo_data(&carrick_token, &cloud_data_serialized)
+        .upload_repo_data(&carrick_org, &cloud_data_serialized)
         .await
         .map_err(|e| format!("Failed to upload repo data: {}", e))?;
     println!("Uploaded current repo data to cloud storage");
 
-    // 2b. Upload generated TypeScript file to MongoDB
-    if let Some(ts_file_path) = find_generated_typescript_file(repo_path) {
-        match std::fs::read_to_string(&ts_file_path) {
-            Ok(ts_content) => {
-                storage
-                    .upload_type_file(
-                        &carrick_token,
-                        &cloud_data_serialized.repo_name,
-                        &ts_file_path,
-                        &ts_content,
-                    )
-                    .await
-                    .map_err(|e| format!("Failed to upload TypeScript file: {}", e))?;
-                println!("Uploaded generated TypeScript file to MongoDB");
-            }
-            Err(e) => {
-                println!(
-                    "DEBUG: WARNING - Failed to read TypeScript file {}: {}",
-                    ts_file_path, e
-                );
-            }
-        }
-    }
-
-    // 3. Download data from all repos with same token
-    let all_repo_data = storage
-        .download_all_repo_data(&carrick_token)
+    // 3. Download data from all repos
+    let (all_repo_data, repo_s3_urls) = storage // Updated to destructure tuple
+        .download_all_repo_data(&carrick_org)
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
     println!("Downloaded data from {} repos", all_repo_data.len());
 
     // 4. Reconstruct analyzer with combined data
-    let analyzer = build_cross_repo_analyzer(all_repo_data)?;
+    let analyzer = build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage).await?; // Pass repo_s3_urls and storage
     println!("Reconstructed analyzer with cross-repo data");
 
-    // 5. Run analysis (same logic as local mode)
+    // 5. Run analysis
     let results = analyzer.get_results();
 
-    // 6. Print results (same as local mode)
+    // 6. Print results
     print_results(results);
 
     Ok(())
@@ -100,7 +76,6 @@ fn serialize_cloud_repo_data_without_ast(data: &CloudRepoData) -> CloudRepoData 
         function_definitions: data.function_definitions.clone(),
         config_json: data.config_json.clone(),
         package_json: data.package_json.clone(),
-        extracted_types: data.extracted_types.clone(),
         last_updated: data.last_updated,
         commit_hash: data.commit_hash.clone(),
     }
@@ -127,27 +102,6 @@ fn strip_ast_from_endpoints(endpoints: Vec<ApiEndpointDetails>) -> Vec<ApiEndpoi
 }
 
 /// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
-fn find_generated_typescript_file(_repo_path: &str) -> Option<String> {
-    use std::fs;
-    use std::path::Path;
-
-    let output_dir = Path::new("ts_check/output");
-    if output_dir.exists() {
-        if let Ok(entries) = fs::read_dir(output_dir) {
-            let all_entries: Vec<_> = entries.flatten().collect();
-
-            for entry in all_entries {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ext == "ts" {
-                        return Some(path.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
 
 fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     let cm: Lrc<SourceMap> = Default::default();
@@ -276,8 +230,7 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
     analyzer.endpoints = endpoints;
     analyzer.resolve_types_for_endpoints(cm.clone());
 
-    // Extract type information for current repo (now that types are resolved)
-    let extracted_types = extract_types_for_current_repo(&analyzer, repo_path, &packages_clone)?;
+    extract_types_for_current_repo(&analyzer, repo_path, &packages_clone)?;
 
     // Build CloudRepoData (strip AST information for serialization)
     let cloud_data = CloudRepoData {
@@ -290,7 +243,6 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
         function_definitions: analyzer.function_definitions.clone(),
         config_json: serde_json::to_string(&config_clone).ok(),
         package_json: serde_json::to_string(&packages_clone).ok(),
-        extracted_types,
         last_updated: Utc::now(),
         commit_hash: get_current_commit_hash(),
     };
@@ -302,7 +254,7 @@ fn extract_types_for_current_repo(
     analyzer: &Analyzer,
     repo_path: &str,
     packages: &Packages,
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     let mut repo_type_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let repo_paths = vec![repo_path.to_string()];
@@ -338,11 +290,13 @@ fn extract_types_for_current_repo(
         analyzer.extract_types_for_repo(repo_path, type_infos.clone(), packages);
     }
 
-    Ok(type_infos)
+    Ok(())
 }
 
-fn build_cross_repo_analyzer(
+async fn build_cross_repo_analyzer<T: CloudStorage>(
     all_repo_data: Vec<CloudRepoData>,
+    repo_s3_urls: HashMap<String, String>, // Add this parameter
+    storage: &T,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
     // Combine all configs
     let combined_config = merge_configs(&all_repo_data)?;
@@ -390,8 +344,9 @@ fn build_cross_repo_analyzer(
         .resolve_types_for_endpoints(cm.clone())
         .analyze_functions_for_fetch_calls();
 
-    // Recreate type files from stored data and run type checking
-    recreate_type_files_and_check(&all_repo_data, &combined_packages)?;
+    // Recreate type files from S3 and run type checking
+    recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
+        .await?;
 
     // Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
@@ -427,9 +382,11 @@ fn merge_packages(all_repo_data: &[CloudRepoData]) -> Result<Packages, Box<dyn s
     Ok(Packages::default())
 }
 
-fn recreate_type_files_and_check(
+async fn recreate_type_files_and_check<T: CloudStorage>(
     all_repo_data: &[CloudRepoData],
-    packages: &Packages,
+    repo_s3_urls: &HashMap<String, String>, // Map repo_name -> s3_url
+    storage: &T,
+    _packages: &Packages,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Clean output directory
     let output_dir = std::path::Path::new("ts_check/output");
@@ -447,25 +404,36 @@ fn recreate_type_files_and_check(
         println!("Created clean output directory: ts_check/output");
     }
 
-    // Recreate type files for each repository
+    // Download type files for each repository
     for repo_data in all_repo_data {
-        if !repo_data.extracted_types.is_empty() {
+        if let Some(s3_url) = repo_s3_urls.get(&repo_data.repo_name) {
             println!(
-                "Recreating {} type files for repository: {}",
-                repo_data.extracted_types.len(),
+                "Downloading type file for repository: {}",
                 repo_data.repo_name
             );
 
-            // Create a temporary analyzer to use the extract_types_for_repo method
-            let cm: Lrc<SourceMap> = Default::default();
-            let temp_analyzer = Analyzer::new(Config::default(), cm);
+            match storage.download_type_file_content(s3_url).await {
+                Ok(type_content) => {
+                    // Create a safe filename from repo name
+                    let safe_repo_name = repo_data.repo_name.replace("/", "_");
+                    let file_name = format!("{}_types.ts", safe_repo_name);
+                    let file_path = output_dir.join(&file_name);
 
-            // Use the repo name as the "path" since we don't have actual file paths in CI
-            temp_analyzer.extract_types_for_repo(
-                &repo_data.repo_name,
-                repo_data.extracted_types.clone(),
-                packages,
-            );
+                    if let Err(e) = std::fs::write(&file_path, type_content) {
+                        println!("Warning: Failed to write type file {}: {}", file_name, e);
+                    } else {
+                        println!("Created type file: {}", file_path.display());
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "Warning: Failed to download type file for {}: {}",
+                        repo_data.repo_name, e
+                    );
+                }
+            }
+        } else {
+            println!("No S3 URL found for repository: {}", repo_data.repo_name);
         }
     }
 

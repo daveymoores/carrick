@@ -10,9 +10,9 @@ mod parser;
 mod router_context;
 mod utils;
 mod visitor;
+use crate::cloud_storage::{AwsStorage, MockStorage};
 use analyzer::analyze_api_consistency;
 use ci_mode::run_ci_mode;
-use cloud_storage::{MockStorage, MongoStorage};
 use config::Config;
 
 use file_finder::find_files;
@@ -110,7 +110,7 @@ async fn run_ci_mode_wrapper() -> Result<(), Box<dyn std::error::Error>> {
         let storage = MockStorage::new();
         run_ci_mode(storage, repo_path).await
     } else {
-        let storage = MongoStorage::new().await?;
+        let storage = AwsStorage::new()?;
         run_ci_mode(storage, repo_path).await
     }
 }

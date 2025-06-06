@@ -14,13 +14,6 @@ npm install --production
 zip -r ../check-or-upload.zip . -x "*.git*" "node_modules/.cache/*"
 cd ..
 
-# Build complete-upload function
-echo "Building complete-upload..."
-cd complete-upload
-npm install --production
-zip -r ../complete-upload.zip . -x "*.git*" "node_modules/.cache/*"
-cd ..
-
 echo "Lambda functions built successfully:"
 ls -la *.zip
 

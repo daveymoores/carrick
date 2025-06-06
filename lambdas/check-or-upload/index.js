@@ -202,9 +202,6 @@ async function handleGetCrossRepoData(payload, apiKey) {
         TableName: TABLE_NAME,
         ExpressionAttributeNames: { "#pk": "pk" },
         KeyConditionExpression: "begins_with(#pk, :orgPrefix)",
-        ExpressionAttributeValues: {
-          ":orgPrefix": `repo#${org}/`,
-        },
         FilterExpression: "apiKey = :apiKey",
         ExpressionAttributeValues: {
           ":orgPrefix": `repo#${org}/`,

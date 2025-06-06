@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::error::Error;
 
 mod mock_storage;
-mod mongodb_storage;
 pub use mock_storage::MockStorage;
-pub use mongodb_storage::MongoStorage;
+mod aws_storage;
+pub use aws_storage::AwsStorage;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
@@ -25,7 +25,6 @@ pub struct CloudRepoData {
     pub function_definitions: HashMap<String, FunctionDefinition>,
     pub config_json: Option<String>,
     pub package_json: Option<String>,
-    pub extracted_types: Vec<serde_json::Value>,
     pub last_updated: DateTime<Utc>,
     pub commit_hash: String,
 }
@@ -53,18 +52,19 @@ impl Error for StorageError {}
 
 #[async_trait]
 pub trait CloudStorage {
-    async fn upload_repo_data(&self, token: &str, data: &CloudRepoData)
-    -> Result<(), StorageError>;
-    async fn download_all_repo_data(&self, token: &str)
-    -> Result<Vec<CloudRepoData>, StorageError>;
+    async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError>;
+    async fn download_all_repo_data(
+        &self,
+        org: &str,
+    ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError>; // Updated return type
     async fn upload_type_file(
         &self,
-        token: &str,
         repo_name: &str,
         file_name: &str,
         content: &str,
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
+    async fn download_type_file_content(&self, s3Url: &str) -> Result<String, StorageError>;
 }
 
 pub fn get_current_commit_hash() -> String {
