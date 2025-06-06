@@ -103,236 +103,75 @@ pub struct CloudRepoData {
 }
 ```
 
-## Current State & Next Steps
 
-### ✅ Recently Completed
-- AWS infrastructure setup (Terraform)
-- Lambda function with multi-action support
-- AWS storage implementation (`AwsStorage`)
-- DynamoDB + S3 integration
-- API Gateway configuration
+# Carrick - Cross-Repository API Analysis Tool - Status Summary
 
-### 🔧 Current Status
-The migration is **functionally complete** but needs:
+## Current State
+Successfully migrated from MongoDB to AWS infrastructure and resolved most CI mode integration issues. The tool analyzes JavaScript/TypeScript APIs across multiple repositories and detects inconsistencies.
 
-1. **CI Mode Integration**: Update `ci_mode/mod.rs` to use `AwsStorage` instead of MongoDB
-2. **Environment Setup**: Switch from `CARRICK_TOKEN`/`MONGODB_URI` to `CARRICK_API_KEY`/`CARRICK_LAMBDA_URL`
-3. **Testing**: Validate end-to-end cross-repo analysis workflow
+## What Just Got Fixed
+1. ✅ **AWS Storage Implementation**: Completed AWS Lambda + DynamoDB + S3 integration
+2. ✅ **CI Mode Pipeline**: Fixed type file generation and upload workflow
+3. ✅ **Lambda Deployment**: Resolved action routing in Lambda functions
+4. ✅ **Request/Response Mapping**: Fixed struct field naming mismatches
 
-### 🎯 Immediate Tasks
-- [ ] Add `run_ci_mode_aws()` function or update main.rs to use AWS storage
-- [ ] Test lambda deployment and API Gateway integration
-- [ ] Verify cross-repo type sharing workflow
-- [ ] Update documentation for new AWS setup
+## Current Issue - ALMOST SOLVED
+**DynamoDB Query Error**: `Query key condition not supported`
 
-### 🔮 Future Enhancements
-- Enhanced type checking across repos
-- Better error reporting and debugging
-- UI for visualizing API dependencies
-- Integration with CI/CD pipelines
-- Support for additional frameworks beyond Express
+### The Problem
+- Using `begins_with()` on partition key in DynamoDB Query operation (not allowed)
+- Current table structure: `pk: repo#org/repo-name`, `sk: types#hash`
+- Need to fetch all repos for an organization
 
-## Development Setup
+### Immediate Fix Needed
+Replace Query with Scan in `lambdas/check-or-upload/index.js`:
 
-**Local Development**:
-```bash
-# Environment variables
-export CARRICK_LAMBDA_URL="https://your-api-gateway.com/types/check-or-upload"
-export CARRICK_API_KEY="your-secure-api-key"
+```javascript
+// In handleGetCrossRepoData function, replace QueryCommand with:
+const results = await docClient.send(
+  new ScanCommand({
+    TableName: TABLE_NAME,
+    FilterExpression: "begins_with(pk, :orgPrefix) AND apiKey = :apiKey",
+    ExpressionAttributeValues: {
+      ":orgPrefix": `repo#${org}/`,
+      ":apiKey": apiKey,
+    },
+  })
+);
 
-# Run analysis
-cargo run -- --mode ci --path ./your-repo
+// Also add ScanCommand to imports:
+const { ScanCommand } = require("@aws-sdk/lib-dynamodb");
 ```
 
-**AWS Deployment**:
+### Deploy Steps
 ```bash
-cd terraform/
+cd lambdas/
+./build.sh
+cd ../terraform/
 terraform apply
-
-cd ../lambdas/check-or-upload/
-npm run build
-# Upload via terraform or AWS CLI
 ```
 
-The project is at a **critical transition point** - the AWS infrastructure is ready, but the Rust application needs final integration to complete the migration from MongoDB to the new scalable AWS architecture.
-
-
----
-
-Looking at your code, it looks correct overall! Here's what you should do:
-
-## Yes, you can remove MongoDB storage (if you want)
-
-Since you're moving to AWS, you can remove `mongodb_storage.rs` if you don't need backward compatibility. But I'd recommend keeping it for now in case you need to roll back.
-
-## Update your module exports
-
-Your `aws_storage.rs` looks good, but you need to update `carrick/src/cloud_storage/mod.rs`:
-
-```rust
-// carrick/src/cloud_storage/mod.rs
-use crate::{
-    analyzer::ApiEndpointDetails,
-    app_context::AppContext,
-    visitor::{FunctionDefinition, Mount},
-};
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::error::Error;
-
-mod mock_storage;
-mod mongodb_storage;
-mod aws_storage; // Add this line
-
-pub use mock_storage::MockStorage;
-pub use mongodb_storage::MongoStorage;
-pub use aws_storage::AwsStorage; // Add this line
-
-// ... rest of the file remains the same
+## Architecture Overview
+```
+Rust App (CI Mode) → AWS API Gateway → Lambda → DynamoDB + S3
+                                    ↓
+                           Type files stored in S3
+                           Metadata stored in DynamoDB
 ```
 
-## Update CI mode to use AWS storage
+## Key Files
+- `carrick/src/cloud_storage/aws_storage.rs` - AWS integration
+- `carrick/lambdas/check-or-upload/index.js` - Lambda function (needs Scan fix)
+- `carrick/src/ci_mode/mod.rs` - Cross-repo analysis orchestration
 
-Your `ci_mode/mod.rs` is still hardcoded for MongoDB. You need to either:
+## Testing
+- Set `CARRICK_ORG=carrick`, `CARRICK_API_KEY=xxx`, `CARRICK_LAMBDA_URL=xxx`
+- Run: `cargo run -- --mode ci --path ./test-repo`
 
-### Option A: Add a new AWS-specific function
+## Next Steps After Fix
+1. Verify cross-repo data download works
+2. Test type file downloading from S3
+3. Validate end-to-end type checking across repos
+4. Consider DynamoDB table restructure for better query performance
 
-```rust
-// Add this to carrick/src/ci_mode/mod.rs
-
-use crate::cloud_storage::AwsStorage; // Add this import
-
-pub async fn run_ci_mode_aws(
-    repo_path: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Running Carrick in CI mode with AWS backend");
-
-    // Initialize AWS storage
-    let storage = AwsStorage::new()?;
-
-    // Verify connectivity early
-    storage
-        .health_check()
-        .await
-        .map_err(|e| format!("Failed to connect to AWS services: {}", e))?;
-    println!("AWS connectivity verified");
-
-    // Use empty token since AwsStorage uses API key from env
-    let token = "";
-
-    // 1. Analyze current repo only
-    let current_repo_data = analyze_current_repo(repo_path)?;
-    println!("Analyzed current repo: {}", current_repo_data.repo_name);
-
-    // 2. Upload current repo data to AWS
-    let cloud_data_serialized = serialize_cloud_repo_data_without_ast(&current_repo_data);
-    storage
-        .upload_repo_data(token, &cloud_data_serialized)
-        .await
-        .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-    println!("Uploaded current repo data to AWS");
-
-    // 3. Download data from all repos
-    let all_repo_data = storage
-        .download_all_repo_data(token)
-        .await
-        .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
-    println!("Downloaded data from {} repos", all_repo_data.len());
-
-    // 4. Reconstruct analyzer with combined data
-    let analyzer = build_cross_repo_analyzer(all_repo_data)?;
-    println!("Reconstructed analyzer with cross-repo data");
-
-    // 5. Run analysis
-    let results = analyzer.get_results();
-
-    // 6. Print results
-    print_results(results);
-
-    Ok(())
-}
-```
-
-### Option B: Update your main.rs to use AWS storage
-
-```rust
-// In your main.rs or wherever you call CI mode
-match run_mode.as_str() {
-    "ci" => {
-        // Use new AWS-based CI mode
-        crate::ci_mode::run_ci_mode_aws(&args.path).await?;
-    }
-    "ci-mongo" => {
-        // Keep MongoDB option for backward compatibility
-        let storage = MongoStorage::new().await?;
-        crate::ci_mode::run_ci_mode(storage, &args.path).await?;
-    }
-    // ... other modes
-}
-```
-
-## Fix one small issue in upload_type_file
-
-Your `upload_type_file` method in `aws_storage.rs` is missing the `s3Url` field:
-
-```rust
-async fn upload_type_file(
-    &self,
-    _token: &str,
-    repo_name: &str,
-    file_name: &str,
-    content: &str,
-) -> Result<(), StorageError> {
-    let (org, repo) = self.extract_org_and_repo(repo_name);
-    let commit_hash = crate::cloud_storage::get_current_commit_hash();
-
-    let request = LambdaRequest {
-        action: "check-or-upload".to_string(),
-        repo,
-        org,
-        hash: commit_hash,
-        filename: file_name.to_string(),
-        cloudRepoData: None,
-        s3Url: None, // Add this line
-    };
-
-    let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
-
-    if let Some(upload_url) = lambda_response.upload_url {
-        self.upload_to_s3(&upload_url, content).await?;
-    }
-
-    Ok(())
-}
-```
-
-## Environment Variables
-
-Make sure your environment is set up correctly:
-
-```bash
-# For AWS (new)
-export CARRICK_LAMBDA_URL="https://your-api-gateway-url/types/check-or-upload"
-export CARRICK_API_KEY="your-api-key"
-
-# Remove MongoDB variables (if not needed for backward compatibility)
-# unset MONGODB_URI
-# unset CARRICK_TOKEN
-```
-
-## Summary
-
-Your AWS implementation looks great! The main things to do are:
-
-1. ✅ **Your `aws_storage.rs` is correct**
-2. ✅ **Your lambda looks good**
-3. 🔧 **Add `AwsStorage` export to `mod.rs`**
-4. 🔧 **Add the `s3Url: None` line to `upload_type_file`**
-5. 🔧 **Add `run_ci_mode_aws()` function or update your main.rs**
-6. 🔧 **Set the correct environment variables**
-
-You can keep the MongoDB storage for now (good for backward compatibility), or remove it if you're confident in the AWS migration.
-
-The architecture looks solid - you've successfully moved from MongoDB to a much more scalable AWS solution!
+The tool is 95% complete - just needs the DynamoDB Scan fix to be fully functional.

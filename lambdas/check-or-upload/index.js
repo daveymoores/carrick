@@ -200,9 +200,7 @@ async function handleGetCrossRepoData(payload, apiKey) {
     const results = await docClient.send(
       new QueryCommand({
         TableName: TABLE_NAME,
-        ExpressionAttributeNames: { "#pk": "pk" },
-        KeyConditionExpression: "begins_with(#pk, :orgPrefix)",
-        FilterExpression: "apiKey = :apiKey",
+        FilterExpression: "begins_with(pk, :orgPrefix) AND apiKey = :apiKey",
         ExpressionAttributeValues: {
           ":orgPrefix": `repo#${org}/`,
           ":apiKey": apiKey,
