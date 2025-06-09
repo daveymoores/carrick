@@ -1,6 +1,6 @@
 use crate::analyzer::{Analyzer, ApiEndpointDetails};
 use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
-use crate::config::Config;
+use crate::config::{Config, create_standard_tsconfig};
 use crate::file_finder::find_files;
 use crate::packages::Packages;
 use crate::parser::parse_file;
@@ -386,7 +386,7 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
     all_repo_data: &[CloudRepoData],
     repo_s3_urls: &HashMap<String, String>, // Map repo_name -> s3_url
     storage: &T,
-    _packages: &Packages,
+    packages: &Packages,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Clean output directory
     let output_dir = std::path::Path::new("ts_check/output");
@@ -436,6 +436,38 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
             println!("No S3 URL found for repository: {}", repo_data.repo_name);
         }
     }
+
+    // Recreate package.json and tsconfig.json after downloading type files
+    recreate_package_and_tsconfig(output_dir, packages)?;
+
+    Ok(())
+}
+
+/// Recreate package.json and tsconfig.json in the output directory
+fn recreate_package_and_tsconfig(
+    output_dir: &std::path::Path,
+    packages: &Packages,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Create package.json
+    let package_json_path = output_dir.join("package.json");
+    let dependencies = packages.get_dependencies();
+    
+    let package_json_content = serde_json::json!({
+        "name": "carrick-type-check",
+        "version": "1.0.0",
+        "type": "module",
+        "dependencies": dependencies
+    });
+    
+    std::fs::write(&package_json_path, serde_json::to_string_pretty(&package_json_content)?)?;
+    println!("Recreated package.json at {}", package_json_path.display());
+
+    // Create tsconfig.json
+    let tsconfig_path = output_dir.join("tsconfig.json");
+    let tsconfig_content = create_standard_tsconfig();
+    
+    std::fs::write(&tsconfig_path, serde_json::to_string_pretty(&tsconfig_content)?)?;
+    println!("Recreated tsconfig.json at {}", tsconfig_path.display());
 
     Ok(())
 }

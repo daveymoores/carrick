@@ -4,7 +4,7 @@ use swc_ecma_ast::TsTypeAnn;
 
 use crate::{
     app_context::AppContext,
-    config::Config,
+    config::{Config, create_standard_tsconfig},
     extractor::CoreExtractor,
     packages::Packages,
     utils::join_prefix_and_path,
@@ -1104,50 +1104,13 @@ impl Analyzer {
         use std::path::Path;
         let tsconfig_path = Path::new(repo_path).join("tsconfig.json");
 
-        // Create a default tsconfig.json if it doesn't exist
-        let ts_config = if !tsconfig_path.exists() {
-            println!("No tsconfig.json found in repo, creating default one in ts_check/output");
-
-            // Ensure the output directory exists
-            let output_dir = Path::new("ts_check/output");
-            if !output_dir.exists() {
-                std::fs::create_dir_all(output_dir).expect("Failed to create output directory");
-            }
-
-            let default_tsconfig_path = Path::new("ts_check/output/tsconfig.json");
-
-            // Create a basic tsconfig.json content
-            let tsconfig_content = serde_json::json!({
-                "compilerOptions": {
-                    "target": "ES2020",
-                    "module": "commonjs",
-                    "strict": true,
-                    "esModuleInterop": true,
-                    "skipLibCheck": true,
-                    "forceConsistentCasingInFileNames": true,
-                    "resolveJsonModule": true,
-                    "declaration": true,
-                    "outDir": "./dist"
-                },
-                "include": [
-                    "*.ts",
-                    "**/*.ts"
-                ],
-                "exclude": [
-                    "node_modules",
-                    "dist"
-                ]
-            });
-
-            std::fs::write(
-                default_tsconfig_path,
-                serde_json::to_string_pretty(&tsconfig_content).unwrap(),
-            )
-            .expect("Failed to write default tsconfig.json");
-
-            default_tsconfig_path.to_path_buf()
-        } else {
+        // Use repo's tsconfig if it exists, otherwise we'll create one later in run_final_type_checking
+        let ts_config = if tsconfig_path.exists() {
             tsconfig_path
+        } else {
+            println!("No tsconfig.json found in repo, will create one during type checking");
+            // Return a placeholder path - the actual tsconfig will be created in run_final_type_checking
+            Path::new("ts_check/output/tsconfig.json").to_path_buf()
         };
 
         println!("Extracting {} types from {}", type_infos.len(), repo_path);
@@ -1280,19 +1243,9 @@ impl Analyzer {
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
         let tsconfig_path = output_dir.join("tsconfig.json");
-        let minimal_tsconfig = r#"{
-  "compilerOptions": {
-    "target": "es2016",
-    "module": "commonjs",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
-  },
-  "include": ["*.ts"]
-}"#;
+        let tsconfig_content = create_standard_tsconfig();
 
-        fs::write(&tsconfig_path, minimal_tsconfig)
+        fs::write(&tsconfig_path, serde_json::to_string_pretty(&tsconfig_content).unwrap())
             .map_err(|e| format!("Failed to create tsconfig.json: {}", e))?;
 
         // Run the type checking script with the minimal tsconfig

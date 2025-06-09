@@ -1,6 +1,7 @@
 use std::{collections::HashSet, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Config {
@@ -76,3 +77,28 @@ impl Config {
             .any(|domain| route.starts_with(domain))
     }
 }
+
+/// Creates a standard TypeScript configuration for type checking only
+pub fn create_standard_tsconfig() -> Value {
+    serde_json::json!({
+        "compilerOptions": {
+            "target": "ES2020",
+            "module": "commonjs",
+            "strict": true,
+            "esModuleInterop": true,
+            "skipLibCheck": true,
+            "forceConsistentCasingInFileNames": true,
+            "resolveJsonModule": true,
+            "noEmit": true
+        },
+        "include": [
+            "*.ts",
+            "**/*.ts"
+        ],
+        "exclude": [
+            "node_modules"
+        ]
+    })
+}
+
+
