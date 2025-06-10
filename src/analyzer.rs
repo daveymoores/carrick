@@ -1104,13 +1104,30 @@ impl Analyzer {
         use std::path::Path;
         let tsconfig_path = Path::new(repo_path).join("tsconfig.json");
 
-        // Use repo's tsconfig if it exists, otherwise we'll create one later in run_final_type_checking
+        // Use repo's tsconfig if it exists, otherwise create a default one in output directory
         let ts_config = if tsconfig_path.exists() {
             tsconfig_path
         } else {
-            println!("No tsconfig.json found in repo, will create one during type checking");
-            // Return a placeholder path - the actual tsconfig will be created in run_final_type_checking
-            Path::new("ts_check/output/tsconfig.json").to_path_buf()
+            println!("No tsconfig.json found in repo, creating default one in ts_check/output");
+
+            // Ensure the output directory exists
+            let output_dir = Path::new("ts_check/output");
+            if !output_dir.exists() {
+                std::fs::create_dir_all(output_dir).expect("Failed to create output directory");
+            }
+
+            let default_tsconfig_path = Path::new("ts_check/output/tsconfig.json");
+
+            // Create a basic tsconfig.json content
+            let tsconfig_content = create_standard_tsconfig();
+
+            std::fs::write(
+                default_tsconfig_path,
+                serde_json::to_string_pretty(&tsconfig_content).unwrap(),
+            )
+            .expect("Failed to write default tsconfig.json");
+
+            default_tsconfig_path.to_path_buf()
         };
 
         println!("Extracting {} types from {}", type_infos.len(), repo_path);
