@@ -1,0 +1,18 @@
+name: Carrick
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test-published-action:
+    name: Test Published Action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Carrick Analysis on entire repo
+        uses: daveymoores/carrick@v1
+        with:
+          carrick-org: ${{ secrets.CARRICK_ORG }}
+          carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
