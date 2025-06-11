@@ -1,66 +1,64 @@
-name: 'Carrick API Analysis'
-description: 'Analyze JavaScript/TypeScript APIs for cross-repository inconsistencies'
+name: "Carrick API Analysis"
+description: "Analyze JavaScript/TypeScript APIs for cross-repository inconsistencies"
 
 inputs:
   path:
-    description: 'Path to analyze'
+    description: "Path to analyze"
     required: false
-    default: '.'
+    default: "."
   carrick-org:
-    description: 'Organization name'
+    description: "Organization name"
     required: true
   carrick-api-key:
-    description: 'API key'
-    required: true
-  carrick-lambda-url:
-    description: 'Lambda URL'
+    description: "API key"
     required: true
 
 outputs:
   success:
-    description: 'Analysis success'
+    description: "Analysis completed successfully"
+    value: ${{ steps.analysis.outputs.success }}
   issues-found:
-    description: 'Number of issues'
+    description: "Number of API issues detected"
+    value: ${{ steps.analysis.outputs.issues-found }}
 
 runs:
-  using: 'composite'
+  using: "composite"
   steps:
     - name: Download Carrick
       shell: bash
       run: |
-        curl -L -o carrick-action.tar.gz https://github.com/${{ github.repository }}/releases/latest/download/carrick-action-linux.tar.gz
-        tar -xzf carrick-action.tar.gz
-        chmod +x carrick
-    
+        curl -L -o carrick-action.tar.gz
+        https://github.com/daveymoores/carrick/releases/latest/download/carrick-action-linux.tar.gz
+
     - name: Install dependencies
       shell: bash
       run: cd ts_check && npm install
-      
+
     - name: Run analysis
+      id: analysis
       shell: bash
       env:
         CARRICK_ORG: ${{ inputs.carrick-org }}
         CARRICK_API_KEY: ${{ inputs.carrick-api-key }}
-        CARRICK_LAMBDA_URL: ${{ inputs.carrick-lambda-url }}
-        CI: 'true'
+        CI: "true"
       run: |
         set +e
         ./carrick ${{ inputs.path }} > analysis.log 2>&1
         EXIT_CODE=$?
         set -e
-        
+
         ISSUES=0
         if grep -q "Found .* API issues:" analysis.log; then
           ISSUES=$(grep "Found .* API issues:" analysis.log | grep -o '[0-9]\+' | head -1)
         fi
-        
+
         if [ $EXIT_CODE -eq 0 ]; then
           echo "success=true" >> $GITHUB_OUTPUT
         else
           echo "success=false" >> $GITHUB_OUTPUT
         fi
-        
+
         echo "issues-found=$ISSUES" >> $GITHUB_OUTPUT
-        
+
         cat analysis.log
         exit $EXIT_CODE

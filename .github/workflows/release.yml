@@ -3,23 +3,26 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           target: x86_64-unknown-linux-gnu
-          
+
       - name: Build binary
+        env:
+          CARRICK_API_ENDPOINT: ${{ secrets.CARRICK_API_ENDPOINT }}
+          CARRICK_LAMBDA_URL: ${{ secrets.CARRICK_LAMBDA_URL }}
         run: cargo build --release --target x86_64-unknown-linux-gnu
-        
+
       - name: Create release archive
         run: |
           mkdir -p release
@@ -27,7 +30,7 @@ jobs:
           cp -r ts_check release/
           cd release
           tar -czf carrick-action-linux.tar.gz carrick ts_check
-          
+
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
