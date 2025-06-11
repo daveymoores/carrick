@@ -64,7 +64,7 @@ cargo test --test integration_test
 
 # Install test dependencies first
 cd test-repo && npm install
-cd ../test-multiple && npm install  
+cd ../test-multiple && npm install
 cd ../tests/fixtures/imported-routers && npm install
 ```
 
@@ -87,7 +87,7 @@ Use the provided GitHub Actions workflow to run tests on every PR and push:
 ```yaml
 # .github/workflows/ci.yml is included for:
 - Unit and integration tests
-- Code formatting and linting  
+- Code formatting and linting
 - Security audit
 - Endpoint detection regression tests
 ```
@@ -96,4 +96,3 @@ Use the provided GitHub Actions workflow to run tests on every PR and push:
 
 - `FORCE_LOCAL_MODE=1` - Forces local analysis mode even in CI environments
 - `MOCK_STORAGE=1` - Uses mock storage instead of MongoDB in CI mode
-- `MONGODB_URI` - MongoDB connection string (required for CI mode)
