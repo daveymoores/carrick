@@ -27,8 +27,7 @@ runs:
     - name: Download Carrick
       shell: bash
       run: |
-        curl -L -o carrick-action.tar.gz https://github.com/daveymoores/carrick/releases/latest/download/carrick-action-linux.tar.gz
-        tar -xzf carrick-action.tar.gz
+        curl -H "Authorization: token ${{ github.token }}" -L -o carrick-action.tar.gz https://github.com/daveymoores/carrick/releases/latest/download/carrick-action-linux.tar.gz
         chmod +x carrick
 
     - name: Install dependencies
