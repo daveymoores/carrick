@@ -12,7 +12,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run Carrick Analysis on entire repo
-        uses: daveymoores/carrick@v1.0.0-alpha.3
+        uses: daveymoores/carrick@v1
         with:
           carrick-org: ${{ secrets.CARRICK_ORG }}
           carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
+          github-token: ${{ secrets.CARRICK_DOWNLOAD_TOKEN }}
