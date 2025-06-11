@@ -464,7 +464,13 @@ fn recreate_package_and_tsconfig(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create package.json
     let package_json_path = output_dir.join("package.json");
-    let dependencies = packages.get_dependencies();
+    let package_dependencies = packages.get_dependencies();
+    
+    // Convert PackageInfo objects to simple version strings for npm
+    let mut dependencies = std::collections::HashMap::new();
+    for (name, package_info) in package_dependencies {
+        dependencies.insert(name.clone(), package_info.version.clone());
+    }
 
     let package_json_content = serde_json::json!({
         "name": "carrick-type-check",
@@ -478,6 +484,22 @@ fn recreate_package_and_tsconfig(
         serde_json::to_string_pretty(&package_json_content)?,
     )?;
     println!("Recreated package.json at {}", package_json_path.display());
+
+    // Install dependencies
+    use std::process::Command;
+    println!("Installing dependencies...");
+    let install_output = Command::new("npm")
+        .arg("install")
+        .current_dir(output_dir)
+        .output()
+        .map_err(|e| format!("Failed to run npm install: {}", e))?;
+
+    if !install_output.status.success() {
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        eprintln!("Warning: npm install failed: {}", stderr);
+    } else {
+        println!("Dependencies installed successfully");
+    }
 
     // Create tsconfig.json
     let tsconfig_path = output_dir.join("tsconfig.json");
