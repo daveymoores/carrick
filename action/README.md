@@ -10,7 +10,6 @@ Analyze JavaScript/TypeScript APIs for cross-repository inconsistencies.
   with:
     carrick-org: ${{ secrets.CARRICK_ORG }}
     carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
-    carrick-lambda-url: ${{ secrets.CARRICK_LAMBDA_URL }}
 ```
 
 ## Inputs
@@ -18,7 +17,6 @@ Analyze JavaScript/TypeScript APIs for cross-repository inconsistencies.
 - `path` - Path to analyze (default: `.`)
 - `carrick-org` - Organization name (required)
 - `carrick-api-key` - API key (required)
-- `carrick-lambda-url` - Lambda URL (required)
 
 ## Outputs
 
@@ -29,5 +27,4 @@ Analyze JavaScript/TypeScript APIs for cross-repository inconsistencies.
 
 Add these secrets to your repository:
 - `CARRICK_ORG`
-- `CARRICK_API_KEY`  
-- `CARRICK_LAMBDA_URL`
+- `CARRICK_API_KEY`
