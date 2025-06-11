@@ -33,7 +33,9 @@ pub struct CloudRepoData {
 pub enum StorageError {
     ConnectionError(String),
     SerializationError(String),
+    #[allow(dead_code)]
     NotFound(String),
+    #[allow(dead_code)]
     DatabaseError(String),
 }
 
@@ -57,6 +59,7 @@ pub trait CloudStorage {
         &self,
         org: &str,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError>; // Updated return type
+    #[allow(dead_code)]
     async fn upload_type_file(
         &self,
         repo_name: &str,
@@ -64,7 +67,7 @@ pub trait CloudStorage {
         content: &str,
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
-    async fn download_type_file_content(&self, s3Url: &str) -> Result<String, StorageError>;
+    async fn download_type_file_content(&self, s3_url: &str) -> Result<String, StorageError>;
 }
 
 pub fn get_current_commit_hash() -> String {
