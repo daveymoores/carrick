@@ -95,4 +95,4 @@ Use the provided GitHub Actions workflow to run tests on every PR and push:
 ### Environment Variables
 
 - `FORCE_LOCAL_MODE=1` - Forces local analysis mode even in CI environments
-- `MOCK_STORAGE=1` - Uses mock storage instead of MongoDB in CI mode
+- `MOCK_STORAGE=1` - Uses mock storage instead of AWS in CI mode

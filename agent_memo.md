@@ -36,12 +36,7 @@ The tool:
 ## Current Implementation Status
 
 ### Cloud Storage Migration (Recently Completed)
-We've **migrated from MongoDB to AWS** for better scalability:
 
-**Previous (MongoDB)**:
-- Direct MongoDB connections
-- All data stored in single database
-- Type files embedded in documents
 
 **Current (AWS)**:
 - **API Gateway** + **Lambda** for REST API interface
@@ -59,7 +54,6 @@ carrick/
 │   ├── cloud_storage/     # Storage abstraction layer
 │   │   ├── mod.rs        # CloudStorage trait definition
 │   │   ├── aws_storage.rs # NEW: AWS implementation
-│   │   ├── mongodb_storage.rs # Legacy MongoDB (kept for compatibility)
 │   │   └── mock_storage.rs    # Testing implementation
 │   ├── ci_mode/          # Cross-repo analysis orchestration
 │   └── parser/           # SWC-based file parsing
@@ -107,7 +101,7 @@ pub struct CloudRepoData {
 # Carrick - Cross-Repository API Analysis Tool - Status Summary
 
 ## Current State
-Successfully migrated from MongoDB to AWS infrastructure and resolved most CI mode integration issues. The tool analyzes JavaScript/TypeScript APIs across multiple repositories and detects inconsistencies.
+The tool analyzes JavaScript/TypeScript APIs across multiple repositories and detects inconsistencies.
 
 ## What Just Got Fixed
 1. ✅ **AWS Storage Implementation**: Completed AWS Lambda + DynamoDB + S3 integration
