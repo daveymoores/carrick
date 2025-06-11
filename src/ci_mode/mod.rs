@@ -228,7 +228,21 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
     let endpoints =
         analyzer.resolve_all_endpoint_paths(&analyzer.endpoints, &analyzer.mounts, &analyzer.apps);
     analyzer.endpoints = endpoints;
-    analyzer.resolve_types_for_endpoints(cm.clone());
+
+    // Build the router after resolving endpoints
+    analyzer.build_endpoint_router();
+
+    // Second pass - analyze function definitions for response fields
+    let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
+        &analyzer.imported_handlers,
+        &analyzer.function_definitions,
+    );
+
+    // Update endpoints with resolved fields and resolve types
+    analyzer
+        .update_endpoints_with_resolved_fields(response_fields, request_fields)
+        .resolve_types_for_endpoints(cm.clone())
+        .analyze_functions_for_fetch_calls();
 
     extract_types_for_current_repo(&analyzer, repo_path, &packages_clone)?;
 
@@ -451,22 +465,28 @@ fn recreate_package_and_tsconfig(
     // Create package.json
     let package_json_path = output_dir.join("package.json");
     let dependencies = packages.get_dependencies();
-    
+
     let package_json_content = serde_json::json!({
         "name": "carrick-type-check",
         "version": "1.0.0",
         "type": "module",
         "dependencies": dependencies
     });
-    
-    std::fs::write(&package_json_path, serde_json::to_string_pretty(&package_json_content)?)?;
+
+    std::fs::write(
+        &package_json_path,
+        serde_json::to_string_pretty(&package_json_content)?,
+    )?;
     println!("Recreated package.json at {}", package_json_path.display());
 
     // Create tsconfig.json
     let tsconfig_path = output_dir.join("tsconfig.json");
     let tsconfig_content = create_standard_tsconfig();
-    
-    std::fs::write(&tsconfig_path, serde_json::to_string_pretty(&tsconfig_content)?)?;
+
+    std::fs::write(
+        &tsconfig_path,
+        serde_json::to_string_pretty(&tsconfig_content)?,
+    )?;
     println!("Recreated tsconfig.json at {}", tsconfig_path.display());
 
     Ok(())

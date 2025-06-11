@@ -256,7 +256,7 @@ impl CloudStorage for AwsStorage {
 
         // Step 2: Upload type file if needed
         if let Some(upload_url) = lambda_response.uploadUrl {
-            if let Some(ts_file_path) = find_generated_typescript_file(".") {
+            if let Some(ts_file_path) = find_generated_typescript_file(&data.repo_name) {
                 let type_file_content = std::fs::read_to_string(&ts_file_path).map_err(|e| {
                     StorageError::SerializationError(format!(
                         "Failed to read TypeScript file: {}",
@@ -385,22 +385,17 @@ impl CloudStorage for AwsStorage {
 }
 
 // Helper function
-fn find_generated_typescript_file(repo_path: &str) -> Option<String> {
-    use std::fs;
+fn find_generated_typescript_file(repo_name: &str) -> Option<String> {
     use std::path::Path;
 
-    let output_dir = Path::new(repo_path).join("ts_check/output");
-    if output_dir.exists() {
-        if let Ok(entries) = fs::read_dir(output_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ext == "ts" {
-                        return Some(path.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
+    let expected_filename = format!("{}_types.ts", repo_name);
+    let expected_path = Path::new(".")
+        .join("ts_check/output")
+        .join(&expected_filename);
+
+    if expected_path.exists() {
+        Some(expected_path.to_string_lossy().to_string())
+    } else {
+        None
     }
-    None
 }
