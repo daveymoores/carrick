@@ -75,34 +75,60 @@ export class DependencyManager {
         `Package.json created at ${packageJsonPath} with ${Object.keys(this.usedDependencies).length} dependencies`,
       );
 
-      // Also copy tsconfig.json to output directory
+      // Also copy tsconfig.json to output directory with dynamic path mappings
       const tsconfigPath = `${outputDir}/tsconfig.json`;
-      const tsconfigContent = {
-        "compilerOptions": {
-          "target": "ES2020",
-          "module": "commonjs",
-          "strict": true,
-          "esModuleInterop": true,
-          "skipLibCheck": true,
-          "forceConsistentCasingInFileNames": true,
-          "resolveJsonModule": true,
-          "declaration": true,
-          "outDir": "./dist"
-        },
-        "include": [
-          "*.ts",
-          "**/*.ts"
-        ],
-        "exclude": [
-          "node_modules",
-          "dist"
-        ]
-      };
+      const tsconfigContent = this.createDynamicTsconfig(outputDir);
       require("fs").writeFileSync(tsconfigPath, JSON.stringify(tsconfigContent, null, 2));
       console.log(`tsconfig.json created at ${tsconfigPath}`);
     } catch (error) {
       console.error("Error creating package.json or tsconfig.json:", error);
     }
+  }
+
+  private createDynamicTsconfig(outputDir: string): any {
+    const paths: Record<string, string[]> = {
+      "*-types": ["./*_types"]
+    };
+
+    // Scan for actual type files and create specific mappings
+    try {
+      const fs = require("fs");
+      const entries = fs.readdirSync(outputDir);
+      
+      for (const fileName of entries) {
+        if (fileName.endsWith("_types.ts")) {
+          const baseName = fileName.replace(".ts", "");
+          const moduleName = baseName.replace("_", "-");
+          paths[moduleName] = [`./${baseName}`];
+        }
+      }
+    } catch (error) {
+      console.warn("Could not scan directory for type files:", error);
+    }
+
+    return {
+      "compilerOptions": {
+        "target": "ES2020",
+        "module": "commonjs",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "forceConsistentCasingInFileNames": true,
+        "resolveJsonModule": true,
+        "declaration": true,
+        "outDir": "./dist",
+        "baseUrl": ".",
+        "paths": paths
+      },
+      "include": [
+        "*.ts",
+        "**/*.ts"
+      ],
+      "exclude": [
+        "node_modules",
+        "dist"
+      ]
+    };
   }
 
   clear(): void {

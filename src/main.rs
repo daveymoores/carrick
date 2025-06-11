@@ -1,5 +1,7 @@
 mod analyzer;
 mod app_context;
+mod ci_mode;
+mod cloud_storage;
 mod config;
 mod extractor;
 mod file_finder;
@@ -8,7 +10,9 @@ mod parser;
 mod router_context;
 mod utils;
 mod visitor;
+use crate::cloud_storage::{AwsStorage, MockStorage};
 use analyzer::analyze_api_consistency;
+use ci_mode::run_ci_mode;
 use config::Config;
 
 use file_finder::find_files;
@@ -69,7 +73,49 @@ fn resolve_import_path(base_file: &Path, import_path: &str) -> Option<PathBuf> {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let is_ci_env = std::env::var("CI").is_ok();
+    let is_ci_arg = args.len() > 1 && args[1] == "ci";
+    let force_local_mode = std::env::var("FORCE_LOCAL_MODE").is_ok();
+
+    if (is_ci_env || is_ci_arg) && !force_local_mode {
+        if let Err(e) = run_ci_mode_wrapper().await {
+            eprintln!("CI mode failed: {}", e);
+            std::process::exit(1);
+        }
+    } else {
+        run_local_mode();
+    }
+}
+
+async fn run_ci_mode_wrapper() -> Result<(), Box<dyn std::error::Error>> {
+    // Extract repository path from args if they exist. If no args are given then default to the current directory.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let repo_path = if args.is_empty() {
+        "."
+    } else if args[0] == "ci" {
+        // If first arg is "ci", use second arg as repo path or default to "."
+        if args.len() > 1 { &args[1] } else { "." }
+    } else {
+        &args[0]
+    };
+
+    // Use MockStorage if MOCK_STORAGE env var is set, otherwise use MongoDB
+    let use_mock = std::env::var("MOCK_STORAGE").is_ok();
+
+    if use_mock {
+        println!("Using MockStorage (MOCK_STORAGE environment variable detected)");
+        let storage = MockStorage::new();
+        run_ci_mode(storage, repo_path).await
+    } else {
+        let storage = AwsStorage::new()?;
+        run_ci_mode(storage, repo_path).await
+    }
+}
+
+fn run_local_mode() {
     // Create shared source map and error handler
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -129,10 +175,16 @@ fn main() {
 
     while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
         let path_str = file_path.to_string_lossy().to_string();
-        if processed_file_paths.contains(&path_str) {
+        // Create a unique key that includes the imported router name to allow
+        // the same file to be processed multiple times with different contexts
+        let processing_key = match &imported_router_name {
+            Some(name) => format!("{}#{}", path_str, name),
+            None => path_str.clone(),
+        };
+        if processed_file_paths.contains(&processing_key) {
             continue;
         }
-        processed_file_paths.insert(path_str.clone());
+        processed_file_paths.insert(processing_key);
 
         println!("Parsing: {}", file_path.display());
 
@@ -210,6 +262,10 @@ fn main() {
     let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs);
 
     // Print results
+    print_local_results(result);
+}
+
+fn print_local_results(result: crate::analyzer::ApiAnalysisResult) {
     println!("\nAPI Analysis Results:");
     println!("=====================");
     println!(
@@ -219,9 +275,9 @@ fn main() {
     println!("Found {} API calls across all files", result.calls.len());
 
     if result.issues.is_empty() {
-        println!("\n✅  No API inconsistencies detected!");
+        println!("\nNo API inconsistencies detected!");
     } else {
-        println!("\n⚠️  Found {} API issues:", result.issues.len());
+        println!("\nFound {} API issues:", result.issues.len());
         let call_issues = result.issues.call_issues;
         let endpoint_issues = result.issues.endpoint_issues;
         let env_var_calls = result.issues.env_var_calls;
@@ -259,7 +315,7 @@ fn main() {
             for issue in env_var_calls.iter() {
                 issue_number = issue_number + 1;
                 print!(
-                    "\n{}. {}\n     • Consider adding to known external APIs configuration",
+                    "\n{}. {}\n     - Consider adding to known external APIs configuration",
                     &issue_number, issue
                 );
             }

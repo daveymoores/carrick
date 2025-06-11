@@ -1,7 +1,7 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
 use derivative::Derivative;
-use serde::Serialize;
+
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
@@ -18,24 +18,26 @@ use crate::{
 };
 extern crate regex;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionArgument {
     #[allow(dead_code)]
     pub name: String,
+    #[serde(skip)]
     pub type_ann: Option<TsTypeAnn>, // swc_ecma_ast::TsTypeAnn
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypeReference {
     pub file_path: PathBuf,
     #[allow(dead_code)]
+    #[serde(skip)]
     pub type_ann: Option<Box<TsType>>,
     pub start_position: usize,
     pub composite_type_string: String,
     pub alias: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Json {
     Null,
     Boolean(bool),
@@ -50,9 +52,52 @@ pub enum FunctionNodeType {
     ArrowFunction(Box<ArrowExpr>),
     FunctionDeclaration(Box<FnDecl>),
     FunctionExpression(Box<FnExpr>),
+    // Used for deserialization when AST data is not available
+    Placeholder,
 }
 
-#[derive(Debug, Clone)]
+impl Default for FunctionNodeType {
+    fn default() -> Self {
+        // This is used when deserializing in CI mode where AST is not available
+        FunctionNodeType::Placeholder
+    }
+}
+
+impl serde::Serialize for FunctionNodeType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            FunctionNodeType::ArrowFunction(_) => serializer.serialize_str("ArrowFunction"),
+            FunctionNodeType::FunctionDeclaration(_) => {
+                serializer.serialize_str("FunctionDeclaration")
+            }
+            FunctionNodeType::FunctionExpression(_) => {
+                serializer.serialize_str("FunctionExpression")
+            }
+            FunctionNodeType::Placeholder => serializer.serialize_str("Placeholder"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FunctionNodeType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "ArrowFunction" => Ok(FunctionNodeType::Placeholder),
+            "FunctionDeclaration" => Ok(FunctionNodeType::Placeholder),
+            "FunctionExpression" => Ok(FunctionNodeType::Placeholder),
+            "Placeholder" => Ok(FunctionNodeType::Placeholder),
+            _ => Ok(FunctionNodeType::Placeholder),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDefinition {
     #[allow(dead_code)]
     pub name: String,
@@ -62,13 +107,13 @@ pub struct FunctionDefinition {
     pub arguments: Vec<FunctionArgument>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OwnerType {
     App(String),
     Router(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Mount {
     pub parent: OwnerType, // App or Router doing the .use
     pub child: OwnerType,  // Router being mounted
