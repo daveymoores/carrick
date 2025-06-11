@@ -1262,8 +1262,11 @@ impl Analyzer {
         let tsconfig_path = output_dir.join("tsconfig.json");
         let tsconfig_content = create_standard_tsconfig();
 
-        fs::write(&tsconfig_path, serde_json::to_string_pretty(&tsconfig_content).unwrap())
-            .map_err(|e| format!("Failed to create tsconfig.json: {}", e))?;
+        fs::write(
+            &tsconfig_path,
+            serde_json::to_string_pretty(&tsconfig_content).unwrap(),
+        )
+        .map_err(|e| format!("Failed to create tsconfig.json: {}", e))?;
 
         // Run the type checking script with the minimal tsconfig
         let output = Command::new("npx")

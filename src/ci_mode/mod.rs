@@ -460,7 +460,7 @@ fn recreate_package_and_tsconfig(
     // Create package.json
     let package_json_path = output_dir.join("package.json");
     let package_dependencies = packages.get_dependencies();
-    
+
     // Convert PackageInfo objects to simple version strings for npm
     let mut dependencies = std::collections::HashMap::new();
     for (name, package_info) in package_dependencies {

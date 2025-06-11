@@ -107,12 +107,12 @@ pub fn create_standard_tsconfig() -> Value {
 
 pub fn create_dynamic_tsconfig(output_dir: &std::path::Path) -> Value {
     use std::collections::HashMap;
-    
+
     let mut paths = HashMap::new();
-    
+
     // Add the generic pattern
     paths.insert("*-types".to_string(), vec!["./*_types".to_string()]);
-    
+
     // Scan for actual type files and create specific mappings
     if let Ok(entries) = std::fs::read_dir(output_dir) {
         for entry in entries.flatten() {
@@ -125,7 +125,7 @@ pub fn create_dynamic_tsconfig(output_dir: &std::path::Path) -> Value {
             }
         }
     }
-    
+
     serde_json::json!({
         "compilerOptions": {
             "target": "ES2020",
@@ -148,5 +148,3 @@ pub fn create_dynamic_tsconfig(output_dir: &std::path::Path) -> Value {
         ]
     })
 }
-
-
