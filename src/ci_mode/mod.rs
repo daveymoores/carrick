@@ -1,6 +1,6 @@
 use crate::analyzer::{Analyzer, ApiEndpointDetails};
 use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
-use crate::config::{Config, create_standard_tsconfig};
+use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
 use crate::packages::Packages;
 use crate::parser::parse_file;
@@ -336,13 +336,8 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
             .extend(repo_data.function_definitions.clone());
     }
 
-    // Resolve endpoint paths (same as local mode)
-    let endpoints = analyzer.resolve_all_endpoint_paths(
-        &analyzer.endpoints.clone(),
-        &analyzer.mounts.clone(),
-        &analyzer.apps.clone(),
-    );
-    analyzer.endpoints = endpoints;
+    // Skip path resolution in CI mode - endpoints are already resolved in analyze_current_repo
+    // analyzer.endpoints already contains resolved paths from individual repos
 
     // Build router
     analyzer.build_endpoint_router();
@@ -501,9 +496,9 @@ fn recreate_package_and_tsconfig(
         println!("Dependencies installed successfully");
     }
 
-    // Create tsconfig.json
+    // Create tsconfig.json with dynamic path mappings based on actual type files
     let tsconfig_path = output_dir.join("tsconfig.json");
-    let tsconfig_content = create_standard_tsconfig();
+    let tsconfig_content = create_dynamic_tsconfig(output_dir);
 
     std::fs::write(
         &tsconfig_path,

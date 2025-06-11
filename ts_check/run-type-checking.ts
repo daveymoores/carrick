@@ -4,6 +4,19 @@ import { TypeCompatibilityChecker } from "./lib/type-checker";
 import { Project } from "ts-morph";
 import * as path from "path";
 
+function cleanupPaths(text: string): string {
+  // Remove absolute paths from TypeScript error messages
+  // Convert: import("/full/path/to/repo-c_types").Comment[]
+  // To: import("repo-c-types").Comment[]
+  return text.replace(
+    /import\("([^"]*[/\\])([^"]*_types)"\)/g,
+    (match, fullPath, fileName) => {
+      const cleanName = fileName.replace("_", "-");
+      return `import("${cleanName}")`;
+    }
+  );
+}
+
 async function main() {
   try {
     console.log("Installing dependencies for type checking...");
@@ -46,9 +59,9 @@ async function main() {
     const simplifiedResult = {
       mismatches: typeCheckResult.mismatches.map((mismatch) => ({
         endpoint: mismatch.endpoint,
-        producerType: mismatch.producerType,
-        consumerType: mismatch.consumerType,
-        error: mismatch.errorDetails,
+        producerType: cleanupPaths(mismatch.producerType),
+        consumerType: cleanupPaths(mismatch.consumerType),
+        error: cleanupPaths(mismatch.errorDetails),
         isCompatible: mismatch.isAssignable,
       })),
       compatibleCount: typeCheckResult.compatiblePairs,
@@ -72,7 +85,7 @@ async function main() {
         `\n❌ Found ${typeCheckResult.mismatches.length} type compatibility issues:`,
       );
       typeCheckResult.mismatches.forEach((mismatch) => {
-        console.log(`  - ${mismatch.endpoint}: ${mismatch.errorDetails}`);
+        console.log(`  - ${mismatch.endpoint}: ${cleanupPaths(mismatch.errorDetails)}`);
       });
     }
 
