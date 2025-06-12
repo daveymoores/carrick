@@ -1,0 +1,176 @@
+   Compiling carrick v0.1.0 (/Users/djm/WebstormProjects/rust-projects/carrick)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.05s
+     Running `target/debug/carrick test-repo`
+---> Analyzing JavaScript/TypeScript files in: test-repo
+Found 1 files to analyze in directory test-repo
+Found package.json: test-repo/package.json
+Found carrick.json file: test-repo/carrick.json
+Parsing: test-repo/test-repo.ts
+Detected Express app: app
+Detected Router: apiRouter
+Detected Router: v1Router
+Detected Router: adminRouter
+Detected endpoint: GET /users on app
+Detected endpoint: GET /dynamic on app
+Detected endpoint: POST /comments on v1Router
+Detected endpoint: GET /stats on adminRouter
+Router use: test-repo:apiRouter(/v1) -> v1Router
+App use: test-repo:app(/api) -> apiRouter
+App use: test-repo:app(/admin) -> adminRouter
+Unique endpoint paths: 4
+Cleaning output directory: ts_check/output
+Created clean output directory: ts_check/output
+Processing 9 types from repository: test-repo
+Extracting 9 types from test-repo
+Type extraction output: Processing 9 types from input
+Found type reference at 544 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Request
+Processing type reference: Request
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+CDR: Resolving import specifier "Request" to its original symbol.
+CDR:   ↳ Found aliased declaration: InterfaceDeclaration in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/node_modules/@types/express/index.d.ts
+Queued composite alias: export type GetUsersRequestProducer = Request;
+Found type reference at 558 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Response<User[]>
+Processing type reference: Response
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+CDR: Resolving import specifier "Response" to its original symbol.
+CDR:   ↳ Found aliased declaration: InterfaceDeclaration in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/node_modules/@types/express/index.d.ts
+  - Type argument: User[]
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+processTypeNode: ArrayType - User[]
+processTypeNode: TypeReference - User
+Found local type argument: User
+CDR: Adding to collectedDeclarations: InterfaceDeclaration "User" from /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetUsersResponseProducer = Response<User[]>;
+Found type reference at 734 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Request
+Processing type reference: Request
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetDynamicRequestProducer = Request;
+Found type reference at 748 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Response
+Processing type reference: Response
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetDynamicResponseProducer = Response;
+Found type reference at 867 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Request<{}, {}, Comment>
+Processing type reference: Request
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+  - Type argument: {}
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+processTypeNode: TypeLiteral - {}
+Processing type literal: {}
+  - Type argument: {}
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+processTypeNode: TypeLiteral - {}
+Processing type literal: {}
+  - Type argument: Comment
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+processTypeNode: TypeReference - Comment
+Found local type argument: Comment
+CDR: Adding to collectedDeclarations: InterfaceDeclaration "Comment" from /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+Queued composite alias: export type PostApiV1CommentsRequestProducer = Request<{}, {}, Comment>;
+Found type reference at 898 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Response
+Processing type reference: Response
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+Queued composite alias: export type PostApiV1CommentsResponseProducer = Response;
+Found type reference at 268 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Request
+Processing type reference: Request
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetAdminStatsRequestProducer = Request;
+Found type reference at 282 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: Response
+Processing type reference: Response
+--------> /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetAdminStatsResponseProducer = Response;
+Found type reference at 1465 in /Users/djm/WebstormProjects/rust-projects/carrick/test-repo/test-repo.ts: :
+Queued composite alias: export type GetEnvVarCoreApiUsersResponseConsumerCall1 = User[];
+After utility collection: 2 declarations.
+Added main package: @types/express
+Added types package: @types/express
+Added main package for types: express
+Package.json created at ts_check/output/package.json with 2 dependencies
+tsconfig.json created at ts_check/output/tsconfig.json
+All recursively acquired type/interface/enum/class declarations written to ts_check/output/test-repo_types.ts
+{"success":true,"output":"ts_check/output/test-repo_types.ts","typeCount":11}
+
+
+Running type compatibility checking...
+Installing dependencies for type checking...
+
+added 79 packages, and audited 80 packages in 3s
+
+14 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+Dependencies installed successfully
+
+🔍 Starting type compatibility checking...
+outputDir -> ts_check/output
+
+✅ All types are compatible!
+
+Type checking summary:
+  Compatible pairs: 0
+  Incompatible pairs: 0
+  Orphaned producers: 4
+  Orphaned consumers: 1
+  Orphaned producers: GET /admin/stats (GetAdminStatsResponseProducer), GET /dynamic (GetDynamicResponseProducer), GET /users (GetUsersResponseProducer), POST /api/v1/comments (PostApiV1CommentsResponseProducer)
+  Orphaned consumers: GET /env/var/core/api/users (GetEnvVarCoreApiUsersResponseConsumerCall1)
+<!-- CARRICK_OUTPUT_START -->
+<!-- CARRICK_ISSUE_COUNT:5 -->
+### 🪢 CARRICK: API Analysis Results
+
+Found **5 total issues**: **1 critical mismatches**, **3 connectivity issues**, and **1 configuration suggestions**.
+
+<br>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">1 Critical: API Mismatches</strong>
+</summary>
+
+> These issues indicate a direct conflict between the API consumer and producer and should be addressed first.
+
+#### Request Body Mismatch: `POST /api/v1/comments`
+
+A call to this endpoint was made with an incorrect body.
+
+  - **Call Payload Type:** `Unknown`
+  - **Endpoint Expects Type:** `Object`
+
+</details>
+<hr>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">3 Connectivity Issues</strong>
+</summary>
+
+> These endpoints are either defined but never used (orphaned) or called but never defined (missing). This could be dead code or a misconfigured route.
+
+#### 1 Missing Endpoint
+
+| Method | Path |
+| :--- | :--- |
+| `GET` | `/not-found` |
+
+<br>
+
+#### 2 Orphaned Endpoints
+
+| Method | Path |
+| :--- | :--- |
+| `GET` | `/admin/stats` |
+| `GET` | `/dynamic` |
+</details>
+<hr>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">1 Configuration Suggestions</strong>
+</summary>
+
+> These API calls use environment variables to construct the URL. To enable full analysis, consider adding them to your tool's external API configuration.
+
+  - `GET` using **[UNKNOWN_API]** in `/data`
+</details>
+-----
+<!-- CARRICK_OUTPUT_END -->
+

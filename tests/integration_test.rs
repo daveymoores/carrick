@@ -3,6 +3,54 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
+// Test utilities for parsing new formatter output
+struct TestOutput {
+    raw_output: String,
+    endpoint_count: usize,
+    has_success: bool,
+}
+
+impl TestOutput {
+    fn parse(stdout: &str) -> Self {
+        let raw_output = stdout.to_string();
+
+        // Extract endpoint count from "Analyzed **X endpoints**" in new formatted output
+        let endpoint_count = stdout
+            .lines()
+            .find(|line| line.contains("Analyzed **") && line.contains(" endpoints**"))
+            .and_then(|line| {
+                // Parse "Analyzed **4 endpoints** and **5 API calls**"
+                let parts: Vec<&str> = line.split("**").collect();
+                if parts.len() >= 2 {
+                    parts[1]
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        // Check for successful analysis (presence of CARRICK header)
+        let has_success = stdout.contains("🪢 CARRICK: API Analysis Results");
+
+        Self {
+            raw_output,
+            endpoint_count,
+            has_success,
+        }
+    }
+
+    fn contains_endpoint(&self, endpoint: &str) -> bool {
+        self.raw_output.contains(endpoint)
+    }
+
+    fn contains_no_duplicates_bug(&self) -> bool {
+        self.raw_output.contains("Unique endpoint paths: 0")
+    }
+}
+
 #[test]
 fn test_imported_router_endpoint_resolution() {
     // Create a temporary directory for the test
@@ -35,50 +83,27 @@ fn test_imported_router_endpoint_resolution() {
     // The command should succeed
     assert!(output.status.success(), "Carrick command failed");
 
-    // Check that endpoints were properly detected and resolved
-    // We expect to find these endpoints based on our test fixture:
-    // - GET /users/:id (from userRouter mounted at /users)
-    // - POST /users (from userRouter mounted at /users)
-    // - GET /users (from userRouter mounted at /users)
-    // - GET /api/v1/posts (from apiRouter mounted at /api/v1)
-    // - POST /api/v1/posts (from apiRouter mounted at /api/v1)
-    // - GET /api/v1/stats (from apiRouter mounted at /api/v1)
-    // - DELETE /api/v1/posts/:id (from apiRouter mounted at /api/v1)
-    // - GET /health/status (from healthRouter mounted at /health)
-    // - GET /health/ping (from healthRouter mounted at /health)
-    // - GET /health/ready (from healthRouter mounted at /health)
+    // Parse the output using our test utilities
+    let test_output = TestOutput::parse(&stdout);
 
-    // Check for "Found X endpoints" message indicating successful endpoint detection
+    // Check that analysis completed successfully
     assert!(
-        stdout.contains("Found ") && stdout.contains(" endpoints across all files"),
-        "Should report found endpoints. Output: {}",
+        test_output.has_success,
+        "Should have successful CARRICK analysis output. Output: {}",
         stdout
     );
 
-    // Extract the number of endpoints found
-    let endpoints_line = stdout
-        .lines()
-        .find(|line| line.contains("Found ") && line.contains(" endpoints across all files"))
-        .expect("Should find endpoints summary line");
-
-    let endpoints_count: usize = endpoints_line
-        .split_whitespace()
-        .nth(1)
-        .expect("Should find endpoints count")
-        .parse()
-        .expect("Should parse endpoints count as number");
-
     // We should find at least 10 endpoints (the exact number depends on our fixture)
     assert!(
-        endpoints_count >= 10,
+        test_output.endpoint_count >= 10,
         "Expected at least 10 endpoints, but found {}. This suggests imported router resolution failed. Output: {}",
-        endpoints_count,
+        test_output.endpoint_count,
         stdout
     );
 
     // Check that "Unique endpoint paths: 0" does NOT appear (this was the bug)
     assert!(
-        !stdout.contains("Unique endpoint paths: 0"),
+        !test_output.contains_no_duplicates_bug(),
         "Found 'Unique endpoint paths: 0' which indicates the imported router bug. Output: {}",
         stdout
     );
@@ -97,7 +122,7 @@ fn test_imported_router_endpoint_resolution() {
 
     for endpoint in &expected_endpoints {
         assert!(
-            stdout.contains(endpoint),
+            test_output.contains_endpoint(endpoint),
             "Expected to find endpoint '{}' in output. This suggests imported router resolution failed. Output: {}",
             endpoint,
             stdout
@@ -134,31 +159,21 @@ fn test_basic_endpoint_detection() {
         "Carrick command failed on test-repo"
     );
 
-    // Should find the expected endpoints from test-repo
+    // Parse the output using our test utilities
+    let test_output = TestOutput::parse(&stdout);
+
+    // Check that analysis completed successfully
     assert!(
-        stdout.contains("Found ") && stdout.contains(" endpoints across all files"),
-        "Should report found endpoints in test-repo. Output: {}",
+        test_output.has_success,
+        "Should have successful CARRICK analysis output for test-repo. Output: {}",
         stdout
     );
 
-    // Extract endpoints count
-    let endpoints_line = stdout
-        .lines()
-        .find(|line| line.contains("Found ") && line.contains(" endpoints across all files"))
-        .expect("Should find endpoints summary line");
-
-    let endpoints_count: usize = endpoints_line
-        .split_whitespace()
-        .nth(1)
-        .expect("Should find endpoints count")
-        .parse()
-        .expect("Should parse endpoints count as number");
-
     // test-repo should have 4 endpoints
     assert_eq!(
-        endpoints_count, 4,
+        test_output.endpoint_count, 4,
         "Expected 4 endpoints in test-repo, but found {}. Output: {}",
-        endpoints_count, stdout
+        test_output.endpoint_count, stdout
     );
 }
 
@@ -208,6 +223,16 @@ fn test_no_duplicate_processing_regression() {
 
     assert!(output.status.success(), "Carrick command failed");
 
+    // Parse the output using our test utilities
+    let test_output = TestOutput::parse(&stdout);
+
+    // Check that analysis completed successfully
+    assert!(
+        test_output.has_success,
+        "Should have successful CARRICK analysis output. Output: {}",
+        stdout
+    );
+
     // Count how many times each router file appears in the parsing logs
     let users_parse_count = stdout
         .matches("Parsing:")
@@ -243,7 +268,7 @@ fn test_no_duplicate_processing_regression() {
 
     // Most importantly, we should NOT see "Unique endpoint paths: 0"
     assert!(
-        !stdout.contains("Unique endpoint paths: 0"),
+        !test_output.contains_no_duplicates_bug(),
         "Found 'Unique endpoint paths: 0' which indicates the imported router resolution bug has regressed. Output: {}",
         stdout
     );

@@ -34,7 +34,9 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
     // Header
     output.push_str(&format!(
-        "### 🪢 CARRICK: API Analysis Results\n\nFound **{} total issues**: **{} critical mismatches**, **{} connectivity issues**, and **{} configuration suggestions**.\n\n<br>\n\n",
+        "### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\nFound **{} total issues**: **{} critical mismatches**, **{} connectivity issues**, and **{} configuration suggestions**.\n\n<br>\n\n",
+        result.endpoints.len(),
+        result.calls.len(),
         total_issues,
         categorized_issues.critical.len(),
         categorized_issues.connectivity.len(),
@@ -74,7 +76,7 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
 fn format_no_issues(result: &ApiAnalysisResult) -> String {
     format!(
-        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\n✅ **No API inconsistencies detected!**\n\nAnalyzed {} endpoints and {} API calls across all repositories.\n\n-----\n<!-- CARRICK_OUTPUT_END -->\n",
+        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n-----\n<!-- CARRICK_OUTPUT_END -->\n",
         result.endpoints.len(),
         result.calls.len()
     )
