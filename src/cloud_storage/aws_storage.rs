@@ -77,11 +77,7 @@ struct GetCrossRepoRequest {
 
 impl AwsStorage {
     pub fn new() -> Result<Self, StorageError> {
-        let lambda_url = env::var("CARRICK_LAMBDA_URL").map_err(|_| {
-            StorageError::ConnectionError(
-                "CARRICK_LAMBDA_URL environment variable not set".to_string(),
-            )
-        })?;
+        let lambda_url = env!("CARRICK_LAMBDA_URL").to_string();
 
         let api_key = env::var("CARRICK_API_KEY").map_err(|_| {
             StorageError::ConnectionError(

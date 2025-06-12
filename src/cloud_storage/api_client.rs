@@ -48,11 +48,7 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new() -> Result<Self, StorageError> {
-        let base_url = env::var("CARRICK_API_ENDPOINT").map_err(|_| {
-            StorageError::ConnectionError(
-                "CARRICK_API_ENDPOINT environment variable not set".to_string(),
-            )
-        })?;
+        let base_url = env!("CARRICK_API_ENDPOINT").to_string();
 
         let api_key = env::var("CARRICK_API_KEY").map_err(|_| {
             StorageError::ConnectionError(
