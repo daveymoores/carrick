@@ -37,24 +37,74 @@ pub async fn run_ci_mode<T: CloudStorage>(
     // 1. Analyze current repo only
     let current_repo_data = analyze_current_repo(repo_path)?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
+    println!(
+        "Current repo has {} API calls",
+        current_repo_data.calls.len()
+    );
 
-    // 2. Upload current repo data to cloud storage (without AST nodes)
-    let cloud_data_serialized = serialize_cloud_repo_data_without_ast(&current_repo_data);
-    storage
-        .upload_repo_data(&carrick_org, &cloud_data_serialized)
-        .await
-        .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-    println!("Uploaded current repo data to cloud storage");
+    // 2. Upload current repo data to cloud storage only if on main branch (not PRs)
+    // Allow upload when running locally (GITHUB_REF not available)
+    let github_ref = env::var("GITHUB_REF").ok();
+    let is_main_branch = match &github_ref {
+        Some(ref_value) => ref_value == "refs/heads/main" || ref_value == "refs/heads/master",
+        None => {
+            println!("GITHUB_REF not found - assuming local development, allowing upload");
+            true
+        }
+    };
 
-    // 3. Download data from all repos
-    let (all_repo_data, repo_s3_urls) = storage // Updated to destructure tuple
+    if is_main_branch {
+        let cloud_data_serialized = serialize_cloud_repo_data_without_ast(&current_repo_data);
+        storage
+            .upload_repo_data(&carrick_org, &cloud_data_serialized)
+            .await
+            .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+        println!("Uploaded current repo data to cloud storage");
+    } else {
+        println!("Skipping upload - running in PR mode (ref: {:?})", github_ref);
+    }
+
+    // 3. Download data from all repos (excluding current repo to avoid duplication)
+    let (mut all_repo_data, repo_s3_urls) = storage // Updated to destructure tuple
         .download_all_repo_data(&carrick_org)
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
-    println!("Downloaded data from {} repos", all_repo_data.len());
+
+    // Filter out current repo to prevent duplication
+    println!(
+        "Before filtering - repos found: {:?}",
+        all_repo_data
+            .iter()
+            .map(|r| &r.repo_name)
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "Current repo name for filtering: '{}'",
+        current_repo_data.repo_name
+    );
+    all_repo_data.retain(|repo_data| repo_data.repo_name != current_repo_data.repo_name);
+    println!(
+        "After filtering - repos remaining: {:?}",
+        all_repo_data
+            .iter()
+            .map(|r| &r.repo_name)
+            .collect::<Vec<_>>()
+    );
+    println!("Downloaded data from {} other repos", all_repo_data.len());
+
+    // Debug: Show API calls from each repo
+    for repo_data in &all_repo_data {
+        println!(
+            "Repo '{}' has {} API calls",
+            repo_data.repo_name,
+            repo_data.calls.len()
+        );
+    }
 
     // 4. Reconstruct analyzer with combined data
-    let analyzer = build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage).await?; // Pass repo_s3_urls and storage
+    let analyzer =
+        build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage, &current_repo_data)
+            .await?; // Pass repo_s3_urls, storage, and current_repo_data
     println!("Reconstructed analyzer with cross-repo data");
 
     // 5. Run analysis
@@ -305,19 +355,35 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     all_repo_data: Vec<CloudRepoData>,
     repo_s3_urls: HashMap<String, String>, // Add this parameter
     storage: &T,
+    current_repo_data: &CloudRepoData,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
-    // Combine all configs
-    let combined_config = merge_configs(&all_repo_data)?;
+    // Combine all configs (including current repo)
+    let combined_config = merge_configs(&all_repo_data, current_repo_data)?;
 
-    // Combine all packages
-    let combined_packages = merge_packages(&all_repo_data)?;
+    // Combine all packages (including current repo)
+    let combined_packages = merge_packages(&all_repo_data, current_repo_data)?;
 
     // Create analyzer with combined config
     let cm: Lrc<SourceMap> = Default::default();
     let mut analyzer = Analyzer::new(combined_config, cm.clone());
 
-    // Populate analyzer with data from all repos
+    // Add current repo data first
+    analyzer
+        .endpoints
+        .extend(current_repo_data.endpoints.clone());
+    analyzer.calls.extend(current_repo_data.calls.clone());
+    analyzer.mounts.extend(current_repo_data.mounts.clone());
+    analyzer.apps.extend(current_repo_data.apps.clone());
+    analyzer
+        .imported_handlers
+        .extend(current_repo_data.imported_handlers.clone());
+    analyzer
+        .function_definitions
+        .extend(current_repo_data.function_definitions.clone());
+
+    // Populate analyzer with data from other repos
     for repo_data in &all_repo_data {
+        println!("Adding repo '{}' with {} calls", repo_data.repo_name, repo_data.calls.len());
         analyzer.endpoints.extend(repo_data.endpoints.clone());
         analyzer.calls.extend(repo_data.calls.clone());
         analyzer.mounts.extend(repo_data.mounts.clone());
@@ -328,6 +394,7 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
         analyzer
             .function_definitions
             .extend(repo_data.function_definitions.clone());
+        println!("After adding '{}': {} total calls", repo_data.repo_name, analyzer.calls.len());
     }
 
     // Skip path resolution in CI mode - endpoints are already resolved in analyze_current_repo
@@ -359,9 +426,18 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     Ok(analyzer)
 }
 
-fn merge_configs(all_repo_data: &[CloudRepoData]) -> Result<Config, Box<dyn std::error::Error>> {
-    // For now, just use the first available config
-    // TODO: Implement proper config merging logic
+fn merge_configs(
+    all_repo_data: &[CloudRepoData],
+    current_repo_data: &CloudRepoData,
+) -> Result<Config, Box<dyn std::error::Error>> {
+    // First try current repo config
+    if let Some(config_json) = &current_repo_data.config_json {
+        if let Ok(config) = serde_json::from_str::<Config>(config_json) {
+            return Ok(config);
+        }
+    }
+
+    // Then try other repos
     for repo_data in all_repo_data {
         if let Some(config_json) = &repo_data.config_json {
             if let Ok(config) = serde_json::from_str::<Config>(config_json) {
@@ -372,9 +448,18 @@ fn merge_configs(all_repo_data: &[CloudRepoData]) -> Result<Config, Box<dyn std:
     Ok(Config::default())
 }
 
-fn merge_packages(all_repo_data: &[CloudRepoData]) -> Result<Packages, Box<dyn std::error::Error>> {
-    // For now, just use the first available packages
-    // TODO: Implement proper package merging logic
+fn merge_packages(
+    all_repo_data: &[CloudRepoData],
+    current_repo_data: &CloudRepoData,
+) -> Result<Packages, Box<dyn std::error::Error>> {
+    // First try current repo packages
+    if let Some(package_json) = &current_repo_data.package_json {
+        if let Ok(packages) = serde_json::from_str::<Packages>(package_json) {
+            return Ok(packages);
+        }
+    }
+
+    // Then try other repos
     for repo_data in all_repo_data {
         if let Some(package_json) = &repo_data.package_json {
             if let Ok(packages) = serde_json::from_str::<Packages>(package_json) {
