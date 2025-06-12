@@ -504,59 +504,6 @@ fn recreate_package_and_tsconfig(
 }
 
 fn print_results(result: crate::analyzer::ApiAnalysisResult) {
-    println!("\nAPI Analysis Results:");
-    println!("=====================");
-    println!(
-        "Found {} endpoints across all files",
-        result.endpoints.len()
-    );
-    println!("Found {} API calls across all files", result.calls.len());
-
-    if result.issues.is_empty() {
-        println!("\nNo API inconsistencies detected!");
-    } else {
-        println!("\nFound {} API issues:", result.issues.len());
-        let call_issues = result.issues.call_issues;
-        let endpoint_issues = result.issues.endpoint_issues;
-        let env_var_calls = result.issues.env_var_calls;
-        let mismatches = result.issues.mismatches;
-        let type_mismatches = result.issues.type_mismatches;
-        let mut issue_number: usize = 0;
-
-        if !call_issues.is_empty() {
-            for (i, issue) in call_issues.iter().enumerate() {
-                issue_number = i + 1;
-                print!("\n{}. {}", &issue_number, issue);
-            }
-        }
-
-        if !endpoint_issues.is_empty() {
-            for issue in endpoint_issues.iter() {
-                issue_number = issue_number + 1;
-                print!("\n{}. {}", &issue_number, issue);
-            }
-        }
-
-        for issue in mismatches.iter() {
-            issue_number = issue_number + 1;
-            print!("\n{}. {}", &issue_number, issue);
-        }
-
-        if !type_mismatches.is_empty() {
-            for issue in type_mismatches.iter() {
-                issue_number = issue_number + 1;
-                print!("\n{}. {}", &issue_number, issue);
-            }
-        }
-
-        if !env_var_calls.is_empty() {
-            for issue in env_var_calls.iter() {
-                issue_number = issue_number + 1;
-                print!(
-                    "\n{}. {}\n     - Consider adding to known external APIs configuration",
-                    &issue_number, issue
-                );
-            }
-        }
-    }
+    let formatted_output = crate::formatter::FormattedOutput::new(result);
+    formatted_output.print();
 }

@@ -52,8 +52,8 @@ runs:
         set -e
 
         ISSUES=0
-        if grep -q "Found .* API issues:" analysis.log; then
-          ISSUES=$(grep "Found .* API issues:" analysis.log | grep -o '[0-9]\+' | head -1)
+        if grep -q "CARRICK_ISSUE_COUNT:" analysis.log; then
+          ISSUES=$(grep "CARRICK_ISSUE_COUNT:" analysis.log | sed 's/.*CARRICK_ISSUE_COUNT:\([0-9]*\).*/\1/')
         fi
 
         if [ $EXIT_CODE -eq 0 ]; then
@@ -64,16 +64,11 @@ runs:
 
         echo "issues-found=$ISSUES" >> $GITHUB_OUTPUT
 
-        # Extract API Analysis Results section and format for PR comment
-        if grep -q "API Analysis Results:" analysis.log; then
-          # Create formatted PR comment
-          {
-            echo "## 🪢 Carrick API Analysis Results"
-            echo ""
-            echo '```'
-            sed -n '/API Analysis Results:/,$p' analysis.log
-            echo '```'
-          } > pr_comment.md
+        # Extract formatted markdown output between delimiters
+        if grep -q "CARRICK_OUTPUT_START" analysis.log; then
+          # Extract content between delimiters
+          sed -n '/<!-- CARRICK_OUTPUT_START -->/,/<!-- CARRICK_OUTPUT_END -->/p' analysis.log | \
+            grep -v "CARRICK_OUTPUT_START\|CARRICK_OUTPUT_END\|CARRICK_ISSUE_COUNT" > pr_comment.md
           
           # Set multiline output for PR comment
           {
@@ -84,9 +79,9 @@ runs:
         else
           {
             echo "pr-comment<<EOF"
-            echo "## 🪢 Carrick API Analysis Results"
+            echo "### 🪢 CARRICK: API Analysis Results"
             echo ""
-            echo "No API analysis results found in output."
+            echo "⚠️ No API analysis results found in output."
             echo "EOF"
           } >> $GITHUB_OUTPUT
         fi
