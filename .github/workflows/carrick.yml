@@ -8,6 +8,8 @@ jobs:
   test-published-action:
     name: Test Published Action
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
