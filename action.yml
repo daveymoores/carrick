@@ -20,6 +20,9 @@ outputs:
   issues-found:
     description: "Number of API issues detected"
     value: ${{ steps.analysis.outputs.issues-found }}
+  pr-comment:
+    description: "Formatted PR comment with API Analysis Results"
+    value: ${{ steps.analysis.outputs.pr-comment }}
 
 runs:
   using: "composite"
@@ -60,6 +63,33 @@ runs:
         fi
 
         echo "issues-found=$ISSUES" >> $GITHUB_OUTPUT
+
+        # Extract API Analysis Results section and format for PR comment
+        if grep -q "API Analysis Results:" analysis.log; then
+          # Create formatted PR comment
+          {
+            echo "## 🪢 Carrick API Analysis Results"
+            echo ""
+            echo '```'
+            sed -n '/API Analysis Results:/,$p' analysis.log
+            echo '```'
+          } > pr_comment.md
+          
+          # Set multiline output for PR comment
+          {
+            echo "pr-comment<<EOF"
+            cat pr_comment.md
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+        else
+          {
+            echo "pr-comment<<EOF"
+            echo "## 🪢 Carrick API Analysis Results"
+            echo ""
+            echo "No API analysis results found in output."
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+        fi
 
         cat analysis.log
         exit $EXIT_CODE
