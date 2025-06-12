@@ -7,7 +7,7 @@ use crate::{
     config::{Config, create_standard_tsconfig},
     extractor::CoreExtractor,
     packages::Packages,
-    utils::{join_prefix_and_path, get_repository_name},
+    utils::{get_repository_name, join_prefix_and_path},
     visitor::{
         Call, DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType,
         TypeReference,
@@ -98,8 +98,6 @@ pub enum FieldMismatch {
     ExtraField(String),
     TypeMismatch(String, String, String), // (path, call_type, endpoint_type)
 }
-
-
 
 impl CoreExtractor for Analyzer {
     fn get_source_map(&self) -> &Lrc<SourceMap> {
