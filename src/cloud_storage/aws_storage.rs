@@ -1,4 +1,5 @@
 use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError};
+use crate::utils::get_repository_name;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -398,7 +399,10 @@ impl CloudStorage for AwsStorage {
 fn find_generated_typescript_file(repo_name: &str) -> Option<String> {
     use std::path::Path;
 
-    let expected_filename = format!("{}_types.ts", repo_name);
+    // Use the shared repository name extraction logic
+    let actual_repo_name = get_repository_name(repo_name);
+
+    let expected_filename = format!("{}_types.ts", actual_repo_name);
     let expected_path = Path::new(".")
         .join("ts_check/output")
         .join(&expected_filename);

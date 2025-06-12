@@ -5,10 +5,12 @@ use crate::file_finder::find_files;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::resolve_import_path;
+use crate::utils::get_repository_name;
 use crate::visitor::DependencyVisitor;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+
 use swc_common::{
     SourceMap,
     errors::{ColorConfig, Handler},
@@ -64,6 +66,8 @@ pub async fn run_ci_mode<T: CloudStorage>(
     Ok(())
 }
 
+
+
 /// Serialize CloudRepoData without AST nodes in ApiEndpointDetails
 fn serialize_cloud_repo_data_without_ast(data: &CloudRepoData) -> CloudRepoData {
     CloudRepoData {
@@ -112,12 +116,8 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
         repo_path
     );
 
-    let repo_name = repo_path
-        .split("/")
-        .filter(|s| !s.is_empty())
-        .last()
-        .unwrap_or(".")
-        .to_string();
+    let repo_name = get_repository_name(repo_path);
+    println!("Extracted repository name: '{}'", repo_name);
 
     // Find files in current repo only
     let ignore_patterns = ["node_modules", "dist", "build", ".next"];
@@ -287,13 +287,9 @@ fn extract_types_for_current_repo(
     }
 
     // Extract types for current repository
-    let repo_name = repo_path
-        .split("/")
-        .filter(|s| !s.is_empty())
-        .last()
-        .unwrap_or("default");
+    let repo_name = get_repository_name(repo_path);
 
-    let type_infos = repo_type_map.get(repo_name).cloned().unwrap_or_default();
+    let type_infos = repo_type_map.get(&repo_name).cloned().unwrap_or_default();
 
     if !type_infos.is_empty() {
         println!(

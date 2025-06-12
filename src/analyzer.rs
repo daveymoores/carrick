@@ -7,7 +7,7 @@ use crate::{
     config::{Config, create_standard_tsconfig},
     extractor::CoreExtractor,
     packages::Packages,
-    utils::join_prefix_and_path,
+    utils::{join_prefix_and_path, get_repository_name},
     visitor::{
         Call, DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType,
         TypeReference,
@@ -98,6 +98,8 @@ pub enum FieldMismatch {
     ExtraField(String),
     TypeMismatch(String, String, String), // (path, call_type, endpoint_type)
 }
+
+
 
 impl CoreExtractor for Analyzer {
     fn get_source_map(&self) -> &Lrc<SourceMap> {
@@ -1086,11 +1088,7 @@ impl Analyzer {
 
         // Prepare JSON input with type information
         let json_input = serde_json::to_string(&type_infos).unwrap();
-        let repo_suffix = repo_path
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .last()
-            .expect("repo_suffix not found");
+        let repo_suffix = get_repository_name(repo_path);
         let output_path = format!("ts_check/output/{}_types.ts", repo_suffix);
 
         // Ensure the `ts_check/output` directory exists
@@ -1395,9 +1393,8 @@ impl Analyzer {
         repo_paths
             .iter()
             .find(|repo_path| file_path_str.starts_with(*repo_path))
-            .and_then(|repo_path| repo_path.split("/").filter(|s| !s.is_empty()).last())
-            .unwrap_or("default")
-            .to_string()
+            .map(|repo_path| get_repository_name(repo_path))
+            .unwrap_or("default".to_string())
     }
 
     /// Add a TypeReference to the repository type map with incremental naming for multiple calls
@@ -1539,12 +1536,8 @@ pub fn analyze_api_consistency(
     // Process types for each repository using the original repo paths
 
     for repo_path in repo_paths {
-        let repo_name = repo_path
-            .split("/")
-            .filter(|s| !s.is_empty())
-            .last()
-            .unwrap_or("default");
-        if let Some(type_infos) = repo_type_map.get(repo_name) {
+        let repo_name = get_repository_name(&repo_path);
+        if let Some(type_infos) = repo_type_map.get(&repo_name) {
             println!(
                 "Processing {} types from repository: {}",
                 type_infos.len(),
