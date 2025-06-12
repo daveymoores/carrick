@@ -66,8 +66,6 @@ pub async fn run_ci_mode<T: CloudStorage>(
     Ok(())
 }
 
-
-
 /// Serialize CloudRepoData without AST nodes in ApiEndpointDetails
 fn serialize_cloud_repo_data_without_ast(data: &CloudRepoData) -> CloudRepoData {
     CloudRepoData {
