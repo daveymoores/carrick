@@ -49,13 +49,17 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
     // Connectivity Issues Section
     if !categorized_issues.connectivity.is_empty() {
-        output.push_str(&format_connectivity_section(&categorized_issues.connectivity));
+        output.push_str(&format_connectivity_section(
+            &categorized_issues.connectivity,
+        ));
         output.push_str("\n<hr>\n\n");
     }
 
     // Configuration Issues Section
     if !categorized_issues.configuration.is_empty() {
-        output.push_str(&format_configuration_section(&categorized_issues.configuration));
+        output.push_str(&format_configuration_section(
+            &categorized_issues.configuration,
+        ));
     }
 
     // Remove trailing <hr> if present
@@ -128,7 +132,11 @@ fn format_critical_section(issues: &[String]) -> String {
 
     for (issue_type, issue_list) in grouped {
         if issue_list.len() > 1 {
-            output.push_str(&format!("#### {} ({} occurrences)\n\n", issue_type, issue_list.len()));
+            output.push_str(&format!(
+                "#### {} ({} occurrences)\n\n",
+                issue_type,
+                issue_list.len()
+            ));
         } else {
             output.push_str(&format!("#### {}\n\n", issue_type));
         }
@@ -158,7 +166,11 @@ fn format_connectivity_section(issues: &[String]) -> String {
     let (missing, orphaned) = separate_missing_orphaned(issues);
 
     if !missing.is_empty() {
-        output.push_str(&format!("#### {} Missing Endpoint{}\n\n", missing.len(), if missing.len() == 1 { "" } else { "s" }));
+        output.push_str(&format!(
+            "#### {} Missing Endpoint{}\n\n",
+            missing.len(),
+            if missing.len() == 1 { "" } else { "s" }
+        ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in missing {
             let (method, path) = extract_method_path(&endpoint);
@@ -168,7 +180,11 @@ fn format_connectivity_section(issues: &[String]) -> String {
     }
 
     if !orphaned.is_empty() {
-        output.push_str(&format!("#### {} Orphaned Endpoint{}\n\n", orphaned.len(), if orphaned.len() == 1 { "" } else { "s" }));
+        output.push_str(&format!(
+            "#### {} Orphaned Endpoint{}\n\n",
+            orphaned.len(),
+            if orphaned.len() == 1 { "" } else { "s" }
+        ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in orphaned {
             let (method, path) = extract_method_path(&endpoint);
@@ -192,7 +208,10 @@ fn format_configuration_section(issues: &[String]) -> String {
 
     for issue in issues {
         let (method, env_vars, path) = extract_env_var_info(issue);
-        output.push_str(&format!("  - `{}` using **[{}]** in `{}`\n", method, env_vars, path));
+        output.push_str(&format!(
+            "  - `{}` using **[{}]** in `{}`\n",
+            method, env_vars, path
+        ));
     }
 
     output.push_str("</details>");
@@ -204,7 +223,10 @@ fn group_similar_issues(issues: &[String]) -> HashMap<String, Vec<String>> {
 
     for issue in issues {
         let issue_type = extract_issue_type(issue);
-        grouped.entry(issue_type).or_insert_with(Vec::new).push(issue.clone());
+        grouped
+            .entry(issue_type)
+            .or_insert_with(Vec::new)
+            .push(issue.clone());
     }
 
     grouped
@@ -231,8 +253,10 @@ fn format_issue_details(issue: &str) -> String {
     if issue.contains("Request body mismatch") {
         if let Some(arrow_pos) = issue.find(" -> ") {
             let details = &issue[arrow_pos + 4..];
-            return format!("A call to this endpoint was made with an incorrect body.\n\n  - **Call Payload Type:** `{}`\n  - **Endpoint Expects Type:** `Object`\n",
-                          extract_call_type(details));
+            return format!(
+                "A call to this endpoint was made with an incorrect body.\n\n  - **Call Payload Type:** `{}`\n  - **Endpoint Expects Type:** `Object`\n",
+                extract_call_type(details)
+            );
         }
     } else if issue.contains("Type mismatch") {
         return "The API's response type is incompatible with what the client code expects.\n\n  - **Producer (Response) Type:** `Producer`\n  - **Consumer (User) Type:** `User`\n\n> *No more specific diagnostic is available.*".to_string();
@@ -274,7 +298,7 @@ fn extract_method_path(issue: &str) -> (String, String) {
             return (parts[0].to_string(), parts[1].to_string());
         }
     }
-    
+
     // Handle orphaned endpoint format: "Orphaned endpoint: No call matching endpoint GET /api/users"
     if let Some(endpoint_pos) = issue.find("endpoint ") {
         let method_path = &issue[endpoint_pos + 9..];
@@ -304,24 +328,28 @@ fn extract_method_path(issue: &str) -> (String, String) {
 
 fn extract_env_var_info(issue: &str) -> (String, String, String) {
     // Parse issues like "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
-    let method = if issue.contains("GET") { 
-        "GET" 
-    } else if issue.contains("POST") { 
-        "POST" 
-    } else if issue.contains("PUT") { 
-        "PUT" 
-    } else if issue.contains("DELETE") { 
-        "DELETE" 
-    } else { 
-        "UNKNOWN" 
+    let method = if issue.contains("GET") {
+        "GET"
+    } else if issue.contains("POST") {
+        "POST"
+    } else if issue.contains("PUT") {
+        "PUT"
+    } else if issue.contains("DELETE") {
+        "DELETE"
+    } else {
+        "UNKNOWN"
     };
 
     let env_vars = if let Some(start) = issue.find('[') {
         if let Some(end) = issue.find(']') {
             &issue[start + 1..end]
-        } else { "UNKNOWN" }
-    } else { "UNKNOWN" };
-    
+        } else {
+            "UNKNOWN"
+        }
+    } else {
+        "UNKNOWN"
+    };
+
     // Extract just the path part after the env var
     let path = if let Some(start) = issue.find("ENV_VAR:") {
         let env_var_section = &issue[start..];
@@ -333,7 +361,9 @@ fn extract_env_var_info(issue: &str) -> (String, String, String) {
         } else {
             "UNKNOWN"
         }
-    } else { "UNKNOWN" };
-    
+    } else {
+        "UNKNOWN"
+    };
+
     (method.to_string(), env_vars.to_string(), path.to_string())
 }
