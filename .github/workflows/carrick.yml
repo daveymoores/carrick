@@ -16,4 +16,4 @@ jobs:
         with:
           carrick-org: ${{ secrets.CARRICK_ORG }}
           carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
-          github-token: ${{ secrets.CARRICK_DOWNLOAD_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
