@@ -37,11 +37,21 @@ pub async fn run_ci_mode<T: CloudStorage>(
     // 1. Analyze current repo only
     let current_repo_data = analyze_current_repo(repo_path)?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
+    println!(
+        "Current repo has {} API calls",
+        current_repo_data.calls.len()
+    );
 
     // 2. Upload current repo data to cloud storage only if on main branch (not PRs)
-    let is_main_branch = env::var("GITHUB_REF")
-        .map(|r| r == "refs/heads/main" || r == "refs/heads/master")
-        .unwrap_or(false);
+    // Allow upload when running locally (GITHUB_REF not available)
+    let github_ref = env::var("GITHUB_REF").ok();
+    let is_main_branch = match &github_ref {
+        Some(ref_value) => ref_value == "refs/heads/main" || ref_value == "refs/heads/master",
+        None => {
+            println!("GITHUB_REF not found - assuming local development, allowing upload");
+            true
+        }
+    };
 
     if is_main_branch {
         let cloud_data_serialized = serialize_cloud_repo_data_without_ast(&current_repo_data);
@@ -51,7 +61,7 @@ pub async fn run_ci_mode<T: CloudStorage>(
             .map_err(|e| format!("Failed to upload repo data: {}", e))?;
         println!("Uploaded current repo data to cloud storage");
     } else {
-        println!("Skipping upload - not on main branch (running in PR mode)");
+        println!("Skipping upload - running in PR mode (ref: {:?})", github_ref);
     }
 
     // 3. Download data from all repos (excluding current repo to avoid duplication)
@@ -61,8 +71,35 @@ pub async fn run_ci_mode<T: CloudStorage>(
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
 
     // Filter out current repo to prevent duplication
+    println!(
+        "Before filtering - repos found: {:?}",
+        all_repo_data
+            .iter()
+            .map(|r| &r.repo_name)
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "Current repo name for filtering: '{}'",
+        current_repo_data.repo_name
+    );
     all_repo_data.retain(|repo_data| repo_data.repo_name != current_repo_data.repo_name);
+    println!(
+        "After filtering - repos remaining: {:?}",
+        all_repo_data
+            .iter()
+            .map(|r| &r.repo_name)
+            .collect::<Vec<_>>()
+    );
     println!("Downloaded data from {} other repos", all_repo_data.len());
+
+    // Debug: Show API calls from each repo
+    for repo_data in &all_repo_data {
+        println!(
+            "Repo '{}' has {} API calls",
+            repo_data.repo_name,
+            repo_data.calls.len()
+        );
+    }
 
     // 4. Reconstruct analyzer with combined data
     let analyzer =
@@ -346,6 +383,7 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
 
     // Populate analyzer with data from other repos
     for repo_data in &all_repo_data {
+        println!("Adding repo '{}' with {} calls", repo_data.repo_name, repo_data.calls.len());
         analyzer.endpoints.extend(repo_data.endpoints.clone());
         analyzer.calls.extend(repo_data.calls.clone());
         analyzer.mounts.extend(repo_data.mounts.clone());
@@ -356,6 +394,7 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
         analyzer
             .function_definitions
             .extend(repo_data.function_definitions.clone());
+        println!("After adding '{}': {} total calls", repo_data.repo_name, analyzer.calls.len());
     }
 
     // Skip path resolution in CI mode - endpoints are already resolved in analyze_current_repo
