@@ -31,10 +31,6 @@ impl ApiIssues {
             && self.endpoint_issues.is_empty()
             && self.type_mismatches.is_empty()
     }
-
-    pub fn len(&self) -> usize {
-        self.call_issues.len() + self.endpoint_issues.len() + self.type_mismatches.len()
-    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
