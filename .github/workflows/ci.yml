@@ -155,7 +155,7 @@ jobs:
           echo "=== Test-repo output ==="
           cat test_output.txt
           # Check that we find the expected 4 endpoints
-          if ! grep -q "Found 4 endpoints across all files" test_output.txt; then
+          if ! grep -q "Analyzed \*\*4 endpoints\*\*" test_output.txt; then
             echo "ERROR: Expected to find 4 endpoints in test-repo"
             exit 1
           fi
@@ -174,11 +174,11 @@ jobs:
             exit 1
           fi
           # Check that we find a reasonable number of endpoints (at least 10)
-          if ! grep -E "Found [0-9]+ endpoints across all files" imported_test_output.txt; then
-            echo "ERROR: No endpoints found message detected"
+          if ! grep -E "Analyzed \*\*[0-9]+ endpoints\*\*" imported_test_output.txt; then
+            echo "ERROR: Expected to find endpoint count in imported-routers test"
             exit 1
           fi
-          ENDPOINT_COUNT=$(grep -E "Found [0-9]+ endpoints across all files" imported_test_output.txt | sed -E 's/.*Found ([0-9]+) endpoints.*/\1/')
+          ENDPOINT_COUNT=$(grep -E "Analyzed \*\*[0-9]+ endpoints\*\*" imported_test_output.txt | sed -E 's/.*Analyzed \*\*([0-9]+) endpoints\*\*.*/\1/')
           if [ "$ENDPOINT_COUNT" -lt 10 ]; then
             echo "ERROR: Expected at least 10 endpoints, but found $ENDPOINT_COUNT"
             exit 1
