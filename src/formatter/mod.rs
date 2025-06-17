@@ -69,14 +69,13 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
         output.truncate(output.len() - 7);
     }
 
-    output.push_str("\n-----\n");
-    output.push_str("<!-- CARRICK_OUTPUT_END -->\n");
+    output.push_str("\n<!-- CARRICK_OUTPUT_END -->\n");
     output
 }
 
 fn format_no_issues(result: &ApiAnalysisResult) -> String {
     format!(
-        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n-----\n<!-- CARRICK_OUTPUT_END -->\n",
+        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n<!-- CARRICK_OUTPUT_END -->\n",
         result.endpoints.len(),
         result.calls.len()
     )
@@ -242,6 +241,27 @@ fn extract_issue_type(issue: &str) -> String {
             }
         }
         "Request Body Mismatch".to_string()
+    } else if issue.contains(": Type '") {
+        // Parse any TypeScript compiler error to extract endpoint
+        let methods = ["GET ", "POST ", "PUT ", "DELETE ", "PATCH "];
+        for method in &methods {
+            if let Some(start) = issue.find(method) {
+                if let Some(end) = issue.find(": Type '") {
+                    let endpoint = &issue[start..end];
+                    return format!("TypeScript Error: `{}`", endpoint);
+                }
+            }
+        }
+        "TypeScript Error".to_string()
+    } else if issue.contains("Type mismatch on ") {
+        // Parse structured type mismatch errors
+        if let Some(start) = issue.find("Type mismatch on ") {
+            if let Some(end) = issue.find(": Producer") {
+                let endpoint = &issue[start + 17..end];
+                return format!("Type Compatibility Issue: `{}`", endpoint);
+            }
+        }
+        "Type Compatibility Issue".to_string()
     } else if issue.contains("Type mismatch") {
         "Response Type Mismatch".to_string()
     } else if issue.contains("Method mismatch") {
@@ -260,6 +280,20 @@ fn format_issue_details(issue: &str) -> String {
                 extract_call_type(details)
             );
         }
+    } else if issue.contains(": Type '") {
+        // Parse any TypeScript compiler error and display the raw error
+        let (endpoint, error_message) = parse_generic_typescript_error(issue);
+        return format!(
+            "TypeScript compiler error detected.\n\n  - **Endpoint:** `{}`\n  - **Error:** {}\n",
+            endpoint, error_message
+        );
+    } else if issue.contains("Type mismatch on ") {
+        // Parse structured type mismatch errors
+        let (endpoint, producer, consumer, error) = parse_structured_type_error(issue);
+        return format!(
+            "Type compatibility issue detected.\n\n  - **Endpoint:** `{}`\n  - **Producer Type:** `{}`\n  - **Consumer Type:** `{}`\n  - **Error:** {}\n",
+            endpoint, producer, consumer, error
+        );
     } else if issue.contains("Type mismatch") {
         return "The API's response type is incompatible with what the client code expects.\n\n  - **Producer (Response) Type:** `Producer`\n  - **Consumer (User) Type:** `User`\n\n> *No more specific diagnostic is available.*".to_string();
     }
@@ -272,6 +306,176 @@ fn extract_call_type(details: &str) -> &str {
         "Null"
     } else {
         "Unknown"
+    }
+}
+
+fn parse_generic_typescript_error(issue: &str) -> (String, String) {
+    // Parse any TypeScript error like: "GET /users/:param: Type '...' error message"
+
+    let endpoint = {
+        let methods = ["GET ", "POST ", "PUT ", "DELETE ", "PATCH "];
+        let mut found_endpoint = "Unknown".to_string();
+
+        for method in &methods {
+            if let Some(start) = issue.find(method) {
+                if let Some(end) = issue.find(": Type '") {
+                    found_endpoint = issue[start..end].to_string();
+                    break;
+                }
+            }
+        }
+        found_endpoint
+    };
+
+    let error_message = if let Some(start) = issue.find(": ") {
+        let remaining = &issue[start + 2..];
+        if remaining.len() > 200 {
+            format!("{}...", &remaining[..200])
+        } else {
+            remaining.to_string()
+        }
+    } else {
+        issue.to_string()
+    };
+
+    (endpoint, error_message)
+}
+
+fn parse_structured_type_error(issue: &str) -> (String, String, String, String) {
+    // Parse errors like: "Type mismatch on GET /users/:param: Producer (SomeType) incompatible with Consumer (AnotherType) - Error details"
+
+    let endpoint = if let Some(start) = issue.find("Type mismatch on ") {
+        if let Some(end) = issue.find(": Producer") {
+            issue[start + 17..end].to_string()
+        } else {
+            "Unknown".to_string()
+        }
+    } else {
+        "Unknown".to_string()
+    };
+
+    let producer = if let Some(start) = issue.find("Producer (") {
+        if let Some(end) = issue.find(") incompatible") {
+            issue[start + 10..end].to_string()
+        } else {
+            "Unknown".to_string()
+        }
+    } else {
+        "Unknown".to_string()
+    };
+
+    let consumer = if let Some(start) = issue.find("Consumer (") {
+        if let Some(end) = issue.find(") - ") {
+            issue[start + 10..end].to_string()
+        } else {
+            "Unknown".to_string()
+        }
+    } else {
+        "Unknown".to_string()
+    };
+
+    let error = if let Some(start) = issue.find(") - ") {
+        let remaining = &issue[start + 4..];
+        if remaining.len() > 150 {
+            format!("{}...", &remaining[..150])
+        } else {
+            remaining.to_string()
+        }
+    } else {
+        "Type compatibility issue".to_string()
+    };
+
+    (endpoint, producer, consumer, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{ApiAnalysisResult, ApiIssues};
+
+    #[test]
+    fn test_typescript_error_formatting() {
+        let type_mismatches = vec![
+            "GET /users/:param/comments: Type '{ userId: number; comments: Comment[]; }' is missing the following properties from type 'Comment[]': length, pop, push, concat, and 29 more.".to_string(),
+            "GET /users/:param: Type '{ commentsByUser: Comment[]; }' is missing the following properties from type 'User': id, name, role".to_string(),
+        ];
+
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches,
+        };
+
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+        };
+
+        let output = format_analysis_results(result);
+
+        // Check that the output contains the TypeScript error details
+        assert!(output.contains("TypeScript Error"));
+        assert!(output.contains("GET /users/:param/comments"));
+        assert!(output.contains("GET /users/:param"));
+        assert!(output.contains("TypeScript compiler error detected"));
+        assert!(output.contains("Type '{ userId: number; comments: Comment[]; }'"));
+        assert!(output.contains("Type '{ commentsByUser: Comment[]; }'"));
+    }
+
+    #[test]
+    fn test_structured_type_error_formatting() {
+        let type_mismatches = vec![
+            "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
+        ];
+
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches,
+        };
+
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+        };
+
+        let output = format_analysis_results(result);
+
+        // Check that the output contains the structured error details
+        assert!(output.contains("Type Compatibility Issue"));
+        assert!(output.contains("GET /api/users"));
+        assert!(output.contains("UserResponse"));
+        assert!(output.contains("User[]"));
+        assert!(output.contains("Property 'role' is missing"));
+    }
+
+    #[test]
+    fn test_no_issues_output() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+        };
+
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+        };
+
+        let output = format_analysis_results(result);
+
+        // Check that no issues message is displayed
+        assert!(output.contains("No API inconsistencies detected"));
+        assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
     }
 }
 
