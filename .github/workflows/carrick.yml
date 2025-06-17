@@ -33,7 +33,7 @@ jobs:
         with:
           script: |
             const comment = process.env.COMMENT_BODY;
-            
+
             if (comment && comment.trim() !== '') {
               github.rest.issues.createComment({
                 issue_number: context.issue.number,
