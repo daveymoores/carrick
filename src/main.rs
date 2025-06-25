@@ -6,6 +6,7 @@ mod config;
 mod extractor;
 mod file_finder;
 mod formatter;
+mod gemini_service;
 mod packages;
 mod parser;
 mod router_context;
@@ -87,7 +88,7 @@ async fn main() {
             std::process::exit(1);
         }
     } else {
-        run_local_mode();
+        run_local_mode().await;
     }
 }
 
@@ -116,7 +117,7 @@ async fn run_ci_mode_wrapper() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_local_mode() {
+async fn run_local_mode() {
     // Create shared source map and error handler
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -260,7 +261,7 @@ fn run_local_mode() {
     };
 
     // Analyze for inconsistencies. Pass the sourcemap to allow relative byte positions to be calculated
-    let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs);
+    let result = analyze_api_consistency(visitors, config, packages, cm, repo_dirs).await;
 
     // Print results
     print_local_results(result);

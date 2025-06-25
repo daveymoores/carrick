@@ -34,7 +34,7 @@ pub async fn run_ci_mode<T: CloudStorage>(
     println!("AWS connectivity verified");
 
     // 1. Analyze current repo only
-    let current_repo_data = analyze_current_repo(repo_path)?;
+    let current_repo_data = analyze_current_repo(repo_path).await?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
 
     // 2. Upload current repo data to cloud storage (without AST nodes)
@@ -54,7 +54,7 @@ pub async fn run_ci_mode<T: CloudStorage>(
     println!("Downloaded data from {} repos", all_repo_data.len());
 
     // 4. Reconstruct analyzer with combined data
-    let analyzer = build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage).await?; // Pass repo_s3_urls and storage
+    let analyzer = build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage).await?;
     println!("Reconstructed analyzer with cross-repo data");
 
     // 5. Run analysis
