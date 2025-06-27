@@ -1,4 +1,4 @@
-use crate::analyzer::{Analyzer, ApiEndpointDetails};
+use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
@@ -27,7 +27,6 @@ pub async fn run_ci_mode<T: CloudStorage>(
 
     println!("Running Carrick in CI mode with org: {}", &carrick_org);
 
-    // Verify MongoDB connectivity early
     storage
         .health_check()
         .await
@@ -39,7 +38,8 @@ pub async fn run_ci_mode<T: CloudStorage>(
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
 
     // 2. Upload current repo data to cloud storage (without AST nodes)
-    let cloud_data_serialized = serialize_cloud_repo_data_without_ast(&current_repo_data);
+    // 2. Upload current repo data (strip AST nodes for serialization)
+    let cloud_data_serialized = strip_ast_nodes(current_repo_data);
     storage
         .upload_repo_data(&carrick_org, &cloud_data_serialized)
         .await
@@ -67,59 +67,49 @@ pub async fn run_ci_mode<T: CloudStorage>(
 }
 
 /// Serialize CloudRepoData without AST nodes in ApiEndpointDetails
-fn serialize_cloud_repo_data_without_ast(data: &CloudRepoData) -> CloudRepoData {
-    CloudRepoData {
-        repo_name: data.repo_name.clone(),
-        endpoints: strip_ast_from_endpoints(data.endpoints.clone()),
-        calls: strip_ast_from_endpoints(data.calls.clone()),
-        mounts: data.mounts.clone(),
-        apps: data.apps.clone(),
-        imported_handlers: data.imported_handlers.clone(),
-        function_definitions: data.function_definitions.clone(),
-        config_json: data.config_json.clone(),
-        package_json: data.package_json.clone(),
-        last_updated: data.last_updated,
-        commit_hash: data.commit_hash.clone(),
-    }
-}
-
-fn strip_ast_from_endpoints(endpoints: Vec<ApiEndpointDetails>) -> Vec<ApiEndpointDetails> {
-    fn strip_ast_from_endpoint(endpoint: &ApiEndpointDetails) -> ApiEndpointDetails {
-        ApiEndpointDetails {
-            owner: endpoint.owner.clone(),
-            route: endpoint.route.clone(),
-            method: endpoint.method.clone(),
-            params: endpoint.params.clone(),
-            request_body: endpoint.request_body.clone(),
-            response_body: endpoint.response_body.clone(),
-            file_path: endpoint.file_path.clone(),
-            // Strip AST nodes - set to None for serialization
-            request_type: None,
-            response_type: None,
-            handler_name: endpoint.handler_name.clone(),
+/// Generic function to merge serialized data from repo configs
+fn merge_serialized_data<T>(
+    all_repo_data: &[CloudRepoData],
+    extractor: fn(&CloudRepoData) -> Option<&String>,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    T: Default + serde::de::DeserializeOwned,
+{
+    for repo_data in all_repo_data {
+        if let Some(json_str) = extractor(repo_data) {
+            if let Ok(data) = serde_json::from_str::<T>(json_str) {
+                return Ok(data);
+            }
         }
     }
+    Ok(T::default())
+}
 
-    endpoints.iter().map(strip_ast_from_endpoint).collect()
+/// Remove AST nodes from CloudRepoData for serialization
+fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
+    fn strip_endpoint_ast(endpoint: &mut ApiEndpointDetails) {
+        endpoint.request_type = None;
+        endpoint.response_type = None;
+    }
+
+    data.endpoints.iter_mut().for_each(strip_endpoint_ast);
+    data.calls.iter_mut().for_each(strip_endpoint_ast);
+    data
 }
 
 /// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
 
-fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
-    let cm: Lrc<SourceMap> = Default::default();
+/// Extract file discovery and parsing logic from analyze_current_repo
+fn discover_and_parse_files(
+    repo_path: &str,
+    cm: Lrc<SourceMap>,
+) -> Result<(Vec<DependencyVisitor>, String), Box<dyn std::error::Error>> {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
-
-    println!(
-        "---> Analyzing JavaScript/TypeScript files in: {}",
-        repo_path
-    );
-
     let repo_name = get_repository_name(repo_path);
-    println!("Extracted repository name: '{}'", repo_name);
 
     // Find files in current repo only
     let ignore_patterns = ["node_modules", "dist", "build", ".next"];
-    let (files, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
+    let (files, _, _) = find_files(repo_path, &ignore_patterns);
 
     println!(
         "Found {} files to analyze in directory {}",
@@ -141,8 +131,6 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
 
     while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
         let path_str = file_path.to_string_lossy().to_string();
-        // Create a unique key that includes the imported router name to allow
-        // the same file to be processed multiple times with different contexts
         let processing_key = match &imported_router_name {
             Some(name) => format!("{}#{}", path_str, name),
             None => path_str.clone(),
@@ -192,7 +180,16 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
         }
     }
 
-    // Create analyzer and extract data
+    Ok((visitors, repo_name))
+}
+
+/// Extract config and package loading logic
+fn load_config_and_packages(
+    repo_path: &str,
+) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
+    let ignore_patterns = ["node_modules", "dist", "build", ".next"];
+    let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
+
     let config = if let Some(config_path) = config_file_path {
         println!("Found carrick.json file: {}", config_path.display());
         Config::new(vec![config_path]).unwrap_or_else(|e| {
@@ -213,48 +210,43 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
         Packages::default()
     };
 
-    let config_clone = config.clone();
-    let packages_clone = packages.clone();
-    let mut analyzer = Analyzer::new(config, cm.clone());
+    Ok((config, packages))
+}
 
-    // Add visitor data to analyzer
-    for visitor in visitors {
-        analyzer.add_visitor_data(visitor);
-    }
-
-    // Resolve endpoint paths and types (this populates request_type and response_type fields)
-    let endpoints =
-        analyzer.resolve_all_endpoint_paths(&analyzer.endpoints, &analyzer.mounts, &analyzer.apps);
-    analyzer.endpoints = endpoints;
-
-    // Build the router after resolving endpoints
-    analyzer.build_endpoint_router();
-
-    // Second pass - analyze function definitions for response fields
-    let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
-        &analyzer.imported_handlers,
-        &analyzer.function_definitions,
+fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+    println!(
+        "---> Analyzing JavaScript/TypeScript files in: {}",
+        repo_path
     );
 
-    // Update endpoints with resolved fields and resolve types
-    analyzer
-        .update_endpoints_with_resolved_fields(response_fields, request_fields)
-        .resolve_types_for_endpoints(cm.clone())
-        .analyze_functions_for_fetch_calls();
+    // 1. Create shared SourceMap for consistent byte position tracking
+    let cm: Lrc<SourceMap> = Default::default();
 
-    extract_types_for_current_repo(&analyzer, repo_path, &packages_clone)?;
+    // 2. Discover and parse files using shared SourceMap
+    let (visitors, repo_name) = discover_and_parse_files(repo_path, cm.clone())?;
+    println!("Extracted repository name: '{}'", repo_name);
 
-    // Build CloudRepoData (strip AST information for serialization)
+    // 3. Load config and packages
+    let (config, packages) = load_config_and_packages(repo_path)?;
+
+    // 4. Build analyzer using shared logic with same SourceMap
+    let builder = AnalyzerBuilder::new(config.clone(), cm);
+    let analyzer = builder.build_from_visitors(visitors)?;
+
+    // 5. Extract types for current repo
+    extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
+
+    // 6. Build CloudRepoData (AST stripping handled by caller)
     let cloud_data = CloudRepoData {
         repo_name: repo_name.clone(),
-        endpoints: strip_ast_from_endpoints(analyzer.endpoints.clone()),
-        calls: strip_ast_from_endpoints(analyzer.calls.clone()),
-        mounts: analyzer.mounts.clone(),
-        apps: analyzer.apps.clone(),
-        imported_handlers: analyzer.imported_handlers.clone(),
-        function_definitions: analyzer.function_definitions.clone(),
-        config_json: serde_json::to_string(&config_clone).ok(),
-        package_json: serde_json::to_string(&packages_clone).ok(),
+        endpoints: analyzer.endpoints,
+        calls: analyzer.calls,
+        mounts: analyzer.mounts,
+        apps: analyzer.apps,
+        imported_handlers: analyzer.imported_handlers,
+        function_definitions: analyzer.function_definitions,
+        config_json: serde_json::to_string(&config).ok(),
+        package_json: serde_json::to_string(&packages).ok(),
         last_updated: Utc::now(),
         commit_hash: get_current_commit_hash(),
     };
@@ -303,86 +295,29 @@ fn extract_types_for_current_repo(
 
 async fn build_cross_repo_analyzer<T: CloudStorage>(
     all_repo_data: Vec<CloudRepoData>,
-    repo_s3_urls: HashMap<String, String>, // Add this parameter
+    repo_s3_urls: HashMap<String, String>,
     storage: &T,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
-    // Combine all configs
-    let combined_config = merge_configs(&all_repo_data)?;
+    // 1. Merge configs and packages using generic function
+    let combined_config = merge_serialized_data(&all_repo_data, |data| data.config_json.as_ref())?;
+    let combined_packages =
+        merge_serialized_data(&all_repo_data, |data| data.package_json.as_ref())?;
 
-    // Combine all packages
-    let combined_packages = merge_packages(&all_repo_data)?;
-
-    // Create analyzer with combined config
+    // 2. Build analyzer using shared logic (skip type resolution for cross-repo)
     let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(combined_config, cm.clone());
+    let builder = AnalyzerBuilder::new_for_cross_repo(combined_config, cm);
+    let analyzer = builder.build_from_repo_data(all_repo_data.clone())?;
 
-    // Populate analyzer with data from all repos
-    for repo_data in &all_repo_data {
-        analyzer.endpoints.extend(repo_data.endpoints.clone());
-        analyzer.calls.extend(repo_data.calls.clone());
-        analyzer.mounts.extend(repo_data.mounts.clone());
-        analyzer.apps.extend(repo_data.apps.clone());
-        analyzer
-            .imported_handlers
-            .extend(repo_data.imported_handlers.clone());
-        analyzer
-            .function_definitions
-            .extend(repo_data.function_definitions.clone());
-    }
-
-    // Skip path resolution in CI mode - endpoints are already resolved in analyze_current_repo
-    // analyzer.endpoints already contains resolved paths from individual repos
-
-    // Build router
-    analyzer.build_endpoint_router();
-
-    // Resolve types and perform analysis
-    let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
-        &analyzer.imported_handlers.clone(),
-        &analyzer.function_definitions.clone(),
-    );
-
-    analyzer
-        .update_endpoints_with_resolved_fields(response_fields, request_fields)
-        .resolve_types_for_endpoints(cm.clone())
-        .analyze_functions_for_fetch_calls();
-
-    // Recreate type files from S3 and run type checking
+    // 3. Recreate type files from S3 and run type checking
     recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
         .await?;
 
-    // Run final type checking
+    // 4. Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
         println!("⚠️  Warning: Type checking failed: {}", e);
     }
 
     Ok(analyzer)
-}
-
-fn merge_configs(all_repo_data: &[CloudRepoData]) -> Result<Config, Box<dyn std::error::Error>> {
-    // For now, just use the first available config
-    // TODO: Implement proper config merging logic
-    for repo_data in all_repo_data {
-        if let Some(config_json) = &repo_data.config_json {
-            if let Ok(config) = serde_json::from_str::<Config>(config_json) {
-                return Ok(config);
-            }
-        }
-    }
-    Ok(Config::default())
-}
-
-fn merge_packages(all_repo_data: &[CloudRepoData]) -> Result<Packages, Box<dyn std::error::Error>> {
-    // For now, just use the first available packages
-    // TODO: Implement proper package merging logic
-    for repo_data in all_repo_data {
-        if let Some(package_json) = &repo_data.package_json {
-            if let Ok(packages) = serde_json::from_str::<Packages>(package_json) {
-                return Ok(packages);
-            }
-        }
-    }
-    Ok(Packages::default())
 }
 
 async fn recreate_type_files_and_check<T: CloudStorage>(
@@ -506,4 +441,166 @@ fn recreate_package_and_tsconfig(
 fn print_results(result: crate::analyzer::ApiAnalysisResult) {
     let formatted_output = crate::formatter::FormattedOutput::new(result);
     formatted_output.print();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::ApiEndpointDetails;
+    use crate::visitor::{OwnerType, TypeReference};
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_ast_stripping_removes_nodes() {
+        // Create test CloudRepoData with AST nodes
+        let endpoint = ApiEndpointDetails {
+            owner: Some(OwnerType::App("test_app".to_string())),
+            route: "/test".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            file_path: PathBuf::from("test.js"),
+            request_type: Some(TypeReference {
+                file_path: PathBuf::from("test.ts"),
+                type_ann: None,
+                start_position: 0,
+                composite_type_string: "TestType".to_string(),
+                alias: "TestType".to_string(),
+            }),
+            response_type: Some(TypeReference {
+                file_path: PathBuf::from("test.ts"),
+                type_ann: None,
+                start_position: 0,
+                composite_type_string: "ResponseType".to_string(),
+                alias: "ResponseType".to_string(),
+            }),
+            handler_name: Some("testHandler".to_string()),
+        };
+
+        let test_data = CloudRepoData {
+            repo_name: "test-repo".to_string(),
+            endpoints: vec![endpoint.clone()],
+            calls: vec![endpoint.clone()],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: None,
+            package_json: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+        };
+
+        // Verify strip_ast_nodes removes AST nodes
+        let stripped = strip_ast_nodes(test_data);
+
+        assert!(stripped.endpoints[0].request_type.is_none());
+        assert!(stripped.endpoints[0].response_type.is_none());
+        assert!(stripped.calls[0].request_type.is_none());
+        assert!(stripped.calls[0].response_type.is_none());
+    }
+
+    #[test]
+    fn test_merge_serialized_data() {
+        use crate::config::Config;
+        use crate::packages::Packages;
+
+        // Test the generic merge function works for both Config and Packages
+        let config_json = r#"{"ignore_patterns": ["test"], "type_check": true}"#;
+        let package_json = r#"{"name": "test-package", "version": "1.0.0"}"#;
+
+        let test_data = vec![CloudRepoData {
+            repo_name: "repo1".to_string(),
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: Some(config_json.to_string()),
+            package_json: Some(package_json.to_string()),
+            last_updated: chrono::Utc::now(),
+            commit_hash: "hash1".to_string(),
+        }];
+
+        // Test Config merging
+        let merged_config: Result<Config, _> =
+            merge_serialized_data(&test_data, |data| data.config_json.as_ref());
+        assert!(merged_config.is_ok());
+
+        // Test Packages merging
+        let merged_packages: Result<Packages, _> =
+            merge_serialized_data(&test_data, |data| data.package_json.as_ref());
+        assert!(merged_packages.is_ok());
+
+        // Test with empty data returns default
+        let empty_data: Vec<CloudRepoData> = vec![];
+        let default_config: Result<Config, _> =
+            merge_serialized_data(&empty_data, |data| data.config_json.as_ref());
+        assert!(default_config.is_ok());
+    }
+
+    #[test]
+    fn test_cross_repo_analyzer_builder_no_sourcemap_issues() {
+        use crate::analyzer::builder::AnalyzerBuilder;
+        use crate::config::Config;
+        use swc_common::{SourceMap, sync::Lrc};
+
+        // Create test data with TypeReferences that would cause SourceMap issues
+        let endpoint = ApiEndpointDetails {
+            owner: Some(OwnerType::App("test_app".to_string())),
+            route: "/test".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            file_path: PathBuf::from("test.js"),
+            request_type: Some(TypeReference {
+                file_path: PathBuf::from("test.ts"),
+                type_ann: None,
+                start_position: 999999, // This would cause SourceMap issues
+                composite_type_string: "TestType".to_string(),
+                alias: "TestType".to_string(),
+            }),
+            response_type: Some(TypeReference {
+                file_path: PathBuf::from("test.ts"),
+                type_ann: None,
+                start_position: 999999, // This would cause SourceMap issues
+                composite_type_string: "ResponseType".to_string(),
+                alias: "ResponseType".to_string(),
+            }),
+            handler_name: Some("testHandler".to_string()),
+        };
+
+        let test_data = vec![CloudRepoData {
+            repo_name: "test-repo".to_string(),
+            endpoints: vec![endpoint.clone()],
+            calls: vec![endpoint.clone()],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: Some(r#"{"ignore_patterns": [], "type_check": false}"#.to_string()),
+            package_json: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+        }];
+
+        // Test that cross-repo builder doesn't fail with SourceMap issues
+        let cm: Lrc<SourceMap> = Default::default();
+        let config = Config::default();
+        let builder = AnalyzerBuilder::new_for_cross_repo(config, cm);
+
+        // This should not panic with SourceMap issues
+        let result = builder.build_from_repo_data(test_data);
+        assert!(
+            result.is_ok(),
+            "Cross-repo analyzer should not fail with SourceMap issues"
+        );
+
+        let analyzer = result.unwrap();
+        assert_eq!(analyzer.endpoints.len(), 1);
+        assert_eq!(analyzer.calls.len(), 1);
+    }
 }
