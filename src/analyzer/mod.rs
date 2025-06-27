@@ -1,3 +1,5 @@
+pub mod builder;
+
 use serde_json::Value;
 use swc_common::{FileName, SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::TsTypeAnn;
