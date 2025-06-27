@@ -306,10 +306,11 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     // 2. Build analyzer using shared logic (skip type resolution for cross-repo)
     let cm: Lrc<SourceMap> = Default::default();
     let builder = AnalyzerBuilder::new_for_cross_repo(combined_config, cm);
-    let analyzer = builder.build_from_repo_data(all_repo_data)?;
+    let analyzer = builder.build_from_repo_data(all_repo_data.clone())?;
 
     // 3. Recreate type files from S3 and run type checking
-    recreate_type_files_and_check(&[], &repo_s3_urls, storage, &combined_packages).await?;
+    recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
+        .await?;
 
     // 4. Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
