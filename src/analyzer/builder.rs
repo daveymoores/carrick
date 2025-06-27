@@ -71,13 +71,16 @@ impl AnalyzerBuilder {
         &self,
         mut analyzer: Analyzer,
     ) -> Result<Analyzer, Box<dyn std::error::Error>> {
-        // Resolve endpoint paths and types
-        let endpoints = analyzer.resolve_all_endpoint_paths(
-            &analyzer.endpoints.clone(),
-            &analyzer.mounts.clone(),
-            &analyzer.apps.clone(),
-        );
-        analyzer.endpoints = endpoints;
+        // Skip path resolution in cross-repo mode - paths are already resolved
+        if !self.skip_type_resolution {
+            // Resolve endpoint paths and types
+            let endpoints = analyzer.resolve_all_endpoint_paths(
+                &analyzer.endpoints.clone(),
+                &analyzer.mounts.clone(),
+                &analyzer.apps.clone(),
+            );
+            analyzer.endpoints = endpoints;
+        }
 
         // Build the router
         analyzer.build_endpoint_router();
