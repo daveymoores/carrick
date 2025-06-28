@@ -180,6 +180,12 @@ impl Analyzer {
             all_async_contexts.len()
         );
 
+        // Skip Gemini call if no async expressions found (safety check)
+        if all_async_contexts.is_empty() {
+            println!("No async expressions found, skipping Gemini analysis");
+            return;
+        }
+
         // Send to Gemini Flash 2.5 for analysis
         let gemini_calls = extract_calls_from_async_expressions(all_async_contexts).await;
 

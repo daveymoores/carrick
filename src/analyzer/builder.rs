@@ -96,9 +96,9 @@ impl AnalyzerBuilder {
 
         if !self.skip_type_resolution {
             analyzer.resolve_types_for_endpoints(self.cm.clone());
+            // Only analyze functions for fetch calls when we have real AST data
+            analyzer.analyze_functions_for_fetch_calls().await;
         }
-
-        analyzer.analyze_functions_for_fetch_calls().await;
 
         Ok(analyzer)
     }
