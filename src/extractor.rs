@@ -871,245 +871,54 @@ pub trait CoreExtractor {
         &self,
         func: &crate::visitor::FunctionDefinition,
     ) -> Vec<crate::gemini_service::AsyncCallContext> {
-        use swc_ecma_ast::*;
+        use swc_common::{SourceMapper, Spanned};
 
         let mut contexts = Vec::new();
 
-        // Extract async calls based on function type
-        match &func.node_type {
-            crate::visitor::FunctionNodeType::ArrowFunction(arrow) => match &*arrow.body {
-                BlockStmtOrExpr::BlockStmt(block) => {
-                    for stmt in &block.stmts {
-                        contexts.extend(self.extract_async_calls_from_stmt(stmt, &func.file_path));
-                    }
-                }
-                BlockStmtOrExpr::Expr(expr) => {
-                    contexts.extend(self.extract_async_calls_from_expr(expr, &func.file_path));
-                }
-            },
+        // Get the function source code for LLM analysis
+        let source_map = self.get_source_map();
+
+        let (function_source, function_name) = match &func.node_type {
+            crate::visitor::FunctionNodeType::ArrowFunction(arrow) => {
+                let source = source_map.span_to_snippet(arrow.span).unwrap_or_default();
+                (source, "arrow_function".to_string())
+            }
             crate::visitor::FunctionNodeType::FunctionDeclaration(decl) => {
-                if let Some(body) = &decl.function.body {
-                    for stmt in &body.stmts {
-                        contexts.extend(self.extract_async_calls_from_stmt(stmt, &func.file_path));
-                    }
-                }
+                let source = source_map.span_to_snippet(decl.span()).unwrap_or_default();
+                let name = decl.ident.sym.to_string();
+                (source, name)
             }
             crate::visitor::FunctionNodeType::FunctionExpression(expr) => {
-                if let Some(body) = &expr.function.body {
-                    for stmt in &body.stmts {
-                        contexts.extend(self.extract_async_calls_from_stmt(stmt, &func.file_path));
-                    }
-                }
+                let source = source_map.span_to_snippet(expr.span()).unwrap_or_default();
+                let name = expr
+                    .ident
+                    .as_ref()
+                    .map(|i| i.sym.to_string())
+                    .unwrap_or("anonymous".to_string());
+                (source, name)
             }
             crate::visitor::FunctionNodeType::Placeholder => {
                 // In CI mode, AST is not available, skip extraction
+                return contexts;
             }
+        };
+
+        // Only create context if we found async patterns in the source
+        if function_source.contains("await")
+            || function_source.contains(".then")
+            || function_source.contains("fetch")
+            || function_source.contains("axios")
+        {
+            contexts.push(crate::gemini_service::AsyncCallContext {
+                kind: "function_analysis".to_string(),
+                function_source,
+                file: func.file_path.to_string_lossy().to_string(),
+                line: 1, // We'll let Gemini figure out the specific line
+                function_name,
+            });
         }
 
         contexts
-    }
-
-    fn extract_async_calls_from_stmt(
-        &self,
-        stmt: &Stmt,
-        file_path: &PathBuf,
-    ) -> Vec<crate::gemini_service::AsyncCallContext> {
-        use swc_ecma_ast::*;
-        let mut contexts = Vec::new();
-
-        match stmt {
-            Stmt::Expr(expr_stmt) => {
-                contexts.extend(self.extract_async_calls_from_expr(&expr_stmt.expr, file_path));
-            }
-            Stmt::Block(block) => {
-                for nested_stmt in &block.stmts {
-                    contexts.extend(self.extract_async_calls_from_stmt(nested_stmt, file_path));
-                }
-            }
-            Stmt::If(if_stmt) => {
-                contexts.extend(self.extract_async_calls_from_stmt(&if_stmt.cons, file_path));
-                if let Some(alt) = &if_stmt.alt {
-                    contexts.extend(self.extract_async_calls_from_stmt(alt, file_path));
-                }
-            }
-            Stmt::Try(try_stmt) => {
-                for nested_stmt in &try_stmt.block.stmts {
-                    contexts.extend(self.extract_async_calls_from_stmt(nested_stmt, file_path));
-                }
-                if let Some(handler) = &try_stmt.handler {
-                    for nested_stmt in &handler.body.stmts {
-                        contexts.extend(self.extract_async_calls_from_stmt(nested_stmt, file_path));
-                    }
-                }
-                if let Some(finalizer) = &try_stmt.finalizer {
-                    for nested_stmt in &finalizer.stmts {
-                        contexts.extend(self.extract_async_calls_from_stmt(nested_stmt, file_path));
-                    }
-                }
-            }
-            Stmt::Return(return_stmt) => {
-                if let Some(arg) = &return_stmt.arg {
-                    contexts.extend(self.extract_async_calls_from_expr(arg, file_path));
-                }
-            }
-            Stmt::Decl(Decl::Var(var_decl)) => {
-                for declarator in &var_decl.decls {
-                    if let Some(init) = &declarator.init {
-                        contexts.extend(self.extract_async_calls_from_expr(init, file_path));
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        contexts
-    }
-
-    fn extract_async_calls_from_expr(
-        &self,
-        expr: &Expr,
-        file_path: &PathBuf,
-    ) -> Vec<crate::gemini_service::AsyncCallContext> {
-        use swc_ecma_ast::*;
-
-        let mut contexts = Vec::new();
-
-        match expr {
-            // await expressions
-            Expr::Await(await_expr) => {
-                if let Some(context) = self.create_async_call_context(expr, file_path) {
-                    contexts.push(context);
-                }
-                // Also check the awaited expression
-                contexts.extend(self.extract_async_calls_from_expr(&await_expr.arg, file_path));
-            }
-            // Promise methods (.then, .catch, etc.)
-            Expr::Call(call_expr) => {
-                if let Callee::Expr(callee_expr) = &call_expr.callee {
-                    if let Expr::Member(member_expr) = &**callee_expr {
-                        if let MemberProp::Ident(prop) = &member_expr.prop {
-                            if matches!(
-                                prop.sym.as_str(),
-                                "then"
-                                    | "catch"
-                                    | "finally"
-                                    | "all"
-                                    | "allSettled"
-                                    | "any"
-                                    | "race"
-                            ) {
-                                if let Some(context) =
-                                    self.create_async_call_context(expr, file_path)
-                                {
-                                    contexts.push(context);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Check arguments recursively
-                for arg in &call_expr.args {
-                    contexts.extend(self.extract_async_calls_from_expr(&arg.expr, file_path));
-                }
-            }
-            // Other expression types that might contain async calls
-            Expr::Assign(assign_expr) => {
-                contexts.extend(self.extract_async_calls_from_expr(&assign_expr.right, file_path));
-            }
-            Expr::Bin(bin_expr) => {
-                contexts.extend(self.extract_async_calls_from_expr(&bin_expr.left, file_path));
-                contexts.extend(self.extract_async_calls_from_expr(&bin_expr.right, file_path));
-            }
-            Expr::Unary(unary_expr) => {
-                contexts.extend(self.extract_async_calls_from_expr(&unary_expr.arg, file_path));
-            }
-            Expr::Cond(cond_expr) => {
-                contexts.extend(self.extract_async_calls_from_expr(&cond_expr.test, file_path));
-                contexts.extend(self.extract_async_calls_from_expr(&cond_expr.cons, file_path));
-                contexts.extend(self.extract_async_calls_from_expr(&cond_expr.alt, file_path));
-            }
-            _ => {}
-        }
-
-        contexts
-    }
-
-    fn create_async_call_context(
-        &self,
-        expr: &Expr,
-        file_path: &PathBuf,
-    ) -> Option<crate::gemini_service::AsyncCallContext> {
-        use swc_common::{SourceMapper, Spanned};
-
-        let source_map = self.get_source_map();
-        let span = expr.span();
-        let loc = source_map.lookup_char_pos(span.lo);
-        let line = loc.line as u32;
-
-        let source_snippet = source_map.span_to_snippet(span).unwrap_or_default();
-        let callee = self.extract_callee_name_from_expr(expr);
-        let arguments = self.extract_arguments_from_expr(expr);
-
-        Some(crate::gemini_service::AsyncCallContext {
-            kind: "async_expression".to_string(),
-            callee,
-            arguments,
-            file: file_path.to_string_lossy().to_string(),
-            line,
-            source_code: source_snippet,
-        })
-    }
-
-    fn extract_callee_name_from_expr(&self, expr: &Expr) -> String {
-        use swc_ecma_ast::*;
-
-        match expr {
-            Expr::Await(await_expr) => self.extract_callee_name_from_expr(&await_expr.arg),
-            Expr::Call(call_expr) => {
-                if let Callee::Expr(callee_expr) = &call_expr.callee {
-                    match &**callee_expr {
-                        Expr::Ident(ident) => ident.sym.to_string(),
-                        Expr::Member(member_expr) => {
-                            let obj_name = match &*member_expr.obj {
-                                Expr::Ident(ident) => ident.sym.to_string(),
-                                _ => "unknown".to_string(),
-                            };
-                            let prop_name = match &member_expr.prop {
-                                MemberProp::Ident(ident) => ident.sym.to_string(),
-                                _ => "unknown".to_string(),
-                            };
-                            format!("{}.{}", obj_name, prop_name)
-                        }
-                        _ => "unknown".to_string(),
-                    }
-                } else {
-                    "unknown".to_string()
-                }
-            }
-            _ => "unknown".to_string(),
-        }
-    }
-
-    fn extract_arguments_from_expr(&self, expr: &Expr) -> Vec<String> {
-        use swc_common::{SourceMapper, Spanned};
-        use swc_ecma_ast::*;
-
-        match expr {
-            Expr::Await(await_expr) => self.extract_arguments_from_expr(&await_expr.arg),
-            Expr::Call(call_expr) => {
-                let source_map = self.get_source_map();
-                call_expr
-                    .args
-                    .iter()
-                    .map(|arg| {
-                        source_map
-                            .span_to_snippet(arg.span())
-                            .unwrap_or("unknown".to_string())
-                    })
-                    .collect()
-            }
-            _ => vec![],
-        }
     }
 }
 

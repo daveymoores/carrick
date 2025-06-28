@@ -7,11 +7,10 @@ use std::path::PathBuf;
 #[derive(Debug, Serialize)]
 pub struct AsyncCallContext {
     pub kind: String,
-    pub callee: String,
-    pub arguments: Vec<String>,
+    pub function_source: String,
     pub file: String,
     pub line: u32,
-    pub source_code: String,
+    pub function_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,10 +31,28 @@ pub async fn extract_calls_from_async_expressions(async_calls: Vec<AsyncCallCont
 
     let chat_req = ChatRequest::new(vec![
         ChatMessage::system(
-            r#"You are an expert at analyzing JavaScript/TypeScript async calls.
-Extract HTTP details and return ONLY a valid JSON array.
-Response format: Start with [ and end with ]. No markdown, no explanation, just JSON.
-Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean)."#,
+            r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction.
+
+CRITICAL REQUIREMENTS:
+1. Extract ONLY HTTP requests (fetch, axios, request libraries) - ignore setTimeout, file I/O, database calls
+2. Return ONLY valid JSON array starting with [ and ending with ]
+3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean)
+
+ENVIRONMENT VARIABLE HANDLING:
+- Format: "ENV_VAR:VARIABLE_NAME:path"
+- process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
+- `${process.env.BASE_URL}/api/data` → "ENV_VAR:BASE_URL:/api/data"
+- env.SERVICE_URL + "/health" → "ENV_VAR:SERVICE_URL:/health"
+
+TEMPLATE LITERAL HANDLING:
+- Keep variable placeholders: `/users/${userId}` → "/users/${userId}"
+- Resolve when possible: `${baseUrl}/api` → "${baseUrl}/api"
+
+URL CONSTRUCTION:
+- String concatenation: "/api" + "/users" → "/api/users"
+- Mixed env vars: process.env.API + "/v1" + path → "ENV_VAR:API:/v1" + path
+
+NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#,
         ),
         ChatMessage::user(prompt),
     ]);
@@ -59,18 +76,40 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
     let calls_json = serde_json::to_string_pretty(async_calls).unwrap_or_default();
 
     format!(
-        r#"Extract HTTP calls from these async expressions:
+        r#"Extract HTTP API calls from these JavaScript/TypeScript functions. Return ONLY a JSON array.
 
+FUNCTIONS TO ANALYZE:
 {}
 
-Rules:
-- Only HTTP requests (fetch, axios, request libs) - ignore setTimeout, file ops, etc.
-- Extract: route (URL path), method (HTTP verb), request_body (JSON or null), has_response_type (boolean)
-- For template literals: resolve to actual paths
-- For env vars: use format "ENV_VAR:VARIABLE_NAME"
+EXTRACTION RULES:
+1. Find HTTP calls: fetch(), axios.get/post/put/delete(), request(), etc.
+2. Ignore: setTimeout, file operations, database calls, console.log
+3. Extract exact route, method, request body
 
-Output JSON array only:
-[{{"route":"/api/users","method":"GET","request_body":null,"has_response_type":false}}]"#,
+ENVIRONMENT VARIABLE FORMAT:
+- process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
+- process.env.BASE + "/api" + path → "ENV_VAR:BASE:/api" + path
+- `${{process.env.SERVICE}}/endpoint` → "ENV_VAR:SERVICE:/endpoint"
+- CONSTANT_VAR + "/path" → "ENV_VAR:CONSTANT_VAR:/path"
+
+TEMPLATE LITERALS:
+- `/users/${{id}}` → "/users/${{id}}"
+- `${{base}}/api` → "${{base}}/api"
+
+STRING CONCATENATION:
+- "/api" + "/users" → "/api/users"
+- path + "/" + id → path + "/${{id}}"
+
+EXAMPLES:
+```js
+fetch(process.env.API_URL + "/users")
+// → {{"route":"ENV_VAR:API_URL:/users","method":"GET","request_body":null,"has_response_type":false}}
+
+axios.post("/api/users", userData)
+// → {{"route":"/api/users","method":"POST","request_body":{{"userData":"placeholder"}},"has_response_type":false}}
+```
+
+OUTPUT JSON ARRAY ONLY:"#,
         calls_json
     )
 }
