@@ -28,7 +28,7 @@ impl AnalyzerBuilder {
     }
 
     /// Build analyzer from visitor data (used by analyze_current_repo)
-    pub fn build_from_visitors(
+    pub async fn build_from_visitors(
         &self,
         visitors: Vec<DependencyVisitor>,
     ) -> Result<Analyzer, Box<dyn std::error::Error>> {
@@ -39,11 +39,11 @@ impl AnalyzerBuilder {
             analyzer.add_visitor_data(visitor);
         }
 
-        self.finalize_analyzer(analyzer)
+        self.finalize_analyzer(analyzer).await
     }
 
     /// Build analyzer from CloudRepoData (used by build_cross_repo_analyzer)
-    pub fn build_from_repo_data(
+    pub async fn build_from_repo_data(
         &self,
         all_repo_data: Vec<CloudRepoData>,
     ) -> Result<Analyzer, Box<dyn std::error::Error>> {
@@ -63,11 +63,11 @@ impl AnalyzerBuilder {
                 .extend(repo_data.function_definitions);
         }
 
-        self.finalize_analyzer(analyzer)
+        self.finalize_analyzer(analyzer).await
     }
 
     /// Common analyzer finalization steps (eliminates duplication)
-    fn finalize_analyzer(
+    async fn finalize_analyzer(
         &self,
         mut analyzer: Analyzer,
     ) -> Result<Analyzer, Box<dyn std::error::Error>> {
@@ -98,7 +98,7 @@ impl AnalyzerBuilder {
             analyzer.resolve_types_for_endpoints(self.cm.clone());
         }
 
-        analyzer.analyze_functions_for_fetch_calls();
+        analyzer.analyze_functions_for_fetch_calls().await;
 
         Ok(analyzer)
     }

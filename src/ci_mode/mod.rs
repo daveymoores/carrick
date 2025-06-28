@@ -213,7 +213,9 @@ fn load_config_and_packages(
     Ok((config, packages))
 }
 
-fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+async fn analyze_current_repo(
+    repo_path: &str,
+) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     println!(
         "---> Analyzing JavaScript/TypeScript files in: {}",
         repo_path
@@ -231,7 +233,7 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
 
     // 4. Build analyzer using shared logic with same SourceMap
     let builder = AnalyzerBuilder::new(config.clone(), cm);
-    let analyzer = builder.build_from_visitors(visitors)?;
+    let analyzer = builder.build_from_visitors(visitors).await?;
 
     // 5. Extract types for current repo
     extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
@@ -306,7 +308,7 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     // 2. Build analyzer using shared logic (skip type resolution for cross-repo)
     let cm: Lrc<SourceMap> = Default::default();
     let builder = AnalyzerBuilder::new_for_cross_repo(combined_config, cm);
-    let analyzer = builder.build_from_repo_data(all_repo_data.clone())?;
+    let analyzer = builder.build_from_repo_data(all_repo_data.clone()).await?;
 
     // 3. Recreate type files from S3 and run type checking
     recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
