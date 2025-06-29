@@ -119,6 +119,10 @@ impl Analyzer {
         }
     }
 
+    pub fn fetch_calls(&self) -> &Vec<Call> {
+        &self.fetch_calls
+    }
+
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
         self.mounts.extend(visitor.mounts);
         self.apps.extend(visitor.express_apps);
@@ -1146,6 +1150,38 @@ impl Analyzer {
         }
     }
 
+    /// Collect type information from Gemini-extracted calls for TypeScript extraction
+    pub fn collect_type_infos_from_calls(&self, calls: &[Call]) -> Vec<serde_json::Value> {
+        println!("collect_type_infos_from_calls is called");
+        let mut type_infos = Vec::new();
+
+        for call in calls {
+            // Collect request type info
+            if let Some(request_type) = &call.request_type {
+                let type_info = serde_json::json!({
+                    "filePath": request_type.file_path.to_string_lossy().to_string(),
+                    "startPosition": request_type.start_position,
+                    "compositeTypeString": request_type.composite_type_string,
+                    "alias": request_type.alias
+                });
+                type_infos.push(type_info);
+            }
+
+            // Collect response type info
+            if let Some(response_type) = &call.response_type {
+                let type_info = serde_json::json!({
+                    "filePath": response_type.file_path.to_string_lossy().to_string(),
+                    "startPosition": response_type.start_position,
+                    "compositeTypeString": response_type.composite_type_string,
+                    "alias": response_type.alias
+                });
+                type_infos.push(type_info);
+            }
+        }
+
+        type_infos
+    }
+
     pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
         use std::fs;
         use std::path::Path;
@@ -1498,10 +1534,20 @@ pub async fn analyze_api_consistency(
         analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
     }
 
-    // Group type information by repository using call file information
-    for call in &analyzer.calls {
-        let repo_prefix = analyzer.extract_repo_prefix_from_file_path(&call.file_path, &repo_paths);
-        analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
+    // Group type information by repository using fetch call file information
+    // (No longer call process_api_detail_types for fetch_calls; handled below)
+
+    // Also collect type information from Gemini-extracted calls for TypeScript extraction
+    let gemini_type_infos = analyzer.collect_type_infos_from_calls(&analyzer.fetch_calls);
+    for type_info in gemini_type_infos {
+        // Extract repo prefix from file path in type info
+        let file_path = type_info["filePath"].as_str().unwrap_or("");
+        let repo_prefix = analyzer
+            .extract_repo_prefix_from_file_path(&std::path::PathBuf::from(file_path), &repo_paths);
+        repo_type_map
+            .entry(repo_prefix)
+            .or_default()
+            .push(type_info);
     }
 
     // Clean output directory before starting type extraction

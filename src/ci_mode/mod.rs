@@ -278,6 +278,18 @@ fn extract_types_for_current_repo(
         analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
     }
 
+    // Collect type information from Gemini-extracted fetch_calls
+    let gemini_type_infos = analyzer.collect_type_infos_from_calls(analyzer.fetch_calls());
+    for type_info in gemini_type_infos {
+        let file_path = type_info["filePath"].as_str().unwrap_or("");
+        let repo_prefix = analyzer
+            .extract_repo_prefix_from_file_path(&std::path::PathBuf::from(file_path), &repo_paths);
+        repo_type_map
+            .entry(repo_prefix)
+            .or_default()
+            .push(type_info);
+    }
+
     // Extract types for current repository
     let repo_name = get_repository_name(repo_path);
 

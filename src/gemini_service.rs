@@ -1,4 +1,4 @@
-use crate::visitor::{Call, Json};
+use crate::visitor::{Call, Json, TypeReference};
 use genai::Client;
 use genai::chat::{ChatMessage, ChatRequest};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,16 @@ pub struct GeminiCallResponse {
     method: String,
     request_body: Option<serde_json::Value>,
     has_response_type: bool,
+    request_type_info: Option<TypeInfo>,
+    response_type_info: Option<TypeInfo>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TypeInfo {
+    pub file_path: String,
+    pub start_position: u32,
+    pub composite_type_string: String,
+    pub alias: String,
 }
 
 pub async fn extract_calls_from_async_expressions(async_calls: Vec<AsyncCallContext>) -> Vec<Call> {
@@ -31,12 +41,25 @@ pub async fn extract_calls_from_async_expressions(async_calls: Vec<AsyncCallCont
 
     let chat_req = ChatRequest::new(vec![
         ChatMessage::system(
-            r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction.
+            r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
 
 CRITICAL REQUIREMENTS:
 1. Extract ONLY HTTP requests (fetch, axios, request libraries) - ignore setTimeout, file I/O, database calls
 2. Return ONLY valid JSON array starting with [ and ending with ]
-3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean)
+3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean), request_type_info (object or null), response_type_info (object or null)
+
+TYPE EXTRACTION REQUIREMENTS:
+4. Look for TypeScript type annotations in function parameters and return types
+5. Extract request types from first parameter annotations (req: RequestType, request: SomeType, etc.)
+6. Extract response types from return type annotations or response variable types
+7. Calculate approximate character position where the type appears in the source
+8. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
+
+TYPE INFO OBJECT FORMAT:
+- file_path: The source file path
+- start_position: Approximate character position of type annotation (number)
+- composite_type_string: Full type string (e.g., "Response<User[]>", "CreateUserRequest")
+- alias: Generated alias name (e.g., "GetUsersResponse", "PostUserRequest")
 
 ENVIRONMENT VARIABLE HANDLING:
 - Format: "ENV_VAR:VARIABLE_NAME:path"
@@ -45,8 +68,10 @@ ENVIRONMENT VARIABLE HANDLING:
 - env.SERVICE_URL + "/health" → "ENV_VAR:SERVICE_URL:/health"
 
 TEMPLATE LITERAL HANDLING:
-- Keep variable placeholders: `/users/${userId}` → "/users/${userId}"
-- Resolve when possible: `${baseUrl}/api` → "${baseUrl}/api"
+- Convert ALL template literals to :id: `/users/${userId}` → "/users/:id"
+- Convert ALL template literals to :id: `/users/${user_id}` → "/users/:id"
+- Convert ALL template literals to :id: `/orders/${orderId}/items/${itemId}` → "/orders/:id/items/:id"
+- Remove query parameters from paths: `/orders?userId=${userId}` → "/orders"
 
 URL CONSTRUCTION:
 - String concatenation: "/api" + "/users" → "/api/users"
@@ -85,6 +110,14 @@ EXTRACTION RULES:
 1. Find HTTP calls: fetch(), axios.get/post/put/delete(), request(), etc.
 2. Ignore: setTimeout, file operations, database calls, console.log
 3. Extract exact route, method, request body
+4. Extract TypeScript type annotations from function parameters and return types
+
+TYPE EXTRACTION RULES:
+- Look for function parameter types: (req: RequestType) → extract "RequestType"
+- Look for return type annotations: ): Promise<ResponseType> → extract "ResponseType"
+- Look for response variable types: const result: UserData = await...
+- Calculate character position by counting from start of function
+- Generate aliases: GET /users → "GetUsersResponse", POST /users → "PostUsersRequest"
 
 ENVIRONMENT VARIABLE FORMAT:
 - process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
@@ -93,20 +126,28 @@ ENVIRONMENT VARIABLE FORMAT:
 - CONSTANT_VAR + "/path" → "ENV_VAR:CONSTANT_VAR:/path"
 
 TEMPLATE LITERALS:
-- `/users/${{id}}` → "/users/${{id}}"
-- `${{base}}/api` → "${{base}}/api"
+- `/users/${{id}}` → "/users/:id"
+- `/users/${{userId}}` → "/users/:id"
+- `/orders/${{orderId}}` → "/orders/:id"
+- `/api/comments?userId=${{userId}}` → "/api/comments"
+- `${{base}}/users/${{id}}` → "ENV_VAR:base:/users/:id"
 
 STRING CONCATENATION:
 - "/api" + "/users" → "/api/users"
 - path + "/" + id → path + "/${{id}}"
 
 EXAMPLES:
-```js
-fetch(process.env.API_URL + "/users")
-// → {{"route":"ENV_VAR:API_URL:/users","method":"GET","request_body":null,"has_response_type":false}}
+```
+async function getUsers(req: GetUsersRequest): Promise<GetUsersResponse> {{{{
+  return fetch(process.env.API_URL + "/users")
+}}}}
+// → {{{{"route":"ENV_VAR:API_URL:/users","method":"GET","request_body":null,"has_response_type":true,"request_type_info":{{{{"file_path":"example.ts","start_position":25,"composite_type_string":"GetUsersRequest","alias":"GetUsersRequest"}}}}, "response_type_info":{{{{"file_path":"example.ts","start_position":50,"composite_type_string":"GetUsersResponse","alias":"GetUsersResponse"}}}}}}}}
+
+fetch(\`/users/${{{{userId}}}}/comments\`)
+// → {{{{"route":"/users/:id/comments","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
 
 axios.post("/api/users", userData)
-// → {{"route":"/api/users","method":"POST","request_body":{{"userData":"placeholder"}},"has_response_type":false}}
+// → {{{{"route":"/api/users","method":"POST","request_body":{{{{"userData":"placeholder"}}}},"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
 ```
 
 OUTPUT JSON ARRAY ONLY:"#,
@@ -127,13 +168,34 @@ fn convert_gemini_responses_to_calls(
                 .map(|c| PathBuf::from(&c.file))
                 .unwrap_or_default();
 
+            // Convert TypeInfo to TypeReference if present
+            let request_type = gc.request_type_info.map(|type_info| {
+                TypeReference {
+                    file_path: PathBuf::from(type_info.file_path),
+                    type_ann: None, // We don't have SWC AST node from Gemini
+                    start_position: type_info.start_position as usize,
+                    composite_type_string: type_info.composite_type_string,
+                    alias: type_info.alias,
+                }
+            });
+
+            let response_type = gc.response_type_info.map(|type_info| {
+                TypeReference {
+                    file_path: PathBuf::from(type_info.file_path),
+                    type_ann: None, // We don't have SWC AST node from Gemini
+                    start_position: type_info.start_position as usize,
+                    composite_type_string: type_info.composite_type_string,
+                    alias: type_info.alias,
+                }
+            });
+
             Call {
                 route: gc.route,
                 method: gc.method.to_uppercase(),
                 response: Json::Null,
                 request: gc.request_body.and_then(|v| serde_json::from_value(v).ok()),
-                response_type: None,
-                request_type: None,
+                response_type,
+                request_type,
                 call_file: file_path,
                 call_id: None,
                 call_number: None,
