@@ -51,7 +51,7 @@ Error: Property 'role' is missing in producer type
 
 ## GitHub Action Output
 
-When Carrick runs in your CI, it produces detailed reports like this:
+When Carrick runs in your CI, it produces detailed reports like this (click sections to expand):
 
 <!-- CARRICK_ISSUE_COUNT:22 -->
 ### 🪢 CARRICK: API Analysis Results
@@ -146,12 +146,6 @@ Add to your GitHub workflow:
 ```
 
 Run on `main` to analyze deployed code, and on PRs to catch divergence before merging.
-
-Local usage:
-```bash
-cargo build --release
-./target/release/carrick /path/to/your/project
-```
 
 ## Technical details
 
