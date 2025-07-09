@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-Carrick is a Rust-based tool that analyzes JavaScript/TypeScript codebases to detect API inconsistencies across multiple repositories. It identifies mismatches between API endpoints and their callers, performs type checking, and helps maintain API compatibility in microservices architectures.
+Carrick is a Rust-based tool that analyzes JavaScript/TypeScript codebases to detect API inconsistencies across multiple repositories. It combines static code analysis with AI-powered code understanding to identify mismatches between API endpoints and their callers, performs type checking, and helps maintain API compatibility in microservices architectures.
 
 ## Core Functionality
 
@@ -12,9 +12,10 @@ Carrick is a Rust-based tool that analyzes JavaScript/TypeScript codebases to de
 **CI Mode**: Performs cross-repository analysis by sharing type information and API definitions between repos
 
 The tool:
-- Parses JavaScript/TypeScript files using SWC
-- Extracts API endpoint definitions (Express routes, handlers)
-- Identifies API calls (fetch, axios, etc.)
+- Parses JavaScript/TypeScript files using SWC for structural analysis
+- Uses Gemini 2.5 Flash to intelligently extract complex API calls from async functions
+- Extracts API endpoint definitions (Express routes, handlers) through AST traversal
+- Identifies API calls (fetch, axios, etc.) with AI-powered semantic understanding
 - Performs type checking and validates request/response schemas
 - Detects mismatches between API providers and consumers across repos
 
@@ -23,15 +24,18 @@ The tool:
 ### Core Components
 - **Parser**: Uses SWC to parse JS/TS files into ASTs
 - **Visitor**: Walks ASTs to extract API endpoints, calls, and type information
+- **AI Extractor**: Uses Gemini 2.5 Flash to analyze complex async functions and extract HTTP calls with proper URL normalization
 - **Analyzer**: Matches endpoints with calls, resolves types, identifies issues
 - **Cloud Storage**: Abstraction for sharing data between repositories
 
 ### Data Flow
-1. Parse files in current repository
-2. Extract endpoints, calls, types, and metadata
-3. Upload current repo data to cloud storage
-4. Download data from other repositories with same API key
-5. Perform cross-repo analysis and report inconsistencies
+1. Parse files in current repository using SWC
+2. Extract API endpoints through AST traversal (traditional static analysis)
+3. Send async function contexts to Gemini 2.5 Flash for intelligent HTTP call extraction
+4. Normalize AI-extracted calls to match Express route patterns (e.g., `${userId}` → `:id`)
+5. Upload current repo data to cloud storage
+6. Download data from other repositories with same API key
+7. Perform cross-repo analysis and report inconsistencies
 
 ## Current Implementation Status
 
@@ -96,7 +100,3 @@ pub struct CloudRepoData {
     pub commit_hash: String,
 }
 ```
-
-**Development Methodology**
-- This is an MVP, so try to keep solutions minimal, providing enough functionality to meet MVP requirements but without the need for additonal market capture
-- Do not write tests unless they are for temporary testing of technical solutions -> we are trying to generate a proof of concept

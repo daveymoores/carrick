@@ -1,98 +1,183 @@
+![Carrick Social Image](https://cdn.prod.website-files.com/685162a038275750f4f698e3/686cee204d48f5406664086d_social-image_1.png)
+
 # Carrick 🪢
 
-Carrick is a tool for finding API dependency issues in microservice architectures. It analyzes TypeScript and JavaScript code to detect problems in API endpoints and calls, helping developers identify issues during code changes.
+A GitHub Action that checks API producers and consumers across repositories to catch mismatches in CI.
 
-## Features
-- Analyzes API endpoints and calls to find mismatches, missing routes, and unused endpoints.
-- Uses SWC for fast static analysis of TypeScript/JavaScript code.
-- Checks TypeScript types with the TypeScript compiler to catch response and request shape issues.
-- Integrates with GitHub Actions to report issues in CI pipelines.
+Rather than contract testing, Carrick uses SWC to extract routes from Express apps and mounted routers to find producers, then extracts async call code and sends it to an LLM to find consumers. It extracts request/response types from both sides and runs a minimal TypeScript compiler pass to surface mismatches between services.
+
+**Looking for beta testers with Express microservices. API keys going out January 18th - sign up at [carrick.tools](https://www.carrick.tools/)**
+
+## How it works
+
+1. **Extract producers**: Uses SWC to parse Express apps and extract route definitions from mounted routers
+2. **Extract consumers**: Finds async function calls and sends them to Gemini 2.5 Flash for intelligent extraction of HTTP calls
+3. **Type analysis**: Extracts TypeScript types from both producers and consumers
+4. **Cross-repo analysis**: Shares data across repositories via cloud storage (DynamoDB + S3)
+5. **Mismatch detection**: Runs TypeScript compiler with extracted types to find incompatibilities
+
+Catches issues like type mismatches, method conflicts, missing endpoints, and orphaned routes.
 
 ## Example
-Carrick can catch **drifting response types** between repositories. For example:
 
-- **Repository A** defines an endpoint:
-  ```typescript
-  // server.ts
-  app.get("/users", (req, res) => res.json([{ id: 1, name: "Alice" }]));
-  ```
-
-- **Repository B** calls the endpoint, expecting a `role` field:
-  ```typescript
-  // client.ts
-  interface User {
-    name: string;
-    role: string;
-  }
-  async function fetchUsers(): Promise<User[]> {
-    const response = await fetch("http://api.company.com/users");
-    return response.json();
-  }
-  ```
-
-Carrick detects the mismatch and reports:
-```
-Response mismatch: Type '{ id: number; name: string; }[]' is not assignable to type 'User[]'. Property 'role' is missing. (client.ts:7)
+**Producer** (Express service):
+```typescript
+app.get("/users/:id", (req, res) => {
+  res.json({ id: 1, name: "Alice" });
+});
 ```
 
-## Installation & Usage
+**Consumer** (Client service):
+```typescript
+interface User {
+  id: number;
+  name: string;
+  role: string;
+}
 
-```bash
-# Build from source
-cargo build --release
-
-# Analyze a project
-./target/release/carrick /path/to/your/project
-
-# Or with cargo run
-cargo run -- /path/to/your/project
-
-# Force local mode (useful in CI environments)
-FORCE_LOCAL_MODE=1 ./target/release/carrick /path/to/your/project
+async function getUser(id: string): Promise<User> {
+  const response = await fetch(`${API_URL}/users/${id}`);
+  return response.json();
+}
 ```
 
-## Testing
-
-Carrick includes comprehensive integration tests to ensure endpoint detection works correctly:
-
-```bash
-# Run all tests
-cargo test
-
-# Run integration tests specifically
-cargo test --test integration_test
-
-# Install test dependencies first
-cd test-repo && npm install
-cd ../test-multiple && npm install
-cd ../tests/fixtures/imported-routers && npm install
+**Result:**
+```
+Type compatibility issue: GET /users/:id
+Producer: { id: number; name: string; }
+Consumer: User
+Error: Property 'role' is missing in producer type
 ```
 
-### Test Coverage
+## GitHub Action Output
 
-- **Basic endpoint detection**: Tests using `test-repo/` fixture
-- **Imported router resolution**: Tests complex routing with imported Express routers
-- **Regression tests**: Specifically catches the imported router endpoint resolution bug
+When Carrick runs in your CI, it produces detailed reports like this:
 
-The tests verify that:
-1. Endpoints are correctly detected and resolved with their full paths
-2. Imported routers are processed correctly with their imported names
-3. No duplicate processing occurs that could break endpoint resolution
-4. The number of detected endpoints matches expectations
+<!-- CARRICK_ISSUE_COUNT:22 -->
+### 🪢 CARRICK: API Analysis Results
 
-## CI/CD Integration
+Analyzed **20 endpoints** and **13 API calls** across all repositories.
 
-Use the provided GitHub Actions workflow to run tests on every PR and push:
+Found **22 total issues**: **2 critical mismatches**, **17 connectivity issues**, and **3 configuration suggestions**.
+
+<br>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">2 Critical: API Mismatches</strong>
+</summary>
+
+> These issues indicate a direct conflict between the API consumer and producer and should be addressed first.
+
+#### Type Compatibility Issue: `GET /users/:id`
+
+Type compatibility issue detected.
+
+  - **Endpoint:** `GET /users/:id`
+  - **Producer Type:** `{ commentsByUser: repo-a-types.Comment[]; }`
+  - **Consumer Type:** `repo-b-types.User`
+  - **Error:** { commentsByUser: Comment[]; } missing properties from User: id, name, role
+
+#### Method Mismatch
+
+Issue details: Method mismatch: GET ENV_VAR:ORDER_SERVICE_URL:/orders is called but endpoint only supports POST
+</details>
+<hr>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">17 Connectivity Issues</strong>
+</summary>
+
+> These endpoints are either defined but never used (orphaned) or called but never defined (missing). This could be dead code or a misconfigured route.
+
+#### 2 Missing Endpoints
+
+| Method | Path |
+| :--- | :--- |
+| `GET` | `ENV_VAR:ORDER_SERVICE_URL:/route-does-not-exist` |
+| `GET` | `/not-found` |
+
+<br>
+
+#### 15 Orphaned Endpoints
+
+| Method | Path |
+| :--- | :--- |
+| `GET` | `/api/orders` |
+| `GET` | `/api/orders/:id/comments` |
+| `GET` | `/users` |
+| `GET` | `/api/comments` |
+| `GET` | `/posts/:postId` |
+| `GET` | `/events/:eventId/register` |
+| `GET` | `/api/potatoes` |
+| `GET` | `/admin/stats` |
+| `GET` | `/dynamic` |
+| `GET` | `/api/profiles` |
+| `GET` | `/users/:id/profile` |
+| `GET` | `/api/v1/stats` |
+| `POST` | `/api/comments` |
+| `GET` | `/api/comments/:id` |
+| `POST` | `/api/v1/chat` |
+</details>
+<hr>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">3 Configuration Suggestions</strong>
+</summary>
+
+> These API calls use environment variables to construct the URL. To enable full analysis, consider adding them to your tool's external API configuration.
+
+  - `GET` using **[COMMENT_SERVICE_URL]** in `/api/comments`
+  - `GET` using **[COMMENT_SERVICE_URL]** in `/comments`
+</details>
+<!-- CARRICK_OUTPUT_END -->
+
+## Setup
+
+Add to your GitHub workflow:
 
 ```yaml
-# .github/workflows/ci.yml is included for:
-- Unit and integration tests
-- Code formatting and linting
-- Security audit
-- Endpoint detection regression tests
+- uses: davidjonathanmoores/carrick@v1
+  with:
+    carrick-org: your-org-name
+    carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
 ```
 
-### Environment Variables
+Run on `main` to analyze deployed code, and on PRs to catch divergence before merging.
 
-- `FORCE_LOCAL_MODE=1` - Forces local analysis mode even in CI environments
-- `MOCK_STORAGE=1` - Uses mock storage instead of AWS in CI mode
+Local usage:
+```bash
+cargo build --release
+./target/release/carrick /path/to/your/project
+```
+
+## Technical details
+
+**Producer extraction**: Uses SWC parser to walk ASTs and extract Express route definitions, including mounted routers and imported handlers.
+
+**Consumer extraction**: Pattern matching finds basic fetch/axios calls. For complex cases (template literals, dynamic URLs), sends function source to Gemini 2.5 Flash for intelligent extraction.
+
+**Type analysis**: Extracts TypeScript interface definitions and runs targeted compiler passes using only the relevant types to check compatibility.
+
+**Cross-repository**: Stores extracted data in DynamoDB with type files in S3. Each repository downloads data from others in the same organization for analysis.
+
+## Configuration
+
+Create a `carrick.json` to help classify your API calls:
+
+```json
+{
+  "internalEnvVars": ["API_URL", "SERVICE_URL"],
+  "externalEnvVars": ["STRIPE_API", "GITHUB_API"],
+  "internalDomains": ["api.yourcompany.com"],
+  "externalDomains": ["api.stripe.com", "api.github.com"]
+}
+```
+
+## Beta testing
+
+Looking for teams with Express microservices to test this. It's fast, low-effort to integrate, and should help catch bugs early across services.
+
+API keys going out January 18th. Sign up at [carrick.tools](https://www.carrick.tools/) if interested.
