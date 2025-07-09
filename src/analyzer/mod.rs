@@ -119,6 +119,10 @@ impl Analyzer {
         }
     }
 
+    pub fn fetch_calls(&self) -> &Vec<Call> {
+        &self.fetch_calls
+    }
+
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
         self.mounts.extend(visitor.mounts);
         self.apps.extend(visitor.express_apps);
@@ -164,48 +168,38 @@ impl Analyzer {
         }
     }
 
-    pub fn analyze_functions_for_fetch_calls(&mut self) {
-        let mut raw_fetch_calls = Vec::new();
+    pub async fn analyze_functions_for_fetch_calls(&mut self) {
+        use crate::gemini_service::extract_calls_from_async_expressions;
 
-        // Clone the function_definitions to avoid borrowing issues
-        let function_defs = self.function_definitions.clone();
+        let mut all_async_contexts = Vec::new();
 
-        // Process each function definition to extract fetch calls
-        for (_, def) in function_defs.iter() {
-            // Extract fetch calls based on function type
-            let fetch_calls = match &def.node_type {
-                FunctionNodeType::ArrowFunction(arrow) => {
-                    self.extract_fetch_calls_from_arrow_with_file(arrow, &def.file_path)
-                }
-                FunctionNodeType::FunctionDeclaration(decl) => {
-                    self.extract_fetch_calls_from_function_decl_with_file(decl, &def.file_path)
-                }
-                FunctionNodeType::FunctionExpression(expr) => {
-                    self.extract_fetch_calls_from_function_expr_with_file(expr, &def.file_path)
-                }
-                FunctionNodeType::Placeholder => {
-                    // In CI mode, AST is not available, skip fetch call extraction
-                    Vec::new()
-                }
-            };
-
-            // Add the discovered calls
-            for mut call in fetch_calls {
-                // Set the file path from the function definition if it's empty
-                if call.call_file.as_os_str().is_empty() {
-                    call.call_file = def.file_path.clone();
-                }
-
-                // Store raw fetch call for processing
-                raw_fetch_calls.push(call);
-            }
+        // Extract async calls from each function definition using extractor methods
+        for (_, def) in &self.function_definitions {
+            let async_contexts = self.extract_async_calls_from_function(def);
+            all_async_contexts.extend(async_contexts);
         }
 
-        // Process fetch calls with unique identifiers for tracking
-        let processed_calls = self.process_fetch_calls(raw_fetch_calls);
+        println!(
+            "Found {} async expressions, sending to Gemini Flash 2.5...",
+            all_async_contexts.len()
+        );
+
+        // Skip Gemini call if no async expressions found (safety check)
+        if all_async_contexts.is_empty() {
+            println!("No async expressions found, skipping Gemini analysis");
+            return;
+        }
+
+        // Send to Gemini Flash 2.5 for analysis
+        let gemini_calls = extract_calls_from_async_expressions(all_async_contexts).await;
+
+        println!("Gemini extracted {} HTTP calls", gemini_calls.len());
+
+        // Process calls as before
+        let processed_calls = self.process_fetch_calls(gemini_calls);
         self.fetch_calls.extend(processed_calls.clone());
 
-        // Create ApiEndpointDetails from processed calls with unique type references
+        // Create ApiEndpointDetails from processed calls
         for call in processed_calls {
             let params = self.extract_params_from_route(&call.route);
             self.calls.push(ApiEndpointDetails {
@@ -1156,6 +1150,38 @@ impl Analyzer {
         }
     }
 
+    /// Collect type information from Gemini-extracted calls for TypeScript extraction
+    pub fn collect_type_infos_from_calls(&self, calls: &[Call]) -> Vec<serde_json::Value> {
+        println!("collect_type_infos_from_calls is called");
+        let mut type_infos = Vec::new();
+
+        for call in calls {
+            // Collect request type info
+            if let Some(request_type) = &call.request_type {
+                let type_info = serde_json::json!({
+                    "filePath": request_type.file_path.to_string_lossy().to_string(),
+                    "startPosition": request_type.start_position,
+                    "compositeTypeString": request_type.composite_type_string,
+                    "alias": request_type.alias
+                });
+                type_infos.push(type_info);
+            }
+
+            // Collect response type info
+            if let Some(response_type) = &call.response_type {
+                let type_info = serde_json::json!({
+                    "filePath": response_type.file_path.to_string_lossy().to_string(),
+                    "startPosition": response_type.start_position,
+                    "compositeTypeString": response_type.composite_type_string,
+                    "alias": response_type.alias
+                });
+                type_infos.push(type_info);
+            }
+        }
+
+        type_infos
+    }
+
     pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
         use std::fs;
         use std::path::Path;
@@ -1464,7 +1490,7 @@ impl Analyzer {
     }
 }
 
-pub fn analyze_api_consistency(
+pub async fn analyze_api_consistency(
     visitors: Vec<DependencyVisitor>,
     config: Config,
     packages: Packages,
@@ -1496,7 +1522,8 @@ pub fn analyze_api_consistency(
     analyzer
         .update_endpoints_with_resolved_fields(response_fields, request_fields)
         .resolve_types_for_endpoints(cm)
-        .analyze_functions_for_fetch_calls();
+        .analyze_functions_for_fetch_calls()
+        .await;
 
     // Extract types for each repository
     let mut repo_type_map: HashMap<String, Vec<Value>> = HashMap::new();
@@ -1507,10 +1534,20 @@ pub fn analyze_api_consistency(
         analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
     }
 
-    // Group type information by repository using call file information
-    for call in &analyzer.calls {
-        let repo_prefix = analyzer.extract_repo_prefix_from_file_path(&call.file_path, &repo_paths);
-        analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
+    // Group type information by repository using fetch call file information
+    // (No longer call process_api_detail_types for fetch_calls; handled below)
+
+    // Also collect type information from Gemini-extracted calls for TypeScript extraction
+    let gemini_type_infos = analyzer.collect_type_infos_from_calls(&analyzer.fetch_calls);
+    for type_info in gemini_type_infos {
+        // Extract repo prefix from file path in type info
+        let file_path = type_info["filePath"].as_str().unwrap_or("");
+        let repo_prefix = analyzer
+            .extract_repo_prefix_from_file_path(&std::path::PathBuf::from(file_path), &repo_paths);
+        repo_type_map
+            .entry(repo_prefix)
+            .or_default()
+            .push(type_info);
     }
 
     // Clean output directory before starting type extraction

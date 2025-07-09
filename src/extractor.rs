@@ -865,6 +865,61 @@ pub trait CoreExtractor {
 
         None
     }
+
+    // Async call extraction methods for Gemini Flash integration
+    fn extract_async_calls_from_function(
+        &self,
+        func: &crate::visitor::FunctionDefinition,
+    ) -> Vec<crate::gemini_service::AsyncCallContext> {
+        use swc_common::{SourceMapper, Spanned};
+
+        let mut contexts = Vec::new();
+
+        // Get the function source code for LLM analysis
+        let source_map = self.get_source_map();
+
+        let (function_source, function_name) = match &func.node_type {
+            crate::visitor::FunctionNodeType::ArrowFunction(arrow) => {
+                let source = source_map.span_to_snippet(arrow.span).unwrap_or_default();
+                (source, "arrow_function".to_string())
+            }
+            crate::visitor::FunctionNodeType::FunctionDeclaration(decl) => {
+                let source = source_map.span_to_snippet(decl.span()).unwrap_or_default();
+                let name = decl.ident.sym.to_string();
+                (source, name)
+            }
+            crate::visitor::FunctionNodeType::FunctionExpression(expr) => {
+                let source = source_map.span_to_snippet(expr.span()).unwrap_or_default();
+                let name = expr
+                    .ident
+                    .as_ref()
+                    .map(|i| i.sym.to_string())
+                    .unwrap_or("anonymous".to_string());
+                (source, name)
+            }
+            crate::visitor::FunctionNodeType::Placeholder => {
+                // In CI mode, AST is not available, skip extraction
+                return contexts;
+            }
+        };
+
+        // Only create context if we found async patterns in the source
+        if function_source.contains("await")
+            || function_source.contains(".then")
+            || function_source.contains("fetch")
+            || function_source.contains("axios")
+        {
+            contexts.push(crate::gemini_service::AsyncCallContext {
+                kind: "function_analysis".to_string(),
+                function_source,
+                file: func.file_path.to_string_lossy().to_string(),
+                line: 1, // We'll let Gemini figure out the specific line
+                function_name,
+            });
+        }
+
+        contexts
+    }
 }
 
 pub trait RouteExtractor: CoreExtractor {

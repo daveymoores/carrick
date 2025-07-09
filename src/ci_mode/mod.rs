@@ -34,7 +34,7 @@ pub async fn run_ci_mode<T: CloudStorage>(
     println!("AWS connectivity verified");
 
     // 1. Analyze current repo only
-    let current_repo_data = analyze_current_repo(repo_path)?;
+    let current_repo_data = analyze_current_repo(repo_path).await?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
 
     // 2. Upload current repo data to cloud storage (without AST nodes)
@@ -54,7 +54,7 @@ pub async fn run_ci_mode<T: CloudStorage>(
     println!("Downloaded data from {} repos", all_repo_data.len());
 
     // 4. Reconstruct analyzer with combined data
-    let analyzer = build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage).await?; // Pass repo_s3_urls and storage
+    let analyzer = build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage).await?;
     println!("Reconstructed analyzer with cross-repo data");
 
     // 5. Run analysis
@@ -213,7 +213,9 @@ fn load_config_and_packages(
     Ok((config, packages))
 }
 
-fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+async fn analyze_current_repo(
+    repo_path: &str,
+) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     println!(
         "---> Analyzing JavaScript/TypeScript files in: {}",
         repo_path
@@ -231,7 +233,7 @@ fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::e
 
     // 4. Build analyzer using shared logic with same SourceMap
     let builder = AnalyzerBuilder::new(config.clone(), cm);
-    let analyzer = builder.build_from_visitors(visitors)?;
+    let analyzer = builder.build_from_visitors(visitors).await?;
 
     // 5. Extract types for current repo
     extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
@@ -276,6 +278,18 @@ fn extract_types_for_current_repo(
         analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
     }
 
+    // Collect type information from Gemini-extracted fetch_calls
+    let gemini_type_infos = analyzer.collect_type_infos_from_calls(analyzer.fetch_calls());
+    for type_info in gemini_type_infos {
+        let file_path = type_info["filePath"].as_str().unwrap_or("");
+        let repo_prefix = analyzer
+            .extract_repo_prefix_from_file_path(&std::path::PathBuf::from(file_path), &repo_paths);
+        repo_type_map
+            .entry(repo_prefix)
+            .or_default()
+            .push(type_info);
+    }
+
     // Extract types for current repository
     let repo_name = get_repository_name(repo_path);
 
@@ -306,7 +320,7 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     // 2. Build analyzer using shared logic (skip type resolution for cross-repo)
     let cm: Lrc<SourceMap> = Default::default();
     let builder = AnalyzerBuilder::new_for_cross_repo(combined_config, cm);
-    let analyzer = builder.build_from_repo_data(all_repo_data.clone())?;
+    let analyzer = builder.build_from_repo_data(all_repo_data.clone()).await?;
 
     // 3. Recreate type files from S3 and run type checking
     recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
