@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARRICK_API_ENDPOINT: ${{ secrets.CARRICK_API_ENDPOINT }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
 jobs:
   test:

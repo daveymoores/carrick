@@ -8,6 +8,13 @@ fn main() {
 
     println!("cargo:rustc-env=CARRICK_API_ENDPOINT={}", api_endpoint);
 
-    // Tell cargo to rerun this build script if the environment variable changes.
+    // Handle GEMINI_API_KEY - provide a default for local builds
+    let gemini_api_key =
+        env::var("GEMINI_API_KEY").unwrap_or_else(|_| "default-gemini-key".to_string());
+
+    println!("cargo:rustc-env=GEMINI_API_KEY={}", gemini_api_key);
+
+    // Tell cargo to rerun this build script if the environment variables change.
     println!("cargo:rerun-if-env-changed=CARRICK_API_ENDPOINT");
+    println!("cargo:rerun-if-env-changed=GEMINI_API_KEY");
 }
