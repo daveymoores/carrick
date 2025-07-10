@@ -66,7 +66,8 @@ fn test_imported_router_endpoint_resolution() {
     // Run carrick on the test project
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(test_project_path.to_str().unwrap())
-        .env("FORCE_LOCAL_MODE", "1")
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_ORG", "test-org")
         .output()
         .expect("Failed to execute carrick");
 
@@ -141,7 +142,8 @@ fn test_basic_endpoint_detection() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(test_repo_path.to_str().unwrap())
-        .env("FORCE_LOCAL_MODE", "1")
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_ORG", "test-org")
         .output()
         .expect("Failed to execute carrick");
 
@@ -208,7 +210,8 @@ fn test_no_duplicate_processing_regression() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(fixture_path.to_str().unwrap())
-        .env("FORCE_LOCAL_MODE", "1")
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_ORG", "test-org")
         .output()
         .expect("Failed to execute carrick");
 

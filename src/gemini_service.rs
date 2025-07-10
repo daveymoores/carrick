@@ -2,6 +2,7 @@ use crate::visitor::{Call, Json, TypeReference};
 use genai::Client;
 use genai::chat::{ChatMessage, ChatRequest};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
@@ -32,6 +33,11 @@ pub struct TypeInfo {
 }
 
 pub async fn extract_calls_from_async_expressions(async_calls: Vec<AsyncCallContext>) -> Vec<Call> {
+    // If CARRICK_MOCK_ALL is set, bypass the actual API call for testing purposes
+    if env::var("CARRICK_MOCK_ALL").is_ok() {
+        return vec![];
+    }
+
     if async_calls.is_empty() {
         return vec![];
     }

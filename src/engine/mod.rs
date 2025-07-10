@@ -4,8 +4,7 @@ use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
 use crate::packages::Packages;
 use crate::parser::parse_file;
-use crate::resolve_import_path;
-use crate::utils::get_repository_name;
+use crate::utils::{get_repository_name, resolve_import_path};
 use crate::visitor::DependencyVisitor;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -18,7 +17,7 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 
-pub async fn run_ci_mode<T: CloudStorage>(
+pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -555,8 +554,8 @@ mod tests {
         assert!(default_config.is_ok());
     }
 
-    #[test]
-    fn test_cross_repo_analyzer_builder_no_sourcemap_issues() {
+    #[tokio::test]
+    async fn test_cross_repo_analyzer_builder_no_sourcemap_issues() {
         use crate::analyzer::builder::AnalyzerBuilder;
         use crate::config::Config;
         use swc_common::{SourceMap, sync::Lrc};
@@ -607,11 +606,8 @@ mod tests {
         let builder = AnalyzerBuilder::new_for_cross_repo(config, cm);
 
         // This should not panic with SourceMap issues
-        let result = builder.build_from_repo_data(test_data);
-        assert!(
-            result.is_ok(),
-            "Cross-repo analyzer should not fail with SourceMap issues"
-        );
+        let result = builder.build_from_repo_data(test_data).await;
+        assert!(result.is_ok(), "build_cross_repo_analyzer should not fail");
 
         let analyzer = result.unwrap();
         assert_eq!(analyzer.endpoints.len(), 1);
