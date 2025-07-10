@@ -169,6 +169,7 @@ impl Analyzer {
     }
 
     pub async fn analyze_functions_for_fetch_calls(&mut self) {
+        println!("When am I called?");
         use crate::gemini_service::extract_calls_from_async_expressions;
 
         let mut all_async_contexts = Vec::new();
@@ -178,11 +179,6 @@ impl Analyzer {
             let async_contexts = self.extract_async_calls_from_function(def);
             all_async_contexts.extend(async_contexts);
         }
-
-        println!(
-            "Found {} async expressions, sending to Gemini Flash 2.5...",
-            all_async_contexts.len()
-        );
 
         // Skip Gemini call if no async expressions found (safety check)
         if all_async_contexts.is_empty() {

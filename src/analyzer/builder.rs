@@ -96,7 +96,8 @@ impl AnalyzerBuilder {
 
         if !self.skip_type_resolution {
             analyzer.resolve_types_for_endpoints(self.cm.clone());
-            // Only analyze functions for fetch calls when we have real AST data
+            // Only analyze functions for fetch calls when building from visitors (current repo)
+            // Skip in cross-repo mode since repos are already analyzed
             analyzer.analyze_functions_for_fetch_calls().await;
         }
 
