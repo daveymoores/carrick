@@ -38,10 +38,39 @@ pub async fn extract_calls_from_async_expressions(async_calls: Vec<AsyncCallCont
         return vec![];
     }
 
+    // Emergency disable option for Gemini API
+    if env::var("DISABLE_GEMINI").is_ok() {
+        println!("Gemini API disabled via DISABLE_GEMINI environment variable");
+        return vec![];
+    }
+
     if async_calls.is_empty() {
         return vec![];
     }
 
+    // Size protection: warn if function sources are very large (high token usage)
+    let total_size: usize = async_calls
+        .iter()
+        .map(|call| call.function_source.len())
+        .sum();
+
+    const MAX_REASONABLE_SIZE: usize = 200_000; // 200KB - warn above this
+    if total_size > MAX_REASONABLE_SIZE {
+        eprintln!(
+            "Warning: Large amount of source code to analyze ({:.1}KB total). This may result in high token usage.",
+            total_size as f64 / 1024.0
+        );
+    }
+
+    println!(
+        "Found {} async expressions, sending to Gemini Flash 2.5...",
+        async_calls.len()
+    );
+
+    // Set the API key as an environment variable for the genai client
+    unsafe {
+        std::env::set_var("GEMINI_API_KEY", env!("GEMINI_API_KEY"));
+    }
     let client = Client::default();
     let prompt = create_extraction_prompt(&async_calls);
 
@@ -88,16 +117,18 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#,
         ChatMessage::user(prompt),
     ]);
 
-    match client
-        .exec_chat("gemini-2.0-flash-exp", chat_req, None)
-        .await
-    {
+    match client.exec_chat("gemini-2.5-flash", chat_req, None).await {
         Ok(response) => {
             let response_text = response.content_text_as_str().unwrap_or("");
+            println!(
+                "Gemini API call successful. Processing {} async expressions.",
+                async_calls.len()
+            );
             parse_gemini_response(response_text, &async_calls)
         }
         Err(e) => {
             eprintln!("Gemini API call failed: {}", e);
+            eprintln!("Continuing analysis without AI-extracted calls...");
             vec![]
         }
     }
