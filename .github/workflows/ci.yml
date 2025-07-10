@@ -9,7 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARRICK_API_ENDPOINT: ${{ secrets.CARRICK_API_ENDPOINT }}
-  CARRICK_LAMBDA_URL: ${{ secrets.CARRICK_LAMBDA_URL }}
 
 jobs:
   test:

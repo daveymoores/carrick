@@ -15,3 +15,8 @@ variable "environment" {
   type        = string
   default     = "dev"
 }
+
+variable "domain_name" {
+  description = "Your domain name (e.g., yoursite.com)"
+  type        = string
+}
