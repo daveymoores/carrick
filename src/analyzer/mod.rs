@@ -169,7 +169,6 @@ impl Analyzer {
     }
 
     pub async fn analyze_functions_for_fetch_calls(&mut self) {
-        println!("When am I called?");
         use crate::gemini_service::extract_calls_from_async_expressions;
 
         let mut all_async_contexts = Vec::new();

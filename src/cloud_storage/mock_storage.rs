@@ -63,7 +63,41 @@ impl CloudStorage for MockStorage {
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
         println!("MOCK: Downloading all repo data for org: {}", org);
         let storage = self.data.lock().unwrap();
-        let result = storage.get(org).cloned().unwrap_or_default();
+        let mut result = storage.get(org).cloned().unwrap_or_default();
+
+        // Add some mock repos to simulate cross-repo scenario
+        if result.len() <= 1 {
+            // Create mock repos for testing
+            let mock_repos = vec![
+                CloudRepoData {
+                    repo_name: "repo-a".to_string(),
+                    endpoints: vec![],
+                    calls: vec![],
+                    mounts: vec![],
+                    apps: HashMap::new(),
+                    imported_handlers: vec![],
+                    function_definitions: HashMap::new(),
+                    config_json: None,
+                    package_json: None,
+                    last_updated: chrono::Utc::now(),
+                    commit_hash: "mock-hash-a".to_string(),
+                },
+                CloudRepoData {
+                    repo_name: "repo-b".to_string(),
+                    endpoints: vec![],
+                    calls: vec![],
+                    mounts: vec![],
+                    apps: HashMap::new(),
+                    imported_handlers: vec![],
+                    function_definitions: HashMap::new(),
+                    config_json: None,
+                    package_json: None,
+                    last_updated: chrono::Utc::now(),
+                    commit_hash: "mock-hash-b".to_string(),
+                },
+            ];
+            result.extend(mock_repos);
+        }
 
         // Create mock S3 URLs
         let mut mock_s3_urls = HashMap::new();
