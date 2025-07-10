@@ -78,8 +78,7 @@ struct GetCrossRepoRequest {
 
 impl AwsStorage {
     pub fn new() -> Result<Self, StorageError> {
-        let api_endpoint = env::var("CARRICK_API_ENDPOINT")
-            .expect("CARRICK_API_ENDPOINT environment variable must be set at build time");
+        let api_endpoint = env!("CARRICK_API_ENDPOINT");
         let lambda_url = format!("{}/types/check-or-upload", api_endpoint);
 
         let api_key = env::var("CARRICK_API_KEY").map_err(|_| {

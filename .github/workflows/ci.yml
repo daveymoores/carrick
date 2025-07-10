@@ -51,13 +51,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
-        env:
-          FORCE_LOCAL_MODE: "1"
 
       - name: Run integration tests
         run: cargo test --test integration_test --verbose
-        env:
-          FORCE_LOCAL_MODE: "1"
 
   lint:
     name: Linting
@@ -159,8 +155,6 @@ jobs:
             exit 1
           fi
           echo "✅ Basic endpoint detection working correctly"
-        env:
-          FORCE_LOCAL_MODE: "1"
 
       - name: Test imported router resolution
         run: |
@@ -183,8 +177,6 @@ jobs:
             exit 1
           fi
           echo "✅ Imported router resolution working correctly ($ENDPOINT_COUNT endpoints found)"
-        env:
-          FORCE_LOCAL_MODE: "1"
 
       - name: Upload test outputs as artifacts
         if: always()
