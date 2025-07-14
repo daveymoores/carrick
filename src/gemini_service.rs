@@ -87,11 +87,12 @@ IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handle
 When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
 
 TYPE EXTRACTION REQUIREMENTS:
-4. Look for TypeScript type annotations in function parameters and return types, BUT DO NOT use Express handler parameter types (Request<T>, Response<T>) for outgoing HTTP calls.
-5. Extract request types from the actual data passed to HTTP calls (e.g., the body argument in fetch/axios), not from Express handler parameters.
-6. Extract response types from how the HTTP call result is used (e.g., assigned to a variable with a type), not from Express handler parameters.
-7. Calculate approximate character position where the type appears in the source
-8. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
+4. For outgoing HTTP calls (fetch, axios, etc.):
+   a. For the response type, if there is an explicit type annotation on the HTTP call (e.g., fetch<T>(), axios.post<T>()), or on the variable assigned from the result (including after parsing, e.g., response.json()), use that type. Otherwise, infer from usage.
+   b. For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
+5. NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
+6. Calculate approximate character position where the type appears in the source
+7. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
 
 TYPE INFO OBJECT FORMAT:
 - file_path: The source file path
@@ -150,8 +151,12 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
     format!(
         r#"Extract HTTP API calls from these JavaScript/TypeScript functions. Return ONLY a JSON array.
 
-IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handler parameters (such as req: Request<T>, res: Response<T>). These describe incoming HTTP requests to the server, NOT outgoing HTTP calls made by the server.
-When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
+IMPORTANT: When analyzing outgoing HTTP calls (fetch, axios, etc.) inside Express route handlers:
+- For the response type:
+   - If there is an explicit type annotation on the HTTP call (e.g., fetch<T>(), axios.post<T>()), or on the variable assigned from the result (including after parsing, e.g., const data: MyType = await response.json();), use that type.
+   - If no explicit type annotation is present, infer the type from usage context.
+- For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
+- NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
 
 FUNCTIONS TO ANALYZE:
 {}
