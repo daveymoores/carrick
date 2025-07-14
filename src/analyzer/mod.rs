@@ -765,6 +765,18 @@ impl Analyzer {
             ));
         }
 
+        // TEMPORARY: Deduplicate environment-based API call warnings.
+        // TODO: Address root cause upstream so this is not needed.
+        let mut seen_env = std::collections::HashSet::new();
+        env_var_calls.retain(|msg| {
+            if seen_env.contains(msg) {
+                false
+            } else {
+                seen_env.insert(msg.clone());
+                true
+            }
+        });
+
         (call_issues, endpoint_issues, env_var_calls)
     }
 
