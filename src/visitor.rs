@@ -47,8 +47,7 @@ pub enum Json {
     Object(Box<HashMap<String, Json>>),
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum FunctionNodeType {
     ArrowFunction(Box<ArrowExpr>),
     FunctionDeclaration(Box<FnDecl>),
@@ -57,7 +56,6 @@ pub enum FunctionNodeType {
     #[default]
     Placeholder,
 }
-
 
 impl serde::Serialize for FunctionNodeType {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -897,10 +895,12 @@ impl DependencyVisitor {
 
                 // Add the router to our tracking if it's not already there
                 // This is important both for locally defined routers AND imported ones
-                if let std::collections::hash_map::Entry::Vacant(e) = self.routers.entry(prefixed_target_name) {
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.routers.entry(prefixed_target_name)
+                {
                     e.insert(RouterContext {
-                            name: target_name.to_string(),
-                        });
+                        name: target_name.to_string(),
+                    });
 
                     // If this is an import, log it specially
                     if self.imported_symbols.contains_key(target_name) {
@@ -938,10 +938,12 @@ impl DependencyVisitor {
                 });
 
                 // Add the router to our tracking if it's not already there
-                if let std::collections::hash_map::Entry::Vacant(e) = self.routers.entry(prefixed_target_name) {
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.routers.entry(prefixed_target_name)
+                {
                     e.insert(RouterContext {
-                            name: target_name.to_string(),
-                        });
+                        name: target_name.to_string(),
+                    });
 
                     // If this is an import, log it specially
                     if self.imported_symbols.contains_key(target_name) {

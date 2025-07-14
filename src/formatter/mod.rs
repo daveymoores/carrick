@@ -224,10 +224,7 @@ fn group_similar_issues(issues: &[String]) -> HashMap<String, Vec<String>> {
 
     for issue in issues {
         let issue_type = extract_issue_type(issue);
-        grouped
-            .entry(issue_type)
-            .or_default()
-            .push(issue.clone());
+        grouped.entry(issue_type).or_default().push(issue.clone());
     }
 
     grouped
