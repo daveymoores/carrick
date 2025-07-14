@@ -388,6 +388,28 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
     storage: &T,
     packages: &Packages,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Before cleaning output directory, copy current repo type file to temp
+    let current_repo = all_repo_data.last().unwrap().repo_name.replace("/", "_");
+    let generated_type_file = format!("ts_check/output/{}_types.ts", current_repo);
+    let temp_dir = std::path::Path::new("ts_check/temp");
+    if !temp_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(temp_dir) {
+            println!("Warning: Failed to create temp directory: {}", e);
+        }
+    }
+    let temp_type_file = temp_dir.join(format!("{}_types.ts", current_repo));
+    if std::fs::copy(&generated_type_file, &temp_type_file).is_ok() {
+        println!(
+            "Backed up type file before cleaning: {}",
+            temp_type_file.display()
+        );
+    } else {
+        println!(
+            "Warning: Could not backup type file before cleaning: {}",
+            generated_type_file
+        );
+    }
+
     // Clean output directory
     let output_dir = std::path::Path::new("ts_check/output");
     if output_dir.exists() {
@@ -404,9 +426,38 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
         println!("Created clean output directory: ts_check/output");
     }
 
+    // Debug: Print the full repo_s3_urls map before download
+    println!("repo_s3_urls map before download: {:?}", repo_s3_urls);
+
     // Download type files for each repository
     for repo_data in all_repo_data {
-        if let Some(s3_url) = repo_s3_urls.get(&repo_data.repo_name) {
+        println!(
+            "Attempting to download type file for repo: {}",
+            repo_data.repo_name
+        );
+        // Use local type file for current repo, download from S3 for others
+        if repo_data.repo_name == all_repo_data.last().unwrap().repo_name {
+            // Assume last in all_repo_data is current repo (matches how current_repo_data is appended)
+            let safe_repo_name = repo_data.repo_name.replace("/", "_");
+            let file_name = format!("{}_types.ts", safe_repo_name);
+            let file_path = output_dir.join(&file_name);
+            // Move the backed up type file from temp into output directory
+            let temp_type_file = format!("ts_check/temp/{}_types.ts", safe_repo_name);
+            match std::fs::copy(&temp_type_file, &file_path) {
+                Ok(_) => println!(
+                    "Moved type file from temp for current repo: {}",
+                    file_path.display()
+                ),
+                Err(e) => println!(
+                    "Warning: Failed to move type file from temp {}: {}",
+                    temp_type_file, e
+                ),
+            }
+            // Clean up temp directory after moving the file
+            if let Err(e) = std::fs::remove_dir_all("ts_check/temp") {
+                println!("Warning: Failed to clean temp directory: {}", e);
+            }
+        } else if let Some(s3_url) = repo_s3_urls.get(&repo_data.repo_name) {
             println!(
                 "Downloading type file for repository: {}",
                 repo_data.repo_name
@@ -427,13 +478,17 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
                 }
                 Err(e) => {
                     println!(
-                        "Warning: Failed to download type file for {}: {}",
+                        "Warning: Failed to download type file for repo {}: {}",
                         repo_data.repo_name, e
                     );
                 }
             }
         } else {
             println!("No S3 URL found for repository: {}", repo_data.repo_name);
+            println!(
+                "repo_s3_urls keys: {:?}",
+                repo_s3_urls.keys().collect::<Vec<_>>()
+            );
         }
     }
 
