@@ -147,7 +147,7 @@ fn format_critical_section(issues: &[String]) -> String {
             output.push_str(&format_issue_details(first_issue));
         }
 
-        output.push_str("\n");
+        output.push('\n');
     }
 
     output.push_str("</details>");
@@ -226,7 +226,7 @@ fn group_similar_issues(issues: &[String]) -> HashMap<String, Vec<String>> {
         let issue_type = extract_issue_type(issue);
         grouped
             .entry(issue_type)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(issue.clone());
     }
 

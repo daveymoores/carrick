@@ -184,7 +184,7 @@ pub trait CoreExtractor {
 
         if let Some(ident) = member.obj.as_ident() {
             if ident.sym == "res" || ident.sym == "json" {
-                let arg = call.args.get(0)?;
+                let arg = call.args.first()?;
                 // Extract the JSON structure from the argument
                 return Some(self.expr_to_json(&arg.expr));
             }
@@ -583,38 +583,36 @@ pub trait CoreExtractor {
         }
 
         // Get the options object (second argument)
-        match &*call.args[1].expr {
-            Expr::Object(obj) => {
-                // Look for body property in options
-                for prop in &obj.props {
-                    if let PropOrSpread::Prop(boxed_prop) = prop {
-                        if let Prop::KeyValue(kv) = &**boxed_prop {
-                            // Check if the property is "body"
-                            if let PropName::Ident(key_ident) = &kv.key {
-                                if key_ident.sym == "body" {
-                                    // Extract the body value
-                                    match &*kv.value {
-                                        // Handle JSON.stringify(...) case
-                                        Expr::Call(body_call) => {
-                                            if let Callee::Expr(callee_expr) = &body_call.callee {
-                                                if let Expr::Member(member) = &**callee_expr {
-                                                    if let Expr::Ident(obj) = &*member.obj {
-                                                        if obj.sym == "JSON" {
-                                                            if let MemberProp::Ident(method) =
-                                                                &member.prop
-                                                            {
-                                                                if method.sym == "stringify" {
-                                                                    // Get the object being stringified
-                                                                    if let Some(arg) =
-                                                                        body_call.args.get(0)
-                                                                    {
-                                                                        // Convert the argument to Json
-                                                                        return Some(
-                                                                            self.expr_to_json(
-                                                                                &arg.expr,
-                                                                            ),
-                                                                        );
-                                                                    }
+        if let Expr::Object(obj) = &*call.args[1].expr {
+            // Look for body property in options
+            for prop in &obj.props {
+                if let PropOrSpread::Prop(boxed_prop) = prop {
+                    if let Prop::KeyValue(kv) = &**boxed_prop {
+                        // Check if the property is "body"
+                        if let PropName::Ident(key_ident) = &kv.key {
+                            if key_ident.sym == "body" {
+                                // Extract the body value
+                                match &*kv.value {
+                                    // Handle JSON.stringify(...) case
+                                    Expr::Call(body_call) => {
+                                        if let Callee::Expr(callee_expr) = &body_call.callee {
+                                            if let Expr::Member(member) = &**callee_expr {
+                                                if let Expr::Ident(obj) = &*member.obj {
+                                                    if obj.sym == "JSON" {
+                                                        if let MemberProp::Ident(method) =
+                                                            &member.prop
+                                                        {
+                                                            if method.sym == "stringify" {
+                                                                // Get the object being stringified
+                                                                if let Some(arg) =
+                                                                    body_call.args.first()
+                                                                {
+                                                                    // Convert the argument to Json
+                                                                    return Some(
+                                                                        self.expr_to_json(
+                                                                            &arg.expr,
+                                                                        ),
+                                                                    );
                                                                 }
                                                             }
                                                         }
@@ -622,16 +620,15 @@ pub trait CoreExtractor {
                                                 }
                                             }
                                         }
-                                        // Direct object literal case (unlikely but possible)
-                                        _ => return Some(self.expr_to_json(&kv.value)),
                                     }
+                                    // Direct object literal case (unlikely but possible)
+                                    _ => return Some(self.expr_to_json(&kv.value)),
                                 }
                             }
                         }
                     }
                 }
             }
-            _ => {}
         }
 
         None
@@ -682,7 +679,7 @@ pub trait CoreExtractor {
             Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
             Expr::Tpl(tpl) => self.process_template(tpl),
             Expr::Ident(ident) => {
-                if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                if let Some(resolved) = self.resolve_variable(ident.sym.as_ref()) {
                     match resolved {
                         Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
                         Expr::Tpl(tpl) => self.process_template(tpl),
@@ -722,7 +719,7 @@ pub trait CoreExtractor {
                 // Check if it's a variable reference
                 else if let Expr::Ident(ident) = &*tpl.exprs[i] {
                     // For variables, check if they're from environment variables
-                    if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                    if let Some(resolved) = self.resolve_variable(ident.sym.as_ref()) {
                         if let Some(env_var) = self.extract_env_var_from_expr(resolved) {
                             route.push_str(&format!("ENV_VAR:{}:", env_var));
                         } else {
@@ -971,7 +968,7 @@ pub trait RouteExtractor: CoreExtractor {
                             if let PropOrSpread::Prop(box_prop) = prop {
                                 if let Prop::KeyValue(kv) = &**box_prop {
                                     if let PropName::Ident(key_ident) = &kv.key {
-                                        if key_ident.sym.to_string() == prop_name {
+                                        if key_ident.sym == prop_name {
                                             return self.extract_string_from_expr(&kv.value);
                                         }
                                     }
@@ -991,7 +988,7 @@ pub trait RouteExtractor: CoreExtractor {
         method: &str,
     ) -> Option<(String, Json, Option<Json>, String)> {
         // Get the route from the first argument
-        let first_arg = call.args.get(0)?;
+        let first_arg = call.args.first()?;
         let route = self.extract_string_from_expr(&first_arg.expr)?;
 
         let mut response_json = Json::Null;
@@ -1033,24 +1030,21 @@ pub trait RouteExtractor: CoreExtractor {
                         "arrow"
                     );
 
-                    match &*arrow_expr.body {
-                        BlockStmtOrExpr::BlockStmt(block) => {
-                            // Extract request body fields using existing method
-                            request_json = self.extract_req_body_fields(block);
+                    if let BlockStmtOrExpr::BlockStmt(block) = &*arrow_expr.body {
+                        // Extract request body fields using existing method
+                        request_json = self.extract_req_body_fields(block);
 
-                            // Extract response fields (using existing logic)
-                            for stmt in &block.stmts {
-                                if let Stmt::Expr(expr_stmt) = stmt {
-                                    if let Expr::Call(call) = &*expr_stmt.expr {
-                                        if let Some(json) = self.extract_res_json_fields(call) {
-                                            response_json = json;
-                                            break;
-                                        }
+                        // Extract response fields (using existing logic)
+                        for stmt in &block.stmts {
+                            if let Stmt::Expr(expr_stmt) = stmt {
+                                if let Expr::Call(call) = &*expr_stmt.expr {
+                                    if let Some(json) = self.extract_res_json_fields(call) {
+                                        response_json = json;
+                                        break;
                                     }
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
 

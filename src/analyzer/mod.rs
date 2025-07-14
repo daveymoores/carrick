@@ -174,7 +174,7 @@ impl Analyzer {
         let mut all_async_contexts = Vec::new();
 
         // Extract async calls from each function definition using extractor methods
-        for (_, def) in &self.function_definitions {
+        for def in self.function_definitions.values() {
             let async_contexts = self.extract_async_calls_from_function(def);
             all_async_contexts.extend(async_contexts);
         }
@@ -187,6 +187,7 @@ impl Analyzer {
 
         // Send to Gemini Flash 2.5 for analysis
         let gemini_calls = extract_calls_from_async_expressions(all_async_contexts).await;
+        println!("Extracted Gemini Calls {:?}", gemini_calls);
 
         println!("Gemini extracted {} HTTP calls", gemini_calls.len());
 
@@ -311,10 +312,7 @@ impl Analyzer {
         for (index, call) in calls.iter().enumerate() {
             if call.response_type.is_some() {
                 let key = (call.route.clone(), call.method.clone());
-                grouped_calls
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push(index);
+                grouped_calls.entry(key).or_default().push(index);
             }
         }
 
@@ -1042,7 +1040,7 @@ impl Analyzer {
 
             path_to_endpoints
                 .entry(normalized_route)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((endpoint.route.clone(), endpoint.method.clone()));
         }
 

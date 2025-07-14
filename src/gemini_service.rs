@@ -1,6 +1,6 @@
 use crate::visitor::{Call, Json, TypeReference};
 use genai::Client;
-use genai::chat::{ChatMessage, ChatRequest};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -83,10 +83,13 @@ CRITICAL REQUIREMENTS:
 2. Return ONLY valid JSON array starting with [ and ending with ]
 3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean), request_type_info (object or null), response_type_info (object or null)
 
+IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handler parameters (such as req: Request<T>, res: Response<T>). These describe incoming HTTP requests to the server, NOT outgoing HTTP calls made by the server.
+When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
+
 TYPE EXTRACTION REQUIREMENTS:
-4. Look for TypeScript type annotations in function parameters and return types
-5. Extract request types from first parameter annotations (req: RequestType, request: SomeType, etc.)
-6. Extract response types from return type annotations or response variable types
+4. Look for TypeScript type annotations in function parameters and return types, BUT DO NOT use Express handler parameter types (Request<T>, Response<T>) for outgoing HTTP calls.
+5. Extract request types from the actual data passed to HTTP calls (e.g., the body argument in fetch/axios), not from Express handler parameters.
+6. Extract response types from how the HTTP call result is used (e.g., assigned to a variable with a type), not from Express handler parameters.
 7. Calculate approximate character position where the type appears in the source
 8. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
 
@@ -117,9 +120,16 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#,
         ChatMessage::user(prompt),
     ]);
 
-    match client.exec_chat("gemini-2.5-flash", chat_req, None).await {
+    let model = "gemini-2.5-flash";
+
+    let chat_options = ChatOptions {
+        reasoning_effort: Some(ReasoningEffort::Low),
+        ..Default::default()
+    };
+
+    match client.exec_chat(model, chat_req, Some(&chat_options)).await {
         Ok(response) => {
-            let response_text = response.content_text_as_str().unwrap_or("");
+            let response_text = response.first_text().unwrap_or("");
             println!(
                 "Gemini API call successful. Processing {} async expressions.",
                 async_calls.len()
@@ -139,6 +149,9 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
 
     format!(
         r#"Extract HTTP API calls from these JavaScript/TypeScript functions. Return ONLY a JSON array.
+
+IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handler parameters (such as req: Request<T>, res: Response<T>). These describe incoming HTTP requests to the server, NOT outgoing HTTP calls made by the server.
+When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
 
 FUNCTIONS TO ANALYZE:
 {}
