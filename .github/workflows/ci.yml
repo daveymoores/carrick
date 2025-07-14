@@ -146,6 +146,9 @@ jobs:
         run: cargo build --release
 
       - name: Test basic endpoint detection (test-repo)
+        env:
+          CARRICK_MOCK_ALL: "true"
+          CARRICK_ORG: "test-org"
         run: |
           ./target/release/carrick ./test-repo/ > test_output.txt 2>&1
           echo "=== Test-repo output ==="
@@ -158,6 +161,9 @@ jobs:
           echo "✅ Basic endpoint detection working correctly"
 
       - name: Test imported router resolution
+        env:
+          CARRICK_MOCK_ALL: "true"
+          CARRICK_ORG: "test-org"
         run: |
           ./target/release/carrick ./tests/fixtures/imported-routers/ > imported_test_output.txt 2>&1
           echo "=== Imported routers test output ==="

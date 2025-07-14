@@ -1,0 +1,157 @@
+Using MockStorage (CARRICK_MOCK_ALL environment variable detected)
+Running Carrick in CI mode with org: test-org (upload: true)
+MOCK: Health check passed
+AWS connectivity verified
+---> Analyzing JavaScript/TypeScript files in: ./test-repo/
+Found 1 files to analyze in directory ./test-repo/
+Parsing: ./test-repo/test-repo.ts
+Detected Express app: app
+Detected Router: apiRouter
+Detected Router: v1Router
+Detected Router: adminRouter
+Detected endpoint: GET /users on app
+Detected endpoint: GET /dynamic on app
+Detected endpoint: POST /comments on v1Router
+Detected endpoint: GET /stats on adminRouter
+Router use: test-repo:apiRouter(/v1) -> v1Router
+App use: test-repo:app(/api) -> apiRouter
+App use: test-repo:app(/admin) -> adminRouter
+Extracted repository name: 'test-repo'
+Found carrick.json file: ./test-repo/carrick.json
+Found package.json: ./test-repo/package.json
+Unique endpoint paths: 4
+Gemini extracted 0 HTTP calls
+collect_type_infos_from_calls is called
+Processing 8 types from repository: ./test-repo/
+Extracting 8 types from ./test-repo/
+Type extraction output: Processing 8 types from input
+Found type reference at 544 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+CDR: Resolving import specifier "Request" to its original symbol.
+Queued composite alias: export type GetUsersRequestProducer = Request;
+Found type reference at 558 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Response<User[]>
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+CDR: Resolving import specifier "Response" to its original symbol.
+  - Type argument: User[]
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+processTypeNode: ArrayType - User[]
+processTypeNode: TypeReference - User
+Found local type argument: User
+CDR: Adding to collectedDeclarations: InterfaceDeclaration "User" from /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetUsersResponseProducer = Response<User[]>;
+Found type reference at 734 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetDynamicRequestProducer = Request;
+Found type reference at 748 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetDynamicResponseProducer = Response;
+Found type reference at 867 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Request<{}, {}, Comment>
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+  - Type argument: {}
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+processTypeNode: TypeLiteral - {}
+Processing type literal: {}
+  - Type argument: {}
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+processTypeNode: TypeLiteral - {}
+Processing type literal: {}
+  - Type argument: Comment
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+processTypeNode: TypeReference - Comment
+Found local type argument: Comment
+CDR: Adding to collectedDeclarations: InterfaceDeclaration "Comment" from /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+Queued composite alias: export type PostApiV1CommentsRequestProducer = Request<{}, {}, Comment>;
+Found type reference at 898 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+Queued composite alias: export type PostApiV1CommentsResponseProducer = Response;
+Found type reference at 268 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetAdminStatsRequestProducer = Request;
+Found type reference at 282 in /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/test-repo/test-repo.ts
+Queued composite alias: export type GetAdminStatsResponseProducer = Response;
+After utility collection: 2 declarations.
+Package.json created at ts_check/output/package.json with 0 dependencies
+tsconfig.json created at ts_check/output/tsconfig.json
+All recursively acquired type/interface/enum/class declarations written to ts_check/output/test-repo_types.ts
+{"success":true,"output":"ts_check/output/test-repo_types.ts","typeCount":10}
+
+Analyzed current repo: test-repo
+MOCK: Uploading repo data for org: test-org, repo: test-repo
+Uploaded current repo data to cloud storage
+MOCK: Downloading all repo data for org: test-org
+MOCK: Found 3 repos for org test-org
+Downloaded data from 2 repos (excluding current repo: test-repo)
+Unique endpoint paths: 4
+Cleaning output directory: ts_check/output
+Created clean output directory: ts_check/output
+Downloading type file for repository: repo-a
+MOCK: Downloading type file from S3 URL: https://mock-s3.com/repo-a
+Created type file: ts_check/output/repo-a_types.ts
+Downloading type file for repository: repo-b
+MOCK: Downloading type file from S3 URL: https://mock-s3.com/repo-b
+Created type file: ts_check/output/repo-b_types.ts
+Downloading type file for repository: test-repo
+MOCK: Downloading type file from S3 URL: https://mock-s3.com/test-repo
+Created type file: ts_check/output/test-repo_types.ts
+Recreated package.json at ts_check/output/package.json
+Installing dependencies...
+Dependencies installed successfully
+Recreated tsconfig.json at ts_check/output/tsconfig.json
+Installing dependencies for type checking...
+
+up to date, audited 134 packages in 441ms
+
+14 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+Dependencies installed successfully
+
+🔍 Starting type compatibility checking...
+outputDir -> ts_check/output
+
+✅ All types are compatible!
+
+Type checking summary:
+  Compatible pairs: 0
+  Incompatible pairs: 0
+  Orphaned producers: 0
+  Orphaned consumers: 0
+Reconstructed analyzer with cross-repo data
+<!-- CARRICK_OUTPUT_START -->
+<!-- CARRICK_ISSUE_COUNT:4 -->
+### 🪢 CARRICK: API Analysis Results
+
+Analyzed **4 endpoints** and **0 API calls** across all repositories.
+
+Found **4 total issues**: **0 critical mismatches**, **4 connectivity issues**, and **0 configuration suggestions**.
+
+<br>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">4 Connectivity Issues</strong>
+</summary>
+
+> These endpoints are either defined but never used (orphaned) or called but never defined (missing). This could be dead code or a misconfigured route.
+
+#### 4 Orphaned Endpoints
+
+| Method | Path |
+| :--- | :--- |
+| `GET` | `/admin/stats` |
+| `POST` | `/api/v1/comments` |
+| `GET` | `/dynamic` |
+| `GET` | `/users` |
+</details>
+<!-- CARRICK_OUTPUT_END -->
+

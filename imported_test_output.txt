@@ -1,0 +1,227 @@
+Using MockStorage (CARRICK_MOCK_ALL environment variable detected)
+Running Carrick in CI mode with org: test-org (upload: true)
+MOCK: Health check passed
+AWS connectivity verified
+---> Analyzing JavaScript/TypeScript files in: ./tests/fixtures/imported-routers/
+Found 4 files to analyze in directory ./tests/fixtures/imported-routers/
+Parsing: ./tests/fixtures/imported-routers/app.ts
+Detected Express app: app
+App use: imported-routers:app(/users) -> userRouter (imported from ./routes/users)
+Detected use of imported router: userRouter
+App use: imported-routers:app(/api/v1) -> apiRouter (imported from ./routes/api)
+Detected use of imported router: apiRouter
+App use: imported-routers:app(/health) -> healthRouter (imported from ./routes/health)
+Detected use of imported router: healthRouter
+Following import 'apiRouter' from './routes/api'
+Resolved to: ./tests/fixtures/imported-routers/routes/api.ts
+Following import 'healthRouter' from './routes/health'
+Resolved to: ./tests/fixtures/imported-routers/routes/health.ts
+Following import 'userRouter' from './routes/users'
+Resolved to: ./tests/fixtures/imported-routers/routes/users.ts
+Parsing: ./tests/fixtures/imported-routers/routes/api.ts
+Detected Router: router
+Detected endpoint: GET /posts on router
+Detected endpoint: POST /posts on router
+Detected endpoint: GET /stats on router
+Detected endpoint: DELETE /posts/:id on router
+Parsing: ./tests/fixtures/imported-routers/routes/health.ts
+Detected Router: router
+Detected endpoint: GET /status on router
+Detected endpoint: GET /ping on router
+Detected endpoint: GET /ready on router
+Parsing: ./tests/fixtures/imported-routers/routes/users.ts
+Detected Router: router
+Detected endpoint: GET /:id on router
+Detected endpoint: POST / on router
+Detected endpoint: GET / on router
+Parsing: ./tests/fixtures/imported-routers/routes/api.ts
+Detected Router: router (imported as: apiRouter)
+Detected endpoint: GET /posts on apiRouter
+Detected endpoint: POST /posts on apiRouter
+Detected endpoint: GET /stats on apiRouter
+Detected endpoint: DELETE /posts/:id on apiRouter
+Parsing: ./tests/fixtures/imported-routers/routes/health.ts
+Detected Router: router (imported as: healthRouter)
+Detected endpoint: GET /status on healthRouter
+Detected endpoint: GET /ping on healthRouter
+Detected endpoint: GET /ready on healthRouter
+Parsing: ./tests/fixtures/imported-routers/routes/users.ts
+Detected Router: router (imported as: userRouter)
+Detected endpoint: GET /:id on userRouter
+Detected endpoint: POST / on userRouter
+Detected endpoint: GET / on userRouter
+Extracted repository name: 'imported-routers'
+Found package.json: ./tests/fixtures/imported-routers/package.json
+Unique endpoint paths: 8
+No async expressions found, skipping Gemini analysis
+collect_type_infos_from_calls is called
+Processing 20 types from repository: ./tests/fixtures/imported-routers/
+No tsconfig.json found in repo, creating default one in ts_check/output
+Extracting 20 types from ./tests/fixtures/imported-routers/
+Type extraction output: Processing 20 types from input
+Found type reference at 128 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+CDR: Resolving import specifier "Request" to its original symbol.
+Queued composite alias: export type GetApiV1PostsRequestProducer = Request;
+Found type reference at 142 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+CDR: Resolving import specifier "Response" to its original symbol.
+Queued composite alias: export type GetApiV1PostsResponseProducer = Response;
+Found type reference at 352 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+Queued composite alias: export type PostApiV1PostsRequestProducer = Request;
+Found type reference at 366 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+Queued composite alias: export type PostApiV1PostsResponseProducer = Response;
+Found type reference at 524 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+Queued composite alias: export type GetApiV1StatsRequestProducer = Request;
+Found type reference at 538 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+Queued composite alias: export type GetApiV1StatsResponseProducer = Response;
+Found type reference at 667 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+Queued composite alias: export type DeleteApiV1PostsByIdRequestProducer = Request;
+Found type reference at 681 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/api.ts
+Queued composite alias: export type DeleteApiV1PostsByIdResponseProducer = Response;
+Found type reference at 130 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts
+CDR: Resolving import specifier "Request" to its original symbol.
+Queued composite alias: export type GetHealthStatusRequestProducer = Request;
+Found type reference at 144 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts
+CDR: Resolving import specifier "Response" to its original symbol.
+Queued composite alias: export type GetHealthStatusResponseProducer = Response;
+Found type reference at 277 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts
+Queued composite alias: export type GetHealthPingRequestProducer = Request;
+Found type reference at 291 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts
+Queued composite alias: export type GetHealthPingResponseProducer = Response;
+Found type reference at 392 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts
+Queued composite alias: export type GetHealthReadyRequestProducer = Request;
+Found type reference at 406 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/health.ts
+Queued composite alias: export type GetHealthReadyResponseProducer = Response;
+Found type reference at 123 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts
+CDR: Resolving import specifier "Request" to its original symbol.
+Queued composite alias: export type GetUsersByIdRequestProducer = Request;
+Found type reference at 137 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts
+CDR: Resolving import specifier "Response" to its original symbol.
+Queued composite alias: export type GetUsersByIdResponseProducer = Response;
+Found type reference at 289 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts
+Queued composite alias: export type PostUsersRequestProducer = Request;
+Found type reference at 303 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts
+Queued composite alias: export type PostUsersResponseProducer = Response;
+Found type reference at 445 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts: Request
+Processing type reference: Request
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts
+Queued composite alias: export type GetUsersRequestProducer = Request;
+Found type reference at 459 in /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts: Response
+Processing type reference: Response
+--------> /Users/davidjonathanmoores/Repositories/carrick/carrick/tests/fixtures/imported-routers/routes/users.ts
+Queued composite alias: export type GetUsersResponseProducer = Response;
+After utility collection: 0 declarations.
+Package.json created at ts_check/output/package.json with 0 dependencies
+tsconfig.json created at ts_check/output/tsconfig.json
+All recursively acquired type/interface/enum/class declarations written to ts_check/output/imported-routers_types.ts
+{"success":true,"output":"ts_check/output/imported-routers_types.ts","typeCount":20}
+
+Analyzed current repo: imported-routers
+MOCK: Uploading repo data for org: test-org, repo: imported-routers
+Uploaded current repo data to cloud storage
+MOCK: Downloading all repo data for org: test-org
+MOCK: Found 3 repos for org test-org
+Downloaded data from 2 repos (excluding current repo: imported-routers)
+Unique endpoint paths: 8
+Cleaning output directory: ts_check/output
+Created clean output directory: ts_check/output
+Downloading type file for repository: repo-a
+MOCK: Downloading type file from S3 URL: https://mock-s3.com/repo-a
+Created type file: ts_check/output/repo-a_types.ts
+Downloading type file for repository: repo-b
+MOCK: Downloading type file from S3 URL: https://mock-s3.com/repo-b
+Created type file: ts_check/output/repo-b_types.ts
+Downloading type file for repository: imported-routers
+MOCK: Downloading type file from S3 URL: https://mock-s3.com/imported-routers
+Created type file: ts_check/output/imported-routers_types.ts
+Recreated package.json at ts_check/output/package.json
+Installing dependencies...
+Warning: npm install failed: npm error code ETARGET
+npm error notarget No matching version found for typescript@5.0.0.
+npm error notarget In most cases you or one of your dependencies are requesting
+npm error notarget a package version that doesn't exist.
+npm error A complete log of this run can be found in: /Users/davidjonathanmoores/.npm/_logs/2025-07-14T10_50_28_551Z-debug-0.log
+
+Recreated tsconfig.json at ts_check/output/tsconfig.json
+Installing dependencies for type checking...
+
+🔍 Starting type compatibility checking...
+outputDir -> ts_check/output
+
+✅ All types are compatible!
+
+Type checking summary:
+  Compatible pairs: 0
+  Incompatible pairs: 0
+  Orphaned producers: 0
+  Orphaned consumers: 0
+Reconstructed analyzer with cross-repo data
+<!-- CARRICK_OUTPUT_START -->
+<!-- CARRICK_ISSUE_COUNT:10 -->
+### 🪢 CARRICK: API Analysis Results
+
+Analyzed **10 endpoints** and **0 API calls** across all repositories.
+
+Found **10 total issues**: **0 critical mismatches**, **10 connectivity issues**, and **0 configuration suggestions**.
+
+<br>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">10 Connectivity Issues</strong>
+</summary>
+
+> These endpoints are either defined but never used (orphaned) or called but never defined (missing). This could be dead code or a misconfigured route.
+
+#### 10 Orphaned Endpoints
+
+| Method | Path |
+| :--- | :--- |
+| `DELETE` | `/api/v1/posts/:id` |
+| `POST` | `/users` |
+| `GET` | `/users` |
+| `GET` | `/health/ready` |
+| `GET` | `/health/ping` |
+| `GET` | `/users/:id` |
+| `GET` | `/api/v1/posts` |
+| `GET` | `/api/v1/stats` |
+| `POST` | `/api/v1/posts` |
+| `GET` | `/health/status` |
+</details>
+<!-- CARRICK_OUTPUT_END -->
+
