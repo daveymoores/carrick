@@ -88,7 +88,27 @@ When extracting HTTP calls (fetch, axios, etc.), infer the request and response 
 
 TYPE EXTRACTION REQUIREMENTS:
 4. For outgoing HTTP calls (fetch, axios, etc.):
-   a. For the response type, if there is an explicit type annotation on the HTTP call (e.g., fetch<T>(), axios.post<T>()), or on the variable assigned from the result (including after parsing, e.g., response.json()), use that type. Otherwise, infer from usage.
+   a. For the response type, extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
+
+   CRITICAL:
+   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
+   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
+   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
+
+   BAD EXAMPLE:
+     const raw: Foo[] = await resp.json();
+     const filtered: Foo[] = filter(raw);
+     // Only extract Foo[], not both.
+
+   BAD EXAMPLE:
+     const a: Bar[] = await resp.json();
+     const b: Bar[] = a.filter(...);
+     // Only extract Bar[], not both.
+
+   GOOD EXAMPLE:
+     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
+     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
+     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
    b. For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
 5. NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
 6. Calculate approximate character position where the type appears in the source
@@ -153,8 +173,27 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
 
 IMPORTANT: When analyzing outgoing HTTP calls (fetch, axios, etc.) inside Express route handlers:
 - For the response type:
-   - If there is an explicit type annotation on the HTTP call (e.g., fetch<T>(), axios.post<T>()), or on the variable assigned from the result (including after parsing, e.g., const data: MyType = await response.json();), use that type.
-   - If no explicit type annotation is present, infer the type from usage context.
+   - Extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
+
+   CRITICAL:
+   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
+   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
+   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
+
+   BAD EXAMPLE:
+     const raw: Foo[] = await resp.json();
+     const filtered: Foo[] = filter(raw);
+     // Only extract Foo[], not both.
+
+   BAD EXAMPLE:
+     const a: Bar[] = await resp.json();
+     const b: Bar[] = a.filter(...);
+     // Only extract Bar[], not both.
+
+   GOOD EXAMPLE:
+     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
+     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
+     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
 - For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
 - NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
 

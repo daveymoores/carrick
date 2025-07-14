@@ -187,7 +187,6 @@ impl Analyzer {
 
         // Send to Gemini Flash 2.5 for analysis
         let gemini_calls = extract_calls_from_async_expressions(all_async_contexts).await;
-        println!("Extracted Gemini Calls {:?}", gemini_calls);
 
         println!("Gemini extracted {} HTTP calls", gemini_calls.len());
 
