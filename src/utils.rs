@@ -8,7 +8,7 @@ pub fn join_prefix_and_path(prefix: &str, path: &str) -> String {
     if prefix.is_empty() || prefix == "/" {
         format!("/{}", path)
     } else if path.is_empty() {
-        format!("{}", prefix)
+        prefix.to_string()
     } else {
         format!("{}/{}", prefix, path)
     }

@@ -22,18 +22,12 @@ pub fn find_files(
         // Check if it's a file
         if path.is_file() {
             // Check if it's carrick.json
-            if path
-                .file_name()
-                .map_or(false, |name| name == "carrick.json")
-            {
+            if path.file_name().is_some_and(|name| name == "carrick.json") {
                 config_file = Some(path.to_path_buf());
                 continue;
             }
             // Get the package.json file
-            if path
-                .file_name()
-                .map_or(false, |name| name == "package.json")
-            {
+            if path.file_name().is_some_and(|name| name == "package.json") {
                 package_json = Some(path.to_path_buf());
                 continue;
             }

@@ -31,12 +31,19 @@ export class OutputGenerator {
         newSourceFile.insertText(0, importStatements);
       }
 
-      // Add composite aliases
-      const sortedCompositeAliases = Array.from(compositeAliases).sort((a, b) =>
-        a.aliasName.localeCompare(b.aliasName),
-      );
+      // TEMPORARY: Deduplicate composite aliases by (aliasName, typeString) pair.
+      // TODO: Address root cause upstream so this is not needed.
+      const seenAliasType = new Set<string>();
+      const dedupedCompositeAliases = Array.from(compositeAliases)
+        .filter(({ aliasName, typeString }) => {
+          const key = `${aliasName}|${typeString}`;
+          if (seenAliasType.has(key)) return false;
+          seenAliasType.add(key);
+          return true;
+        })
+        .sort((a, b) => a.aliasName.localeCompare(b.aliasName));
 
-      for (const { aliasName, typeString } of sortedCompositeAliases) {
+      for (const { aliasName, typeString } of dedupedCompositeAliases) {
         newSourceFile.addStatements(
           `export type ${aliasName} = ${typeString};\n`,
         );
@@ -47,7 +54,7 @@ export class OutputGenerator {
       newSourceFile.saveSync();
 
       const totalTypeCount =
-        collectedDeclarations.size + sortedCompositeAliases.length;
+        collectedDeclarations.size + dedupedCompositeAliases.length;
 
       console.log(
         `All recursively acquired type/interface/enum/class declarations written to ${outputFile}`,

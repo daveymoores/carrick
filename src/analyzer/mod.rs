@@ -174,15 +174,10 @@ impl Analyzer {
         let mut all_async_contexts = Vec::new();
 
         // Extract async calls from each function definition using extractor methods
-        for (_, def) in &self.function_definitions {
+        for def in self.function_definitions.values() {
             let async_contexts = self.extract_async_calls_from_function(def);
             all_async_contexts.extend(async_contexts);
         }
-
-        println!(
-            "Found {} async expressions, sending to Gemini Flash 2.5...",
-            all_async_contexts.len()
-        );
 
         // Skip Gemini call if no async expressions found (safety check)
         if all_async_contexts.is_empty() {
@@ -316,10 +311,7 @@ impl Analyzer {
         for (index, call) in calls.iter().enumerate() {
             if call.response_type.is_some() {
                 let key = (call.route.clone(), call.method.clone());
-                grouped_calls
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push(index);
+                grouped_calls.entry(key).or_default().push(index);
             }
         }
 
@@ -773,6 +765,18 @@ impl Analyzer {
             ));
         }
 
+        // TEMPORARY: Deduplicate environment-based API call warnings.
+        // TODO: Address root cause upstream so this is not needed.
+        let mut seen_env = std::collections::HashSet::new();
+        env_var_calls.retain(|msg| {
+            if seen_env.contains(msg) {
+                false
+            } else {
+                seen_env.insert(msg.clone());
+                true
+            }
+        });
+
         (call_issues, endpoint_issues, env_var_calls)
     }
 
@@ -1047,7 +1051,7 @@ impl Analyzer {
 
             path_to_endpoints
                 .entry(normalized_route)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((endpoint.route.clone(), endpoint.method.clone()));
         }
 

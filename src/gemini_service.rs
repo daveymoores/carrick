@@ -1,6 +1,6 @@
 use crate::visitor::{Call, Json, TypeReference};
 use genai::Client;
-use genai::chat::{ChatMessage, ChatRequest};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -83,12 +83,36 @@ CRITICAL REQUIREMENTS:
 2. Return ONLY valid JSON array starting with [ and ending with ]
 3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean), request_type_info (object or null), response_type_info (object or null)
 
+IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handler parameters (such as req: Request<T>, res: Response<T>). These describe incoming HTTP requests to the server, NOT outgoing HTTP calls made by the server.
+When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
+
 TYPE EXTRACTION REQUIREMENTS:
-4. Look for TypeScript type annotations in function parameters and return types
-5. Extract request types from first parameter annotations (req: RequestType, request: SomeType, etc.)
-6. Extract response types from return type annotations or response variable types
-7. Calculate approximate character position where the type appears in the source
-8. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
+4. For outgoing HTTP calls (fetch, axios, etc.):
+   a. For the response type, extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
+
+   CRITICAL:
+   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
+   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
+   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
+
+   BAD EXAMPLE:
+     const raw: Foo[] = await resp.json();
+     const filtered: Foo[] = filter(raw);
+     // Only extract Foo[], not both.
+
+   BAD EXAMPLE:
+     const a: Bar[] = await resp.json();
+     const b: Bar[] = a.filter(...);
+     // Only extract Bar[], not both.
+
+   GOOD EXAMPLE:
+     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
+     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
+     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
+   b. For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
+5. NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
+6. Calculate approximate character position where the type appears in the source
+7. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
 
 TYPE INFO OBJECT FORMAT:
 - file_path: The source file path
@@ -117,9 +141,16 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#,
         ChatMessage::user(prompt),
     ]);
 
-    match client.exec_chat("gemini-2.5-flash", chat_req, None).await {
+    let model = "gemini-2.5-flash";
+
+    let chat_options = ChatOptions {
+        reasoning_effort: Some(ReasoningEffort::Low),
+        ..Default::default()
+    };
+
+    match client.exec_chat(model, chat_req, Some(&chat_options)).await {
         Ok(response) => {
-            let response_text = response.content_text_as_str().unwrap_or("");
+            let response_text = response.first_text().unwrap_or("");
             println!(
                 "Gemini API call successful. Processing {} async expressions.",
                 async_calls.len()
@@ -139,6 +170,32 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
 
     format!(
         r#"Extract HTTP API calls from these JavaScript/TypeScript functions. Return ONLY a JSON array.
+
+IMPORTANT: When analyzing outgoing HTTP calls (fetch, axios, etc.) inside Express route handlers:
+- For the response type:
+   - Extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
+
+   CRITICAL:
+   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
+   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
+   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
+
+   BAD EXAMPLE:
+     const raw: Foo[] = await resp.json();
+     const filtered: Foo[] = filter(raw);
+     // Only extract Foo[], not both.
+
+   BAD EXAMPLE:
+     const a: Bar[] = await resp.json();
+     const b: Bar[] = a.filter(...);
+     // Only extract Bar[], not both.
+
+   GOOD EXAMPLE:
+     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
+     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
+     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
+- For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
+- NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
 
 FUNCTIONS TO ANALYZE:
 {}

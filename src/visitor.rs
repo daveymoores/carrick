@@ -47,20 +47,14 @@ pub enum Json {
     Object(Box<HashMap<String, Json>>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum FunctionNodeType {
     ArrowFunction(Box<ArrowExpr>),
     FunctionDeclaration(Box<FnDecl>),
     FunctionExpression(Box<FnExpr>),
     // Used for deserialization when AST data is not available
+    #[default]
     Placeholder,
-}
-
-impl Default for FunctionNodeType {
-    fn default() -> Self {
-        // This is used when deserializing in CI mode where AST is not available
-        FunctionNodeType::Placeholder
-    }
 }
 
 impl serde::Serialize for FunctionNodeType {
@@ -274,7 +268,7 @@ impl RouteExtractor for DependencyVisitor {
 
     fn resolve_template_string(&self, tpl: &Tpl) -> Option<String> {
         // Only handle simple cases for now
-        if tpl.exprs.len() > 0 {
+        if !tpl.exprs.is_empty() {
             let mut result = String::new();
 
             // Iterate through quasis and expressions
@@ -282,7 +276,7 @@ impl RouteExtractor for DependencyVisitor {
 
             // Always start with a quasi (could be empty)
             if let Some(first_quasi) = quasi_iter.next() {
-                result.push_str(&first_quasi.raw.to_string());
+                result.push_str(first_quasi.raw.as_ref());
             }
 
             // Then alternate between expressions and quasis
@@ -290,10 +284,10 @@ impl RouteExtractor for DependencyVisitor {
                 // Try to resolve the expression
                 match &**expr {
                     Expr::Ident(ident) => {
-                        if let Some(resolved) = self.resolve_variable(&ident.sym.to_string()) {
+                        if let Some(resolved) = self.resolve_variable(ident.sym.as_ref()) {
                             // For now, just handle string literals in template expressions
                             if let Expr::Lit(Lit::Str(str_lit)) = resolved {
-                                result.push_str(&str_lit.value.to_string());
+                                result.push_str(str_lit.value.as_ref());
                             } else {
                                 // Can't fully resolve - return None
                                 return None;
@@ -309,7 +303,7 @@ impl RouteExtractor for DependencyVisitor {
 
                 // Add the next quasi if available
                 if let Some(quasi) = quasi_iter.next() {
-                    result.push_str(&quasi.raw.to_string());
+                    result.push_str(quasi.raw.as_ref());
                 }
             }
 
@@ -869,7 +863,7 @@ impl DependencyVisitor {
             return;
         }
 
-        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(&args);
+        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(args);
 
         // Check if the argument at target_arg_idx is a router or middleware reference
         if target_arg_idx < args.len() {
@@ -901,13 +895,12 @@ impl DependencyVisitor {
 
                 // Add the router to our tracking if it's not already there
                 // This is important both for locally defined routers AND imported ones
-                if !self.routers.contains_key(&prefixed_target_name) {
-                    self.routers.insert(
-                        prefixed_target_name,
-                        RouterContext {
-                            name: target_name.to_string(),
-                        },
-                    );
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.routers.entry(prefixed_target_name)
+                {
+                    e.insert(RouterContext {
+                        name: target_name.to_string(),
+                    });
 
                     // If this is an import, log it specially
                     if self.imported_symbols.contains_key(target_name) {
@@ -924,7 +917,7 @@ impl DependencyVisitor {
             return;
         }
 
-        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(&args);
+        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(args);
 
         // Check if the argument at target_arg_idx is a router reference
         if target_arg_idx < args.len() {
@@ -945,13 +938,12 @@ impl DependencyVisitor {
                 });
 
                 // Add the router to our tracking if it's not already there
-                if !self.routers.contains_key(&prefixed_target_name) {
-                    self.routers.insert(
-                        prefixed_target_name,
-                        RouterContext {
-                            name: target_name.to_string(),
-                        },
-                    );
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.routers.entry(prefixed_target_name)
+                {
+                    e.insert(RouterContext {
+                        name: target_name.to_string(),
+                    });
 
                     // If this is an import, log it specially
                     if self.imported_symbols.contains_key(target_name) {

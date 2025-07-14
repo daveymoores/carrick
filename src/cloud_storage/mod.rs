@@ -72,7 +72,7 @@ pub trait CloudStorage {
 
 pub fn get_current_commit_hash() -> String {
     std::process::Command::new("git")
-        .args(&["rev-parse", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())

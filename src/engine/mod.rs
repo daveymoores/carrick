@@ -17,6 +17,34 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 
+/// Determine if we should upload data based on GitHub context
+/// Only upload on main/master branch, not on PRs
+fn should_upload_data() -> bool {
+    // Check if we're in a pull request
+    if let Ok(event_name) = env::var("GITHUB_EVENT_NAME") {
+        if event_name == "pull_request" {
+            return false;
+        }
+    }
+
+    // Check if we're on a feature branch (not main/master)
+    if let Ok(ref_name) = env::var("GITHUB_REF") {
+        // GITHUB_REF format: refs/heads/branch-name or refs/pull/123/merge
+        if ref_name.starts_with("refs/pull/") {
+            return false;
+        }
+
+        if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+            // Only upload for main/master branches
+            return branch == "main" || branch == "master";
+        }
+    }
+
+    // If we can't determine the context, default to upload (for local testing)
+    // You might want to change this to false for stricter behavior
+    true
+}
+
 pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
@@ -24,7 +52,12 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     // TODO we have no way of finding unique org names, so I think this will need to be a token
     let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
 
-    println!("Running Carrick in CI mode with org: {}", &carrick_org);
+    // Determine if we should upload based on branch/event type
+    let should_upload = should_upload_data();
+    println!(
+        "Running Carrick in CI mode with org: {} (upload: {})",
+        &carrick_org, should_upload
+    );
 
     storage
         .health_check()
@@ -36,24 +69,37 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     let current_repo_data = analyze_current_repo(repo_path).await?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
 
-    // 2. Upload current repo data to cloud storage (without AST nodes)
-    // 2. Upload current repo data (strip AST nodes for serialization)
-    let cloud_data_serialized = strip_ast_nodes(current_repo_data);
-    storage
-        .upload_repo_data(&carrick_org, &cloud_data_serialized)
-        .await
-        .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-    println!("Uploaded current repo data to cloud storage");
+    // 2. Conditionally upload current repo data to cloud storage
+    if should_upload {
+        let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
+        storage
+            .upload_repo_data(&carrick_org, &cloud_data_serialized)
+            .await
+            .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+        println!("Uploaded current repo data to cloud storage");
+    } else {
+        println!("Skipping upload (PR/branch mode - analyzing only)");
+    }
 
     // 3. Download data from all repos
-    let (all_repo_data, repo_s3_urls) = storage // Updated to destructure tuple
+    let (mut all_repo_data, repo_s3_urls) = storage // Updated to destructure tuple
         .download_all_repo_data(&carrick_org)
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
-    println!("Downloaded data from {} repos", all_repo_data.len());
 
-    // 4. Reconstruct analyzer with combined data
-    let analyzer = build_cross_repo_analyzer(all_repo_data, repo_s3_urls, &storage).await?;
+    // Remove current repo from cross-repo data to prevent duplicate processing
+    let current_repo_name = &current_repo_data.repo_name;
+    all_repo_data.retain(|repo| &repo.repo_name != current_repo_name);
+
+    println!(
+        "Downloaded data from {} repos (excluding current repo: {})",
+        all_repo_data.len(),
+        current_repo_name
+    );
+
+    // 4. Reconstruct analyzer with combined data (including current repo)
+    let analyzer =
+        build_cross_repo_analyzer(all_repo_data, current_repo_data, repo_s3_urls, &storage).await?;
     println!("Reconstructed analyzer with cross-repo data");
 
     // 5. Run analysis
@@ -307,10 +353,13 @@ fn extract_types_for_current_repo(
 }
 
 async fn build_cross_repo_analyzer<T: CloudStorage>(
-    all_repo_data: Vec<CloudRepoData>,
+    mut all_repo_data: Vec<CloudRepoData>,
+    current_repo_data: CloudRepoData,
     repo_s3_urls: HashMap<String, String>,
     storage: &T,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
+    // Add current repo data to the mix
+    all_repo_data.push(current_repo_data);
     // 1. Merge configs and packages using generic function
     let combined_config = merge_serialized_data(&all_repo_data, |data| data.config_json.as_ref())?;
     let combined_packages =
@@ -339,6 +388,28 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
     storage: &T,
     packages: &Packages,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Before cleaning output directory, copy current repo type file to temp
+    let current_repo = all_repo_data.last().unwrap().repo_name.replace("/", "_");
+    let generated_type_file = format!("ts_check/output/{}_types.ts", current_repo);
+    let temp_dir = std::path::Path::new("ts_check/temp");
+    if !temp_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(temp_dir) {
+            println!("Warning: Failed to create temp directory: {}", e);
+        }
+    }
+    let temp_type_file = temp_dir.join(format!("{}_types.ts", current_repo));
+    if std::fs::copy(&generated_type_file, &temp_type_file).is_ok() {
+        println!(
+            "Backed up type file before cleaning: {}",
+            temp_type_file.display()
+        );
+    } else {
+        println!(
+            "Warning: Could not backup type file before cleaning: {}",
+            generated_type_file
+        );
+    }
+
     // Clean output directory
     let output_dir = std::path::Path::new("ts_check/output");
     if output_dir.exists() {
@@ -355,9 +426,38 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
         println!("Created clean output directory: ts_check/output");
     }
 
+    // Debug: Print the full repo_s3_urls map before download
+    println!("repo_s3_urls map before download: {:?}", repo_s3_urls);
+
     // Download type files for each repository
     for repo_data in all_repo_data {
-        if let Some(s3_url) = repo_s3_urls.get(&repo_data.repo_name) {
+        println!(
+            "Attempting to download type file for repo: {}",
+            repo_data.repo_name
+        );
+        // Use local type file for current repo, download from S3 for others
+        if repo_data.repo_name == all_repo_data.last().unwrap().repo_name {
+            // Assume last in all_repo_data is current repo (matches how current_repo_data is appended)
+            let safe_repo_name = repo_data.repo_name.replace("/", "_");
+            let file_name = format!("{}_types.ts", safe_repo_name);
+            let file_path = output_dir.join(&file_name);
+            // Move the backed up type file from temp into output directory
+            let temp_type_file = format!("ts_check/temp/{}_types.ts", safe_repo_name);
+            match std::fs::copy(&temp_type_file, &file_path) {
+                Ok(_) => println!(
+                    "Moved type file from temp for current repo: {}",
+                    file_path.display()
+                ),
+                Err(e) => println!(
+                    "Warning: Failed to move type file from temp {}: {}",
+                    temp_type_file, e
+                ),
+            }
+            // Clean up temp directory after moving the file
+            if let Err(e) = std::fs::remove_dir_all("ts_check/temp") {
+                println!("Warning: Failed to clean temp directory: {}", e);
+            }
+        } else if let Some(s3_url) = repo_s3_urls.get(&repo_data.repo_name) {
             println!(
                 "Downloading type file for repository: {}",
                 repo_data.repo_name
@@ -378,13 +478,17 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
                 }
                 Err(e) => {
                     println!(
-                        "Warning: Failed to download type file for {}: {}",
+                        "Warning: Failed to download type file for repo {}: {}",
                         repo_data.repo_name, e
                     );
                 }
             }
         } else {
             println!("No S3 URL found for repository: {}", repo_data.repo_name);
+            println!(
+                "repo_s3_urls keys: {:?}",
+                repo_s3_urls.keys().collect::<Vec<_>>()
+            );
         }
     }
 
