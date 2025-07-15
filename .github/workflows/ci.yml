@@ -150,11 +150,12 @@ jobs:
           CARRICK_MOCK_ALL: "true"
           CARRICK_ORG: "test-org"
         run: |
-          ./target/release/carrick ./test-repo/ > test_output.txt 2>&1
+          mkdir -p test-repo/output
+          ./target/release/carrick ./test-repo/ > test-repo/output/test_output.txt 2>&1
           echo "=== Test-repo output ==="
-          cat test_output.txt
+          cat test-repo/output/test_output.txt
           # Check that we find the expected 4 endpoints
-          if ! grep -q "Analyzed \*\*4 endpoints\*\*" test_output.txt; then
+          if ! grep -q "Analyzed \*\*4 endpoints\*\*" test-repo/output/test_output.txt; then
             echo "ERROR: Expected to find 4 endpoints in test-repo"
             exit 1
           fi
@@ -165,24 +166,26 @@ jobs:
           CARRICK_MOCK_ALL: "true"
           CARRICK_ORG: "test-org"
         run: |
-          ./target/release/carrick ./tests/fixtures/imported-routers/ > imported_test_output.txt 2>&1
+          mkdir -p tests/fixtures/imported-routers/output
+          ./target/release/carrick ./tests/fixtures/imported-routers/ > tests/fixtures/imported-routers/output/test_output.txt 2>&1
           echo "=== Imported routers test output ==="
-          cat imported_test_output.txt
+          cat tests/fixtures/imported-routers/output/test_output.txt
           # Check that we don't have the regression bug
-          if grep -q "Unique endpoint paths: 0" imported_test_output.txt; then
+          if grep -q "Unique endpoint paths: 0" tests/fixtures/imported-routers/output/test_output.txt; then
             echo "ERROR: Found 'Unique endpoint paths: 0' - imported router resolution bug has regressed!"
             exit 1
           fi
           # Check that we find a reasonable number of endpoints (at least 10)
-          if ! grep -E "Analyzed \*\*[0-9]+ endpoints\*\*" imported_test_output.txt; then
-            echo "ERROR: Expected to find endpoint count in imported-routers test"
+          if ! grep -E "Analyzed \*\*[0-9]+ endpoints\*\*" tests/fixtures/imported-routers/output/test_output.txt; then
+            echo "ERROR: Expected to find some endpoints in imported router test, but found none"
             exit 1
           fi
-          ENDPOINT_COUNT=$(grep -E "Analyzed \*\*[0-9]+ endpoints\*\*" imported_test_output.txt | sed -E 's/.*Analyzed \*\*([0-9]+) endpoints\*\*.*/\1/')
+          ENDPOINT_COUNT=$(grep -E "Analyzed \*\*[0-9]+ endpoints\*\*" tests/fixtures/imported-routers/output/test_output.txt | sed -E 's/.*Analyzed \*\*([0-9]+) endpoints\*\*.*/\1/')
           if [ "$ENDPOINT_COUNT" -lt 10 ]; then
             echo "ERROR: Expected at least 10 endpoints, but found $ENDPOINT_COUNT"
             exit 1
           fi
+          echo "✅ Imported router resolution working correctly"
           echo "✅ Imported router resolution working correctly ($ENDPOINT_COUNT endpoints found)"
 
       - name: Upload test outputs as artifacts
@@ -191,8 +194,8 @@ jobs:
         with:
           name: test-outputs
           path: |
-            test_output.txt
-            imported_test_output.txt
+            test-repo/output/test_output.txt
+            tests/fixtures/imported-routers/output/test_output.txt
 
   security:
     name: Security Audit
