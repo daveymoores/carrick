@@ -64,6 +64,54 @@ exports.handler = async (event) => {
   }
 };
 
+// S3 URL validation regex (bucket-specific)
+const EXPECTED_S3_URL_PATTERN = new RegExp(
+  `^https://${BUCKET_NAME}\\.s3\\.amazonaws\\.com/(.+)$`,
+);
+
+// Utility: Build S3 key and URL from org/repo/hash/filename
+function buildS3Key(org, repo, hash, filename) {
+  return `${org}/${repo}/${hash}/${filename}`;
+}
+function buildS3Url(org, repo, hash, filename) {
+  return `https://${BUCKET_NAME}.s3.amazonaws.com/${buildS3Key(org, repo, hash, filename)}`;
+}
+
+// Utility: Get expected S3 key for validation
+function getExpectedS3Key(org, repo, hash, filename) {
+  return buildS3Key(org, repo, hash, filename);
+}
+
+// Utility function to create a standardized DynamoDB item
+function createDynamoDbItem({
+  org,
+  repo,
+  hash,
+  apiKey,
+  s3Url,
+  filename,
+  cloudRepoData,
+  createdAt,
+  updatedAt,
+}) {
+  const pk = `repo#${org}/${repo}`;
+  const sk = `types`;
+  return {
+    pk,
+    sk,
+    org,
+    repo,
+    hash,
+    apiKey,
+    s3Url,
+    filename,
+    cloudRepoData,
+    createdAt,
+    updatedAt,
+    ttl: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60, // 30 days TTL
+  };
+}
+
 async function handleCheckOrUpload(payload) {
   const { repo, org, hash, filename } = payload;
 
@@ -74,33 +122,53 @@ async function handleCheckOrUpload(payload) {
   }
 
   const pk = `repo#${org}/${repo}`;
-  const sk = `types#${hash}`;
-  const s3Key = `${org}/${repo}/${hash}/${filename}`;
+  const sk = `types`;
+  const s3Key = buildS3Key(org, repo, hash, filename);
   let exists = false;
-  let s3Url = `https://${BUCKET_NAME}.s3.amazonaws.com/${s3Key}`;
+  let needsUpload = false;
+  let s3Url = buildS3Url(org, repo, hash, filename);
 
+  // Check if record exists for this repo
   try {
     const result = await docClient.send(
       new GetCommand({ TableName: TABLE_NAME, Key: { pk, sk } }),
     );
-    if (result.Item) exists = true;
+    if (result.Item) {
+      exists = true;
+      // Check if the hash has changed
+      if (result.Item.hash !== hash) {
+        needsUpload = true;
+        // Update S3 URL for new hash
+        s3Url = buildS3Url(org, repo, hash, filename);
+      } else {
+        // Same hash, file should exist
+        s3Url = result.Item.s3Url;
+      }
+    } else {
+      needsUpload = true;
+    }
   } catch (err) {
     console.warn("Error checking DynamoDB:", err);
+    needsUpload = true;
   }
 
-  if (!exists) {
+  // If record doesn't exist or hash changed, check S3 and prepare upload URL
+  if (!exists || needsUpload) {
     try {
       await s3Client.send(
         new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key }),
       );
-      exists = true;
+      // File exists in S3 but record is missing/outdated
+      needsUpload = false;
     } catch (err) {
       if (err.name !== "NotFound") throw err;
+      // File doesn't exist in S3, need to upload
+      needsUpload = true;
     }
   }
 
   let uploadUrl = null;
-  if (!exists) {
+  if (needsUpload) {
     uploadUrl = await getSignedUrl(
       s3Client,
       new PutObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key }),
@@ -122,12 +190,12 @@ async function handleCheckOrUpload(payload) {
     );
 
     adjacent = (adjacentResults.Items || [])
-      .filter((item) => item.pk !== pk || item.sk !== sk)
+      .filter((item) => item.pk !== pk)
       .map((item) => {
         const [, repoPart] = item.pk.split("/");
         return {
           repo: repoPart,
-          hash: item.sk.replace("types#", ""),
+          hash: item.hash,
           s3Url: item.s3Url,
           filename: item.filename,
           // Include the full CloudRepoData if it exists
@@ -139,7 +207,7 @@ async function handleCheckOrUpload(payload) {
   }
 
   return response(200, {
-    exists,
+    exists: exists && !needsUpload,
     s3Url,
     uploadUrl,
     hash,
@@ -157,25 +225,28 @@ async function handleStoreMetadata(payload, apiKey) {
     });
   }
 
-  const pk = `repo#${org}/${repo}`;
-  const sk = `types#${hash}`;
-  const s3Key = `${org}/${repo}/${hash}/${filename}`;
-  const s3Url = `https://${BUCKET_NAME}.s3.amazonaws.com/${s3Key}`;
+  // Build the s3Url consistently
+  const s3Url = buildS3Url(org, repo, hash, filename);
+  const now = new Date().toISOString();
+
+  // Use the utility function to create a complete and standardized item
+  const item = createDynamoDbItem({
+    org,
+    repo,
+    hash,
+    apiKey,
+    s3Url,
+    filename,
+    cloudRepoData,
+    createdAt: now, // Use createdAt and updatedAt for consistency
+    updatedAt: now,
+  });
 
   try {
     await docClient.send(
       new PutCommand({
         TableName: TABLE_NAME,
-        Item: {
-          pk,
-          sk,
-          apiKey,
-          s3Url,
-          filename,
-          cloudRepoData, // Store the full CloudRepoData object
-          lastUpdated: new Date().toISOString(),
-          ttl: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60, // 30 days TTL
-        },
+        Item: item, // Use the complete item from the utility function
       }),
     );
 
@@ -199,30 +270,80 @@ async function handleGetCrossRepoData(payload, apiKey) {
   }
 
   try {
-    const results = await docClient.send(
-      new ScanCommand({
+    // Handle DynamoDB pagination to get all repos
+    let allItems = [];
+    let lastEvaluatedKey = undefined;
+    let scanCount = 0;
+
+    do {
+      scanCount++;
+      const scanParams = {
         TableName: TABLE_NAME,
-        FilterExpression: "begins_with(pk, :orgPrefix) AND apiKey = :apiKey",
+        FilterExpression: "begins_with(pk, :orgPrefix)",
         ExpressionAttributeValues: {
           ":orgPrefix": `repo#${org}/`,
-          ":apiKey": apiKey,
         },
-      }),
+      };
+
+      if (lastEvaluatedKey) {
+        scanParams.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const results = await docClient.send(new ScanCommand(scanParams));
+
+      if (results.Items && results.Items.length > 0) {
+        allItems = allItems.concat(results.Items);
+      }
+
+      lastEvaluatedKey = results.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    console.log(
+      `Cross-repo scan: Found ${allItems.length} repos using ${scanCount} scans`,
     );
 
-    const repos = (results.Items || []).map((item) => ({
-      repo: item.pk.split("/")[1],
-      hash: item.sk.replace("types#", ""),
-      s3Url: item.s3Url,
-      filename: item.filename,
-      metadata: item.cloudRepoData,
-      lastUpdated: item.lastUpdated,
-    }));
+    const repos = [];
+    const errors = [];
 
-    return response(200, { repos });
+    for (let i = 0; i < allItems.length; i++) {
+      const item = allItems[i];
+      try {
+        const repoData = {
+          repo: item.pk.split("/")[1],
+          hash: item.hash,
+          s3Url: item.s3Url,
+          filename: item.filename,
+          metadata: item.cloudRepoData,
+          lastUpdated: item.lastUpdated,
+        };
+
+        repos.push(repoData);
+      } catch (itemErr) {
+        console.error(`Error processing repo ${item.repo}:`, itemErr.message);
+        errors.push({
+          repo: item.repo,
+          error: itemErr.message,
+          pk: item.pk,
+        });
+      }
+    }
+
+    if (errors.length > 0) {
+      console.error(`Processing errors for ${errors.length} repos:`, errors);
+    }
+
+    const responseBody = { repos };
+    if (errors.length > 0) {
+      responseBody.processing_errors = errors;
+    }
+
+    return response(200, responseBody);
   } catch (err) {
     console.error("Error fetching cross-repo data:", err);
-    return response(500, { error: "Failed to fetch cross-repo data" });
+    return response(500, {
+      error: "Failed to fetch cross-repo data",
+      debug: err.message,
+    });
   }
 }
 
@@ -236,18 +357,15 @@ async function handleCompleteUpload(payload, apiKey) {
     });
   }
 
-  // Validate s3Url format
-  const expectedS3UrlPattern = new RegExp(
-    `^https://${BUCKET_NAME}\\.s3\\.amazonaws\\.com/(.+)$`,
-  );
-  const match = s3Url.match(expectedS3UrlPattern);
+  // Validate s3Url format and key
+  const match = s3Url.match(EXPECTED_S3_URL_PATTERN);
 
   if (!match) {
     return response(400, { error: "Invalid s3Url format" });
   }
 
   const s3Key = match[1];
-  const expectedKey = `${org}/${repo}/${hash}/${filename}`;
+  const expectedKey = getExpectedS3Key(org, repo, hash, filename);
 
   if (s3Key !== expectedKey) {
     return response(400, {
@@ -274,29 +392,25 @@ async function handleCompleteUpload(payload, apiKey) {
     throw error;
   }
 
-  // Store complete metadata
-  const pk = `repo#${org}/${repo}`;
-  const sk = `types#${hash}`;
   const now = new Date().toISOString();
+
+  const item = createDynamoDbItem({
+    org,
+    repo,
+    hash,
+    apiKey,
+    s3Url,
+    filename,
+    cloudRepoData,
+    createdAt: now,
+    updatedAt: now,
+  });
 
   try {
     await docClient.send(
       new PutCommand({
         TableName: TABLE_NAME,
-        Item: {
-          pk,
-          sk,
-          s3Url,
-          filename,
-          org,
-          repo,
-          hash,
-          apiKey,
-          cloudRepoData,
-          createdAt: now,
-          updatedAt: now,
-          ttl: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60, // 30 days
-        },
+        Item: item,
       }),
     );
 
@@ -304,7 +418,12 @@ async function handleCompleteUpload(payload, apiKey) {
       success: true,
       message: "Upload and metadata storage completed successfully",
       s3Url,
-      metadata: { pk, sk, hasCloudRepoData: true, createdAt: now },
+      metadata: {
+        pk: item.pk,
+        sk: item.sk,
+        hasCloudRepoData: true,
+        createdAt: now,
+      },
     });
   } catch (error) {
     console.error("Error storing metadata:", error);
@@ -319,11 +438,8 @@ async function handleDownloadFile(payload, apiKey) {
     return response(400, { error: "Missing required field: s3Url" });
   }
 
-  // Validate s3Url format
-  const expectedS3UrlPattern = new RegExp(
-    `^https://${BUCKET_NAME}\\.s3\\.amazonaws\\.com/(.+)$`,
-  );
-  const match = s3Url.match(expectedS3UrlPattern);
+  // Validate s3Url format and extract key
+  const match = s3Url.match(EXPECTED_S3_URL_PATTERN);
 
   if (!match) {
     return response(400, { error: "Invalid s3Url format" });
@@ -354,12 +470,29 @@ async function handleDownloadFile(payload, apiKey) {
 }
 
 function response(statusCode, body) {
-  return {
-    statusCode,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
-    body: JSON.stringify(body),
-  };
+  try {
+    const responseBody = JSON.stringify(body);
+    return {
+      statusCode,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+      body: responseBody,
+    };
+  } catch (err) {
+    console.error("Response serialization failed:", err.message);
+    return {
+      statusCode: 500,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+      body: JSON.stringify({
+        error: "Response serialization failed",
+        debug: err.message,
+        originalStatusCode: statusCode,
+      }),
+    };
+  }
 }
