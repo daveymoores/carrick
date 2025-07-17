@@ -632,10 +632,6 @@ mod tests {
         use crate::config::Config;
         use crate::packages::Packages;
 
-        // Test the generic merge function works for both Config and Packages
-        let config_json = r#"{"ignore_patterns": ["test"], "type_check": true}"#;
-        let package_json = r#"{"name": "test-package", "version": "1.0.0"}"#;
-
         let test_data = vec![CloudRepoData {
             repo_name: "test-repo".to_string(),
             endpoints: vec![],
