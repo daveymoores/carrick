@@ -1,6 +1,6 @@
 use crate::visitor::{Call, Json, TypeReference};
 use genai::Client;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -19,7 +19,6 @@ pub struct GeminiCallResponse {
     route: String,
     method: String,
     request_body: Option<serde_json::Value>,
-    has_response_type: bool,
     request_type_info: Option<TypeInfo>,
     response_type_info: Option<TypeInfo>,
 }

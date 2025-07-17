@@ -19,12 +19,34 @@ use core::fmt;
 use std::collections::HashSet;
 use std::{collections::HashMap, path::PathBuf};
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ConflictSeverity {
+    Critical, // Major version differences (1.x vs 2.x)
+    Warning,  // Minor version differences (1.1.x vs 1.2.x)
+    Info,     // Patch version differences (1.1.1 vs 1.1.2)
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DependencyConflict {
+    pub package_name: String,
+    pub repos: Vec<RepoPackageInfo>,
+    pub severity: ConflictSeverity,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RepoPackageInfo {
+    pub repo_name: String,
+    pub version: String,
+    pub source_path: PathBuf,
+}
+
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
     pub endpoint_issues: Vec<String>,
     pub env_var_calls: Vec<String>,
     pub mismatches: Vec<String>,
     pub type_mismatches: Vec<String>,
+    pub dependency_conflicts: Vec<DependencyConflict>,
 }
 
 impl ApiIssues {
@@ -32,6 +54,7 @@ impl ApiIssues {
         self.call_issues.is_empty()
             && self.endpoint_issues.is_empty()
             && self.type_mismatches.is_empty()
+            && self.dependency_conflicts.is_empty()
     }
 }
 
@@ -88,6 +111,7 @@ pub struct Analyzer {
     config: Config,
     endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
     source_map: Lrc<SourceMap>,
+    all_repo_packages: HashMap<String, Packages>, // repo_name -> packages
 }
 
 #[derive(Debug)]
@@ -116,11 +140,91 @@ impl Analyzer {
             config,
             endpoint_router: None,
             source_map,
+            all_repo_packages: HashMap::new(),
         }
     }
 
     pub fn fetch_calls(&self) -> &Vec<Call> {
         &self.fetch_calls
+    }
+
+    pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
+        self.all_repo_packages.insert(repo_name, packages);
+    }
+
+    pub fn analyze_dependencies(&self) -> Vec<DependencyConflict> {
+        self.find_dependency_conflicts()
+    }
+
+    fn find_dependency_conflicts(&self) -> Vec<DependencyConflict> {
+        let mut package_versions: HashMap<String, Vec<RepoPackageInfo>> = HashMap::new();
+
+        // Collect all packages from all repositories
+        for (repo_name, packages) in &self.all_repo_packages {
+            for (package_name, package_info) in packages.get_dependencies() {
+                let repo_package_info = RepoPackageInfo {
+                    repo_name: repo_name.clone(),
+                    version: package_info.version.clone(),
+                    source_path: package_info.source_path.clone(),
+                };
+
+                package_versions
+                    .entry(package_name.clone())
+                    .or_default()
+                    .push(repo_package_info);
+            }
+        }
+
+        // Find packages with conflicting versions
+        let mut conflicts = Vec::new();
+        for (package_name, repo_infos) in package_versions {
+            if repo_infos.len() > 1 {
+                // Check if all versions are the same
+                let first_version = &repo_infos[0].version;
+                let has_conflicts = repo_infos.iter().any(|info| info.version != *first_version);
+
+                if has_conflicts {
+                    let severity = Self::determine_conflict_severity(&repo_infos);
+                    conflicts.push(DependencyConflict {
+                        package_name,
+                        repos: repo_infos,
+                        severity,
+                    });
+                }
+            }
+        }
+
+        conflicts
+    }
+
+    fn determine_conflict_severity(repo_infos: &[RepoPackageInfo]) -> ConflictSeverity {
+        use semver::Version;
+
+        let mut versions = Vec::new();
+        for info in repo_infos {
+            if let Ok(version) = Version::parse(&info.version) {
+                versions.push(version);
+            }
+        }
+
+        if versions.len() < 2 {
+            return ConflictSeverity::Info;
+        }
+
+        // Check for major version differences
+        let first_major = versions[0].major;
+        if versions.iter().any(|v| v.major != first_major) {
+            return ConflictSeverity::Critical;
+        }
+
+        // Check for minor version differences
+        let first_minor = versions[0].minor;
+        if versions.iter().any(|v| v.minor != first_minor) {
+            return ConflictSeverity::Warning;
+        }
+
+        // Only patch differences remain
+        ConflictSeverity::Info
     }
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
@@ -1253,6 +1357,7 @@ impl Analyzer {
         let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
         let mismatches = self.compare_calls_to_endpoints();
         let type_mismatches = self.get_type_mismatches();
+        let dependency_conflicts = self.analyze_dependencies();
 
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
@@ -1263,6 +1368,7 @@ impl Analyzer {
                 env_var_calls,
                 mismatches,
                 type_mismatches,
+                dependency_conflicts,
             },
         }
     }
@@ -1492,103 +1598,4 @@ impl Analyzer {
             self.add_type_to_repo_map(resp_type, repo_prefix, repo_type_map);
         }
     }
-}
-
-pub async fn analyze_api_consistency(
-    visitors: Vec<DependencyVisitor>,
-    config: Config,
-    packages: Packages,
-    cm: Lrc<SourceMap>,
-    repo_paths: Vec<String>,
-) -> ApiAnalysisResult {
-    use std::collections::HashMap;
-    // Create and populate our analyzer
-    let mut analyzer = Analyzer::new(config, cm.clone());
-
-    // First pass - collect all data from visitors
-    for visitor in visitors {
-        analyzer.add_visitor_data(visitor);
-    }
-
-    let endpoints =
-        analyzer.resolve_all_endpoint_paths(&analyzer.endpoints, &analyzer.mounts, &analyzer.apps);
-    analyzer.endpoints = endpoints;
-
-    // Build the router after resolving endpoints
-    analyzer.build_endpoint_router();
-
-    // Second pass - analyze function definitions for response fields
-    let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
-        &analyzer.imported_handlers,
-        &analyzer.function_definitions,
-    );
-
-    analyzer
-        .update_endpoints_with_resolved_fields(response_fields, request_fields)
-        .resolve_types_for_endpoints(cm)
-        .analyze_functions_for_fetch_calls()
-        .await;
-
-    // Extract types for each repository
-    let mut repo_type_map: HashMap<String, Vec<Value>> = HashMap::new();
-
-    // Group type information by repository using endpoint owner information
-    for endpoint in &analyzer.endpoints {
-        let repo_prefix = analyzer.extract_repo_prefix_from_owner(&endpoint.owner);
-        analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
-    }
-
-    // Group type information by repository using fetch call file information
-    // (No longer call process_api_detail_types for fetch_calls; handled below)
-
-    // Also collect type information from Gemini-extracted calls for TypeScript extraction
-    let gemini_type_infos = analyzer.collect_type_infos_from_calls(&analyzer.fetch_calls);
-    for type_info in gemini_type_infos {
-        // Extract repo prefix from file path in type info
-        let file_path = type_info["filePath"].as_str().unwrap_or("");
-        let repo_prefix = analyzer
-            .extract_repo_prefix_from_file_path(&std::path::PathBuf::from(file_path), &repo_paths);
-        repo_type_map
-            .entry(repo_prefix)
-            .or_default()
-            .push(type_info);
-    }
-
-    // Clean output directory before starting type extraction
-    let output_dir = std::path::Path::new("ts_check/output");
-    if output_dir.exists() {
-        println!("Cleaning output directory: ts_check/output");
-        if let Err(e) = std::fs::remove_dir_all(output_dir) {
-            println!("Warning: Failed to clean output directory: {}", e);
-        }
-    }
-
-    // Create clean output directory
-    if let Err(e) = std::fs::create_dir_all(output_dir) {
-        println!("Warning: Failed to create output directory: {}", e);
-    } else {
-        println!("Created clean output directory: ts_check/output");
-    }
-
-    // Process types for each repository using the original repo paths
-
-    for repo_path in repo_paths {
-        let repo_name = get_repository_name(&repo_path);
-        if let Some(type_infos) = repo_type_map.get(&repo_name) {
-            println!(
-                "Processing {} types from repository: {}",
-                type_infos.len(),
-                &repo_path
-            );
-            analyzer.extract_types_for_repo(&repo_path, type_infos.clone(), &packages);
-        }
-    }
-
-    // Run type checking once after all repositories have been processed
-    println!("\nRunning type compatibility checking...");
-    if let Err(e) = analyzer.run_final_type_checking() {
-        println!("⚠️  Warning: Type checking failed: {}", e);
-    }
-
-    analyzer.get_results()
 }

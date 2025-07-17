@@ -1,4 +1,4 @@
-use crate::analyzer::{ApiAnalysisResult, ApiIssues};
+use crate::analyzer::{ApiAnalysisResult, ApiIssues, ConflictSeverity, DependencyConflict};
 use std::collections::HashMap;
 
 pub struct FormattedOutput {
@@ -24,7 +24,8 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
     let categorized_issues = categorize_issues(&result.issues);
     let total_issues = categorized_issues.critical.len()
         + categorized_issues.connectivity.len()
-        + categorized_issues.configuration.len();
+        + categorized_issues.configuration.len()
+        + categorized_issues.dependencies.len();
 
     let mut output = String::new();
 
@@ -34,12 +35,13 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
     // Header
     output.push_str(&format!(
-        "### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\nFound **{} total issues**: **{} critical mismatches**, **{} connectivity issues**, and **{} configuration suggestions**.\n\n<br>\n\n",
+        "### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\nFound **{} total issues**: **{} critical mismatches**, **{} connectivity issues**, **{} dependency conflicts**, and **{} configuration suggestions**.\n\n<br>\n\n",
         result.endpoints.len(),
         result.calls.len(),
         total_issues,
         categorized_issues.critical.len(),
         categorized_issues.connectivity.len(),
+        categorized_issues.dependencies.len(),
         categorized_issues.configuration.len()
     ));
 
@@ -54,6 +56,12 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
         output.push_str(&format_connectivity_section(
             &categorized_issues.connectivity,
         ));
+        output.push_str("\n<hr>\n\n");
+    }
+
+    // Dependency Issues Section
+    if !categorized_issues.dependencies.is_empty() {
+        output.push_str(&format_dependency_section(&categorized_issues.dependencies));
         output.push_str("\n<hr>\n\n");
     }
 
@@ -85,6 +93,7 @@ struct CategorizedIssues {
     critical: Vec<String>,
     connectivity: Vec<String>,
     configuration: Vec<String>,
+    dependencies: Vec<DependencyConflict>,
 }
 
 fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
@@ -115,6 +124,7 @@ fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
         critical,
         connectivity,
         configuration,
+        dependencies: issues.dependency_conflicts.clone(),
     }
 }
 
@@ -213,6 +223,107 @@ fn format_configuration_section(issues: &[String]) -> String {
             "  - `{}` using **[{}]** in `{}`\n",
             method, env_vars, path
         ));
+    }
+
+    output.push_str("</details>");
+    output
+}
+
+fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
+    let mut output = String::new();
+
+    // Group conflicts by severity
+    let mut critical = Vec::new();
+    let mut warning = Vec::new();
+    let mut info = Vec::new();
+
+    for conflict in conflicts {
+        match conflict.severity {
+            ConflictSeverity::Critical => critical.push(conflict),
+            ConflictSeverity::Warning => warning.push(conflict),
+            ConflictSeverity::Info => info.push(conflict),
+        }
+    }
+
+    output.push_str(&format!(
+        "<details>\n<summary>\n<strong style=\"font-size: 1.1em;\">{} Dependency Conflicts</strong>\n</summary>\n\n",
+        conflicts.len()
+    ));
+
+    output.push_str("> These packages have different versions across repositories, which could cause compatibility issues.\n\n");
+
+    // Critical conflicts (major version differences)
+    if !critical.is_empty() {
+        output.push_str(&format!(
+            "### Critical Conflicts ({}) - Major Version Differences\n\n",
+            critical.len()
+        ));
+        output.push_str("> These conflicts involve major version differences that could cause breaking changes.\n\n");
+
+        for conflict in &critical {
+            output.push_str(&format!("#### {}\n\n", conflict.package_name));
+            output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
+
+            for repo_info in &conflict.repos {
+                output.push_str(&format!(
+                    "| `{}` | `{}` | `{}` |\n",
+                    repo_info.repo_name,
+                    repo_info.version,
+                    repo_info.source_path.display()
+                ));
+            }
+            output.push_str("\n");
+        }
+        output.push_str("\n");
+    }
+
+    // Warning conflicts (minor version differences)
+    if !warning.is_empty() {
+        output.push_str(&format!(
+            "### Warning Conflicts ({}) - Minor Version Differences\n\n",
+            warning.len()
+        ));
+        output.push_str("> These conflicts involve minor version differences that may cause compatibility issues.\n\n");
+
+        for conflict in &warning {
+            output.push_str(&format!("#### {}\n\n", conflict.package_name));
+            output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
+
+            for repo_info in &conflict.repos {
+                output.push_str(&format!(
+                    "| `{}` | `{}` | `{}` |\n",
+                    repo_info.repo_name,
+                    repo_info.version,
+                    repo_info.source_path.display()
+                ));
+            }
+            output.push_str("\n");
+        }
+        output.push_str("\n");
+    }
+
+    // Info conflicts (patch version differences)
+    if !info.is_empty() {
+        output.push_str(&format!(
+            "### Info Conflicts ({}) - Patch Version Differences\n\n",
+            info.len()
+        ));
+        output.push_str("> These conflicts involve only patch version differences and are typically low risk.\n\n");
+
+        for conflict in &info {
+            output.push_str(&format!("#### {}\n\n", conflict.package_name));
+            output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
+
+            for repo_info in &conflict.repos {
+                output.push_str(&format!(
+                    "| `{}` | `{}` | `{}` |\n",
+                    repo_info.repo_name,
+                    repo_info.version,
+                    repo_info.source_path.display()
+                ));
+            }
+            output.push_str("\n");
+        }
     }
 
     output.push_str("</details>");
@@ -403,6 +514,7 @@ mod tests {
             env_var_calls: vec![],
             mismatches: vec![],
             type_mismatches,
+            dependency_conflicts: vec![],
         };
 
         let result = ApiAnalysisResult {
@@ -434,6 +546,7 @@ mod tests {
             env_var_calls: vec![],
             mismatches: vec![],
             type_mismatches,
+            dependency_conflicts: vec![],
         };
 
         let result = ApiAnalysisResult {
@@ -460,6 +573,7 @@ mod tests {
             env_var_calls: vec![],
             mismatches: vec![],
             type_mismatches: vec![],
+            dependency_conflicts: vec![],
         };
 
         let result = ApiAnalysisResult {
