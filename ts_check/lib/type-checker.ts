@@ -145,15 +145,24 @@ export class TypeCompatibilityChecker {
             if (typeNode) {
               const nodeText = typeNode.getText();
 
-              // For simple type aliases, we can get better display by checking if it's a basic type
-              if (nodeText === "Comment[]" || nodeText === "User" || nodeText === "Order[]" || 
-                  nodeText.includes("string") || nodeText.includes("number") || 
-                  nodeText.startsWith("{") || nodeText.startsWith("Array<")) {
+              // For simple type aliases (arrays, primitives, simple objects), we get better type
+              // resolution by creating a temporary file with the actual import and variable declaration.
+              // This is because TypeScript's compiler API sometimes shows import references like
+              // "import('path').TypeName" instead of the resolved structure. The temp file approach
+              // forces proper type resolution but is only used for simple types to avoid performance
+              // issues and circular dependency problems with complex types.
+              if (this.isSimpleTypeAlias(nodeText)) {
                 // Create a temporary variable with this type to get proper resolution
                 try {
+                  const importedTypes = this.extractTypeNamesFromText(nodeText);
+                  const importStatement =
+                    importedTypes.length > 0
+                      ? `import { ${importedTypes.join(", ")} } from "${fullFilePath.replace(/\.ts$/, "")}";`
+                      : "";
+
                   const tempFile = this.project.createSourceFile(
                     `__temp_resolve_${Date.now()}.ts`,
-                    `import { Comment, User, Order } from "${fullFilePath.replace(/\.ts$/, "")}";
+                    `${importStatement}
 const tempVar: ${nodeText} = null as any;`,
                     { overwrite: true },
                   );
@@ -167,7 +176,7 @@ const tempVar: ${nodeText} = null as any;`,
                   return typeNode.getType();
                 }
               }
-              
+
               // For complex types, return the original type
               return typeNode.getType();
             }
@@ -404,7 +413,9 @@ const tempVar: ${nodeText} = null as any;`,
           consumerCall: consumer.callId,
           consumerType: consumerType.getText(),
           isAssignable: false,
-          errorDetails: diagnosticMessage || `Type '${producerType.getText()}' is not assignable to type '${consumerType.getText()}'.`,
+          errorDetails:
+            diagnosticMessage ||
+            `Type '${producerType.getText()}' is not assignable to type '${consumerType.getText()}'.`,
           producerLocation: producer.file,
           consumerLocation: consumer.file,
         };
@@ -571,5 +582,78 @@ const tempVar: ${nodeText} = null as any;`,
     }
 
     return await this.checkCompatibility(sourceFiles);
+  }
+
+  /**
+   * Check if a type alias is simple enough to warrant creating a temporary file for better resolution
+   */
+  private isSimpleTypeAlias(nodeText: string): boolean {
+    // Array types
+    if (nodeText.endsWith("[]") || nodeText.startsWith("Array<")) {
+      return true;
+    }
+
+    // Primitive types
+    if (
+      ["string", "number", "boolean", "Date"].some((primitive) =>
+        nodeText.includes(primitive),
+      )
+    ) {
+      return true;
+    }
+
+    // Object literals
+    if (nodeText.startsWith("{")) {
+      return true;
+    }
+
+    // Simple generic types (avoid deeply nested generics)
+    if (nodeText.includes("<") && nodeText.includes(">")) {
+      const openCount = (nodeText.match(/</g) || []).length;
+      const closeCount = (nodeText.match(/>/g) || []).length;
+      // Only consider simple generics with one level of nesting
+      return openCount === closeCount && openCount <= 2;
+    }
+
+    // Union types with simple components (avoid complex unions)
+    if (
+      nodeText.includes("|") &&
+      !nodeText.includes("{") &&
+      nodeText.length < 100
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Extract type names that need to be imported from a type string
+   */
+  private extractTypeNamesFromText(nodeText: string): string[] {
+    const typeNames = new Set<string>();
+
+    // Match capitalized identifiers that look like type names (not primitives)
+    const typePattern = /\b[A-Z][a-zA-Z0-9]*\b/g;
+    const matches = nodeText.match(typePattern) || [];
+
+    for (const match of matches) {
+      // Exclude known primitives and built-in types
+      if (
+        ![
+          "Array",
+          "Promise",
+          "Date",
+          "String",
+          "Number",
+          "Boolean",
+          "Object",
+        ].includes(match)
+      ) {
+        typeNames.add(match);
+      }
+    }
+
+    return Array.from(typeNames);
   }
 }
