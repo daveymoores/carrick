@@ -31,9 +31,9 @@ pub struct PackageInfo {
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Packages {
-    package_jsons: Vec<PackageJson>,
-    source_paths: Vec<PathBuf>,
-    merged_dependencies: HashMap<String, PackageInfo>,
+    pub package_jsons: Vec<PackageJson>,
+    pub source_paths: Vec<PathBuf>,
+    pub merged_dependencies: HashMap<String, PackageInfo>,
 }
 
 impl Packages {
@@ -58,7 +58,7 @@ impl Packages {
     }
 
     /// Resolves dependencies across all package.json files, choosing the highest version for conflicts
-    fn resolve_dependencies(&mut self) {
+    pub fn resolve_dependencies(&mut self) {
         for (idx, package_json) in self.package_jsons.iter().enumerate() {
             let source_path = &self.source_paths[idx];
 

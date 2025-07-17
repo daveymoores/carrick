@@ -294,6 +294,7 @@ async fn analyze_current_repo(
         function_definitions: analyzer.function_definitions,
         config_json: serde_json::to_string(&config).ok(),
         package_json: serde_json::to_string(&packages).ok(),
+        packages: Some(packages),
         last_updated: Utc::now(),
         commit_hash: get_current_commit_hash(),
     };
@@ -368,13 +369,20 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     // 2. Build analyzer using shared logic (skip type resolution for cross-repo)
     let cm: Lrc<SourceMap> = Default::default();
     let builder = AnalyzerBuilder::new_for_cross_repo(combined_config, cm);
-    let analyzer = builder.build_from_repo_data(all_repo_data.clone()).await?;
+    let mut analyzer = builder.build_from_repo_data(all_repo_data.clone()).await?;
 
-    // 3. Recreate type files from S3 and run type checking
+    // 3. Add packages data from all repos for dependency analysis
+    for repo_data in &all_repo_data {
+        if let Some(packages) = &repo_data.packages {
+            analyzer.add_repo_packages(repo_data.repo_name.clone(), packages.clone());
+        }
+    }
+
+    // 4. Recreate type files from S3 and run type checking
     recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
         .await?;
 
-    // 4. Run final type checking
+    // 5. Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
         println!("⚠️  Warning: Type checking failed: {}", e);
     }
@@ -605,6 +613,7 @@ mod tests {
             function_definitions: std::collections::HashMap::new(),
             config_json: None,
             package_json: None,
+            packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
         };
@@ -628,17 +637,18 @@ mod tests {
         let package_json = r#"{"name": "test-package", "version": "1.0.0"}"#;
 
         let test_data = vec![CloudRepoData {
-            repo_name: "repo1".to_string(),
+            repo_name: "test-repo".to_string(),
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
             apps: std::collections::HashMap::new(),
             imported_handlers: vec![],
             function_definitions: std::collections::HashMap::new(),
-            config_json: Some(config_json.to_string()),
-            package_json: Some(package_json.to_string()),
+            config_json: None,
+            package_json: None,
+            packages: None,
             last_updated: chrono::Utc::now(),
-            commit_hash: "hash1".to_string(),
+            commit_hash: "test-hash".to_string(),
         }];
 
         // Test Config merging
@@ -700,6 +710,7 @@ mod tests {
             function_definitions: std::collections::HashMap::new(),
             config_json: Some(r#"{"ignore_patterns": [], "type_check": false}"#.to_string()),
             package_json: None,
+            packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
         }];

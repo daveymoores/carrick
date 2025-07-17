@@ -1,6 +1,7 @@
 use crate::{
     analyzer::ApiEndpointDetails,
     app_context::AppContext,
+    packages::Packages,
     visitor::{FunctionDefinition, Mount},
 };
 use async_trait::async_trait;
@@ -25,6 +26,7 @@ pub struct CloudRepoData {
     pub function_definitions: HashMap<String, FunctionDefinition>,
     pub config_json: Option<String>,
     pub package_json: Option<String>,
+    pub packages: Option<Packages>, // Structured package data for dependency analysis
     pub last_updated: DateTime<Utc>,
     pub commit_hash: String,
 }

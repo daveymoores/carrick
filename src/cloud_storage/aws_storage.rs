@@ -362,6 +362,7 @@ impl CloudStorage for AwsStorage {
                     function_definitions: HashMap::new(),
                     config_json: None,
                     package_json: None,
+                    packages: None,
                     last_updated: chrono::Utc::now(),
                     commit_hash: adjacent.hash,
                 };
