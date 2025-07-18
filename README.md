@@ -58,7 +58,7 @@ When Carrick runs in your CI, it produces detailed reports like this (click sect
 
 Analyzed **20 endpoints** and **13 API calls** across all repositories.
 
-Found **22 total issues**: **2 critical mismatches**, **17 connectivity issues**, and **3 configuration suggestions**.
+Found **24 total issues**: **2 critical mismatches**, **17 connectivity issues**, **2 dependency conflicts**, and **3 configuration suggestions**.
 
 <br>
 
@@ -81,6 +81,38 @@ Type compatibility issue detected.
 #### Method Mismatch
 
 Issue details: Method mismatch: GET ENV_VAR:ORDER_SERVICE_URL:/orders is called but endpoint only supports POST
+</details>
+<hr>
+
+<details>
+<summary>
+<strong style="font-size: 1.1em;">2 Dependency Conflicts</strong>
+</summary>
+
+> These packages have different versions across repositories, which could cause compatibility issues.
+
+### Critical Conflicts (1) - Major Version Differences
+
+> These conflicts involve major version differences that could cause breaking changes.
+
+#### express
+
+| Repository | Version | Source |
+| :--- | :--- | :--- |
+| `user-service` | `4.18.0` | `package.json` |
+| `comment-service` | `3.4.8` | `package.json` |
+
+### Warning Conflicts (1) - Minor Version Differences
+
+> These conflicts involve minor version differences that may cause compatibility issues.
+
+#### @types/node
+
+| Repository | Version | Source |
+| :--- | :--- | :--- |
+| `user-service` | `18.15.0` | `package.json` |
+| `comment-service` | `18.11.9` | `package.json` |
+
 </details>
 <hr>
 
