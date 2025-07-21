@@ -11,6 +11,10 @@ aws_region = "us-east-1"
 # Environment name (affects resource naming)
 environment = "dev"
 
+# Google Gemini API key for AI-powered code analysis
+# Get your free key at: https://aistudio.google.com/
+gemini_api_key = "AIzaSyD1234567890abcdefghijklmnop"
+
 # Example of how to generate secure API keys:
 # openssl rand -hex 32
 # or use a password manager to generate random strings

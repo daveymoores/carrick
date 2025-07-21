@@ -1,6 +1,5 @@
 use crate::visitor::{Call, Json, TypeReference};
-use genai::Client;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -31,20 +30,48 @@ pub struct TypeInfo {
     pub alias: String,
 }
 
-pub async fn extract_calls_from_async_expressions(async_calls: Vec<AsyncCallContext>) -> Vec<Call> {
+#[derive(Debug, Serialize)]
+struct ProxyRequest {
+    messages: Vec<ProxyMessage>,
+    options: ProxyOptions,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxyMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxyOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyResponse {
+    success: bool,
+    text: String,
+}
+
+pub async fn extract_calls_from_async_expressions(
+    async_calls: Vec<AsyncCallContext>,
+) -> Result<Vec<Call>, Box<dyn std::error::Error>> {
     // If CARRICK_MOCK_ALL is set, bypass the actual API call for testing purposes
     if env::var("CARRICK_MOCK_ALL").is_ok() {
-        return vec![];
+        return Ok(vec![]);
     }
 
     // Emergency disable option for Gemini API
     if env::var("DISABLE_GEMINI").is_ok() {
         println!("Gemini API disabled via DISABLE_GEMINI environment variable");
-        return vec![];
+        return Ok(vec![]);
     }
 
     if async_calls.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
 
     // Size protection: warn if function sources are very large (high token usage)
@@ -66,16 +93,14 @@ pub async fn extract_calls_from_async_expressions(async_calls: Vec<AsyncCallCont
         async_calls.len()
     );
 
-    // Set the API key as an environment variable for the genai client
-    unsafe {
-        std::env::set_var("GEMINI_API_KEY", env!("GEMINI_API_KEY"));
-    }
-    let client = Client::default();
+    // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
+    let api_base = env!("CARRICK_API_ENDPOINT");
+    let proxy_endpoint = format!("{}/gemini/chat", api_base);
+
+    let client = Client::new();
     let prompt = create_extraction_prompt(&async_calls);
 
-    let chat_req = ChatRequest::new(vec![
-        ChatMessage::system(
-            r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
+    let system_message = r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
 
 CRITICAL REQUIREMENTS:
 1. Extract ONLY HTTP requests (fetch, axios, request libraries) - ignore setTimeout, file I/O, database calls
@@ -135,31 +160,81 @@ URL CONSTRUCTION:
 - String concatenation: "/api" + "/users" → "/api/users"
 - Mixed env vars: process.env.API + "/v1" + path → "ENV_VAR:API:/v1" + path
 
-NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#,
-        ),
-        ChatMessage::user(prompt),
-    ]);
+NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
 
-    let model = "gemini-2.5-flash";
-
-    let chat_options = ChatOptions {
-        reasoning_effort: Some(ReasoningEffort::Low),
-        ..Default::default()
+    let proxy_request = ProxyRequest {
+        messages: vec![
+            ProxyMessage {
+                role: "system".to_string(),
+                content: system_message.to_string(),
+            },
+            ProxyMessage {
+                role: "user".to_string(),
+                content: prompt,
+            },
+        ],
+        options: ProxyOptions {
+            temperature: None,       // Use Gemini defaults
+            max_output_tokens: None, // Use Gemini defaults
+        },
     };
 
-    match client.exec_chat(model, chat_req, Some(&chat_options)).await {
+    let mut request_builder = client
+        .post(&proxy_endpoint)
+        .json(&proxy_request)
+        .timeout(std::time::Duration::from_secs(60));
+
+    // Add API key if available (for authentication with proxy)
+    if let Ok(api_key) = env::var("CARRICK_API_KEY") {
+        request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    match request_builder.send().await {
         Ok(response) => {
-            let response_text = response.first_text().unwrap_or("");
-            println!(
-                "Gemini API call successful. Processing {} async expressions.",
-                async_calls.len()
-            );
-            parse_gemini_response(response_text, &async_calls)
+            if response.status().is_success() {
+                match response.json::<ProxyResponse>().await {
+                    Ok(proxy_response) => {
+                        if proxy_response.success {
+                            println!(
+                                "Gemini proxy call successful. Processing {} async expressions.",
+                                async_calls.len()
+                            );
+                            Ok(parse_gemini_response(&proxy_response.text, &async_calls))
+                        } else {
+                            eprintln!("Gemini proxy returned unsuccessful response");
+                            Ok(vec![])
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to parse proxy response: {}", e);
+                        Ok(vec![])
+                    }
+                }
+            } else {
+                let status = response.status();
+                match response.text().await {
+                    Ok(error_text) => {
+                        eprintln!(
+                            "Gemini proxy call failed with status {}: {}",
+                            status, error_text
+                        );
+                        if status == 429 {
+                            eprintln!(
+                                "Rate limit exceeded. Consider deploying your own proxy or try again later."
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("Gemini proxy call failed with status {}", status);
+                    }
+                }
+                Ok(vec![])
+            }
         }
         Err(e) => {
-            eprintln!("Gemini API call failed: {}", e);
+            eprintln!("Gemini proxy call failed: {}", e);
             eprintln!("Continuing analysis without AI-extracted calls...");
-            vec![]
+            Ok(vec![])
         }
     }
 }

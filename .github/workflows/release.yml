@@ -23,7 +23,6 @@ jobs:
       - name: Build binary
         env:
           CARRICK_API_ENDPOINT: ${{ secrets.CARRICK_API_ENDPOINT }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
         run: cargo build --release --target x86_64-unknown-linux-gnu
 
