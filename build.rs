@@ -2,9 +2,9 @@ use std::env;
 
 fn main() {
     // Read environment variables at build time and set them as cargo environment variables.
-    // If CARRICK_API_ENDPOINT is not set (e.g., in a local build), provide a default.
+    // CARRICK_API_ENDPOINT is required at build time - no default provided.
     let api_endpoint = env::var("CARRICK_API_ENDPOINT")
-        .unwrap_or_else(|_| "https://default.carrick.io/api".to_string());
+        .expect("CARRICK_API_ENDPOINT environment variable must be set at build time");
 
     println!("cargo:rustc-env=CARRICK_API_ENDPOINT={}", api_endpoint);
 

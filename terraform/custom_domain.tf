@@ -27,7 +27,7 @@ resource "aws_apigatewayv2_api_mapping" "api_mapping" {
   domain_name = aws_apigatewayv2_domain_name.api_domain.id
   stage       = aws_apigatewayv2_stage.default_stage.id
 }
-
+#
 # Output the DNS target for your domain provider
 output "api_domain_dns_target" {
   value       = aws_apigatewayv2_domain_name.api_domain.domain_name_configuration[0].target_domain_name

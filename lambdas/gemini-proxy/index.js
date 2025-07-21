@@ -1,7 +1,9 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { GoogleGenAI } = require("@google/genai");
 
 // Initialize Gemini client
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const client = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
 
 // VALID_API_KEYS will be checked in handler
 
@@ -101,25 +103,31 @@ function validateRequest(body) {
 
 // Convert Carrick message format to Gemini format
 function convertMessages(messages) {
-  // For code analysis, combine all messages into a single user prompt
-  let combinedText = "";
+  const convertedMessages = [];
 
   for (const msg of messages) {
     if (typeof msg === "string") {
-      combinedText += msg + "\n\n";
+      convertedMessages.push({
+        role: "user",
+        content: msg,
+      });
     } else if (msg.role === "system") {
-      combinedText += msg.content + "\n\n";
+      // Convert system messages to user messages with prefix
+      convertedMessages.push({
+        role: "user",
+        content: `System: ${msg.content}`,
+      });
     } else {
-      combinedText += msg.content || msg.text || "";
+      // Map roles to Gemini-compatible roles
+      const role = msg.role === "assistant" ? "model" : "user";
+      convertedMessages.push({
+        role: role,
+        content: msg.content || msg.text || "",
+      });
     }
   }
 
-  return [
-    {
-      role: "user",
-      parts: [{ text: combinedText.trim() }],
-    },
-  ];
+  return convertedMessages;
 }
 
 // Main Lambda handler
@@ -127,9 +135,9 @@ exports.handler = async (event) => {
   const startTime = Date.now();
 
   console.log("Gemini proxy request:", {
-    method: event.httpMethod,
-    path: event.path,
-    userAgent: event.headers?.["User-Agent"],
+    method: event.requestContext?.http?.method || event.httpMethod,
+    path: event.requestContext?.http?.path || event.path,
+    userAgent: event.headers?.["User-Agent"] || event.headers?.["user-agent"],
   });
 
   // CORS headers
@@ -140,8 +148,11 @@ exports.handler = async (event) => {
     "Content-Type": "application/json",
   };
 
+  // Get HTTP method (API Gateway v2 vs v1 compatibility)
+  const httpMethod = event.requestContext?.http?.method || event.httpMethod;
+
   // Handle preflight requests
-  if (event.httpMethod === "OPTIONS") {
+  if (httpMethod === "OPTIONS") {
     return {
       statusCode: 200,
       headers: corsHeaders,
@@ -150,7 +161,7 @@ exports.handler = async (event) => {
   }
 
   // Only allow POST requests
-  if (event.httpMethod !== "POST") {
+  if (httpMethod !== "POST") {
     return {
       statusCode: 405,
       headers: corsHeaders,
@@ -177,9 +188,10 @@ exports.handler = async (event) => {
     const VALID_API_KEYS =
       process.env.VALID_API_KEYS.split(",").filter(Boolean);
 
-    // Check API key authentication
-    const apiKey =
-      event.headers?.authorization?.replace(/^Bearer /, "") ?? null;
+    // Check API key authentication (API Gateway v2 vs v1 compatibility)
+    const authHeader =
+      event.headers?.authorization || event.headers?.Authorization;
+    const apiKey = authHeader?.replace(/^Bearer /, "") ?? null;
 
     if (!apiKey || !VALID_API_KEYS.includes(apiKey)) {
       return {
@@ -243,15 +255,15 @@ exports.handler = async (event) => {
 
     // Prepare Gemini request
     const model = requestBody.model || "gemini-2.5-flash";
-    const geminiModel = genAI.getGenerativeModel({ model });
 
     // Convert messages to Gemini format
     const geminiMessages = convertMessages(requestBody.messages);
 
-    // Prepare generation config - use Gemini defaults unless specified
+    // Prepare generation config with low reasoning budget for code analysis
     const generationConfig = {
-      // Match original genai configuration
-      reasoningEffort: "low",
+      thinkingConfig: {
+        budget: 1000, // Low budget for cost efficiency in code analysis
+      },
     };
 
     if (requestBody.options?.temperature !== undefined) {
@@ -260,24 +272,26 @@ exports.handler = async (event) => {
     if (requestBody.options?.maxOutputTokens !== undefined) {
       generationConfig.maxOutputTokens = requestBody.options.maxOutputTokens;
     }
-    if (requestBody.options?.reasoningEffort !== undefined) {
-      generationConfig.reasoningEffort = requestBody.options.reasoningEffort;
-    }
-    // Don't set topK and topP - let Gemini use its defaults
 
     console.log("Calling Gemini API:", {
       model,
       messageCount: geminiMessages.length,
       dailyRemaining: limitCheck.remaining,
+      httpMethod: httpMethod,
+      reasoningBudget: 1000,
     });
 
-    // Make the Gemini API call - each request is independent
-    const result = await geminiModel.generateContent({
-      contents: geminiMessages,
+    // Make the Gemini API call using new @google/genai package
+    const result = await client.models.generateContent({
+      model,
+      contents: geminiMessages.map((msg) => ({
+        role: msg.role,
+        parts: [{ text: msg.content }],
+      })),
       generationConfig,
     });
-    const response = await result.response;
-    const text = response.text();
+
+    const text = result.text;
 
     const endTime = Date.now();
     const duration = endTime - startTime;
@@ -285,7 +299,7 @@ exports.handler = async (event) => {
     console.log("Gemini API success:", {
       duration: `${duration}ms`,
       responseLength: text.length,
-      tokensUsed: response.usageMetadata || "unknown",
+      tokensUsed: result.usage || "unknown",
     });
 
     // Return successful response
@@ -300,7 +314,7 @@ exports.handler = async (event) => {
       body: JSON.stringify({
         success: true,
         text: text,
-        usage: response.usageMetadata,
+        usage: result.usage,
         responseTime: duration,
       }),
     };

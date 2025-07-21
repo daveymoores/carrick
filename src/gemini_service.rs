@@ -49,8 +49,6 @@ struct ProxyOptions {
     temperature: Option<f32>,
     #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
-    #[serde(rename = "reasoningEffort", skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,9 +94,8 @@ pub async fn extract_calls_from_async_expressions(
         async_calls.len()
     );
 
-    // Get proxy endpoint from CARRICK_API_ENDPOINT
-    let api_base = env::var("CARRICK_API_ENDPOINT")
-        .map_err(|_| "CARRICK_API_ENDPOINT environment variable must be set")?;
+    // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
+    let api_base = env!("CARRICK_API_ENDPOINT");
     let proxy_endpoint = format!("{}/gemini/chat", api_base);
 
     let client = Client::new();
@@ -179,9 +176,8 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
         ],
         model: "gemini-2.5-flash".to_string(),
         options: ProxyOptions {
-            temperature: None,                         // Use Gemini defaults
-            max_output_tokens: None,                   // Use Gemini defaults
-            reasoning_effort: Some("low".to_string()), // Match original genai config
+            temperature: None,       // Use Gemini defaults
+            max_output_tokens: None, // Use Gemini defaults
         },
     };
 

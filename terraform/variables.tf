@@ -19,6 +19,7 @@ variable "environment" {
 variable "domain_name" {
   description = "Your domain name (e.g., yoursite.com)"
   type        = string
+  default     = "carrick.tools"
 }
 
 variable "gemini_api_key" {
