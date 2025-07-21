@@ -53,6 +53,10 @@ Error: Property 'role' is missing in producer type
 
 When Carrick runs in your CI, it produces detailed reports like this (click sections to expand):
 
+---
+
+> ** Example Analysis Report**
+
 <!-- CARRICK_ISSUE_COUNT:22 -->
 ### 🪢 CARRICK: API Analysis Results
 
@@ -166,18 +170,68 @@ Issue details: Method mismatch: GET ENV_VAR:ORDER_SERVICE_URL:/orders is called 
 </details>
 <!-- CARRICK_OUTPUT_END -->
 
+---
+
 ## Setup
 
-Add to your GitHub workflow:
+Add to your GitHub workflow (`.github/workflows/carrick.yml`) for each Express service in your microservice architecture:
 
 ```yaml
-- uses: davidjonathanmoores/carrick@v1
-  with:
-    carrick-org: your-org-name
-    carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
+name: Carrick
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  carrick-analysis:
+    name: Carrick Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Carrick Analysis
+        id: carrick-analysis
+        uses: daveymoores/carrick@v1
+        with:
+          carrick-org: your-org-name
+          carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
+
+      - name: Comment PR with Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ steps.carrick-analysis.outputs.pr-comment }}
+        with:
+          script: |
+            const comment = process.env.COMMENT_BODY;
+
+            if (comment && comment.trim() !== '') {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } else {
+              console.log('No comment content to post');
+            }
 ```
 
-Run on `main` to analyze deployed code, and on PRs to catch divergence before merging.
+### Requirements
+- API key from [carrick.tools](https://carrick.tools)
+- Add `CARRICK_API_KEY` to your repository secrets
+- Replace `your-org-name` with your GitHub organization name
+
+### How it works
+Runs analysis on both main branch deployments and pull requests. On main, shares your repository's API metadata with other repositories in your organization for cross-service analysis. On PRs, automatically posts detailed analysis results as comments showing type mismatches, missing endpoints, and orphaned routes across all repositories in your organization.
 
 ## Technical details
 
@@ -202,8 +256,19 @@ Create a `carrick.json` to help classify your API calls:
 }
 ```
 
-## Beta testing
+## What Carrick Catches
 
-Looking for teams with Express microservices to test this. It's fast, low-effort to integrate, and should help catch bugs early across services.
+- Mismatched types
+- Incorrect package versions
+- Wrong HTTP verbs
+- Missing or deprecated endpoints
 
-API keys going out January 18th. Sign up at [carrick.tools](https://www.carrick.tools/) if interested.
+## Join the Private Beta
+
+We're now inviting developers to join our private beta. Here's how to get started:
+
+1. Go to [carrick.tools](https://carrick.tools) and sign up for the beta
+2. We'll send you your personal API key as we onboard new users
+3. Once you have your key, follow the setup guide above to add the Carrick GitHub Action to your workflows
+
+As an early user, your feedback will be invaluable in shaping the future of the product. We're excited to build it with you.
