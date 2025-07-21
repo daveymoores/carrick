@@ -6,7 +6,7 @@ A GitHub Action that checks API producers and consumers across repositories to c
 
 Rather than contract testing, Carrick uses SWC to extract routes from Express apps and mounted routers to find producers, then extracts async call code and sends it to an LLM to find consumers. It extracts request/response types from both sides and runs a minimal TypeScript compiler pass to surface mismatches between services.
 
-**Looking for beta testers with Express microservices. API keys going out January 18th - sign up at [carrick.tools](https://www.carrick.tools/)**
+**Looking for beta testers with Express microservicesx - sign up at [carrick.tools](https://www.carrick.tools/)**
 
 ## How it works
 
