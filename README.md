@@ -55,9 +55,8 @@ When Carrick runs in your CI, it produces detailed reports like this (click sect
 
 ---
 
-> ** Example Analysis Report**
 
-<!-- CARRICK_ISSUE_COUNT:22 -->
+<!-- CARRICK_ISSUE_COUNT:24 -->
 ### 🪢 CARRICK: API Analysis Results
 
 Analyzed **20 endpoints** and **13 API calls** across all repositories.
