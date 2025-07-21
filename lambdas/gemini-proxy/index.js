@@ -81,22 +81,15 @@ function validateRequest(body) {
     return sum + (msg.content || "").length;
   }, 0);
 
-  if (totalLength > 1048576) {
-    // 1MB limit
+  if (totalLength > 5242880) {
+    // 5MB limit - allows for large codebases with many async functions
     return {
       valid: false,
-      error: "Request too large (max 1MB)",
+      error: "Request too large (max 5MB)",
     };
   }
 
-  // Validate model if specified
-  const allowedModels = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro"];
-  if (body.model && !allowedModels.includes(body.model)) {
-    return {
-      valid: false,
-      error: `Invalid model. Allowed: ${allowedModels.join(", ")}`,
-    };
-  }
+  // Model is hardcoded to gemini-2.5-flash for simplicity
 
   return { valid: true };
 }
@@ -253,8 +246,8 @@ exports.handler = async (event) => {
       };
     }
 
-    // Prepare Gemini request
-    const model = requestBody.model || "gemini-2.5-flash";
+    // Use hardcoded model for simplicity
+    const model = "gemini-2.5-flash";
 
     // Convert messages to Gemini format
     const geminiMessages = convertMessages(requestBody.messages);
@@ -269,9 +262,7 @@ exports.handler = async (event) => {
     if (requestBody.options?.temperature !== undefined) {
       generationConfig.temperature = requestBody.options.temperature;
     }
-    if (requestBody.options?.maxOutputTokens !== undefined) {
-      generationConfig.maxOutputTokens = requestBody.options.maxOutputTokens;
-    }
+    // Remove custom options for simplicity - use defaults
 
     console.log("Calling Gemini API:", {
       model,

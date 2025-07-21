@@ -33,7 +33,6 @@ pub struct TypeInfo {
 #[derive(Debug, Serialize)]
 struct ProxyRequest {
     messages: Vec<ProxyMessage>,
-    model: String,
     options: ProxyOptions,
 }
 
@@ -174,7 +173,6 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
                 content: prompt,
             },
         ],
-        model: "gemini-2.5-flash".to_string(),
         options: ProxyOptions {
             temperature: None,       // Use Gemini defaults
             max_output_tokens: None, // Use Gemini defaults
