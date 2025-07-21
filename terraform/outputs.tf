@@ -3,6 +3,11 @@ output "api_endpoint" {
   description = "Base API endpoint URL - append /types/check-or-upload for the lambda function"
 }
 
+output "gemini_proxy_endpoint" {
+  value       = "${aws_apigatewayv2_api.carrick_api.api_endpoint}/gemini/chat"
+  description = "Gemini proxy endpoint for AI-powered code analysis"
+}
+
 output "aws_api_endpoint" {
   value       = aws_apigatewayv2_api.carrick_api.api_endpoint
   description = "AWS-generated API endpoint (fallback)"
