@@ -1,6 +1,10 @@
 name: "Carrick API Analysis"
 description: "Analyze JavaScript/TypeScript APIs for cross-repository inconsistencies"
 
+branding:
+  icon: "link"
+  color: "blue"
+
 inputs:
   path:
     description: "Path to analyze"
@@ -69,7 +73,7 @@ runs:
           # Extract content between delimiters
           sed -n '/<!-- CARRICK_OUTPUT_START -->/,/<!-- CARRICK_OUTPUT_END -->/p' analysis.log | \
             grep -v "CARRICK_OUTPUT_START\|CARRICK_OUTPUT_END\|CARRICK_ISSUE_COUNT" > pr_comment.md
-          
+
           # Set multiline output for PR comment
           {
             echo "pr-comment<<EOF"
