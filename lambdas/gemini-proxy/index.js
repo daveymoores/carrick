@@ -252,12 +252,8 @@ exports.handler = async (event) => {
     // Convert messages to Gemini format
     const geminiMessages = convertMessages(requestBody.messages);
 
-    // Prepare generation config with low reasoning budget for code analysis
-    const generationConfig = {
-      thinkingConfig: {
-        budget: 1000, // Low budget for cost efficiency in code analysis
-      },
-    };
+    // Prepare generation config - removing thinking config to avoid timeouts
+    const generationConfig = {};
 
     if (requestBody.options?.temperature !== undefined) {
       generationConfig.temperature = requestBody.options.temperature;
@@ -269,7 +265,6 @@ exports.handler = async (event) => {
       messageCount: geminiMessages.length,
       dailyRemaining: limitCheck.remaining,
       httpMethod: httpMethod,
-      reasoningBudget: 1000,
     });
 
     // Make the Gemini API call using new @google/genai package
