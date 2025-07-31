@@ -153,7 +153,7 @@ fn discover_and_parse_files(
     let repo_name = get_repository_name(repo_path);
 
     // Find files in current repo only
-    let ignore_patterns = ["node_modules", "dist", "build", ".next"];
+    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
     let (files, _, _) = find_files(repo_path, &ignore_patterns);
 
     println!(
@@ -232,7 +232,7 @@ fn discover_and_parse_files(
 fn load_config_and_packages(
     repo_path: &str,
 ) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
-    let ignore_patterns = ["node_modules", "dist", "build", ".next"];
+    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
     let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
 
     let config = if let Some(config_path) = config_file_path {
@@ -518,59 +518,14 @@ fn recreate_package_and_tsconfig(
     // Convert PackageInfo objects to simple version strings for npm
     let mut dependencies = std::collections::HashMap::new();
     for (name, package_info) in package_dependencies {
-        println!(
-            "Found dependency: {} -> '{}' (source: {})",
-            name,
-            package_info.version,
-            package_info.source_path.display()
-        );
-
-        // Validate that version is not empty or undefined
-        if package_info.version.is_empty() {
-            eprintln!(
-                "ERROR: Empty version for dependency '{}' from {}",
-                name,
-                package_info.source_path.display()
-            );
-            continue;
-        }
-        if package_info.version == "undefined" || package_info.version == "null" {
-            eprintln!(
-                "ERROR: Invalid version '{}' for dependency '{}' from {}",
-                package_info.version,
-                name,
-                package_info.source_path.display()
-            );
-            continue;
-        }
-
         dependencies.insert(name.clone(), package_info.version.clone());
     }
 
-    println!("Total dependencies collected: {}", dependencies.len());
-
-    // Validate and report TypeScript dependencies specifically
-    if let Some(ts_version) = dependencies.get("typescript") {
-        println!("typescript found with version: '{}'", ts_version);
-        if ts_version.is_empty() || ts_version == "undefined" {
-            eprintln!("ERROR: typescript has invalid version: '{}'", ts_version);
-            dependencies.insert("typescript".to_string(), "5.0.0".to_string());
-            println!("Replaced with fallback typescript@5.0.0");
-        }
-    } else {
-        println!("typescript not found, adding typescript@5.0.0");
-        dependencies.insert("typescript".to_string(), "5.0.0".to_string());
+    // Only add essential TypeScript dependencies if they're missing
+    if !dependencies.contains_key("typescript") {
+        dependencies.insert("typescript".to_string(), "5.8.3".to_string());
     }
-
-    if let Some(ts_node_version) = dependencies.get("ts-node") {
-        println!("ts-node found with version: '{}'", ts_node_version);
-        if ts_node_version.is_empty() || ts_node_version == "undefined" {
-            eprintln!("ERROR: ts-node has invalid version: '{}'", ts_node_version);
-            dependencies.insert("ts-node".to_string(), "10.9.2".to_string());
-            println!("Replaced with fallback ts-node@10.9.2");
-        }
-    } else {
-        println!("ts-node not found, adding ts-node@10.9.2");
+    if !dependencies.contains_key("ts-node") {
         dependencies.insert("ts-node".to_string(), "10.9.2".to_string());
     }
 
@@ -581,17 +536,10 @@ fn recreate_package_and_tsconfig(
         "dependencies": dependencies
     });
 
-    let package_json_string = serde_json::to_string_pretty(&package_json_content)?;
-    println!("Final package.json content:\n{}", package_json_string);
-
-    // Double-check for any undefined values in the final JSON
-    if package_json_string.contains("undefined") {
-        eprintln!("ERROR: Found 'undefined' in final package.json!");
-        eprintln!("This will cause npm install to fail.");
-        return Err("Invalid package.json content with undefined values".into());
-    }
-
-    std::fs::write(&package_json_path, &package_json_string)?;
+    std::fs::write(
+        &package_json_path,
+        serde_json::to_string_pretty(&package_json_content)?,
+    )?;
     println!("Recreated package.json at {}", package_json_path.display());
 
     // Install dependencies
