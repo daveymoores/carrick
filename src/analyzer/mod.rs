@@ -815,25 +815,32 @@ impl Analyzer {
                 else {
                     // Extract the env var names for the error message
                     let mut env_vars = Vec::new();
-                    let segments = api_call_details.route.split("ENV_VAR:");
+                    let segments: Vec<&str> = api_call_details.route.split("ENV_VAR:").collect();
+                    let mut clean_path = String::new();
 
-                    for segment in segments.skip(1) {
-                        // Skip the first segment (before any ENV_VAR)
+                    // Add the part before any ENV_VAR marker
+                    clean_path.push_str(segments[0]);
+
+                    // Process each segment with an ENV_VAR marker
+                    for segment in segments.iter().skip(1) {
                         let parts: Vec<&str> = segment.splitn(2, ':').collect();
                         if !parts.is_empty() {
                             env_vars.push(parts[0].to_string());
                         }
+                        if parts.len() == 2 {
+                            clean_path.push_str(parts[1]);
+                        }
                     }
 
-                    // Format the error message
+                    // Format the error message for configuration suggestion
                     let env_var_list = env_vars.join(", ");
                     env_var_calls.push(format!(
                         "Environment variable endpoint: {} using env vars [{}] in {}",
                         api_call_details.method, env_var_list, api_call_details.route
                     ));
 
-                    // Skip further processing
-                    continue;
+                    // Continue with endpoint matching using the clean path
+                    clean_path
                 }
             } else {
                 // Regular call - use the full route
