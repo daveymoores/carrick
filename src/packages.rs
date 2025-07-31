@@ -71,7 +71,23 @@ impl Packages {
 
             for deps in all_deps {
                 for (name, version_spec) in deps {
+                    println!(
+                        "Processing dependency: {} = '{}' from {}",
+                        name,
+                        version_spec,
+                        source_path.display()
+                    );
                     let clean_version = self.clean_version_spec(version_spec);
+                    println!("Cleaned version: '{}' -> '{}'", version_spec, clean_version);
+
+                    // Validate cleaned version
+                    if clean_version.is_empty() {
+                        eprintln!(
+                            "ERROR: Version cleaning resulted in empty string for {} (original: '{}')",
+                            name, version_spec
+                        );
+                        continue;
+                    }
 
                     match self.merged_dependencies.get(name) {
                         Some(existing) => {
@@ -105,6 +121,14 @@ impl Packages {
 
     /// Cleans version specifications to extract actual version numbers
     fn clean_version_spec(&self, version_spec: &str) -> String {
+        println!("Cleaning version spec: '{}'", version_spec);
+
+        // Check for empty or invalid input
+        if version_spec.is_empty() {
+            eprintln!("ERROR: Empty version spec provided");
+            return "".to_string();
+        }
+
         // Remove common prefixes like ^, ~, >=, etc.
         let cleaned = version_spec
             .trim_start_matches('^')
@@ -131,7 +155,17 @@ impl Packages {
             }
         }
 
-        cleaned.trim().to_string()
+        let result = cleaned.trim().to_string();
+        println!("Final cleaned version: '{}'", result);
+
+        if result.is_empty() {
+            eprintln!(
+                "ERROR: Version cleaning resulted in empty string for input: '{}'",
+                version_spec
+            );
+        }
+
+        result
     }
 
     /// Determines if we should update to a new version (chooses higher version)
