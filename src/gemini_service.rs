@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Serialize)]
 pub struct AsyncCallContext {
@@ -192,54 +193,86 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
         request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
     }
 
-    match request_builder.send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.json::<ProxyResponse>().await {
-                    Ok(proxy_response) => {
-                        if proxy_response.success {
-                            println!(
-                                "Gemini proxy call successful. Processing {} async expressions.",
-                                async_calls.len()
-                            );
-                            Ok(parse_gemini_response(&proxy_response.text, &async_calls))
-                        } else {
-                            eprintln!("Gemini proxy returned unsuccessful response");
-                            Ok(vec![])
+    // Retry logic for transient failures (max 3 attempts)
+    for attempt in 1..=3 {
+        match request_builder.try_clone().unwrap().send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.json::<ProxyResponse>().await {
+                        Ok(proxy_response) => {
+                            if proxy_response.success {
+                                println!(
+                                    "Gemini proxy call successful. Processing {} async expressions.",
+                                    async_calls.len()
+                                );
+                                return Ok(parse_gemini_response(
+                                    &proxy_response.text,
+                                    &async_calls,
+                                ));
+                            } else {
+                                eprintln!("Gemini proxy returned unsuccessful response");
+                                return Ok(vec![]);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to parse proxy response: {}", e);
+                            return Ok(vec![]);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to parse proxy response: {}", e);
-                        Ok(vec![])
-                    }
-                }
-            } else {
-                let status = response.status();
-                match response.text().await {
-                    Ok(error_text) => {
+                } else {
+                    let status = response.status();
+
+                    // Only retry on 503 Service Unavailable
+                    if status == 503 && attempt < 3 {
+                        let delay_ms = 1000 * attempt; // 1s, 2s delays
                         eprintln!(
-                            "Gemini proxy call failed with status {}: {}",
-                            status, error_text
+                            "Gemini API returned 503, retrying in {}ms (attempt {}/3)",
+                            delay_ms, attempt
                         );
-                        if status == 429 {
+                        sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    match response.text().await {
+                        Ok(error_text) => {
                             eprintln!(
-                                "Rate limit exceeded. Consider deploying your own proxy or try again later."
+                                "Gemini proxy call failed with status {}: {}",
+                                status, error_text
                             );
+                            if status == 429 {
+                                eprintln!(
+                                    "Rate limit exceeded. Consider deploying your own proxy or try again later."
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("Gemini proxy call failed with status {}", status);
                         }
                     }
-                    Err(_) => {
-                        eprintln!("Gemini proxy call failed with status {}", status);
-                    }
+                    return Ok(vec![]);
                 }
-                Ok(vec![])
+            }
+            Err(e) => {
+                // Only retry network errors on first 2 attempts
+                if attempt < 3 {
+                    let delay_ms = 1000 * attempt;
+                    eprintln!(
+                        "Gemini proxy call failed: {}, retrying in {}ms (attempt {}/3)",
+                        e, delay_ms, attempt
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+
+                eprintln!("Gemini proxy call failed: {}", e);
+                eprintln!("Continuing analysis without AI-extracted calls...");
+                return Ok(vec![]);
             }
         }
-        Err(e) => {
-            eprintln!("Gemini proxy call failed: {}", e);
-            eprintln!("Continuing analysis without AI-extracted calls...");
-            Ok(vec![])
-        }
     }
+
+    // Should never reach here, but just in case
+    Ok(vec![])
 }
 
 fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
