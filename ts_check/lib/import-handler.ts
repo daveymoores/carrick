@@ -24,14 +24,32 @@ export class ImportHandler {
       moduleSpecifier = getModuleSpecifierFromNodeModulesPath(sourceFilePath);
     }
 
-    // Get the type name
-    const typeName =
+    // Get the type name - try multiple approaches
+    let typeName: string | undefined;
+
+    if (
       Node.isInterfaceDeclaration(node) ||
       Node.isClassDeclaration(node) ||
       Node.isTypeAliasDeclaration(node) ||
       Node.isEnumDeclaration(node)
-        ? node.getName?.()
-        : undefined;
+    ) {
+      typeName = node.getName?.();
+    } else if (Node.isImportSpecifier(node)) {
+      typeName = node.getName();
+    } else {
+      // Try to extract type name from the node text or symbol
+      const symbol = node.getSymbol();
+      if (symbol) {
+        typeName = symbol.getName();
+      } else {
+        // Last resort: try to parse the node text
+        const nodeText = node.getText();
+        const match = nodeText.match(/\b([A-Z][a-zA-Z0-9]*)\b/);
+        if (match) {
+          typeName = match[1];
+        }
+      }
+    }
 
     if (typeName && moduleSpecifier) {
       // Prevent imports from excluded module specifiers

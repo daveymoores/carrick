@@ -570,6 +570,7 @@ fn recreate_package_and_tsconfig(
     let package_json_content = serde_json::json!({
         "name": "carrick-type-check",
         "version": "1.0.0",
+        "type": "module",
         "dependencies": dependencies
     });
 

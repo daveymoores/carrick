@@ -113,37 +113,34 @@ When extracting HTTP calls (fetch, axios, etc.), infer the request and response 
 
 TYPE EXTRACTION REQUIREMENTS:
 4. For outgoing HTTP calls (fetch, axios, etc.):
-   a. For the response type, extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
+   a. For response types: Look for type annotations in these patterns ONLY:
+      - Generic type parameters: `axios.get<User>(...)` → extract "User"
+      - Variable type annotations: `const data: UserData = await response.json()` → extract "UserData"
+      - Function return types: `async function(): Promise<ApiResponse>` → extract "ApiResponse"
 
-   CRITICAL:
-   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
-   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
-   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
+   b. For request types: Look for type annotations on request data:
+      - Request body types: `axios.post<any, CreateUserRequest>(url, userData)` → extract "CreateUserRequest"
+      - Variable types: `const payload: OrderRequest = {...}; axios.post(url, payload)` → extract "OrderRequest"
 
-   BAD EXAMPLE:
-     const raw: Foo[] = await resp.json();
-     const filtered: Foo[] = filter(raw);
-     // Only extract Foo[], not both.
+5. POSITION CALCULATION - CRITICAL:
+   - For generic types like `axios.get<User>(...)`: Position should point to the "U" in "User"
+   - For variable types like `const data: UserData =`: Position should point to the "U" in "UserData"
+   - Count characters from the beginning of the function source code
+   - Be precise - position must point to the start of the type name, not URLs or other text
 
-   BAD EXAMPLE:
-     const a: Bar[] = await resp.json();
-     const b: Bar[] = a.filter(...);
-     // Only extract Bar[], not both.
-
-   GOOD EXAMPLE:
-     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
-     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
-     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
-   b. For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
-5. NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
-6. Calculate approximate character position where the type appears in the source
-7. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
+6. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
 
 TYPE INFO OBJECT FORMAT:
-- file_path: The source file path
-- start_position: Approximate character position of type annotation (number)
-- composite_type_string: Full type string (e.g., "Response<User[]>", "CreateUserRequest")
+- file_path: The source file path from the input
+- start_position: Character position pointing to the START of the type name (number)
+- composite_type_string: Full type string (e.g., "User", "CreateUserRequest", "ApiResponse<User[]>")
 - alias: Generated alias name (e.g., "GetUsersResponse", "PostUserRequest")
+
+POSITION EXAMPLES:
+For code: `const userResponse = await axios.get<User>(\`\${USER_SERVICE_URL}/api/users/\${order.userId}\`);`
+- Type: "User"
+- Position: count to the "U" in "<User>"
+- NOT the position of the URL string
 
 ENVIRONMENT VARIABLE HANDLING:
 - Format: "ENV_VAR:VARIABLE_NAME:path"
@@ -281,47 +278,28 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
     format!(
         r#"Extract HTTP API calls from these JavaScript/TypeScript functions. Return ONLY a JSON array.
 
-IMPORTANT: When analyzing outgoing HTTP calls (fetch, axios, etc.) inside Express route handlers:
-- For the response type:
-   - Extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
+Find HTTP calls (axios.get, fetch, etc.) and locate TypeScript type annotations.
 
-   CRITICAL:
-   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
-   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
-   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
+For generic types like `axios.get<User>(url)`:
+- Find the position of the type name "User" (not the URL or method name)
+- Count characters from start of function to the "U" in "<User>"
+- Example: if "axios.get<User>" starts at position 100, then "User" is at position 111
 
-   BAD EXAMPLE:
-     const raw: Foo[] = await resp.json();
-     const filtered: Foo[] = filter(raw);
-     // Only extract Foo[], not both.
+For variable types like `const data: ApiType = await fetch()`:
+- Find the position of "ApiType" (not the variable name)
+- Count characters from start of function to the "A" in "ApiType"
 
-   BAD EXAMPLE:
-     const a: Bar[] = await resp.json();
-     const b: Bar[] = a.filter(...);
-     // Only extract Bar[], not both.
-
-   GOOD EXAMPLE:
-     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
-     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
-     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
-- For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
-- NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
+CRITICAL: start_position must point to the type name itself, not URLs, variables, or method names.
 
 FUNCTIONS TO ANALYZE:
 {}
 
-EXTRACTION RULES:
-1. Find HTTP calls: fetch(), axios.get/post/put/delete(), request(), etc.
-2. Ignore: setTimeout, file operations, database calls, console.log
-3. Extract exact route, method, request body
-4. Extract TypeScript type annotations from function parameters and return types
-
-TYPE EXTRACTION RULES:
-- Look for function parameter types: (req: RequestType) → extract "RequestType"
-- Look for return type annotations: ): Promise<ResponseType> → extract "ResponseType"
-- Look for response variable types: const result: UserData = await...
-- Calculate character position by counting from start of function
-- Generate aliases: GET /users → "GetUsersResponse", POST /users → "PostUsersRequest"
+Extract each HTTP call with:
+- route: URL path with env vars converted (ENV_VAR:VAR_NAME:path)
+- method: HTTP method (GET, POST, etc.)
+- response_type_info: type annotation for response (if found)
+- request_type_info: type annotation for request data (if found)
+POSITION ACCURACY IS CRITICAL - Count every single character carefully.
 
 ENVIRONMENT VARIABLE FORMAT:
 - process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
@@ -431,7 +409,7 @@ fn parse_gemini_response(response: &str, contexts: &[AsyncCallContext]) -> Vec<C
         extract_from_code_block(json_str),
         // Extract JSON array bounds
         extract_json_array(json_str),
-        // Clean and retry
+        // Clean version
         &cleaned,
     ];
 

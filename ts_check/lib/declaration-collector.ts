@@ -31,27 +31,38 @@ export class DeclarationCollector {
     if (!Node.isTypeReference(typeRef)) return;
 
     const typeName = typeRef.getTypeName().getText();
-    console.log(`Processing type reference: ${typeName}`);
-    console.log("--------> " + typeRef.getSourceFile().getFilePath());
+
+    // Debug User type specifically
+    if (typeName === "User") {
+      console.log(`[DEBUG] Processing User type reference`);
+    }
 
     const symbol = typeRef.getTypeName().getSymbol();
     if (symbol) {
+      if (typeName === "User") {
+        console.log(
+          `[DEBUG] User symbol found with ${symbol.getDeclarations().length} declarations`,
+        );
+      }
       for (const decl of symbol.getDeclarations()) {
-        const isNodeModule = decl
-          .getSourceFile()
-          .getFilePath()
-          .includes("node_modules");
+        const declFilePath = decl.getSourceFile().getFilePath();
+        const isNodeModule = declFilePath.includes("node_modules");
+        if (typeName === "User") {
+          console.log(
+            `[DEBUG] User declaration: ${decl.getKindName()} in ${declFilePath} (isNodeModule: ${isNodeModule})`,
+          );
+        }
         if (isNodeModule) {
           this.importHandler.addImportForExternalType(decl);
         } else {
           this.collectDeclarationsRecursively(decl, true);
         }
       }
+    } else if (typeName === "User") {
+      console.log(`[DEBUG] No symbol found for User type reference`);
     }
 
     for (const typeArg of typeRef.getTypeArguments()) {
-      console.log(`  - Type argument: ${typeArg.getText()}`);
-      console.log("--------> " + typeArg.getSourceFile().getFilePath());
       this.typeProcessor.processTypeArgument(typeArg);
     }
   }
@@ -65,19 +76,9 @@ export class DeclarationCollector {
     if (Node.isImportSpecifier(node)) {
       const aliasedSymbol = node.getSymbol()?.getAliasedSymbol();
       if (aliasedSymbol) {
-        console.log(
-          `CDR: Resolving import specifier "${node.getName()}" to its original symbol.`,
-        );
         for (const aliasedDecl of aliasedSymbol.getDeclarations()) {
-          console.log(
-            `CDR:   ↳ Found aliased declaration: ${aliasedDecl.getKindName()} in ${aliasedDecl.getSourceFile().getFilePath()}`,
-          );
           this.collectDeclarationsRecursively(aliasedDecl, true);
         }
-      } else {
-        console.warn(
-          `CDR: Could not get aliased symbol for import specifier "${node.getName()}"`,
-        );
       }
       return;
     }
@@ -95,9 +96,12 @@ export class DeclarationCollector {
       Node.isEnumDeclaration(node) ||
       Node.isClassDeclaration(node)
     ) {
-      console.log(
-        `CDR: Adding to collectedDeclarations: ${node.getKindName()} "${node.getName?.()}" from ${sourceFilePath}`,
-      );
+      const nodeName = node.getName?.();
+      if (nodeName === "User") {
+        console.log(
+          `[DEBUG] Adding User interface to collected declarations from ${sourceFilePath}`,
+        );
+      }
       this.collectedDeclarations.add(node);
 
       // Process type parameters
