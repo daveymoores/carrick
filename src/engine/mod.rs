@@ -532,7 +532,6 @@ fn recreate_package_and_tsconfig(
     let package_json_content = serde_json::json!({
         "name": "carrick-type-check",
         "version": "1.0.0",
-        "type": "module",
         "dependencies": dependencies
     });
 
@@ -541,6 +540,20 @@ fn recreate_package_and_tsconfig(
         serde_json::to_string_pretty(&package_json_content)?,
     )?;
     println!("Recreated package.json at {}", package_json_path.display());
+
+    // Clean any existing node_modules and package-lock.json to avoid conflicts
+    let node_modules_path = output_dir.join("node_modules");
+    let package_lock_path = output_dir.join("package-lock.json");
+
+    if node_modules_path.exists() {
+        println!("Removing existing node_modules directory...");
+        std::fs::remove_dir_all(&node_modules_path).ok();
+    }
+
+    if package_lock_path.exists() {
+        println!("Removing existing package-lock.json...");
+        std::fs::remove_file(&package_lock_path).ok();
+    }
 
     // Install dependencies
     use std::process::Command;

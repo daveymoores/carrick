@@ -151,14 +151,17 @@ ENVIRONMENT VARIABLE HANDLING:
 - env.SERVICE_URL + "/health" → "ENV_VAR:SERVICE_URL:/health"
 
 TEMPLATE LITERAL HANDLING:
-- Convert ALL template literals to :id: `/users/${userId}` → "/users/:id"
-- Convert ALL template literals to :id: `/users/${user_id}` → "/users/:id"
-- Convert ALL template literals to :id: `/orders/${orderId}/items/${itemId}` → "/orders/:id/items/:id"
-- Remove query parameters from paths: `/orders?userId=${userId}` → "/orders"
+- Convert ALL template literals to :id but PRESERVE ALL PATH PARTS: `/api/users/${{userId}}` → "/api/users/:id"
+- Convert ALL template literals to :id: `/users/${{user_id}}` → "/users/:id"
+- Convert ALL template literals to :id: `/orders/${{orderId}}/items/${{itemId}}` → "/orders/:id/items/:id"
+- PRESERVE PATH PREFIXES: `/api/orders/${{orderId}}` → "/api/orders/:id"
+- Remove query parameters from paths: `/orders?userId=${{userId}}` → "/orders"
 
 URL CONSTRUCTION:
 - String concatenation: "/api" + "/users" → "/api/users"
 - Mixed env vars: process.env.API + "/v1" + path → "ENV_VAR:API:/v1" + path
+- Template literals with env vars: `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
+- Complex template literals: `${{BASE_URL}}/api/users/${{id}}` → "ENV_VAR:BASE_URL:/api/users/:id"
 
 NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
 
@@ -291,14 +294,18 @@ ENVIRONMENT VARIABLE FORMAT:
 - process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
 - process.env.BASE + "/api" + path → "ENV_VAR:BASE:/api" + path
 - `${{process.env.SERVICE}}/endpoint` → "ENV_VAR:SERVICE:/endpoint"
+- `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
+- `${{USER_SERVICE_URL}}/api/users/${{userId}}` → "ENV_VAR:USER_SERVICE_URL:/api/users/:id"
 - CONSTANT_VAR + "/path" → "ENV_VAR:CONSTANT_VAR:/path"
 
 TEMPLATE LITERALS:
 - `/users/${{id}}` → "/users/:id"
 - `/users/${{userId}}` → "/users/:id"
+- `/api/users/${{userId}}` → "/api/users/:id" (PRESERVE /api prefix)
 - `/orders/${{orderId}}` → "/orders/:id"
 - `/api/comments?userId=${{userId}}` → "/api/comments"
 - `${{base}}/users/${{id}}` → "ENV_VAR:base:/users/:id"
+- `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
 
 STRING CONCATENATION:
 - "/api" + "/users" → "/api/users"
@@ -311,11 +318,17 @@ async function getUsers(req: GetUsersRequest): Promise<GetUsersResponse> {{{{
 }}}}
 // → {{{{"route":"ENV_VAR:API_URL:/users","method":"GET","request_body":null,"has_response_type":true,"request_type_info":{{{{"file_path":"example.ts","start_position":25,"composite_type_string":"GetUsersRequest","alias":"GetUsersRequest"}}}}, "response_type_info":{{{{"file_path":"example.ts","start_position":50,"composite_type_string":"GetUsersResponse","alias":"GetUsersResponse"}}}}}}}}
 
-fetch(\`/users/${{{{userId}}}}/comments\`)
+const response = await axios.get(`${{{{BASE_URL}}}}/path/to/endpoint`)
+// → {{{{"route":"ENV_VAR:BASE_URL:/path/to/endpoint","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
+
+const item = await axios.get(`${{{{SERVICE_URL}}}}/nested/path/items/${{{{itemId}}}}`)
+// → {{{{"route":"ENV_VAR:SERVICE_URL:/nested/path/items/:id","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
+
+fetch(`/users/${{{{userId}}}}/comments`)
 // → {{{{"route":"/users/:id/comments","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
 
-axios.post("/api/users", userData)
-// → {{{{"route":"/api/users","method":"POST","request_body":{{{{"userData":"placeholder"}}}},"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
+axios.post("/path/to/resource", userData)
+// → {{{{"route":"/path/to/resource","method":"POST","request_body":{{{{"userData":"placeholder"}}}},"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
 ```
 
 OUTPUT JSON ARRAY ONLY:"#,
