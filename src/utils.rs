@@ -24,12 +24,22 @@ pub fn get_repository_name(repo_path: &str) -> String {
     }
 
     // Fall back to extracting from path
-    repo_path
+    let path_name = repo_path
         .split("/")
         .filter(|s| !s.is_empty())
         .last()
-        .expect("repo_suffix not found")
-        .to_string()
+        .unwrap_or(".");
+
+    // If we got "." (current directory), use the actual directory name
+    if path_name == "." {
+        if let Ok(current_dir) = env::current_dir() {
+            if let Some(dir_name) = current_dir.file_name() {
+                return dir_name.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    path_name.to_string()
 }
 
 /// Resolves a relative import path to an absolute file path.

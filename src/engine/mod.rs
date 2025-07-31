@@ -120,6 +120,44 @@ fn merge_serialized_data<T>(
 where
     T: Default + serde::de::DeserializeOwned,
 {
+    // Special handling for Config to properly merge all configs
+    if std::any::type_name::<T>() == std::any::type_name::<crate::config::Config>() {
+        use std::path::PathBuf;
+        let mut temp_files = Vec::new();
+
+        // Write each config to a temporary file
+        for (i, repo_data) in all_repo_data.iter().enumerate() {
+            if let Some(json_str) = extractor(repo_data) {
+                let temp_path = PathBuf::from(format!("/tmp/carrick_config_{}.json", i));
+                if let Err(_) = std::fs::write(&temp_path, json_str) {
+                    continue;
+                }
+                temp_files.push(temp_path);
+            }
+        }
+
+        // Use Config::new to properly merge all configs
+        if !temp_files.is_empty() {
+            let merged_config = crate::config::Config::new(temp_files.clone()).unwrap_or_default();
+
+            // Clean up temp files
+            for temp_file in temp_files {
+                let _ = std::fs::remove_file(temp_file);
+            }
+
+            // This is a bit of a hack to return the merged config as T
+            // Since we know T is Config when we get here
+            let config_any = Box::new(merged_config) as Box<dyn std::any::Any>;
+            if let Ok(config) = config_any.downcast::<crate::config::Config>() {
+                let config_json = serde_json::to_string(&*config)?;
+                return Ok(serde_json::from_str(&config_json)?);
+            }
+        }
+
+        return Ok(T::default());
+    }
+
+    // For non-Config types, use the first found (original behavior)
     for repo_data in all_repo_data {
         if let Some(json_str) = extractor(repo_data) {
             if let Ok(data) = serde_json::from_str::<T>(json_str) {
@@ -153,7 +191,7 @@ fn discover_and_parse_files(
     let repo_name = get_repository_name(repo_path);
 
     // Find files in current repo only
-    let ignore_patterns = ["node_modules", "dist", "build", ".next"];
+    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
     let (files, _, _) = find_files(repo_path, &ignore_patterns);
 
     println!(
@@ -232,7 +270,7 @@ fn discover_and_parse_files(
 fn load_config_and_packages(
     repo_path: &str,
 ) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
-    let ignore_patterns = ["node_modules", "dist", "build", ".next"];
+    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
     let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
 
     let config = if let Some(config_path) = config_file_path {
@@ -521,10 +559,17 @@ fn recreate_package_and_tsconfig(
         dependencies.insert(name.clone(), package_info.version.clone());
     }
 
+    // Only add essential TypeScript dependencies if they're missing
+    if !dependencies.contains_key("typescript") {
+        dependencies.insert("typescript".to_string(), "5.8.3".to_string());
+    }
+    if !dependencies.contains_key("ts-node") {
+        dependencies.insert("ts-node".to_string(), "10.9.2".to_string());
+    }
+
     let package_json_content = serde_json::json!({
         "name": "carrick-type-check",
         "version": "1.0.0",
-        "type": "module",
         "dependencies": dependencies
     });
 
@@ -534,9 +579,24 @@ fn recreate_package_and_tsconfig(
     )?;
     println!("Recreated package.json at {}", package_json_path.display());
 
+    // Clean any existing node_modules and package-lock.json to avoid conflicts
+    let node_modules_path = output_dir.join("node_modules");
+    let package_lock_path = output_dir.join("package-lock.json");
+
+    if node_modules_path.exists() {
+        println!("Removing existing node_modules directory...");
+        std::fs::remove_dir_all(&node_modules_path).ok();
+    }
+
+    if package_lock_path.exists() {
+        println!("Removing existing package-lock.json...");
+        std::fs::remove_file(&package_lock_path).ok();
+    }
+
     // Install dependencies
     use std::process::Command;
     println!("Installing dependencies...");
+
     let install_output = Command::new("npm")
         .arg("install")
         .current_dir(output_dir)

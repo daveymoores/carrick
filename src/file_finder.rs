@@ -21,6 +21,15 @@ pub fn find_files(
 
         // Check if it's a file
         if path.is_file() {
+            // Check if path matches any ignore pattern for all file types
+            let should_ignore = ignore_patterns
+                .iter()
+                .any(|pattern| path.to_string_lossy().contains(pattern));
+
+            if should_ignore {
+                continue;
+            }
+
             // Check if it's carrick.json
             if path.file_name().is_some_and(|name| name == "carrick.json") {
                 config_file = Some(path.to_path_buf());
@@ -36,13 +45,7 @@ pub fn find_files(
             if let Some(extension) = path.extension() {
                 let ext_str = extension.to_string_lossy().to_lowercase();
                 if ext_str == "js" || ext_str == "ts" || ext_str == "jsx" || ext_str == "tsx" {
-                    // Check if path matches any ignore pattern
-                    if !ignore_patterns
-                        .iter()
-                        .any(|pattern| path.to_string_lossy().contains(pattern))
-                    {
-                        js_ts_files.push(path.to_path_buf());
-                    }
+                    js_ts_files.push(path.to_path_buf());
                 }
             }
         }

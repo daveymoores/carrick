@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Serialize)]
 pub struct AsyncCallContext {
@@ -151,14 +152,17 @@ ENVIRONMENT VARIABLE HANDLING:
 - env.SERVICE_URL + "/health" → "ENV_VAR:SERVICE_URL:/health"
 
 TEMPLATE LITERAL HANDLING:
-- Convert ALL template literals to :id: `/users/${userId}` → "/users/:id"
-- Convert ALL template literals to :id: `/users/${user_id}` → "/users/:id"
-- Convert ALL template literals to :id: `/orders/${orderId}/items/${itemId}` → "/orders/:id/items/:id"
-- Remove query parameters from paths: `/orders?userId=${userId}` → "/orders"
+- Convert ALL template literals to :id but PRESERVE ALL PATH PARTS: `/api/users/${{userId}}` → "/api/users/:id"
+- Convert ALL template literals to :id: `/users/${{user_id}}` → "/users/:id"
+- Convert ALL template literals to :id: `/orders/${{orderId}}/items/${{itemId}}` → "/orders/:id/items/:id"
+- PRESERVE PATH PREFIXES: `/api/orders/${{orderId}}` → "/api/orders/:id"
+- Remove query parameters from paths: `/orders?userId=${{userId}}` → "/orders"
 
 URL CONSTRUCTION:
 - String concatenation: "/api" + "/users" → "/api/users"
 - Mixed env vars: process.env.API + "/v1" + path → "ENV_VAR:API:/v1" + path
+- Template literals with env vars: `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
+- Complex template literals: `${{BASE_URL}}/api/users/${{id}}` → "ENV_VAR:BASE_URL:/api/users/:id"
 
 NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
 
@@ -189,54 +193,86 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
         request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
     }
 
-    match request_builder.send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.json::<ProxyResponse>().await {
-                    Ok(proxy_response) => {
-                        if proxy_response.success {
-                            println!(
-                                "Gemini proxy call successful. Processing {} async expressions.",
-                                async_calls.len()
-                            );
-                            Ok(parse_gemini_response(&proxy_response.text, &async_calls))
-                        } else {
-                            eprintln!("Gemini proxy returned unsuccessful response");
-                            Ok(vec![])
+    // Retry logic for transient failures (max 3 attempts)
+    for attempt in 1..=3 {
+        match request_builder.try_clone().unwrap().send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.json::<ProxyResponse>().await {
+                        Ok(proxy_response) => {
+                            if proxy_response.success {
+                                println!(
+                                    "Gemini proxy call successful. Processing {} async expressions.",
+                                    async_calls.len()
+                                );
+                                return Ok(parse_gemini_response(
+                                    &proxy_response.text,
+                                    &async_calls,
+                                ));
+                            } else {
+                                eprintln!("Gemini proxy returned unsuccessful response");
+                                return Ok(vec![]);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to parse proxy response: {}", e);
+                            return Ok(vec![]);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to parse proxy response: {}", e);
-                        Ok(vec![])
-                    }
-                }
-            } else {
-                let status = response.status();
-                match response.text().await {
-                    Ok(error_text) => {
+                } else {
+                    let status = response.status();
+
+                    // Only retry on 503 Service Unavailable
+                    if status == 503 && attempt < 3 {
+                        let delay_ms = 1000 * attempt; // 1s, 2s delays
                         eprintln!(
-                            "Gemini proxy call failed with status {}: {}",
-                            status, error_text
+                            "Gemini API returned 503, retrying in {}ms (attempt {}/3)",
+                            delay_ms, attempt
                         );
-                        if status == 429 {
+                        sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    match response.text().await {
+                        Ok(error_text) => {
                             eprintln!(
-                                "Rate limit exceeded. Consider deploying your own proxy or try again later."
+                                "Gemini proxy call failed with status {}: {}",
+                                status, error_text
                             );
+                            if status == 429 {
+                                eprintln!(
+                                    "Rate limit exceeded. Consider deploying your own proxy or try again later."
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("Gemini proxy call failed with status {}", status);
                         }
                     }
-                    Err(_) => {
-                        eprintln!("Gemini proxy call failed with status {}", status);
-                    }
+                    return Ok(vec![]);
                 }
-                Ok(vec![])
+            }
+            Err(e) => {
+                // Only retry network errors on first 2 attempts
+                if attempt < 3 {
+                    let delay_ms = 1000 * attempt;
+                    eprintln!(
+                        "Gemini proxy call failed: {}, retrying in {}ms (attempt {}/3)",
+                        e, delay_ms, attempt
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+
+                eprintln!("Gemini proxy call failed: {}", e);
+                eprintln!("Continuing analysis without AI-extracted calls...");
+                return Ok(vec![]);
             }
         }
-        Err(e) => {
-            eprintln!("Gemini proxy call failed: {}", e);
-            eprintln!("Continuing analysis without AI-extracted calls...");
-            Ok(vec![])
-        }
     }
+
+    // Should never reach here, but just in case
+    Ok(vec![])
 }
 
 fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
@@ -291,14 +327,18 @@ ENVIRONMENT VARIABLE FORMAT:
 - process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
 - process.env.BASE + "/api" + path → "ENV_VAR:BASE:/api" + path
 - `${{process.env.SERVICE}}/endpoint` → "ENV_VAR:SERVICE:/endpoint"
+- `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
+- `${{USER_SERVICE_URL}}/api/users/${{userId}}` → "ENV_VAR:USER_SERVICE_URL:/api/users/:id"
 - CONSTANT_VAR + "/path" → "ENV_VAR:CONSTANT_VAR:/path"
 
 TEMPLATE LITERALS:
 - `/users/${{id}}` → "/users/:id"
 - `/users/${{userId}}` → "/users/:id"
+- `/api/users/${{userId}}` → "/api/users/:id" (PRESERVE /api prefix)
 - `/orders/${{orderId}}` → "/orders/:id"
 - `/api/comments?userId=${{userId}}` → "/api/comments"
 - `${{base}}/users/${{id}}` → "ENV_VAR:base:/users/:id"
+- `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
 
 STRING CONCATENATION:
 - "/api" + "/users" → "/api/users"
@@ -311,11 +351,17 @@ async function getUsers(req: GetUsersRequest): Promise<GetUsersResponse> {{{{
 }}}}
 // → {{{{"route":"ENV_VAR:API_URL:/users","method":"GET","request_body":null,"has_response_type":true,"request_type_info":{{{{"file_path":"example.ts","start_position":25,"composite_type_string":"GetUsersRequest","alias":"GetUsersRequest"}}}}, "response_type_info":{{{{"file_path":"example.ts","start_position":50,"composite_type_string":"GetUsersResponse","alias":"GetUsersResponse"}}}}}}}}
 
-fetch(\`/users/${{{{userId}}}}/comments\`)
+const response = await axios.get(`${{{{BASE_URL}}}}/path/to/endpoint`)
+// → {{{{"route":"ENV_VAR:BASE_URL:/path/to/endpoint","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
+
+const item = await axios.get(`${{{{SERVICE_URL}}}}/nested/path/items/${{{{itemId}}}}`)
+// → {{{{"route":"ENV_VAR:SERVICE_URL:/nested/path/items/:id","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
+
+fetch(`/users/${{{{userId}}}}/comments`)
 // → {{{{"route":"/users/:id/comments","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
 
-axios.post("/api/users", userData)
-// → {{{{"route":"/api/users","method":"POST","request_body":{{{{"userData":"placeholder"}}}},"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
+axios.post("/path/to/resource", userData)
+// → {{{{"route":"/path/to/resource","method":"POST","request_body":{{{{"userData":"placeholder"}}}},"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
 ```
 
 OUTPUT JSON ARRAY ONLY:"#,

@@ -13,7 +13,7 @@ function cleanupPaths(text: string): string {
     (match, fullPath, fileName) => {
       const cleanName = fileName.replace("_", "-");
       return `import("${cleanName}")`;
-    }
+    },
   );
 }
 
@@ -85,7 +85,9 @@ async function main() {
         `\n❌ Found ${typeCheckResult.mismatches.length} type compatibility issues:`,
       );
       typeCheckResult.mismatches.forEach((mismatch) => {
-        console.log(`  - ${mismatch.endpoint}: ${cleanupPaths(mismatch.errorDetails)}`);
+        console.log(
+          `  - ${mismatch.endpoint}: ${cleanupPaths(mismatch.errorDetails)}`,
+        );
       });
     }
 
