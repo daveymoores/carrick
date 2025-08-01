@@ -433,8 +433,27 @@ const tempVar: ${nodeText} = null as any;`,
   async checkCompatibility(
     sourceFiles: SourceFile[],
   ): Promise<TypeCheckResult> {
+    console.log(`\nType checking ${sourceFiles.length} files:`);
+    sourceFiles.forEach((sf) => console.log(`  - ${sf.getBaseName()}`));
+
     const typeDefinitions = this.extractTypeDefinitions(sourceFiles);
+    console.log(`\nFound ${typeDefinitions.size} type definitions:`);
+    for (const [name, info] of typeDefinitions) {
+      console.log(`  - ${name} (${info.node.getKindName()}) in ${info.file}`);
+    }
+
     const { producers, consumers } = this.groupTypesByEndpoint(typeDefinitions);
+
+    console.log(`\nProducers (${producers.size}):`);
+    for (const [endpoint, producer] of producers) {
+      console.log(`  - ${endpoint} → ${producer.name}`);
+    }
+
+    console.log(`\nConsumers (${consumers.size} endpoints):`);
+    for (const [endpoint, consumerList] of consumers) {
+      console.log(`  - ${endpoint}:`);
+      consumerList.forEach((c) => console.log(`    * ${c.name} (${c.callId})`));
+    }
 
     const result: TypeCheckResult = {
       totalProducers: producers.size,
@@ -581,7 +600,100 @@ const tempVar: ${nodeText} = null as any;`,
       throw new Error("No TypeScript files found in output directory");
     }
 
-    return await this.checkCompatibility(sourceFiles);
+    // Check for compilation errors first
+    const compilationErrors = this.checkCompilationErrors(sourceFiles);
+
+    // Extract type definitions to help map compilation errors to endpoints
+    const typeDefinitions = this.extractTypeDefinitions(sourceFiles);
+
+    const result = await this.checkCompatibility(sourceFiles);
+
+    // Add compilation errors as mismatches
+    for (const error of compilationErrors) {
+      // Try to extract endpoint from the undefined type name
+      const parsedType = this.parseTypeName(error.undefinedType);
+      let endpoint = parsedType ? parsedType.endpoint : null;
+
+      // If we couldn't parse the endpoint directly, try to find which endpoint types reference this undefined type
+      if (!endpoint) {
+        // Look through all type definitions to find consumer types that might be missing this type
+        for (const [typeName, typeInfo] of typeDefinitions) {
+          const parsed = this.parseTypeName(typeName);
+          if (parsed && parsed.type === "consumer") {
+            // Check if the consumer type definition contains a reference to our undefined type
+            const typeText = typeInfo.node.getText();
+            if (typeText.includes(error.undefinedType)) {
+              endpoint = parsed.endpoint;
+              break;
+            }
+          }
+        }
+      }
+
+      // Fall back to a descriptive name if we still can't find an endpoint
+      if (!endpoint) {
+        endpoint = `COMPILATION_ERROR_${error.undefinedType}`;
+      }
+
+      result.mismatches.push({
+        endpoint: endpoint,
+        producerType: "undefined",
+        consumerCall: error.undefinedType,
+        consumerType: error.undefinedType,
+        isAssignable: false,
+        errorDetails: `Type '${error.undefinedType}' is not defined. ${error.message}`,
+        producerLocation: undefined,
+        consumerLocation: error.file,
+      });
+      result.incompatiblePairs++;
+    }
+
+    return result;
+  }
+
+  /**
+   * Check for TypeScript compilation errors like undefined types
+   */
+  private checkCompilationErrors(sourceFiles: SourceFile[]): Array<{
+    file: string;
+    undefinedType: string;
+    message: string;
+  }> {
+    const errors: Array<{
+      file: string;
+      undefinedType: string;
+      message: string;
+    }> = [];
+
+    for (const sourceFile of sourceFiles) {
+      const diagnostics = sourceFile.getPreEmitDiagnostics();
+
+      for (const diagnostic of diagnostics) {
+        const messageText = diagnostic.getMessageText();
+        const message =
+          typeof messageText === "string"
+            ? messageText
+            : messageText.getMessageText();
+
+        // Check for "Cannot find name" errors which indicate undefined types
+        if (message.includes("Cannot find name")) {
+          const match = message.match(/Cannot find name '([^']+)'/);
+          if (match) {
+            const undefinedType = match[1];
+            console.log(
+              `Found undefined type: ${undefinedType} in ${sourceFile.getBaseName()}`,
+            );
+            errors.push({
+              file: sourceFile.getBaseName(),
+              undefinedType,
+              message,
+            });
+          }
+        }
+      }
+    }
+
+    return errors;
   }
 
   /**

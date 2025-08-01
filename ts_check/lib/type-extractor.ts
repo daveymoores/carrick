@@ -49,8 +49,22 @@ export class TypeExtractor {
         console.error(
           `Type not found in '${sourceFile.getFilePath()}' at position ${startPosition}`,
         );
+        console.error(
+          `Looking for type: ${compositeTypeString} with alias: ${alias}`,
+        );
+        console.error(`Source file content around position ${startPosition}:`);
+        const content = sourceFile.getFullText();
+        const start = Math.max(0, startPosition - 50);
+        const end = Math.min(content.length, startPosition + 50);
+        console.error(`"${content.slice(start, end)}"`);
         continue;
       }
+
+      console.log(
+        `Found type reference for ${compositeTypeString} at position ${startPosition}`,
+      );
+      console.log(`Type reference text: "${typeRefNode.getText()}"`);
+      console.log(`Type reference kind: ${typeRefNode.getKindName()}`);
 
       console.log(
         `Found type reference at ${startPosition} in ${filePath}: ${typeRefNode.getText()}`,
