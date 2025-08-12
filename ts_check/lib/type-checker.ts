@@ -55,7 +55,16 @@ export class TypeCompatibilityChecker {
     const consumerMatch = typeName.match(/(.+)Consumer(Call\d+)$/);
     if (consumerMatch) {
       const [, baseType, callId] = consumerMatch;
-      const endpoint = this.convertToEndpoint(baseType);
+      // For EnvVar types, extract the actual endpoint part after the env var
+      let endpointBase = baseType;
+      if (baseType.startsWith("GetEnvVar") && baseType.includes("Url")) {
+        // Extract everything after the last "Url" - this is the actual endpoint
+        const urlIndex = baseType.lastIndexOf("Url");
+        if (urlIndex !== -1) {
+          endpointBase = "Get" + baseType.slice(urlIndex + 3);
+        }
+      }
+      const endpoint = this.convertToEndpoint(endpointBase);
       return { endpoint, type: "consumer", callId };
     }
 
@@ -360,7 +369,9 @@ const tempVar: ${nodeText} = null as any;`,
     for (const [typeName, typeInfo] of typeDefinitions) {
       const parsed = this.parseTypeName(typeName);
 
-      if (!parsed) continue;
+      if (!parsed) {
+        continue;
+      }
 
       if (parsed.type === "producer") {
         producers.set(parsed.endpoint, { name: typeName, ...typeInfo });
@@ -388,7 +399,18 @@ const tempVar: ${nodeText} = null as any;`,
     consumer: { name: string; file: string; node: any; callId: string },
   ): Promise<TypeMismatch | null> {
     try {
-      let producerType = producer.node.getType();
+      let producerType;
+      if (producer.node.getKindName() === "TypeAliasDeclaration") {
+        // For type aliases, get the type from the type node, not the declaration
+        const typeNode = producer.node.getTypeNode();
+        if (typeNode) {
+          producerType = typeNode.getType();
+        } else {
+          producerType = producer.node.getType();
+        }
+      } else {
+        producerType = producer.node.getType();
+      }
       let consumerType = consumer.node.getType();
 
       // Unwrap Response<T> wrapper from producer
