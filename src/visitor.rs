@@ -142,14 +142,14 @@ pub struct Call {
     pub common_type_name: Option<String>, // Common interface name for type comparison
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SymbolKind {
     Named,
     Default,
     Namespace,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImportedSymbol {
     #[allow(dead_code)]
     pub local_name: String,

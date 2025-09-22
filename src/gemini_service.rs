@@ -5,6 +5,121 @@ use std::env;
 use std::path::PathBuf;
 use tokio::time::{Duration, sleep};
 
+/// Reusable service for making Gemini API calls
+#[derive(Debug, Clone)]
+pub struct GeminiService {
+    api_key: String,
+    client: Client,
+}
+
+impl GeminiService {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            api_key,
+            client: Client::new(),
+        }
+    }
+
+    /// Generic method for making Gemini API calls
+    pub async fn analyze_code(
+        &self,
+        prompt: &str,
+        system_message: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Skip API call in mock mode
+        if env::var("CARRICK_MOCK_ALL").is_ok() {
+            return Ok(r#"{
+  "frameworks": ["express"],
+  "data_fetchers": ["axios"],
+  "notes": "Mock response for testing"
+}"#.to_string());
+        }
+
+        // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
+        let api_base = env!("CARRICK_API_ENDPOINT");
+        let proxy_endpoint = format!("{}/gemini/chat", api_base);
+
+        let proxy_request = ProxyRequest {
+            messages: vec![
+                ProxyMessage {
+                    role: "system".to_string(),
+                    content: system_message.to_string(),
+                },
+                ProxyMessage {
+                    role: "user".to_string(),
+                    content: prompt.to_string(),
+                },
+            ],
+            options: ProxyOptions {
+                temperature: None,
+                max_output_tokens: None,
+            },
+        };
+
+        let mut request_builder = self.client
+            .post(&proxy_endpoint)
+            .json(&proxy_request)
+            .timeout(std::time::Duration::from_secs(60));
+
+        // Add API key for authentication
+        request_builder = request_builder.header("Authorization", format!("Bearer {}", self.api_key));
+
+        // Retry logic for transient failures (max 3 attempts)
+        for attempt in 1..=3 {
+            match request_builder.try_clone().unwrap().send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.json::<ProxyResponse>().await {
+                            Ok(proxy_response) => {
+                                if proxy_response.success {
+                                    return Ok(proxy_response.text);
+                                } else {
+                                    return Err("Gemini proxy returned unsuccessful response".into());
+                                }
+                            }
+                            Err(e) => {
+                                return Err(format!("Failed to parse proxy response: {}", e).into());
+                            }
+                        }
+                    } else {
+                        let status = response.status();
+                        
+                        // Only retry on 503 Service Unavailable
+                        if status == 503 && attempt < 3 {
+                            let delay_ms = 1000 * attempt;
+                            eprintln!(
+                                "Gemini API returned 503, retrying in {}ms (attempt {}/3)",
+                                delay_ms, attempt
+                            );
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+
+                        let error_text = response.text().await.unwrap_or_default();
+                        return Err(format!("Gemini proxy call failed with status {}: {}", status, error_text).into());
+                    }
+                }
+                Err(e) => {
+                    // Only retry network errors on first 2 attempts
+                    if attempt < 3 {
+                        let delay_ms = 1000 * attempt;
+                        eprintln!(
+                            "Gemini proxy call failed: {}, retrying in {}ms (attempt {}/3)",
+                            e, delay_ms, attempt
+                        );
+                        sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    return Err(format!("Gemini proxy call failed: {}", e).into());
+                }
+            }
+        }
+
+        Err("Maximum retry attempts exceeded".into())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AsyncCallContext {
     pub kind: String,

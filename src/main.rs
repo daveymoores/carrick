@@ -6,6 +6,7 @@ mod engine;
 mod extractor;
 mod file_finder;
 mod formatter;
+mod framework_detector;
 mod gemini_service;
 mod packages;
 mod parser;

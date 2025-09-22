@@ -6,6 +6,7 @@ pub mod engine;
 pub mod extractor;
 pub mod file_finder;
 pub mod formatter;
+pub mod framework_detector;
 pub mod gemini_service;
 pub mod packages;
 pub mod parser;

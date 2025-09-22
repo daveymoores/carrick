@@ -2,6 +2,8 @@ use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
+use crate::framework_detector::FrameworkDetector;
+use crate::gemini_service::GeminiService;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::utils::{get_repository_name, resolve_import_path};
@@ -313,15 +315,42 @@ async fn analyze_current_repo(
 
     // 3. Load config and packages
     let (config, packages) = load_config_and_packages(repo_path)?;
+    
+    // 4. Run framework detection
+    let api_key = env::var("CARRICK_API_KEY")
+        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
+    let gemini_service = GeminiService::new(api_key);
+    let detector = FrameworkDetector::new(gemini_service);
+    
+    let mut all_imported_symbols = HashMap::new();
+    for visitor in &visitors {
+        all_imported_symbols.extend(visitor.imported_symbols.clone());
+    }
+    
+    let detection_result = detector.detect_frameworks_and_libraries(&packages, &all_imported_symbols).await
+        .unwrap_or_else(|e| {
+            println!("Framework detection failed: {}", e);
+            crate::framework_detector::DetectionResult {
+                frameworks: vec![],
+                data_fetchers: vec![],
+                notes: format!("Detection failed: {}", e),
+            }
+        });
+    
+    println!("Detected frameworks: {:?}", detection_result.frameworks);
+    println!("Detected data fetchers: {:?}", detection_result.data_fetchers);
+    if !detection_result.notes.is_empty() {
+        println!("Notes: {}", detection_result.notes);
+    }
 
-    // 4. Build analyzer using shared logic with same SourceMap
+    // 5. Build analyzer using shared logic with same SourceMap
     let builder = AnalyzerBuilder::new(config.clone(), cm);
     let analyzer = builder.build_from_visitors(visitors).await?;
 
-    // 5. Extract types for current repo
+    // 6. Extract types for current repo
     extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
 
-    // 6. Build CloudRepoData (AST stripping handled by caller)
+    // 7. Build CloudRepoData (AST stripping handled by caller)
     let cloud_data = CloudRepoData {
         repo_name: repo_name.clone(),
         endpoints: analyzer.endpoints,
