@@ -345,12 +345,18 @@ async fn analyze_current_repo(
 
     // 5. Build analyzer using shared logic with same SourceMap
     let builder = AnalyzerBuilder::new(config.clone(), cm);
-    let analyzer = builder.build_from_visitors(visitors).await?;
+    let mut analyzer = builder.build_from_visitors(visitors).await?;
+    
+    // 6. Set framework detection data in analyzer
+    analyzer.set_framework_detection(
+        detection_result.frameworks.clone(),
+        detection_result.data_fetchers.clone(),
+    );
 
-    // 6. Extract types for current repo
+    // 7. Extract types for current repo
     extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
 
-    // 7. Build CloudRepoData (AST stripping handled by caller)
+    // 8. Build CloudRepoData (AST stripping handled by caller)
     let cloud_data = CloudRepoData {
         repo_name: repo_name.clone(),
         endpoints: analyzer.endpoints,

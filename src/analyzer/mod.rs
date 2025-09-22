@@ -112,6 +112,8 @@ pub struct Analyzer {
     endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
     source_map: Lrc<SourceMap>,
     all_repo_packages: HashMap<String, Packages>, // repo_name -> packages
+    detected_frameworks: Vec<String>,
+    detected_data_fetchers: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -141,6 +143,8 @@ impl Analyzer {
             endpoint_router: None,
             source_map,
             all_repo_packages: HashMap::new(),
+            detected_frameworks: Vec::new(),
+            detected_data_fetchers: Vec::new(),
         }
     }
 
@@ -150,6 +154,11 @@ impl Analyzer {
 
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
         self.all_repo_packages.insert(repo_name, packages);
+    }
+    
+    pub fn set_framework_detection(&mut self, frameworks: Vec<String>, data_fetchers: Vec<String>) {
+        self.detected_frameworks = frameworks;
+        self.detected_data_fetchers = data_fetchers;
     }
 
     pub fn analyze_dependencies(&self) -> Vec<DependencyConflict> {
@@ -289,8 +298,12 @@ impl Analyzer {
             return;
         }
 
-        // Send to Gemini Flash 2.5 for analysis
-        let gemini_calls = match extract_calls_from_async_expressions(all_async_contexts).await {
+        // Send to Gemini Flash 2.5 for analysis with framework context
+        let gemini_calls = match extract_calls_from_async_expressions(
+            all_async_contexts,
+            &self.detected_frameworks,
+            &self.detected_data_fetchers,
+        ).await {
             Ok(calls) => calls,
             Err(e) => {
                 eprintln!("Failed to extract calls from async expressions: {}", e);

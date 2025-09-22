@@ -118,6 +118,35 @@ impl GeminiService {
 
         Err("Maximum retry attempts exceeded".into())
     }
+    
+    /// Specialized method for analyzing async calls with framework context
+    pub async fn analyze_async_calls_with_context(
+        &self,
+        prompt: &str,
+        system_message: &str,
+        frameworks: &[String],
+        data_fetchers: &[String],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Skip API call in mock mode
+        if env::var("CARRICK_MOCK_ALL").is_ok() {
+            return Ok("[]".to_string());
+        }
+
+        // Build enhanced system message with framework context
+        let context_info = if !data_fetchers.is_empty() {
+            format!(
+                "\n\nFRAMEWORK CONTEXT:\n- HTTP Client Libraries: {}\n- HTTP Frameworks: {}\n\nFocus analysis on these specific libraries when extracting HTTP calls.",
+                data_fetchers.join(", "),
+                frameworks.join(", ")
+            )
+        } else {
+            String::new()
+        };
+        
+        let enhanced_system_message = format!("{}{}", system_message, context_info);
+        
+        self.analyze_code(prompt, &enhanced_system_message).await
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -174,6 +203,8 @@ struct ProxyResponse {
 
 pub async fn extract_calls_from_async_expressions(
     async_calls: Vec<AsyncCallContext>,
+    frameworks: &[String],
+    data_fetchers: &[String],
 ) -> Result<Vec<Call>, Box<dyn std::error::Error>> {
     // If CARRICK_MOCK_ALL is set, bypass the actual API call for testing purposes
     if env::var("CARRICK_MOCK_ALL").is_ok() {
@@ -205,18 +236,30 @@ pub async fn extract_calls_from_async_expressions(
     }
 
     println!(
-        "Found {} async expressions, sending to Gemini Flash 2.5...",
+        "Found {} async expressions, sending to Gemini Flash 2.5 with framework context...",
         async_calls.len()
     );
 
-    // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
-    let api_base = env!("CARRICK_API_ENDPOINT");
-    let proxy_endpoint = format!("{}/gemini/chat", api_base);
-
-    let client = Client::new();
+    // Get API key and create GeminiService
+    let api_key = env::var("CARRICK_API_KEY")
+        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
+    let gemini_service = GeminiService::new(api_key);
+    
     let prompt = create_extraction_prompt(&async_calls);
+    let system_message = create_extraction_system_message();
+    
+    let response = gemini_service.analyze_async_calls_with_context(
+        &prompt,
+        &system_message,
+        frameworks,
+        data_fetchers,
+    ).await?;
+    
+    Ok(parse_gemini_response(&response, &async_calls))
+}
 
-    let system_message = r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
+fn create_extraction_system_message() -> String {
+    r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
 
 CRITICAL REQUIREMENTS:
 1. Extract ONLY HTTP requests (fetch, axios, request libraries) - ignore setTimeout, file I/O, database calls
@@ -279,210 +322,27 @@ URL CONSTRUCTION:
 - Template literals with env vars: `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
 - Complex template literals: `${{BASE_URL}}/api/users/${{id}}` → "ENV_VAR:BASE_URL:/api/users/:id"
 
-NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#;
-
-    let proxy_request = ProxyRequest {
-        messages: vec![
-            ProxyMessage {
-                role: "system".to_string(),
-                content: system_message.to_string(),
-            },
-            ProxyMessage {
-                role: "user".to_string(),
-                content: prompt,
-            },
-        ],
-        options: ProxyOptions {
-            temperature: None,       // Use Gemini defaults
-            max_output_tokens: None, // Use Gemini defaults
-        },
-    };
-
-    let mut request_builder = client
-        .post(&proxy_endpoint)
-        .json(&proxy_request)
-        .timeout(std::time::Duration::from_secs(60));
-
-    // Add API key if available (for authentication with proxy)
-    if let Ok(api_key) = env::var("CARRICK_API_KEY") {
-        request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
-    }
-
-    // Retry logic for transient failures (max 3 attempts)
-    for attempt in 1..=3 {
-        match request_builder.try_clone().unwrap().send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    match response.json::<ProxyResponse>().await {
-                        Ok(proxy_response) => {
-                            if proxy_response.success {
-                                println!(
-                                    "Gemini proxy call successful. Processing {} async expressions.",
-                                    async_calls.len()
-                                );
-                                return Ok(parse_gemini_response(
-                                    &proxy_response.text,
-                                    &async_calls,
-                                ));
-                            } else {
-                                eprintln!("Gemini proxy returned unsuccessful response");
-                                return Ok(vec![]);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to parse proxy response: {}", e);
-                            return Ok(vec![]);
-                        }
-                    }
-                } else {
-                    let status = response.status();
-
-                    // Only retry on 503 Service Unavailable
-                    if status == 503 && attempt < 3 {
-                        let delay_ms = 1000 * attempt; // 1s, 2s delays
-                        eprintln!(
-                            "Gemini API returned 503, retrying in {}ms (attempt {}/3)",
-                            delay_ms, attempt
-                        );
-                        sleep(Duration::from_millis(delay_ms)).await;
-                        continue;
-                    }
-
-                    match response.text().await {
-                        Ok(error_text) => {
-                            eprintln!(
-                                "Gemini proxy call failed with status {}: {}",
-                                status, error_text
-                            );
-                            if status == 429 {
-                                eprintln!(
-                                    "Rate limit exceeded. Consider deploying your own proxy or try again later."
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            eprintln!("Gemini proxy call failed with status {}", status);
-                        }
-                    }
-                    return Ok(vec![]);
-                }
-            }
-            Err(e) => {
-                // Only retry network errors on first 2 attempts
-                if attempt < 3 {
-                    let delay_ms = 1000 * attempt;
-                    eprintln!(
-                        "Gemini proxy call failed: {}, retrying in {}ms (attempt {}/3)",
-                        e, delay_ms, attempt
-                    );
-                    sleep(Duration::from_millis(delay_ms)).await;
-                    continue;
-                }
-
-                eprintln!("Gemini proxy call failed: {}", e);
-                eprintln!("Continuing analysis without AI-extracted calls...");
-                return Ok(vec![]);
-            }
-        }
-    }
-
-    // Should never reach here, but just in case
-    Ok(vec![])
+NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
 }
 
 fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
-    let calls_json = serde_json::to_string_pretty(async_calls).unwrap_or_default();
-
-    format!(
-        r#"Extract HTTP API calls from these JavaScript/TypeScript functions. Return ONLY a JSON array.
-
-IMPORTANT: When analyzing outgoing HTTP calls (fetch, axios, etc.) inside Express route handlers:
-- For the response type:
-   - Extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
-
-   CRITICAL:
-   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
-   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
-   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
-
-   BAD EXAMPLE:
-     const raw: Foo[] = await resp.json();
-     const filtered: Foo[] = filter(raw);
-     // Only extract Foo[], not both.
-
-   BAD EXAMPLE:
-     const a: Bar[] = await resp.json();
-     const b: Bar[] = a.filter(...);
-     // Only extract Bar[], not both.
-
-   GOOD EXAMPLE:
-     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
-     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
-     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
-- For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
-- NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
-
-FUNCTIONS TO ANALYZE:
-{}
-
-EXTRACTION RULES:
-1. Find HTTP calls: fetch(), axios.get/post/put/delete(), request(), etc.
-2. Ignore: setTimeout, file operations, database calls, console.log
-3. Extract exact route, method, request body
-4. Extract TypeScript type annotations from function parameters and return types
-
-TYPE EXTRACTION RULES:
-- Look for function parameter types: (req: RequestType) → extract "RequestType"
-- Look for return type annotations: ): Promise<ResponseType> → extract "ResponseType"
-- Look for response variable types: const result: UserData = await...
-- Calculate character position by counting from start of function
-- Generate aliases: GET /users → "GetUsersResponse", POST /users → "PostUsersRequest"
-
-ENVIRONMENT VARIABLE FORMAT:
-- process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
-- process.env.BASE + "/api" + path → "ENV_VAR:BASE:/api" + path
-- `${{process.env.SERVICE}}/endpoint` → "ENV_VAR:SERVICE:/endpoint"
-- `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
-- `${{USER_SERVICE_URL}}/api/users/${{userId}}` → "ENV_VAR:USER_SERVICE_URL:/api/users/:id"
-- CONSTANT_VAR + "/path" → "ENV_VAR:CONSTANT_VAR:/path"
-
-TEMPLATE LITERALS:
-- `/users/${{id}}` → "/users/:id"
-- `/users/${{userId}}` → "/users/:id"
-- `/api/users/${{userId}}` → "/api/users/:id" (PRESERVE /api prefix)
-- `/orders/${{orderId}}` → "/orders/:id"
-- `/api/comments?userId=${{userId}}` → "/api/comments"
-- `${{base}}/users/${{id}}` → "ENV_VAR:base:/users/:id"
-- `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
-
-STRING CONCATENATION:
-- "/api" + "/users" → "/api/users"
-- path + "/" + id → path + "/${{id}}"
-
-EXAMPLES:
-```
-async function getUsers(req: GetUsersRequest): Promise<GetUsersResponse> {{{{
-  return fetch(process.env.API_URL + "/users")
-}}}}
-// → {{{{"route":"ENV_VAR:API_URL:/users","method":"GET","request_body":null,"has_response_type":true,"request_type_info":{{{{"file_path":"example.ts","start_position":25,"composite_type_string":"GetUsersRequest","alias":"GetUsersRequest"}}}}, "response_type_info":{{{{"file_path":"example.ts","start_position":50,"composite_type_string":"GetUsersResponse","alias":"GetUsersResponse"}}}}}}}}
-
-const response = await axios.get(`${{{{BASE_URL}}}}/path/to/endpoint`)
-// → {{{{"route":"ENV_VAR:BASE_URL:/path/to/endpoint","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
-
-const item = await axios.get(`${{{{SERVICE_URL}}}}/nested/path/items/${{{{itemId}}}}`)
-// → {{{{"route":"ENV_VAR:SERVICE_URL:/nested/path/items/:id","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
-
-fetch(`/users/${{{{userId}}}}/comments`)
-// → {{{{"route":"/users/:id/comments","method":"GET","request_body":null,"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
-
-axios.post("/path/to/resource", userData)
-// → {{{{"route":"/path/to/resource","method":"POST","request_body":{{{{"userData":"placeholder"}}}},"has_response_type":false,"request_type_info":null,"response_type_info":null}}}}
-```
-
-OUTPUT JSON ARRAY ONLY:"#,
-        calls_json
-    )
+    let mut prompt = String::from("Extract HTTP calls from these async JavaScript/TypeScript functions:\n\n");
+    
+    for (i, call) in async_calls.iter().enumerate() {
+        prompt.push_str(&format!(
+            "## Function {} ({}:{})\n```{}\n{}\n```\n\n",
+            i + 1,
+            call.file,
+            call.line,
+            call.kind,
+            call.function_source
+        ));
+    }
+    
+    prompt
 }
+
+
 
 fn convert_gemini_responses_to_calls(
     gemini_calls: Vec<GeminiCallResponse>,
