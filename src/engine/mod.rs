@@ -2,8 +2,7 @@ use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
-use crate::framework_detector::FrameworkDetector;
-use crate::gemini_service::GeminiService;
+use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::utils::{get_repository_name, resolve_import_path};
@@ -302,77 +301,158 @@ async fn analyze_current_repo(
     repo_path: &str,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     println!(
-        "---> Analyzing JavaScript/TypeScript files in: {}",
+        "---> Running multi-agent framework-agnostic analysis on: {}",
         repo_path
     );
 
-    // 1. Create shared SourceMap for consistent byte position tracking
+    // 1. Create shared SourceMap and discover/parse files using existing logic
     let cm: Lrc<SourceMap> = Default::default();
-
-    // 2. Discover and parse files using shared SourceMap
     let (visitors, repo_name) = discover_and_parse_files(repo_path, cm.clone())?;
     println!("Extracted repository name: '{}'", repo_name);
 
-    // 3. Load config and packages
+    // 2. Load config and packages using existing logic
     let (config, packages) = load_config_and_packages(repo_path)?;
     
-    // 4. Run framework detection
-    let api_key = env::var("CARRICK_API_KEY")
-        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
-    let gemini_service = GeminiService::new(api_key);
-    let detector = FrameworkDetector::new(gemini_service);
-    
+    // 3. Extract imported symbols from visitors for framework detection
     let mut all_imported_symbols = HashMap::new();
     for visitor in &visitors {
         all_imported_symbols.extend(visitor.imported_symbols.clone());
     }
+    println!("Extracted {} imported symbols from visitors", all_imported_symbols.len());
+
+    // 4. Extract file paths from visitors for call site extraction
+    let files: Vec<std::path::PathBuf> = visitors.iter()
+        .map(|v| v.current_file.clone())
+        .collect();
+
+    // 5. Initialize multi-agent orchestrator and run complete analysis
+    let api_key = env::var("CARRICK_API_KEY")
+        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
+    let orchestrator = MultiAgentOrchestrator::new(api_key, cm.clone());
     
-    let detection_result = detector.detect_frameworks_and_libraries(&packages, &all_imported_symbols).await
-        .unwrap_or_else(|e| {
-            println!("Framework detection failed: {}", e);
-            crate::framework_detector::DetectionResult {
-                frameworks: vec![],
-                data_fetchers: vec![],
-                notes: format!("Detection failed: {}", e),
+    let analysis_result = orchestrator
+        .run_complete_analysis(files, &packages, &all_imported_symbols)
+        .await?;
+
+    // 6. Convert multi-agent results to CloudRepoData format
+    let cloud_data = convert_analysis_to_cloud_data(
+        analysis_result,
+        repo_name,
+        config,
+        packages,
+    )?;
+
+    Ok(cloud_data)
+}
+
+/// Convert multi-agent analysis results to CloudRepoData format
+fn convert_analysis_to_cloud_data(
+    analysis: crate::multi_agent_orchestrator::MultiAgentAnalysisResult,
+    repo_name: String,
+    config: Config,
+    packages: Packages,
+) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+    let mount_graph = &analysis.mount_graph;
+    
+    // Convert resolved endpoints to ApiEndpointDetails
+    let endpoints: Vec<ApiEndpointDetails> = mount_graph
+        .get_resolved_endpoints()
+        .iter()
+        .map(|endpoint| {
+            ApiEndpointDetails {
+                owner: Some(crate::visitor::OwnerType::App(endpoint.owner.clone())),
+                route: endpoint.full_path.clone(), // Use full resolved path as the route
+                method: endpoint.method.clone(),
+                params: Vec::new(), // Could extract parameters from the path
+                request_body: None, // Could be enhanced with actual request analysis
+                response_body: None, // Could be enhanced with actual response analysis
+                handler_name: endpoint.handler.clone(),
+                request_type: None,  // AST types will be stripped anyway
+                response_type: None, // AST types will be stripped anyway
+                file_path: endpoint.file_location.clone().into(),
             }
-        });
+        })
+        .collect();
     
-    println!("Detected frameworks: {:?}", detection_result.frameworks);
-    println!("Detected data fetchers: {:?}", detection_result.data_fetchers);
-    if !detection_result.notes.is_empty() {
-        println!("Notes: {}", detection_result.notes);
+    // Convert data calls to ApiEndpointDetails (as consumers)
+    let calls: Vec<ApiEndpointDetails> = mount_graph
+        .get_data_calls()
+        .iter()
+        .map(|call| {
+            ApiEndpointDetails {
+                owner: None, // Calls don't have owners in the same sense as endpoints
+                route: call.target_url.clone(), // Use the target URL as the route
+                method: call.method.clone(),
+                params: Vec::new(), // Could extract parameters from the URL
+                request_body: None, // Could be enhanced with actual request analysis
+                response_body: None, // Could be enhanced with actual response analysis
+                handler_name: Some(call.client.clone()), // Client library used for the call
+                request_type: None,  // AST types will be stripped anyway
+                response_type: None, // AST types will be stripped anyway
+                file_path: call.file_location.clone().into(),
+            }
+        })
+        .collect();
+    
+    // Convert mount graph to legacy mount format
+    let mounts: Vec<crate::visitor::Mount> = mount_graph
+        .get_mounts()
+        .iter()
+        .map(|mount| {
+            crate::visitor::Mount {
+                parent: crate::visitor::OwnerType::App(mount.parent.clone()),
+                child: crate::visitor::OwnerType::Router(mount.child.clone()),
+                prefix: mount.path_prefix.clone(),
+            }
+        })
+        .collect();
+    
+    // Create apps from mount graph nodes - CloudRepoData expects HashMap<String, AppContext>
+    let mut apps = HashMap::new();
+    // Create a map of node IDs to file paths from the endpoints and calls
+    let mut node_file_paths = HashMap::new();
+    
+    // Collect file paths from endpoints
+    for endpoint in mount_graph.get_resolved_endpoints() {
+        node_file_paths.insert(endpoint.owner.clone(), endpoint.file_location.clone());
     }
-
-    // 5. Build analyzer using shared logic with same SourceMap
-    let builder = AnalyzerBuilder::new(config.clone(), cm);
-    let mut analyzer = builder.build_from_visitors(visitors).await?;
     
-    // 6. Set framework detection data in analyzer
-    analyzer.set_framework_detection(
-        detection_result.frameworks.clone(),
-        detection_result.data_fetchers.clone(),
-    );
-
-    // 7. Extract types for current repo
-    extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
-
-    // 8. Build CloudRepoData (AST stripping handled by caller)
-    let cloud_data = CloudRepoData {
-        repo_name: repo_name.clone(),
-        endpoints: analyzer.endpoints,
-        calls: analyzer.calls,
-        mounts: analyzer.mounts,
-        apps: analyzer.apps,
-        imported_handlers: analyzer.imported_handlers,
-        function_definitions: analyzer.function_definitions,
+    // Add app contexts for all app nodes
+    for (node_id, node) in mount_graph.get_nodes() {
+        if matches!(node.node_type, crate::mount_graph::NodeType::App) {
+            // Use the file path if we have it, otherwise use "unknown"
+            let _file_path = node_file_paths.get(node_id).cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            
+            // Create AppContext with the available information
+            let app_context = crate::app_context::AppContext {
+                name: node_id.clone(),
+            };
+            
+            apps.insert(node_id.clone(), app_context);
+        }
+    }
+    
+    println!("Converted to CloudRepoData:");
+    println!("  - {} endpoints (producers)", endpoints.len());
+    println!("  - {} calls (consumers)", calls.len());
+    println!("  - {} mounts", mounts.len());
+    println!("  - {} apps", apps.len());
+    
+    Ok(CloudRepoData {
+        repo_name,
+        endpoints,
+        calls,
+        mounts,
+        apps,
+        imported_handlers: Vec::new(), // Legacy field - could be populated from classified sites
+        function_definitions: HashMap::new(), // Legacy field - matches expected type
         config_json: serde_json::to_string(&config).ok(),
         package_json: serde_json::to_string(&packages).ok(),
         packages: Some(packages),
         last_updated: Utc::now(),
         commit_hash: get_current_commit_hash(),
-    };
-
-    Ok(cloud_data)
+    })
 }
 
 fn extract_types_for_current_repo(

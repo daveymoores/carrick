@@ -10,6 +10,8 @@ mod file_finder;
 mod formatter;
 mod framework_detector;
 mod gemini_service;
+mod mount_graph;
+mod multi_agent_orchestrator;
 mod packages;
 mod parser;
 mod router_context;
