@@ -10,6 +10,8 @@ pub mod file_finder;
 pub mod formatter;
 pub mod framework_detector;
 pub mod gemini_service;
+pub mod mount_graph;
+pub mod multi_agent_orchestrator;
 pub mod packages;
 pub mod parser;
 pub mod router_context;

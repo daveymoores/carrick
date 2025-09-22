@@ -1,0 +1,215 @@
+use crate::{
+    call_site_classifier::{CallSiteClassifier, ClassifiedCallSite},
+    call_site_extractor::{CallSiteExtractor, CallSiteExtractionService},
+    framework_detector::{DetectionResult, FrameworkDetector},
+    gemini_service::GeminiService,
+    mount_graph::MountGraph,
+    packages::Packages,
+    parser::parse_file,
+    visitor::ImportedSymbol,
+};
+use std::collections::HashMap;
+use swc_common::{errors::{ColorConfig, Handler}, sync::Lrc, SourceMap};
+
+/// Complete analysis result from the multi-agent workflow
+#[derive(Debug)]
+pub struct MultiAgentAnalysisResult {
+    pub framework_detection: DetectionResult,
+    pub mount_graph: MountGraph,
+    pub classified_call_sites: Vec<ClassifiedCallSite>,
+}
+
+/// Orchestrates the complete multi-agent workflow
+pub struct MultiAgentOrchestrator {
+    gemini_service: GeminiService,
+    source_map: Lrc<SourceMap>,
+}
+
+impl MultiAgentOrchestrator {
+    pub fn new(api_key: String, source_map: Lrc<SourceMap>) -> Self {
+        Self {
+            gemini_service: GeminiService::new(api_key),
+            source_map,
+        }
+    }
+
+    /// Run the complete multi-agent analysis workflow
+    pub async fn run_complete_analysis(
+        &self,
+        files: Vec<std::path::PathBuf>,
+        packages: &Packages,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+    ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
+        println!("Starting multi-agent framework-agnostic analysis...");
+
+        // Stage 0: Framework Detection
+        println!("Stage 0: Framework Detection");
+        let framework_detector = FrameworkDetector::new(self.gemini_service.clone());
+        let framework_detection = framework_detector
+            .detect_frameworks_and_libraries(packages, imported_symbols)
+            .await?;
+        
+        println!("Detected frameworks: {:?}", framework_detection.frameworks);
+        println!("Detected data fetchers: {:?}", framework_detection.data_fetchers);
+
+        // Stage 1: Call Site Extraction
+        println!("Stage 1: Call Site Extraction");
+        let call_sites = self.extract_all_call_sites(&files).await?;
+        println!("Extracted {} call sites", call_sites.len());
+
+        // Stage 2: Call Site Classification
+        println!("Stage 2: Call Site Classification");
+        let classifier = CallSiteClassifier::new(self.gemini_service.clone());
+        let classified_sites = classifier
+            .classify_call_sites(&call_sites, &framework_detection)
+            .await?;
+        
+        println!("Classified {} call sites", classified_sites.len());
+        self.print_classification_summary(&classified_sites);
+
+        // Stage 3: Mount Graph Construction
+        println!("Stage 3: Mount Graph Construction");
+        let mount_graph = MountGraph::build_from_classified_sites(classified_sites.clone());
+        
+        println!("Built mount graph:");
+        println!("  - {} nodes", mount_graph.get_nodes().len());
+        println!("  - {} mounts", mount_graph.get_mounts().len());
+        println!("  - {} endpoints", mount_graph.get_resolved_endpoints().len());
+        println!("  - {} data calls", mount_graph.get_data_calls().len());
+
+        Ok(MultiAgentAnalysisResult {
+            framework_detection,
+            mount_graph,
+            classified_call_sites: classified_sites,
+        })
+    }
+
+    /// Extract call sites from all files using framework-agnostic approach
+    async fn extract_all_call_sites(
+        &self,
+        files: &[std::path::PathBuf],
+    ) -> Result<Vec<crate::call_site_extractor::CallSite>, Box<dyn std::error::Error>> {
+        let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(self.source_map.clone()));
+        let mut extraction_service = CallSiteExtractionService::new();
+        let mut extractors = Vec::new();
+
+        for file_path in files {
+            if let Some(module) = parse_file(file_path, &self.source_map, &handler) {
+                let mut extractor = CallSiteExtractor::new(file_path.clone(), self.source_map.clone());
+                swc_ecma_visit::VisitWith::visit_with(&module, &mut extractor);
+                extractors.push(extractor);
+            }
+        }
+
+        extraction_service.extract_from_visitors(extractors);
+        Ok(extraction_service.get_call_sites().to_vec())
+    }
+
+    fn print_classification_summary(&self, classified_sites: &[ClassifiedCallSite]) {
+        let mut counts = HashMap::new();
+        for site in classified_sites {
+            *counts.entry(format!("{:?}", site.classification)).or_insert(0) += 1;
+        }
+
+        for (classification, count) in counts {
+            println!("  - {}: {}", classification, count);
+        }
+    }
+
+    /// Get framework-aware endpoint analysis for comparison with existing system
+    pub fn get_endpoint_analysis(&self, result: &MultiAgentAnalysisResult) -> EndpointAnalysis {
+        let mount_graph = &result.mount_graph;
+        
+        EndpointAnalysis {
+            producers: mount_graph.get_resolved_endpoints().to_vec(),
+            consumers: mount_graph.get_data_calls().to_vec(),
+            mount_relationships: mount_graph.get_mounts().to_vec(),
+        }
+    }
+}
+
+/// Analysis result in a format compatible with existing systems
+#[derive(Debug)]
+pub struct EndpointAnalysis {
+    pub producers: Vec<crate::mount_graph::ResolvedEndpoint>,
+    pub consumers: Vec<crate::mount_graph::DataFetchingCall>,
+    pub mount_relationships: Vec<crate::mount_graph::MountEdge>,
+}
+
+impl EndpointAnalysis {
+    /// Find potential API mismatches by comparing producers and consumers
+    pub fn find_potential_mismatches(&self) -> Vec<PotentialMismatch> {
+        let mut mismatches = Vec::new();
+        
+        for consumer in &self.consumers {
+            let matching_producers: Vec<_> = self.producers.iter()
+                .filter(|producer| {
+                    producer.method.eq_ignore_ascii_case(&consumer.method) &&
+                    self.urls_could_match(&producer.full_path, &consumer.target_url)
+                })
+                .collect();
+            
+            if matching_producers.is_empty() {
+                mismatches.push(PotentialMismatch {
+                    consumer_call: consumer.clone(),
+                    issue: MismatchType::MissingEndpoint,
+                    details: format!("No producer found for {} {}", consumer.method, consumer.target_url),
+                });
+            }
+        }
+        
+        // Find orphaned endpoints
+        for producer in &self.producers {
+            let has_consumers = self.consumers.iter()
+                .any(|consumer| {
+                    consumer.method.eq_ignore_ascii_case(&producer.method) &&
+                    self.urls_could_match(&producer.full_path, &consumer.target_url)
+                });
+            
+            if !has_consumers {
+                mismatches.push(PotentialMismatch {
+                    consumer_call: crate::mount_graph::DataFetchingCall {
+                        method: producer.method.clone(),
+                        target_url: producer.full_path.clone(),
+                        client: "none".to_string(),
+                        file_location: "orphaned".to_string(),
+                    },
+                    issue: MismatchType::OrphanedEndpoint,
+                    details: format!("Endpoint {} {} has no consumers", producer.method, producer.full_path),
+                });
+            }
+        }
+        
+        mismatches
+    }
+    
+    fn urls_could_match(&self, endpoint_path: &str, call_url: &str) -> bool {
+        // Simple heuristic - could be enhanced
+        if call_url.starts_with("http") {
+            // Extract path from full URL
+            if let Some(url_path) = call_url.split('/')
+                .skip(3) // Skip protocol and domain
+                .collect::<Vec<_>>()
+                .first() {
+                return endpoint_path.contains(url_path);
+            }
+        }
+        
+        endpoint_path == call_url || call_url.contains(endpoint_path)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PotentialMismatch {
+    pub consumer_call: crate::mount_graph::DataFetchingCall,
+    pub issue: MismatchType,
+    pub details: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum MismatchType {
+    MissingEndpoint,
+    OrphanedEndpoint,
+    MethodMismatch,
+    PathMismatch,
+}
