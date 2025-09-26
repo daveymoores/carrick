@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Classification result for a call site
+/// Classification result for a call site with detailed extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifiedCallSite {
     #[serde(flatten)]
@@ -13,6 +13,20 @@ pub struct ClassifiedCallSite {
     pub classification: CallSiteType,
     pub confidence: f32,
     pub reasoning: String,
+    // Mount information (for RouterMounts)
+    pub mount_parent: Option<String>,
+    pub mount_child: Option<String>,
+    pub mount_prefix: Option<String>,
+    // Handler information (for HttpEndpoint or Middleware)
+    pub handler_name: Option<String>,
+    pub handler_args: Vec<HandlerArgument>,
+}
+
+/// Handler argument information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandlerArgument {
+    pub name: String,
+    pub arg_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +82,8 @@ CRITICAL REQUIREMENTS:
 2. Consider callee_object, callee_property, args, and definition together
 3. Return ONLY valid JSON array starting with [ and ending with ]
 4. Each object must have: call_site (original data), classification, confidence (0.0-1.0), reasoning
+5. For RouterMount: extract mount_parent, mount_child, mount_prefix
+6. For HttpEndpoint/Middleware: extract handler_name and handler_args with types
 
 ANALYSIS APPROACH:
 - Look at the detected frameworks to understand which routing/server libraries are in use
@@ -107,10 +123,21 @@ Return JSON array with this structure:
     "call_site": {{ /* original call site data */ }},
     "classification": "RouterMount|Middleware|HttpEndpoint|DataFetchingCall|GraphQLCall|Irrelevant",
     "confidence": 0.95,
-    "reasoning": "Brief explanation based on framework knowledge"
+    "reasoning": "Brief explanation based on framework knowledge",
+    "mount_parent": "parent_object_name or null",
+    "mount_child": "child_object_name or null", 
+    "mount_prefix": "path_prefix or null",
+    "handler_name": "handler_function_name or null",
+    "handler_args": [{{"name": "req", "arg_type": "Request"}}, {{"name": "res", "arg_type": "Response"}}]
   }},
   ...
-]"#,
+]
+
+EXTRACTION GUIDELINES:
+- For RouterMount: extract mount_parent (caller object), mount_child (mounted object), mount_prefix (path)
+- For HttpEndpoint/Middleware: extract handler_name and analyze function arguments for type info
+- Use TypeScript annotations when available, infer common patterns (req/res, request/reply, ctx, next)
+- Set fields to null when not applicable for the classification type"#,
             frameworks_json, call_sites_json
         )
     }

@@ -129,41 +129,21 @@ impl MountGraph {
     }
 
     fn extract_mount_relationship(&self, site: &ClassifiedCallSite) -> Option<MountEdge> {
-        let parent = site.call_site.callee_object.clone();
+        // Use LLM-extracted mount information instead of heuristic parsing
+        let parent = site.mount_parent.as_ref()?;
+        let child = site.mount_child.as_ref()?;
+        let path_prefix = site.mount_prefix.as_ref().unwrap_or(&"/".to_string()).clone();
         
-        // Extract path prefix and child router from arguments
-        let mut path_prefix = "/".to_string();
-        let mut child_router = None;
-        let mut middleware_stack = Vec::new();
+        // TODO: Extract middleware stack from arguments if needed
+        // For now, use empty middleware stack since LLM doesn't extract this yet
+        let middleware_stack = Vec::new();
         
-        for (i, arg) in site.call_site.args.iter().enumerate() {
-            match (&arg.arg_type, &arg.value) {
-                (crate::call_site_extractor::ArgumentType::StringLiteral, Some(path)) => {
-                    if i == 0 {
-                        path_prefix = path.clone();
-                    }
-                }
-                (crate::call_site_extractor::ArgumentType::Identifier, Some(identifier)) => {
-                    if child_router.is_none() {
-                        child_router = Some(identifier.clone());
-                    } else {
-                        middleware_stack.push(identifier.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        
-        if let Some(child) = child_router {
-            Some(MountEdge {
-                parent,
-                child,
-                path_prefix,
-                middleware_stack,
-            })
-        } else {
-            None
-        }
+        Some(MountEdge {
+            parent: parent.clone(),
+            child: child.clone(),
+            path_prefix,
+            middleware_stack,
+        })
     }
 
     fn collect_endpoints(&mut self, classified_sites: &[ClassifiedCallSite]) {
@@ -180,7 +160,7 @@ impl MountGraph {
         let method = site.call_site.callee_property.to_uppercase();
         let owner = site.call_site.callee_object.clone();
         
-        // Extract path from first string argument
+        // Extract path from first string argument (fallback to heuristic if needed)
         let path = site.call_site.args.iter()
             .find_map(|arg| {
                 if matches!(arg.arg_type, crate::call_site_extractor::ArgumentType::StringLiteral) {
@@ -191,27 +171,17 @@ impl MountGraph {
             })
             .unwrap_or_else(|| "/".to_string());
         
-        // Extract handler from function arguments
-        let handler = site.call_site.args.iter()
-            .find_map(|arg| {
-                if matches!(arg.arg_type, 
-                    crate::call_site_extractor::ArgumentType::FunctionExpression | 
-                    crate::call_site_extractor::ArgumentType::ArrowFunction |
-                    crate::call_site_extractor::ArgumentType::Identifier) {
-                    Some("handler".to_string()) // Placeholder - could be enhanced
-                } else {
-                    None
-                }
-            });
+        // Use LLM-extracted handler name instead of placeholder
+        let handler = site.handler_name.clone();
 
         Some(ResolvedEndpoint {
             method,
             path: path.clone(),
-            full_path: path, // Will be resolved later
+            full_path: path, // Will be resolved later by resolve_endpoint_paths()
             handler,
             owner,
             file_location: site.call_site.location.clone(),
-            middleware_chain: Vec::new(),
+            middleware_chain: Vec::new(), // TODO: Could extract from handler_args if needed
         })
     }
 
