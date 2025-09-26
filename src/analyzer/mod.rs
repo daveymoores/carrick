@@ -238,7 +238,7 @@ impl Analyzer {
 
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
         self.mounts.extend(visitor.mounts);
-        self.apps.extend(visitor.express_apps);
+        // Note: App context will be populated via framework detection instead of visitor
 
         for endpoint in visitor.endpoints {
             let params = self.extract_params_from_route(&endpoint.route);

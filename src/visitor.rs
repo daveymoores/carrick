@@ -3,8 +3,7 @@ extern crate swc_ecma_parser;
 use derivative::Derivative;
 
 use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
+    collections::HashMap,
     path::PathBuf,
 };
 use swc_common::{SourceMap, sync::Lrc};
@@ -12,9 +11,7 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::{
-    app_context::AppContext,
     extractor::{CoreExtractor, RouteExtractor},
-    router_context::RouterContext,
 };
 extern crate regex;
 
@@ -173,14 +170,7 @@ pub struct DependencyVisitor {
     // Store local function definitions found in this file, which may be
     // referenced from other files via imports
     pub function_definitions: HashMap<String, FunctionDefinition>,
-    pub router_imports: HashSet<String>,
     pub imported_router_name: Option<String>,
-    pub has_express_import: bool,
-    pub express_import_name: Option<String>, // The local name for the express import
-    // Track Express app instances
-    pub express_apps: HashMap<String, AppContext>, // app_name -> AppContext
-    // Track routers with their full context
-    pub routers: HashMap<String, RouterContext>, // router_name -> RouterContext
     pub exported_variables: HashMap<String, Expr>,
     pub imported_symbols: HashMap<String, ImportedSymbol>,
     pub variable_values: HashMap<String, Expr>,
@@ -204,12 +194,7 @@ impl DependencyVisitor {
             current_file: file_path,
             imported_handlers: Vec::new(),
             function_definitions: HashMap::new(),
-            router_imports: HashSet::new(),
             imported_router_name,
-            routers: HashMap::new(),
-            express_import_name: None,
-            express_apps: HashMap::new(),
-            has_express_import: false,
             exported_variables: HashMap::new(),
             imported_symbols: HashMap::new(),
             variable_values: HashMap::new(),
@@ -443,34 +428,6 @@ impl Visit for DependencyVisitor {
     fn visit_import_decl(&mut self, import: &ImportDecl) {
         let source = import.src.value.to_string();
 
-        // Check if the import is from 'express'
-        if source == "express" {
-            self.has_express_import = true;
-
-            // Track the local name for the express import
-            for specifier in &import.specifiers {
-                match specifier {
-                    ImportSpecifier::Default(default) => {
-                        // express is typically imported as default: import express from 'express'
-                        let local_name = default.local.sym.to_string();
-                        self.express_import_name = Some(local_name);
-                    }
-                    ImportSpecifier::Named(named) => {
-                        // Sometimes specific things are imported from express like: import { Router } from 'express'
-                        let local_name = named.local.sym.to_string();
-                        if local_name == "Router" {
-                            self.router_imports.insert(local_name);
-                        }
-                    }
-                    ImportSpecifier::Namespace(namespace) => {
-                        // Handle namespace imports: import * as expressLib from 'express'
-                        let local_name = namespace.local.sym.to_string();
-                        self.express_import_name = Some(local_name);
-                    }
-                }
-            }
-        }
-
         for specifier in &import.specifiers {
             match specifier {
                 ImportSpecifier::Named(named) => {
@@ -565,60 +522,10 @@ impl Visit for DependencyVisitor {
                             self.response_fields.insert(var_name.clone(), fields);
                         }
 
-                        // Call expression (could be a router/app creation or other call)
+                        // Call expression (could contain callback functions)
                         Expr::Call(call_expr) => {
-                            // Your existing router and express app detection logic
-                            let var_name_str = var_name.as_str();
-
-                            // Check if this is a router creation
-                            if self.is_router_creation(call_expr) {
-                                // If this is the 'router' variable and we have an imported name,
-                                // use the imported name instead
-                                let router_name = if var_name_str == "router"
-                                    && self.imported_router_name.is_some()
-                                {
-                                    self.imported_router_name.as_ref().unwrap().as_str()
-                                } else {
-                                    var_name_str
-                                };
-
-                                let prefixed_router_name = self.prefix_owner_type(router_name);
-
-                                // Add the router to the `routers` map with an initial context
-                                self.routers.insert(
-                                    prefixed_router_name.clone(),
-                                    RouterContext {
-                                        name: prefixed_router_name.clone(),
-                                    },
-                                );
-
-                                if router_name != var_name_str {
-                                    println!(
-                                        "Detected Router: {} (imported as: {})",
-                                        var_name_str, router_name
-                                    );
-                                } else {
-                                    println!("Detected Router: {}", var_name_str);
-                                }
-                            }
-                            // Check if this is an express app creation
-                            else if let Some(express_name) = &self.express_import_name {
-                                if self.is_express_app_creation(call_expr, express_name) {
-                                    let express_app_name = self.prefix_owner_type(var_name_str);
-                                    // Add to express_apps map
-                                    self.express_apps.insert(
-                                        express_app_name.to_owned(),
-                                        AppContext {
-                                            name: express_app_name,
-                                        },
-                                    );
-
-                                    println!("Detected Express app: {}", var_name_str);
-                                }
-                            }
-
-                            // Check if the call contains callback functions
-                            self.extract_callbacks_from_call(call_expr, &var_name);
+                            // Extract any function definitions from this call
+                            self.extract_functions_from_call_args(call_expr);
                         }
 
                         // Other expression types don't need special handling for function detection
@@ -633,35 +540,10 @@ impl Visit for DependencyVisitor {
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
-        // Check the callee (what's being called)
-        if let Callee::Expr(callee_expr) = &call.callee {
-            if let Expr::Member(member) = &**callee_expr {
-                // Check if the object is a known router or app
-                if let Expr::Ident(obj_ident) = &*member.obj {
-                    // object identifier being the app in app.get
-                    let var_name = self.prefix_owner_type(obj_ident.sym.as_str());
-
-                    // Check if the method is a valid HTTP method (GET, POST, etc.)
-                    if let Some(http_method) = self.is_express_route_method(member) {
-                        // Process route handler for this router/app
-                        self.process_route_handler(&var_name, &http_method, call);
-                    }
-                    // Check for .use() method for mounting routers or middleware
-                    else if self.is_use_method(member) {
-                        // Check if this is an app or router
-                        if self.express_apps.contains_key(&var_name) {
-                            // This is an app.use() call
-                            self.process_app_use(&var_name, &call.args);
-                        } else {
-                            // This is a router.use() call
-                            self.process_router_use(&var_name, &call.args);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Continue visiting children
+        // Extract all function definitions from arguments (including anonymous functions)
+        self.extract_functions_from_call_args(call);
+        
+        // Continue visiting children to catch nested calls
         call.visit_children_with(self);
     }
 }
@@ -693,31 +575,62 @@ impl DependencyVisitor {
             .collect()
     }
 
-    // New helper method to extract callbacks from call expressions
-    fn extract_callbacks_from_call(&mut self, call: &CallExpr, context_name: &str) {
-        // Check if this is a routing method call like app.get('/route', function...)
-        if let Callee::Expr(callee_expr) = &call.callee {
-            if let Expr::Member(member) = &**callee_expr {
-                // Check if the method could be a route handler (get, post, etc.)
-                if let MemberProp::Ident(method_ident) = &member.prop {
-                    let method_name = method_ident.sym.to_string().to_lowercase();
-
-                    if ["get", "post", "put", "delete", "patch"].contains(&method_name.as_str()) {
-                        // This is likely a route definition, check for callback in the second arg
-                        if call.args.len() >= 2 {
-                            self.extract_function_from_arg(
-                                &call.args[1].expr,
-                                &format!("{}_{}_callback", context_name, method_name),
-                            );
-                        }
+    // Extract all function definitions from call arguments (framework-agnostic)
+    fn extract_functions_from_call_args(&mut self, call: &CallExpr) {
+        // Generate a unique context name for this call site
+        let call_context = self.generate_call_context_name(call);
+        
+        // Check each argument for function expressions (callbacks, handlers, etc.)
+        for (i, arg) in call.args.iter().enumerate() {
+            self.extract_function_from_arg(&arg.expr, &format!("{}_{}", call_context, i));
+        }
+    }
+    
+    // Generate a context name for a call site based on its location and structure
+    fn generate_call_context_name(&self, call: &CallExpr) -> String {
+        match &call.callee {
+            Callee::Expr(callee_expr) => {
+                match &**callee_expr {
+                    Expr::Member(member) => {
+                        // For member calls like obj.method(), use obj_method format
+                        let obj_name = self.extract_object_name(&member.obj).unwrap_or("unknown".to_string());
+                        let method_name = self.extract_property_name(&member.prop).unwrap_or("unknown".to_string());
+                        format!("{}_{}", obj_name, method_name)
                     }
+                    Expr::Ident(ident) => {
+                        // For direct function calls like func(), use the function name
+                        ident.sym.to_string()
+                    }
+                    _ => "unknown_call".to_string(),
                 }
             }
+            _ => "unknown_call".to_string(),
         }
-
-        // Check each argument for function expressions (callbacks)
-        for (i, arg) in call.args.iter().enumerate() {
-            self.extract_function_from_arg(&arg.expr, &format!("{}_{}", context_name, i));
+    }
+    
+    // Extract object name from an expression
+    fn extract_object_name(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(ident) => Some(ident.sym.to_string()),
+            Expr::Member(member) => {
+                // For nested member access like app.router.use, get the full path
+                let obj = self.extract_object_name(&member.obj).unwrap_or("unknown".to_string());
+                let prop = self.extract_property_name(&member.prop).unwrap_or("unknown".to_string());
+                Some(format!("{}.{}", obj, prop))
+            }
+            _ => None,
+        }
+    }
+    
+    // Extract property name from a member property
+    fn extract_property_name(&self, prop: &MemberProp) -> Option<String> {
+        match prop {
+            MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+            MemberProp::Computed(computed) => {
+                // For computed properties like obj["method"], try to extract the string
+                self.extract_string_from_expr(&computed.expr)
+            }
+            _ => None,
         }
     }
 
@@ -759,275 +672,16 @@ impl DependencyVisitor {
         }
     }
 
-    fn prefix_owner_type(&self, name: &str) -> String {
-        format!("{}:{}", self.repo_prefix, name)
-    }
 
-    fn get_owner_type(&self, name: &str) -> String {
-        name.split(":")
-            .filter(|x| !x.is_empty())
-            .last()
-            .unwrap()
-            .to_string()
-    }
-
-    fn is_express_route_method(&self, member: &MemberExpr) -> Option<String> {
-        // Get the method name (the property part of the member expression)
-        if let MemberProp::Ident(method_ident) = &member.prop {
-            let method_name = method_ident.sym.to_string().to_lowercase();
-
-            // Check if it's a standard HTTP method
-            if ["get", "post", "put", "delete", "patch"].contains(&method_name.as_str()) {
-                return Some(method_name.to_uppercase());
+    // Extract string literal from expressions like "string", `template`, etc.
+    fn extract_string_from_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+            Expr::Tpl(tpl) if tpl.quasis.len() == 1 && tpl.exprs.is_empty() => {
+                // Simple template literal with no expressions
+                Some(tpl.quasis[0].raw.to_string())
             }
-        }
-        None
-    }
-
-    fn is_express_app_creation(&self, call_expr: &CallExpr, express_name: &str) -> bool {
-        match &call_expr.callee {
-            // Check for express()
-            Callee::Expr(expr) => {
-                if let Expr::Ident(ident) = &expr.deref() {
-                    if ident.sym == *express_name {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-        false
-    }
-
-    fn is_router_creation(&self, call_expr: &CallExpr) -> bool {
-        match &call_expr.callee {
-            // Check for express.Router()
-            Callee::Expr(expr) => {
-                if let Expr::Member(member) = &**expr {
-                    if let (Expr::Ident(obj), MemberProp::Ident(prop)) =
-                        (&*member.obj, &member.prop)
-                    {
-                        if obj.sym == "express" && prop.sym == "Router" {
-                            return true; // Detected express.Router()
-                        }
-                    }
-                }
-
-                // Check for Router() after import { Router } from 'express'
-                if let Expr::Ident(callee) = &expr.deref() {
-                    if self.router_imports.contains(&callee.sym.to_string()) {
-                        return true; // Detected Router()
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        false
-    }
-
-    fn is_use_method(&self, member: &MemberExpr) -> bool {
-        if let MemberProp::Ident(method_ident) = &member.prop {
-            if method_ident.sym == *"use" {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn get_path_prefix_from_use_call(&self, args: &[ExprOrSpread]) -> (String, usize) {
-        // Determine if the first argument is a path or a middleware/router
-        let (path_prefix, target_arg_idx) = if args.len() >= 2 {
-            if let Some(path) = self.extract_string_from_expr(&args[0].expr) {
-                (path, 1) // First arg is path, second is router/app
-            } else {
-                ("/".to_string(), 0) // First arg is middleware or router/app
-            }
-        } else {
-            ("/".to_string(), 0) // Only one arg, must be middleware or router/app
-        };
-
-        // Normalize path prefix
-        let path_prefix = if !path_prefix.starts_with('/') {
-            format!("/{}", path_prefix)
-        } else {
-            path_prefix
-        };
-
-        (path_prefix, target_arg_idx)
-    }
-
-    // Process app.use() - mounting routers or other apps
-    fn process_app_use(&mut self, app_name: &str, args: &[ExprOrSpread]) {
-        if args.is_empty() {
-            return;
-        }
-
-        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(args);
-
-        // Check if the argument at target_arg_idx is a router or middleware reference
-        if target_arg_idx < args.len() {
-            if let Expr::Ident(target_ident) = &*args[target_arg_idx].expr {
-                let target_name = target_ident.sym.as_str();
-                let prefixed_target_name = self.prefix_owner_type(target_name);
-
-                // Check if this is an imported symbol
-                if let Some(imported) = self.imported_symbols.get(target_name) {
-                    println!(
-                        "App use: {}({}) -> {} (imported from {})",
-                        app_name, path_prefix, target_name, imported.source
-                    );
-
-                    // This is the important part - record that we need to
-                    // analyze the module this router was imported from
-                    // The caller would need to handle this information
-                } else {
-                    println!("App use: {}({}) -> {}", app_name, path_prefix, target_name);
-                }
-
-                // For ALL identifiers used with app.use, assume they could be routers
-                // and create the mount relationship
-                self.mounts.push(Mount {
-                    parent: OwnerType::App(app_name.to_string()),
-                    child: OwnerType::Router(prefixed_target_name.clone()),
-                    prefix: path_prefix,
-                });
-
-                // Add the router to our tracking if it's not already there
-                // This is important both for locally defined routers AND imported ones
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.routers.entry(prefixed_target_name)
-                {
-                    e.insert(RouterContext {
-                        name: target_name.to_string(),
-                    });
-
-                    // If this is an import, log it specially
-                    if self.imported_symbols.contains_key(target_name) {
-                        println!("Detected use of imported router: {}", target_name);
-                    }
-                }
-            }
-        }
-    }
-
-    // Process router.use() - mounting other routers
-    fn process_router_use(&mut self, parent_router_name: &str, args: &[ExprOrSpread]) {
-        if args.is_empty() {
-            return;
-        }
-
-        let (path_prefix, target_arg_idx) = self.get_path_prefix_from_use_call(args);
-
-        // Check if the argument at target_arg_idx is a router reference
-        if target_arg_idx < args.len() {
-            if let Expr::Ident(target_ident) = &*args[target_arg_idx].expr {
-                let target_name = target_ident.sym.as_str();
-                let prefixed_target_name = self.prefix_owner_type(target_name);
-
-                println!(
-                    "Router use: {}({}) -> {}",
-                    parent_router_name, path_prefix, target_name
-                );
-
-                // Create mount relationship
-                self.mounts.push(Mount {
-                    parent: OwnerType::Router(parent_router_name.to_string()),
-                    child: OwnerType::Router(prefixed_target_name.clone()),
-                    prefix: path_prefix,
-                });
-
-                // Add the router to our tracking if it's not already there
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.routers.entry(prefixed_target_name)
-                {
-                    e.insert(RouterContext {
-                        name: target_name.to_string(),
-                    });
-
-                    // If this is an import, log it specially
-                    if self.imported_symbols.contains_key(target_name) {
-                        println!("Detected use of imported router: {}", target_name);
-                    }
-                }
-            }
-        }
-    }
-
-    // Process route handlers on routers
-    fn process_route_handler(&mut self, var_name: &str, http_method: &str, call: &CallExpr) {
-        // If this is the generic "router" variable and we have an imported name
-        let effective_name = if var_name == self.prefix_owner_type("router")
-            && self.imported_router_name.is_some()
-        {
-            self.prefix_owner_type(self.imported_router_name.as_ref().unwrap())
-        } else {
-            var_name.to_string()
-        };
-
-        // Find whether this is an app or router
-        let owner = match self.express_apps.get(&effective_name) {
-            Some(_) => OwnerType::App(effective_name.to_string()),
-            None => OwnerType::Router(effective_name.to_string()),
-        };
-
-        if let Some(endpoint_data) = self.extract_endpoint(call, http_method) {
-            let (route, response_fields, request_fields, handler_name) = endpoint_data;
-
-            if let Some(second_arg) = call.args.get(1) {
-                match &*second_arg.expr {
-                    Expr::Arrow(arrow) => {
-                        // Store arrow function definition
-                        let arguments = self.extract_function_arguments_from_pats(&arrow.params);
-                        self.function_definitions.insert(
-                            handler_name.clone(),
-                            FunctionDefinition {
-                                name: handler_name.clone(),
-                                file_path: self.current_file.clone(),
-                                node_type: FunctionNodeType::ArrowFunction(Box::new(arrow.clone())),
-                                arguments,
-                            },
-                        );
-                    }
-                    Expr::Fn(fn_expr) => {
-                        // Store function expression definition
-                        let arguments =
-                            self.extract_function_arguments_from_params(&fn_expr.function.params);
-                        self.function_definitions.insert(
-                            handler_name.clone(),
-                            FunctionDefinition {
-                                name: handler_name.clone(),
-                                file_path: self.current_file.clone(),
-                                node_type: FunctionNodeType::FunctionExpression(Box::new(
-                                    fn_expr.clone(),
-                                )),
-                                arguments,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-            }
-
-            // Store the endpoint with its initial path and type information
-            self.endpoints.push(Endpoint {
-                owner,
-                route: route.clone(),
-                method: http_method.to_string(),
-                response: response_fields.clone(),
-                request: request_fields.clone(),
-                request_type: None,
-                response_type: None,
-                handler_file: self.current_file.clone(),
-                handler_name,
-            });
-
-            println!(
-                "Detected endpoint: {} {} on {}",
-                http_method,
-                route,
-                self.get_owner_type(&effective_name),
-            );
+            _ => None,
         }
     }
 }
