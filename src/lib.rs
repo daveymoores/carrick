@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod analyzer;
 pub mod app_context;
 pub mod call_site_classifier;

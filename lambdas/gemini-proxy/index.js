@@ -1,4 +1,4 @@
-const { GoogleGenAI } = require("@google/genai");
+const { GoogleGenAI, Type } = require("@google/genai");
 
 // Initialize Gemini client
 const client = new GoogleGenAI({
@@ -87,6 +87,11 @@ function validateRequest(body) {
       valid: false,
       error: "Request too large (max 5MB)",
     };
+  }
+
+  // Validate response_schema if provided
+  if (body.response_schema && typeof body.response_schema !== "object") {
+    return { valid: false, error: "response_schema must be an object" };
   }
 
   // Model is hardcoded to gemini-2.5-flash for simplicity
@@ -260,11 +265,23 @@ exports.handler = async (event) => {
     }
     // Remove custom options for simplicity - use defaults
 
+    // Prepare config object for structured output
+    const config = {
+      generationConfig,
+    };
+
+    // Add structured output schema if provided
+    if (requestBody.response_schema) {
+      config.responseMimeType = "application/json";
+      config.responseSchema = convertStringTypesToGeminiTypes(requestBody.response_schema);
+    }
+
     console.log("Calling Gemini API:", {
       model,
       messageCount: geminiMessages.length,
       dailyRemaining: limitCheck.remaining,
       httpMethod: httpMethod,
+      hasSchema: !!requestBody.response_schema,
     });
 
     // Make the Gemini API call using new @google/genai package
@@ -274,7 +291,7 @@ exports.handler = async (event) => {
         role: msg.role,
         parts: [{ text: msg.content }],
       })),
-      generationConfig,
+      config,
     });
 
     const text = result.text;
@@ -343,3 +360,53 @@ exports.handler = async (event) => {
     };
   }
 };
+
+// Convert string type names to Gemini Type constants
+function convertStringTypesToGeminiTypes(schema) {
+  if (Array.isArray(schema)) {
+    return schema.map(convertStringTypesToGeminiTypes);
+  }
+
+  if (typeof schema !== 'object' || schema === null) {
+    return schema;
+  }
+
+  const converted = { ...schema };
+
+  // Convert type field from string to Type constant
+  if (converted.type) {
+    switch (converted.type) {
+      case "ARRAY":
+        converted.type = Type.ARRAY;
+        break;
+      case "OBJECT":
+        converted.type = Type.OBJECT;
+        break;
+      case "STRING":
+        converted.type = Type.STRING;
+        break;
+      case "NUMBER":
+        converted.type = Type.NUMBER;
+        break;
+      case "BOOLEAN":
+        converted.type = Type.BOOLEAN;
+        break;
+      // Keep as-is if already a Type constant or unknown
+    }
+  }
+
+  // Recursively convert nested objects
+  if (converted.items) {
+    converted.items = convertStringTypesToGeminiTypes(converted.items);
+  }
+
+  if (converted.properties) {
+    const newProperties = {};
+    for (const [key, value] of Object.entries(converted.properties)) {
+      newProperties[key] = convertStringTypesToGeminiTypes(value);
+    }
+    converted.properties = newProperties;
+  }
+
+  return converted;
+}
