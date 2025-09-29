@@ -1,14 +1,17 @@
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
+use crate::app_context::AppContext;
 use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
+use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
-use crate::utils::{get_repository_name, resolve_import_path};
-use crate::visitor::DependencyVisitor;
+use crate::utils::get_repository_name;
+use crate::visitor::{DependencyVisitor, FunctionDefinition, Mount, OwnerType};
 use chrono::Utc;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 
 use swc_common::{
     SourceMap,
@@ -182,11 +185,18 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
 
 /// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
 
-/// Extract file discovery and parsing logic from analyze_current_repo
-fn discover_and_parse_files(
+/// Discover files and extract symbols for MultiAgentOrchestrator
+fn discover_files_and_symbols(
     repo_path: &str,
     cm: Lrc<SourceMap>,
-) -> Result<(Vec<DependencyVisitor>, String), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Vec<PathBuf>,
+        HashMap<String, crate::visitor::ImportedSymbol>,
+        String,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
@@ -200,70 +210,25 @@ fn discover_and_parse_files(
         repo_path
     );
 
-    // Track processed files to avoid duplicates
-    let mut processed_file_paths = HashSet::new();
-    let mut file_queue = VecDeque::new();
+    // Extract imported symbols by parsing files
+    let mut all_imported_symbols = HashMap::new();
 
-    // Queue all discovered files for processing
-    for file_path in files {
-        file_queue.push_back((file_path, repo_name.clone(), None));
-    }
-
-    // Process all files in the queue (including newly discovered imports)
-    let mut visitors = Vec::new();
-
-    while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
-        let path_str = file_path.to_string_lossy().to_string();
-        let processing_key = match &imported_router_name {
-            Some(name) => format!("{}#{}", path_str, name),
-            None => path_str.clone(),
-        };
-        if processed_file_paths.contains(&processing_key) {
-            continue;
-        }
-        processed_file_paths.insert(processing_key);
-
-        println!("Parsing: {}", file_path.display());
-
-        if let Some(module) = parse_file(&file_path, &cm, &handler) {
-            let mut visitor = DependencyVisitor::new(
-                file_path.clone(),
-                &repo_prefix,
-                imported_router_name,
-                cm.clone(),
-            );
+    for file_path in &files {
+        if let Some(module) = parse_file(file_path, &cm, &handler) {
+            let mut visitor =
+                DependencyVisitor::new(file_path.clone(), &repo_name, None, cm.clone());
             module.visit_with(&mut visitor);
-
-            // Queue imported router files that might be used with app.use or router.use
-            for (name, symbol) in &visitor.imported_symbols {
-                let is_router = visitor.mounts.iter().any(|mount| match &mount.child {
-                    crate::visitor::OwnerType::Router(router_name) => {
-                        let parts: Vec<_> = router_name.split(':').collect();
-                        let local_name = parts.last().unwrap_or(&"");
-                        local_name == name
-                    }
-                    _ => false,
-                });
-
-                if is_router {
-                    println!("Following import '{}' from '{}'", name, symbol.source);
-
-                    if let Some(resolved_path) = resolve_import_path(&file_path, &symbol.source) {
-                        println!("Resolved to: {}", resolved_path.display());
-                        file_queue.push_back((
-                            resolved_path,
-                            repo_prefix.clone(),
-                            Some(name.clone()),
-                        ));
-                    }
-                }
-            }
-
-            visitors.push(visitor);
+            all_imported_symbols.extend(visitor.imported_symbols);
         }
     }
 
-    Ok((visitors, repo_name))
+    println!(
+        "Extracted {} imported symbols from {} files",
+        all_imported_symbols.len(),
+        files.len()
+    );
+
+    Ok((files, all_imported_symbols, repo_name))
 }
 
 /// Extract config and package loading logic
@@ -300,63 +265,67 @@ async fn analyze_current_repo(
     repo_path: &str,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     println!(
-        "---> Running enhanced visitor-based analysis with framework detection on: {}",
+        "---> Running multi-agent framework-agnostic analysis on: {}",
         repo_path
     );
 
-    // 1. Create shared SourceMap and discover/parse files using existing queue-based logic
+    // 1. Create shared SourceMap and discover files and symbols
     let cm: Lrc<SourceMap> = Default::default();
-    let (visitors, repo_name) = discover_and_parse_files(repo_path, cm.clone())?;
-    println!("Extracted repository name: '{}' from {} files", repo_name, visitors.len());
+    let (files, all_imported_symbols, repo_name) =
+        discover_files_and_symbols(repo_path, cm.clone())?;
+    println!(
+        "Extracted repository name: '{}' from {} files",
+        repo_name,
+        files.len()
+    );
 
     // 2. Load config and packages using existing logic
     let (config, packages) = load_config_and_packages(repo_path)?;
-    
-    // 3. Extract imported symbols from visitors for framework detection
-    let mut all_imported_symbols = HashMap::new();
-    for visitor in &visitors {
-        all_imported_symbols.extend(visitor.imported_symbols.clone());
-    }
-    println!("Extracted {} imported symbols from visitors", all_imported_symbols.len());
 
-    // 4. Run framework detection to enhance the analysis
+    // 3. Get API key and create MultiAgentOrchestrator
     let api_key = env::var("CARRICK_API_KEY")
         .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
-    let gemini_service = crate::gemini_service::GeminiService::new(api_key);
-    let framework_detector = crate::framework_detector::FrameworkDetector::new(gemini_service);
-    
-    let framework_detection = framework_detector
-        .detect_frameworks_and_libraries(&packages, &all_imported_symbols)
-        .await
-        .unwrap_or_else(|e| {
-            println!("Framework detection failed: {}", e);
-            crate::framework_detector::DetectionResult {
-                frameworks: vec![],
-                data_fetchers: vec![],
-                notes: format!("Detection failed: {}", e),
-            }
-        });
-    
-    println!("Detected frameworks: {:?}", framework_detection.frameworks);
-    println!("Detected data fetchers: {:?}", framework_detection.data_fetchers);
-    if !framework_detection.notes.is_empty() {
-        println!("Notes: {}", framework_detection.notes);
-    }
+    let orchestrator = MultiAgentOrchestrator::new(api_key, cm.clone());
 
-    // 5. Build analyzer using the existing visitor-based approach (preserves all detailed extraction)
-    let builder = crate::analyzer::builder::AnalyzerBuilder::new(config.clone(), cm);
-    let mut analyzer = builder.build_from_visitors(visitors).await?;
-    
-    // 6. Enhance analyzer with framework detection data
+    // 4. Run the complete multi-agent analysis
+    let analysis_result = orchestrator
+        .run_complete_analysis(files, &packages, &all_imported_symbols)
+        .await?;
+
+    // 5. Create an Analyzer and populate it with the orchestrator results
+    let mut analyzer = Analyzer::new(config.clone(), cm);
+
+    // Convert orchestrator results to analyzer data structures
+    let (endpoints, calls, mounts, apps, imported_handlers, function_definitions) =
+        convert_orchestrator_results_to_analyzer_data(&analysis_result);
+
+    // Populate the analyzer with the new data
+    analyzer.endpoints = endpoints;
+    analyzer.calls = calls;
+    analyzer.mounts = mounts;
+    analyzer.apps = apps;
+    analyzer.imported_handlers = imported_handlers;
+    analyzer.function_definitions = function_definitions;
+
+    // Set framework detection data from orchestrator
     analyzer.set_framework_detection(
-        framework_detection.frameworks.clone(),
-        framework_detection.data_fetchers.clone(),
+        analysis_result.framework_detection.frameworks.clone(),
+        analysis_result.framework_detection.data_fetchers.clone(),
     );
 
-    // 7. Extract types for current repo (now with complete visitor data + framework detection)
+    // Build the endpoint router for matching
+    analyzer.build_endpoint_router();
+
+    // 6. Extract types for current repo (critical for cross-repo type checking)
     extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
 
-    // 8. Build CloudRepoData from analyzer (preserves all visitor-extracted detailed info)
+    // 7. Run analysis to generate issues (critical for formatter output)
+    let analysis_results = analyzer.get_results();
+
+    // 8. Print formatted results with all issue categories
+    print_results(analysis_results);
+
+    // 9. Build CloudRepoData from analyzer (now with complete data + type extraction)
     let cloud_data = CloudRepoData {
         repo_name,
         endpoints: analyzer.endpoints,
@@ -375,7 +344,87 @@ async fn analyze_current_repo(
     Ok(cloud_data)
 }
 
+/// Convert MultiAgentOrchestrator results to analyzer data structures
+fn convert_orchestrator_results_to_analyzer_data(
+    result: &crate::multi_agent_orchestrator::MultiAgentAnalysisResult,
+) -> (
+    Vec<ApiEndpointDetails>,
+    Vec<ApiEndpointDetails>,
+    Vec<Mount>,
+    HashMap<String, AppContext>,
+    Vec<(String, String, String, String)>,
+    HashMap<String, FunctionDefinition>,
+) {
+    let mount_graph = &result.mount_graph;
 
+    // Convert ResolvedEndpoints to ApiEndpointDetails (endpoints)
+    let endpoints: Vec<ApiEndpointDetails> = mount_graph
+        .get_resolved_endpoints()
+        .iter()
+        .map(|endpoint| ApiEndpointDetails {
+            owner: Some(OwnerType::App(endpoint.owner.clone())),
+            route: endpoint.full_path.clone(), // Use full_path instead of path for proper resolution
+            method: endpoint.method.clone(),
+            params: vec![],      // TODO: Extract from handler analysis if needed
+            request_body: None,  // TODO: Extract from handler analysis if needed
+            response_body: None, // TODO: Extract from handler analysis if needed
+            handler_name: endpoint.handler.clone(),
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(&endpoint.file_location),
+        })
+        .collect();
+
+    // Convert DataFetchingCalls to ApiEndpointDetails (calls)
+    let calls: Vec<ApiEndpointDetails> = mount_graph
+        .get_data_calls()
+        .iter()
+        .map(|call| ApiEndpointDetails {
+            owner: None, // Calls don't have owners
+            route: call.target_url.clone(),
+            method: call.method.clone(),
+            params: vec![],      // TODO: Extract from call analysis if needed
+            request_body: None,  // TODO: Extract from call analysis if needed
+            response_body: None, // TODO: Extract from call analysis if needed
+            handler_name: Some(call.client.clone()),
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(&call.file_location),
+        })
+        .collect();
+
+    // Convert MountEdges to Mount
+    let mounts: Vec<Mount> = mount_graph
+        .get_mounts()
+        .iter()
+        .map(|mount| Mount {
+            parent: OwnerType::App(mount.parent.clone()),
+            child: OwnerType::Router(mount.child.clone()),
+            prefix: mount.path_prefix.clone(),
+        })
+        .collect();
+
+    // For now, return empty collections for these - they can be enhanced later
+    let apps = HashMap::new();
+    let imported_handlers = vec![];
+    let function_definitions = HashMap::new();
+
+    println!("Converted orchestrator results:");
+    println!("  - {} endpoints", endpoints.len());
+    println!("  - {} calls", calls.len());
+    println!("  - {} mounts", mounts.len());
+
+    (
+        endpoints,
+        calls,
+        mounts,
+        apps,
+        imported_handlers,
+        function_definitions,
+    )
+}
+
+/// Extract types for current repo - restored from the old system
 fn extract_types_for_current_repo(
     analyzer: &Analyzer,
     repo_path: &str,
@@ -388,7 +437,6 @@ fn extract_types_for_current_repo(
     // Group type information by repository using endpoint owner information
     for endpoint in &analyzer.endpoints {
         let repo_prefix = analyzer.extract_repo_prefix_from_owner(&endpoint.owner);
-
         analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
     }
 
@@ -402,8 +450,8 @@ fn extract_types_for_current_repo(
     let gemini_type_infos = analyzer.collect_type_infos_from_calls(analyzer.fetch_calls());
     for type_info in gemini_type_infos {
         let file_path = type_info["filePath"].as_str().unwrap_or("");
-        let repo_prefix = analyzer
-            .extract_repo_prefix_from_file_path(&std::path::PathBuf::from(file_path), &repo_paths);
+        let repo_prefix =
+            analyzer.extract_repo_prefix_from_file_path(&PathBuf::from(file_path), &repo_paths);
         repo_type_map
             .entry(repo_prefix)
             .or_default()
@@ -412,7 +460,6 @@ fn extract_types_for_current_repo(
 
     // Extract types for current repository
     let repo_name = get_repository_name(repo_path);
-
     let type_infos = repo_type_map.get(&repo_name).cloned().unwrap_or_default();
 
     if !type_infos.is_empty() {
