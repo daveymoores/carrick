@@ -1,6 +1,5 @@
 use crate::{
-    call_site_extractor::CallSite,
-    framework_detector::DetectionResult,
+    call_site_extractor::CallSite, framework_detector::DetectionResult,
     gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
@@ -55,10 +54,39 @@ impl CallSiteClassifier {
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
     ) -> Result<Vec<ClassifiedCallSite>, Box<dyn std::error::Error>> {
+        println!("=== CALL SITE CLASSIFICATION DEBUG ===");
+        println!("Number of call sites to classify: {}", call_sites.len());
+        println!("Framework detection: {:?}", framework_detection);
+
+        // Print each call site for debugging
+        for (i, call_site) in call_sites.iter().enumerate() {
+            println!(
+                "Call site {}: {}.{}()",
+                i + 1,
+                call_site.callee_object,
+                call_site.callee_property
+            );
+            println!("  Location: {}", call_site.location);
+            println!("  Args: {} arguments", call_site.args.len());
+        }
+
         let prompt = self.build_classification_prompt(call_sites, framework_detection);
         let system_message = self.build_system_message();
 
-        let response = self.gemini_service.analyze_code(&prompt, &system_message).await?;
+        println!("=== PROMPT BEING SENT TO GEMINI ===");
+        println!("System message length: {} chars", system_message.len());
+        println!("Prompt length: {} chars", prompt.len());
+        println!("Full prompt:\n{}", prompt);
+        println!("=== END OF PROMPT ===");
+
+        let response = self
+            .gemini_service
+            .analyze_code(&prompt, &system_message)
+            .await?;
+
+        println!("=== GEMINI RESPONSE ===");
+        println!("{}", response);
+        println!("=== END OF RESPONSE ===");
 
         let classified_sites: Vec<ClassifiedCallSite> = serde_json::from_str(&response)
             .map_err(|e| format!("Failed to parse LLM classification response: {}", e))?;
@@ -95,7 +123,11 @@ ANALYSIS APPROACH:
 NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
     }
 
-    fn build_classification_prompt(&self, call_sites: &[CallSite], framework_detection: &DetectionResult) -> String {
+    fn build_classification_prompt(
+        &self,
+        call_sites: &[CallSite],
+        framework_detection: &DetectionResult,
+    ) -> String {
         let call_sites_json = serde_json::to_string_pretty(call_sites).unwrap_or_default();
         let frameworks_json = serde_json::to_string(framework_detection).unwrap_or_default();
 
@@ -110,7 +142,7 @@ CALL SITES TO CLASSIFY:
 
 For each call site, analyze:
 1. callee_object: The object being called on
-2. callee_property: The method being called  
+2. callee_property: The method being called
 3. args: The arguments with their types (StringLiteral, Identifier, FunctionExpression, etc.)
 4. definition: How the callee_object was created/assigned
 5. location: File and line number
@@ -125,7 +157,7 @@ Return JSON array with this structure:
     "confidence": 0.95,
     "reasoning": "Brief explanation based on framework knowledge",
     "mount_parent": "parent_object_name or null",
-    "mount_child": "child_object_name or null", 
+    "mount_child": "child_object_name or null",
     "mount_prefix": "path_prefix or null",
     "handler_name": "handler_function_name or null",
     "handler_args": [{{"name": "req", "arg_type": "Request"}}, {{"name": "res", "arg_type": "Response"}}]

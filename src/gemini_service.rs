@@ -26,13 +26,25 @@ impl GeminiService {
         prompt: &str,
         system_message: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        self.analyze_code_with_schema(prompt, system_message, None)
+            .await
+    }
+
+    /// Generic method for making Gemini API calls with optional response schema
+    pub async fn analyze_code_with_schema(
+        &self,
+        prompt: &str,
+        system_message: &str,
+        response_schema: Option<serde_json::Value>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         // Skip API call in mock mode
         if env::var("CARRICK_MOCK_ALL").is_ok() {
             return Ok(r#"{
   "frameworks": ["express"],
   "data_fetchers": ["axios"],
   "notes": "Mock response for testing"
-}"#.to_string());
+}"#
+            .to_string());
         }
 
         // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
@@ -54,15 +66,18 @@ impl GeminiService {
                 temperature: None,
                 max_output_tokens: None,
             },
+            response_schema,
         };
 
-        let mut request_builder = self.client
+        let mut request_builder = self
+            .client
             .post(&proxy_endpoint)
             .json(&proxy_request)
             .timeout(std::time::Duration::from_secs(60));
 
         // Add API key for authentication
-        request_builder = request_builder.header("Authorization", format!("Bearer {}", self.api_key));
+        request_builder =
+            request_builder.header("Authorization", format!("Bearer {}", self.api_key));
 
         // Retry logic for transient failures (max 3 attempts)
         for attempt in 1..=3 {
@@ -74,7 +89,9 @@ impl GeminiService {
                                 if proxy_response.success {
                                     return Ok(proxy_response.text);
                                 } else {
-                                    return Err("Gemini proxy returned unsuccessful response".into());
+                                    return Err(
+                                        "Gemini proxy returned unsuccessful response".into()
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -83,7 +100,7 @@ impl GeminiService {
                         }
                     } else {
                         let status = response.status();
-                        
+
                         // Only retry on 503 Service Unavailable
                         if status == 503 && attempt < 3 {
                             let delay_ms = 1000 * attempt;
@@ -96,7 +113,11 @@ impl GeminiService {
                         }
 
                         let error_text = response.text().await.unwrap_or_default();
-                        return Err(format!("Gemini proxy call failed with status {}: {}", status, error_text).into());
+                        return Err(format!(
+                            "Gemini proxy call failed with status {}: {}",
+                            status, error_text
+                        )
+                        .into());
                     }
                 }
                 Err(e) => {
@@ -118,7 +139,7 @@ impl GeminiService {
 
         Err("Maximum retry attempts exceeded".into())
     }
-    
+
     /// Specialized method for analyzing async calls with framework context
     pub async fn analyze_async_calls_with_context(
         &self,
@@ -142,9 +163,9 @@ impl GeminiService {
         } else {
             String::new()
         };
-        
+
         let enhanced_system_message = format!("{}{}", system_message, context_info);
-        
+
         self.analyze_code(prompt, &enhanced_system_message).await
     }
 }
@@ -179,6 +200,8 @@ pub struct TypeInfo {
 struct ProxyRequest {
     messages: Vec<ProxyMessage>,
     options: ProxyOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,17 +267,14 @@ pub async fn extract_calls_from_async_expressions(
     let api_key = env::var("CARRICK_API_KEY")
         .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
     let gemini_service = GeminiService::new(api_key);
-    
+
     let prompt = create_extraction_prompt(&async_calls);
     let system_message = create_extraction_system_message();
-    
-    let response = gemini_service.analyze_async_calls_with_context(
-        &prompt,
-        &system_message,
-        frameworks,
-        data_fetchers,
-    ).await?;
-    
+
+    let response = gemini_service
+        .analyze_async_calls_with_context(&prompt, &system_message, frameworks, data_fetchers)
+        .await?;
+
     Ok(parse_gemini_response(&response, &async_calls))
 }
 
@@ -326,8 +346,9 @@ NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
 }
 
 fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
-    let mut prompt = String::from("Extract HTTP calls from these async JavaScript/TypeScript functions:\n\n");
-    
+    let mut prompt =
+        String::from("Extract HTTP calls from these async JavaScript/TypeScript functions:\n\n");
+
     for (i, call) in async_calls.iter().enumerate() {
         prompt.push_str(&format!(
             "## Function {} ({}:{})\n```{}\n{}\n```\n\n",
@@ -338,11 +359,9 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
             call.function_source
         ));
     }
-    
+
     prompt
 }
-
-
 
 fn convert_gemini_responses_to_calls(
     gemini_calls: Vec<GeminiCallResponse>,
