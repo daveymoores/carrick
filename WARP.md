@@ -85,6 +85,10 @@ Carrick follows a modular architecture with clear separation of concerns:
 - Runs TypeScript type checking on extracted types
 - Detects mismatches, missing endpoints, and dependency conflicts
 
+**Type Checker (`ts_check/`)**: A collection of TypeScript scripts that provide the core type analysis capabilities.
+- **`extract-type-definitions.ts`**: Called by the Rust engine, it uses `ts-morph` to find a given type in the codebase and recursively collect all its dependent type definitions into a single, self-contained `.ts` file.
+- **`run-type-checking.ts`**: Called at the end of a cross-repo analysis. It runs `npm install` on a staged project containing all type signatures from all repos, then uses the TypeScript compiler to verify that producer and consumer types for each API endpoint are compatible.
+
 **Extractor** (`src/extractor.rs`): Contains traits and utilities for extracting structured data from AST nodes.
 
 **Cloud Storage** (`src/cloud_storage.rs`): Handles AWS S3/DynamoDB integration for sharing data between repositories in the same organization.

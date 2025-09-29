@@ -42,19 +42,19 @@ impl FrameworkDetector {
     ) -> Result<DetectionResult, Box<dyn std::error::Error>> {
         // Extract package.json data
         let package_summary = self.extract_package_summary(packages);
-        
+
         // Extract import statements
         let import_statements = self.extract_import_statements(imported_symbols);
-        
+
         // Prepare input for LLM
         let input = FrameworkDetectionInput {
             package_json: package_summary,
             imports: import_statements,
         };
-        
+
         // Call LLM for classification
         let result = self.classify_with_llm(input).await?;
-        
+
         Ok(result)
     }
 
@@ -68,8 +68,8 @@ impl FrameworkDetector {
             for (name, version) in &package_json.dependencies {
                 all_dependencies.insert(name.clone(), version.clone());
             }
-            
-            // Merge dev dependencies  
+
+            // Merge dev dependencies
             for (name, version) in &package_json.dev_dependencies {
                 all_dev_dependencies.insert(name.clone(), version.clone());
             }
@@ -82,7 +82,10 @@ impl FrameworkDetector {
     }
 
     /// Convert imported symbols to import statement strings for LLM analysis
-    fn extract_import_statements(&self, imported_symbols: &HashMap<String, ImportedSymbol>) -> Vec<String> {
+    fn extract_import_statements(
+        &self,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+    ) -> Vec<String> {
         let mut import_statements = Vec::new();
         let mut source_to_symbols: HashMap<String, Vec<&ImportedSymbol>> = HashMap::new();
 
@@ -97,30 +100,44 @@ impl FrameworkDetector {
         // Convert to import statement strings
         for (source, symbols) in source_to_symbols {
             let mut statement = String::new();
-            
-            let default_imports: Vec<_> = symbols.iter()
+
+            let default_imports: Vec<_> = symbols
+                .iter()
                 .filter(|s| matches!(s.kind, crate::visitor::SymbolKind::Default))
                 .collect();
-                
-            let named_imports: Vec<_> = symbols.iter()
+
+            let named_imports: Vec<_> = symbols
+                .iter()
                 .filter(|s| matches!(s.kind, crate::visitor::SymbolKind::Named))
                 .collect();
-                
-            let namespace_imports: Vec<_> = symbols.iter()
+
+            let namespace_imports: Vec<_> = symbols
+                .iter()
                 .filter(|s| matches!(s.kind, crate::visitor::SymbolKind::Namespace))
                 .collect();
 
             if !default_imports.is_empty() {
-                statement.push_str(&format!("import {} from '{}';", default_imports[0].local_name, source));
+                statement.push_str(&format!(
+                    "import {} from '{}';",
+                    default_imports[0].local_name, source
+                ));
             } else if !named_imports.is_empty() {
-                let named_list: Vec<_> = named_imports.iter()
+                let named_list: Vec<_> = named_imports
+                    .iter()
                     .map(|s| s.local_name.as_str())
                     .collect();
-                statement.push_str(&format!("import {{ {} }} from '{}';", named_list.join(", "), source));
+                statement.push_str(&format!(
+                    "import {{ {} }} from '{}';",
+                    named_list.join(", "),
+                    source
+                ));
             } else if !namespace_imports.is_empty() {
-                statement.push_str(&format!("import * as {} from '{}';", namespace_imports[0].local_name, source));
+                statement.push_str(&format!(
+                    "import * as {} from '{}';",
+                    namespace_imports[0].local_name, source
+                ));
             }
-            
+
             if !statement.is_empty() {
                 import_statements.push(statement);
             }
@@ -130,17 +147,32 @@ impl FrameworkDetector {
     }
 
     /// Use LLM to classify frameworks and data-fetching libraries
-    async fn classify_with_llm(&self, input: FrameworkDetectionInput) -> Result<DetectionResult, Box<dyn std::error::Error>> {
+    async fn classify_with_llm(
+        &self,
+        input: FrameworkDetectionInput,
+    ) -> Result<DetectionResult, Box<dyn std::error::Error>> {
         let prompt = self.build_classification_prompt(&input);
-        
+
         let response = self.gemini_service.analyze_code(
             &prompt,
             "You are analyzing a Node.js/TypeScript project to detect HTTP frameworks and data-fetching libraries."
         ).await?;
 
+        // Debug: Print the actual LLM response
+        println!("Framework Detection LLM Response:");
+        println!("{}", response);
+        println!("--- End of Response ---");
+
+        // Extract JSON from response using robust method
+        let json_str = self.extract_json_from_response(&response)?;
+
         // Parse the JSON response
-        let detection_result: DetectionResult = serde_json::from_str(&response)
-            .map_err(|e| format!("Failed to parse LLM response as JSON: {}", e))?;
+        let detection_result: DetectionResult = serde_json::from_str(&json_str).map_err(|e| {
+            format!(
+                "Failed to parse LLM response as JSON: {}. Response was: {}",
+                e, json_str
+            )
+        })?;
 
         Ok(detection_result)
     }
@@ -148,8 +180,9 @@ impl FrameworkDetector {
     /// Build the prompt for LLM classification
     fn build_classification_prompt(&self, input: &FrameworkDetectionInput) -> String {
         let input_json = serde_json::to_string_pretty(input).unwrap_or_default();
-        
-        format!(r#"
+
+        format!(
+            r#"
 You are analyzing a Node.js / TypeScript project to detect which HTTP frameworks and data-fetching libraries are used.
 
 Input:
@@ -196,7 +229,60 @@ Actual Input:
 {}
 
 Respond with valid JSON only:
-"#, input_json)
+"#,
+            input_json
+        )
+    }
+
+    /// Extract JSON from LLM response that may contain extra text
+    fn extract_json_from_response(
+        &self,
+        response: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let response = response.trim();
+
+        // If response is pure JSON, return it
+        if response.starts_with('{') && response.ends_with('}') {
+            return Ok(response.to_string());
+        }
+
+        // Find JSON object boundaries
+        let mut brace_count = 0;
+        let mut start_idx = None;
+        let mut end_idx = None;
+
+        for (i, ch) in response.char_indices() {
+            match ch {
+                '{' => {
+                    if start_idx.is_none() {
+                        start_idx = Some(i);
+                    }
+                    brace_count += 1;
+                }
+                '}' => {
+                    brace_count -= 1;
+                    if brace_count == 0 && start_idx.is_some() {
+                        end_idx = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let (Some(start), Some(end)) = (start_idx, end_idx) {
+            Ok(response[start..=end].to_string())
+        } else {
+            // Fallback: try to find JSON-like patterns
+            if let Some(start) = response.find('{') {
+                if let Some(end) = response.rfind('}') {
+                    Ok(response[start..=end].to_string())
+                } else {
+                    Err("Could not find valid JSON in LLM response".into())
+                }
+            } else {
+                Err("No JSON object found in LLM response".into())
+            }
+        }
     }
 }
-
