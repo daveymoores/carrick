@@ -4,13 +4,31 @@
 
 **⚠️ CRITICAL: This is a migration-in-progress document for completing the framework-agnostic multi-agent architecture.**
 
+### Current State: BROKEN OUTPUT
+
+The multi-agent branch is **not producing any analysis results**. When run, it shows:
+```
+Analyzed **0 endpoints** and **0 API calls** across all repositories.
+```
+
+This happens despite:
+- ✅ Multi-agent orchestrator is implemented
+- ✅ All 5 specialist agents exist (Triage, Endpoint, Consumer, Mount, Middleware)
+- ✅ MountGraph construction logic is complete
+- ✅ Framework detection works
+- ✅ Files are discovered and parsed
+
+**The Problem**: Either call sites aren't being extracted from the AST, OR agents aren't being invoked with Gemini API calls, OR agent results are getting lost in the conversion pipeline.
+
+### What Carrick Is
+
 Carrick is transitioning from a framework-specific (Express-focused) API analysis tool to a **framework-agnostic multi-agent system** that can analyze any JavaScript/TypeScript codebase regardless of the HTTP framework or library used. The system combines Rust-based AST analysis with LLM-powered semantic understanding and TypeScript-based cross-repository type checking to catch API mismatches before deployment.
 
 **Key Innovation**: The new system uses a **Classify-Then-Dispatch** pattern where a lightweight triage agent classifies all code patterns first, then specialized agents extract detailed information only from relevant call sites. Cross-repo type compatibility is ensured through a sophisticated TypeScript type extraction and checking system.
 
 ### 🎯 Primary Goal
 
-**REMOVE ALL LEGACY CODE** that makes the tool brittle and prevents it from being framework-agnostic. The multi-agent system (`src/multi_agent_orchestrator.rs`) is the future—legacy visitors and Express-specific code must be eliminated.
+**FIX THE ZERO OUTPUT BUG FIRST**, then **REMOVE ALL LEGACY CODE** that makes the tool brittle and prevents it from being framework-agnostic. The multi-agent system (`src/multi_agent_orchestrator.rs`) is the future—legacy visitors and Express-specific code must be eliminated.
 
 ### ✅ What's Complete
 
@@ -24,6 +42,16 @@ Carrick is transitioning from a framework-specific (Express-focused) API analysi
 
 ### ❌ What's Missing (BLOCKERS)
 
+**🚨 CRITICAL BUG**: The tool outputs **0 endpoints and 0 API calls** despite the multi-agent system running successfully. This is because:
+
+1. **Multi-agent orchestrator runs without Gemini calls**: The agents need actual LLM calls to extract endpoint/call details, but the system appears to run without making these calls
+2. **MountGraph receives empty agent results**: The `AnalysisResults` from agents contains empty vectors because agents never actually call Gemini
+3. **Integration test fixture has no TypeScript files**: Running on `tests/fixtures/imported-routers` finds TypeScript files but extracts nothing
+
+**Root Cause**: The multi-agent workflow is implemented but **agents are not actually calling Gemini to extract data**. The orchestrator runs through the motions but produces empty results.
+
+### Additional Blockers (After Fixing Critical Bug):
+
 1. **Type Extraction Integration**: Currently only extracts types from Gemini calls, not from multi-agent results
 2. **Complete Legacy Removal**: Old visitor patterns still exist in `src/visitor.rs` and parts of `src/analyzer/`
 3. **Direct Agent-to-CloudRepoData Flow**: Still using adapter pattern to convert to legacy format
@@ -32,21 +60,81 @@ Carrick is transitioning from a framework-specific (Express-focused) API analysi
 
 ---
 
+## Quick Start: Debugging the Zero Output Bug
+
+**If you're seeing 0 endpoints and 0 calls**, follow these steps:
+
+1. **Add debug logging** to see where data stops flowing:
+   ```rust
+   // In src/multi_agent_orchestrator.rs, after extract_all_call_sites:
+   println!("DEBUG: Extracted {} call sites total", call_sites.len());
+   
+   // In src/agents/orchestrator.rs, before analyze_call_sites returns:
+   println!("DEBUG: Agent analysis complete: {} endpoints, {} calls",
+            analysis_results.endpoints.len(),
+            analysis_results.data_fetching_calls.len());
+   
+   // In src/engine/mod.rs, in convert_orchestrator_results_to_analyzer_data:
+   println!("DEBUG: MountGraph has {} endpoints, {} calls",
+            mount_graph.get_resolved_endpoints().len(),
+            mount_graph.get_data_calls().len());
+   ```
+
+2. **Run with a real Gemini API key** (not "mock"):
+   ```bash
+   # Get API key from Google AI Studio: https://makersuite.google.com/app/apikey
+   export CARRICK_API_KEY="your-real-api-key-here"
+   export CARRICK_API_ENDPOINT="http://localhost:3000"  # Or your lambda endpoint
+   export CARRICK_MOCK_ALL=1
+   export CARRICK_ORG=test-org
+   
+   cargo run -- tests/fixtures/imported-routers 2>&1 | tee debug.log
+   grep DEBUG debug.log
+   ```
+
+3. **Check the output** for where the count drops to zero:
+   - If call sites = 0: Problem in CallSiteExtractor (AST parsing)
+   - If call sites > 0 but agent results = 0: Problem in agent invocation (Gemini calls)
+   - If agent results > 0 but mount graph = 0: Problem in MountGraph construction
+   - If mount graph > 0 but conversion = 0: Problem in adapter function
+
+4. **Test CallSiteExtractor directly**:
+   ```rust
+   // Add to src/call_site_extractor.rs
+   #[cfg(test)]
+   mod tests {
+       #[test]
+       fn test_extract_from_simple_express() {
+           let code = r#"
+               const app = express();
+               app.get('/test', handler);
+           "#;
+           // Test extraction logic
+       }
+   }
+   ```
+
+5. **Read section 2.0** below for detailed debugging steps.
+
+---
+
 ## Table of Contents
 
+0. [Quick Start: Debugging the Zero Output Bug](#quick-start-debugging-the-zero-output-bug)
 1. [Expected Output Format](#expected-output-format)
 2. [What's Missing to Complete This Feature](#whats-missing-to-complete-this-feature)
-3. [Architecture Overview](#architecture-overview)
-4. [Multi-Agent Workflow](#multi-agent-workflow)
-5. [TypeScript Type Checking System (ts_check/)](#typescript-type-checking-system-ts_check)
-6. [Core Components](#core-components)
-7. [Framework-Agnostic Design Principles](#framework-agnostic-design-principles)
-8. [Data Flow](#data-flow)
-9. [Agent Responsibilities](#agent-responsibilities)
-10. [Technical Implementation Details](#technical-implementation-details)
-11. [Cross-Repository Analysis](#cross-repository-analysis)
-12. [Legacy Code to Remove](#legacy-code-to-remove)
-13. [LLM Optimization Strategies](#llm-optimization-strategies)
+3. [Implementation Roadmap](#implementation-roadmap)
+4. [Architecture Overview](#architecture-overview)
+5. [Multi-Agent Workflow](#multi-agent-workflow)
+6. [TypeScript Type Checking System (ts_check/)](#typescript-type-checking-system-ts_check)
+7. [Core Components](#core-components)
+8. [Framework-Agnostic Design Principles](#framework-agnostic-design-principles)
+9. [Data Flow](#data-flow)
+10. [Agent Responsibilities](#agent-responsibilities)
+11. [Technical Implementation Details](#technical-implementation-details)
+12. [Cross-Repository Analysis](#cross-repository-analysis)
+13. [Legacy Code to Remove](#legacy-code-to-remove)
+14. [LLM Optimization Strategies](#llm-optimization-strategies)
 
 ---
 
@@ -180,9 +268,128 @@ Analyzed **X endpoints** and **Y API calls** across all repositories.
 
 ## 2. What's Missing to Complete This Feature
 
+### 🚨 CRITICAL BUG: Zero Output Issue
+
+**IMMEDIATE PROBLEM**: The tool shows `Analyzed **0 endpoints** and **0 API calls**` even though:
+- The multi-agent orchestrator runs
+- Files are discovered (e.g., 4 TypeScript files in `tests/fixtures/imported-routers`)
+- Call sites should be extracted
+- Agents should be invoked
+
+**Symptoms**:
+```
+Found 4 files to analyze in directory tests/fixtures/imported-routers
+Extracted 0 imported symbols from 4 files
+Converted orchestrator results:
+  - 0 endpoints
+  - 0 calls
+  - 0 mounts
+```
+
+**What to Debug**:
+
+1. **Check if agents are being called at all**:
+   - Add logging in `CallSiteOrchestrator::analyze_call_sites` (src/agents/orchestrator.rs)
+   - Verify `TriageAgent`, `EndpointAgent`, `ConsumerAgent` are receiving call sites
+   - Check if Gemini API is being invoked
+
+2. **Verify CallSiteExtractor is working**:
+   - Check `MultiAgentOrchestrator::extract_all_call_sites` in src/multi_agent_orchestrator.rs
+   - Ensure it's actually parsing files and extracting `object.method()` patterns
+   - Log the number of call sites extracted before triage
+
+3. **Check FrameworkDetector**:
+   - Verify it detects Express from package.json
+   - Ensure framework context is passed to agents
+
+4. **Verify Gemini API connectivity**:
+   - Check CARRICK_API_KEY is valid (not just "mock")
+   - Ensure Gemini proxy endpoint (CARRICK_API_ENDPOINT) is accessible
+   - Look for network errors in agent logs
+
+**Expected Flow**:
+```
+Files (4 .ts) → Parse → Extract CallSites (should be ~13)
+  ↓
+Framework Detection (should detect Express)
+  ↓
+Triage Agent → LLM classifies call sites
+  ↓
+Endpoint/Consumer/Mount Agents → LLM extracts details
+  ↓
+MountGraph builds → Should have endpoints/calls
+  ↓
+Conversion → CloudRepoData
+  ↓
+Formatter → Output
+```
+
+**Where it's Breaking**: Likely at CallSite extraction or agent invocation.
+
+---
+
 ### 🚨 CRITICAL: Framework Agnosticism Goal
 
 **DO NOT support or maintain legacy code.** The goal is to **REMOVE ALL FRAMEWORK-SPECIFIC PATTERNS** that make the tool brittle. The multi-agent system already works—we need to eliminate the old code that prevents full framework agnosticism.
+
+### 2.0 Fix Critical Zero Output Bug (MUST DO FIRST)
+
+**Current Problem**: No endpoints or calls are being detected despite files being parsed.
+
+**Debugging Steps**:
+
+1. **Add logging to CallSiteExtractor** (`src/call_site_extractor.rs`):
+   ```rust
+   // In extract_call_sites_from_file or wherever call sites are collected
+   println!("DEBUG: Extracted {} call sites from file: {:?}", call_sites.len(), file_path);
+   ```
+
+2. **Add logging to MultiAgentOrchestrator** (`src/multi_agent_orchestrator.rs`):
+   ```rust
+   // In run_complete_analysis after extract_all_call_sites
+   println!("DEBUG: Total call sites extracted: {}", call_sites.len());
+   println!("DEBUG: Sample call sites: {:#?}", call_sites.iter().take(3).collect::<Vec<_>>());
+   ```
+
+3. **Add logging to agents** (`src/agents/orchestrator.rs`):
+   ```rust
+   // In analyze_call_sites before triage
+   println!("DEBUG: Analyzing {} call sites with orchestrator", call_sites.len());
+   
+   // After triage
+   println!("DEBUG: Triage results: {} total", triage_results.len());
+   ```
+
+4. **Test with simple fixture**:
+   ```bash
+   # Run with verbose output
+   CARRICK_API_ENDPOINT=http://localhost:3000 CARRICK_MOCK_ALL=1 \
+   CARRICK_ORG=test-org CARRICK_API_KEY=mock \
+   cargo run -- tests/fixtures/imported-routers 2>&1 | grep DEBUG
+   ```
+
+5. **Check if Gemini is being called**:
+   - Look for error messages about API calls
+   - If using mock key, Gemini won't work - need real API key
+   - Check if `gemini_service.analyze_code_with_schema` is being invoked
+
+**Expected Behavior**:
+- `app.ts` should yield ~7 call sites: `app.use` (4x), `express()`, `express.json()`
+- Each router file should yield 1-3 call sites
+- Total: ~13 call sites across all files
+- After triage: 3 endpoints, 3 mounts, 1 middleware
+
+**If Call Sites Are Empty**:
+- The parser might not be extracting member expressions correctly
+- Check `call_site_extractor.rs` implementation
+- Verify SWC visitor is traversing AST properly
+
+**If Call Sites Exist But Results Are Empty**:
+- Gemini API calls are failing silently
+- Agent batching logic has issues
+- Triage is marking everything as Irrelevant
+
+---
 
 ### 2.1 Type Extraction from Multi-Agent Results
 
@@ -324,7 +531,82 @@ impl TypeExtractionAgent {
 
 ---
 
-## 3. Architecture Overview
+## 3. Implementation Roadmap
+
+### Phase 0: Fix Critical Bug (🚨 DO THIS FIRST)
+
+**Goal**: Get the multi-agent system producing output.
+
+**Tasks**:
+1. Add debug logging throughout the pipeline (see section 2.0)
+2. Identify where data flow stops (call sites, agents, mount graph, or conversion)
+3. Fix the root cause:
+   - If CallSiteExtractor: Fix AST visitor to extract member expressions
+   - If Agents: Ensure Gemini API is being called and returning results
+   - If MountGraph: Fix how AnalysisResults are converted to internal structures
+   - If Conversion: Fix how mount graph data is mapped to ApiEndpointDetails
+4. Validate with `tests/fixtures/imported-routers` - should show 3 endpoints, 3 mounts
+
+**Success Criteria**:
+- Running on `tests/fixtures/imported-routers` shows non-zero endpoints and calls
+- Output includes actual route paths like `/users`, `/api/v1`, `/health`
+- Debug logs show data flowing through each stage
+
+---
+
+### Phase 1: Type Extraction Integration
+
+**Goal**: Extract types from multi-agent results, not just legacy Gemini calls.
+
+**Tasks**:
+1. Add type reference extraction to `EndpointAgent` and `ConsumerAgent`
+2. Modify agent schemas to include type information
+3. Update MountGraph to include type references in `ResolvedEndpoint` and `DataFetchingCall`
+4. Wire type extraction through the pipeline to ts_check/
+
+**Success Criteria**:
+- Type files are generated for endpoints detected by agents
+- Cross-repo type checking works with multi-agent extracted types
+
+---
+
+### Phase 2: Remove Legacy Code
+
+**Goal**: Delete all framework-specific pattern matching and old visitor code.
+
+**Tasks**:
+1. Remove `DependencyVisitor` usage from `src/visitor.rs`
+2. Remove Express-specific checks ("express.Router()", "app.get()")
+3. Delete `src/extractor.rs` if no longer needed
+4. Remove adapter function `convert_orchestrator_results_to_analyzer_data`
+5. Build `CloudRepoData` directly from multi-agent results
+
+**Success Criteria**:
+- No code references Express, Fastify, or any specific framework
+- Tests pass with multiple framework types
+- Output is identical before and after legacy removal
+
+---
+
+### Phase 3: Validation and Optimization
+
+**Goal**: Ensure the system works reliably across different codebases.
+
+**Tasks**:
+1. Add test fixtures for Fastify, Koa, Hapi, NestJS
+2. Benchmark LLM usage and execution time
+3. Optimize agent batching and retry logic
+4. Add error handling for edge cases
+5. Document the new architecture
+
+**Success Criteria**:
+- Analysis works on 5+ different frameworks
+- Performance is acceptable (< 30s for small repos)
+- No framework-specific bugs
+
+---
+
+## 4. Architecture Overview
 
 ### 1.1 High-Level Design
 
@@ -356,9 +638,9 @@ Result: Framework-Agnostic API Analysis with Type Safety
 
 ---
 
-## 2. Multi-Agent Workflow
+## 5. Multi-Agent Workflow
 
-### 2.1 Stage 0: Framework Detection
+### 5.1 Stage 0: Framework Detection
 
 **File**: `src/framework_detector.rs`
 
@@ -383,7 +665,7 @@ pub struct DetectionResult {
 
 ---
 
-### 2.2 Stage 1: Universal Call Site Extraction
+### 5.2 Stage 1: Universal Call Site Extraction
 
 **File**: `src/call_site_extractor.rs`
 
@@ -404,7 +686,7 @@ pub struct CallSite {
 
 ---
 
-### 2.3 Stage 2: Classify-Then-Dispatch
+### 5.3 Stage 2: Classify-Then-Dispatch
 
 **File**: `src/agents/orchestrator.rs`
 
@@ -436,7 +718,7 @@ All run in parallel using `tokio::try_join!`.
 
 ---
 
-### 2.4 Stage 3: Mount Graph Construction
+### 5.4 Stage 3: Mount Graph Construction
 
 **File**: `src/mount_graph.rs`
 
@@ -449,7 +731,7 @@ All run in parallel using `tokio::try_join!`.
 
 ---
 
-### 2.5 Stage 4: Type Extraction & Cross-Repo Type Checking
+### 5.5 Stage 4: Type Extraction & Cross-Repo Type Checking
 
 **Critical Component**: This is where Carrick ensures type safety across repositories.
 
@@ -464,7 +746,7 @@ All run in parallel using `tokio::try_join!`.
 
 ---
 
-## 3. TypeScript Type Checking System (ts_check/)
+## 6. TypeScript Type Checking System (ts_check/)
 
 ### 3.1 Overview
 
@@ -814,9 +1096,9 @@ pub fn run_final_type_checking(&self) -> Result<(), String> {
 
 ---
 
-## 4. Core Components
+## 7. Core Components
 
-### 4.1 MultiAgentOrchestrator
+### 6.1 MultiAgentOrchestrator
 
 **File**: `src/multi_agent_orchestrator.rs`
 
@@ -855,9 +1137,190 @@ pub async fn run_complete_analysis(
 }
 ```
 
+**CRITICAL DEBUG POINT**: If `call_sites` is empty after Stage 1, the entire pipeline produces zero output. This is the most likely failure point.
+
 ---
 
-### 4.2 Analyzer
+### 6.2 CallSiteExtractor
+
+**File**: `src/call_site_extractor.rs`
+
+**Role**: Universal extraction of `object.method()` call patterns from JavaScript/TypeScript AST.
+
+**How It Works**:
+1. Uses SWC to parse files into AST
+2. Visits `CallExpression` nodes with `MemberExpression` callees
+3. Extracts:
+   - `callee_object` (e.g., "app", "router", "axios")
+   - `callee_property` (e.g., "get", "post", "use")
+   - `args` (function arguments)
+   - `definition` (variable definition context)
+   - `location` (file:line:column)
+
+**Example Output**:
+```rust
+CallSite {
+    callee_object: "app",
+    callee_property: "use",
+    args: [CallArgument { value: Some("/users"), arg_type: StringLiteral }],
+    definition: Some("const app = express()"),
+    location: "app.ts:10:0"
+}
+```
+
+**Common Issues**:
+- Parser errors (SWC fails silently on some TS features)
+- Import resolution problems (doesn't extract from unresolved imports)
+- Member expression nesting (might miss deeply nested calls)
+
+**Debug**: Add logging inside `visit_call_expr` or equivalent to see raw AST nodes.
+
+---
+
+### 6.3 MountGraph Implementation
+
+**File**: `src/mount_graph.rs`
+
+**Key Methods**:
+```rust
+// Build from agent results (new path)
+pub fn build_from_analysis_results(analysis_results: &AnalysisResults) -> Self {
+    let mut graph = Self::new();
+    
+    // Collect nodes from various sources
+    graph.collect_nodes_from_endpoints(&analysis_results.endpoints);
+    graph.collect_nodes_from_mounts(&analysis_results.mount_relationships);
+    
+    // Build mount relationships
+    graph.build_mounts_from_analysis(&analysis_results.mount_relationships);
+    
+    // Add endpoints and calls
+    graph.add_endpoints_from_analysis(&analysis_results.endpoints);
+    graph.add_data_calls_from_analysis(&analysis_results.data_fetching_calls);
+    
+    // Resolve paths by walking mount chain
+    graph.resolve_endpoint_paths();
+    
+    graph
+}
+
+// Public accessors used by engine
+pub fn get_resolved_endpoints(&self) -> &[ResolvedEndpoint] {
+    &self.endpoints  // Returns slice of all endpoints
+}
+
+pub fn get_data_calls(&self) -> &[DataFetchingCall] {
+    &self.data_calls  // Returns slice of all data calls
+}
+
+pub fn get_mounts(&self) -> &[MountEdge] {
+    &self.mounts  // Returns slice of all mounts
+}
+```
+
+**How Data Flows**:
+1. `AnalysisResults` from agents contains: `endpoints`, `data_fetching_calls`, `mount_relationships`
+2. MountGraph copies these into its internal `Vec<ResolvedEndpoint>` and `Vec<DataFetchingCall>`
+3. `get_resolved_endpoints()` returns a slice reference to the internal vec
+4. Engine calls `mount_graph.get_resolved_endpoints().iter()` to convert to `ApiEndpointDetails`
+
+**If Empty**: The `AnalysisResults` from agents is empty, meaning agents didn't extract anything.
+
+---
+
+### 6.4 Engine Integration
+
+**File**: `src/engine/mod.rs`
+
+**Role**: Orchestrates the complete analysis workflow including multi-agent analysis, type extraction, and cross-repo coordination.
+
+**Key Flow** (`analyze_current_repo`):
+```rust
+async fn analyze_current_repo(repo_path: &str) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+    // 1. Discover files and extract imported symbols
+    let (files, all_imported_symbols, repo_name) = discover_files_and_symbols(repo_path, cm)?;
+    
+    // 2. Load config and packages
+    let (config, packages) = load_config_and_packages(repo_path)?;
+    
+    // 3. Create MultiAgentOrchestrator
+    let api_key = env::var("CARRICK_API_KEY")?;
+    let orchestrator = MultiAgentOrchestrator::new(api_key, cm.clone());
+    
+    // 4. Run complete multi-agent analysis
+    let analysis_result = orchestrator
+        .run_complete_analysis(files, &packages, &all_imported_symbols)
+        .await?;
+    
+    // 5. Create Analyzer and populate with orchestrator results
+    let mut analyzer = Analyzer::new(config.clone(), cm);
+    
+    // 6. Convert orchestrator results to analyzer format (ADAPTER PATTERN)
+    let (endpoints, calls, mounts, apps, imported_handlers, function_definitions) =
+        convert_orchestrator_results_to_analyzer_data(&analysis_result);
+    
+    analyzer.endpoints = endpoints;
+    analyzer.calls = calls;
+    analyzer.mounts = mounts;
+    // ... etc
+    
+    // 7. Build CloudRepoData
+    let cloud_data = CloudRepoData {
+        repo_name,
+        endpoints: analyzer.endpoints,
+        calls: analyzer.calls,
+        // ... etc
+    };
+    
+    Ok(cloud_data)
+}
+```
+
+**Conversion Function** (`convert_orchestrator_results_to_analyzer_data`):
+```rust
+fn convert_orchestrator_results_to_analyzer_data(
+    result: &MultiAgentAnalysisResult,
+) -> (Vec<ApiEndpointDetails>, Vec<ApiEndpointDetails>, Vec<Mount>, ...) {
+    let mount_graph = &result.mount_graph;
+    
+    // Convert ResolvedEndpoints to ApiEndpointDetails
+    let endpoints: Vec<ApiEndpointDetails> = mount_graph
+        .get_resolved_endpoints()  // <-- Gets slice from mount_graph
+        .iter()
+        .map(|endpoint| ApiEndpointDetails {
+            owner: Some(OwnerType::App(endpoint.owner.clone())),
+            route: endpoint.full_path.clone(),
+            method: endpoint.method.clone(),
+            // ... map fields
+        })
+        .collect();
+    
+    // Convert DataFetchingCalls to ApiEndpointDetails
+    let calls: Vec<ApiEndpointDetails> = mount_graph
+        .get_data_calls()  // <-- Gets slice from mount_graph
+        .iter()
+        .map(|call| ApiEndpointDetails {
+            route: call.target_url.clone(),
+            method: call.method.clone(),
+            // ... map fields
+        })
+        .collect();
+    
+    println!("Converted orchestrator results:");
+    println!("  - {} endpoints", endpoints.len());
+    println!("  - {} calls", calls.len());
+    
+    (endpoints, calls, mounts, apps, imported_handlers, function_definitions)
+}
+```
+
+**Debug Point**: If this prints `0 endpoints` and `0 calls`, then `mount_graph.get_resolved_endpoints()` is returning an empty slice. This means:
+1. Either agents didn't extract anything (check agents)
+2. Or MountGraph didn't receive the agent results (check AnalysisResults)
+
+---
+
+### 6.5 Analyzer
 
 **File**: `src/analyzer/mod.rs`
 
@@ -884,7 +1347,7 @@ pub fn get_type_mismatches(&self) -> Vec<TypeMismatch>
 
 ---
 
-### 4.3 CloudStorage Trait
+### 7.6 CloudStorage Trait
 
 **File**: `src/cloud_storage/mod.rs`
 
@@ -914,7 +1377,7 @@ pub trait CloudStorage {
 
 ---
 
-## 5. Framework-Agnostic Design Principles
+## 8. Framework-Agnostic Design Principles
 
 ### 5.1 Behavioral Classification Over Pattern Matching
 
@@ -965,7 +1428,7 @@ if mounted_nodes.contains(&node_name) {
 
 ---
 
-## 6. Data Flow
+## 9. Data Flow
 
 ### 6.1 End-to-End Pipeline
 
@@ -1001,7 +1464,7 @@ if mounted_nodes.contains(&node_name) {
 
 ---
 
-### 6.2 Type Checking Data Flow
+### 9.2 Type Checking Data Flow
 
 ```
 Rust: Analyzer
@@ -1037,7 +1500,7 @@ Rust: Read Results
 
 ---
 
-## 7. Agent Responsibilities
+## 10. Agent Responsibilities
 
 ### 7.1 TriageAgent
 
@@ -1079,7 +1542,7 @@ Rust: Read Results
 
 ---
 
-## 8. Technical Implementation Details
+## 11. Technical Implementation Details
 
 ### 8.1 Batching Strategy
 
@@ -1169,7 +1632,7 @@ const isCompatible = producerType.isAssignableTo(consumerType);
 
 ---
 
-## 9. Cross-Repository Analysis
+## 12. Cross-Repository Analysis
 
 ### 9.1 Data Sharing Architecture
 
@@ -1233,7 +1696,7 @@ const isCompatible = producerType.isAssignableTo(consumerType);
 
 ---
 
-## 12. Legacy Code to Remove
+## 13. Legacy Code to Remove
 
 ### ⚠️ CRITICAL DIRECTIVE: DO NOT MAINTAIN LEGACY CODE
 
@@ -1305,7 +1768,7 @@ if mounted_nodes.contains(&node_name) {
 
 ---
 
-## 11. LLM Optimization Strategies
+## 14. LLM Optimization Strategies
 
 ### 11.1 Two-Stage Classification
 
@@ -1344,7 +1807,7 @@ if mounted_nodes.contains(&node_name) {
 
 ---
 
-## 12. Future Considerations
+## 15. Future Considerations
 
 ### 12.1 Type Extraction Improvements
 
