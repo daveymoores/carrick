@@ -327,6 +327,9 @@ exports.handler = async (event) => {
 
     console.error("Gemini API error:", {
       error: error.message,
+      errorName: error.name,
+      errorCode: error.code,
+      errorDetails: JSON.stringify(error, null, 2),
       stack: error.stack,
       duration: `${duration}ms`,
     });
@@ -334,6 +337,7 @@ exports.handler = async (event) => {
     // Handle specific Gemini API errors
     let statusCode = 500;
     let errorMessage = "Internal server error";
+    let debugInfo = error.message;
 
     if (error.message?.includes("quota") || error.message?.includes("limit")) {
       statusCode = 429;
@@ -355,6 +359,7 @@ exports.handler = async (event) => {
       body: JSON.stringify({
         error: "API Error",
         message: errorMessage,
+        debugInfo: debugInfo,
         requestId: event.requestContext?.requestId,
       }),
     };

@@ -76,8 +76,8 @@ impl TriageAgent {
         println!("=== TRIAGE AGENT DEBUG ===");
         println!("Triaging {} call sites", call_sites.len());
 
-        // Batch size to avoid 503 errors - start small
-        const BATCH_SIZE: usize = 10;
+        // Batch size to avoid 503 errors and rate limiting - reduced from 10 to 5
+        const BATCH_SIZE: usize = 5;
         let mut all_results = Vec::new();
 
         for (batch_num, batch) in call_sites.chunks(BATCH_SIZE).enumerate() {
@@ -124,9 +124,9 @@ impl TriageAgent {
             );
             all_results.extend(batch_results);
 
-            // Small delay between batches to be nice to the API
+            // Delay between batches to avoid rate limiting - increased from 500ms to 1000ms
             if batch_num + 1 < (call_sites.len() + BATCH_SIZE - 1) / BATCH_SIZE {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             }
         }
 
