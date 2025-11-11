@@ -150,3 +150,7 @@ Projects can include a `carrick.json` configuration file to help classify API ca
 - **serde/serde_json**: Serialization for data exchange
 - **reqwest**: HTTP client for Gemini API integration
 - **matchit**: Fast HTTP route matching for endpoint resolution
+
+## Safety Rules
+
+- **NEVER run Terraform deployment commands** such as `terraform apply`, `terraform destroy`, or any command that modifies infrastructure. Only read-only commands like `terraform plan`, `terraform validate`, or `terraform show` are allowed.
