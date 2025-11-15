@@ -177,11 +177,16 @@ CRITICAL:
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
     ) -> String {
-        // Strategy 1: Send only necessary data fields - convert to lean call sites
-        let lean_call_sites: Vec<LeanCallSite> = call_sites.iter().map(|cs| cs.into()).collect();
-
-        // Strategy 2: Minify JSON - use compact serialization without pretty printing
-        let call_sites_json = serde_json::to_string(&lean_call_sites).unwrap_or_default();
+        // In mock mode, pass full call sites so mock generator can classify properly
+        // In real mode, use lean call sites to reduce prompt size
+        let call_sites_json = if std::env::var("CARRICK_MOCK_ALL").is_ok() {
+            serde_json::to_string(call_sites).unwrap_or_default()
+        } else {
+            // Strategy 1: Send only necessary data fields - convert to lean call sites
+            let lean_call_sites: Vec<LeanCallSite> = call_sites.iter().map(|cs| cs.into()).collect();
+            // Strategy 2: Minify JSON - use compact serialization without pretty printing
+            serde_json::to_string(&lean_call_sites).unwrap_or_default()
+        };
         let frameworks_json = serde_json::to_string(framework_detection).unwrap_or_default();
 
         format!(
