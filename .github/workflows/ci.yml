@@ -50,8 +50,20 @@ jobs:
           cd ../test-multiple && npm install
           cd ../tests/fixtures/imported-routers && npm install
 
-      - name: Run tests
+      - name: Run all tests
         run: cargo test --verbose
+
+      - name: Run output contract tests
+        run: cargo test --test output_contract_test --verbose
+
+      - name: Run endpoint matching tests
+        run: cargo test --test endpoint_matching_test --verbose
+
+      - name: Run MockStorage tests
+        run: cargo test --test mock_storage_test --verbose
+
+      - name: Run dependency analysis tests
+        run: cargo test --test dependency_analysis_test --verbose
 
       - name: Run integration tests
         run: cargo test --test integration_test --verbose

@@ -271,3 +271,48 @@ We're now inviting developers to join our private beta. Here's how to get starte
 3. Once you have your key, follow the setup guide above to add the Carrick GitHub Action to your workflows
 
 As an early user, your feedback will be invaluable in shaping the future of the product. We're excited to build it with you.
+
+## Development
+
+### Running Tests
+
+Carrick has comprehensive test coverage with 43 tests covering:
+- Dependency conflict detection
+- API endpoint matching
+- Cloud storage workflows
+- Integration tests
+
+```bash
+# Run all tests
+CARRICK_API_ENDPOINT=https://test.example.com cargo test
+
+# Run specific test suite
+CARRICK_API_ENDPOINT=https://test.example.com cargo test --test endpoint_matching_test
+```
+
+### Pre-Commit Hook
+
+Install the pre-commit hook to automatically run tests before each commit:
+
+```bash
+./scripts/install-hooks.sh
+```
+
+This ensures all tests pass before code is committed, preventing broken commits.
+
+### Documentation
+
+- **Testing Strategy**: See `.thoughts/research/testing_strategy.md` for comprehensive testing documentation
+- **Architecture**: See `.thoughts/research/cloud_infrastructure.md` for AWS architecture details
+- **Type Checking**: See `.thoughts/research/ts_check.md` for TypeScript type system details
+
+### Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Install pre-commit hooks: `./scripts/install-hooks.sh`
+4. Make your changes
+5. Ensure tests pass: `cargo test`
+6. Submit a pull request
+
+All pull requests must pass the full test suite in CI.
