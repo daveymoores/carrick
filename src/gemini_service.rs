@@ -37,14 +37,9 @@ impl GeminiService {
         system_message: &str,
         response_schema: Option<serde_json::Value>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        // Skip API call in mock mode
+        // Skip API call in mock mode - return schema-appropriate mock data
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            return Ok(r#"{
-  "frameworks": ["express"],
-  "data_fetchers": ["axios"],
-  "notes": "Mock response for testing"
-}"#
-            .to_string());
+            return Ok(generate_mock_response(&response_schema, prompt));
         }
 
         // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
@@ -469,4 +464,349 @@ fn clean_response(text: &str) -> String {
         .filter(|line| !line.is_empty() && !line.starts_with("//"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Generate mock response based on schema type
+fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> String {
+    match schema {
+        Some(schema_val) => {
+            // Check if schema is for an array
+            if schema_val.get("type").and_then(|t| t.as_str()) == Some("ARRAY") {
+                // Check what kind of array based on the items schema
+                if let Some(items) = schema_val.get("items") {
+                    if let Some(props) = items.get("properties") {
+                        // Triage schema - has location, classification, confidence
+                        if props.get("classification").is_some() {
+                            return generate_mock_triage_response(prompt);
+                        }
+                        // Endpoint schema - has method, path, handler, node_name
+                        if props.get("node_name").is_some() && props.get("path").is_some() {
+                            return generate_mock_endpoint_response(prompt);
+                        }
+                        // Consumer schema - has library, url, method
+                        if props.get("library").is_some() {
+                            return generate_mock_consumer_response(prompt);
+                        }
+                        // Mount schema - has parent_node, child_node, mount_path
+                        if props.get("parent_node").is_some() && props.get("child_node").is_some() {
+                            return generate_mock_mount_response(prompt);
+                        }
+                        // Middleware schema - has middleware_type
+                        if props.get("middleware_type").is_some() {
+                            return generate_mock_middleware_response(prompt);
+                        }
+                    }
+                }
+                // Default array response
+                "[]".to_string()
+            } else {
+                // Framework detection or other object schema
+                r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#.to_string()
+            }
+        }
+        None => {
+            // No schema - return framework detection format
+            r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#.to_string()
+        }
+    }
+}
+
+/// Generate mock triage responses by extracting locations from prompt
+fn generate_mock_triage_response(prompt: &str) -> String {
+    // Parse the prompt to extract call site locations
+    let call_sites: Vec<serde_json::Value> = if let Some(start) = prompt.find("[{\"callee_object\"") {
+        if let Some(end) = prompt[start..].find("]\n") {
+            let json_str = &prompt[start..start + end + 1];
+            serde_json::from_str(json_str).unwrap_or_default()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    // Generate triage results for each call site
+    let triage_results: Vec<serde_json::Value> = call_sites
+        .iter()
+        .map(|cs| {
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+
+            // Simple heuristic for classification
+            let classification = if matches!(
+                callee_property,
+                "get" | "post" | "put" | "delete" | "patch"
+            ) {
+                "HttpEndpoint"
+            } else if callee_property == "use" {
+                // Check if it's a router mount or middleware
+                let args = cs.get("args").and_then(|a| a.as_array());
+                if args.map(|a| a.len()).unwrap_or(0) >= 2 {
+                    // Check if first arg is string and second is identifier
+                    let first_is_string = args
+                        .and_then(|a| a.first())
+                        .and_then(|arg| arg.get("arg_type"))
+                        .and_then(|t| t.as_str()) == Some("StringLiteral");
+                    let second_is_id = args
+                        .and_then(|a| a.get(1))
+                        .and_then(|arg| arg.get("arg_type"))
+                        .and_then(|t| t.as_str()) == Some("Identifier");
+                    
+                    if first_is_string && second_is_id {
+                        "RouterMount"
+                    } else {
+                        "Middleware"
+                    }
+                } else {
+                    "Middleware"
+                }
+            } else if matches!(callee_property, "json" | "urlencoded") {
+                "Middleware"
+            } else {
+                "Irrelevant"
+            };
+
+            serde_json::json!({
+                "location": location,
+                "classification": classification,
+                "confidence": 0.9
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&triage_results).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock endpoint responses
+fn generate_mock_endpoint_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+    let endpoints: Vec<serde_json::Value> = call_sites
+        .iter()
+        .filter_map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("app");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+            
+            // Extract path from args if available
+            let path = cs
+                .get("args")
+                .and_then(|args| args.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|arg| arg.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("/");
+
+            if matches!(
+                callee_property,
+                "get" | "post" | "put" | "delete" | "patch"
+            ) {
+                Some(serde_json::json!({
+                    "method": callee_property.to_uppercase(),
+                    "path": path,
+                    "handler": "handler",
+                    "node_name": callee_object,
+                    "location": location,
+                    "confidence": 0.9,
+                    "reasoning": "Mock endpoint extraction"
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    serde_json::to_string(&endpoints).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock consumer (data fetching) responses
+fn generate_mock_consumer_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+    let consumers: Vec<serde_json::Value> = call_sites
+        .iter()
+        .filter_map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("fetch");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+
+            // Check if it looks like an API call
+            if matches!(callee_object, "fetch" | "axios" | "response" | "resp") {
+                Some(serde_json::json!({
+                    "library": callee_object,
+                    "url": null,
+                    "method": callee_property.to_uppercase(),
+                    "location": location,
+                    "confidence": 0.8,
+                    "reasoning": "Mock data fetching call"
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    serde_json::to_string(&consumers).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock mount relationship responses  
+fn generate_mock_mount_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+    let mounts: Vec<serde_json::Value> = call_sites
+        .iter()
+        .filter_map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("app");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+            
+            // Extract path and router from args if it looks like app.use('/path', router)
+            let args = cs.get("args").and_then(|a| a.as_array());
+            if callee_property == "use" && args.map(|a| a.len()).unwrap_or(0) >= 2 {
+                // First arg should be the path (StringLiteral)
+                let first_arg_type = args
+                    .and_then(|a| a.first())
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str());
+                
+                // Second arg should be an identifier (the router)
+                let second_arg_type = args
+                    .and_then(|a| a.get(1))
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str());
+                
+                // Only consider it a mount if first arg is string and second is identifier
+                if first_arg_type == Some("StringLiteral") && second_arg_type == Some("Identifier") {
+                    let path = args
+                        .and_then(|a| a.first())
+                        .and_then(|arg| arg.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("/");
+                    let child = args
+                        .and_then(|a| a.get(1))
+                        .and_then(|arg| arg.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("router");
+
+                    return Some(serde_json::json!({
+                        "parent_node": callee_object,
+                        "child_node": child,
+                        "mount_path": path,
+                        "location": location,
+                        "confidence": 0.9,
+                        "reasoning": "Router mount detected via app.use(path, router)"
+                    }));
+                }
+            }
+            None
+        })
+        .collect();
+
+    serde_json::to_string(&mounts).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock middleware responses
+fn generate_mock_middleware_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+    let middleware: Vec<serde_json::Value> = call_sites
+        .iter()
+        .filter_map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("app");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+
+            // app.use with single argument or app.json/urlencoded = middleware
+            if callee_property == "use" || matches!(callee_property, "json" | "urlencoded" | "static") {
+                Some(serde_json::json!({
+                    "middleware_type": if callee_property == "json" { "body-parser" } else { "custom" },
+                    "path_prefix": null,
+                    "handler": callee_property,
+                    "node_name": callee_object,
+                    "location": location,
+                    "confidence": 0.8,
+                    "reasoning": "Mock middleware"
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    serde_json::to_string(&middleware).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Helper function to extract call sites from prompt JSON
+fn extract_call_sites_from_prompt(prompt: &str) -> Vec<serde_json::Value> {
+    // Try multiple search patterns for compact and pretty-printed JSON
+    let patterns = [
+        "[{\"callee_object\"",  // Compact JSON
+        "[\n  {\n    \"callee_object\"",  // Pretty-printed JSON
+        "[\n  {\n   \"callee_object\"",  // Alternative indentation
+    ];
+
+    for pattern in &patterns {
+        if let Some(start) = prompt.find(pattern) {
+            // Find matching closing bracket
+            if let Some(end_offset) = find_matching_bracket(&prompt[start..]) {
+                let json_str = &prompt[start..start + end_offset];
+                if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                    return parsed;
+                }
+            }
+        }
+    }
+    
+    vec![]
+}
+
+/// Find the matching closing bracket for a JSON array
+fn find_matching_bracket(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    
+    for (i, ch) in s.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '[' if !in_string => depth += 1,
+            ']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            },
+            _ => {}
+        }
+    }
+    None
 }

@@ -319,11 +319,10 @@ async fn analyze_current_repo(
     // 6. Extract types for current repo (critical for cross-repo type checking)
     extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
 
-    // 7. Run analysis to generate issues (critical for formatter output)
-    let analysis_results = analyzer.get_results();
-
-    // 8. Print formatted results with all issue categories
-    print_results(analysis_results);
+    // 7. Run analysis to generate issues (for cross-repo analysis)
+    // Note: Don't print here - will be printed at the end of cross-repo analysis
+    // let analysis_results = analyzer.get_results();
+    // print_results(analysis_results);
 
     // 9. Build CloudRepoData from analyzer (now with complete data + type extraction)
     let cloud_data = CloudRepoData {
