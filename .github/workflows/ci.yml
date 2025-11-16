@@ -50,9 +50,6 @@ jobs:
           cd ../test-multiple && npm install
           cd ../tests/fixtures/imported-routers && npm install
 
-      - name: Run all tests
-        run: cargo test --verbose
-
       - name: Run output contract tests
         run: cargo test --test output_contract_test --verbose
 
@@ -67,6 +64,9 @@ jobs:
 
       - name: Run integration tests
         run: cargo test --test integration_test --verbose
+
+      - name: Run library tests
+        run: cargo test --lib --verbose
 
   lint:
     name: Linting

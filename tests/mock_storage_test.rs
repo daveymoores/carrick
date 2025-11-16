@@ -268,10 +268,14 @@ async fn test_empty_org_returns_empty_or_mock_data() {
         .await
         .expect("Download should succeed even for empty org");
 
-    // Then: should return empty list or mock data
-    // MockStorage might add mock repos, so we just verify it doesn't crash
-    // The test passing means it didn't crash - no assertion needed
-    let _ = downloaded.len(); // Verify we can access the data
+    // Then: should return data without crashing
+    // MockStorage returns mock data for testing purposes (2 repos when result.len() <= 1)
+    // We verify the operation succeeds and returns the expected mock data
+    assert_eq!(
+        downloaded.len(),
+        2,
+        "MockStorage should return mock data for non-existent org"
+    );
 }
 
 #[tokio::test]
