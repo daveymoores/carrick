@@ -1,0 +1,46 @@
+{
+  "dependency_conflicts": [
+    {
+      "package_name": "express",
+      "versions": [
+        {
+          "repo": "repo-a",
+          "version": "5.0.0"
+        },
+        {
+          "repo": "repo-b",
+          "version": "4.18.0"
+        }
+      ],
+      "severity": "Critical"
+    },
+    {
+      "package_name": "react",
+      "versions": [
+        {
+          "repo": "repo-a",
+          "version": "18.3.0"
+        },
+        {
+          "repo": "repo-b",
+          "version": "18.2.0"
+        }
+      ],
+      "severity": "Warning"
+    },
+    {
+      "package_name": "lodash",
+      "versions": [
+        {
+          "repo": "repo-a",
+          "version": "4.17.22"
+        },
+        {
+          "repo": "repo-b",
+          "version": "4.17.21"
+        }
+      ],
+      "severity": "Info"
+    }
+  ]
+}

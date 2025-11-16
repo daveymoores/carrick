@@ -129,7 +129,7 @@ where
         for (i, repo_data) in all_repo_data.iter().enumerate() {
             if let Some(json_str) = extractor(repo_data) {
                 let temp_path = PathBuf::from(format!("/tmp/carrick_config_{}.json", i));
-                if let Err(_) = std::fs::write(&temp_path, json_str) {
+                if std::fs::write(&temp_path, json_str).is_err() {
                     continue;
                 }
                 temp_files.push(temp_path);
@@ -181,7 +181,6 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
 }
 
 /// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
-
 /// Extract file discovery and parsing logic from analyze_current_repo
 fn discover_and_parse_files(
     repo_path: &str,

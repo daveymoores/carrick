@@ -272,9 +272,9 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
                     repo_info.source_path.display()
                 ));
             }
-            output.push_str("\n");
+            output.push('\n');
         }
-        output.push_str("\n");
+        output.push('\n');
     }
 
     // Warning conflicts (minor version differences)
@@ -297,9 +297,9 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
                     repo_info.source_path.display()
                 ));
             }
-            output.push_str("\n");
+            output.push('\n');
         }
-        output.push_str("\n");
+        output.push('\n');
     }
 
     // Info conflicts (patch version differences)
@@ -322,7 +322,7 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
                     repo_info.source_path.display()
                 ));
             }
-            output.push_str("\n");
+            output.push('\n');
         }
     }
 
@@ -496,100 +496,6 @@ fn parse_structured_type_error(issue: &str) -> (String, String, String, String) 
     (endpoint, producer, consumer, error)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::{ApiAnalysisResult, ApiIssues};
-
-    #[test]
-    fn test_typescript_error_formatting() {
-        let type_mismatches = vec![
-            "GET /users/:param/comments: Type '{ userId: number; comments: Comment[]; }' is missing the following properties from type 'Comment[]': length, pop, push, concat, and 29 more.".to_string(),
-            "GET /users/:param: Type '{ commentsByUser: Comment[]; }' is missing the following properties from type 'User': id, name, role".to_string(),
-        ];
-
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches,
-            dependency_conflicts: vec![],
-        };
-
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-        };
-
-        let output = format_analysis_results(result);
-
-        // Check that the output contains the TypeScript error details
-        assert!(output.contains("TypeScript Error"));
-        assert!(output.contains("GET /users/:param/comments"));
-        assert!(output.contains("GET /users/:param"));
-        assert!(output.contains("TypeScript compiler error detected"));
-        assert!(output.contains("Type '{ userId: number; comments: Comment[]; }'"));
-        assert!(output.contains("Type '{ commentsByUser: Comment[]; }'"));
-    }
-
-    #[test]
-    fn test_structured_type_error_formatting() {
-        let type_mismatches = vec![
-            "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
-        ];
-
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches,
-            dependency_conflicts: vec![],
-        };
-
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-        };
-
-        let output = format_analysis_results(result);
-
-        // Check that the output contains the structured error details
-        assert!(output.contains("Type Compatibility Issue"));
-        assert!(output.contains("GET /api/users"));
-        assert!(output.contains("UserResponse"));
-        assert!(output.contains("User[]"));
-        assert!(output.contains("Property 'role' is missing"));
-    }
-
-    #[test]
-    fn test_no_issues_output() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-        };
-
-        let output = format_analysis_results(result);
-
-        // Check that no issues message is displayed
-        assert!(output.contains("No API inconsistencies detected"));
-        assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
-    }
-}
-
 fn separate_missing_orphaned(issues: &[String]) -> (Vec<String>, Vec<String>) {
     let mut missing = Vec::new();
     let mut orphaned = Vec::new();
@@ -683,4 +589,98 @@ fn extract_env_var_info(issue: &str) -> (String, String, String) {
     };
 
     (method.to_string(), env_vars.to_string(), path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{ApiAnalysisResult, ApiIssues};
+
+    #[test]
+    fn test_typescript_error_formatting() {
+        let type_mismatches = vec![
+            "GET /users/:param/comments: Type '{ userId: number; comments: Comment[]; }' is missing the following properties from type 'Comment[]': length, pop, push, concat, and 29 more.".to_string(),
+            "GET /users/:param: Type '{ commentsByUser: Comment[]; }' is missing the following properties from type 'User': id, name, role".to_string(),
+        ];
+
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches,
+            dependency_conflicts: vec![],
+        };
+
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+        };
+
+        let output = format_analysis_results(result);
+
+        // Check that the output contains the TypeScript error details
+        assert!(output.contains("TypeScript Error"));
+        assert!(output.contains("GET /users/:param/comments"));
+        assert!(output.contains("GET /users/:param"));
+        assert!(output.contains("TypeScript compiler error detected"));
+        assert!(output.contains("Type '{ userId: number; comments: Comment[]; }'"));
+        assert!(output.contains("Type '{ commentsByUser: Comment[]; }'"));
+    }
+
+    #[test]
+    fn test_structured_type_error_formatting() {
+        let type_mismatches = vec![
+            "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
+        ];
+
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches,
+            dependency_conflicts: vec![],
+        };
+
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+        };
+
+        let output = format_analysis_results(result);
+
+        // Check that the output contains the structured error details
+        assert!(output.contains("Type Compatibility Issue"));
+        assert!(output.contains("GET /api/users"));
+        assert!(output.contains("UserResponse"));
+        assert!(output.contains("User[]"));
+        assert!(output.contains("Property 'role' is missing"));
+    }
+
+    #[test]
+    fn test_no_issues_output() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+        };
+
+        let output = format_analysis_results(result);
+
+        // Check that no issues message is displayed
+        assert!(output.contains("No API inconsistencies detected"));
+        assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
+    }
 }
