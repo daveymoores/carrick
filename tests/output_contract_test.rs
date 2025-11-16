@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use swc_common::{sync::Lrc, SourceMap};
+use swc_common::{SourceMap, sync::Lrc};
 
 // Expected output structures matching our fixture JSON files
 #[derive(Debug, Deserialize, Serialize)]
@@ -65,10 +65,7 @@ fn severity_to_string(severity: &ConflictSeverity) -> String {
 }
 
 // Helper function to assert dependency conflicts match expected output
-fn assert_conflicts_match(
-    actual: &[DependencyConflict],
-    expected: &ExpectedDependencyConflicts,
-) {
+fn assert_conflicts_match(actual: &[DependencyConflict], expected: &ExpectedDependencyConflicts) {
     // Check we have the right number of conflicts
     assert_eq!(
         actual.len(),
@@ -79,10 +76,8 @@ fn assert_conflicts_match(
     );
 
     // Build a map of actual conflicts by package name for easier comparison
-    let actual_map: HashMap<String, &DependencyConflict> = actual
-        .iter()
-        .map(|c| (c.package_name.clone(), c))
-        .collect();
+    let actual_map: HashMap<String, &DependencyConflict> =
+        actual.iter().map(|c| (c.package_name.clone(), c)).collect();
 
     // Verify each expected conflict
     for expected_conflict in &expected.dependency_conflicts {

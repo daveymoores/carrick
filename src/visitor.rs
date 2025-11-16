@@ -44,7 +44,7 @@ pub enum Json {
     Number(f64),
     String(String),
     Array(Vec<Json>),
-    Object(Box<HashMap<String, Json>>),
+    Object(HashMap<String, Json>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -284,16 +284,12 @@ impl RouteExtractor for DependencyVisitor {
                 // Try to resolve the expression
                 match &**expr {
                     Expr::Ident(ident) => {
-                        if let Some(resolved) = self.resolve_variable(ident.sym.as_ref()) {
-                            // For now, just handle string literals in template expressions
-                            if let Expr::Lit(Lit::Str(str_lit)) = resolved {
-                                result.push_str(str_lit.value.as_ref());
-                            } else {
-                                // Can't fully resolve - return None
-                                return None;
-                            }
+                        if let Some(Expr::Lit(Lit::Str(str_lit))) =
+                            self.resolve_variable(ident.sym.as_ref())
+                        {
+                            result.push_str(str_lit.value.as_ref());
                         } else {
-                            // Can't resolve this variable
+                            // Can't fully resolve - return None
                             return None;
                         }
                     }

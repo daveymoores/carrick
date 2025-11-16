@@ -224,7 +224,8 @@ async fn test_concurrent_uploads() {
     for i in 0..5 {
         let storage_clone = storage.clone();
         let handle = tokio::spawn(async move {
-            let repo = create_test_repo_data(&format!("concurrent-repo-{}", i), &format!("hash{}", i));
+            let repo =
+                create_test_repo_data(&format!("concurrent-repo-{}", i), &format!("hash{}", i));
             storage_clone
                 .upload_repo_data("concurrent-org", &repo)
                 .await
@@ -269,11 +270,8 @@ async fn test_empty_org_returns_empty_or_mock_data() {
 
     // Then: should return empty list or mock data
     // MockStorage might add mock repos, so we just verify it doesn't crash
-    assert!(
-        true,
-        "Download from empty org should not crash (got {} repos)",
-        downloaded.len()
-    );
+    // The test passing means it didn't crash - no assertion needed
+    let _ = downloaded.len(); // Verify we can access the data
 }
 
 #[tokio::test]
@@ -307,7 +305,7 @@ async fn test_update_existing_repo() {
 
     // MockStorage currently appends, so we'll have 2 versions
     assert!(
-        versions.len() >= 1,
+        !versions.is_empty(),
         "Should have at least one version of the repo"
     );
 }

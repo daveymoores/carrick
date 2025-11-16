@@ -49,12 +49,12 @@ pub fn resolve_import_path(base_file: &Path, import_path: &str) -> Option<PathBu
         let base_dir = base_file.parent()?;
 
         // Remove leading "./" or "../" but keep the path structure
-        let normalized_path = if import_path.starts_with("./") {
-            &import_path[2..]
-        } else if import_path.starts_with("../") {
+        let normalized_path = if let Some(stripped) = import_path.strip_prefix("./") {
+            stripped
+        } else if let Some(stripped) = import_path.strip_prefix("../") {
             let mut dir_path = base_dir.to_path_buf();
             dir_path.pop(); // Go up one directory for ../
-            return resolve_import_path(&dir_path.join("dummy.js"), &import_path[3..]);
+            return resolve_import_path(&dir_path.join("dummy.js"), stripped);
         } else {
             import_path
         };

@@ -2,7 +2,7 @@ use carrick::analyzer::{Analyzer, ApiEndpointDetails};
 use carrick::config::Config;
 use carrick::visitor::OwnerType;
 use std::path::PathBuf;
-use swc_common::{sync::Lrc, SourceMap};
+use swc_common::{SourceMap, sync::Lrc};
 
 /// Helper function to create a test endpoint
 fn create_endpoint(route: &str, method: &str, file_path: &str) -> ApiEndpointDetails {
