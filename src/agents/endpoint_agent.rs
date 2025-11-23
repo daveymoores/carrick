@@ -51,8 +51,23 @@ impl EndpointAgent {
             .analyze_code_with_schema(&prompt, &system_message, Some(schema))
             .await?;
 
+        println!("=== RAW GEMINI ENDPOINT RESPONSE ===");
+        println!("{}", response);
+        println!("=== END RAW RESPONSE ===");
+
         let endpoints: Vec<HttpEndpoint> = serde_json::from_str(&response)
             .map_err(|e| format!("Failed to parse endpoint detection response: {}", e))?;
+
+        println!("Extracted {} endpoints:", endpoints.len());
+        for (i, endpoint) in endpoints.iter().enumerate() {
+            println!(
+                "  {}. {} {} (owner: {})",
+                i + 1,
+                endpoint.method,
+                endpoint.path,
+                endpoint.node_name
+            );
+        }
 
         Ok(endpoints)
     }
