@@ -1,0 +1,28 @@
+{
+  "endpoint_mismatches": [
+    {
+      "endpoint": "/api/users/:id",
+      "consumer_method": "DELETE",
+      "producer_methods": ["GET"],
+      "issue": "method_not_found"
+    },
+    {
+      "endpoint": "/api/users/:id",
+      "consumer_method": "PUT",
+      "producer_methods": ["GET"],
+      "issue": "method_not_found"
+    },
+    {
+      "endpoint": "/api/products",
+      "consumer_method": "GET",
+      "producer_methods": [],
+      "issue": "endpoint_not_found"
+    }
+  ],
+  "matching_endpoints": [
+    {
+      "endpoint": "/api/users",
+      "method": "GET"
+    }
+  ]
+}

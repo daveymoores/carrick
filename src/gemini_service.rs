@@ -506,7 +506,8 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
         }
         None => {
             // No schema - return framework detection format
-            r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#.to_string()
+            r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#
+                .to_string()
         }
     }
 }
@@ -514,7 +515,8 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
 /// Generate mock triage responses by extracting locations from prompt
 fn generate_mock_triage_response(prompt: &str) -> String {
     // Parse the prompt to extract call site locations
-    let call_sites: Vec<serde_json::Value> = if let Some(start) = prompt.find("[{\"callee_object\"") {
+    let call_sites: Vec<serde_json::Value> = if let Some(start) = prompt.find("[{\"callee_object\"")
+    {
         if let Some(end) = prompt[start..].find("]\n") {
             let json_str = &prompt[start..start + end + 1];
             serde_json::from_str(json_str).unwrap_or_default()
@@ -536,38 +538,38 @@ fn generate_mock_triage_response(prompt: &str) -> String {
                 .unwrap_or("");
 
             // Simple heuristic for classification
-            let classification = if matches!(
-                callee_property,
-                "get" | "post" | "put" | "delete" | "patch"
-            ) {
-                "HttpEndpoint"
-            } else if callee_property == "use" {
-                // Check if it's a router mount or middleware
-                let args = cs.get("args").and_then(|a| a.as_array());
-                if args.map(|a| a.len()).unwrap_or(0) >= 2 {
-                    // Check if first arg is string and second is identifier
-                    let first_is_string = args
-                        .and_then(|a| a.first())
-                        .and_then(|arg| arg.get("arg_type"))
-                        .and_then(|t| t.as_str()) == Some("StringLiteral");
-                    let second_is_id = args
-                        .and_then(|a| a.get(1))
-                        .and_then(|arg| arg.get("arg_type"))
-                        .and_then(|t| t.as_str()) == Some("Identifier");
-                    
-                    if first_is_string && second_is_id {
-                        "RouterMount"
+            let classification =
+                if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
+                    "HttpEndpoint"
+                } else if callee_property == "use" {
+                    // Check if it's a router mount or middleware
+                    let args = cs.get("args").and_then(|a| a.as_array());
+                    if args.map(|a| a.len()).unwrap_or(0) >= 2 {
+                        // Check if first arg is string and second is identifier
+                        let first_is_string = args
+                            .and_then(|a| a.first())
+                            .and_then(|arg| arg.get("arg_type"))
+                            .and_then(|t| t.as_str())
+                            == Some("StringLiteral");
+                        let second_is_id = args
+                            .and_then(|a| a.get(1))
+                            .and_then(|arg| arg.get("arg_type"))
+                            .and_then(|t| t.as_str())
+                            == Some("Identifier");
+
+                        if first_is_string && second_is_id {
+                            "RouterMount"
+                        } else {
+                            "Middleware"
+                        }
                     } else {
                         "Middleware"
                     }
-                } else {
+                } else if matches!(callee_property, "json" | "urlencoded") {
                     "Middleware"
-                }
-            } else if matches!(callee_property, "json" | "urlencoded") {
-                "Middleware"
-            } else {
-                "Irrelevant"
-            };
+                } else {
+                    "Irrelevant"
+                };
 
             serde_json::json!({
                 "location": location,
@@ -595,7 +597,7 @@ fn generate_mock_endpoint_response(prompt: &str) -> String {
                 .and_then(|o| o.as_str())
                 .unwrap_or("app");
             let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
-            
+
             // Extract path from args if available
             let path = cs
                 .get("args")
@@ -605,10 +607,7 @@ fn generate_mock_endpoint_response(prompt: &str) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("/");
 
-            if matches!(
-                callee_property,
-                "get" | "post" | "put" | "delete" | "patch"
-            ) {
+            if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
                 Some(serde_json::json!({
                     "method": callee_property.to_uppercase(),
                     "path": path,
@@ -677,7 +676,7 @@ fn generate_mock_mount_response(prompt: &str) -> String {
                 .and_then(|o| o.as_str())
                 .unwrap_or("app");
             let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
-            
+
             // Extract path and router from args if it looks like app.use('/path', router)
             let args = cs.get("args").and_then(|a| a.as_array());
             if callee_property == "use" && args.map(|a| a.len()).unwrap_or(0) >= 2 {
@@ -686,15 +685,16 @@ fn generate_mock_mount_response(prompt: &str) -> String {
                     .and_then(|a| a.first())
                     .and_then(|arg| arg.get("arg_type"))
                     .and_then(|t| t.as_str());
-                
+
                 // Second arg should be an identifier (the router)
                 let second_arg_type = args
                     .and_then(|a| a.get(1))
                     .and_then(|arg| arg.get("arg_type"))
                     .and_then(|t| t.as_str());
-                
+
                 // Only consider it a mount if first arg is string and second is identifier
-                if first_arg_type == Some("StringLiteral") && second_arg_type == Some("Identifier") {
+                if first_arg_type == Some("StringLiteral") && second_arg_type == Some("Identifier")
+                {
                     let path = args
                         .and_then(|a| a.first())
                         .and_then(|arg| arg.get("value"))
@@ -763,8 +763,8 @@ fn generate_mock_middleware_response(prompt: &str) -> String {
 fn extract_call_sites_from_prompt(prompt: &str) -> Vec<serde_json::Value> {
     // Try multiple search patterns for compact and pretty-printed JSON
     let patterns = [
-        "[{\"callee_object\"",  // Compact JSON
-        "[\n  {\n    \"callee_object\"",  // Pretty-printed JSON
+        "[{\"callee_object\"",           // Compact JSON
+        "[\n  {\n    \"callee_object\"", // Pretty-printed JSON
         "[\n  {\n   \"callee_object\"",  // Alternative indentation
     ];
 
@@ -779,7 +779,7 @@ fn extract_call_sites_from_prompt(prompt: &str) -> Vec<serde_json::Value> {
             }
         }
     }
-    
+
     vec![]
 }
 
@@ -788,13 +788,13 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
     let mut depth = 0;
     let mut in_string = false;
     let mut escape_next = false;
-    
+
     for (i, ch) in s.char_indices() {
         if escape_next {
             escape_next = false;
             continue;
         }
-        
+
         match ch {
             '\\' if in_string => escape_next = true,
             '"' => in_string = !in_string,
@@ -804,7 +804,7 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
                 if depth == 0 {
                     return Some(i + 1);
                 }
-            },
+            }
             _ => {}
         }
     }

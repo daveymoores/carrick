@@ -155,7 +155,7 @@ impl Analyzer {
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
         self.all_repo_packages.insert(repo_name, packages);
     }
-    
+
     pub fn set_framework_detection(&mut self, frameworks: Vec<String>, data_fetchers: Vec<String>) {
         self.detected_frameworks = frameworks;
         self.detected_data_fetchers = data_fetchers;
@@ -303,7 +303,9 @@ impl Analyzer {
             all_async_contexts,
             &self.detected_frameworks,
             &self.detected_data_fetchers,
-        ).await {
+        )
+        .await
+        {
             Ok(calls) => calls,
             Err(e) => {
                 eprintln!("Failed to extract calls from async expressions: {}", e);

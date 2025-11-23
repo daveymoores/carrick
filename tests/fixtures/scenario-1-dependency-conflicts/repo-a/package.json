@@ -1,0 +1,9 @@
+{
+  "name": "repo-a",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^5.0.0",
+    "react": "^18.3.0",
+    "lodash": "^4.17.22"
+  }
+}

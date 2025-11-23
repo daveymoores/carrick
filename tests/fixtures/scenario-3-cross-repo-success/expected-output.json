@@ -1,0 +1,23 @@
+{
+  "dependency_conflicts": [],
+  "endpoint_mismatches": [],
+  "matching_endpoints": [
+    {
+      "endpoint": "/api/users",
+      "method": "GET",
+      "producer": "repo-a",
+      "consumers": ["repo-b", "repo-c"]
+    },
+    {
+      "endpoint": "/api/products",
+      "method": "GET",
+      "producer": "repo-b",
+      "consumers": ["repo-c"]
+    }
+  ],
+  "summary": {
+    "total_repos": 3,
+    "total_endpoints": 2,
+    "total_conflicts": 0
+  }
+}

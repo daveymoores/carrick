@@ -2,17 +2,12 @@ extern crate swc_common;
 extern crate swc_ecma_parser;
 use derivative::Derivative;
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-};
+use std::{collections::HashMap, path::PathBuf};
 use swc_common::{SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::{
-    extractor::{CoreExtractor, RouteExtractor},
-};
+use crate::extractor::{CoreExtractor, RouteExtractor};
 extern crate regex;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -542,7 +537,7 @@ impl Visit for DependencyVisitor {
     fn visit_call_expr(&mut self, call: &CallExpr) {
         // Extract all function definitions from arguments (including anonymous functions)
         self.extract_functions_from_call_args(call);
-        
+
         // Continue visiting children to catch nested calls
         call.visit_children_with(self);
     }
@@ -579,13 +574,13 @@ impl DependencyVisitor {
     fn extract_functions_from_call_args(&mut self, call: &CallExpr) {
         // Generate a unique context name for this call site
         let call_context = self.generate_call_context_name(call);
-        
+
         // Check each argument for function expressions (callbacks, handlers, etc.)
         for (i, arg) in call.args.iter().enumerate() {
             self.extract_function_from_arg(&arg.expr, &format!("{}_{}", call_context, i));
         }
     }
-    
+
     // Generate a context name for a call site based on its location and structure
     fn generate_call_context_name(&self, call: &CallExpr) -> String {
         match &call.callee {
@@ -593,8 +588,12 @@ impl DependencyVisitor {
                 match &**callee_expr {
                     Expr::Member(member) => {
                         // For member calls like obj.method(), use obj_method format
-                        let obj_name = self.extract_object_name(&member.obj).unwrap_or("unknown".to_string());
-                        let method_name = self.extract_property_name(&member.prop).unwrap_or("unknown".to_string());
+                        let obj_name = self
+                            .extract_object_name(&member.obj)
+                            .unwrap_or("unknown".to_string());
+                        let method_name = self
+                            .extract_property_name(&member.prop)
+                            .unwrap_or("unknown".to_string());
                         format!("{}_{}", obj_name, method_name)
                     }
                     Expr::Ident(ident) => {
@@ -607,21 +606,25 @@ impl DependencyVisitor {
             _ => "unknown_call".to_string(),
         }
     }
-    
+
     // Extract object name from an expression
     fn extract_object_name(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Ident(ident) => Some(ident.sym.to_string()),
             Expr::Member(member) => {
                 // For nested member access like app.router.use, get the full path
-                let obj = self.extract_object_name(&member.obj).unwrap_or("unknown".to_string());
-                let prop = self.extract_property_name(&member.prop).unwrap_or("unknown".to_string());
+                let obj = self
+                    .extract_object_name(&member.obj)
+                    .unwrap_or("unknown".to_string());
+                let prop = self
+                    .extract_property_name(&member.prop)
+                    .unwrap_or("unknown".to_string());
                 Some(format!("{}.{}", obj, prop))
             }
             _ => None,
         }
     }
-    
+
     // Extract property name from a member property
     fn extract_property_name(&self, prop: &MemberProp) -> Option<String> {
         match prop {
@@ -671,7 +674,6 @@ impl DependencyVisitor {
             _ => {}
         }
     }
-
 
     // Extract string literal from expressions like "string", `template`, etc.
     fn extract_string_from_expr(&self, expr: &Expr) -> Option<String> {

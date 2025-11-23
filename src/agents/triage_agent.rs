@@ -183,7 +183,8 @@ CRITICAL:
             serde_json::to_string(call_sites).unwrap_or_default()
         } else {
             // Strategy 1: Send only necessary data fields - convert to lean call sites
-            let lean_call_sites: Vec<LeanCallSite> = call_sites.iter().map(|cs| cs.into()).collect();
+            let lean_call_sites: Vec<LeanCallSite> =
+                call_sites.iter().map(|cs| cs.into()).collect();
             // Strategy 2: Minify JSON - use compact serialization without pretty printing
             serde_json::to_string(&lean_call_sites).unwrap_or_default()
         };
