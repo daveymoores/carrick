@@ -111,17 +111,42 @@ impl MultiAgentOrchestrator {
         let mut extraction_service = CallSiteExtractionService::new();
         let mut extractors = Vec::new();
 
+        println!("DEBUG: Parsing {} files", files.len());
         for file_path in files {
             if let Some(module) = parse_file(file_path, &self.source_map, &handler) {
                 let mut extractor =
                     CallSiteExtractor::new(file_path.clone(), self.source_map.clone());
                 swc_ecma_visit::VisitWith::visit_with(&module, &mut extractor);
+                println!(
+                    "DEBUG: File {:?} - extracted {} call sites",
+                    file_path,
+                    extractor.call_sites.len()
+                );
                 extractors.push(extractor);
+            } else {
+                println!("DEBUG: Failed to parse file {:?}", file_path);
             }
         }
 
         extraction_service.extract_from_visitors(extractors);
-        Ok(extraction_service.get_call_sites().to_vec())
+        let call_sites = extraction_service.get_call_sites().to_vec();
+        println!(
+            "DEBUG: Total call sites after aggregation: {}",
+            call_sites.len()
+        );
+        if !call_sites.is_empty() {
+            println!("DEBUG: Sample call sites (first 3):");
+            for (i, site) in call_sites.iter().take(3).enumerate() {
+                println!(
+                    "  {}. {}.{}() at {}",
+                    i + 1,
+                    site.callee_object,
+                    site.callee_property,
+                    site.location
+                );
+            }
+        }
+        Ok(call_sites)
     }
 
     fn print_analysis_summary(&self, analysis_results: &AnalysisResults) {

@@ -50,8 +50,23 @@ impl MountAgent {
             .analyze_code_with_schema(&prompt, &system_message, Some(schema))
             .await?;
 
+        println!("=== RAW GEMINI MOUNT RESPONSE ===");
+        println!("{}", response);
+        println!("=== END RAW RESPONSE ===");
+
         let mounts: Vec<MountRelationship> = serde_json::from_str(&response)
             .map_err(|e| format!("Failed to parse mount detection response: {}", e))?;
+
+        println!("Extracted {} mount relationships:", mounts.len());
+        for (i, mount) in mounts.iter().enumerate() {
+            println!(
+                "  {}. {} mounts {} at {}",
+                i + 1,
+                mount.parent_node,
+                mount.child_node,
+                mount.mount_path
+            );
+        }
 
         Ok(mounts)
     }
