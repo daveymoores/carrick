@@ -123,9 +123,13 @@ Return JSON array with this structure:
 GUIDELINES:
 - These are all data fetching calls (already triaged)
 - Extract URL from string literals in arguments if present, otherwise set to null
+- If arguments are Identifiers, check the "resolved_value" field for the actual string value
+- If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
+- Infer HTTP method from function name (get=GET, post=POST, etc.)
 - Infer HTTP method from function name (get=GET, post=POST, etc.)
 - For response parsing calls (.json(), .text()), use "response_parsing" as library
 - For direct HTTP client calls (axios.get, fetch), extract the client library name
+- If callee_object is "global", the library name is the callee_property (e.g., "fetch")
 - Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#,
             frameworks_json, call_sites_json
         )

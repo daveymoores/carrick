@@ -144,6 +144,9 @@ GUIDELINES:
 - Extract parent_node from callee_object field
 - Extract child_node from the second argument (usually an Identifier)
 - Extract mount_path from the first argument (usually a StringLiteral)
+- If arguments are Identifiers, check the "resolved_value" field for the actual string value
+- If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
+- Common patterns:
 - Common patterns:
   - app.use('/path', router) -> parent: app, child: router, path: /path
   - router.use('/path', subRouter) -> parent: router, child: subRouter, path: /path

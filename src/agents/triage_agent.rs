@@ -154,7 +154,7 @@ CATEGORIES:
 - DataFetchingCall: Outbound API calls (fetch, axios, response.json, etc.)
 - Middleware: Middleware registration (app.use with single argument)
 - RouterMount: Router mounting (app.use('/path', router))
-- Irrelevant: Everything else (Array methods, console.log, etc.)
+- Irrelevant: Everything else (Array methods, console.log, etc.) AND response methods (res.send, res.json, res.status)
 
 REQUIRED JSON FORMAT:
 [
@@ -204,7 +204,7 @@ For each call site, assign it to one of these categories:
 - DataFetchingCall: Makes outbound API calls or fetches data
 - Middleware: Registers middleware or interceptors (single argument)
 - RouterMount: Mounts routers or sub-applications (two arguments: path + router)
-- Irrelevant: Utility functions, logging, Array methods, etc.
+- Irrelevant: Utility functions, logging, Array methods, and response methods (res.send, res.json, etc.)
 
 Return JSON array with this structure:
 [
@@ -224,7 +224,7 @@ Return JSON array with this structure:
 GUIDELINES:
 - Use the framework context to understand what libraries are in use
 - app.get('/path', handler) = HttpEndpoint
-- fetch('url') or axios.get() = DataFetchingCall
+- fetch('url') (global.fetch) or axios.get() = DataFetchingCall
 - response.json() or resp.text() = DataFetchingCall (parsing API responses)
 - app.use(singleMiddleware) = Middleware
 - app.use('/path', router) = RouterMount (path + router/sub-app)
