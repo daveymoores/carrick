@@ -14,6 +14,9 @@ pub struct HttpEndpoint {
     pub location: String,
     pub confidence: f32,
     pub reasoning: String,
+    pub response_type_file: Option<String>,
+    pub response_type_position: Option<u32>,
+    pub response_type_string: Option<String>,
 }
 
 /// Specialized agent for detecting HTTP endpoints (routes)
@@ -82,12 +85,18 @@ EXTRACTION GOALS:
 - Route path (e.g., "/users", "/users/:id", "/api/v1/orders")
 - Handler function name (or "anonymous" if inline function)
 - Location information
+- Response Type Information (CRITICAL for type checking):
+  - Identify the return type of the handler (e.g., `Response<User[]>`)
+  - Extract the file path where the type is used
+  - Estimate the start position (character index) of the type annotation
+  - Extract the type string itself
 
 CRITICAL REQUIREMENTS:
 1. Return ONLY valid JSON array
 2. Extract details from ALL provided call sites (they're all endpoints)
 3. Set confidence based on how clearly you can extract the details
 4. Provide brief reasoning for each extraction
+5. For response types, look for `res: Response<Type>` annotations in Express handlers.
 
 NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
     }
@@ -114,6 +123,7 @@ For each endpoint call site, extract:
 2. Route path (e.g., "/users", "/users/:id", "/api/v1/orders")
 3. Handler function name (or "anonymous" if unnamed)
 4. File location
+5. Response Type Info (file, position, string) - look for `res: Response<T>`
 
 Return JSON array with this structure:
 [
@@ -124,7 +134,10 @@ Return JSON array with this structure:
     "node_name": "app",
     "location": "server.ts:46:0",
     "confidence": 0.95,
-    "reasoning": "Express route handler with path parameter"
+    "reasoning": "Express route handler with path parameter",
+    "response_type_file": "server.ts",
+    "response_type_position": 1250,
+    "response_type_string": "Response<UserProfile>"
   }},
   ...
 ]

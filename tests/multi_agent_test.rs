@@ -24,10 +24,12 @@ async fn test_multi_agent_orchestrator_mock_mode() {
                 CallArgument {
                     arg_type: ArgumentType::StringLiteral,
                     value: Some("/users".to_string()),
+                    resolved_value: None,
                 },
                 CallArgument {
                     arg_type: ArgumentType::Identifier,
                     value: Some("userRouter".to_string()),
+                    resolved_value: None,
                 },
             ],
             definition: Some("const app = express()".to_string()),
@@ -41,10 +43,12 @@ async fn test_multi_agent_orchestrator_mock_mode() {
                 CallArgument {
                     arg_type: ArgumentType::StringLiteral,
                     value: Some("/posts".to_string()),
+                    resolved_value: None,
                 },
                 CallArgument {
                     arg_type: ArgumentType::FunctionExpression,
                     value: None,
+                    resolved_value: None,
                 },
             ],
             definition: Some("const router = Router()".to_string()),
@@ -57,6 +61,7 @@ async fn test_multi_agent_orchestrator_mock_mode() {
             args: vec![CallArgument {
                 arg_type: ArgumentType::Other,
                 value: None,
+                resolved_value: None,
             }],
             definition: Some("const app = express()".to_string()),
             location: "app.ts:7:0".to_string(),
@@ -110,6 +115,9 @@ fn test_mount_graph_construction() {
                 location: "routes/api.ts:6:0".to_string(),
                 confidence: 0.9,
                 reasoning: "Test endpoint".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
             HttpEndpoint {
                 method: "GET".to_string(),
@@ -119,6 +127,9 @@ fn test_mount_graph_construction() {
                 location: "routes/users.ts:6:0".to_string(),
                 confidence: 0.9,
                 reasoning: "Test endpoint".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
         ],
         data_fetching_calls: vec![],
@@ -224,4 +235,81 @@ async fn test_empty_call_sites() {
     assert_eq!(result.endpoints.len(), 0);
     assert_eq!(result.data_fetching_calls.len(), 0);
     assert_eq!(result.mount_relationships.len(), 0);
+}
+
+/// Test extraction of type information from analysis results
+#[test]
+fn test_type_extraction_from_analysis() {
+    use carrick::agents::{DataFetchingCall, HttpEndpoint};
+    use carrick::multi_agent_orchestrator::MultiAgentOrchestrator;
+    use swc_common::SourceMap;
+    use swc_common::sync::Lrc;
+
+    // Create orchestrator (mock service, real sourcemap)
+    let cm: Lrc<SourceMap> = Default::default();
+    let orchestrator = MultiAgentOrchestrator::new("mock_key".to_string(), cm);
+
+    // Create mock analysis results with type info
+    let analysis_results = AnalysisResults {
+        endpoints: vec![HttpEndpoint {
+            method: "GET".to_string(),
+            path: "/users".to_string(),
+            handler: "getUsers".to_string(),
+            node_name: "app".to_string(),
+            location: "server.ts:10:0".to_string(),
+            confidence: 1.0,
+            reasoning: "Test".to_string(),
+            response_type_file: Some("server.ts".to_string()),
+            response_type_position: Some(100),
+            response_type_string: Some("User[]".to_string()),
+        }],
+        data_fetching_calls: vec![DataFetchingCall {
+            library: "fetch".to_string(),
+            url: Some("/api/products".to_string()),
+            method: Some("GET".to_string()),
+            location: "client.ts:20:0".to_string(),
+            confidence: 1.0,
+            reasoning: "Test".to_string(),
+            expected_type_file: Some("client.ts".to_string()),
+            expected_type_position: Some(200),
+            expected_type_string: Some("Product[]".to_string()),
+        }],
+        middleware: vec![],
+        mount_relationships: vec![],
+        triage_stats: carrick::agents::TriageStats::default(),
+    };
+
+    // Run extraction
+    let type_infos = orchestrator.extract_types_from_analysis(&analysis_results);
+
+    // Verify results
+    assert_eq!(type_infos.len(), 2, "Should extract 2 types");
+
+    // Check endpoint type (Producer)
+    let producer_type = type_infos
+        .iter()
+        .find(|t| t["filePath"] == "server.ts")
+        .expect("Should find producer type");
+    assert_eq!(producer_type["startPosition"], 100);
+    assert_eq!(producer_type["compositeTypeString"], "User[]");
+    assert!(
+        producer_type["alias"]
+            .as_str()
+            .unwrap()
+            .contains("GetUsersResponseProducer")
+    );
+
+    // Check call type (Consumer)
+    let consumer_type = type_infos
+        .iter()
+        .find(|t| t["filePath"] == "client.ts")
+        .expect("Should find consumer type");
+    assert_eq!(consumer_type["startPosition"], 200);
+    assert_eq!(consumer_type["compositeTypeString"], "Product[]");
+    assert!(
+        consumer_type["alias"]
+            .as_str()
+            .unwrap()
+            .contains("GetApiProductsResponseConsumer")
+    );
 }

@@ -13,6 +13,9 @@ pub struct DataFetchingCall {
     pub location: String,
     pub confidence: f32,
     pub reasoning: String,
+    pub expected_type_file: Option<String>,
+    pub expected_type_position: Option<u32>,
+    pub expected_type_string: Option<String>,
 }
 
 /// Specialized agent for detecting outbound API/data fetching calls
@@ -66,12 +69,18 @@ EXTRACTION GOALS:
 - URL being called (if detectable from string literals)
 - HTTP method (if detectable)
 - Location information
+- Expected Response Type (CRITICAL for type checking):
+  - Identify the type expected from the API call (e.g., `const data: User[] = await ...`)
+  - Extract the file path where the type is used
+  - Estimate the start position (character index) of the type annotation
+  - Extract the type string itself
 
 CRITICAL REQUIREMENTS:
 1. Return ONLY valid JSON array
 2. Extract details from ALL provided call sites (they're all data fetching calls)
 3. Set confidence based on how clearly you can extract the details
 4. Provide brief reasoning for each extraction
+5. For expected types, look for variable type annotations (`const x: Type = ...`) or generic calls (`axios.get<Type>(...)`).
 
 NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
     }
@@ -98,6 +107,7 @@ For each data fetching call site, extract:
 2. URL being called (if detectable from string literals)
 3. HTTP method (GET, POST, etc. if detectable)
 4. File location
+5. Expected Response Type Info (file, position, string)
 
 Return JSON array with this structure:
 [
@@ -107,7 +117,10 @@ Return JSON array with this structure:
     "method": "GET",
     "location": "server.ts:58:11",
     "confidence": 0.95,
-    "reasoning": "Direct fetch call with URL"
+    "reasoning": "Direct fetch call with URL",
+    "expected_type_file": "server.ts",
+    "expected_type_position": 850,
+    "expected_type_string": "Order[]"
   }},
   {{
     "library": "axios",
@@ -115,7 +128,10 @@ Return JSON array with this structure:
     "method": "POST",
     "location": "api.ts:23:5",
     "confidence": 0.85,
-    "reasoning": "Axios POST method call"
+    "reasoning": "Axios POST method call",
+    "expected_type_file": null,
+    "expected_type_position": null,
+    "expected_type_string": null
   }},
   ...
 ]

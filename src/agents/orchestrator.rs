@@ -24,7 +24,7 @@ pub struct AnalysisResults {
 }
 
 /// Statistics from the triage process
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TriageStats {
     pub total_call_sites: usize,
     pub endpoints_count: usize,

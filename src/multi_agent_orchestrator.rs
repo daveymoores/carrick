@@ -198,6 +198,81 @@ impl MultiAgentOrchestrator {
             mount_relationships: mount_graph.get_mounts().to_vec(),
         }
     }
+
+    /// Extract type information from agent analysis results for type checking
+    pub fn extract_types_from_analysis(
+        &self,
+        analysis_results: &AnalysisResults,
+    ) -> Vec<serde_json::Value> {
+        use crate::analyzer::Analyzer;
+        let mut type_infos = Vec::new();
+
+        // 1. Extract types from endpoints (Producers)
+        for endpoint in &analysis_results.endpoints {
+            if let (Some(file), Some(pos), Some(type_str)) = (
+                &endpoint.response_type_file,
+                endpoint.response_type_position,
+                &endpoint.response_type_string,
+            ) {
+                let alias = Analyzer::generate_common_type_alias_name(
+                    &endpoint.path,
+                    &endpoint.method,
+                    false, // is_request_type (false = response)
+                    false, // is_consumer (false = producer)
+                );
+
+                type_infos.push(serde_json::json!({
+                    "filePath": file,
+                    "startPosition": pos,
+                    "compositeTypeString": type_str,
+                    "alias": alias
+                }));
+            }
+        }
+
+        // 2. Extract types from data fetching calls (Consumers)
+        // Group calls by (url, method) to assign call numbers matching Analyzer logic
+        let mut calls_by_endpoint: HashMap<(String, String), u32> = HashMap::new();
+
+        for call in &analysis_results.data_fetching_calls {
+            // Skip calls without URL or method or type info
+            let url = match &call.url {
+                Some(u) => u,
+                None => continue,
+            };
+            let method = match &call.method {
+                Some(m) => m,
+                None => continue,
+            };
+
+            if let (Some(file), Some(pos), Some(type_str)) = (
+                &call.expected_type_file,
+                call.expected_type_position,
+                &call.expected_type_string,
+            ) {
+                // Increment call counter for this endpoint
+                let counter = calls_by_endpoint
+                    .entry((url.clone(), method.clone()))
+                    .or_insert(0);
+                *counter += 1;
+
+                let alias = Analyzer::generate_unique_call_alias_name(
+                    url, method, false,    // is_request_type (false = response)
+                    *counter, // call_number
+                    true,     // is_consumer (true = consumer)
+                );
+
+                type_infos.push(serde_json::json!({
+                    "filePath": file,
+                    "startPosition": pos,
+                    "compositeTypeString": type_str,
+                    "alias": alias
+                }));
+            }
+        }
+
+        type_infos
+    }
 }
 
 /// Analysis result in a format compatible with existing systems

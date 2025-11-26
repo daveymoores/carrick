@@ -292,6 +292,10 @@ async fn analyze_current_repo(
         .run_complete_analysis(files, &packages, &all_imported_symbols)
         .await?;
 
+    // Extract types from agent analysis results
+    let agent_type_infos =
+        orchestrator.extract_types_from_analysis(&analysis_result.analysis_results);
+
     // 5. Create an Analyzer and populate it with the orchestrator results
     let mut analyzer = Analyzer::new(config.clone(), cm);
 
@@ -317,7 +321,7 @@ async fn analyze_current_repo(
     analyzer.build_endpoint_router();
 
     // 6. Extract types for current repo (critical for cross-repo type checking)
-    extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
+    extract_types_for_current_repo(&analyzer, repo_path, &packages, agent_type_infos)?;
 
     // 7. Run analysis to generate issues (for cross-repo analysis)
     // Note: Don't print here - will be printed at the end of cross-repo analysis
@@ -428,6 +432,7 @@ fn extract_types_for_current_repo(
     analyzer: &Analyzer,
     repo_path: &str,
     packages: &Packages,
+    agent_type_infos: Vec<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     let mut repo_type_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
@@ -447,7 +452,12 @@ fn extract_types_for_current_repo(
 
     // Collect type information from Gemini-extracted fetch_calls
     let gemini_type_infos = analyzer.collect_type_infos_from_calls(analyzer.fetch_calls());
-    for type_info in gemini_type_infos {
+
+    // Combine Gemini async types AND Agent types
+    for type_info in gemini_type_infos
+        .into_iter()
+        .chain(agent_type_infos.into_iter())
+    {
         let file_path = type_info["filePath"].as_str().unwrap_or("");
         let repo_prefix =
             analyzer.extract_repo_prefix_from_file_path(&PathBuf::from(file_path), &repo_paths);
