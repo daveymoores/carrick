@@ -80,6 +80,21 @@ impl AgentSchemas {
                     "reasoning": {
                         "type": "STRING",
                         "description": "Brief explanation of the extraction"
+                    },
+                    "response_type_file": {
+                        "type": "STRING",
+                        "nullable": true,
+                        "description": "File path containing the response type definition"
+                    },
+                    "response_type_position": {
+                        "type": "NUMBER",
+                        "nullable": true,
+                        "description": "Start position (index) of the response type definition in the file"
+                    },
+                    "response_type_string": {
+                        "type": "STRING",
+                        "nullable": true,
+                        "description": "The type string itself (e.g. 'User[]', 'Response<Order>')"
                     }
                 },
                 "required": ["method", "path", "handler", "node_name", "location", "confidence", "reasoning"]
@@ -121,6 +136,21 @@ impl AgentSchemas {
                     "reasoning": {
                         "type": "STRING",
                         "description": "Brief explanation of the extraction"
+                    },
+                    "expected_type_file": {
+                        "type": "STRING",
+                        "nullable": true,
+                        "description": "File path containing the expected response type definition"
+                    },
+                    "expected_type_position": {
+                        "type": "NUMBER",
+                        "nullable": true,
+                        "description": "Start position (index) of the expected response type definition in the file"
+                    },
+                    "expected_type_string": {
+                        "type": "STRING",
+                        "nullable": true,
+                        "description": "The type string expected (e.g. 'User[]')"
                     }
                 },
                 "required": ["library", "url", "method", "location", "confidence", "reasoning"]
