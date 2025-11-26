@@ -550,6 +550,7 @@ mod tests {
                 callee_property: callee_property.to_string(),
                 args: vec![CallArgument {
                     value: Some("/test".to_string()),
+                    resolved_value: None,
                     arg_type: ArgumentType::StringLiteral,
                 }],
                 definition,

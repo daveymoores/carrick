@@ -132,6 +132,9 @@ Return JSON array with this structure:
 GUIDELINES:
 - These are all HTTP endpoint definitions (already triaged)
 - Extract the actual path string from string literals in arguments
+- If an argument is an Identifier, use the "resolved_value" field if available to find the actual path string
+- If an argument is a TemplateLiteral, use the "value" field which contains the reconstructed template string
+- Extract node_name from the callee_object field (e.g., "app", "router", "fastify")
 - Extract node_name from the callee_object field (e.g., "app", "router", "fastify")
 - If handler is an inline function, use "anonymous"
 - If handler is a variable reference, use the variable name
