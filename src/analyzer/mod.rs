@@ -8,6 +8,7 @@ use crate::{
     app_context::AppContext,
     config::{Config, create_standard_tsconfig},
     extractor::CoreExtractor,
+    mount_graph::MountGraph,
     packages::Packages,
     utils::{get_repository_name, join_prefix_and_path},
     visitor::{
@@ -15,7 +16,6 @@ use crate::{
         TypeReference,
     },
 };
-use core::fmt;
 use std::collections::HashSet;
 use std::{
     collections::HashMap,
@@ -85,20 +85,6 @@ pub struct ApiEndpointDetails {
     pub file_path: PathBuf,
 }
 
-impl fmt::Display for FieldMismatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FieldMismatch::MissingField(field) => write!(f, "Missing field: {}", field),
-            FieldMismatch::ExtraField(field) => write!(f, "Extra field: {}", field),
-            FieldMismatch::TypeMismatch(path, call_type, endpoint_type) => write!(
-                f,
-                "Type mismatch at {}: call has type {}, endpoint expects type {}",
-                path, call_type, endpoint_type
-            ),
-        }
-    }
-}
-
 pub struct ApiAnalysisResult {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
@@ -120,13 +106,7 @@ pub struct Analyzer {
     all_repo_packages: HashMap<String, Packages>, // repo_name -> packages
     detected_frameworks: Vec<String>,
     detected_data_fetchers: Vec<String>,
-}
-
-#[derive(Debug)]
-pub enum FieldMismatch {
-    MissingField(String),
-    ExtraField(String),
-    TypeMismatch(String, String, String), // (path, call_type, endpoint_type)
+    mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
 }
 
 impl CoreExtractor for Analyzer {
@@ -151,7 +131,13 @@ impl Analyzer {
             all_repo_packages: HashMap::new(),
             detected_frameworks: Vec::new(),
             detected_data_fetchers: Vec::new(),
+            mount_graph: None,
         }
+    }
+
+    /// Set the mount graph for framework-agnostic analysis
+    pub fn set_mount_graph(&mut self, mount_graph: MountGraph) {
+        self.mount_graph = Some(mount_graph);
     }
 
     pub fn fetch_calls(&self) -> &Vec<Call> {
@@ -769,276 +755,131 @@ impl Analyzer {
         self
     }
 
-    pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+    /// Framework-agnostic analysis using mount graph
+    /// Finds orphaned endpoints and missing API calls without pattern matching
+    fn analyze_matches_with_mount_graph(
+        &self,
+        mount_graph: &MountGraph,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut call_issues = Vec::new();
         let mut endpoint_issues = Vec::new();
         let mut env_var_calls = Vec::new();
 
-        // Initialize with all endpoints as potentially orphaned
-        let mut orphaned_endpoints: HashSet<(String, String)> = self
-            .endpoints
-            .iter()
-            .map(|api_endpoint_details| {
-                (
-                    api_endpoint_details.route.clone(),
-                    api_endpoint_details.method.clone(),
-                )
-            })
-            .collect();
+        // Track which endpoints have been matched
+        let mut matched_endpoints: HashSet<String> = HashSet::new();
 
-        // Deduplicate calls based on route, method, and file_path
+        // Deduplicate calls
         let mut unique_calls = Vec::new();
-        let mut seen_calls = std::collections::HashSet::new();
-
-        for api_call_details in &self.calls {
-            let call_key = (
-                api_call_details.route.clone(),
-                api_call_details.method.clone(),
-                api_call_details.file_path.clone(),
+        let mut seen_calls = HashSet::new();
+        for call in &self.calls {
+            let key = format!(
+                "{}:{}:{}",
+                call.method,
+                call.route,
+                call.file_path.display()
             );
-
-            if seen_calls.insert(call_key) {
-                unique_calls.push(api_call_details);
+            if seen_calls.insert(key) {
+                unique_calls.push(call);
             }
         }
 
-        // Check each call against endpoints
-        for api_call_details in &unique_calls {
-            // Process the call based on its type
-            let path_to_match = if api_call_details.route.contains("ENV_VAR:") {
-                // First check if this is a known external API call
-                if self.config.is_external_call(&api_call_details.route) {
-                    // Skip external API calls entirely
+        // For each call, try to find matching endpoint using mount graph
+        for call in &unique_calls {
+            // Check for environment variable URLs (framework-agnostic)
+            if call.route.contains("ENV_VAR:")
+                || call.route.contains("process.env")
+                || call.route.contains("${")
+            {
+                // Check if it's a configured external or internal call
+                if self.config.is_external_call(&call.route) {
+                    continue; // Skip external calls
+                } else if !self.config.is_internal_call(&call.route) {
+                    // Unknown env var URL
+                    env_var_calls.push(format!(
+                        "API call with environment variable URL: {} {} in {}",
+                        call.method,
+                        call.route,
+                        call.file_path.display()
+                    ));
                     continue;
                 }
-                // Then check if it's a known internal API call
-                else if self.config.is_internal_call(&api_call_details.route) {
-                    // For internal calls, extract the path portion without the ENV_VAR prefix
-                    let mut clean_path = String::new();
-                    let segments: Vec<&str> = api_call_details.route.split("ENV_VAR:").collect();
+            }
 
-                    // Add the part before any ENV_VAR marker
-                    clean_path.push_str(segments[0]);
+            // Use mount graph to find matching endpoints (framework-agnostic)
+            let matching_endpoints = mount_graph.find_matching_endpoints(&call.route, &call.method);
 
-                    // Process each segment with an ENV_VAR marker
-                    for segment in segments.iter().skip(1) {
-                        let subparts: Vec<&str> = segment.splitn(2, ':').collect();
-                        if subparts.len() == 2 {
-                            clean_path.push_str(subparts[1]);
-                        }
-                    }
-
-                    clean_path
-                }
-                // Otherwise it's an unknown env var
-                else {
-                    // Extract the env var names for the error message
-                    let mut env_vars = Vec::new();
-                    let segments: Vec<&str> = api_call_details.route.split("ENV_VAR:").collect();
-                    let mut clean_path = String::new();
-
-                    // Add the part before any ENV_VAR marker
-                    clean_path.push_str(segments[0]);
-
-                    // Process each segment with an ENV_VAR marker
-                    for segment in segments.iter().skip(1) {
-                        let parts: Vec<&str> = segment.splitn(2, ':').collect();
-                        if !parts.is_empty() {
-                            env_vars.push(parts[0].to_string());
-                        }
-                        if parts.len() == 2 {
-                            clean_path.push_str(parts[1]);
-                        }
-                    }
-
-                    // Format the error message for configuration suggestion
-                    let env_var_list = env_vars.join(", ");
-                    env_var_calls.push(format!(
-                        "Environment variable endpoint: {} using env vars [{}] in {}",
-                        api_call_details.method, env_var_list, api_call_details.route
-                    ));
-
-                    // Continue with endpoint matching using the clean path
-                    clean_path
-                }
+            if matching_endpoints.is_empty() {
+                call_issues.push(format!(
+                    "Missing endpoint for {} {} (called from {})",
+                    call.method,
+                    call.route,
+                    call.file_path.display()
+                ));
             } else {
-                // Regular call - use the full route
-                api_call_details.route.clone()
-            };
-
-            // Try to find a matching endpoint using the determined path
-            let endpoint_match = self.find_matching_endpoint(
-                &path_to_match,
-                &api_call_details.method,
-                &self.endpoints,
-                &mut orphaned_endpoints,
-            );
-
-            // Check if we found a match and if methods are compatible
-            match endpoint_match {
-                Some((_, endpoint_method)) => {
-                    if &api_call_details.method != endpoint_method {
-                        call_issues.push(format!(
-                            "Method mismatch: {} {} is called but endpoint only supports {}",
-                            api_call_details.method, api_call_details.route, endpoint_method
-                        ));
-                    }
-                }
-                None => {
-                    call_issues.push(format!(
-                        "Missing endpoint: No endpoint defined for {} {}",
-                        api_call_details.method, api_call_details.route
-                    ));
+                // Mark endpoints as matched
+                for endpoint in matching_endpoints {
+                    let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                    matched_endpoints.insert(key);
                 }
             }
         }
 
-        // After checking all calls, anything left in orphaned_endpoints has no matching call
-        for (orphaned_endpoint, orphaned_method) in orphaned_endpoints {
-            endpoint_issues.push(format!(
-                "Orphaned endpoint: No call matching endpoint {} {}",
-                orphaned_method, orphaned_endpoint
-            ));
-        }
-
-        // TEMPORARY: Deduplicate environment-based API call warnings.
-        // TODO: Address root cause upstream so this is not needed.
-        let mut seen_env = std::collections::HashSet::new();
-        env_var_calls.retain(|msg| {
-            if seen_env.contains(msg) {
-                false
-            } else {
-                seen_env.insert(msg.clone());
-                true
+        // Find orphaned endpoints (not matched by any call)
+        for endpoint in mount_graph.get_resolved_endpoints() {
+            let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+            if !matched_endpoints.contains(&key) {
+                endpoint_issues.push(format!(
+                    "Orphaned endpoint: {} {} in {}",
+                    endpoint.method, endpoint.full_path, endpoint.file_location
+                ));
             }
-        });
+        }
 
         (call_issues, endpoint_issues, env_var_calls)
     }
 
-    // Helper method to find a matching endpoint using our various matching strategies
-    fn find_matching_endpoint<'a>(
-        &self,
-        route: &str,
-        method: &str,
-        endpoints: &'a [ApiEndpointDetails],
-        orphaned_endpoints: &mut HashSet<(String, String)>,
-    ) -> Option<(&'a String, &'a String)> {
-        // Safety check
-        let router = match &self.endpoint_router {
-            Some(r) => r,
-            None => return None,
-        };
-
-        // Try to match the route with matchit
-        match router.at(route) {
-            Ok(matched) => {
-                // Now we get back a Vec<(String, String)> of route-method pairs
-                let route_methods = matched.value;
-
-                // First look for an exact method match
-                for (endpoint_route, endpoint_method) in route_methods {
-                    if endpoint_method == method {
-                        // Find the actual endpoint for this route+method
-                        if let Some(endpoint) = endpoints
-                            .iter()
-                            .find(|ep| &ep.route == endpoint_route && &ep.method == endpoint_method)
-                        {
-                            // Remove from orphaned endpoints
-                            orphaned_endpoints
-                                .remove(&(endpoint.route.clone(), endpoint.method.clone()));
-
-                            return Some((&endpoint.route, &endpoint.method));
-                        }
-                    }
-                }
-
-                // If we didn't find an exact method match, return the first endpoint with this route
-                // (this is for reporting method mismatches)
-                if let Some((endpoint_route, endpoint_method)) = route_methods.first() {
-                    if let Some(endpoint) = endpoints
-                        .iter()
-                        .find(|ep| &ep.route == endpoint_route && &ep.method == endpoint_method)
-                    {
-                        // Remove from orphaned endpoints
-                        orphaned_endpoints
-                            .remove(&(endpoint.route.clone(), endpoint.method.clone()));
-
-                        return Some((&endpoint.route, &endpoint.method));
-                    }
-                }
-            }
-            Err(_) => {
-                // No match found via matchit
-            }
-        }
-
-        None
-    }
-
-    fn normalize_call_route(&self, route: &str) -> String {
-        // Remove ENV_VAR prefix if present
-        if route.starts_with("ENV_VAR:") {
-            // Find the second colon and take everything after it
-            if let Some(second_colon) = route.find(':').and_then(|first| {
-                route[first + 1..]
-                    .find(':')
-                    .map(|second| first + 1 + second)
-            }) {
-                route[second_colon + 1..].to_string()
-            } else {
-                route.to_string()
-            }
-        } else {
-            route.to_string()
-        }
-    }
-
-    pub fn compare_calls_to_endpoints(&self) -> Vec<String> {
+    /// Framework-agnostic type comparison using mount graph
+    /// Compares request/response types without pattern matching
+    fn compare_calls_with_mount_graph(&self, mount_graph: &MountGraph) -> Vec<String> {
         let mut issues = Vec::new();
 
-        // Safety check
-        let router = match &self.endpoint_router {
-            Some(r) => r,
-            None => return issues,
-        };
-
         for call in &self.calls {
-            let normalized_route = self.normalize_call_route(&call.route);
+            let matching_endpoints = mount_graph.find_matching_endpoints(&call.route, &call.method);
 
-            match router.at(&normalized_route) {
-                Ok(matched) => {
-                    // Get the endpoint routes and methods
-                    let route_methods = &matched.value;
-
-                    // Look for a method match
-                    let matching_endpoint = route_methods
-                        .iter()
-                        .filter(|(_, endpoint_method)| endpoint_method == &call.method)
-                        .find_map(|(endpoint_route, endpoint_method)| {
-                            self.endpoints.iter().find(|ep| {
-                                &ep.route == endpoint_route && &ep.method == endpoint_method
-                            })
-                        });
-
-                    if let Some(ep) = matching_endpoint {
-                        // Compare request bodies if both exist
-                        if let (Some(call_req), Some(ep_req)) =
-                            (&call.request_body, &ep.request_body)
-                        {
-                            let mismatches = Self::compare_json_fields(call_req, ep_req, "");
-                            for mismatch in mismatches {
-                                issues.push(format!(
-                                    "Request body mismatch for {} {} -> {}",
-                                    call.method, call.route, mismatch
-                                ));
-                            }
+            for matched_endpoint in matching_endpoints {
+                // Find the full endpoint details from self.endpoints
+                if let Some(endpoint) = self.endpoints.iter().find(|e| {
+                    e.route == matched_endpoint.full_path && e.method == matched_endpoint.method
+                }) {
+                    // Compare request body types if both exist
+                    if let (Some(call_req), Some(endpoint_req)) =
+                        (&call.request_body, &endpoint.request_body)
+                    {
+                        if !Self::json_types_compatible(call_req, endpoint_req) {
+                            issues.push(format!(
+                                "Request body type mismatch for {} {}: call sends '{}' but endpoint expects '{}'",
+                                call.method,
+                                call.route,
+                                serde_json::to_string(call_req).unwrap_or_default(),
+                                serde_json::to_string(endpoint_req).unwrap_or_default()
+                            ));
                         }
                     }
-                }
-                Err(_) => {
-                    // No matching endpoint found via matchit
-                    // Already reported by analyze_matches()
+
+                    // Compare response body types if both exist
+                    if let (Some(call_resp), Some(endpoint_resp)) =
+                        (&call.response_body, &endpoint.response_body)
+                    {
+                        if !Self::json_types_compatible(call_resp, endpoint_resp) {
+                            issues.push(format!(
+                                "Response body type mismatch for {} {}: call expects '{}' but endpoint returns '{}'",
+                                call.method,
+                                call.route,
+                                serde_json::to_string(call_resp).unwrap_or_default(),
+                                serde_json::to_string(endpoint_resp).unwrap_or_default()
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1046,62 +887,34 @@ impl Analyzer {
         issues
     }
 
-    pub fn compare_json_fields(
-        call_json: &Json,
-        endpoint_json: &Json,
-        path: &str,
-    ) -> Vec<FieldMismatch> {
-        let mut mismatches = Vec::new();
-
+    /// Framework-agnostic JSON type compatibility check
+    /// Compares JSON structures without framework-specific assumptions
+    fn json_types_compatible(call_json: &Json, endpoint_json: &Json) -> bool {
         match (call_json, endpoint_json) {
             (Json::Object(call_map), Json::Object(endpoint_map)) => {
-                let call_keys: HashSet<_> = call_map.keys().collect();
-                let endpoint_keys: HashSet<_> = endpoint_map.keys().collect();
-
-                // Fields required by endpoint but missing in call
-                for key in endpoint_keys.difference(&call_keys) {
-                    let field_path = if path.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{}.{}", path, key)
-                    };
-                    mismatches.push(FieldMismatch::MissingField(field_path));
+                // Check that all endpoint keys exist in call
+                for key in endpoint_map.keys() {
+                    if !call_map.contains_key(key) {
+                        return false;
+                    }
+                    // Recursively check nested structures
+                    if let (Some(call_val), Some(endpoint_val)) =
+                        (call_map.get(key), endpoint_map.get(key))
+                    {
+                        if !Self::json_types_compatible(call_val, endpoint_val) {
+                            return false;
+                        }
+                    }
                 }
-                // Fields present in call but not expected by endpoint
-                for key in call_keys.difference(&endpoint_keys) {
-                    let field_path = if path.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{}.{}", path, key)
-                    };
-                    mismatches.push(FieldMismatch::ExtraField(field_path));
-                }
-                // Compare common fields recursively
-                for key in call_keys.intersection(&endpoint_keys) {
-                    let sub_path = if path.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{}.{}", path, key)
-                    };
-                    let sub_mismatches =
-                        Self::compare_json_fields(&call_map[*key], &endpoint_map[*key], &sub_path);
-                    mismatches.extend(sub_mismatches);
-                }
+                true
             }
-            (Json::Array(_), Json::Array(_)) => {
-                // You could compare element types here if desired
-            }
-            (a, b) if std::mem::discriminant(a) != std::mem::discriminant(b) => {
-                mismatches.push(FieldMismatch::TypeMismatch(
-                    path.to_string(),
-                    format!("{:?}", a),
-                    format!("{:?}", b),
-                ));
-            }
-            _ => {}
+            (Json::Array(_), Json::Array(_)) => true, // Arrays are compatible if both are arrays
+            (Json::String(_), Json::String(_)) => true,
+            (Json::Number(_), Json::Number(_)) => true,
+            (Json::Boolean(_), Json::Boolean(_)) => true,
+            (Json::Null, Json::Null) => true,
+            _ => false, // Type mismatch
         }
-
-        mismatches
     }
 
     pub fn compute_full_paths_for_endpoint(
@@ -1385,8 +1198,13 @@ impl Analyzer {
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
-        let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
-        let mismatches = self.compare_calls_to_endpoints();
+        // Framework-agnostic analysis using mount graph (required)
+        let mount_graph = self.mount_graph.as_ref()
+            .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
+
+        let (call_issues, endpoint_issues, env_var_calls) =
+            self.analyze_matches_with_mount_graph(mount_graph);
+        let mismatches = self.compare_calls_with_mount_graph(mount_graph);
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 

@@ -1,6 +1,7 @@
 use crate::{
     analyzer::ApiEndpointDetails,
     app_context::AppContext,
+    mount_graph::MountGraph,
     multi_agent_orchestrator::MultiAgentAnalysisResult,
     packages::Packages,
     visitor::{FunctionDefinition, Mount, OwnerType},
@@ -31,6 +32,8 @@ pub struct CloudRepoData {
     pub packages: Option<Packages>, // Structured package data for dependency analysis
     pub last_updated: DateTime<Utc>,
     pub commit_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
 }
 
 impl CloudRepoData {
@@ -110,6 +113,7 @@ impl CloudRepoData {
             packages,
             last_updated: Utc::now(),
             commit_hash: get_current_commit_hash(),
+            mount_graph: Some(mount_graph.clone()), // Store mount graph for cross-repo analysis
         }
     }
 }

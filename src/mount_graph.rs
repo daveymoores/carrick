@@ -647,6 +647,53 @@ impl MountGraph {
 
         true
     }
+
+    /// Merge mount graphs from multiple repos for cross-repo analysis
+    /// This is framework-agnostic - it merges the behavior-based analysis results
+    pub fn merge_from_repos(all_repo_data: &[crate::cloud_storage::CloudRepoData]) -> Self {
+        let mut merged = MountGraph::new();
+        let mut seen_endpoints: HashSet<String> = HashSet::new();
+        let mut seen_data_calls: HashSet<String> = HashSet::new();
+        let mut seen_mounts: HashSet<String> = HashSet::new();
+
+        for repo_data in all_repo_data {
+            if let Some(ref mount_graph) = repo_data.mount_graph {
+                // Merge nodes (deduplicate by name, prefer first occurrence)
+                for (node_name, node) in &mount_graph.nodes {
+                    merged
+                        .nodes
+                        .entry(node_name.clone())
+                        .or_insert_with(|| node.clone());
+                }
+
+                // Merge endpoints (deduplicate by method + full_path)
+                for endpoint in &mount_graph.endpoints {
+                    let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                    if seen_endpoints.insert(key) {
+                        merged.endpoints.push(endpoint.clone());
+                    }
+                }
+
+                // Merge data calls (deduplicate by method + target_url + file_location)
+                for call in &mount_graph.data_calls {
+                    let key = format!("{}:{}:{}", call.method, call.target_url, call.file_location);
+                    if seen_data_calls.insert(key) {
+                        merged.data_calls.push(call.clone());
+                    }
+                }
+
+                // Merge mounts (deduplicate by parent + child + prefix)
+                for mount in &mount_graph.mounts {
+                    let key = format!("{}:{}:{}", mount.parent, mount.child, mount.path_prefix);
+                    if seen_mounts.insert(key) {
+                        merged.mounts.push(mount.clone());
+                    }
+                }
+            }
+        }
+
+        merged
+    }
 }
 
 impl Default for MountGraph {

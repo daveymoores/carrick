@@ -2,6 +2,7 @@ use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{CloudRepoData, CloudStorage};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
+use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
@@ -389,18 +390,22 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     let builder = AnalyzerBuilder::new_for_cross_repo(combined_config, cm);
     let mut analyzer = builder.build_from_repo_data(all_repo_data.clone()).await?;
 
-    // 3. Add packages data from all repos for dependency analysis
+    // 3. Merge mount graphs from all repos for framework-agnostic analysis
+    let merged_mount_graph = MountGraph::merge_from_repos(&all_repo_data);
+    analyzer.set_mount_graph(merged_mount_graph);
+
+    // 4. Add packages data from all repos for dependency analysis
     for repo_data in &all_repo_data {
         if let Some(packages) = &repo_data.packages {
             analyzer.add_repo_packages(repo_data.repo_name.clone(), packages.clone());
         }
     }
 
-    // 4. Recreate type files from S3 and run type checking
+    // 5. Recreate type files from S3 and run type checking
     recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
         .await?;
 
-    // 5. Run final type checking
+    // 6. Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
         println!("⚠️  Warning: Type checking failed: {}", e);
     }
@@ -656,6 +661,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            mount_graph: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -685,6 +691,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            mount_graph: None,
         }];
 
         // Test Config merging
@@ -749,6 +756,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            mount_graph: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
