@@ -1,0 +1,277 @@
+# Carrick Documentation Index
+
+This directory contains all design documents, research, and progress reports for the Carrick multi-agent framework-agnostic migration project.
+
+---
+
+## 🚀 Quick Start (Start Here!)
+
+### If You're Implementing Phase 2 Remaining Work
+
+1. **[phase2_handoff_guide.md](phase2_handoff_guide.md)** ⏱️ 10 min
+   - Overview of what's done and what remains
+   - Quick start guide
+   - All the links you need
+
+2. **[phase2_remaining_work.md](phase2_remaining_work.md)** ⏱️ 30 min
+   - **YOUR MAIN IMPLEMENTATION GUIDE**
+   - Step-by-step instructions
+   - Code examples and pseudocode
+   - Testing strategy
+
+3. **[migration_status.md](migration_status.md)** ⏱️ 15 min
+   - Current state of all phases
+   - What's working, what remains
+
+### If You're Just Checking Status
+
+- **[phase2_summary.md](phase2_summary.md)** ⏱️ 2 min - Quick overview
+
+### If You're New to the Project
+
+- **[multi_agent_framework_agnostic_analysis.md](multi_agent_framework_agnostic_analysis.md)** ⏱️ 60 min - Original vision
+
+---
+
+## 📚 Documentation by Category
+
+### Phase Documentation (Current Work)
+
+| Document | Purpose | Time | Priority |
+|----------|---------|------|----------|
+| **[phase2_handoff_guide.md](phase2_handoff_guide.md)** | Complete handoff for Phase 2 | 10 min | ⭐ START HERE |
+| **[phase2_remaining_work.md](phase2_remaining_work.md)** | Step-by-step implementation guide | 30 min | ⭐ IMPLEMENT |
+| **[phase2_summary.md](phase2_summary.md)** | Quick reference and status | 2 min | Quick check |
+| **[phase2_priority1_complete.md](phase2_priority1_complete.md)** | What was done in Priority 1 | 10 min | Reference |
+| **[phase0_complete.md](phase0_complete.md)** | Phase 0 completion report | 10 min | Historical |
+| **[phase0_findings.md](phase0_findings.md)** | Phase 0 debugging findings | 15 min | Historical |
+
+### Architecture & Design (Vision)
+
+| Document | Purpose | Time | Priority |
+|----------|---------|------|----------|
+| **[multi_agent_framework_agnostic_analysis.md](multi_agent_framework_agnostic_analysis.md)** | Original architecture vision | 60 min | Deep context |
+| **[multi_agent_architecture.md](multi_agent_architecture.md)** | Architecture details | 20 min | Reference |
+| **[migration_status.md](migration_status.md)** | Overall migration status | 15 min | Current state |
+
+### Testing Documentation
+
+| Document | Purpose | Time | Priority |
+|----------|---------|------|----------|
+| **[test-coverage-complete.md](test-coverage-complete.md)** | Test coverage summary | 5 min | Reference |
+| **[test-coverage-progress.md](test-coverage-progress.md)** | Test implementation progress | 5 min | Historical |
+| **[test-implementation-summary.md](test-implementation-summary.md)** | Test implementation details | 10 min | Reference |
+| **[adding-output-tests-guide.md](adding-output-tests-guide.md)** | Guide for adding tests | 15 min | How-to |
+
+### Infrastructure & Improvements
+
+| Document | Purpose | Time | Priority |
+|----------|---------|------|----------|
+| **[mock_mode_improvements.md](mock_mode_improvements.md)** | Mock mode enhancements | 10 min | Reference |
+| **[research/cloud_infrastructure.md](research/cloud_infrastructure.md)** | Cloud storage design | 15 min | Reference |
+| **[research/testing_strategy.md](research/testing_strategy.md)** | Testing approach | 10 min | Reference |
+| **[research/ts_check.md](research/ts_check.md)** | TypeScript checking system | 15 min | Reference |
+
+---
+
+## 🎯 Reading Order by Scenario
+
+### Scenario 1: I Need to Complete Phase 2
+
+**Read in this order** (1 hour total):
+
+1. [phase2_handoff_guide.md](phase2_handoff_guide.md) - 10 min (overview)
+2. [migration_status.md](migration_status.md) - 15 min (current state)
+3. [phase2_remaining_work.md](phase2_remaining_work.md) - 30 min (implementation guide)
+4. [phase2_priority1_complete.md](phase2_priority1_complete.md) - 10 min (what was done)
+
+**Then start coding!**
+
+### Scenario 2: I'm Reviewing the Architecture
+
+**Read in this order** (1.5 hours total):
+
+1. [phase2_summary.md](phase2_summary.md) - 2 min (quick status)
+2. [migration_status.md](migration_status.md) - 15 min (overall state)
+3. [multi_agent_framework_agnostic_analysis.md](multi_agent_framework_agnostic_analysis.md) - 60 min (deep dive)
+4. [phase2_priority1_complete.md](phase2_priority1_complete.md) - 10 min (what changed)
+
+### Scenario 3: I'm New to the Project
+
+**Read in this order** (2 hours total):
+
+1. [phase2_summary.md](phase2_summary.md) - 2 min (quick status)
+2. [multi_agent_framework_agnostic_analysis.md](multi_agent_framework_agnostic_analysis.md) - 60 min (vision)
+3. [migration_status.md](migration_status.md) - 15 min (current state)
+4. [multi_agent_architecture.md](multi_agent_architecture.md) - 20 min (architecture)
+5. [phase0_complete.md](phase0_complete.md) - 10 min (Phase 0 work)
+6. [phase2_priority1_complete.md](phase2_priority1_complete.md) - 10 min (Phase 2.1 work)
+7. [test-coverage-complete.md](test-coverage-complete.md) - 5 min (testing)
+
+### Scenario 4: I'm Just Checking Status
+
+**Read this** (2 minutes):
+
+- [phase2_summary.md](phase2_summary.md)
+
+---
+
+## 📊 Project Status
+
+**Last Updated**: January 2025
+
+| Phase | Status | Completion |
+|-------|--------|------------|
+| Phase 0: Fix Zero Output Bug | ✅ Complete | 100% |
+| Phase 1: Type Extraction | ✅ Complete | 100% |
+| **Phase 2: Legacy Removal** | **🟡 Partial** | **60%** |
+| - Priority 1: Adapter Layer | ✅ Complete | 100% |
+| - Priority 2: Legacy Methods | 🔴 Not Started | 0% |
+| - Priority 3: DependencyVisitor | 🔴 Not Started | 0% |
+| Phase 3: Multi-Framework | ✅ Complete | 100% |
+
+**All Tests**: ✅ 46/46 Passing  
+**Clippy**: ✅ Clean  
+**Frameworks**: ✅ Express, Fastify, Koa
+
+---
+
+## 🔑 Key Concepts
+
+### The Multi-Agent System
+
+The project uses a "classify-then-dispatch" pattern where:
+1. Framework detection identifies what frameworks are used
+2. Call sites are extracted universally (AST traversal)
+3. Triage classifier determines what each call site is
+4. Specialist agents analyze each type (endpoints, data fetching, mounts)
+5. Mount graph constructs the full application structure
+6. Type checking validates cross-repo compatibility
+
+### Phase 2 Migration
+
+**Priority 1** ✅ (DONE): Remove adapter layer
+- Before: MultiAgent → Adapter → Analyzer → CloudRepoData
+- After: MultiAgent → CloudRepoData
+
+**Priority 2** 🔴 (TODO): Remove legacy analysis methods
+- Replace `analyze_matches()` with mount graph queries
+- Replace `compare_calls_to_endpoints()` with mount graph matching
+- Delete legacy pattern matching code
+
+**Priority 3** 🔴 (TODO): Simplify DependencyVisitor
+- Create `SymbolExtractor` for imports/functions only
+- Remove endpoint/call/mount extraction
+
+---
+
+## 🗂️ File Organization
+
+```
+.thoughts/
+├── README.md                                    ← You are here
+│
+├── Phase 2 Documents (Current Focus)
+│   ├── phase2_handoff_guide.md                 ← START HERE for implementation
+│   ├── phase2_remaining_work.md                ← IMPLEMENTATION GUIDE ⭐
+│   ├── phase2_summary.md                       ← Quick status
+│   └── phase2_priority1_complete.md            ← What was done
+│
+├── Architecture & Vision
+│   ├── multi_agent_framework_agnostic_analysis.md  ← Original vision
+│   ├── multi_agent_architecture.md             ← Architecture details
+│   └── migration_status.md                     ← Overall status
+│
+├── Phase History
+│   ├── phase0_complete.md                      ← Phase 0 completion
+│   └── phase0_findings.md                      ← Phase 0 debugging
+│
+├── Testing
+│   ├── test-coverage-complete.md               ← Test summary
+│   ├── test-coverage-progress.md               ← Test progress
+│   ├── test-implementation-summary.md          ← Test details
+│   └── adding-output-tests-guide.md            ← Test guide
+│
+├── Improvements
+│   └── mock_mode_improvements.md               ← Mock mode enhancements
+│
+└── research/
+    ├── README.md                                ← Research index
+    ├── cloud_infrastructure.md                 ← AWS/storage design
+    ├── testing_strategy.md                     ← Test approach
+    └── ts_check.md                             ← TypeScript checking
+```
+
+---
+
+## 🎓 For Different Roles
+
+### Engineers
+- Start: [phase2_handoff_guide.md](phase2_handoff_guide.md)
+- Guide: [phase2_remaining_work.md](phase2_remaining_work.md)
+- Status: [migration_status.md](migration_status.md)
+
+### Architects
+- Vision: [multi_agent_framework_agnostic_analysis.md](multi_agent_framework_agnostic_analysis.md)
+- Details: [multi_agent_architecture.md](multi_agent_architecture.md)
+- Changes: [phase2_priority1_complete.md](phase2_priority1_complete.md)
+
+### Project Managers
+- Quick: [phase2_summary.md](phase2_summary.md)
+- Detailed: [migration_status.md](migration_status.md)
+- Risks: See "Risk Assessment" in migration_status.md
+
+### QA/Testing
+- Coverage: [test-coverage-complete.md](test-coverage-complete.md)
+- Strategy: [research/testing_strategy.md](research/testing_strategy.md)
+- How-to: [adding-output-tests-guide.md](adding-output-tests-guide.md)
+
+---
+
+## 🔍 Quick Reference
+
+### File Naming Convention
+- **phase0_**, **phase1_**, **phase2_** - Phase-specific documents
+- **multi_agent_** - Architecture and design
+- **test-** - Testing related
+- **_complete**, **_summary**, **_status** - Document type suffixes
+- All lowercase with underscores
+
+### Document Types
+- **handoff_guide** - Complete guide for taking over work
+- **remaining_work** - Step-by-step implementation guide
+- **summary** - Quick reference (2-5 min read)
+- **complete** - Detailed completion report
+- **status** - Current state overview
+- **analysis** - Deep architectural analysis
+- **findings** - Investigation results
+
+---
+
+## 💡 Tips
+
+1. **Always start with the handoff guide** if you're implementing
+2. **Check migration_status.md** for current state
+3. **Use phase2_summary.md** for quick status checks
+4. **Read the original vision** to understand "why"
+5. **Follow the reading order** for your scenario
+6. **Test after every change** when implementing
+
+---
+
+## 📝 Document Status
+
+| Document | Status | Last Updated |
+|----------|--------|--------------|
+| phase2_handoff_guide.md | ✅ Current | January 2025 |
+| phase2_remaining_work.md | ✅ Current | January 2025 |
+| phase2_summary.md | ✅ Current | January 2025 |
+| phase2_priority1_complete.md | ✅ Current | January 2025 |
+| migration_status.md | ✅ Current | January 2025 |
+| multi_agent_framework_agnostic_analysis.md | ✅ Current | December 2024 |
+| phase0_complete.md | 📚 Historical | December 2024 |
+| test-coverage-complete.md | ✅ Current | December 2024 |
+
+---
+
+**Ready to start?** Go to [phase2_handoff_guide.md](phase2_handoff_guide.md) 🚀

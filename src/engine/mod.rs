@@ -1,14 +1,12 @@
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
-use crate::app_context::AppContext;
-use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
+use crate::cloud_storage::{CloudRepoData, CloudStorage};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::utils::get_repository_name;
-use crate::visitor::{DependencyVisitor, FunctionDefinition, Mount, OwnerType};
-use chrono::Utc;
+use crate::visitor::DependencyVisitor;
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -29,15 +27,6 @@ type FileDiscoveryResult = Result<
     ),
     Box<dyn std::error::Error>,
 >;
-
-type OrchestratorConversionResult = (
-    Vec<ApiEndpointDetails>,
-    Vec<ApiEndpointDetails>,
-    Vec<Mount>,
-    HashMap<String, AppContext>,
-    Vec<(String, String, String, String)>,
-    HashMap<String, FunctionDefinition>,
-);
 
 /// Determine if we should upload data based on GitHub context
 /// Only upload on main/master branch, not on PRs
@@ -300,132 +289,30 @@ async fn analyze_current_repo(
         .run_complete_analysis(files, &packages, &all_imported_symbols)
         .await?;
 
-    // Extract types from agent analysis results
+    // 5. Extract types from agent analysis results
     let agent_type_infos =
         orchestrator.extract_types_from_analysis(&analysis_result.analysis_results);
 
-    // 5. Create an Analyzer and populate it with the orchestrator results
-    let mut analyzer = Analyzer::new(config.clone(), cm);
-
-    // Convert orchestrator results to analyzer data structures
-    let (endpoints, calls, mounts, apps, imported_handlers, function_definitions) =
-        convert_orchestrator_results_to_analyzer_data(&analysis_result);
-
-    // Populate the analyzer with the new data
-    analyzer.endpoints = endpoints;
-    analyzer.calls = calls;
-    analyzer.mounts = mounts;
-    analyzer.apps = apps;
-    analyzer.imported_handlers = imported_handlers;
-    analyzer.function_definitions = function_definitions;
-
-    // Set framework detection data from orchestrator
-    analyzer.set_framework_detection(
-        analysis_result.framework_detection.frameworks.clone(),
-        analysis_result.framework_detection.data_fetchers.clone(),
+    // 6. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
+    let cloud_data = CloudRepoData::from_multi_agent_results(
+        repo_name.clone(),
+        &analysis_result,
+        serde_json::to_string(&config).ok(),
+        serde_json::to_string(&packages).ok(),
+        Some(packages.clone()),
     );
 
-    // Build the endpoint router for matching
+    // 7. Create a minimal Analyzer ONLY for type extraction (temporary until type extraction is refactored)
+    let mut analyzer = Analyzer::new(config.clone(), cm);
+    analyzer.endpoints = cloud_data.endpoints.clone();
+    analyzer.calls = cloud_data.calls.clone();
+    analyzer.mounts = cloud_data.mounts.clone();
     analyzer.build_endpoint_router();
 
-    // 6. Extract types for current repo (critical for cross-repo type checking)
+    // 8. Extract types for current repo (critical for cross-repo type checking)
     extract_types_for_current_repo(&analyzer, repo_path, &packages, agent_type_infos)?;
 
-    // 7. Run analysis to generate issues (for cross-repo analysis)
-    // Note: Don't print here - will be printed at the end of cross-repo analysis
-    // let analysis_results = analyzer.get_results();
-    // print_results(analysis_results);
-
-    // 9. Build CloudRepoData from analyzer (now with complete data + type extraction)
-    let cloud_data = CloudRepoData {
-        repo_name,
-        endpoints: analyzer.endpoints,
-        calls: analyzer.calls,
-        mounts: analyzer.mounts,
-        apps: analyzer.apps,
-        imported_handlers: analyzer.imported_handlers,
-        function_definitions: analyzer.function_definitions,
-        config_json: serde_json::to_string(&config).ok(),
-        package_json: serde_json::to_string(&packages).ok(),
-        packages: Some(packages),
-        last_updated: Utc::now(),
-        commit_hash: get_current_commit_hash(),
-    };
-
     Ok(cloud_data)
-}
-
-/// Convert MultiAgentOrchestrator results to analyzer data structures
-fn convert_orchestrator_results_to_analyzer_data(
-    result: &crate::multi_agent_orchestrator::MultiAgentAnalysisResult,
-) -> OrchestratorConversionResult {
-    let mount_graph = &result.mount_graph;
-
-    // Convert ResolvedEndpoints to ApiEndpointDetails (endpoints)
-    let endpoints: Vec<ApiEndpointDetails> = mount_graph
-        .get_resolved_endpoints()
-        .iter()
-        .map(|endpoint| ApiEndpointDetails {
-            owner: Some(OwnerType::App(endpoint.owner.clone())),
-            route: endpoint.full_path.clone(), // Use full_path instead of path for proper resolution
-            method: endpoint.method.clone(),
-            params: vec![],      // TODO: Extract from handler analysis if needed
-            request_body: None,  // TODO: Extract from handler analysis if needed
-            response_body: None, // TODO: Extract from handler analysis if needed
-            handler_name: endpoint.handler.clone(),
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from(&endpoint.file_location),
-        })
-        .collect();
-
-    // Convert DataFetchingCalls to ApiEndpointDetails (calls)
-    let calls: Vec<ApiEndpointDetails> = mount_graph
-        .get_data_calls()
-        .iter()
-        .map(|call| ApiEndpointDetails {
-            owner: None, // Calls don't have owners
-            route: call.target_url.clone(),
-            method: call.method.clone(),
-            params: vec![],      // TODO: Extract from call analysis if needed
-            request_body: None,  // TODO: Extract from call analysis if needed
-            response_body: None, // TODO: Extract from call analysis if needed
-            handler_name: Some(call.client.clone()),
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from(&call.file_location),
-        })
-        .collect();
-
-    // Convert MountEdges to Mount
-    let mounts: Vec<Mount> = mount_graph
-        .get_mounts()
-        .iter()
-        .map(|mount| Mount {
-            parent: OwnerType::App(mount.parent.clone()),
-            child: OwnerType::Router(mount.child.clone()),
-            prefix: mount.path_prefix.clone(),
-        })
-        .collect();
-
-    // For now, return empty collections for these - they can be enhanced later
-    let apps = HashMap::new();
-    let imported_handlers = vec![];
-    let function_definitions = HashMap::new();
-
-    println!("Converted orchestrator results:");
-    println!("  - {} endpoints", endpoints.len());
-    println!("  - {} calls", calls.len());
-    println!("  - {} mounts", mounts.len());
-
-    (
-        endpoints,
-        calls,
-        mounts,
-        apps,
-        imported_handlers,
-        function_definitions,
-    )
 }
 
 /// Extract types for current repo - restored from the old system

@@ -18,6 +18,7 @@ use swc_common::{
 /// Complete analysis result from the multi-agent workflow
 #[derive(Debug)]
 pub struct MultiAgentAnalysisResult {
+    #[allow(dead_code)]
     pub framework_detection: DetectionResult,
     pub mount_graph: MountGraph,
     pub analysis_results: AnalysisResults,
