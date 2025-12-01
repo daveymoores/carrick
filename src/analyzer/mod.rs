@@ -162,6 +162,7 @@ impl Analyzer {
         self.all_repo_packages.insert(repo_name, packages);
     }
 
+    #[allow(dead_code)]
     pub fn set_framework_detection(&mut self, frameworks: Vec<String>, data_fetchers: Vec<String>) {
         self.detected_frameworks = frameworks;
         self.detected_data_fetchers = data_fetchers;

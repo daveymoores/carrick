@@ -1,14 +1,16 @@
 use crate::{
     analyzer::ApiEndpointDetails,
     app_context::AppContext,
+    multi_agent_orchestrator::MultiAgentAnalysisResult,
     packages::Packages,
-    visitor::{FunctionDefinition, Mount},
+    visitor::{FunctionDefinition, Mount, OwnerType},
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::PathBuf;
 
 mod mock_storage;
 pub use mock_storage::MockStorage;
@@ -29,6 +31,87 @@ pub struct CloudRepoData {
     pub packages: Option<Packages>, // Structured package data for dependency analysis
     pub last_updated: DateTime<Utc>,
     pub commit_hash: String,
+}
+
+impl CloudRepoData {
+    /// Create CloudRepoData directly from multi-agent analysis results
+    /// This bypasses the legacy Analyzer adapter layer
+    pub fn from_multi_agent_results(
+        repo_name: String,
+        analysis_result: &MultiAgentAnalysisResult,
+        config_json: Option<String>,
+        package_json: Option<String>,
+        packages: Option<Packages>,
+    ) -> Self {
+        let mount_graph = &analysis_result.mount_graph;
+
+        // Convert ResolvedEndpoints to ApiEndpointDetails
+        let endpoints: Vec<ApiEndpointDetails> = mount_graph
+            .get_resolved_endpoints()
+            .iter()
+            .map(|endpoint| ApiEndpointDetails {
+                owner: Some(OwnerType::App(endpoint.owner.clone())),
+                route: endpoint.full_path.clone(),
+                method: endpoint.method.clone(),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: endpoint.handler.clone(),
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from(&endpoint.file_location),
+            })
+            .collect();
+
+        // Convert DataFetchingCalls to ApiEndpointDetails
+        let calls: Vec<ApiEndpointDetails> = mount_graph
+            .get_data_calls()
+            .iter()
+            .map(|call| ApiEndpointDetails {
+                owner: None,
+                route: call.target_url.clone(),
+                method: call.method.clone(),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: Some(call.client.clone()),
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from(&call.file_location),
+            })
+            .collect();
+
+        // Convert MountEdges to Mount
+        let mounts: Vec<Mount> = mount_graph
+            .get_mounts()
+            .iter()
+            .map(|mount| Mount {
+                parent: OwnerType::App(mount.parent.clone()),
+                child: OwnerType::Router(mount.child.clone()),
+                prefix: mount.path_prefix.clone(),
+            })
+            .collect();
+
+        println!("Created CloudRepoData directly from multi-agent results:");
+        println!("  - {} endpoints", endpoints.len());
+        println!("  - {} calls", calls.len());
+        println!("  - {} mounts", mounts.len());
+
+        Self {
+            repo_name,
+            endpoints,
+            calls,
+            mounts,
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json,
+            package_json,
+            packages,
+            last_updated: Utc::now(),
+            commit_hash: get_current_commit_hash(),
+        }
+    }
 }
 
 #[derive(Debug)]
