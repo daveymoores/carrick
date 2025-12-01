@@ -79,7 +79,8 @@ impl MultiAgentOrchestrator {
 
         // Stage 3: Mount Graph Construction
         println!("Stage 3: Mount Graph Construction");
-        let mount_graph = MountGraph::build_from_analysis_results(&analysis_results);
+        let mount_graph =
+            MountGraph::build_from_analysis_results(&analysis_results, imported_symbols);
 
         println!("Built mount graph:");
         println!("  - {} nodes", mount_graph.get_nodes().len());
@@ -189,6 +190,7 @@ impl MultiAgentOrchestrator {
     }
 
     /// Get framework-aware endpoint analysis for comparison with existing system
+    #[allow(dead_code)]
     pub fn get_endpoint_analysis(&self, result: &MultiAgentAnalysisResult) -> EndpointAnalysis {
         let mount_graph = &result.mount_graph;
 
@@ -277,12 +279,14 @@ impl MultiAgentOrchestrator {
 
 /// Analysis result in a format compatible with existing systems
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct EndpointAnalysis {
     pub producers: Vec<crate::mount_graph::ResolvedEndpoint>,
     pub consumers: Vec<crate::mount_graph::DataFetchingCall>,
     pub mount_relationships: Vec<crate::mount_graph::MountEdge>,
 }
 
+#[allow(dead_code)]
 impl EndpointAnalysis {
     /// Find potential API mismatches by comparing producers and consumers
     pub fn find_potential_mismatches(&self) -> Vec<PotentialMismatch> {
@@ -356,6 +360,7 @@ impl EndpointAnalysis {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PotentialMismatch {
     pub consumer_call: crate::mount_graph::DataFetchingCall,
     pub issue: MismatchType,
@@ -363,6 +368,7 @@ pub struct PotentialMismatch {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum MismatchType {
     MissingEndpoint,
     OrphanedEndpoint,

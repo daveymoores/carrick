@@ -108,15 +108,23 @@ pub struct Mount {
 
 #[derive(Debug, Clone)]
 pub struct Endpoint {
+    #[allow(dead_code)]
     pub owner: OwnerType,
+    #[allow(dead_code)]
     pub route: String,
+    #[allow(dead_code)]
     pub method: String,
+    #[allow(dead_code)]
     pub response: Json,
+    #[allow(dead_code)]
     pub request: Option<Json>,
+    #[allow(dead_code)]
     pub response_type: Option<TypeReference>,
+    #[allow(dead_code)]
     pub request_type: Option<TypeReference>,
     #[allow(dead_code)]
     pub handler_file: PathBuf,
+    #[allow(dead_code)]
     pub handler_name: String,
 }
 
@@ -124,6 +132,7 @@ pub struct Endpoint {
 pub struct Call {
     pub route: String,
     pub method: String,
+    #[allow(dead_code)]
     pub response: Json,
     pub request: Option<Json>,
     pub response_type: Option<TypeReference>,
@@ -267,6 +276,7 @@ impl RouteExtractor for DependencyVisitor {
                         if let Some(Expr::Lit(Lit::Str(str_lit))) =
                             self.resolve_variable(ident.sym.as_ref())
                         {
+                            // For now, just handle string literals in template expressions
                             result.push_str(str_lit.value.as_ref());
                         } else {
                             // Can't fully resolve - return None

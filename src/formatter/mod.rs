@@ -164,6 +164,22 @@ fn format_critical_section(issues: &[String]) -> String {
     output
 }
 
+/// Separates endpoint issues into missing and orphaned categories
+fn separate_missing_orphaned(issues: &[String]) -> (Vec<&String>, Vec<&String>) {
+    let mut missing = Vec::new();
+    let mut orphaned = Vec::new();
+
+    for issue in issues {
+        if issue.starts_with("Missing endpoint:") {
+            missing.push(issue);
+        } else if issue.starts_with("Orphaned endpoint:") {
+            orphaned.push(issue);
+        }
+    }
+
+    (missing, orphaned)
+}
+
 fn format_connectivity_section(issues: &[String]) -> String {
     let mut output = String::new();
 
@@ -184,7 +200,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
         ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in missing {
-            let (method, path) = extract_method_path(&endpoint);
+            let (method, path) = extract_method_path(endpoint);
             output.push_str(&format!("| `{}` | `{}` |\n", method, path));
         }
         output.push_str("\n<br>\n\n");
@@ -198,7 +214,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
         ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in orphaned {
-            let (method, path) = extract_method_path(&endpoint);
+            let (method, path) = extract_method_path(endpoint);
             output.push_str(&format!("| `{}` | `{}` |\n", method, path));
         }
     }
@@ -494,21 +510,6 @@ fn parse_structured_type_error(issue: &str) -> (String, String, String, String) 
     };
 
     (endpoint, producer, consumer, error)
-}
-
-fn separate_missing_orphaned(issues: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut missing = Vec::new();
-    let mut orphaned = Vec::new();
-
-    for issue in issues {
-        if issue.contains("Missing endpoint") {
-            missing.push(issue.clone());
-        } else if issue.contains("Orphaned endpoint") {
-            orphaned.push(issue.clone());
-        }
-    }
-
-    (missing, orphaned)
 }
 
 fn extract_method_path(issue: &str) -> (String, String) {

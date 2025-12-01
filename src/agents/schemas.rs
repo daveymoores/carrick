@@ -2,8 +2,10 @@ use serde_json::{Value, json};
 
 /// Gemini schema types for structured output
 /// These correspond to the Type constants from @google/genai
+#[allow(dead_code)]
 pub struct GeminiType;
 
+#[allow(dead_code)]
 impl GeminiType {
     pub const ARRAY: &'static str = "ARRAY";
     pub const OBJECT: &'static str = "OBJECT";

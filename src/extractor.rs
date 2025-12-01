@@ -333,9 +333,7 @@ pub trait CoreExtractor {
                 if let Some(left_json) = self.extract_req_body_from_expr(&bin.left) {
                     return Some(left_json);
                 }
-                if let Some(right_json) = self.extract_req_body_from_expr(&bin.right) {
-                    return Some(right_json);
-                }
+                return self.extract_req_body_from_expr(&bin.right);
             }
 
             // Direct field access
@@ -401,6 +399,7 @@ pub trait CoreExtractor {
     }
 }
 
+#[allow(dead_code)]
 pub trait RouteExtractor: CoreExtractor {
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
     fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;
@@ -441,7 +440,9 @@ pub trait RouteExtractor: CoreExtractor {
             // Try to resolve the object
             if let Some(Expr::Object(obj_lit)) = self.resolve_variable(&obj_name) {
                 // If it's an object literal, extract the property
-                if let MemberProp::Ident(prop_ident) = &member.prop {
+                if let (Expr::Object(obj_lit), MemberProp::Ident(prop_ident)) =
+                    (resolved_obj, &member.prop)
+                {
                     let prop_name = prop_ident.sym.to_string();
 
                     // Find the property in the object

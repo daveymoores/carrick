@@ -4,7 +4,9 @@ use carrick::{
     framework_detector::DetectionResult,
     gemini_service::GeminiService,
     mount_graph::MountGraph,
+    visitor::ImportedSymbol,
 };
+use std::collections::HashMap;
 
 /// Test that the multi-agent orchestrator correctly processes call sites in mock mode
 #[tokio::test]
@@ -163,7 +165,8 @@ fn test_mount_graph_construction() {
     };
 
     // Build the mount graph
-    let mount_graph = MountGraph::build_from_analysis_results(&analysis_results);
+    let imported_symbols: HashMap<String, ImportedSymbol> = HashMap::new();
+    let mount_graph = MountGraph::build_from_analysis_results(&analysis_results, &imported_symbols);
 
     // Verify nodes were created
     assert_eq!(

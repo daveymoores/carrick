@@ -39,10 +39,12 @@ pub enum CallSiteType {
 }
 
 /// Service for classifying call sites using LLM with framework context
+#[allow(dead_code)]
 pub struct CallSiteClassifier {
     gemini_service: GeminiService,
 }
 
+#[allow(dead_code)]
 impl CallSiteClassifier {
     pub fn new(gemini_service: GeminiService) -> Self {
         Self { gemini_service }

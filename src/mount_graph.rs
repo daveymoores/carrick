@@ -4,9 +4,11 @@ use crate::{
         MountRelationship,
     },
     call_site_classifier::{CallSiteType, ClassifiedCallSite},
+    visitor::ImportedSymbol,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// Represents a node in the mount graph (router or app)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -74,6 +76,7 @@ impl MountGraph {
     }
 
     /// Build the mount graph from classified call sites
+    #[allow(dead_code)]
     pub fn build_from_classified_sites(classified_sites: Vec<ClassifiedCallSite>) -> Self {
         let mut graph = Self::new();
 
@@ -97,7 +100,10 @@ impl MountGraph {
     }
 
     /// Build the mount graph directly from analysis results (framework-agnostic)
-    pub fn build_from_analysis_results(analysis_results: &AnalysisResults) -> Self {
+    pub fn build_from_analysis_results(
+        analysis_results: &AnalysisResults,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+    ) -> Self {
         let mut graph = Self::new();
 
         // First pass: collect nodes from endpoints, middleware, and mount relationships
@@ -111,11 +117,18 @@ impl MountGraph {
         // Third pass: infer node types based on mount behavior
         graph.infer_node_types_from_behavior();
 
-        // Fourth pass: add endpoints and data calls directly
+        // Fourth pass: resolve owner names using import information (framework-agnostic)
+        graph.resolve_owner_names(
+            &analysis_results.endpoints,
+            &analysis_results.mount_relationships,
+            imported_symbols,
+        );
+
+        // Fifth pass: add endpoints and data calls directly
         graph.add_endpoints_from_analysis(&analysis_results.endpoints);
         graph.add_data_calls_from_analysis(&analysis_results.data_fetching_calls);
 
-        // Fifth pass: resolve full paths for all endpoints
+        // Sixth pass: resolve full paths for all endpoints
         graph.resolve_endpoint_paths();
 
         graph
@@ -198,14 +211,115 @@ impl MountGraph {
         }
     }
 
+    /// Resolve owner names by matching endpoints to mounts using import information
+    /// This is framework-agnostic - it uses ES module import/export semantics
+    fn resolve_owner_names(
+        &mut self,
+        _endpoints: &[HttpEndpoint],
+        mounts: &[MountRelationship],
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+    ) {
+        // Build a map of import name -> source file path
+        let mut import_to_source: HashMap<String, String> = HashMap::new();
+        for (name, symbol) in imported_symbols {
+            import_to_source.insert(name.clone(), symbol.source.clone());
+        }
+
+        // Build a map of (source_file, local_name) -> imported_name from mounts
+        // This tells us: "router defined in ./routes/users is imported as userRouter"
+        let mut owner_mapping: HashMap<(String, String), String> = HashMap::new();
+
+        for mount in mounts {
+            // Check if the child_node is an imported symbol
+            if let Some(source) = import_to_source.get(&mount.child_node) {
+                // Normalize the source path (remove .ts/.js extensions, handle relative paths)
+                let normalized_source = Self::normalize_import_source(source);
+
+                // For all endpoints in that source file, map their local owner to the imported name
+                // We'll store this as (source_path, "*") -> imported_name to match any local name
+                owner_mapping.insert(
+                    (normalized_source, "*".to_string()),
+                    mount.child_node.clone(),
+                );
+            }
+        }
+
+        // Now update the node names in our tracking
+        // We'll store this for use when adding endpoints
+        for (key, imported_name) in &owner_mapping {
+            if key.1 == "*" {
+                // Store in a way we can look it up later
+                self.nodes.insert(
+                    format!("__import_map__::{}", key.0),
+                    GraphNode {
+                        name: imported_name.clone(),
+                        node_type: NodeType::Unknown,
+                        creation_site: None,
+                        file_location: key.0.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Normalize import source paths to match against file locations
+    /// Handles: ./routes/users, ./routes/users.ts, routes/users, etc.
+    fn normalize_import_source(source: &str) -> String {
+        let path = source
+            .trim_start_matches("./")
+            .trim_start_matches("../")
+            .trim_end_matches(".ts")
+            .trim_end_matches(".js")
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".jsx");
+        path.to_string()
+    }
+
+    /// Extract the file path from a location string (format: "path/to/file.ts:line:col")
+    fn extract_file_from_location(location: &str) -> String {
+        location.split(':').next().unwrap_or(location).to_string()
+    }
+
+    /// Try to resolve an endpoint owner name using import information
+    fn resolve_endpoint_owner(&self, endpoint_owner: &str, endpoint_location: &str) -> String {
+        let endpoint_file = Self::extract_file_from_location(endpoint_location);
+
+        // Extract just the filename and parent directory for matching
+        let endpoint_path = Path::new(&endpoint_file);
+        let file_parts: Vec<_> = endpoint_path.iter().rev().take(2).collect();
+
+        // Try to find a matching import mapping
+        for (key, node) in &self.nodes {
+            if key.starts_with("__import_map__::") {
+                let source_pattern = key.trim_start_matches("__import_map__::");
+
+                // Check if endpoint file matches this source pattern
+                if endpoint_file.contains(source_pattern)
+                    || file_parts
+                        .iter()
+                        .any(|part| part.to_str().unwrap_or("").contains(source_pattern))
+                {
+                    return node.name.clone();
+                }
+            }
+        }
+
+        // No mapping found, return original owner
+        endpoint_owner.to_string()
+    }
+
     fn add_endpoints_from_analysis(&mut self, endpoints: &[HttpEndpoint]) {
         for endpoint in endpoints {
+            // Resolve the owner name using import information
+            let resolved_owner =
+                self.resolve_endpoint_owner(&endpoint.node_name, &endpoint.location);
+
             self.endpoints.push(ResolvedEndpoint {
                 method: endpoint.method.clone(),
                 path: endpoint.path.clone(),
                 full_path: endpoint.path.clone(), // Will be resolved later
                 handler: Some(endpoint.handler.clone()),
-                owner: endpoint.node_name.clone(),
+                owner: resolved_owner,
                 file_location: endpoint.location.clone(),
                 middleware_chain: Vec::new(), // Will be populated during path resolution
             });
@@ -226,6 +340,7 @@ impl MountGraph {
         }
     }
 
+    #[allow(dead_code)]
     fn collect_nodes(&mut self, classified_sites: &[ClassifiedCallSite]) {
         for site in classified_sites {
             let node_name = site.call_site.callee_object.clone();
@@ -281,6 +396,7 @@ impl MountGraph {
         }
     }
 
+    #[allow(dead_code)]
     fn build_mount_edges(&mut self, classified_sites: &[ClassifiedCallSite]) {
         for site in classified_sites {
             if matches!(site.classification, CallSiteType::RouterMount) {
@@ -291,6 +407,7 @@ impl MountGraph {
         }
     }
 
+    #[allow(dead_code)]
     fn extract_mount_relationship(&self, site: &ClassifiedCallSite) -> Option<MountEdge> {
         // Use LLM-extracted mount information instead of heuristic parsing
         let parent = site.mount_parent.as_ref()?;
@@ -313,6 +430,7 @@ impl MountGraph {
         })
     }
 
+    #[allow(dead_code)]
     fn collect_endpoints(&mut self, classified_sites: &[ClassifiedCallSite]) {
         for site in classified_sites {
             if matches!(site.classification, CallSiteType::HttpEndpoint) {
@@ -323,6 +441,7 @@ impl MountGraph {
         }
     }
 
+    #[allow(dead_code)]
     fn extract_endpoint(&self, site: &ClassifiedCallSite) -> Option<ResolvedEndpoint> {
         let method = site.call_site.callee_property.to_uppercase();
         let owner = site.call_site.callee_object.clone();
@@ -358,6 +477,7 @@ impl MountGraph {
         })
     }
 
+    #[allow(dead_code)]
     fn collect_data_calls(&mut self, classified_sites: &[ClassifiedCallSite]) {
         for site in classified_sites {
             if matches!(site.classification, CallSiteType::DataFetchingCall) {
@@ -368,6 +488,7 @@ impl MountGraph {
         }
     }
 
+    #[allow(dead_code)]
     fn extract_data_call(&self, site: &ClassifiedCallSite) -> Option<DataFetchingCall> {
         let method = site.call_site.callee_property.to_uppercase();
         let client = site.call_site.callee_object.clone();
@@ -489,6 +610,7 @@ impl MountGraph {
     }
 
     /// Find all endpoints that match a given path pattern
+    #[allow(dead_code)]
     pub fn find_matching_endpoints(&self, path: &str, method: &str) -> Vec<&ResolvedEndpoint> {
         self.endpoints
             .iter()
@@ -499,11 +621,13 @@ impl MountGraph {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn paths_match(&self, endpoint_path: &str, call_path: &str) -> bool {
         // Simple path matching - could be enhanced with parameter matching
         endpoint_path == call_path || self.path_matches_with_params(endpoint_path, call_path)
     }
 
+    #[allow(dead_code)]
     fn path_matches_with_params(&self, endpoint_path: &str, call_path: &str) -> bool {
         let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
         let call_segments: Vec<&str> = call_path.split('/').collect();

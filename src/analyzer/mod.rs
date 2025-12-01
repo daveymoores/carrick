@@ -22,6 +22,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Type aliases to reduce complexity
+type RouteFieldMap = HashMap<(String, String), Json>;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
     Critical, // Major version differences (1.x vs 2.x)
@@ -241,6 +244,7 @@ impl Analyzer {
         ConflictSeverity::Info
     }
 
+    #[allow(dead_code)]
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
         self.mounts.extend(visitor.mounts);
         // Note: App context will be populated via framework detection instead of visitor
@@ -686,7 +690,7 @@ impl Analyzer {
         &self,
         imported_handlers: &[(String, String, String, String)],
         function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> (RouteFieldsMap, RouteFieldsMap) {
+    ) -> (RouteFieldMap, RouteFieldMap) {
         let mut response_fields = HashMap::new();
         let mut request_fields = HashMap::new();
 
@@ -1023,7 +1027,7 @@ impl Analyzer {
                         if let (Some(call_req), Some(ep_req)) =
                             (&call.request_body, &ep.request_body)
                         {
-                            let mismatches = self.compare_json_fields(call_req, ep_req, "");
+                            let mismatches = Self::compare_json_fields(call_req, ep_req, "");
                             for mismatch in mismatches {
                                 issues.push(format!(
                                     "Request body mismatch for {} {} -> {}",
@@ -1045,7 +1049,6 @@ impl Analyzer {
 
     #[allow(clippy::only_used_in_recursion)]
     pub fn compare_json_fields(
-        &self,
         call_json: &Json,
         endpoint_json: &Json,
         path: &str,
@@ -1083,7 +1086,7 @@ impl Analyzer {
                         format!("{}.{}", path, key)
                     };
                     let sub_mismatches =
-                        self.compare_json_fields(&call_map[*key], &endpoint_map[*key], &sub_path);
+                        Self::compare_json_fields(&call_map[*key], &endpoint_map[*key], &sub_path);
                     mismatches.extend(sub_mismatches);
                 }
             }
