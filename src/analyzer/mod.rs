@@ -17,7 +17,13 @@ use crate::{
 };
 use core::fmt;
 use std::collections::HashSet;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+// Type aliases to reduce complexity
+type RouteFieldMap = HashMap<(String, String), Json>;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
@@ -236,6 +242,7 @@ impl Analyzer {
         ConflictSeverity::Info
     }
 
+    #[allow(dead_code)]
     pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
         self.mounts.extend(visitor.mounts);
         // Note: App context will be populated via framework detection instead of visitor
@@ -353,8 +360,8 @@ impl Analyzer {
             clean_path.push_str(segments[0]);
 
             // Process each segment with an ENV_VAR marker
-            for i in 1..segments.len() {
-                let subparts: Vec<&str> = segments[i].splitn(2, ':').collect();
+            for segment in segments.iter().skip(1) {
+                let subparts: Vec<&str> = segment.splitn(2, ':').collect();
                 if subparts.len() == 2 {
                     clean_path.push_str(subparts[1]);
                 }
@@ -494,9 +501,8 @@ impl Analyzer {
             .split('/')
             .filter(|segment| !segment.is_empty()) // Remove empty segments
             .map(|segment| {
-                if segment.starts_with(':') {
+                if let Some(param_name) = segment.strip_prefix(':') {
                     // Convert :id -> ById, :userId -> ByUserId, :eventId -> ByEventId
-                    let param_name = &segment[1..]; // Remove the ':'
                     format!("By{}", Self::to_pascal_case(param_name))
                 } else {
                     // Convert regular segments to PascalCase
@@ -538,7 +544,7 @@ impl Analyzer {
     pub fn create_type_reference_from_swc(
         type_ann_swc: &TsTypeAnn,
         cm: &Lrc<SourceMap>,
-        func_def_file_path: &PathBuf,
+        func_def_file_path: &Path,
         alias: String,
     ) -> Option<TypeReference> {
         let type_ref_span = match &*type_ann_swc.type_ann {
@@ -589,7 +595,7 @@ impl Analyzer {
             .unwrap_or_else(|_| "UnknownType".to_string());
 
         Some(TypeReference {
-            file_path: func_def_file_path.clone(), // Use the function's file path
+            file_path: func_def_file_path.to_path_buf(), // Use the function's file path
             type_ann: Some(Box::new(*type_ann_swc.type_ann.clone())), // Store the SWC AST node
             start_position: utf16_offset,
             composite_type_string,
@@ -682,10 +688,7 @@ impl Analyzer {
         &self,
         imported_handlers: &[(String, String, String, String)],
         function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> (
-        HashMap<(String, String), Json>,
-        HashMap<(String, String), Json>,
-    ) {
+    ) -> (RouteFieldMap, RouteFieldMap) {
         let mut response_fields = HashMap::new();
         let mut request_fields = HashMap::new();
 
@@ -817,8 +820,8 @@ impl Analyzer {
                     clean_path.push_str(segments[0]);
 
                     // Process each segment with an ENV_VAR marker
-                    for i in 1..segments.len() {
-                        let subparts: Vec<&str> = segments[i].splitn(2, ':').collect();
+                    for segment in segments.iter().skip(1) {
+                        let subparts: Vec<&str> = segment.splitn(2, ':').collect();
                         if subparts.len() == 2 {
                             clean_path.push_str(subparts[1]);
                         }
@@ -1022,7 +1025,7 @@ impl Analyzer {
                         if let (Some(call_req), Some(ep_req)) =
                             (&call.request_body, &ep.request_body)
                         {
-                            let mismatches = self.compare_json_fields(call_req, ep_req, "");
+                            let mismatches = Self::compare_json_fields(call_req, ep_req, "");
                             for mismatch in mismatches {
                                 issues.push(format!(
                                     "Request body mismatch for {} {} -> {}",
@@ -1043,7 +1046,6 @@ impl Analyzer {
     }
 
     pub fn compare_json_fields(
-        &self,
         call_json: &Json,
         endpoint_json: &Json,
         path: &str,
@@ -1081,7 +1083,7 @@ impl Analyzer {
                         format!("{}.{}", path, key)
                     };
                     let sub_mismatches =
-                        self.compare_json_fields(&call_map[*key], &endpoint_map[*key], &sub_path);
+                        Self::compare_json_fields(&call_map[*key], &endpoint_map[*key], &sub_path);
                     mismatches.extend(sub_mismatches);
                 }
             }
@@ -1546,7 +1548,7 @@ impl Analyzer {
     /// Extract repository prefix from file path by matching against repository paths
     pub fn extract_repo_prefix_from_file_path(
         &self,
-        file_path: &PathBuf,
+        file_path: &Path,
         repo_paths: &[String],
     ) -> String {
         let file_path_str = file_path.to_string_lossy();

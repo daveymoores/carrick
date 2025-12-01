@@ -11,6 +11,7 @@ pub struct AnalyzerBuilder {
 }
 
 impl AnalyzerBuilder {
+    #[allow(dead_code)]
     pub fn new(config: Config, cm: Lrc<SourceMap>) -> Self {
         Self {
             config,
@@ -28,6 +29,7 @@ impl AnalyzerBuilder {
     }
 
     /// Build analyzer from visitor data (used by analyze_current_repo)
+    #[allow(dead_code)]
     pub async fn build_from_visitors(
         &self,
         visitors: Vec<DependencyVisitor>,

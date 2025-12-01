@@ -260,6 +260,12 @@ pub struct CallSiteExtractionService {
     call_sites: Vec<CallSite>,
 }
 
+impl Default for CallSiteExtractionService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CallSiteExtractionService {
     pub fn new() -> Self {
         Self {
@@ -278,6 +284,7 @@ impl CallSiteExtractionService {
     }
 
     /// Prepare call sites for LLM classification with framework context
+    #[allow(dead_code)]
     pub fn prepare_for_classification(&self) -> serde_json::Value {
         serde_json::json!({
             "call_sites": self.call_sites,

@@ -20,6 +20,25 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 
+// Type aliases to reduce complexity
+type FileDiscoveryResult = Result<
+    (
+        Vec<PathBuf>,
+        HashMap<String, crate::visitor::ImportedSymbol>,
+        String,
+    ),
+    Box<dyn std::error::Error>,
+>;
+
+type OrchestratorConversionResult = (
+    Vec<ApiEndpointDetails>,
+    Vec<ApiEndpointDetails>,
+    Vec<Mount>,
+    HashMap<String, AppContext>,
+    Vec<(String, String, String, String)>,
+    HashMap<String, FunctionDefinition>,
+);
+
 /// Determine if we should upload data based on GitHub context
 /// Only upload on main/master branch, not on PRs
 fn should_upload_data() -> bool {
@@ -132,7 +151,7 @@ where
         for (i, repo_data) in all_repo_data.iter().enumerate() {
             if let Some(json_str) = extractor(repo_data) {
                 let temp_path = PathBuf::from(format!("/tmp/carrick_config_{}.json", i));
-                if let Err(_) = std::fs::write(&temp_path, json_str) {
+                if std::fs::write(&temp_path, json_str).is_err() {
                     continue;
                 }
                 temp_files.push(temp_path);
@@ -184,19 +203,8 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
 }
 
 /// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
-
 /// Discover files and extract symbols for MultiAgentOrchestrator
-fn discover_files_and_symbols(
-    repo_path: &str,
-    cm: Lrc<SourceMap>,
-) -> Result<
-    (
-        Vec<PathBuf>,
-        HashMap<String, crate::visitor::ImportedSymbol>,
-        String,
-    ),
-    Box<dyn std::error::Error>,
-> {
+fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
@@ -350,14 +358,7 @@ async fn analyze_current_repo(
 /// Convert MultiAgentOrchestrator results to analyzer data structures
 fn convert_orchestrator_results_to_analyzer_data(
     result: &crate::multi_agent_orchestrator::MultiAgentAnalysisResult,
-) -> (
-    Vec<ApiEndpointDetails>,
-    Vec<ApiEndpointDetails>,
-    Vec<Mount>,
-    HashMap<String, AppContext>,
-    Vec<(String, String, String, String)>,
-    HashMap<String, FunctionDefinition>,
-) {
+) -> OrchestratorConversionResult {
     let mount_graph = &result.mount_graph;
 
     // Convert ResolvedEndpoints to ApiEndpointDetails (endpoints)

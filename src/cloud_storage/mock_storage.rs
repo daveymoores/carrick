@@ -12,6 +12,12 @@ pub struct MockStorage {
     type_files: Mutex<HashMap<String, String>>,
 }
 
+impl Default for MockStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockStorage {
     pub fn new() -> Self {
         Self {

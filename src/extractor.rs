@@ -28,8 +28,8 @@ pub trait CoreExtractor {
         }
     }
 
-    fn extract_json_fields_from_return(&self, expr: &Box<Expr>) -> Option<Json> {
-        if let Expr::Call(call) = &**expr {
+    fn extract_json_fields_from_return(&self, expr: &Expr) -> Option<Json> {
+        if let Expr::Call(call) = expr {
             self.extract_res_json_fields(call)
         } else {
             None
@@ -214,7 +214,7 @@ pub trait CoreExtractor {
                     }
                 }
 
-                Json::Object(Box::new(map))
+                Json::Object(map)
             }
 
             // Other expressions (function calls, identifiers, etc.) - treat as null for now
@@ -279,7 +279,7 @@ pub trait CoreExtractor {
                                         }
 
                                         if !fields.is_empty() {
-                                            return Some(Json::Object(Box::new(fields)));
+                                            return Some(Json::Object(fields));
                                         }
                                     }
                                 }
@@ -306,7 +306,7 @@ pub trait CoreExtractor {
                                     let field_name = field_prop.sym.to_string();
                                     let mut fields = HashMap::new();
                                     fields.insert(field_name, Json::Null);
-                                    return Some(Json::Object(Box::new(fields)));
+                                    return Some(Json::Object(fields));
                                 }
                             }
                         }
@@ -333,9 +333,7 @@ pub trait CoreExtractor {
                 if let Some(left_json) = self.extract_req_body_from_expr(&bin.left) {
                     return Some(left_json);
                 }
-                if let Some(right_json) = self.extract_req_body_from_expr(&bin.right) {
-                    return Some(right_json);
-                }
+                return self.extract_req_body_from_expr(&bin.right);
             }
 
             // Direct field access
@@ -401,6 +399,7 @@ pub trait CoreExtractor {
     }
 }
 
+#[allow(dead_code)]
 pub trait RouteExtractor: CoreExtractor {
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
     fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;
@@ -441,18 +440,18 @@ pub trait RouteExtractor: CoreExtractor {
             // Try to resolve the object
             if let Some(resolved_obj) = self.resolve_variable(&obj_name) {
                 // If it's an object literal, extract the property
-                if let Expr::Object(obj_lit) = resolved_obj {
-                    if let MemberProp::Ident(prop_ident) = &member.prop {
-                        let prop_name = prop_ident.sym.to_string();
+                if let (Expr::Object(obj_lit), MemberProp::Ident(prop_ident)) =
+                    (resolved_obj, &member.prop)
+                {
+                    let prop_name = prop_ident.sym.to_string();
 
-                        // Find the property in the object
-                        for prop in &obj_lit.props {
-                            if let PropOrSpread::Prop(box_prop) = prop {
-                                if let Prop::KeyValue(kv) = &**box_prop {
-                                    if let PropName::Ident(key_ident) = &kv.key {
-                                        if key_ident.sym == prop_name {
-                                            return self.extract_string_from_expr(&kv.value);
-                                        }
+                    // Find the property in the object
+                    for prop in &obj_lit.props {
+                        if let PropOrSpread::Prop(box_prop) = prop {
+                            if let Prop::KeyValue(kv) = &**box_prop {
+                                if let PropName::Ident(key_ident) = &kv.key {
+                                    if key_ident.sym == prop_name {
+                                        return self.extract_string_from_expr(&kv.value);
                                     }
                                 }
                             }

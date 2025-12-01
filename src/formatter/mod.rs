@@ -164,6 +164,22 @@ fn format_critical_section(issues: &[String]) -> String {
     output
 }
 
+/// Separates endpoint issues into missing and orphaned categories
+fn separate_missing_orphaned(issues: &[String]) -> (Vec<&String>, Vec<&String>) {
+    let mut missing = Vec::new();
+    let mut orphaned = Vec::new();
+
+    for issue in issues {
+        if issue.starts_with("Missing endpoint:") {
+            missing.push(issue);
+        } else if issue.starts_with("Orphaned endpoint:") {
+            orphaned.push(issue);
+        }
+    }
+
+    (missing, orphaned)
+}
+
 fn format_connectivity_section(issues: &[String]) -> String {
     let mut output = String::new();
 
@@ -184,7 +200,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
         ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in missing {
-            let (method, path) = extract_method_path(&endpoint);
+            let (method, path) = extract_method_path(endpoint);
             output.push_str(&format!("| `{}` | `{}` |\n", method, path));
         }
         output.push_str("\n<br>\n\n");
@@ -198,7 +214,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
         ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in orphaned {
-            let (method, path) = extract_method_path(&endpoint);
+            let (method, path) = extract_method_path(endpoint);
             output.push_str(&format!("| `{}` | `{}` |\n", method, path));
         }
     }
@@ -272,9 +288,9 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
                     repo_info.source_path.display()
                 ));
             }
-            output.push_str("\n");
+            output.push('\n');
         }
-        output.push_str("\n");
+        output.push('\n');
     }
 
     // Warning conflicts (minor version differences)
@@ -297,9 +313,9 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
                     repo_info.source_path.display()
                 ));
             }
-            output.push_str("\n");
+            output.push('\n');
         }
-        output.push_str("\n");
+        output.push('\n');
     }
 
     // Info conflicts (patch version differences)
@@ -322,7 +338,7 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
                     repo_info.source_path.display()
                 ));
             }
-            output.push_str("\n");
+            output.push('\n');
         }
     }
 
@@ -496,6 +512,86 @@ fn parse_structured_type_error(issue: &str) -> (String, String, String, String) 
     (endpoint, producer, consumer, error)
 }
 
+fn extract_method_path(issue: &str) -> (String, String) {
+    // Extract method and path from issues like "Missing endpoint: No endpoint defined for GET /api/users"
+    // or "Orphaned endpoint: No call matching endpoint GET /api/users"
+    if let Some(for_pos) = issue.find(" for ") {
+        let method_path = &issue[for_pos + 5..];
+        let parts: Vec<&str> = method_path.splitn(2, ' ').collect();
+        if parts.len() == 2 {
+            return (parts[0].to_string(), parts[1].to_string());
+        }
+    }
+
+    // Handle orphaned endpoint format: "Orphaned endpoint: No call matching endpoint GET /api/users"
+    if let Some(endpoint_pos) = issue.find("endpoint ") {
+        let method_path = &issue[endpoint_pos + 9..];
+        let parts: Vec<&str> = method_path.splitn(2, ' ').collect();
+        if parts.len() == 2 {
+            return (parts[0].to_string(), parts[1].to_string());
+        }
+    }
+
+    // Fallback: try to extract any method and path pattern
+    let methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
+    for method in &methods {
+        if let Some(method_pos) = issue.find(method) {
+            let after_method = &issue[method_pos + method.len()..];
+            if let Some(path_start) = after_method.find(' ') {
+                let path_part = after_method[path_start..].trim();
+                if path_part.starts_with('/') {
+                    let path_end = path_part.find(' ').unwrap_or(path_part.len());
+                    return (method.to_string(), path_part[..path_end].to_string());
+                }
+            }
+        }
+    }
+
+    ("UNKNOWN".to_string(), "UNKNOWN".to_string())
+}
+
+fn extract_env_var_info(issue: &str) -> (String, String, String) {
+    // Parse issues like "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
+    let method = if issue.contains("GET") {
+        "GET"
+    } else if issue.contains("POST") {
+        "POST"
+    } else if issue.contains("PUT") {
+        "PUT"
+    } else if issue.contains("DELETE") {
+        "DELETE"
+    } else {
+        "UNKNOWN"
+    };
+
+    let env_vars = if let Some(start) = issue.find('[') {
+        if let Some(end) = issue.find(']') {
+            &issue[start + 1..end]
+        } else {
+            "UNKNOWN"
+        }
+    } else {
+        "UNKNOWN"
+    };
+
+    // Extract just the path part after the env var
+    let path = if let Some(start) = issue.find("ENV_VAR:") {
+        let env_var_section = &issue[start..];
+        // Format: "ENV_VAR:UNKNOWN_API:/data"
+        // Find the second colon to get just the path part
+        let parts: Vec<&str> = env_var_section.splitn(3, ':').collect();
+        if parts.len() >= 3 {
+            parts[2] // The path part after "ENV_VAR:VARNAME:"
+        } else {
+            "UNKNOWN"
+        }
+    } else {
+        "UNKNOWN"
+    };
+
+    (method.to_string(), env_vars.to_string(), path.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,99 +684,4 @@ mod tests {
         assert!(output.contains("No API inconsistencies detected"));
         assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
     }
-}
-
-fn separate_missing_orphaned(issues: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut missing = Vec::new();
-    let mut orphaned = Vec::new();
-
-    for issue in issues {
-        if issue.contains("Missing endpoint") {
-            missing.push(issue.clone());
-        } else if issue.contains("Orphaned endpoint") {
-            orphaned.push(issue.clone());
-        }
-    }
-
-    (missing, orphaned)
-}
-
-fn extract_method_path(issue: &str) -> (String, String) {
-    // Extract method and path from issues like "Missing endpoint: No endpoint defined for GET /api/users"
-    // or "Orphaned endpoint: No call matching endpoint GET /api/users"
-    if let Some(for_pos) = issue.find(" for ") {
-        let method_path = &issue[for_pos + 5..];
-        let parts: Vec<&str> = method_path.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            return (parts[0].to_string(), parts[1].to_string());
-        }
-    }
-
-    // Handle orphaned endpoint format: "Orphaned endpoint: No call matching endpoint GET /api/users"
-    if let Some(endpoint_pos) = issue.find("endpoint ") {
-        let method_path = &issue[endpoint_pos + 9..];
-        let parts: Vec<&str> = method_path.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            return (parts[0].to_string(), parts[1].to_string());
-        }
-    }
-
-    // Fallback: try to extract any method and path pattern
-    let methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
-    for method in &methods {
-        if let Some(method_pos) = issue.find(method) {
-            let after_method = &issue[method_pos + method.len()..];
-            if let Some(path_start) = after_method.find(' ') {
-                let path_part = after_method[path_start..].trim();
-                if path_part.starts_with('/') {
-                    let path_end = path_part.find(' ').unwrap_or(path_part.len());
-                    return (method.to_string(), path_part[..path_end].to_string());
-                }
-            }
-        }
-    }
-
-    ("UNKNOWN".to_string(), "UNKNOWN".to_string())
-}
-
-fn extract_env_var_info(issue: &str) -> (String, String, String) {
-    // Parse issues like "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
-    let method = if issue.contains("GET") {
-        "GET"
-    } else if issue.contains("POST") {
-        "POST"
-    } else if issue.contains("PUT") {
-        "PUT"
-    } else if issue.contains("DELETE") {
-        "DELETE"
-    } else {
-        "UNKNOWN"
-    };
-
-    let env_vars = if let Some(start) = issue.find('[') {
-        if let Some(end) = issue.find(']') {
-            &issue[start + 1..end]
-        } else {
-            "UNKNOWN"
-        }
-    } else {
-        "UNKNOWN"
-    };
-
-    // Extract just the path part after the env var
-    let path = if let Some(start) = issue.find("ENV_VAR:") {
-        let env_var_section = &issue[start..];
-        // Format: "ENV_VAR:UNKNOWN_API:/data"
-        // Find the second colon to get just the path part
-        let parts: Vec<&str> = env_var_section.splitn(3, ':').collect();
-        if parts.len() >= 3 {
-            parts[2] // The path part after "ENV_VAR:VARNAME:"
-        } else {
-            "UNKNOWN"
-        }
-    } else {
-        "UNKNOWN"
-    };
-
-    (method.to_string(), env_vars.to_string(), path.to_string())
 }

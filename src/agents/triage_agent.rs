@@ -84,7 +84,7 @@ impl TriageAgent {
             println!(
                 "Processing batch {} of {} ({} call sites)",
                 batch_num + 1,
-                (call_sites.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+                call_sites.len().div_ceil(BATCH_SIZE),
                 batch.len()
             );
 
@@ -125,7 +125,7 @@ impl TriageAgent {
             all_results.extend(batch_results);
 
             // Delay between batches to avoid rate limiting - increased from 500ms to 1000ms
-            if batch_num + 1 < (call_sites.len() + BATCH_SIZE - 1) / BATCH_SIZE {
+            if batch_num + 1 < call_sites.len().div_ceil(BATCH_SIZE) {
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             }
         }
