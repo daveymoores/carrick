@@ -101,6 +101,7 @@ impl CloudStorage for MockStorage {
                     packages: Some(mock_packages_a),
                     last_updated: Utc::now(),
                     commit_hash: "abc123".to_string(),
+                    mount_graph: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -115,6 +116,7 @@ impl CloudStorage for MockStorage {
                     packages: Some(mock_packages_b),
                     last_updated: Utc::now(),
                     commit_hash: "def456".to_string(),
+                    mount_graph: None,
                 },
             ];
             result.extend(mock_repos);
