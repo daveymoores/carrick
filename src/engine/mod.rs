@@ -7,7 +7,7 @@ use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::utils::get_repository_name;
-use crate::visitor::DependencyVisitor;
+use crate::visitor::ImportSymbolExtractor;
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -213,10 +213,9 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
-            let mut visitor =
-                DependencyVisitor::new(file_path.clone(), &repo_name, None, cm.clone());
-            module.visit_with(&mut visitor);
-            all_imported_symbols.extend(visitor.imported_symbols);
+            let mut extractor = ImportSymbolExtractor::new();
+            module.visit_with(&mut extractor);
+            all_imported_symbols.extend(extractor.imported_symbols);
         }
     }
 
