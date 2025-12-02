@@ -6,7 +6,7 @@ use carrick::{
     mount_graph::MountGraph,
     packages::Packages,
     parser::parse_file,
-    visitor::{DependencyVisitor, ImportedSymbol},
+    visitor::{ImportSymbolExtractor, ImportedSymbol},
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,9 +35,9 @@ async fn analyze_fixture(fixture_path: &str) -> (Vec<String>, Vec<String>) {
     // Parse file and extract symbols
     let mut imported_symbols = HashMap::new();
     let module = parse_file(&server_path, &cm, &handler).unwrap();
-    let mut visitor = DependencyVisitor::new(server_path.clone(), "test-repo", None, cm.clone());
-    module.visit_with(&mut visitor);
-    imported_symbols.extend(visitor.imported_symbols);
+    let mut extractor = ImportSymbolExtractor::new();
+    module.visit_with(&mut extractor);
+    imported_symbols.extend(extractor.imported_symbols);
 
     // Framework Detection
     let gemini_service = GeminiService::new("mock_key".to_string());

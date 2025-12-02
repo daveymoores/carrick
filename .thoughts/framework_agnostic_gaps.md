@@ -26,7 +26,7 @@ If matching fails, the entire product fails—users see every endpoint as "orpha
 | **P1** | Path Matching Limited | High | 1-2 days | ✅ **COMPLETE** |
 | **P2** | Type Comparison Dead Code | Medium | 0.5 days | ✅ **COMPLETE** |
 | **P3** | Test Coverage Overstates Support | Medium | 1-2 days | Confidence issue |
-| **P4** | Legacy Visitor Dependency | Low | 2-3 hours | Deferred correctly |
+| **P4** | Legacy Visitor Dependency | Low | 2-3 hours | ✅ **COMPLETE** |
 
 ---
 
@@ -224,39 +224,32 @@ The fixtures (`tests/fixtures/fastify-api/`, `tests/fixtures/koa-api/`) contain 
 
 ## 5. Dependency on Legacy Visitor for Imports
 
-**Severity: LOW (P4)** — Correctly deferred as Priority 3 work.
+**Severity: LOW (P4)** — ✅ **COMPLETE** (January 2025)
 
 ### The Problem
 
-`discover_files_and_symbols` still uses `DependencyVisitor` to collect `ImportedSymbol` data:
+`discover_files_and_symbols` was using the heavy `DependencyVisitor` (500+ lines) to collect `ImportedSymbol` data, when only import extraction was needed.
 
-```carrick/src/engine/mod.rs#L195-210
-fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
-    ...
-    for file_path in &files {
-        if let Some(module) = parse_file(file_path, &cm, &handler) {
-            let mut visitor =
-                DependencyVisitor::new(file_path.clone(), &repo_name, None, cm.clone());
-            module.visit_with(&mut visitor);
-            all_imported_symbols.extend(visitor.imported_symbols);
-        }
-    }
-```
+### Implementation (Completed)
 
-Any ES module feature the visitor doesn't understand (dynamic imports, TS path aliases) could affect owner resolution.
+1. **Created lightweight `ImportSymbolExtractor`** (~60 lines):
+   - Focused only on ES module import extraction
+   - Handles named, default, and namespace imports
+   - No unnecessary AST traversal for endpoints/calls/mounts
 
-### Why This Is Low Priority
+2. **Updated `engine/mod.rs`**:
+   - Replaced `DependencyVisitor` with `ImportSymbolExtractor`
+   - Cleaner, more focused code
 
-- The system works for common patterns
-- This was explicitly deferred in Phase 2 as optional cleanup
-- The multi-agent system extracts endpoints/calls independently
+3. **Removed dead code**:
+   - Deleted `build_from_visitors()` from `AnalyzerBuilder`
+   - Deleted `add_visitor_data()` from `Analyzer`
+   - Marked `DependencyVisitor` as deprecated with `#[allow(dead_code)]`
 
-### Future Work (When Convenient)
+4. **Updated tests**:
+   - `multi_framework_test.rs` now uses `ImportSymbolExtractor`
 
-- Extract a lightweight `SymbolExtractor` focused on import graphs
-- Or teach `CallSiteExtractor` to emit import metadata
-
-**Estimated effort:** 2-3 hours
+**Result**: Import extraction is now done by a minimal, focused extractor. The legacy `DependencyVisitor` is preserved but deprecated for potential future reference.
 
 ---
 
@@ -293,12 +286,14 @@ Any ES module feature the visitor doesn't understand (dynamic imports, TS path a
    - Add real-API integration test job
    - Document mock vs. real coverage
 
-### Phase 3: Polish (P4)
+### Phase 3: Polish (P4) — ✅ COMPLETE
 
 **Goal:** Long-term maintainability.
 
-5. **Visitor Cleanup** (P4, when convenient)
-   - Optional refactor of import extraction
+5. **Visitor Cleanup** (P4) ✅
+   - Created `ImportSymbolExtractor` (lightweight, focused)
+   - Removed dead `build_from_visitors()` and `add_visitor_data()`
+   - Deprecated `DependencyVisitor` with documentation
 
 ---
 
@@ -336,4 +331,8 @@ After P0 and P1 are complete, running Carrick on a real microservices architectu
 | `src/lib.rs` | Added `url_normalizer` module |
 | `src/main.rs` | Added `url_normalizer` module |
 | `src/mount_graph.rs` | Added normalized matching methods + tests |
-| `src/analyzer/mod.rs` | Updated to use `UrlNormalizer` for matching; removed dead JSON comparison code |
+| `src/analyzer/mod.rs` | Updated to use `UrlNormalizer` for matching; removed dead JSON comparison code; removed `add_visitor_data()` |
+| `src/analyzer/builder.rs` | Removed dead `build_from_visitors()` method |
+| `src/visitor.rs` | Added `ImportSymbolExtractor`; deprecated `DependencyVisitor` |
+| `src/engine/mod.rs` | Switched to `ImportSymbolExtractor` |
+| `tests/multi_framework_test.rs` | Switched to `ImportSymbolExtractor` |

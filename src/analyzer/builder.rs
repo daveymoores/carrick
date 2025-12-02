@@ -1,7 +1,6 @@
 use crate::analyzer::Analyzer;
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
-use crate::visitor::DependencyVisitor;
 use swc_common::{SourceMap, sync::Lrc};
 
 pub struct AnalyzerBuilder {
@@ -26,22 +25,6 @@ impl AnalyzerBuilder {
             cm,
             skip_type_resolution: true,
         }
-    }
-
-    /// Build analyzer from visitor data (used by analyze_current_repo)
-    #[allow(dead_code)]
-    pub async fn build_from_visitors(
-        &self,
-        visitors: Vec<DependencyVisitor>,
-    ) -> Result<Analyzer, Box<dyn std::error::Error>> {
-        let mut analyzer = Analyzer::new(self.config.clone(), self.cm.clone());
-
-        // Add visitor data to analyzer
-        for visitor in visitors {
-            analyzer.add_visitor_data(visitor);
-        }
-
-        self.finalize_analyzer(analyzer).await
     }
 
     /// Build analyzer from CloudRepoData (used by build_cross_repo_analyzer)

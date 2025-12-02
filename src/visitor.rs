@@ -159,6 +159,79 @@ pub struct ImportedSymbol {
     pub kind: SymbolKind,
 }
 
+/// Lightweight extractor focused only on import symbols.
+/// This replaces the heavy DependencyVisitor for cases where only
+/// import resolution is needed (e.g., multi-agent orchestration).
+#[derive(Debug)]
+pub struct ImportSymbolExtractor {
+    pub imported_symbols: HashMap<String, ImportedSymbol>,
+}
+
+impl ImportSymbolExtractor {
+    pub fn new() -> Self {
+        Self {
+            imported_symbols: HashMap::new(),
+        }
+    }
+}
+
+impl Default for ImportSymbolExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Visit for ImportSymbolExtractor {
+    fn visit_import_decl(&mut self, import: &ImportDecl) {
+        let source = import.src.value.to_string();
+
+        for specifier in &import.specifiers {
+            match specifier {
+                ImportSpecifier::Named(named) => {
+                    let local_name = named.local.sym.to_string();
+                    self.imported_symbols.insert(
+                        local_name.to_string(),
+                        ImportedSymbol {
+                            local_name: local_name.clone(),
+                            imported_name: local_name,
+                            source: source.clone(),
+                            kind: SymbolKind::Named,
+                        },
+                    );
+                }
+                ImportSpecifier::Default(default) => {
+                    let local_name = default.local.sym.to_string();
+                    self.imported_symbols.insert(
+                        local_name.to_string(),
+                        ImportedSymbol {
+                            local_name: local_name.clone(),
+                            imported_name: local_name,
+                            source: source.clone(),
+                            kind: SymbolKind::Default,
+                        },
+                    );
+                }
+                ImportSpecifier::Namespace(namespace) => {
+                    let local_name = namespace.local.sym.to_string();
+                    self.imported_symbols.insert(
+                        local_name.to_string(),
+                        ImportedSymbol {
+                            local_name: local_name.clone(),
+                            imported_name: local_name,
+                            source: source.clone(),
+                            kind: SymbolKind::Namespace,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// DEPRECATED: This visitor is no longer used in the multi-agent pipeline.
+/// Use `ImportSymbolExtractor` instead for import resolution.
+/// Kept for potential future reference but can be safely removed.
+#[allow(dead_code)]
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct DependencyVisitor {
@@ -182,6 +255,7 @@ pub struct DependencyVisitor {
     pub source_map: Lrc<SourceMap>,
 }
 
+#[allow(dead_code)]
 impl DependencyVisitor {
     pub fn new(
         file_path: PathBuf,

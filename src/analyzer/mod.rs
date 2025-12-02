@@ -12,10 +12,7 @@ use crate::{
     packages::Packages,
     url_normalizer::UrlNormalizer,
     utils::{get_repository_name, join_prefix_and_path},
-    visitor::{
-        Call, DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType,
-        TypeReference,
-    },
+    visitor::{Call, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
 };
 use std::collections::HashSet;
 use std::{
@@ -228,52 +225,6 @@ impl Analyzer {
 
         // Only patch differences remain
         ConflictSeverity::Info
-    }
-
-    #[allow(dead_code)]
-    pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
-        self.mounts.extend(visitor.mounts);
-        // Note: App context will be populated via framework detection instead of visitor
-
-        for endpoint in visitor.endpoints {
-            let params = self.extract_params_from_route(&endpoint.route);
-            self.endpoints.push(ApiEndpointDetails {
-                owner: Some(endpoint.owner.clone()),
-                route: endpoint.route.to_string(),
-                method: endpoint.method.to_string(),
-                params,
-                response_body: Some(endpoint.response),
-                request_body: endpoint.request,
-                handler_name: Some(endpoint.handler_name),
-                request_type: endpoint.request_type,
-                response_type: endpoint.response_type,
-                file_path: endpoint.handler_file,
-            });
-        }
-
-        // expected_fields being returned data from all CRUD calls
-        for call in visitor.calls {
-            let params = self.extract_params_from_route(&call.route);
-            self.calls.push(ApiEndpointDetails {
-                owner: None,
-                route: call.route.to_string(),
-                method: call.method.to_string(),
-                params,
-                response_body: Some(call.response),
-                request_body: call.request,
-                handler_name: None, // Calls don't typically have handlers
-                request_type: call.request_type,
-                response_type: call.response_type,
-                file_path: call.call_file,
-            })
-        }
-
-        self.imported_handlers
-            .extend(visitor.imported_handlers.clone());
-
-        for (name, def) in visitor.function_definitions {
-            self.function_definitions.insert(name, def);
-        }
     }
 
     pub async fn analyze_functions_for_fetch_calls(&mut self) {
