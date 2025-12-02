@@ -129,11 +129,15 @@ This directory contains all design documents, research, and progress reports for
 | - Priority 2: Legacy Methods | ✅ Complete | 100% |
 | - Priority 3: DependencyVisitor | 🟡 Deferred | 0% |
 | Phase 3: Multi-Framework | ✅ Complete | 100% |
+| **Phase 4: URL Normalization** | **✅ Complete** | **100%** |
+| - P0: URL Normalization | ✅ Complete | 100% |
+| - P1: Path Matching | ✅ Complete | 100% |
 
-**All Tests**: ✅ 36/36 Passing (down from 46, removed Express-specific tests)  
+**All Tests**: ✅ 70+ Passing (includes 19 URL normalizer + 6 mount graph matching tests)  
 **Clippy**: ✅ Clean  
 **Frameworks**: ✅ Express, Fastify, Koa  
-**Framework Agnostic**: ✅ Pure mount graph implementation
+**Framework Agnostic**: ✅ Pure mount graph implementation  
+**Cross-Service Matching**: ✅ Full URL normalization support
 
 ---
 
@@ -158,6 +162,19 @@ The project uses a "classify-then-dispatch" pattern where:
 **Priority 2** ✅ (DONE): Remove legacy analysis methods
 - Deleted `analyze_matches()` - Express-specific pattern matching
 - Deleted `compare_calls_to_endpoints()` - router-based comparison
+
+### Phase 4: URL Normalization (Gap Analysis P0-P1)
+
+**P0** ✅ (DONE): URL Normalization
+- Added `src/url_normalizer.rs` (650 lines)
+- Handles full URLs, env var patterns, template literals
+- Integrates with `carrick.json` domain configuration
+- 19 unit tests for URL patterns
+
+**P1** ✅ (DONE): Enhanced Path Matching
+- Optional segments (`/:id?`)
+- Wildcards (`/*`, `/**`, `(.*)`)
+- Query string and trailing slash normalization
 - Deleted `find_matching_endpoint()` - matchit router helper
 - Implemented framework-agnostic mount graph-based analysis
 - Removed 341 lines of Express-specific code

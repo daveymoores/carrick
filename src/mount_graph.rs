@@ -4,6 +4,7 @@ use crate::{
         MountRelationship,
     },
     call_site_classifier::{CallSiteType, ClassifiedCallSite},
+    url_normalizer::UrlNormalizer,
     visitor::ImportedSymbol,
 };
 use serde::{Deserialize, Serialize};
@@ -610,6 +611,9 @@ impl MountGraph {
     }
 
     /// Find all endpoints that match a given path pattern
+    ///
+    /// This is the basic matching method that does not perform URL normalization.
+    /// For cross-service matching with full URLs, use `find_matching_endpoints_normalized`.
     #[allow(dead_code)]
     pub fn find_matching_endpoints(&self, path: &str, method: &str) -> Vec<&ResolvedEndpoint> {
         self.endpoints
@@ -621,14 +625,128 @@ impl MountGraph {
             .collect()
     }
 
+    /// Find all endpoints that match a given URL pattern with URL normalization
+    ///
+    /// This method handles real-world URL patterns:
+    /// - Full URLs: `https://user-service.internal/users/123` → matches `/users/:id`
+    /// - Env var patterns: `ENV_VAR:SERVICE_URL:/users/123` → matches `/users/:id`
+    /// - Template literals: `${API_URL}/users/${id}` → matches `/users/:id`
+    /// - Query strings are stripped: `/users?page=1` → matches `/users`
+    ///
+    /// Returns `None` if the URL is identified as external (should be skipped).
+    /// Returns `Some(vec)` with matching endpoints (may be empty if no match found).
+    pub fn find_matching_endpoints_with_normalizer(
+        &self,
+        url: &str,
+        method: &str,
+        normalizer: &UrlNormalizer,
+    ) -> Option<Vec<&ResolvedEndpoint>> {
+        let normalized = normalizer.normalize(url);
+
+        // Skip external calls
+        if normalized.is_external {
+            return None;
+        }
+
+        let matching = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.method.eq_ignore_ascii_case(method)
+                    && self.paths_match(&endpoint.full_path, &normalized.path)
+            })
+            .collect();
+
+        Some(matching)
+    }
+
     #[allow(dead_code)]
     fn paths_match(&self, endpoint_path: &str, call_path: &str) -> bool {
-        // Simple path matching - could be enhanced with parameter matching
-        endpoint_path == call_path || self.path_matches_with_params(endpoint_path, call_path)
+        // Exact match
+        if endpoint_path == call_path {
+            return true;
+        }
+
+        // Parameter matching (e.g., /users/:id matches /users/123)
+        if self.path_matches_with_params(endpoint_path, call_path) {
+            return true;
+        }
+
+        // Try matching with wildcards
+        if self.path_matches_with_wildcards(endpoint_path, call_path) {
+            return true;
+        }
+
+        false
     }
 
     #[allow(dead_code)]
     fn path_matches_with_params(&self, endpoint_path: &str, call_path: &str) -> bool {
+        let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
+        let call_segments: Vec<&str> = call_path.split('/').collect();
+
+        // Handle optional segments (e.g., /users/:id?)
+        let endpoint_required_count = endpoint_segments
+            .iter()
+            .filter(|s| !s.ends_with('?'))
+            .count();
+
+        // Call must have at least required segments and at most all segments
+        if call_segments.len() < endpoint_required_count
+            || call_segments.len() > endpoint_segments.len()
+        {
+            return false;
+        }
+
+        for (i, endpoint_seg) in endpoint_segments.iter().enumerate() {
+            // Check if this is an optional segment
+            let is_optional = endpoint_seg.ends_with('?');
+            let seg = endpoint_seg.trim_end_matches('?');
+
+            // If we're past the call segments, remaining endpoint segments must be optional
+            if i >= call_segments.len() {
+                if !is_optional {
+                    return false;
+                }
+                continue;
+            }
+
+            let call_seg = call_segments[i];
+
+            // Parameter segment matches anything (starts with :)
+            if seg.starts_with(':') {
+                continue;
+            }
+
+            // Exact match required for non-parameter segments
+            if seg != call_seg {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Match paths with wildcard patterns
+    ///
+    /// Supports:
+    /// - `*` matches a single path segment
+    /// - `**` or `(.*)` matches zero or more path segments
+    #[allow(dead_code)]
+    fn path_matches_with_wildcards(&self, endpoint_path: &str, call_path: &str) -> bool {
+        // Check for catch-all patterns
+        if endpoint_path.ends_with("/*") || endpoint_path.ends_with("/**") {
+            let prefix = endpoint_path.trim_end_matches("/**").trim_end_matches("/*");
+            return call_path.starts_with(prefix);
+        }
+
+        // Check for regex-style catch-all
+        if endpoint_path.ends_with("/(.*)") {
+            let prefix = endpoint_path.trim_end_matches("/(.*)");
+            return call_path.starts_with(prefix);
+        }
+
+        // Check for single-segment wildcards in the middle
         let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
         let call_segments: Vec<&str> = call_path.split('/').collect();
 
@@ -637,8 +755,8 @@ impl MountGraph {
         }
 
         for (endpoint_seg, call_seg) in endpoint_segments.iter().zip(call_segments.iter()) {
-            if endpoint_seg.starts_with(':') {
-                continue; // Parameter segment matches anything
+            if *endpoint_seg == "*" {
+                continue; // Single-segment wildcard matches anything
             }
             if endpoint_seg != call_seg {
                 return false;
@@ -708,6 +826,7 @@ mod tests {
 
     use crate::call_site_classifier::{CallSiteType, ClassifiedCallSite};
     use crate::call_site_extractor::{ArgumentType, CallArgument, CallSite};
+    use crate::config::Config;
 
     fn create_test_call_site(
         callee_object: &str,
@@ -851,6 +970,170 @@ mod tests {
         assert_eq!(standalone_api.node_type, NodeType::Unknown);
         assert_eq!(http_client.node_type, NodeType::Unknown);
         assert_eq!(utility_object.node_type, NodeType::Unknown);
+    }
+
+    #[test]
+    fn test_url_normalized_matching_full_url() {
+        // Test that full URLs are normalized and matched against endpoint paths
+        let mut graph = MountGraph::new();
+
+        // Add an endpoint
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/users/:id".to_string(),
+            full_path: "/users/:id".to_string(),
+            handler: Some("getUser".to_string()),
+            owner: "userRouter".to_string(),
+            file_location: "routes/users.js:10:1".to_string(),
+            middleware_chain: vec![],
+        });
+
+        // Create config with internal domain
+        let config = Config {
+            internal_domains: ["user-service.internal".to_string()].into_iter().collect(),
+            external_domains: ["api.stripe.com".to_string()].into_iter().collect(),
+            internal_env_vars: Default::default(),
+            external_env_vars: Default::default(),
+        };
+
+        // Test: Full internal URL should match
+        let normalizer = UrlNormalizer::new(&config);
+        let result = graph.find_matching_endpoints_with_normalizer(
+            "https://user-service.internal/users/123",
+            "GET",
+            &normalizer,
+        );
+        assert!(result.is_some());
+        let matches = result.unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].full_path, "/users/:id");
+
+        // Test: External URL should return None (skip)
+        let result = graph.find_matching_endpoints_with_normalizer(
+            "https://api.stripe.com/v1/charges",
+            "GET",
+            &normalizer,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_url_normalized_matching_env_var_pattern() {
+        let mut graph = MountGraph::new();
+
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/orders".to_string(),
+            full_path: "/orders".to_string(),
+            handler: Some("createOrder".to_string()),
+            owner: "orderRouter".to_string(),
+            file_location: "routes/orders.js:15:1".to_string(),
+            middleware_chain: vec![],
+        });
+
+        let config = Config {
+            internal_domains: Default::default(),
+            external_domains: Default::default(),
+            internal_env_vars: ["ORDER_SERVICE_URL".to_string()].into_iter().collect(),
+            external_env_vars: ["STRIPE_API".to_string()].into_iter().collect(),
+        };
+
+        // Test: Internal env var pattern should match
+        let normalizer = UrlNormalizer::new(&config);
+        let result = graph.find_matching_endpoints_with_normalizer(
+            "ENV_VAR:ORDER_SERVICE_URL:/orders",
+            "POST",
+            &normalizer,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+
+        // Test: External env var pattern should return None
+        let result = graph.find_matching_endpoints_with_normalizer(
+            "ENV_VAR:STRIPE_API:/v1/charges",
+            "POST",
+            &normalizer,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_url_normalized_matching_template_literal() {
+        let mut graph = MountGraph::new();
+
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/users/:userId/orders/:orderId".to_string(),
+            full_path: "/users/:userId/orders/:orderId".to_string(),
+            handler: Some("getUserOrder".to_string()),
+            owner: "orderRouter".to_string(),
+            file_location: "routes/orders.js:20:1".to_string(),
+            middleware_chain: vec![],
+        });
+
+        let config = Config {
+            internal_domains: Default::default(),
+            external_domains: Default::default(),
+            internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
+            external_env_vars: Default::default(),
+        };
+
+        // Test: Template literal should be normalized and matched
+        let normalizer = UrlNormalizer::new(&config);
+        let result = graph.find_matching_endpoints_with_normalizer(
+            "${API_URL}/users/${userId}/orders/${orderId}",
+            "GET",
+            &normalizer,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_url_normalized_matching_query_string_stripped() {
+        let mut graph = MountGraph::new();
+
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/users".to_string(),
+            full_path: "/users".to_string(),
+            handler: Some("listUsers".to_string()),
+            owner: "userRouter".to_string(),
+            file_location: "routes/users.js:5:1".to_string(),
+            middleware_chain: vec![],
+        });
+
+        let config = Config::default();
+
+        // Test: Query string should be stripped before matching
+        let normalizer = UrlNormalizer::new(&config);
+        let result = graph.find_matching_endpoints_with_normalizer(
+            "/users?page=1&limit=10",
+            "GET",
+            &normalizer,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_path_matches_with_optional_segments() {
+        let graph = MountGraph::new();
+
+        // Test optional segment matching
+        assert!(graph.path_matches_with_params("/users/:id?", "/users"));
+        assert!(graph.path_matches_with_params("/users/:id?", "/users/123"));
+        assert!(!graph.path_matches_with_params("/users/:id", "/users")); // Not optional
+    }
+
+    #[test]
+    fn test_path_matches_with_wildcards() {
+        let graph = MountGraph::new();
+
+        // Test wildcard matching
+        assert!(graph.path_matches_with_wildcards("/api/*", "/api/users"));
+        assert!(graph.path_matches_with_wildcards("/api/**", "/api/users/123/orders"));
+        assert!(graph.path_matches_with_wildcards("/files/(.*)", "/files/path/to/file.txt"));
     }
 
     #[test]

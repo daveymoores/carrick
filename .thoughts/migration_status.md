@@ -2,7 +2,7 @@
 
 **Date**: January 2025  
 **Branch**: `main`  
-**Last Updated**: After fixing `test_imported_router_endpoint_resolution`
+**Last Updated**: After completing P0/P1 URL Normalization (Gap Analysis)
 
 ---
 
@@ -27,7 +27,9 @@ We are currently in **Phase 2** of the migration to a fully framework-agnostic, 
 │  │  - Specialist Agents ✅                          │  │
 │  │  - Mount Graph ✅                                │  │
 │  │  - Type Extraction ✅                            │  │
-│  │  - Import Resolution ✅ (NEW!)                   │  │
+│  │  - Import Resolution ✅                          │  │
+│  │  - URL Normalization ✅ (NEW!)                   │  │
+│  │  - Cross-Service Matching ✅ (NEW!)              │  │
 │  └──────────────────────────────────────────────────┘  │
 │                         ↓                                │
 │  ┌──────────────────────────────────────────────────┐  │
@@ -54,6 +56,56 @@ We are currently in **Phase 2** of the migration to a fully framework-agnostic, 
 ---
 
 ## Phase Status
+
+### ✅ Phase 4: URL Normalization (Gap Analysis P0-P1) - COMPLETE
+
+**Status**: 100% Complete  
+**Document**: `framework_agnostic_gaps.md`
+
+**Problem Solved**:
+Without URL normalization, Carrick could not match cross-service API calls:
+- Service A defines: `GET /users/:id`
+- Service B calls: `fetch('http://user-service.internal/users/123')`
+- Result: No matches → All endpoints "orphaned", all calls "missing endpoint"
+
+**Implementation**:
+
+**P0: URL Normalization** ✅
+- Added `src/url_normalizer.rs` (650 lines)
+- `UrlNormalizer` struct with config-aware normalization
+- Handles all URL patterns:
+  - Full URLs: `https://service.internal/users/123` → `/users/123`
+  - Env var patterns: `ENV_VAR:SERVICE_URL:/users` → `/users`
+  - Template literals: `${API_URL}/users/${userId}` → `/users/:userId`
+  - Query strings stripped, trailing slashes normalized
+- Integrated with `carrick.json` (`internalDomains`, `internalEnvVars`)
+- External URLs skip matching (returns `None`)
+
+**P1: Enhanced Path Matching** ✅
+- Optional segments: `/:id?` matches `/users` and `/users/123`
+- Single-segment wildcards: `/*` matches any segment
+- Catch-all wildcards: `/**` and `(.*)` match zero or more segments
+- Methods added to `MountGraph`:
+  - `find_matching_endpoints_normalized()`
+  - `find_matching_endpoints_with_normalizer()`
+  - `path_matches_with_wildcards()`
+
+**Test Results**:
+- ✅ 19 URL normalizer tests (all patterns covered)
+- ✅ 6 mount graph matching tests (normalized + wildcards)
+- ✅ All 70+ tests passing
+- ✅ Clippy clean
+
+**Files Changed**:
+| File | Change |
+|------|--------|
+| `src/url_normalizer.rs` | **NEW** — URL normalization module |
+| `src/lib.rs` | Added `url_normalizer` module |
+| `src/main.rs` | Added `url_normalizer` module |
+| `src/mount_graph.rs` | Added normalized matching methods + tests |
+| `src/analyzer/mod.rs` | Updated to use `UrlNormalizer` for matching |
+
+---
 
 ### ✅ Phase 0: Fix Critical Zero Output Bug (COMPLETE)
 

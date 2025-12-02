@@ -10,6 +10,7 @@ use crate::{
     extractor::CoreExtractor,
     mount_graph::MountGraph,
     packages::Packages,
+    url_normalizer::UrlNormalizer,
     utils::{get_repository_name, join_prefix_and_path},
     visitor::{
         Call, DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType,
@@ -805,21 +806,37 @@ impl Analyzer {
                 }
             }
 
-            // Use mount graph to find matching endpoints (framework-agnostic)
-            let matching_endpoints = mount_graph.find_matching_endpoints(&call.route, &call.method);
+            // Use mount graph to find matching endpoints with URL normalization
+            // This handles full URLs, env var patterns, template literals, etc.
+            let normalizer = UrlNormalizer::new(&self.config);
 
-            if matching_endpoints.is_empty() {
-                call_issues.push(format!(
-                    "Missing endpoint for {} {} (called from {})",
-                    call.method,
-                    call.route,
-                    call.file_path.display()
-                ));
-            } else {
-                // Mark endpoints as matched
-                for endpoint in matching_endpoints {
-                    let key = format!("{}:{}", endpoint.method, endpoint.full_path);
-                    matched_endpoints.insert(key);
+            match mount_graph.find_matching_endpoints_with_normalizer(
+                &call.route,
+                &call.method,
+                &normalizer,
+            ) {
+                None => {
+                    // URL was identified as external - skip it
+                    continue;
+                }
+                Some(matching_endpoints) => {
+                    if matching_endpoints.is_empty() {
+                        // Extract normalized path for better error message
+                        let normalized_path = normalizer.extract_path(&call.route);
+                        call_issues.push(format!(
+                            "Missing endpoint for {} {} (normalized: {}) (called from {})",
+                            call.method,
+                            call.route,
+                            normalized_path,
+                            call.file_path.display()
+                        ));
+                    } else {
+                        // Mark endpoints as matched
+                        for endpoint in matching_endpoints {
+                            let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                            matched_endpoints.insert(key);
+                        }
+                    }
                 }
             }
         }
@@ -843,8 +860,17 @@ impl Analyzer {
     fn compare_calls_with_mount_graph(&self, mount_graph: &MountGraph) -> Vec<String> {
         let mut issues = Vec::new();
 
+        let normalizer = UrlNormalizer::new(&self.config);
+
         for call in &self.calls {
-            let matching_endpoints = mount_graph.find_matching_endpoints(&call.route, &call.method);
+            let matching_endpoints = match mount_graph.find_matching_endpoints_with_normalizer(
+                &call.route,
+                &call.method,
+                &normalizer,
+            ) {
+                Some(endpoints) => endpoints,
+                None => continue, // Skip external calls
+            };
 
             for matched_endpoint in matching_endpoints {
                 // Find the full endpoint details from self.endpoints
