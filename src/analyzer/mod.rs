@@ -855,94 +855,6 @@ impl Analyzer {
         (call_issues, endpoint_issues, env_var_calls)
     }
 
-    /// Framework-agnostic type comparison using mount graph
-    /// Compares request/response types without pattern matching
-    fn compare_calls_with_mount_graph(&self, mount_graph: &MountGraph) -> Vec<String> {
-        let mut issues = Vec::new();
-
-        let normalizer = UrlNormalizer::new(&self.config);
-
-        for call in &self.calls {
-            let matching_endpoints = match mount_graph.find_matching_endpoints_with_normalizer(
-                &call.route,
-                &call.method,
-                &normalizer,
-            ) {
-                Some(endpoints) => endpoints,
-                None => continue, // Skip external calls
-            };
-
-            for matched_endpoint in matching_endpoints {
-                // Find the full endpoint details from self.endpoints
-                if let Some(endpoint) = self.endpoints.iter().find(|e| {
-                    e.route == matched_endpoint.full_path && e.method == matched_endpoint.method
-                }) {
-                    // Compare request body types if both exist
-                    if let (Some(call_req), Some(endpoint_req)) =
-                        (&call.request_body, &endpoint.request_body)
-                    {
-                        if !Self::json_types_compatible(call_req, endpoint_req) {
-                            issues.push(format!(
-                                "Request body type mismatch for {} {}: call sends '{}' but endpoint expects '{}'",
-                                call.method,
-                                call.route,
-                                serde_json::to_string(call_req).unwrap_or_default(),
-                                serde_json::to_string(endpoint_req).unwrap_or_default()
-                            ));
-                        }
-                    }
-
-                    // Compare response body types if both exist
-                    if let (Some(call_resp), Some(endpoint_resp)) =
-                        (&call.response_body, &endpoint.response_body)
-                    {
-                        if !Self::json_types_compatible(call_resp, endpoint_resp) {
-                            issues.push(format!(
-                                "Response body type mismatch for {} {}: call expects '{}' but endpoint returns '{}'",
-                                call.method,
-                                call.route,
-                                serde_json::to_string(call_resp).unwrap_or_default(),
-                                serde_json::to_string(endpoint_resp).unwrap_or_default()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        issues
-    }
-
-    /// Framework-agnostic JSON type compatibility check
-    /// Compares JSON structures without framework-specific assumptions
-    fn json_types_compatible(call_json: &Json, endpoint_json: &Json) -> bool {
-        match (call_json, endpoint_json) {
-            (Json::Object(call_map), Json::Object(endpoint_map)) => {
-                // Check that all endpoint keys exist in call
-                for key in endpoint_map.keys() {
-                    if !call_map.contains_key(key) {
-                        return false;
-                    }
-                    // Recursively check nested structures
-                    if let (Some(call_val), Some(endpoint_val)) =
-                        (call_map.get(key), endpoint_map.get(key))
-                    {
-                        if !Self::json_types_compatible(call_val, endpoint_val) {
-                            return false;
-                        }
-                    }
-                }
-                true
-            }
-            (Json::Array(_), Json::Array(_)) => true, // Arrays are compatible if both are arrays
-            (Json::String(_), Json::String(_)) => true,
-            (Json::Number(_), Json::Number(_)) => true,
-            (Json::Boolean(_), Json::Boolean(_)) => true,
-            (Json::Null, Json::Null) => true,
-            _ => false, // Type mismatch
-        }
-    }
-
     pub fn compute_full_paths_for_endpoint(
         endpoint: &ApiEndpointDetails,
         mounts: &[Mount],
@@ -1230,7 +1142,8 @@ impl Analyzer {
 
         let (call_issues, endpoint_issues, env_var_calls) =
             self.analyze_matches_with_mount_graph(mount_graph);
-        let mismatches = self.compare_calls_with_mount_graph(mount_graph);
+        // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
+        let mismatches = Vec::new();
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 

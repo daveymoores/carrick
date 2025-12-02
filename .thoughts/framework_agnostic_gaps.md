@@ -24,7 +24,7 @@ If matching fails, the entire product fails—users see every endpoint as "orpha
 |----------|-----|----------|--------|--------|
 | **P0** | URL Normalization Missing | **Critical** | 2-3 days | ✅ **COMPLETE** |
 | **P1** | Path Matching Limited | High | 1-2 days | ✅ **COMPLETE** |
-| **P2** | Type Comparison Dead Code | Medium | 0.5 days | Technical debt |
+| **P2** | Type Comparison Dead Code | Medium | 0.5 days | ✅ **COMPLETE** |
 | **P3** | Test Coverage Overstates Support | Medium | 1-2 days | Confidence issue |
 | **P4** | Legacy Visitor Dependency | Low | 2-3 hours | Deferred correctly |
 
@@ -145,7 +145,7 @@ Enhanced `MountGraph::paths_match()` in `src/mount_graph.rs`:
 
 ## 3. Type Comparison via Analyzer Is Effectively Dead
 
-**Severity: MEDIUM (P2)** — Technical debt, not blocking.
+**Severity: MEDIUM (P2)** — ✅ **COMPLETE** (January 2025)
 
 ### The Problem
 
@@ -175,21 +175,16 @@ However, the dead code creates confusion:
 - The code path exists but never executes
 - No tests verify the expected behavior
 
-### Required Work (Choose One)
+### Implementation (Completed)
 
-**Option A: Delete dead code** (Recommended)
-- Remove `compare_calls_with_mount_graph` or clearly mark it as deprecated
-- Document that type checking is TS-only
+**Option A was implemented: Delete dead code**
 
-**Option B: Propagate agent type data**
-- Flow `response_type_string` from agents through to `ApiEndpointDetails`
-- Enable JSON comparison as a complement to TS checking
+- Removed `compare_calls_with_mount_graph()` method (60 lines)
+- Removed `json_types_compatible()` helper method (28 lines)
+- Updated `get_results()` to return empty `mismatches` vector with comment explaining type checking is via TypeScript
+- Total: ~90 lines of dead code removed
 
-**Option C: Leave as-is**
-- Add documentation explaining the current state
-- Accept technical debt
-
-**Estimated effort:** 0.5 days for Option A
+Type checking continues to work via the TypeScript-based `ts_check/` system, which is the canonical approach for cross-repo type validation.
 
 ---
 
@@ -285,13 +280,14 @@ Any ES module feature the visitor doesn't understand (dynamic imports, TS path a
 - Cross-service calls match endpoints
 - "Orphaned" and "Missing" counts are accurate
 
-### Phase 2: Clean Up (P2-P3)
+### Phase 2: Clean Up (P2-P3) — P2 COMPLETE
 
 **Goal:** Remove technical debt and improve confidence.
 
-3. **Type Comparison Cleanup** (P2, 0.5 days)
-   - Delete dead JSON comparison code OR propagate type data
-   - Document the type checking strategy
+3. **Type Comparison Cleanup** (P2) ✅
+   - Deleted `compare_calls_with_mount_graph()` (~60 lines)
+   - Deleted `json_types_compatible()` (~28 lines)
+   - Added comment documenting that type checking is TS-only
 
 4. **Test Infrastructure** (P3, 1-2 days)
    - Add real-API integration test job
@@ -340,4 +336,4 @@ After P0 and P1 are complete, running Carrick on a real microservices architectu
 | `src/lib.rs` | Added `url_normalizer` module |
 | `src/main.rs` | Added `url_normalizer` module |
 | `src/mount_graph.rs` | Added normalized matching methods + tests |
-| `src/analyzer/mod.rs` | Updated to use `UrlNormalizer` for matching |
+| `src/analyzer/mod.rs` | Updated to use `UrlNormalizer` for matching; removed dead JSON comparison code |
