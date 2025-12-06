@@ -739,3 +739,128 @@ async function fetchData() {
         "text() call should not have correlated_fetch"
     );
 }
+
+/// Test template literal with dynamic path parameter (e.g., ${userId})
+/// The path parameter should be normalized to :param style for matching
+#[test]
+fn test_template_literal_with_dynamic_path_param() {
+    let code = r#"
+interface UserProfile {
+    id: number;
+    name: string;
+}
+
+async function fetchUserProfile(userId: string) {
+    const resp = await fetch(`${process.env.API_URL}/users/${userId}/profile`);
+    const profile: UserProfile = await resp.json();
+    return profile;
+}
+"#;
+
+    let call_sites = parse_and_extract_call_sites(code, "test_dynamic_path.ts");
+
+    let json_call = call_sites
+        .iter()
+        .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
+        .expect("Should find resp.json() call");
+
+    assert!(json_call.correlated_fetch.is_some());
+    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
+
+    // The URL should have dynamic params converted to :param style
+    // /users/${userId}/profile -> /users/:userId/profile
+    let url = fetch_info.url.as_ref().expect("Should have URL");
+    assert!(
+        url.contains(":userId") || url.contains(":param"),
+        "Dynamic path param should be normalized. Got: {}",
+        url
+    );
+    assert!(
+        !url.contains("${"),
+        "Template expressions should be removed. Got: {}",
+        url
+    );
+}
+
+/// Test template literal with multiple dynamic path parameters
+#[test]
+fn test_template_literal_with_multiple_dynamic_params() {
+    let code = r#"
+interface Comment {
+    id: number;
+    text: string;
+}
+
+async function fetchUserComments(userId: string, postId: string) {
+    const resp = await fetch(`${process.env.API_URL}/users/${userId}/posts/${postId}/comments`);
+    const comments: Comment[] = await resp.json();
+    return comments;
+}
+"#;
+
+    let call_sites = parse_and_extract_call_sites(code, "test_multi_params.ts");
+
+    let json_call = call_sites
+        .iter()
+        .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
+        .expect("Should find resp.json() call");
+
+    assert!(json_call.correlated_fetch.is_some());
+    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
+    let url = fetch_info.url.as_ref().expect("Should have URL");
+
+    // Should have two distinct dynamic params, not duplicated names
+    // /users/${userId}/posts/${postId}/comments -> /users/:userId/posts/:postId/comments
+    assert!(
+        !url.contains("${"),
+        "Template expressions should be removed. Got: {}",
+        url
+    );
+
+    // Count the number of path parameters
+    let param_count = url.matches(':').count();
+    assert_eq!(
+        param_count, 2,
+        "Should have 2 distinct path params. Got: {}",
+        url
+    );
+}
+
+/// Test that base URL prefix is stripped but path params are preserved
+#[test]
+fn test_base_url_stripped_path_params_preserved() {
+    let code = r#"
+interface Order {
+    id: string;
+}
+
+async function fetchOrder(orderId: string) {
+    const resp = await fetch(`http://localhost:3000/orders/${orderId}`);
+    const order: Order = await resp.json();
+    return order;
+}
+"#;
+
+    let call_sites = parse_and_extract_call_sites(code, "test_base_url.ts");
+
+    let json_call = call_sites
+        .iter()
+        .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
+        .expect("Should find resp.json() call");
+
+    assert!(json_call.correlated_fetch.is_some());
+    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
+    let url = fetch_info.url.as_ref().expect("Should have URL");
+
+    // Should extract /orders/:orderId, not the full URL
+    assert!(
+        url.starts_with('/'),
+        "Should extract path portion. Got: {}",
+        url
+    );
+    assert!(
+        url.contains(":orderId") || url.contains(":param"),
+        "Should normalize path param. Got: {}",
+        url
+    );
+}

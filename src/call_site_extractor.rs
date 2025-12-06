@@ -299,29 +299,67 @@ impl CallSiteExtractor {
         }
     }
 
-    /// Extract path portion from a URL string
-    /// Handles: "/orders", "http://localhost/orders", "${ENV}/orders"
+    /// Extract path portion from a URL string and normalize template expressions to :param style
+    /// Handles: "/orders", "http://localhost/orders", "${ENV}/orders", "/users/${userId}"
     fn extract_path_from_url(&self, url: &str) -> Option<String> {
-        // If it starts with /, it's already a path
-        if url.starts_with('/') {
-            return Some(url.to_string());
-        }
-
-        // Look for pattern like }/ which indicates end of template expression before path
-        if let Some(idx) = url.find("}/") {
-            return Some(url[idx + 1..].to_string());
-        }
-
-        // Try to extract path from full URL
-        if url.starts_with("http://") || url.starts_with("https://") {
+        let path = if url.starts_with('/') {
+            // Already a path, use as-is
+            url.to_string()
+        } else if let Some(idx) = url.find("}/") {
+            // Template expression prefix like ${ENV}/ - extract path after it
+            url[idx + 1..].to_string()
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            // Full URL - extract path portion
             if let Some(path_start) = url.find("://").and_then(|i| url[i + 3..].find('/')) {
                 let path_idx = url.find("://").unwrap() + 3 + path_start;
-                return Some(url[path_idx..].to_string());
+                url[path_idx..].to_string()
+            } else {
+                return Some(url.to_string());
+            }
+        } else {
+            url.to_string()
+        };
+
+        // Normalize template expressions ${varName} to :varName style parameters
+        Some(Self::normalize_template_params(&path))
+    }
+
+    /// Convert template literal expressions like ${userId} to :userId style path parameters
+    /// This allows consumer paths to match producer paths that use :param notation
+    fn normalize_template_params(path: &str) -> String {
+        let mut result = String::new();
+        let mut chars = path.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '$' && chars.peek() == Some(&'{') {
+                // Consume the '{'
+                chars.next();
+
+                // Extract the variable name (everything until '}')
+                let mut var_name = String::new();
+                for inner_c in chars.by_ref() {
+                    if inner_c == '}' {
+                        break;
+                    }
+                    // Only keep the last part if it's a member expression like process.env.VAR
+                    if inner_c == '.' {
+                        var_name.clear();
+                    } else {
+                        var_name.push(inner_c);
+                    }
+                }
+
+                // Convert to :param style if we got a variable name
+                if !var_name.is_empty() {
+                    result.push(':');
+                    result.push_str(&var_name);
+                }
+            } else {
+                result.push(c);
             }
         }
 
-        // Return as-is if we can't parse it
-        Some(url.to_string())
+        result
     }
 
     /// Extract HTTP method from fetch() call options
