@@ -14,3 +14,6 @@ pub use orchestrator::{AnalysisResults, CallSiteOrchestrator};
 // TriageStats is used in AnalysisResults and tests
 #[allow(unused_imports)]
 pub use orchestrator::TriageStats;
+// LeanCallSite and TriageClassification are needed for testing mount classification
+#[allow(unused_imports)]
+pub use triage_agent::{LeanCallSite, TriageClassification};

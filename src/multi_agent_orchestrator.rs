@@ -210,7 +210,15 @@ impl MultiAgentOrchestrator {
         use crate::analyzer::Analyzer;
         let mut type_infos = Vec::new();
 
+        println!("=== EXTRACT TYPES FROM ANALYSIS DEBUG ===");
+        println!(
+            "Endpoints to process: {}, Data fetching calls to process: {}",
+            analysis_results.endpoints.len(),
+            analysis_results.data_fetching_calls.len()
+        );
+
         // 1. Extract types from endpoints (Producers)
+        let mut endpoints_with_types = 0;
         for endpoint in &analysis_results.endpoints {
             if let (Some(file), Some(pos), Some(type_str)) = (
                 &endpoint.response_type_file,
@@ -230,40 +238,56 @@ impl MultiAgentOrchestrator {
                     "compositeTypeString": type_str,
                     "alias": alias
                 }));
+                endpoints_with_types += 1;
+                println!(
+                    "  Endpoint type extracted: {} {} -> {} (file: {}, pos: {})",
+                    endpoint.method, endpoint.path, type_str, file, pos
+                );
             }
         }
+        println!(
+            "Endpoints with type info: {}/{}",
+            endpoints_with_types,
+            analysis_results.endpoints.len()
+        );
 
         // 2. Extract types from data fetching calls (Consumers)
         // Group calls by (url, method) to assign call numbers matching Analyzer logic
         let mut calls_by_endpoint: HashMap<(String, String), u32> = HashMap::new();
+        let mut calls_by_location: HashMap<String, u32> = HashMap::new();
+        let mut calls_with_types = 0;
 
         for call in &analysis_results.data_fetching_calls {
-            // Skip calls without URL or method or type info
-            let url = match &call.url {
-                Some(u) => u,
-                None => continue,
-            };
-            let method = match &call.method {
-                Some(m) => m,
-                None => continue,
-            };
-
+            // Check if this call has type info (file, position, and type string)
             if let (Some(file), Some(pos), Some(type_str)) = (
                 &call.expected_type_file,
                 call.expected_type_position,
                 &call.expected_type_string,
             ) {
-                // Increment call counter for this endpoint
-                let counter = calls_by_endpoint
-                    .entry((url.clone(), method.clone()))
-                    .or_insert(0);
-                *counter += 1;
+                // Generate alias based on URL/method if available, otherwise use location
+                let alias = if let (Some(url), Some(method)) = (&call.url, &call.method) {
+                    // Increment call counter for this endpoint
+                    let counter = calls_by_endpoint
+                        .entry((url.clone(), method.clone()))
+                        .or_insert(0);
+                    *counter += 1;
 
-                let alias = Analyzer::generate_unique_call_alias_name(
-                    url, method, false,    // is_request_type (false = response)
-                    *counter, // call_number
-                    true,     // is_consumer (true = consumer)
-                );
+                    Analyzer::generate_unique_call_alias_name(
+                        url, method, false,    // is_request_type (false = response)
+                        *counter, // call_number
+                        true,     // is_consumer (true = consumer)
+                    )
+                } else {
+                    // For response parsing calls without URL (e.g., .json()), use location-based alias
+                    let counter = calls_by_location.entry(call.location.clone()).or_insert(0);
+                    *counter += 1;
+
+                    // Extract a simple identifier from location (file:line:col -> line_col)
+                    let location_parts: Vec<&str> = call.location.split(':').collect();
+                    let line = location_parts.get(1).unwrap_or(&"0");
+                    let col = location_parts.get(2).unwrap_or(&"0");
+                    format!("ResponseParsingConsumerL{}C{}", line, col)
+                };
 
                 type_infos.push(serde_json::json!({
                     "filePath": file,
@@ -271,8 +295,20 @@ impl MultiAgentOrchestrator {
                     "compositeTypeString": type_str,
                     "alias": alias
                 }));
+                calls_with_types += 1;
+                println!(
+                    "  Call type extracted: {} -> {} (file: {}, pos: {})",
+                    alias, type_str, file, pos
+                );
             }
         }
+        println!(
+            "Calls with type info: {}/{}",
+            calls_with_types,
+            analysis_results.data_fetching_calls.len()
+        );
+        println!("Total type_infos extracted: {}", type_infos.len());
+        println!("=== END EXTRACT TYPES FROM ANALYSIS DEBUG ===");
 
         type_infos
     }

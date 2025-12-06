@@ -20,18 +20,35 @@ use serde::{Deserialize, Serialize};
 /// This ensures downstream agents still have access to args, definition, etc. while
 /// optimizing the triage prompt for size and cost.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LeanCallSite {
-    callee_object: String,
-    callee_property: String,
-    location: String, // Critical: must match original CallSite.location for orchestrator matching
+pub struct LeanCallSite {
+    pub callee_object: String,
+    pub callee_property: String,
+    pub location: String, // Critical: must match original CallSite.location for orchestrator matching
+    pub arg_count: usize, // Number of arguments - helps distinguish middleware from mounts
+    pub first_arg_type: Option<String>, // Type of first argument (e.g., "StringLiteral", "Identifier")
+    pub first_arg_value: Option<String>, // Value of first argument if available (e.g., "/api")
 }
 
 impl From<&CallSite> for LeanCallSite {
     fn from(call_site: &CallSite) -> Self {
+        let (first_arg_type, first_arg_value) = call_site
+            .args
+            .first()
+            .map(|arg| {
+                (
+                    Some(format!("{:?}", arg.arg_type)),
+                    arg.value.clone().or_else(|| arg.resolved_value.clone()),
+                )
+            })
+            .unwrap_or((None, None));
+
         Self {
             callee_object: call_site.callee_object.clone(),
             callee_property: call_site.callee_property.clone(),
             location: call_site.location.clone(),
+            arg_count: call_site.args.len(),
+            first_arg_type,
+            first_arg_value,
         }
     }
 }
@@ -152,9 +169,16 @@ TASK: Classify each call site into exactly one category.
 CATEGORIES:
 - HttpEndpoint: Route definitions (app.get, router.post, etc.)
 - DataFetchingCall: Outbound API calls (fetch, axios, response.json, etc.)
-- Middleware: Middleware registration (app.use with single argument)
-- RouterMount: Router mounting (app.use('/path', router))
+- Middleware: Middleware registration (app.use with single argument that is NOT a path)
+- RouterMount: Router mounting (app.use('/path', router) - MUST have 2+ args where first is a path string)
 - Irrelevant: Everything else (Array methods, console.log, etc.) AND response methods (res.send, res.json, res.status)
+
+CRITICAL DISTINCTION - app.use() and router.use():
+Use the arg_count, first_arg_type, and first_arg_value fields to distinguish:
+- RouterMount: arg_count >= 2 AND first_arg_type == "StringLiteral" AND first_arg_value starts with "/"
+  Examples: app.use('/api', router), router.use('/v1', v1Router)
+- Middleware: arg_count == 1 OR first_arg_type != "StringLiteral" OR first_arg_value doesn't start with "/"
+  Examples: app.use(cors()), app.use(express.json()), app.use(authMiddleware)
 
 REQUIRED JSON FORMAT:
 [
@@ -202,9 +226,14 @@ CALL SITES TO CLASSIFY:
 For each call site, assign it to one of these categories:
 - HttpEndpoint: Defines routes that handle incoming HTTP requests
 - DataFetchingCall: Makes outbound API calls or fetches data
-- Middleware: Registers middleware or interceptors (single argument)
-- RouterMount: Mounts routers or sub-applications (two arguments: path + router)
+- Middleware: Registers middleware (arg_count=1, or first arg is NOT a path string)
+- RouterMount: Mounts routers (arg_count>=2, first_arg_type="StringLiteral", first_arg_value starts with "/")
 - Irrelevant: Utility functions, logging, Array methods, and response methods (res.send, res.json, etc.)
+
+IMPORTANT: Each call site includes arg_count, first_arg_type, and first_arg_value fields.
+Use these to distinguish RouterMount from Middleware:
+- If callee_property is "use" AND arg_count >= 2 AND first_arg_type == "StringLiteral" AND first_arg_value starts with "/" -> RouterMount
+- If callee_property is "use" AND (arg_count == 1 OR first_arg_type != "StringLiteral") -> Middleware
 
 Return JSON array with this structure:
 [
@@ -226,8 +255,9 @@ GUIDELINES:
 - app.get('/path', handler) = HttpEndpoint
 - fetch('url') (global.fetch) or axios.get() = DataFetchingCall
 - response.json() or resp.text() = DataFetchingCall (parsing API responses)
-- app.use(singleMiddleware) = Middleware
-- app.use('/path', router) = RouterMount (path + router/sub-app)
+- app.use(middleware) where arg_count=1 = Middleware
+- app.use('/api', router) where arg_count=2, first_arg_type="StringLiteral", first_arg_value="/api" = RouterMount
+- router.use('/v1', v1Router) where arg_count=2, first_arg_type="StringLiteral" = RouterMount
 - Array.isArray() or console.log() = Irrelevant
 - Match EVERY input call site with exactly ONE classification
 - Use the exact location strings from the input"#,

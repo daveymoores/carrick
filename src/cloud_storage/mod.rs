@@ -45,6 +45,7 @@ impl CloudRepoData {
         config_json: Option<String>,
         package_json: Option<String>,
         packages: Option<Packages>,
+        function_definitions: HashMap<String, FunctionDefinition>,
     ) -> Self {
         let mount_graph = &analysis_result.mount_graph;
 
@@ -99,6 +100,7 @@ impl CloudRepoData {
         println!("  - {} endpoints", endpoints.len());
         println!("  - {} calls", calls.len());
         println!("  - {} mounts", mounts.len());
+        println!("  - {} function definitions", function_definitions.len());
 
         Self {
             repo_name,
@@ -107,7 +109,7 @@ impl CloudRepoData {
             mounts,
             apps: HashMap::new(),
             imported_handlers: vec![],
-            function_definitions: HashMap::new(),
+            function_definitions,
             config_json,
             package_json,
             packages,
