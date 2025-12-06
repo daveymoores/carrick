@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Running Carrick against the test repositories revealed **6 distinct issues**. Four have been fully fixed, and 2 remain open:
+Running Carrick against the test repositories revealed **7 distinct issues**. Five have been fully fixed, and 2 remain open:
 
 | Issue | Status | Priority |
 |-------|--------|----------|
@@ -20,154 +20,99 @@ Running Carrick against the test repositories revealed **6 distinct issues**. Fo
 | 4. API Call URL Extraction | 🟡 Open | MEDIUM |
 | 5. Path Resolution (Nested Routers) | 🟡 Open | MEDIUM |
 | 6. Consumer Type Extraction | ✅ **FIXED** | - |
-| **7. Consumer-Producer Alias Matching** | 🔴 **Open** | **CRITICAL** |
+| **7. Consumer-Producer Alias Matching** | 🟡 **PARTIALLY FIXED** | **CRITICAL** |
 
 ---
 
-## Issue 7: Consumer-Producer Alias Matching 🔴
+## Issue 7: Consumer-Producer Alias Matching 🟡
 
-### Status: OPEN - CRITICAL BLOCKER
+### Status: PARTIALLY FIXED - NEEDS INVESTIGATION
 
-### Symptoms
+### What Was Done
 
-From test output:
+Two commits implemented fetch-to-json call correlation:
+
+1. **`b6c8947`** - `feat: implement fetch-to-json call correlation for consumer type matching`
+   - Added `FetchCallInfo` struct to track fetch() call URL/method/location
+   - Added `fetch_result_vars: HashMap<String, FetchCallInfo>` to `CallSiteExtractor`
+   - When processing `const resp = await fetch(url)`, stores fetch info by variable name
+   - When processing `resp.json()`, looks up correlated fetch info and attaches to CallSite
+   - Added `correlated_fetch` field to `CallSite` struct
+   - Updated `enrich_data_fetching_calls_with_type_info` to copy URL/method from correlated_fetch
+   - All tests pass
+
+2. **`8a8f439`** - `fix: normalize template literal path params to :param style`
+   - Added `normalize_template_params()` to convert `${varName}` to `:varName` format
+   - Updated `extract_path_from_url()` to call the normalizer
+   - Tests verify: `/users/${userId}/profile` → `/users/:userId/profile`
+
+### Current Test Output (STILL BROKEN)
+
 ```
 Type checking summary:
   Compatible pairs: 0
   Incompatible pairs: 0
   Orphaned producers: 6
-  Orphaned consumers: 0
+  Orphaned consumers: 6
+  Orphaned producers: GET /dynamic (GetDynamicResponseProducer), GET /users/:id/comments (GetUsersByIdCommentsResponseProducer), ...
+  Orphaned consumers: GET /api/comments/userid/userid (GetApiCommentsUseridUseridResponseConsumerCall1), GET /orders/userid/userid (GetOrdersUseridUseridResponseConsumerCall1), ...
 ```
 
-Consumer types ARE being extracted now (5/12 calls have type info), but they're not being matched to producers because the alias naming conventions don't match.
+### Problem Analysis
 
-### Diagnostic Output Analysis
+The consumer aliases still show `userid` (lowercase, no colon):
+- `GetApiCommentsUseridUseridResponseConsumerCall1`
+- `GetOrdersUseridUseridResponseConsumerCall1`
+- `GetUsersUseridCommentsResponseConsumerCall1`
 
-```
-=== EXTRACT TYPES FROM ANALYSIS DEBUG ===
-Endpoints with type info: 5/6
-  Call type extracted: ResponseParsingConsumerL59C37 -> Order[] (file: ..., pos: 1438)
-  Call type extracted: ResponseParsingConsumerL76C42 -> Comment[] (file: ..., pos: 2068)
-  Call type extracted: ResponseParsingConsumerL81C36 -> User (file: ..., pos: 2240)
-  Call type extracted: ResponseParsingConsumerL103C41 -> Comment[] (file: ..., pos: 2798)
-  Call type extracted: ResponseParsingConsumerL128C44 -> Comment[] (file: ..., pos: 3589)
-Calls with type info: 5/12
-Total type_infos extracted: 10
-```
+This indicates that **the fix in `extract_path_from_url` is NOT being applied** to these paths. The `${userId}` template expressions are being processed by `sanitize_route_for_dynamic_paths` in `analyzer/mod.rs` instead, which doesn't recognize `${...}` patterns.
 
-Consumer types are extracted, but with location-based aliases like `ResponseParsingConsumerL59C37` instead of path-based aliases like `GetOrdersResponseConsumer`.
+### Investigation Needed
 
-### Root Cause Analysis
+The fix added `normalize_template_params()` in `call_site_extractor.rs`, but the consumer aliases are being generated elsewhere. Need to trace:
 
-The issue is a **design gap** in how `.json()` calls relate to their original `fetch()` calls:
+1. **Where are consumer aliases generated?**
+   - `multi_agent_orchestrator.rs` → `extract_types_from_analysis()` calls `Analyzer::generate_unique_call_alias_name()`
+   - This uses `sanitize_route_for_dynamic_paths()` which doesn't handle `${...}`
 
-1. **Type annotations are on `.json()` calls, not `fetch()` calls**:
-   ```typescript
-   const ordersResp = await fetch(`${process.env.ORDER_SERVICE_URL}/orders`);
-   const ordersRaw: Order[] = await ordersResp.json();  // Type is here
-   ```
+2. **Why isn't the fix being applied?**
+   - The fix is in `extract_path_from_url()` which is called by `extract_fetch_url()` 
+   - This populates `FetchCallInfo.url` when tracking fetch() calls
+   - But the URL might be coming from a different source (LLM extraction?)
 
-2. **URL information is on `fetch()` calls, not `.json()` calls**:
-   - The `fetch()` call has the URL but no type annotation
-   - The `.json()` call has the type annotation but no URL
+3. **Possible causes:**
+   - The LLM-extracted URL (from ConsumerAgent) overrides the SWC-extracted URL
+   - The enrichment isn't happening before alias generation
+   - The path is being extracted correctly but then re-processed incorrectly
 
-3. **No linkage between the two calls**:
-   - We correctly extract `Order[]` from `ordersRaw: Order[]`
-   - But we can't generate `GetOrdersResponseConsumer` because we don't know this relates to `/orders`
+### Files to Investigate
 
-4. **Location-based aliases don't match producer patterns**:
-   - Producer: `GetOrdersResponseProducer` (based on path `/orders`)
-   - Consumer: `ResponseParsingConsumerL59C37` (based on file location)
-   - These will never match in the type checker
+| File | What to Check |
+|------|---------------|
+| `src/call_site_extractor.rs` | Is `normalize_template_params()` being called? |
+| `src/agents/orchestrator.rs` | Is `correlated_fetch` being used correctly? |
+| `src/multi_agent_orchestrator.rs` | What URL is passed to `generate_unique_call_alias_name()`? |
+| `src/analyzer/mod.rs` | Does `sanitize_route_for_dynamic_paths()` need to handle `${...}`? |
 
-### What Should Happen
+### Recommended Next Steps
 
-When analyzing:
-```typescript
-const ordersResp = await fetch(`${process.env.ORDER_SERVICE_URL}/orders`);
-const ordersRaw: Order[] = await ordersResp.json();
-```
+1. **Add debug logging** to trace where the URL `/api/comments/userid/userid` comes from
+2. **Check if LLM extraction overrides SWC extraction** - the ConsumerAgent might be returning the raw template literal
+3. **Consider fixing `sanitize_route_for_dynamic_paths()`** to also handle `${...}` patterns as a fallback
 
-The system should:
-1. Detect `fetch()` call with URL pattern `/orders` ✅ (working)
-2. Detect `.json()` call with type `Order[]` ✅ (working now)
-3. **Link the `.json()` call to its corresponding `fetch()` call** ❌ (not implemented)
-4. Generate consumer alias: `GetOrdersResponseConsumer = Order[]` ❌
+### Tests Added (All Passing)
 
-### Proposed Fix
+In `tests/consumer_type_extraction_test.rs`:
+- `test_fetch_to_json_correlation` - Basic correlation works
+- `test_fetch_to_json_correlation_template_literal` - Template URL extraction
+- `test_fetch_to_json_correlation_post_method` - POST method extraction
+- `test_multiple_fetch_to_json_correlations` - Multiple correlations in same function
+- `test_non_json_call_no_correlation` - Only json() calls get correlation
+- `test_template_literal_with_dynamic_path_param` - Verifies `:userId` normalization
+- `test_template_literal_with_multiple_dynamic_params` - Multiple params
+- `test_base_url_stripped_path_params_preserved` - Base URL stripping
 
-#### Option A: Variable Tracking (Recommended)
-
-Track which variable receives the `fetch()` result, then link the `.json()` call on that variable back to the original URL:
-
-```rust
-// In call_site_extractor.rs
-struct CallSiteExtractor {
-    // NEW: Track fetch() results to their variable names
-    fetch_result_vars: HashMap<String, FetchCallInfo>,
-    // NEW: When we see varName.json(), look up the original fetch
-}
-
-struct FetchCallInfo {
-    url: Option<String>,
-    method: String,
-    location: String,
-}
-```
-
-**Logic:**
-1. When we see `const ordersResp = await fetch(url)`:
-   - Extract the URL from the fetch call
-   - Store: `fetch_result_vars["ordersResp"] = { url: "/orders", method: "GET" }`
-
-2. When we see `const ordersRaw: Order[] = await ordersResp.json()`:
-   - Look up `ordersResp` in `fetch_result_vars`
-   - Find the original URL `/orders`
-   - Generate alias `GetOrdersResponseConsumer`
-
-#### Option B: Post-Processing Correlation
-
-After extracting all call sites, correlate `.json()` calls with `fetch()` calls:
-
-```rust
-fn correlate_json_calls_with_fetch_calls(call_sites: &[CallSite]) -> HashMap<String, FetchInfo> {
-    // For each .json() call on variable X
-    // Find the fetch() call that assigned to variable X
-    // Return mapping of json_location -> fetch_info
-}
-```
-
-#### Option C: Chained Call Detection
-
-Detect chained patterns like `await fetch(...).then(r => r.json())`:
-
-```typescript
-const data: Order[] = await fetch("/orders").then(r => r.json());
-```
-
-This is simpler to handle as both URL and type are in the same expression chain.
-
-### Files Involved
-
-| File | Required Change |
-|------|-----------------|
-| `src/call_site_extractor.rs` | Add `fetch_result_vars` tracking |
-| `src/call_site_extractor.rs` | In `visit_var_decl`, track fetch result variables |
-| `src/call_site_extractor.rs` | When extracting `.json()` calls, look up original fetch |
-| `src/agents/orchestrator.rs` | Update enrichment to use correlated URL |
-| `src/multi_agent_orchestrator.rs` | Generate path-based aliases for correlated calls |
-
-### Impact
-
-Without this fix:
-- ❌ Consumer types are extracted but never matched to producers
-- ❌ Type checking shows 0 compatible/incompatible pairs
-- ❌ All producers appear as "orphaned"
-- ❌ Core type mismatch detection doesn't work
-
-### Priority: CRITICAL
-
-This is the final piece needed for type checking to work. Consumer types are now being extracted, but without proper alias matching, they can't be compared to producers.
+The unit tests pass, meaning the SWC-level extraction works correctly. The issue is in how the extracted data flows through the system to alias generation.
 
 ---
 
@@ -187,12 +132,6 @@ This is the final piece needed for type checking to work. Consumer types are now
 3. Link type annotations to call expressions using span mapping
 4. Added `enrich_data_fetching_calls_with_type_info()` in orchestrator
 5. Modified `extract_types_from_analysis` to handle calls without URLs using location-based aliases
-
-**Files Changed**:
-- `src/call_site_extractor.rs` - Added `ResultTypeInfo`, `result_type` field, span tracking
-- `src/agents/orchestrator.rs` - Added `enrich_data_fetching_calls_with_type_info()`
-- `src/multi_agent_orchestrator.rs` - Handle calls without URLs
-- `tests/consumer_type_extraction_test.rs` - 16 new tests
 
 **Results**:
 - Before: `Calls with type info: 0/12`
@@ -259,7 +198,7 @@ Extract the path portion from template literals even when the host is a variable
 
 ### Priority: MEDIUM
 
-Related to Issue 7 - solving the variable tracking for consumer-producer matching may also help here.
+Related to Issue 7 - the SWC-based extraction in `call_site_extractor.rs` now handles this, but it's not flowing through to the final output.
 
 ---
 
@@ -279,29 +218,48 @@ Most mounts work correctly. This edge case affects nested routers with same inte
 
 ## Recommended Priority Order
 
-1. **🔴 Issue 7: Consumer-Producer Alias Matching** - CRITICAL - Types are extracted but can't be compared
-2. **Issue 4: API Call URL Extraction** - Important for matching and reporting
+1. **🟡 Issue 7: Consumer-Producer Alias Matching** - Debug why SWC-extracted URLs aren't reaching alias generation
+2. **Issue 4: API Call URL Extraction** - May be same root cause as Issue 7
 3. **Issue 5: Nested Router Path Resolution** - Edge case improvement
 
 ---
 
-## Test Results Summary (After Issue 6 Fix)
+## Implementation Summary
 
-**repo-a Analysis:**
-- 6 endpoints detected ✅
-- 12 data fetching calls detected ✅
-- 5 consumer types extracted ✅ (was 0)
-- 10 total type_infos (5 producer + 5 consumer) ✅
-- BUT: 0 matched pairs (alias mismatch) ❌
+### New Structs Added
 
-**Type Checking Result:**
+```rust
+// In call_site_extractor.rs
+pub struct FetchCallInfo {
+    pub url: Option<String>,
+    pub method: String,
+    pub location: String,
+}
+
+// Added to CallSite
+pub correlated_fetch: Option<FetchCallInfo>,
 ```
-Type checking summary:
-  Compatible pairs: 0      <-- Should be >0 after Issue 7 fix
-  Incompatible pairs: 0
-  Orphaned producers: 6
-  Orphaned consumers: 0    <-- Consumers exist but orphaned due to alias mismatch
+
+### New Fields in CallSiteExtractor
+
+```rust
+pub struct CallSiteExtractor {
+    // ... existing fields ...
+    
+    /// Maps variable names to their fetch call info
+    fetch_result_vars: HashMap<String, FetchCallInfo>,
+}
 ```
+
+### Key Functions Added/Modified
+
+1. `find_call_expr_in_expr()` - Unwrap call expressions from await/paren
+2. `is_fetch_call()` - Detect if a call is a fetch() call
+3. `extract_fetch_url()` - Extract URL from fetch arguments
+4. `extract_path_from_url()` - Extract path portion and normalize template params
+5. `normalize_template_params()` - Convert `${varName}` to `:varName`
+6. `extract_fetch_method()` - Extract HTTP method from fetch options
+7. `enrich_data_fetching_calls_with_type_info()` - Now copies URL/method from correlated_fetch
 
 ---
 
@@ -317,13 +275,22 @@ export GEMINI_API_KEY="your-gemini-key"
 cargo run -- ../test_repos/express-demo-1/repo-a/
 ```
 
-**Expected output after Issue 7 is fixed:**
+**Expected output after Issue 7 is fully fixed:**
 ```
 Type checking summary:
   Compatible pairs: X    (matched producer-consumer pairs)
   Incompatible pairs: Y  (type mismatches found!)
   Orphaned producers: Z  (endpoints with no callers)
   Orphaned consumers: W  (calls to external services)
+```
+
+**Current output (Issue 7 partially fixed):**
+```
+Type checking summary:
+  Compatible pairs: 0
+  Incompatible pairs: 0
+  Orphaned producers: 6
+  Orphaned consumers: 6  (aliases still wrong - userid instead of :userId)
 ```
 
 ---
@@ -337,3 +304,4 @@ Type checking summary:
 5. **Inline handlers need special handling** - Can't rely on function definition lookup
 6. **Consumer types need SWC-based extraction** - LLM-based extraction doesn't work
 7. **`.json()` calls need to be linked to their `fetch()` calls** - Type is on json, URL is on fetch
+8. **SWC extraction works but data flow needs tracing** - Unit tests pass but integration fails
