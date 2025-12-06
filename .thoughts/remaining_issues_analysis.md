@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Running Carrick against the test repositories revealed **7 distinct issues**. Five have been fully fixed, and 2 remain open:
+Running Carrick against the test repositories revealed **7 distinct issues**. Six have been fully fixed, and 2 remain open:
 
 | Issue | Status | Priority |
 |-------|--------|----------|
@@ -20,99 +20,85 @@ Running Carrick against the test repositories revealed **7 distinct issues**. Fi
 | 4. API Call URL Extraction | 🟡 Open | MEDIUM |
 | 5. Path Resolution (Nested Routers) | 🟡 Open | MEDIUM |
 | 6. Consumer Type Extraction | ✅ **FIXED** | - |
-| **7. Consumer-Producer Alias Matching** | 🟡 **PARTIALLY FIXED** | **CRITICAL** |
+| **7. Consumer-Producer Alias Matching** | ✅ **FIXED** | - |
 
 ---
 
-## Issue 7: Consumer-Producer Alias Matching 🟡
+## Issue 7: Consumer-Producer Alias Matching ✅
 
-### Status: PARTIALLY FIXED - NEEDS INVESTIGATION
+### Status: FIXED
 
-### What Was Done
+### Root Cause
 
-Two commits implemented fetch-to-json call correlation:
+The `sanitize_route_for_dynamic_paths` function in `analyzer/mod.rs` only handled `:param` style path parameters but not `${param}` template literal style that the LLM might return.
 
-1. **`b6c8947`** - `feat: implement fetch-to-json call correlation for consumer type matching`
-   - Added `FetchCallInfo` struct to track fetch() call URL/method/location
-   - Added `fetch_result_vars: HashMap<String, FetchCallInfo>` to `CallSiteExtractor`
-   - When processing `const resp = await fetch(url)`, stores fetch info by variable name
-   - When processing `resp.json()`, looks up correlated fetch info and attaches to CallSite
-   - Added `correlated_fetch` field to `CallSite` struct
-   - Updated `enrich_data_fetching_calls_with_type_info` to copy URL/method from correlated_fetch
-   - All tests pass
+When the LLM returned URLs like `/users/${userId}/comments`, the function would:
+1. Split by `/`: `["users", "${userId}", "comments"]`
+2. For `${userId}`: `strip_prefix(':')` returns `None` (starts with `$` not `:`)
+3. So it was treated as a regular segment: `to_pascal_case("${userId}")` → `Userid`
+4. Result: `UsersUseridComments` (missing `By` prefix!)
 
-2. **`8a8f439`** - `fix: normalize template literal path params to :param style`
-   - Added `normalize_template_params()` to convert `${varName}` to `:varName` format
-   - Updated `extract_path_from_url()` to call the normalizer
-   - Tests verify: `/users/${userId}/profile` → `/users/:userId/profile`
+This caused consumer aliases like `GetUsersUseridCommentsResponseConsumerCall1` instead of `GetUsersByUseridCommentsResponseConsumerCall1`.
 
-### Current Test Output (STILL BROKEN)
+### Fix Applied
 
+Updated `sanitize_route_for_dynamic_paths` in `src/analyzer/mod.rs` to handle both `:param` and `${param}` formats:
+
+```rust
+fn sanitize_route_for_dynamic_paths(route: &str) -> String {
+    route
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if let Some(param_name) = segment.strip_prefix(':') {
+                // Convert :id -> ById, :userId -> ByUserId
+                format!("By{}", Self::to_pascal_case(param_name))
+            } else if segment.starts_with("${") && segment.ends_with('}') {
+                // Handle template literal syntax: ${userId} -> ByUserid
+                let inner = &segment[2..segment.len() - 1]; // Remove ${ and }
+                // If it contains a dot (like process.env.VAR), take the last part
+                let param_name = inner.rsplit('.').next().unwrap_or(inner);
+                format!("By{}", Self::to_pascal_case(param_name))
+            } else {
+                Self::to_pascal_case(segment)
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("")
+}
 ```
-Type checking summary:
-  Compatible pairs: 0
-  Incompatible pairs: 0
-  Orphaned producers: 6
-  Orphaned consumers: 6
-  Orphaned producers: GET /dynamic (GetDynamicResponseProducer), GET /users/:id/comments (GetUsersByIdCommentsResponseProducer), ...
-  Orphaned consumers: GET /api/comments/userid/userid (GetApiCommentsUseridUseridResponseConsumerCall1), GET /orders/userid/userid (GetOrdersUseridUseridResponseConsumerCall1), ...
-```
 
-### Problem Analysis
+### Tests Added
 
-The consumer aliases still show `userid` (lowercase, no colon):
-- `GetApiCommentsUseridUseridResponseConsumerCall1`
-- `GetOrdersUseridUseridResponseConsumerCall1`
-- `GetUsersUseridCommentsResponseConsumerCall1`
+1. **Unit tests in `src/analyzer/mod.rs`**:
+   - `test_sanitize_route_colon_params` - Standard `:param` style
+   - `test_sanitize_route_template_literal_params` - `${param}` style
+   - `test_sanitize_route_template_literal_with_dot_notation` - `${process.env.VAR}` style
+   - `test_sanitize_route_mixed_params` - Mix of both styles
+   - `test_generate_unique_call_alias_name_with_template_params` - Full alias generation
 
-This indicates that **the fix in `extract_path_from_url` is NOT being applied** to these paths. The `${userId}` template expressions are being processed by `sanitize_route_for_dynamic_paths` in `analyzer/mod.rs` instead, which doesn't recognize `${...}` patterns.
+2. **Integration tests in `tests/url_alias_matching_test.rs`**:
+   - `test_alias_generation_template_literal_path` - Verifies template paths produce correct aliases
+   - `test_swc_extractor_normalizes_template_params` - Verifies SWC extraction normalizes paths
+   - `test_enrichment_prefers_swc_url_over_llm_url` - Documents URL preference behavior
+   - `test_double_path_params_handled_correctly` - Multiple path params
+   - `test_path_patterns_produce_matchable_aliases` - Various path patterns
 
-### Investigation Needed
+### How Matching Now Works
 
-The fix added `normalize_template_params()` in `call_site_extractor.rs`, but the consumer aliases are being generated elsewhere. Need to trace:
+1. **Producer endpoint**: `GET /users/:id/comments`
+   - Alias: `GetUsersByIdCommentsResponseProducer`
+   - Path extracted by TypeScript: `/users/:id/comments`
 
-1. **Where are consumer aliases generated?**
-   - `multi_agent_orchestrator.rs` → `extract_types_from_analysis()` calls `Analyzer::generate_unique_call_alias_name()`
-   - This uses `sanitize_route_for_dynamic_paths()` which doesn't handle `${...}`
+2. **Consumer call**: `GET /users/${userId}/comments` (from LLM or template literal)
+   - Alias: `GetUsersByUseridCommentsResponseConsumerCall1`
+   - Path extracted by TypeScript: `/users/:userid/comments`
 
-2. **Why isn't the fix being applied?**
-   - The fix is in `extract_path_from_url()` which is called by `extract_fetch_url()` 
-   - This populates `FetchCallInfo.url` when tracking fetch() calls
-   - But the URL might be coming from a different source (LLM extraction?)
+3. **Path matching**: The TypeScript `normalizePathForMatching` function converts both to:
+   - `/users/{param}/comments` 
+   
+   These match!
 
-3. **Possible causes:**
-   - The LLM-extracted URL (from ConsumerAgent) overrides the SWC-extracted URL
-   - The enrichment isn't happening before alias generation
-   - The path is being extracted correctly but then re-processed incorrectly
-
-### Files to Investigate
-
-| File | What to Check |
-|------|---------------|
-| `src/call_site_extractor.rs` | Is `normalize_template_params()` being called? |
-| `src/agents/orchestrator.rs` | Is `correlated_fetch` being used correctly? |
-| `src/multi_agent_orchestrator.rs` | What URL is passed to `generate_unique_call_alias_name()`? |
-| `src/analyzer/mod.rs` | Does `sanitize_route_for_dynamic_paths()` need to handle `${...}`? |
-
-### Recommended Next Steps
-
-1. **Add debug logging** to trace where the URL `/api/comments/userid/userid` comes from
-2. **Check if LLM extraction overrides SWC extraction** - the ConsumerAgent might be returning the raw template literal
-3. **Consider fixing `sanitize_route_for_dynamic_paths()`** to also handle `${...}` patterns as a fallback
-
-### Tests Added (All Passing)
-
-In `tests/consumer_type_extraction_test.rs`:
-- `test_fetch_to_json_correlation` - Basic correlation works
-- `test_fetch_to_json_correlation_template_literal` - Template URL extraction
-- `test_fetch_to_json_correlation_post_method` - POST method extraction
-- `test_multiple_fetch_to_json_correlations` - Multiple correlations in same function
-- `test_non_json_call_no_correlation` - Only json() calls get correlation
-- `test_template_literal_with_dynamic_path_param` - Verifies `:userId` normalization
-- `test_template_literal_with_multiple_dynamic_params` - Multiple params
-- `test_base_url_stripped_path_params_preserved` - Base URL stripping
-
-The unit tests pass, meaning the SWC-level extraction works correctly. The issue is in how the extracted data flows through the system to alias generation.
 
 ---
 
