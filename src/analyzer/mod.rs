@@ -1128,6 +1128,35 @@ impl Analyzer {
         fs::create_dir_all(output_dir)
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
+        // Check if there are any type files to check
+        let type_files: Vec<_> = fs::read_dir(output_dir)
+            .map_err(|e| format!("Failed to read output directory: {}", e))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().is_some_and(|ext| ext == "ts")
+                    && entry
+                        .path()
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().ends_with("_types.ts"))
+            })
+            .collect();
+
+        if type_files.is_empty() {
+            println!("⚠️  No type files found in ts_check/output/ - skipping type checking");
+            println!("   This may happen if:");
+            println!("   - Source code lacks explicit TypeScript type annotations");
+            println!("   - Type extraction agents couldn't identify response/request types");
+            println!("   - This is the first run and no cross-repo data exists yet");
+            println!("   Type checking will work when type annotations are present in the source.");
+            return Ok(());
+        }
+
+        println!(
+            "Found {} type file(s) to check: {:?}",
+            type_files.len(),
+            type_files.iter().map(|f| f.file_name()).collect::<Vec<_>>()
+        );
+
         let tsconfig_path = output_dir.join("tsconfig.json");
         let tsconfig_content = create_standard_tsconfig();
 
@@ -1241,6 +1270,9 @@ impl Analyzer {
     }
 
     /// Extract repository prefix from endpoint owner information
+    /// Note: Currently unused but kept for future multi-repo scenarios where
+    /// owner names might contain repo prefixes (format: "repo_prefix:name")
+    #[allow(dead_code)]
     pub fn extract_repo_prefix_from_owner(&self, owner: &Option<OwnerType>) -> String {
         if let Some(owner) = owner {
             match owner {

@@ -35,7 +35,7 @@ export interface ParsedTypeName {
 }
 
 export class TypeCompatibilityChecker {
-  constructor(private project: Project) {}
+  constructor(private project: Project) { }
 
   /**
    * Parse type name to extract endpoint and type info
@@ -600,7 +600,20 @@ const tempVar: ${nodeText} = null as any;`,
     }
 
     if (sourceFiles.length === 0) {
-      throw new Error("No TypeScript files found in output directory");
+      console.warn("⚠️  No TypeScript type files (*_types.ts) found in output directory");
+      console.warn("   This typically means no type annotations were extracted from the source code.");
+      console.warn("   Type checking requires explicit TypeScript type annotations (e.g., `res: Response<User[]>`).");
+
+      // Return empty result instead of throwing
+      return {
+        totalProducers: 0,
+        totalConsumers: 0,
+        compatiblePairs: 0,
+        incompatiblePairs: 0,
+        mismatches: [],
+        orphanedProducers: [],
+        orphanedConsumers: [],
+      };
     }
 
     return await this.checkCompatibility(sourceFiles);

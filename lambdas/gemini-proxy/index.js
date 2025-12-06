@@ -257,13 +257,18 @@ exports.handler = async (event) => {
     // Convert messages to Gemini format
     const geminiMessages = convertMessages(requestBody.messages);
 
-    // Prepare generation config - removing thinking config to avoid timeouts
-    const generationConfig = {};
+    // Prepare generation config - disable thinking to speed up responses
+    const generationConfig = {
+      // Disable thinking mode (reasoning) to get faster responses
+      // Set thinkingConfig with budget of 0 to turn off thinking entirely
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
+    };
 
     if (requestBody.options?.temperature !== undefined) {
       generationConfig.temperature = requestBody.options.temperature;
     }
-    // Remove custom options for simplicity - use defaults
 
     // Prepare config object for structured output
     const config = {

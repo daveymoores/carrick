@@ -7,7 +7,7 @@ use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::utils::get_repository_name;
-use crate::visitor::ImportSymbolExtractor;
+use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -24,6 +24,7 @@ type FileDiscoveryResult = Result<
     (
         Vec<PathBuf>,
         HashMap<String, crate::visitor::ImportedSymbol>,
+        HashMap<String, FunctionDefinition>,
         String,
     ),
     Box<dyn std::error::Error>,
@@ -208,24 +209,37 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
         repo_path
     );
 
-    // Extract imported symbols by parsing files
+    // Extract imported symbols and function definitions by parsing files
     let mut all_imported_symbols = HashMap::new();
+    let mut all_function_definitions = HashMap::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
-            let mut extractor = ImportSymbolExtractor::new();
-            module.visit_with(&mut extractor);
-            all_imported_symbols.extend(extractor.imported_symbols);
+            // Extract import symbols
+            let mut import_extractor = ImportSymbolExtractor::new();
+            module.visit_with(&mut import_extractor);
+            all_imported_symbols.extend(import_extractor.imported_symbols);
+
+            // Extract function definitions with type annotations
+            let mut func_extractor = FunctionDefinitionExtractor::new(file_path.clone());
+            module.visit_with(&mut func_extractor);
+            all_function_definitions.extend(func_extractor.function_definitions);
         }
     }
 
     println!(
-        "Extracted {} imported symbols from {} files",
+        "Extracted {} imported symbols and {} function definitions from {} files",
         all_imported_symbols.len(),
+        all_function_definitions.len(),
         files.len()
     );
 
-    Ok((files, all_imported_symbols, repo_name))
+    Ok((
+        files,
+        all_imported_symbols,
+        all_function_definitions,
+        repo_name,
+    ))
 }
 
 /// Extract config and package loading logic
@@ -268,12 +282,13 @@ async fn analyze_current_repo(
 
     // 1. Create shared SourceMap and discover files and symbols
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_imported_symbols, repo_name) =
+    let (files, all_imported_symbols, function_definitions, repo_name) =
         discover_files_and_symbols(repo_path, cm.clone())?;
     println!(
-        "Extracted repository name: '{}' from {} files",
+        "Extracted repository name: '{}' from {} files ({} function definitions)",
         repo_name,
-        files.len()
+        files.len(),
+        function_definitions.len()
     );
 
     // 2. Load config and packages using existing logic
@@ -300,14 +315,19 @@ async fn analyze_current_repo(
         serde_json::to_string(&config).ok(),
         serde_json::to_string(&packages).ok(),
         Some(packages.clone()),
+        function_definitions.clone(),
     );
 
-    // 7. Create a minimal Analyzer ONLY for type extraction (temporary until type extraction is refactored)
-    let mut analyzer = Analyzer::new(config.clone(), cm);
+    // 7. Create a minimal Analyzer for type extraction
+    let mut analyzer = Analyzer::new(config.clone(), cm.clone());
     analyzer.endpoints = cloud_data.endpoints.clone();
     analyzer.calls = cloud_data.calls.clone();
     analyzer.mounts = cloud_data.mounts.clone();
+    analyzer.function_definitions = function_definitions;
     analyzer.build_endpoint_router();
+
+    // 7a. Resolve types for endpoints using SWC AST (accurate position extraction)
+    analyzer.resolve_types_for_endpoints(cm);
 
     // 8. Extract types for current repo (critical for cross-repo type checking)
     extract_types_for_current_repo(&analyzer, repo_path, &packages, agent_type_infos)?;
@@ -326,22 +346,69 @@ fn extract_types_for_current_repo(
     let mut repo_type_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let repo_paths = vec![repo_path.to_string()];
 
-    // Group type information by repository using endpoint owner information
+    println!("=== TYPE EXTRACTION DIAGNOSTIC START ===");
+    println!("Repository path: {}", repo_path);
+    println!("Agent type_infos count: {}", agent_type_infos.len());
+
+    // Log agent type infos for debugging
+    for (i, type_info) in agent_type_infos.iter().enumerate() {
+        println!(
+            "  Agent type_info[{}]: filePath={}, alias={}, typeString={}",
+            i,
+            type_info["filePath"].as_str().unwrap_or("NONE"),
+            type_info["alias"].as_str().unwrap_or("NONE"),
+            type_info["compositeTypeString"].as_str().unwrap_or("NONE")
+        );
+    }
+
+    // Count endpoints and calls with type info (for diagnostics)
+    let endpoints_with_types = analyzer
+        .endpoints
+        .iter()
+        .filter(|e| e.request_type.is_some() || e.response_type.is_some())
+        .count();
+    let calls_with_types = analyzer
+        .calls
+        .iter()
+        .filter(|c| c.request_type.is_some() || c.response_type.is_some())
+        .count();
+
+    println!(
+        "Analyzer endpoints: {} total, {} with type info",
+        analyzer.endpoints.len(),
+        endpoints_with_types
+    );
+    println!(
+        "Analyzer calls: {} total, {} with type info",
+        analyzer.calls.len(),
+        calls_with_types
+    );
+    println!("Analyzer fetch_calls: {}", analyzer.fetch_calls().len());
+
+    // Group type information by repository using endpoint file path
+    // This ensures types are keyed by repo name (e.g., "repo-a") not owner (e.g., "app")
     for endpoint in &analyzer.endpoints {
-        let repo_prefix = analyzer.extract_repo_prefix_from_owner(&endpoint.owner);
+        let repo_prefix =
+            analyzer.extract_repo_prefix_from_file_path(&endpoint.file_path, &repo_paths);
         analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
     }
 
     // Group type information by repository using call file information
+    // NOTE: Same issue - type info is None from the adapter layer
     for call in &analyzer.calls {
         let repo_prefix = analyzer.extract_repo_prefix_from_file_path(&call.file_path, &repo_paths);
         analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
     }
 
-    // Collect type information from Gemini-extracted fetch_calls
+    // Collect type information from Gemini-extracted fetch_calls (legacy path)
     let gemini_type_infos = analyzer.collect_type_infos_from_calls(analyzer.fetch_calls());
+    println!(
+        "Gemini type_infos from fetch_calls: {}",
+        gemini_type_infos.len()
+    );
 
     // Combine Gemini async types AND Agent types
+    // This is the primary source of type info in the multi-agent architecture
     for type_info in gemini_type_infos
         .into_iter()
         .chain(agent_type_infos.into_iter())
@@ -359,6 +426,14 @@ fn extract_types_for_current_repo(
     let repo_name = get_repository_name(repo_path);
     let type_infos = repo_type_map.get(&repo_name).cloned().unwrap_or_default();
 
+    println!(
+        "Repo type map keys: {:?}",
+        repo_type_map.keys().collect::<Vec<_>>()
+    );
+    println!("Looking for repo_name: '{}'", repo_name);
+    println!("Final type_infos count for this repo: {}", type_infos.len());
+    println!("=== TYPE EXTRACTION DIAGNOSTIC END ===");
+
     if !type_infos.is_empty() {
         println!(
             "Processing {} types from repository: {}",
@@ -366,6 +441,11 @@ fn extract_types_for_current_repo(
             repo_path
         );
         analyzer.extract_types_for_repo(repo_path, type_infos.clone(), packages);
+    } else {
+        println!(
+            "WARNING: No types to extract for repository: {} - type file will not be generated",
+            repo_path
+        );
     }
 
     Ok(())
