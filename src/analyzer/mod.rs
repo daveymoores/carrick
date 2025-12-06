@@ -443,6 +443,13 @@ impl Analyzer {
                 if let Some(param_name) = segment.strip_prefix(':') {
                     // Convert :id -> ById, :userId -> ByUserId, :eventId -> ByEventId
                     format!("By{}", Self::to_pascal_case(param_name))
+                } else if segment.starts_with("${") && segment.ends_with('}') {
+                    // Handle template literal syntax: ${userId} -> ByUserid
+                    // Extract the variable name from ${varName} or ${process.env.VAR}
+                    let inner = &segment[2..segment.len() - 1]; // Remove ${ and }
+                    // If it contains a dot (like process.env.VAR), take the last part
+                    let param_name = inner.rsplit('.').next().unwrap_or(inner);
+                    format!("By{}", Self::to_pascal_case(param_name))
                 } else {
                     // Convert regular segments to PascalCase
                     Self::to_pascal_case(segment)
@@ -1368,5 +1375,127 @@ impl Analyzer {
         if let Some(resp_type) = &api_detail.response_type {
             self.add_type_to_repo_map(resp_type, repo_prefix, repo_type_map);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_route_colon_params() {
+        // Standard :param style path parameters
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:id"),
+            "UsersById"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:userId/comments"),
+            "UsersByUseridComments"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/:id/comments/:commentId"),
+            "ApiByIdCommentsByCommentid"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_template_literal_params() {
+        // Template literal ${param} style path parameters
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/${userId}"),
+            "UsersByUserid"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/${userId}/comments"),
+            "UsersByUseridComments"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/${postId}/comments/${commentId}"),
+            "ApiByPostidCommentsByCommentid"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_template_literal_with_dot_notation() {
+        // Template literals with process.env or object property access
+        // Should use the last part (the actual variable name)
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/orders/${process.env.ORDER_ID}"),
+            "OrdersByOrderId"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_mixed_params() {
+        // Mix of :param and ${param} styles (unlikely but should work)
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:id/posts/${postId}"),
+            "UsersByIdPostsByPostid"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_no_params() {
+        // Paths without any parameters
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/users"),
+            "ApiUsers"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/health"),
+            "Health"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_root_path() {
+        assert_eq!(Analyzer::sanitize_route_for_dynamic_paths("/"), "");
+    }
+
+    #[test]
+    fn test_sanitize_route_empty_segments() {
+        // Should handle double slashes gracefully
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api//users"),
+            "ApiUsers"
+        );
+    }
+
+    #[test]
+    fn test_to_pascal_case() {
+        assert_eq!(Analyzer::to_pascal_case("userId"), "Userid");
+        assert_eq!(Analyzer::to_pascal_case("user_id"), "UserId");
+        assert_eq!(Analyzer::to_pascal_case("user-id"), "UserId");
+        assert_eq!(Analyzer::to_pascal_case("USER"), "User");
+        assert_eq!(Analyzer::to_pascal_case(""), "");
+    }
+
+    #[test]
+    fn test_generate_unique_call_alias_name_with_template_params() {
+        // Verify the full alias generation works with template literal paths
+        let alias = Analyzer::generate_unique_call_alias_name(
+            "/users/${userId}/comments",
+            "GET",
+            false, // is_request_type
+            1,     // call_number
+            true,  // is_consumer
+        );
+
+        assert!(
+            alias.contains("ByUserid"),
+            "Alias should contain 'ByUserid'. Got: {}",
+            alias
+        );
+        assert!(
+            alias.starts_with("Get"),
+            "Alias should start with 'Get'. Got: {}",
+            alias
+        );
+        assert!(
+            alias.contains("Consumer"),
+            "Alias should contain 'Consumer'. Got: {}",
+            alias
+        );
     }
 }
