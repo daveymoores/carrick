@@ -499,6 +499,18 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
                 }
                 // Default array response
                 "[]".to_string()
+            } else if schema_val.get("type").and_then(|t| t.as_str()) == Some("OBJECT") {
+                // Check for framework guidance schema - has mount_patterns, endpoint_patterns, etc.
+                if let Some(props) = schema_val.get("properties") {
+                    if props.get("mount_patterns").is_some()
+                        && props.get("endpoint_patterns").is_some()
+                        && props.get("triage_hints").is_some()
+                    {
+                        return generate_mock_framework_guidance_response(prompt);
+                    }
+                }
+                // Framework detection or other object schema
+                r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#.to_string()
             } else {
                 // Framework detection or other object schema
                 r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#.to_string()
@@ -510,6 +522,14 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
                 .to_string()
         }
     }
+}
+
+/// Generate mock framework guidance response - returns empty structure for testing
+/// The real LLM will provide actual patterns based on detected frameworks
+fn generate_mock_framework_guidance_response(_prompt: &str) -> String {
+    // In mock mode, return a valid but empty structure
+    // The real LLM call will populate this with framework-specific patterns
+    r#"{"mount_patterns":[],"endpoint_patterns":[],"middleware_patterns":[],"data_fetching_patterns":[],"triage_hints":"Mock mode - no guidance generated","parsing_notes":"Mock mode - no parsing notes"}"#.to_string()
 }
 
 /// Generate mock triage responses by extracting locations from prompt
@@ -681,7 +701,7 @@ fn generate_mock_consumer_response(prompt: &str) -> String {
     serde_json::to_string(&consumers).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Generate mock mount relationship responses  
+/// Generate mock mount relationship responses
 fn generate_mock_mount_response(prompt: &str) -> String {
     let call_sites = extract_call_sites_from_prompt(prompt);
     let mounts: Vec<serde_json::Value> = call_sites

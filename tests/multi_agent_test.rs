@@ -1,5 +1,5 @@
 use carrick::{
-    agents::{AnalysisResults, CallSiteOrchestrator, LeanCallSite},
+    agents::{AnalysisResults, CallSiteOrchestrator, FrameworkGuidance, LeanCallSite},
     call_site_extractor::{ArgumentType, CallArgument, CallSite},
     framework_detector::DetectionResult,
     gemini_service::GeminiService,
@@ -87,12 +87,21 @@ async fn test_multi_agent_orchestrator_mock_mode() {
         notes: "Test framework detection".to_string(),
     };
 
+    let framework_guidance = FrameworkGuidance {
+        mount_patterns: vec![],
+        endpoint_patterns: vec![],
+        middleware_patterns: vec![],
+        data_fetching_patterns: vec![],
+        triage_hints: String::new(),
+        parsing_notes: String::new(),
+    };
+
     let gemini_service = GeminiService::new("mock".to_string());
     let orchestrator = CallSiteOrchestrator::new(gemini_service);
 
     // Run the analysis
     let result = orchestrator
-        .analyze_call_sites(&call_sites, &framework_detection)
+        .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
         .await
         .expect("Analysis should succeed");
 
@@ -237,11 +246,20 @@ async fn test_empty_call_sites() {
         notes: "Test".to_string(),
     };
 
+    let framework_guidance = FrameworkGuidance {
+        mount_patterns: vec![],
+        endpoint_patterns: vec![],
+        middleware_patterns: vec![],
+        data_fetching_patterns: vec![],
+        triage_hints: String::new(),
+        parsing_notes: String::new(),
+    };
+
     let gemini_service = GeminiService::new("mock".to_string());
     let orchestrator = CallSiteOrchestrator::new(gemini_service);
 
     let result = orchestrator
-        .analyze_call_sites(&[], &framework_detection)
+        .analyze_call_sites(&[], &framework_detection, &framework_guidance)
         .await
         .expect("Should handle empty call sites");
 
@@ -682,11 +700,20 @@ async fn test_endpoint_enrichment_with_inline_types() {
         notes: "Test".to_string(),
     };
 
+    let framework_guidance = FrameworkGuidance {
+        mount_patterns: vec![],
+        endpoint_patterns: vec![],
+        middleware_patterns: vec![],
+        data_fetching_patterns: vec![],
+        triage_hints: String::new(),
+        parsing_notes: String::new(),
+    };
+
     let gemini_service = GeminiService::new("mock".to_string());
     let orchestrator = CallSiteOrchestrator::new(gemini_service);
 
     let result = orchestrator
-        .analyze_call_sites(&call_sites, &framework_detection)
+        .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
         .await
         .expect("Analysis should succeed");
 

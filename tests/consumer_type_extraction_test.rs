@@ -10,7 +10,7 @@
 //! The type `Order[]` should be captured and linked to the `response.json()` call.
 
 use carrick::{
-    agents::{AnalysisResults, CallSiteOrchestrator, TriageStats},
+    agents::{AnalysisResults, CallSiteOrchestrator, FrameworkGuidance, TriageStats},
     call_site_extractor::{
         ArgumentType, CallArgument, CallSite, CallSiteExtractor, ResultTypeInfo,
     },
@@ -317,11 +317,20 @@ async fn test_data_fetching_call_enrichment() {
         notes: "Test".to_string(),
     };
 
+    let framework_guidance = FrameworkGuidance {
+        mount_patterns: vec![],
+        endpoint_patterns: vec![],
+        middleware_patterns: vec![],
+        data_fetching_patterns: vec![],
+        triage_hints: String::new(),
+        parsing_notes: String::new(),
+    };
+
     let gemini_service = GeminiService::new("mock".to_string());
     let orchestrator = CallSiteOrchestrator::new(gemini_service);
 
     let result = orchestrator
-        .analyze_call_sites(&call_sites, &framework_detection)
+        .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
         .await
         .expect("Analysis should succeed");
 

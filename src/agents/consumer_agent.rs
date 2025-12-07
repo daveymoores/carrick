@@ -1,6 +1,8 @@
 use crate::{
-    agents::schemas::AgentSchemas, call_site_extractor::CallSite,
-    framework_detector::DetectionResult, gemini_service::GeminiService,
+    agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
+    call_site_extractor::CallSite,
+    framework_detector::DetectionResult,
+    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +35,7 @@ impl ConsumerAgent {
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> Result<Vec<DataFetchingCall>, Box<dyn std::error::Error>> {
         if call_sites.is_empty() {
             return Ok(Vec::new());
@@ -44,7 +47,8 @@ impl ConsumerAgent {
             call_sites.len()
         );
 
-        let prompt = self.build_fetching_prompt(call_sites, framework_detection);
+        let prompt =
+            self.build_fetching_prompt(call_sites, framework_detection, framework_guidance);
         let system_message = self.build_system_message();
 
         let schema = AgentSchemas::consumer_schema();
@@ -89,18 +93,35 @@ NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> String {
         let call_sites_json = serde_json::to_string_pretty(call_sites).unwrap_or_default();
         let frameworks_json = serde_json::to_string(framework_detection).unwrap_or_default();
+
+        // Format framework-specific data fetching patterns
+        let data_fetching_patterns = framework_guidance
+            .data_fetching_patterns
+            .iter()
+            .map(|p| format!("- {} -> {} ({})", p.pattern, p.description, p.framework))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsing_notes = &framework_guidance.parsing_notes;
 
         format!(
             r#"Extract detailed information from these pre-identified data fetching call sites.
 
 FRAMEWORK CONTEXT:
-{}
+{frameworks_json}
+
+FRAMEWORK-SPECIFIC DATA FETCHING PATTERNS:
+{data_fetching_patterns}
+
+PARSING NOTES:
+{parsing_notes}
 
 DATA FETCHING CALL SITES:
-{}
+{call_sites_json}
 
 For each data fetching call site, extract:
 1. Library name (fetch, axios, got, etc.)
@@ -138,16 +159,17 @@ Return JSON array with this structure:
 
 GUIDELINES:
 - These are all data fetching calls (already triaged)
+- Use the framework-specific data fetching patterns above to understand how each library makes HTTP calls
 - Extract URL from string literals in arguments if present, otherwise set to null
 - If arguments are Identifiers, check the "resolved_value" field for the actual string value
 - If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
 - Infer HTTP method from function name (get=GET, post=POST, etc.)
-- Infer HTTP method from function name (get=GET, post=POST, etc.)
 - For response parsing calls (.json(), .text()), use "response_parsing" as library
 - For direct HTTP client calls (axios.get, fetch), extract the client library name
 - If callee_object is "global", the library name is the callee_property (e.g., "fetch")
-- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#,
-            frameworks_json, call_sites_json
+- ky and got use .json() chaining for response parsing
+- ofetch uses $fetch() function
+- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
     }
 }

@@ -1,6 +1,8 @@
 use crate::{
-    agents::schemas::AgentSchemas, call_site_extractor::CallSite,
-    framework_detector::DetectionResult, gemini_service::GeminiService,
+    agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
+    call_site_extractor::CallSite,
+    framework_detector::DetectionResult,
+    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,7 @@ impl MountAgent {
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> Result<Vec<MountRelationship>, Box<dyn std::error::Error>> {
         if call_sites.is_empty() {
             return Ok(Vec::new());
@@ -41,7 +44,7 @@ impl MountAgent {
             call_sites.len()
         );
 
-        let prompt = self.build_mount_prompt(call_sites, framework_detection);
+        let prompt = self.build_mount_prompt(call_sites, framework_detection, framework_guidance);
         let system_message = self.build_system_message();
 
         let schema = AgentSchemas::mount_schema();
@@ -99,18 +102,35 @@ NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> String {
         let call_sites_json = serde_json::to_string_pretty(call_sites).unwrap_or_default();
         let frameworks_json = serde_json::to_string(framework_detection).unwrap_or_default();
+
+        // Format framework-specific mount patterns
+        let mount_patterns = framework_guidance
+            .mount_patterns
+            .iter()
+            .map(|p| format!("- {} -> {} ({})", p.pattern, p.description, p.framework))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsing_notes = &framework_guidance.parsing_notes;
 
         format!(
             r#"Extract mount relationship details from these pre-identified router mount call sites.
 
 FRAMEWORK CONTEXT:
-{}
+{frameworks_json}
+
+FRAMEWORK-SPECIFIC MOUNT PATTERNS:
+{mount_patterns}
+
+PARSING NOTES:
+{parsing_notes}
 
 ROUTER MOUNT CALL SITES:
-{}
+{call_sites_json}
 
 For each router mount call site, extract:
 1. Parent node (the object doing the mounting)
@@ -147,12 +167,14 @@ GUIDELINES:
 - If arguments are Identifiers, check the "resolved_value" field for the actual string value
 - If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
 - Common patterns:
+- Use the framework-specific mount patterns above to understand how mounts work in each framework
 - Common patterns:
   - app.use('/path', router) -> parent: app, child: router, path: /path
   - router.use('/path', subRouter) -> parent: router, child: subRouter, path: /path
   - server.mount('/path', handler) -> parent: server, child: handler, path: /path
-- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#,
-            frameworks_json, call_sites_json
+  - app.route('/path', subApp) -> parent: app, child: subApp, path: /path (Hono)
+  - fastify.register(routes, {{ prefix: '/path' }}) -> parent: fastify, child: routes, path: /path (Fastify)
+- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
     }
 }

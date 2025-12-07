@@ -1,5 +1,5 @@
 use carrick::{
-    agents::CallSiteOrchestrator,
+    agents::{CallSiteOrchestrator, FrameworkGuidance},
     call_site_extractor::{CallSiteExtractionService, CallSiteExtractor},
     framework_detector::FrameworkDetector,
     gemini_service::GeminiService,
@@ -55,10 +55,20 @@ async fn analyze_fixture(fixture_path: &str) -> (Vec<String>, Vec<String>) {
     extraction_service.extract_from_visitors(vec![extractor]);
     let call_sites = extraction_service.get_call_sites();
 
+    // Framework Guidance - empty in tests, real LLM provides patterns
+    let framework_guidance = FrameworkGuidance {
+        mount_patterns: vec![],
+        endpoint_patterns: vec![],
+        middleware_patterns: vec![],
+        data_fetching_patterns: vec![],
+        triage_hints: String::new(),
+        parsing_notes: String::new(),
+    };
+
     // Orchestrator
     let orchestrator = CallSiteOrchestrator::new(gemini_service.clone());
     let analysis_results = orchestrator
-        .analyze_call_sites(call_sites, &detection)
+        .analyze_call_sites(call_sites, &detection, &framework_guidance)
         .await
         .unwrap();
 

@@ -1,6 +1,8 @@
 use crate::{
-    agents::schemas::AgentSchemas, call_site_extractor::CallSite,
-    framework_detector::DetectionResult, gemini_service::GeminiService,
+    agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
+    call_site_extractor::CallSite,
+    framework_detector::DetectionResult,
+    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +36,7 @@ impl EndpointAgent {
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> Result<Vec<HttpEndpoint>, Box<dyn std::error::Error>> {
         if call_sites.is_empty() {
             return Ok(Vec::new());
@@ -45,7 +48,8 @@ impl EndpointAgent {
             call_sites.len()
         );
 
-        let prompt = self.build_endpoint_prompt(call_sites, framework_detection);
+        let prompt =
+            self.build_endpoint_prompt(call_sites, framework_detection, framework_guidance);
         let system_message = self.build_system_message();
 
         let schema = AgentSchemas::endpoint_schema();
@@ -105,18 +109,35 @@ NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> String {
         let call_sites_json = serde_json::to_string_pretty(call_sites).unwrap_or_default();
         let frameworks_json = serde_json::to_string(framework_detection).unwrap_or_default();
+
+        // Format framework-specific endpoint patterns
+        let endpoint_patterns = framework_guidance
+            .endpoint_patterns
+            .iter()
+            .map(|p| format!("- {} -> {} ({})", p.pattern, p.description, p.framework))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsing_notes = &framework_guidance.parsing_notes;
 
         format!(
             r#"Extract detailed information from these pre-identified HTTP endpoint call sites.
 
 FRAMEWORK CONTEXT:
-{}
+{frameworks_json}
+
+FRAMEWORK-SPECIFIC ENDPOINT PATTERNS:
+{endpoint_patterns}
+
+PARSING NOTES:
+{parsing_notes}
 
 HTTP ENDPOINT CALL SITES:
-{}
+{call_sites_json}
 
 For each endpoint call site, extract:
 1. HTTP method (GET, POST, PUT, DELETE, etc.)
@@ -144,16 +165,15 @@ Return JSON array with this structure:
 
 GUIDELINES:
 - These are all HTTP endpoint definitions (already triaged)
+- Use the framework-specific patterns above to understand how endpoints are defined
 - Extract the actual path string from string literals in arguments
 - If an argument is an Identifier, use the "resolved_value" field if available to find the actual path string
 - If an argument is a TemplateLiteral, use the "value" field which contains the reconstructed template string
 - Extract node_name from the callee_object field (e.g., "app", "router", "fastify")
-- Extract node_name from the callee_object field (e.g., "app", "router", "fastify")
 - If handler is an inline function, use "anonymous"
 - If handler is a variable reference, use the variable name
 - Infer HTTP method from the callee_property (get=GET, post=POST, etc.)
-- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#,
-            frameworks_json, call_sites_json
+- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
     }
 }

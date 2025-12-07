@@ -1,6 +1,8 @@
 use crate::{
-    agents::schemas::AgentSchemas, call_site_extractor::CallSite,
-    framework_detector::DetectionResult, gemini_service::GeminiService,
+    agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
+    call_site_extractor::CallSite,
+    framework_detector::DetectionResult,
+    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +87,7 @@ impl TriageAgent {
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> Result<Vec<TriageResult>, Box<dyn std::error::Error>> {
         if call_sites.is_empty() {
             return Ok(Vec::new());
@@ -105,7 +108,7 @@ impl TriageAgent {
                 batch.len()
             );
 
-            let prompt = self.build_triage_prompt(batch, framework_detection);
+            let prompt = self.build_triage_prompt(batch, framework_detection, framework_guidance);
             let system_message = self.build_system_message();
 
             println!(
@@ -200,6 +203,7 @@ CRITICAL:
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> String {
         // In mock mode, pass full call sites so mock generator can classify properly
         // In real mode, use lean call sites to reduce prompt size
@@ -214,14 +218,40 @@ CRITICAL:
         };
         let frameworks_json = serde_json::to_string(framework_detection).unwrap_or_default();
 
+        // Format framework-specific guidance
+        let triage_hints = &framework_guidance.triage_hints;
+        let mount_patterns = framework_guidance
+            .mount_patterns
+            .iter()
+            .map(|p| format!("  - {} ({}) - {}", p.pattern, p.framework, p.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let endpoint_patterns = framework_guidance
+            .endpoint_patterns
+            .iter()
+            .map(|p| format!("  - {} ({}) - {}", p.pattern, p.framework, p.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         format!(
             r#"Perform initial triage classification of these JavaScript/TypeScript call sites.
 
 FRAMEWORK CONTEXT:
-{}
+{frameworks_json}
+
+FRAMEWORK-SPECIFIC PATTERNS:
+
+Mount Patterns (RouterMount):
+{mount_patterns}
+
+Endpoint Patterns (HttpEndpoint):
+{endpoint_patterns}
+
+FRAMEWORK-SPECIFIC HINTS:
+{triage_hints}
 
 CALL SITES TO CLASSIFY:
-{}
+{call_sites_json}
 
 For each call site, assign it to one of these categories:
 - HttpEndpoint: Defines routes that handle incoming HTTP requests
@@ -251,7 +281,7 @@ Return JSON array with this structure:
 ]
 
 GUIDELINES:
-- Use the framework context to understand what libraries are in use
+- Use the framework context and framework-specific patterns to understand what libraries are in use
 - app.get('/path', handler) = HttpEndpoint
 - fetch('url') (global.fetch) or axios.get() = DataFetchingCall
 - response.json() or resp.text() = DataFetchingCall (parsing API responses)
@@ -260,8 +290,7 @@ GUIDELINES:
 - router.use('/v1', v1Router) where arg_count=2, first_arg_type="StringLiteral" = RouterMount
 - Array.isArray() or console.log() = Irrelevant
 - Match EVERY input call site with exactly ONE classification
-- Use the exact location strings from the input"#,
-            frameworks_json, call_sites_json
+- Use the exact location strings from the input"#
         )
     }
 }

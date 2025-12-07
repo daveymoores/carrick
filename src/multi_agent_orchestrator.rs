@@ -1,5 +1,5 @@
 use crate::{
-    agents::{AnalysisResults, CallSiteOrchestrator},
+    agents::{AnalysisResults, CallSiteOrchestrator, FrameworkGuidance, FrameworkGuidanceAgent},
     call_site_extractor::{CallSiteExtractionService, CallSiteExtractor},
     framework_detector::{DetectionResult, FrameworkDetector},
     gemini_service::GeminiService,
@@ -20,6 +20,8 @@ use swc_common::{
 pub struct MultiAgentAnalysisResult {
     #[allow(dead_code)]
     pub framework_detection: DetectionResult,
+    #[allow(dead_code)]
+    pub framework_guidance: FrameworkGuidance,
     pub mount_graph: MountGraph,
     pub analysis_results: AnalysisResults,
 }
@@ -60,6 +62,19 @@ impl MultiAgentOrchestrator {
             framework_detection.data_fetchers
         );
 
+        // Stage 0.5: Framework Guidance Generation
+        println!("Stage 0.5: Framework Guidance Generation");
+        let framework_guidance_agent = FrameworkGuidanceAgent::new(self.gemini_service.clone());
+        let framework_guidance = framework_guidance_agent
+            .generate_guidance(&framework_detection)
+            .await?;
+
+        println!(
+            "Generated guidance with {} mount patterns, {} endpoint patterns",
+            framework_guidance.mount_patterns.len(),
+            framework_guidance.endpoint_patterns.len()
+        );
+
         // Stage 1: Call Site Extraction
         println!("Stage 1: Call Site Extraction");
         let call_sites = self.extract_all_call_sites(&files).await?;
@@ -69,7 +84,7 @@ impl MultiAgentOrchestrator {
         println!("Stage 2: Call Site Classification using Classify-Then-Dispatch");
         let orchestrator = CallSiteOrchestrator::new(self.gemini_service.clone());
         let analysis_results = orchestrator
-            .analyze_call_sites(&call_sites, &framework_detection)
+            .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
             .await?;
 
         println!(
@@ -94,6 +109,7 @@ impl MultiAgentOrchestrator {
 
         Ok(MultiAgentAnalysisResult {
             framework_detection,
+            framework_guidance,
             mount_graph,
             analysis_results,
         })

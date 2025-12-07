@@ -204,6 +204,86 @@ impl AgentSchemas {
         })
     }
 
+    /// Schema for FrameworkGuidanceAgent output
+    pub fn framework_guidance_schema() -> Value {
+        json!({
+            "type": "OBJECT",
+            "properties": {
+                "mount_patterns": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "pattern": {
+                                "type": "STRING",
+                                "description": "Code pattern example, e.g., app.route('/path', subApp)"
+                            },
+                            "description": {
+                                "type": "STRING",
+                                "description": "What this pattern represents"
+                            },
+                            "framework": {
+                                "type": "STRING",
+                                "description": "Which framework this pattern is for"
+                            }
+                        },
+                        "required": ["pattern", "description", "framework"]
+                    },
+                    "description": "Patterns for router/sub-app mounting"
+                },
+                "endpoint_patterns": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "pattern": { "type": "STRING" },
+                            "description": { "type": "STRING" },
+                            "framework": { "type": "STRING" }
+                        },
+                        "required": ["pattern", "description", "framework"]
+                    },
+                    "description": "Patterns for HTTP endpoint definitions"
+                },
+                "middleware_patterns": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "pattern": { "type": "STRING" },
+                            "description": { "type": "STRING" },
+                            "framework": { "type": "STRING" }
+                        },
+                        "required": ["pattern", "description", "framework"]
+                    },
+                    "description": "Patterns for middleware registration"
+                },
+                "data_fetching_patterns": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "pattern": { "type": "STRING" },
+                            "description": { "type": "STRING" },
+                            "framework": { "type": "STRING" }
+                        },
+                        "required": ["pattern", "description", "framework"]
+                    },
+                    "description": "Patterns for outbound HTTP calls"
+                },
+                "triage_hints": {
+                    "type": "STRING",
+                    "description": "Free-form hints for distinguishing between categories"
+                },
+                "parsing_notes": {
+                    "type": "STRING",
+                    "description": "Framework-specific notes that may affect parsing"
+                }
+            },
+            "required": ["mount_patterns", "endpoint_patterns", "middleware_patterns",
+                        "data_fetching_patterns", "triage_hints", "parsing_notes"]
+        })
+    }
+
     /// Schema for MountAgent output - array of MountRelationship
     pub fn mount_schema() -> Value {
         json!({
@@ -256,6 +336,20 @@ mod tests {
         assert!(AgentSchemas::consumer_schema().is_object());
         assert!(AgentSchemas::middleware_schema().is_object());
         assert!(AgentSchemas::mount_schema().is_object());
+        assert!(AgentSchemas::framework_guidance_schema().is_object());
+    }
+
+    #[test]
+    fn test_framework_guidance_schema_structure() {
+        let schema = AgentSchemas::framework_guidance_schema();
+        assert_eq!(schema["type"], "OBJECT");
+        assert!(schema["properties"]["mount_patterns"].is_object());
+        assert!(schema["properties"]["endpoint_patterns"].is_object());
+        assert!(schema["properties"]["middleware_patterns"].is_object());
+        assert!(schema["properties"]["data_fetching_patterns"].is_object());
+        assert!(schema["properties"]["triage_hints"].is_object());
+        assert!(schema["properties"]["parsing_notes"].is_object());
+        assert!(schema["required"].is_array());
     }
 
     #[test]

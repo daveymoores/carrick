@@ -1,6 +1,8 @@
 use crate::{
-    agents::schemas::AgentSchemas, call_site_extractor::CallSite,
-    framework_detector::DetectionResult, gemini_service::GeminiService,
+    agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
+    call_site_extractor::CallSite,
+    framework_detector::DetectionResult,
+    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,7 @@ impl MiddlewareAgent {
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> Result<Vec<Middleware>, Box<dyn std::error::Error>> {
         if call_sites.is_empty() {
             return Ok(Vec::new());
@@ -42,7 +45,8 @@ impl MiddlewareAgent {
             call_sites.len()
         );
 
-        let prompt = self.build_middleware_prompt(call_sites, framework_detection);
+        let prompt =
+            self.build_middleware_prompt(call_sites, framework_detection, framework_guidance);
         let system_message = self.build_system_message();
 
         let schema = AgentSchemas::middleware_schema();
@@ -81,18 +85,35 @@ NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> String {
         let call_sites_json = serde_json::to_string_pretty(call_sites).unwrap_or_default();
         let frameworks_json = serde_json::to_string(framework_detection).unwrap_or_default();
+
+        // Format framework-specific middleware patterns
+        let middleware_patterns = framework_guidance
+            .middleware_patterns
+            .iter()
+            .map(|p| format!("- {} -> {} ({})", p.pattern, p.description, p.framework))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsing_notes = &framework_guidance.parsing_notes;
 
         format!(
             r#"Extract detailed information from these pre-identified middleware call sites.
 
 FRAMEWORK CONTEXT:
-{}
+{frameworks_json}
+
+FRAMEWORK-SPECIFIC MIDDLEWARE PATTERNS:
+{middleware_patterns}
+
+PARSING NOTES:
+{parsing_notes}
 
 MIDDLEWARE CALL SITES:
-{}
+{call_sites_json}
 
 For each middleware call site, extract:
 1. Middleware type (body-parser, cors, auth, static, custom, etc.)
@@ -125,6 +146,7 @@ Return JSON array with this structure:
 
 GUIDELINES:
 - These are all middleware registrations (already triaged)
+- Use the framework-specific middleware patterns above to understand how middleware works in each framework
 - Extract path prefix from string literals if present (e.g., app.use('/api', middleware))
 - If no path prefix, set to null (applies to all routes)
 - Extract node_name from the callee_object field (e.g., "app", "router", "server")
@@ -132,10 +154,12 @@ GUIDELINES:
   - express.json, express.urlencoded = "body-parser"
   - cors() = "cors"
   - express.static() = "static"
+  - fastify.addHook() = "lifecycle-hook" (Fastify)
+  - app.use('*', fn) = middleware registration (Hono)
+  - app.derive() = "context-derivation" (Elysia)
   - Custom function names = "custom"
 - For handler, use the actual function name if available
-- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#,
-            frameworks_json, call_sites_json
+- Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
     }
 }

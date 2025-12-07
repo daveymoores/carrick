@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use super::{
     consumer_agent::{ConsumerAgent, DataFetchingCall},
     endpoint_agent::{EndpointAgent, HttpEndpoint},
+    framework_guidance_agent::FrameworkGuidance,
     middleware_agent::{Middleware, MiddlewareAgent},
     mount_agent::{MountAgent, MountRelationship},
     triage_agent::{TriageAgent, TriageClassification, TriageResult},
@@ -66,6 +67,7 @@ impl CallSiteOrchestrator {
         &self,
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
+        framework_guidance: &FrameworkGuidance,
     ) -> Result<AnalysisResults, Box<dyn std::error::Error>> {
         if call_sites.is_empty() {
             return Ok(AnalysisResults {
@@ -90,7 +92,7 @@ impl CallSiteOrchestrator {
         // Step 1: Triage - Classify all call sites into broad categories
         let triage_results = self
             .triage_agent
-            .classify_call_sites(call_sites, framework_detection)
+            .classify_call_sites(call_sites, framework_detection, framework_guidance)
             .await?;
 
         // Step 2: Dispatch - Group call sites by classification and create lookup map
@@ -106,14 +108,26 @@ impl CallSiteOrchestrator {
 
         // Step 3: Run specialist agents in parallel on their respective call sites
         let (mut endpoints_result, data_fetching_result, middleware_result, mount_result) = tokio::try_join!(
-            self.endpoint_agent
-                .detect_endpoints(&grouped_call_sites.endpoints, framework_detection),
-            self.consumer_agent
-                .detect_data_fetching_calls(&grouped_call_sites.data_fetching, framework_detection),
-            self.middleware_agent
-                .detect_middleware(&grouped_call_sites.middleware, framework_detection),
-            self.mount_agent
-                .detect_mounts(&grouped_call_sites.router_mounts, framework_detection),
+            self.endpoint_agent.detect_endpoints(
+                &grouped_call_sites.endpoints,
+                framework_detection,
+                framework_guidance
+            ),
+            self.consumer_agent.detect_data_fetching_calls(
+                &grouped_call_sites.data_fetching,
+                framework_detection,
+                framework_guidance
+            ),
+            self.middleware_agent.detect_middleware(
+                &grouped_call_sites.middleware,
+                framework_detection,
+                framework_guidance
+            ),
+            self.mount_agent.detect_mounts(
+                &grouped_call_sites.router_mounts,
+                framework_detection,
+                framework_guidance
+            ),
         )?;
 
         // Step 4: Enrich endpoints with type info from call sites (SWC-extracted, reliable)

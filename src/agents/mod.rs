@@ -1,5 +1,6 @@
 pub mod consumer_agent;
 pub mod endpoint_agent;
+pub mod framework_guidance_agent;
 pub mod middleware_agent;
 pub mod mount_agent;
 pub mod orchestrator;
@@ -8,6 +9,7 @@ pub mod triage_agent;
 
 pub use consumer_agent::DataFetchingCall;
 pub use endpoint_agent::HttpEndpoint;
+pub use framework_guidance_agent::{FrameworkGuidance, FrameworkGuidanceAgent};
 pub use middleware_agent::Middleware;
 pub use mount_agent::MountRelationship;
 pub use orchestrator::{AnalysisResults, CallSiteOrchestrator};
