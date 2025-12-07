@@ -8,24 +8,21 @@
 
 ## Quick Start for Next Agent
 
-### To Fix Issue 4 (API Calls Showing as [UNKNOWN])
+### Issue 4 (API Calls Showing as [UNKNOWN]) - ✅ FIXED
 
-The problem is that SWC-extracted URLs are not flowing through to the final output. Key files:
+**Fixed in**: `src/agents/orchestrator.rs`
 
-1. **`src/call_site_extractor.rs`** - Already extracts URLs correctly (see `extract_fetch_url`, `extract_path_from_url`)
-2. **`src/agents/orchestrator.rs`** - `enrich_data_fetching_calls_with_type_info` only uses SWC URL when `call.url.is_none()`
-3. **`src/agents/consumer_agent.rs`** - LLM returns URLs that may be `null` or malformed
+The fix ensures SWC-extracted URLs always take priority over LLM-provided URLs in `enrich_data_fetching_calls_with_type_info`. The LLM often returns malformed URLs (e.g., `${process.env.ORDER_SERVICE_URL}/orders`) while SWC properly normalizes them (e.g., `/orders`).
 
-**Fix approach**: In `enrich_data_fetching_calls_with_type_info`, always prefer the SWC-extracted `correlated_fetch.url` over the LLM-provided URL.
+**Tests added**: 5 new tests in `agents::orchestrator::tests`
 
-### To Fix Issue 5 (Nested Router Paths)
+### Issue 5 (Nested Router Paths) - ✅ FIXED
 
-The problem is nested routers with same variable names. Key files:
+**Fixed in**: `src/mount_graph.rs`
 
-1. **`src/mount_graph.rs`** - Builds router hierarchy
-2. **`src/agents/mount_agent.rs`** - Extracts mount relationships
+The fix resolves parent node names in mount relationships using import context. When a local variable like `router` is used across multiple files, the system now correctly maps it to the imported name (e.g., `apiRouter`) by tracking which file the mount occurs in.
 
-**Note**: Most mounts work. This is an edge case with variable name collisions.
+**Tests added**: `test_nested_router_path_resolution_with_same_variable_name`
 
 ### carrick.json Feature (Already Exists!)
 
@@ -45,13 +42,13 @@ The `UrlNormalizer` uses this to:
 - Classify as internal/external for matching
 - Convert `${userId}` to `:userId` for path matching
 
-**Issue 4 may be that the UrlNormalizer isn't being called in the multi-agent flow.** Check if URLs pass through `UrlNormalizer::normalize()` before being used for matching.
+**Note**: URL normalization in the SWC extractor (`call_site_extractor.rs`) already handles the path extraction and template param normalization. The `UrlNormalizer` is used later for matching in `analyzer/mod.rs`.
 
 ---
 
 ## Executive Summary
 
-Running Carrick against the test repositories revealed **7 distinct issues**. Six have been fully fixed, and 2 remain open:
+Running Carrick against the test repositories revealed **7 distinct issues**. All have been fully fixed:
 
 | Issue | Status | Priority |
 |-------|--------|----------|
@@ -60,8 +57,8 @@ Running Carrick against the test repositories revealed **7 distinct issues**. Si
 | 2a. Inline Handler Type Extraction | ✅ **FIXED** | - |
 | 2b. Repo Name Key Mismatch | ✅ **FIXED** | - |
 | 3. Cross-Repo Data Flow | ✅ **FIXED** (Working as Designed) | - |
-| 4. API Call URL Extraction | 🟡 Open | MEDIUM |
-| 5. Path Resolution (Nested Routers) | 🟡 Open | MEDIUM |
+| 4. API Call URL Extraction | ✅ **FIXED** | - |
+| 5. Path Resolution (Nested Routers) | ✅ **FIXED** | - |
 | 6. Consumer Type Extraction | ✅ **FIXED** | - |
 | **7. Consumer-Producer Alias Matching** | ✅ **FIXED** | - |
 
@@ -197,9 +194,9 @@ Cross-repo data flow works correctly when repos have been previously analyzed.
 
 ---
 
-## Issue 4: API Calls Showing as [UNKNOWN] 🟡
+## Issue 4: API Calls Showing as [UNKNOWN] ✅
 
-### Status: OPEN
+### Status: FIXED
 
 ### Symptoms
 
@@ -276,6 +273,34 @@ The `src/url_normalizer.rs` module already exists and handles:
 | `src/agents/orchestrator.rs` | Change `enrich_data_fetching_calls_with_type_info` to always prefer SWC URL |
 | `src/multi_agent_orchestrator.rs` | Possibly integrate `UrlNormalizer::normalize()` before alias generation |
 
+### Fix Applied
+
+The fix was implemented in `src/agents/orchestrator.rs` in the `enrich_data_fetching_calls_with_type_info` method:
+
+1. **Restructured the enrichment logic** to always apply SWC URL preference FIRST, regardless of whether result_type exists
+2. **Changed the conditional** from `if call.url.is_none()` to `if fetch_info.url.is_some()` - always use SWC URL when available
+3. **Added 5 new tests** to verify the behavior:
+   - `test_swc_url_preferred_over_llm_url` - SWC URL replaces malformed LLM URL
+   - `test_swc_url_used_when_llm_url_is_none` - SWC URL used when LLM returned null
+   - `test_no_correlated_fetch_preserves_llm_url` - LLM URL preserved when no correlated fetch
+   - `test_type_info_enrichment_from_call_site` - Type info enrichment still works
+   - `test_swc_url_preferred_even_without_result_type` - SWC URL used even without result_type
+
+**Key code change:**
+```rust
+// FIX for Issue 4: Always prefer SWC-extracted URL over LLM URL
+// The LLM often returns malformed URLs (e.g., template literals with env vars)
+// while SWC properly normalizes them (e.g., /orders instead of ${process.env.URL}/orders)
+if let Some(fetch_info) = &call_site.correlated_fetch {
+    if fetch_info.url.is_some() {
+        call.url = fetch_info.url.clone(); // Always use SWC URL
+    }
+    if call.method.is_none() {
+        call.method = Some(fetch_info.method.clone());
+    }
+}
+```
+
 ### Test to Add
 
 ```rust
@@ -302,13 +327,13 @@ fn test_swc_url_preferred_over_llm_url() {
 }
 ```
 
-### Priority: MEDIUM
+### Priority: MEDIUM (COMPLETED)
 
 ---
 
-## Issue 5: Endpoint Paths Not Fully Resolved (Nested Routers) 🟡
+## Issue 5: Endpoint Paths Not Fully Resolved (Nested Routers) ✅
 
-### Status: PARTIALLY FIXED
+### Status: FIXED
 
 ### Symptoms
 
@@ -363,17 +388,34 @@ fn test_nested_router_path_resolution() {
 }
 ```
 
-### Priority: MEDIUM
+### Priority: MEDIUM (COMPLETED)
 
-This is an edge case. Most router mounts work correctly.
+### Fix Applied
+
+The fix was implemented in `src/mount_graph.rs`:
+
+1. **Added `build_import_map` function** - Creates a mapping from source file paths to imported names
+2. **Added `resolve_node_name_from_location` function** - Resolves local variable names to their imported names based on file context
+3. **Modified `build_mounts_from_analysis`** - Now resolves parent node names before creating mount edges
+
+**Key insight**: When `router.use('/v1', v1Router)` is in `routes/api.ts`, and `routes/api.ts` is imported as `apiRouter`, the parent node `router` should be resolved to `apiRouter` for proper chain resolution.
+
+**Test added**: `test_nested_router_path_resolution_with_same_variable_name` verifies that:
+- `routes/v1.ts`: `router.get('/chat', handler)` 
+- `routes/api.ts`: `router.use('/v1', v1Router)`
+- `server.ts`: `app.use('/api', apiRouter)`
+
+Results in full path `/api/v1/chat` (not just `/v1/chat`).
 
 ---
 
 ## Recommended Priority Order
 
 1. ~~Issue 7: Consumer-Producer Alias Matching~~ ✅ **FIXED** (commit `30a33b7`)
-2. **Issue 4: API Call URL Extraction** - Simple fix in `orchestrator.rs`, ~30 min
-3. **Issue 5: Nested Router Path Resolution** - More complex, edge case
+2. ~~Issue 4: API Call URL Extraction~~ ✅ **FIXED** - Always prefer SWC URL over LLM URL
+3. ~~Issue 5: Nested Router Path Resolution~~ ✅ **FIXED** - Resolve parent names using import context
+
+**All issues are now resolved!**
 
 ---
 
