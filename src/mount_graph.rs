@@ -641,7 +641,60 @@ impl MountGraph {
     }
 
     fn find_mount_for_child(&self, child: &str) -> Option<&MountEdge> {
-        self.mounts.iter().find(|mount| mount.child == child)
+        // First, try to find an exact match by child name
+        if let Some(mount) = self.mounts.iter().find(|mount| mount.child == child) {
+            return Some(mount);
+        }
+
+        // If no exact match, try to find a mount where the child node has the same
+        // file location as the current node. This handles cases where the same router
+        // is referred to by different names (e.g., local name "router" vs imported name "apiRouter")
+        let current_node_location = self.nodes.get(child).map(|n| &n.file_location);
+
+        if let Some(location) = current_node_location {
+            // Find all nodes that share this file location (they are aliases of the same router)
+            let alias_names: Vec<&String> = self
+                .nodes
+                .iter()
+                .filter(|(name, node)| {
+                    *name != child && Self::file_locations_match(&node.file_location, location)
+                })
+                .map(|(name, _)| name)
+                .collect();
+
+            // Try to find a mount where the child is one of these aliases
+            for alias in alias_names {
+                if let Some(mount) = self.mounts.iter().find(|mount| &mount.child == alias) {
+                    return Some(mount);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if two file locations refer to the same file (ignoring line/column numbers)
+    fn file_locations_match(loc1: &str, loc2: &str) -> bool {
+        // Extract just the file path from location strings (format: "path/to/file.ts:line:col")
+        let file1 = loc1.split(':').next().unwrap_or(loc1);
+        let file2 = loc2.split(':').next().unwrap_or(loc2);
+
+        // Normalize paths by removing ./ prefix and extensions for comparison
+        let normalized1 = file1
+            .trim_start_matches("./")
+            .trim_end_matches(".ts")
+            .trim_end_matches(".js")
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".jsx");
+
+        let normalized2 = file2
+            .trim_start_matches("./")
+            .trim_end_matches(".ts")
+            .trim_end_matches(".js")
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".jsx");
+
+        normalized1 == normalized2
     }
 
     fn join_paths(&self, prefix: &str, path: &str) -> String {
@@ -1194,6 +1247,248 @@ mod tests {
         assert_eq!(
             endpoint.full_path, "/api/v1/chat",
             "Nested router path should include all mount prefixes"
+        );
+    }
+
+    /// Test for exact 3-level nesting structure from CI logs (repo-b)
+    ///
+    /// Structure:
+    /// - app (Root) mounts apiRouter at /api
+    /// - apiRouter (Mountable) mounts v1Router at /v1
+    /// - v1Router (Mountable) owns POST /chat
+    ///
+    /// Expected: `compute_full_path("v1Router", "/chat")` returns `/api/v1/chat`
+    #[test]
+    fn test_nested_router_three_levels() {
+        // Set up the graph manually to reproduce the exact structure from the logs
+        let mut graph = MountGraph::new();
+
+        // Add nodes
+        graph.nodes.insert(
+            "app".to_string(),
+            GraphNode {
+                name: "app".to_string(),
+                node_type: NodeType::Root,
+                creation_site: None,
+                file_location: "repo-b_server.ts:1:0".to_string(),
+            },
+        );
+        graph.nodes.insert(
+            "apiRouter".to_string(),
+            GraphNode {
+                name: "apiRouter".to_string(),
+                node_type: NodeType::Mountable,
+                creation_site: None,
+                file_location: "api-router.ts:1:0".to_string(),
+            },
+        );
+        graph.nodes.insert(
+            "v1Router".to_string(),
+            GraphNode {
+                name: "v1Router".to_string(),
+                node_type: NodeType::Mountable,
+                creation_site: None,
+                file_location: "v1-router.ts:1:0".to_string(),
+            },
+        );
+
+        // Add mount edges: app -> apiRouter at /api
+        graph.mounts.push(MountEdge {
+            parent: "app".to_string(),
+            child: "apiRouter".to_string(),
+            path_prefix: "/api".to_string(),
+            middleware_stack: Vec::new(),
+        });
+
+        // Add mount edges: apiRouter -> v1Router at /v1
+        graph.mounts.push(MountEdge {
+            parent: "apiRouter".to_string(),
+            child: "v1Router".to_string(),
+            path_prefix: "/v1".to_string(),
+            middleware_stack: Vec::new(),
+        });
+
+        // Test compute_full_path for the endpoint POST /chat owned by v1Router
+        let full_path = graph.compute_full_path("v1Router", "/chat");
+
+        println!("Computed full path: {}", full_path);
+        println!("Nodes: {:?}", graph.nodes.keys().collect::<Vec<_>>());
+        println!("Mounts: {:?}", graph.mounts);
+
+        // The bug would cause this to return "/api/chat" (missing /v1)
+        // or "/v1/chat" (missing /api)
+        assert_eq!(
+            full_path, "/api/v1/chat",
+            "Three-level nested router path should include all mount prefixes: expected /api/v1/chat but got {}",
+            full_path
+        );
+    }
+
+    /// Test for broken mount chain where parent node names don't match across files.
+    ///
+    /// This reproduces the exact bug from CI logs where:
+    /// - In server.ts: `app.use('/api', router)` - 'router' is imported from api-router.ts
+    /// - In api-router.ts: `router.use('/v1', v1Router)` - 'router' is the local variable name
+    ///
+    /// The mount edges created are:
+    /// - app -> router at /api (using imported name in server.ts)
+    /// - router -> v1Router at /v1 (using local name in api-router.ts)
+    ///
+    /// BUG: If the import name resolution fails, 'router' in server.ts might not be
+    /// recognized as the same as 'router' in api-router.ts, breaking the chain.
+    #[test]
+    fn test_nested_router_broken_chain_with_local_variable_names() {
+        // This test simulates what happens when the parent of a mount uses a local
+        // variable name that wasn't properly resolved to its imported name
+        let mut graph = MountGraph::new();
+
+        // Add nodes - note that "router" appears as a separate node from "apiRouter"
+        graph.nodes.insert(
+            "app".to_string(),
+            GraphNode {
+                name: "app".to_string(),
+                node_type: NodeType::Root,
+                creation_site: None,
+                file_location: "repo-b_server.ts:1:0".to_string(),
+            },
+        );
+        // This node represents "router" as imported in server.ts
+        graph.nodes.insert(
+            "router".to_string(),
+            GraphNode {
+                name: "router".to_string(),
+                node_type: NodeType::Mountable,
+                creation_site: None,
+                file_location: "api-router.ts:1:0".to_string(),
+            },
+        );
+        graph.nodes.insert(
+            "v1Router".to_string(),
+            GraphNode {
+                name: "v1Router".to_string(),
+                node_type: NodeType::Mountable,
+                creation_site: None,
+                file_location: "v1-router.ts:1:0".to_string(),
+            },
+        );
+
+        // Mount edges as they would be created from the logs
+        // app mounts router (the imported name) at /api
+        graph.mounts.push(MountEdge {
+            parent: "app".to_string(),
+            child: "router".to_string(),
+            path_prefix: "/api".to_string(),
+            middleware_stack: Vec::new(),
+        });
+
+        // router (local name in api-router.ts) mounts v1Router at /v1
+        graph.mounts.push(MountEdge {
+            parent: "router".to_string(),
+            child: "v1Router".to_string(),
+            path_prefix: "/v1".to_string(),
+            middleware_stack: Vec::new(),
+        });
+
+        // Test compute_full_path for the endpoint POST /chat owned by v1Router
+        let full_path = graph.compute_full_path("v1Router", "/chat");
+
+        println!("Broken chain test - Computed full path: {}", full_path);
+        println!("Mounts: {:?}", graph.mounts);
+
+        // When mounts are properly connected (router -> router), this should work
+        assert_eq!(
+            full_path, "/api/v1/chat",
+            "Even with local variable names, path should resolve correctly when mount chain is connected"
+        );
+    }
+
+    /// Test for the actual bug: when mount parent names are inconsistent
+    /// This reproduces the ACTUAL bug where the second mount's parent doesn't match
+    /// the first mount's child due to import name resolution failure
+    #[test]
+    fn test_nested_router_disconnected_chain_bug() {
+        let mut graph = MountGraph::new();
+
+        // Add nodes
+        graph.nodes.insert(
+            "app".to_string(),
+            GraphNode {
+                name: "app".to_string(),
+                node_type: NodeType::Root,
+                creation_site: None,
+                file_location: "repo-b_server.ts:1:0".to_string(),
+            },
+        );
+        // "apiRouter" is the imported name in server.ts
+        graph.nodes.insert(
+            "apiRouter".to_string(),
+            GraphNode {
+                name: "apiRouter".to_string(),
+                node_type: NodeType::Mountable,
+                creation_site: None,
+                file_location: "api-router.ts:1:0".to_string(),
+            },
+        );
+        // "router" is the local name in api-router.ts (DIFFERENT from "apiRouter")
+        graph.nodes.insert(
+            "router".to_string(),
+            GraphNode {
+                name: "router".to_string(),
+                node_type: NodeType::Mountable,
+                creation_site: None,
+                file_location: "api-router.ts:1:0".to_string(),
+            },
+        );
+        graph.nodes.insert(
+            "v1Router".to_string(),
+            GraphNode {
+                name: "v1Router".to_string(),
+                node_type: NodeType::Mountable,
+                creation_site: None,
+                file_location: "v1-router.ts:1:0".to_string(),
+            },
+        );
+
+        // BUG REPRODUCTION: Mount edges with DISCONNECTED names
+        // app mounts apiRouter (the imported name) at /api
+        graph.mounts.push(MountEdge {
+            parent: "app".to_string(),
+            child: "apiRouter".to_string(), // <-- imported name
+            path_prefix: "/api".to_string(),
+            middleware_stack: Vec::new(),
+        });
+
+        // router (local name, NOT "apiRouter") mounts v1Router at /v1
+        // This creates a BROKEN chain because "router" != "apiRouter"
+        graph.mounts.push(MountEdge {
+            parent: "router".to_string(), // <-- local name, doesn't match "apiRouter"!
+            child: "v1Router".to_string(),
+            path_prefix: "/v1".to_string(),
+            middleware_stack: Vec::new(),
+        });
+
+        // Test compute_full_path for the endpoint POST /chat owned by v1Router
+        let full_path = graph.compute_full_path("v1Router", "/chat");
+
+        println!(
+            "Disconnected chain bug test - Computed full path: {}",
+            full_path
+        );
+        println!("Mounts: {:?}", graph.mounts);
+
+        // BUG: This will return "/v1/chat" because the chain is broken at "router"
+        // The traversal finds v1Router -> router at /v1, but then can't find
+        // a mount where router is the child (because the mount has "apiRouter" as child)
+
+        // For now, this test documents the current (buggy) behavior
+        // After the fix, this should return "/api/v1/chat"
+
+        // Current buggy behavior: returns /v1/chat (missing /api)
+        // We assert what SHOULD happen after fix:
+        assert_eq!(
+            full_path, "/api/v1/chat",
+            "Disconnected chain should still resolve to /api/v1/chat after fix. Got: {}",
+            full_path
         );
     }
 
