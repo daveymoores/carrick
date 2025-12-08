@@ -1,6 +1,7 @@
 # Final Analysis Report: Carrick API Validation Tool
 
 **Date**: January 2025
+**Last Updated**: January 2025
 **Subject**: Comprehensive analysis of recent output fixes, persistent bugs, and architectural gaps in the Carrick API consistency tool.
 
 ## 1. Executive Summary
@@ -22,14 +23,26 @@ The following fixes improved the *presentation* but not the *core logic*:
 
 ## 3. Root Cause Analysis of Persistent Bugs
 
-### 3.1. The "Route Identification" Bug (The Mount Graph Issue)
+### 3.1. The "Route Identification" Bug (The Mount Graph Issue) ✅ FIXED
+
+**Status**: **RESOLVED** (January 2025)
+
 **Symptom**: Endpoints defined in nested routers are missing path segments (e.g., `/api/chat` instead of `/api/v1/chat`).
-**Root Cause**: **Flawed Graph Traversal Logic.**
-The logs from `repo-b` show:
-*   `router` mounts `v1Router` at `/v1`.
-*   `app` mounts `router` at `/api`.
-*   `v1Router` owns `POST /chat`.
-The analyzer fails to recursively chain these mounts (`app` -> `/api` -> `router` -> `/v1` -> `v1Router`), likely flattening the graph at the first level of depth. This results in "Orphaned Endpoints" because the calculated path does not match the actual API structure.
+
+**Root Cause**: **Disconnected Mount Chain Due to Name Aliases.**
+When routers are referred to by different names in different files (e.g., local variable `router` vs imported name `apiRouter`), the mount chain was becoming disconnected. The `find_mount_for_child` method only searched for exact name matches, so when traversing from `v1Router` -> `router`, it couldn't find the mount `app` -> `apiRouter` because `router` != `apiRouter`.
+
+**Fix Applied**: Enhanced `find_mount_for_child` in `src/mount_graph.rs` to:
+1. First try exact name match
+2. If no match, find nodes that share the same file location (alias names for the same router)
+3. Search for mounts where the child is one of these aliases
+
+**Tests Added**:
+- `test_nested_router_three_levels`: Exact 3-level nesting from CI logs
+- `test_nested_router_broken_chain_with_local_variable_names`: Connected chains with local names
+- `test_nested_router_disconnected_chain_bug`: Reproduces the actual bug scenario
+
+**Commit**: `fix(mount_graph): resolve nested router path resolution with name aliases`
 
 ### 3.2. The "Cross-Repo Comparison" Bug (The Missing Link)
 **Symptom**: Valid cross-service calls (e.g., `GET ENV_VAR:ORDER_SERVICE_URL:/orders`) are flagged as "Configuration Suggestions" instead of being matched to `repo-b`.
@@ -64,8 +77,9 @@ To resolve these issues and make the tool fully functional, the following steps 
     *   Stop deferring this task. It is the core value proposition.
     *   Implement logic to extract the generic type from `fetch<T>()` or the return type of the wrapper function.
 
-2.  **Fix Nested Mount Graph Traversal**:
-    *   Debug and rewrite the `MountGraph` path resolution logic to correctly handle multi-level nesting (`app` -> `router` -> `sub-router`).
+2.  ~~**Fix Nested Mount Graph Traversal**~~: ✅ **COMPLETED**
+    *   ~~Debug and rewrite the `MountGraph` path resolution logic to correctly handle multi-level nesting (`app` -> `router` -> `sub-router`).~~
+    *   Fixed by enhancing `find_mount_for_child` to resolve name aliases via file location matching.
 
 3.  **Implement Service Resolution**:
     *   Add a mapping mechanism in `carrick.json` (e.g., `{"ORDER_SERVICE_URL": "repo-b"}`).

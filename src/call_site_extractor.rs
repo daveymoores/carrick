@@ -100,15 +100,23 @@ impl CallSiteExtractor {
         (loc.line, loc.col_display)
     }
 
+    /// Convert an expression to a string representation.
+    /// Recursively handles nested member expressions like `process.env.API_URL`.
+    #[allow(clippy::only_used_in_recursion)]
     fn expr_to_string(&self, expr: &Expr) -> String {
         match expr {
             Expr::Ident(ident) => ident.sym.to_string(),
             Expr::Member(member) => {
-                if let (Expr::Ident(obj), MemberProp::Ident(prop)) = (&*member.obj, &member.prop) {
-                    format!("{}.{}", obj.sym, prop.sym)
-                } else {
-                    "member_expr".to_string()
-                }
+                // Recursively build the full member expression
+                let obj_str = self.expr_to_string(&member.obj);
+                let prop_str = match &member.prop {
+                    MemberProp::Ident(ident) => ident.sym.to_string(),
+                    MemberProp::Computed(computed) => {
+                        format!("[{}]", self.expr_to_string(&computed.expr))
+                    }
+                    MemberProp::PrivateName(name) => format!("#{}", name.name),
+                };
+                format!("{}.{}", obj_str, prop_str)
             }
             Expr::Lit(Lit::Str(s)) => s.value.to_string(),
             Expr::Lit(Lit::Num(n)) => n.value.to_string(),

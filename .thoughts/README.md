@@ -231,6 +231,14 @@ Detailed reference documentation in `research/`:
 | [ts_check.md](research/ts_check.md) | TypeScript type checking system |
 | [testing_strategy.md](research/testing_strategy.md) | Testing philosophy and coverage |
 
+## Fix Plans
+
+Active fix plans for known issues:
+
+| Document | Purpose | Status |
+|----------|---------|--------|
+| [fix_plan_output_issues.md](fix_plan_output_issues.md) | Fix for [UNKNOWN] config suggestions, query param aliases, env var preservation | 🟡 Planning |
+
 ---
 
 ## Quick Reference

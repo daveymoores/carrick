@@ -438,7 +438,14 @@ impl Analyzer {
     }
 
     fn sanitize_route_for_dynamic_paths(route: &str) -> String {
-        route
+        // Strip query parameters first
+        let route_without_query = if let Some(query_idx) = route.find('?') {
+            &route[..query_idx]
+        } else {
+            route
+        };
+
+        route_without_query
             .split('/')
             .filter(|segment| !segment.is_empty()) // Remove empty segments
             .map(|segment| {
@@ -484,6 +491,116 @@ impl Analyzer {
         }
 
         result
+    }
+
+    /// Extract environment variable name from a route
+    /// Examples:
+    /// - "ENV_VAR:API_URL:/users" -> "API_URL"
+    /// - "${process.env.SERVICE_URL}/orders" -> "SERVICE_URL"
+    /// - "${API_BASE}/users" -> "API_BASE"
+    /// - "unknown" -> "UNKNOWN_API"
+    fn extract_env_var_name(route: &str) -> String {
+        // Handle ENV_VAR:NAME:/path format
+        if route.starts_with("ENV_VAR:") {
+            let parts: Vec<&str> = route.splitn(3, ':').collect();
+            if parts.len() >= 2 {
+                return parts[1].to_string();
+            }
+        }
+
+        // Handle ${process.env.VAR} or ${VAR} patterns
+        if let Some(start) = route.find("${") {
+            if let Some(end) = route[start..].find('}') {
+                let inner = &route[start + 2..start + end];
+                // Handle process.env.VAR -> VAR
+                if let Some(last_dot) = inner.rfind('.') {
+                    return inner[last_dot + 1..].to_string();
+                }
+                return inner.to_string();
+            }
+        }
+
+        // Handle process.env.VAR patterns (without ${})
+        if let Some(idx) = route.find("process.env.") {
+            let after = &route[idx + 12..];
+            let end = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            if end > 0 {
+                return after[..end].to_string();
+            }
+        }
+
+        "UNKNOWN_API".to_string()
+    }
+
+    /// Check if a route represents an environment variable base URL.
+    ///
+    /// Returns true for:
+    /// - "ENV_VAR:API_URL:/users" (explicit ENV_VAR format)
+    /// - "${process.env.API_URL}/users" (process.env pattern at start)
+    /// - "${API_BASE_URL}/users" (UPPER_CASE var at start)
+    ///
+    /// Returns false for:
+    /// - "/users/${userId}" (path parameter, not base URL)
+    /// - "/api/${version}/data" (path parameter in middle)
+    fn is_env_var_base_url(route: &str) -> bool {
+        // Check for explicit ENV_VAR: prefix format
+        if route.starts_with("ENV_VAR:") {
+            return true;
+        }
+
+        // Check for process.env pattern
+        if route.contains("process.env.") {
+            return true;
+        }
+
+        // Check for ${...} at the START of the route (not in the middle)
+        if route.starts_with("${") {
+            if let Some(end) = route.find('}') {
+                let var_name = &route[2..end];
+                // If it contains a dot (like process.env.X) or is UPPER_CASE, it's an env var
+                if var_name.contains('.')
+                    || var_name
+                        .chars()
+                        .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Extract path from environment variable route
+    /// Examples:
+    /// - "ENV_VAR:API_URL:/users" -> "/users"
+    /// - "${process.env.SERVICE_URL}/orders" -> "/orders"
+    /// - "${API_BASE}/users/123" -> "/users/123"
+    fn extract_path_from_env_var_route(route: &str) -> String {
+        // Handle ENV_VAR:NAME:/path format
+        if route.starts_with("ENV_VAR:") {
+            let parts: Vec<&str> = route.splitn(3, ':').collect();
+            if parts.len() >= 3 {
+                return parts[2].to_string();
+            }
+        }
+
+        // Handle ${VAR}/path patterns - extract after }
+        if let Some(idx) = route.find("}/") {
+            return route[idx + 1..].to_string();
+        }
+
+        // Handle process.env.VAR + "/path" patterns
+        if let Some(idx) = route.find("+ \"") {
+            let after = &route[idx + 3..];
+            if let Some(end) = after.find('"') {
+                return after[..end].to_string();
+            }
+        }
+
+        "/".to_string()
     }
 
     /// Helper to process a TsTypeAnn and produce a TypeReference.
@@ -747,20 +864,18 @@ impl Analyzer {
         // For each call, try to find matching endpoint using mount graph
         for call in &unique_calls {
             // Check for environment variable URLs (framework-agnostic)
-            if call.route.contains("ENV_VAR:")
-                || call.route.contains("process.env")
-                || call.route.contains("${")
-            {
+            // Use smarter detection to avoid false positives on path parameters
+            if Self::is_env_var_base_url(&call.route) {
                 // Check if it's a configured external or internal call
                 if self.config.is_external_call(&call.route) {
                     continue; // Skip external calls
                 } else if !self.config.is_internal_call(&call.route) {
-                    // Unknown env var URL
+                    // Unknown env var URL - format message for formatter to parse
+                    let env_var_name = Self::extract_env_var_name(&call.route);
+                    let path = Self::extract_path_from_env_var_route(&call.route);
                     env_var_calls.push(format!(
-                        "API call with environment variable URL: {} {} in {}",
-                        call.method,
-                        call.route,
-                        call.file_path.display()
+                        "Environment variable endpoint: {} using env vars [{}] in ENV_VAR:{}:{}",
+                        call.method, env_var_name, env_var_name, path
                     ));
                     continue;
                 }
@@ -1465,6 +1580,27 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_route_strips_query_params() {
+        // Query parameters should be stripped before processing
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/orders?userId=123"),
+            "Orders"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:id?include=posts"),
+            "UsersById"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/data?page=1&limit=10"),
+            "ApiData"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/orders?userId=:userId"),
+            "Orders"
+        );
+    }
+
+    #[test]
     fn test_to_pascal_case() {
         assert_eq!(Analyzer::to_pascal_case("userId"), "Userid");
         assert_eq!(Analyzer::to_pascal_case("user_id"), "UserId");
@@ -1499,5 +1635,108 @@ mod tests {
             "Alias should contain 'Consumer'. Got: {}",
             alias
         );
+    }
+
+    #[test]
+    fn test_extract_env_var_name() {
+        // ENV_VAR:NAME:/path format
+        assert_eq!(
+            Analyzer::extract_env_var_name("ENV_VAR:API_URL:/users"),
+            "API_URL"
+        );
+        assert_eq!(
+            Analyzer::extract_env_var_name("ENV_VAR:ORDER_SERVICE_URL:/orders"),
+            "ORDER_SERVICE_URL"
+        );
+
+        // ${process.env.VAR} format
+        assert_eq!(
+            Analyzer::extract_env_var_name("${process.env.SERVICE_URL}/orders"),
+            "SERVICE_URL"
+        );
+        assert_eq!(
+            Analyzer::extract_env_var_name("${process.env.API_BASE}/users/123"),
+            "API_BASE"
+        );
+
+        // ${VAR} format (without process.env)
+        assert_eq!(
+            Analyzer::extract_env_var_name("${BASE_URL}/orders"),
+            "BASE_URL"
+        );
+
+        // process.env.VAR without ${}
+        assert_eq!(
+            Analyzer::extract_env_var_name("process.env.MY_API_URL + \"/data\""),
+            "MY_API_URL"
+        );
+
+        // Unknown/fallback
+        assert_eq!(Analyzer::extract_env_var_name("unknown"), "UNKNOWN_API");
+        assert_eq!(Analyzer::extract_env_var_name("/users"), "UNKNOWN_API");
+    }
+
+    #[test]
+    fn test_extract_path_from_env_var_route() {
+        // ENV_VAR:NAME:/path format
+        assert_eq!(
+            Analyzer::extract_path_from_env_var_route("ENV_VAR:API_URL:/users"),
+            "/users"
+        );
+        assert_eq!(
+            Analyzer::extract_path_from_env_var_route("ENV_VAR:ORDER_SERVICE_URL:/orders/123"),
+            "/orders/123"
+        );
+
+        // ${VAR}/path format
+        assert_eq!(
+            Analyzer::extract_path_from_env_var_route("${process.env.SERVICE_URL}/orders"),
+            "/orders"
+        );
+        assert_eq!(
+            Analyzer::extract_path_from_env_var_route("${API_BASE}/users/456"),
+            "/users/456"
+        );
+
+        // process.env.VAR + "/path" format
+        assert_eq!(
+            Analyzer::extract_path_from_env_var_route("process.env.API_URL + \"/data\""),
+            "/data"
+        );
+
+        // Fallback
+        assert_eq!(Analyzer::extract_path_from_env_var_route("unknown"), "/");
+    }
+
+    #[test]
+    fn test_is_env_var_base_url() {
+        // Should return true for env var base URLs
+        assert!(Analyzer::is_env_var_base_url("ENV_VAR:API_URL:/users"));
+        assert!(Analyzer::is_env_var_base_url(
+            "ENV_VAR:ORDER_SERVICE_URL:/orders"
+        ));
+        assert!(Analyzer::is_env_var_base_url(
+            "${process.env.API_URL}/users"
+        ));
+        assert!(Analyzer::is_env_var_base_url(
+            "${process.env.SERVICE_URL}/orders"
+        ));
+        assert!(Analyzer::is_env_var_base_url("${API_BASE_URL}/users"));
+        assert!(Analyzer::is_env_var_base_url("${ORDER_SERVICE}/orders"));
+        assert!(Analyzer::is_env_var_base_url(
+            "process.env.API_URL + \"/data\""
+        ));
+
+        // Should return false for path parameters (not base URL env vars)
+        assert!(!Analyzer::is_env_var_base_url("/users/${userId}"));
+        assert!(!Analyzer::is_env_var_base_url("/api/${version}/data"));
+        assert!(!Analyzer::is_env_var_base_url("/orders/${orderId}/items"));
+        assert!(!Analyzer::is_env_var_base_url("/users/:id"));
+        assert!(!Analyzer::is_env_var_base_url("/api/users"));
+
+        // Edge cases
+        assert!(!Analyzer::is_env_var_base_url("${userId}")); // lowercase, not env var pattern
+        assert!(!Analyzer::is_env_var_base_url("${camelCase}/path")); // camelCase, not env var
+        assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
     }
 }
