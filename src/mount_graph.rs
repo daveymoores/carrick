@@ -651,19 +651,27 @@ impl MountGraph {
             return Some(mount);
         }
 
-        // If no exact match, try to find a mount where the child node has the same
-        // file location as the current node. This handles cases where the same router
-        // is referred to by different names (e.g., local name "router" vs imported name "apiRouter")
+        // If no exact match, try to find a mount where the child node is an alias
+        // of the current node. This handles cases where the same router is referred
+        // to by different names:
+        //   - routes/users.ts defines `const router = express.Router()`
+        //   - server.ts imports it as `import userRouter from './routes/users'`
+        //   - Mount is `app.use('/users', userRouter)` but endpoint owner is `router`
+        //
+        // Two nodes are considered aliases if they have the SAME file location
+        // (same file AND same line/column). This distinguishes:
+        //   - Aliases: `router` and `apiRouter` both at `api-router.ts:1:0` (same variable, different names)
+        //   - Different routers: `router` at `server.ts:5:0` and `apiRouter` at `server.ts:27:0`
         let current_node_location = self.nodes.get(child).map(|n| &n.file_location);
 
         if let Some(location) = current_node_location {
-            // Find all nodes that share this file location (they are aliases of the same router)
+            // Find all nodes that share this EXACT file location (they are aliases of the same router)
+            // We use exact match (including line/column) to avoid treating different routers
+            // in the same file as aliases
             let alias_names: Vec<&String> = self
                 .nodes
                 .iter()
-                .filter(|(name, node)| {
-                    *name != child && Self::file_locations_match(&node.file_location, location)
-                })
+                .filter(|(name, node)| *name != child && node.file_location == *location)
                 .map(|(name, _)| name)
                 .collect();
 
@@ -676,30 +684,6 @@ impl MountGraph {
         }
 
         None
-    }
-
-    /// Check if two file locations refer to the same file (ignoring line/column numbers)
-    fn file_locations_match(loc1: &str, loc2: &str) -> bool {
-        // Extract just the file path from location strings (format: "path/to/file.ts:line:col")
-        let file1 = loc1.split(':').next().unwrap_or(loc1);
-        let file2 = loc2.split(':').next().unwrap_or(loc2);
-
-        // Normalize paths by removing ./ prefix and extensions for comparison
-        let normalized1 = file1
-            .trim_start_matches("./")
-            .trim_end_matches(".ts")
-            .trim_end_matches(".js")
-            .trim_end_matches(".tsx")
-            .trim_end_matches(".jsx");
-
-        let normalized2 = file2
-            .trim_start_matches("./")
-            .trim_end_matches(".ts")
-            .trim_end_matches(".js")
-            .trim_end_matches(".tsx")
-            .trim_end_matches(".jsx");
-
-        normalized1 == normalized2
     }
 
     fn join_paths(&self, prefix: &str, path: &str) -> String {
