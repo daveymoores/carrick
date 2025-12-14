@@ -44,10 +44,32 @@ When routers are referred to by different names in different files (e.g., local 
 
 **Commit**: `fix(mount_graph): resolve nested router path resolution with name aliases`
 
-### 3.2. The "Cross-Repo Comparison" Bug (The Missing Link)
+### 3.2. The "Cross-Repo Comparison" Bug (The Missing Link) ✅ CLARIFIED
+
+**Status**: **CLARIFIED** (January 2025)
+
 **Symptom**: Valid cross-service calls (e.g., `GET ENV_VAR:ORDER_SERVICE_URL:/orders`) are flagged as "Configuration Suggestions" instead of being matched to `repo-b`.
-**Root Cause**: **Lack of Service Resolution.**
-The tool identifies that `ORDER_SERVICE_URL` is an environment variable, but it has no logic to map `ORDER_SERVICE_URL` to `repo-b`. Without a "Service Discovery" map (e.g., in `carrick.json`), the matcher treats these as unknown external APIs.
+
+**Root Cause**: **Missing Configuration.**
+The tool correctly identifies environment variable URLs, but users must classify them in `carrick.json`:
+- `internalEnvVars`: Env vars pointing to internal services (routes will be validated)
+- `externalEnvVars`: Env vars pointing to external APIs (calls will be ignored)
+
+**Resolution**: This is working as designed. When an env var is not classified, the tool now outputs a helpful message:
+```
+Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars or externalEnvVars in carrick.json
+```
+
+**Configuration Example**:
+```json
+{
+  "serviceName": "order-service",
+  "internalEnvVars": ["USER_SERVICE_URL", "INVENTORY_API"],
+  "externalEnvVars": ["STRIPE_API", "GITHUB_API"]
+}
+```
+
+When `ORDER_SERVICE_URL` is added to `internalEnvVars`, the route `/orders` will be validated against all known endpoints across repos. If no match is found, it becomes a "Missing Endpoint" issue rather than a configuration suggestion.
 
 ### 3.3. The "Type Naming" Bug
 **Symptom**: Producer and Consumer types have different generated names, preventing comparison.
@@ -78,6 +100,14 @@ To resolve these issues and make the tool fully functional, the following steps 
     *   Implement logic to extract the generic type from `fetch<T>()` or the return type of the wrapper function.
 
 2.  ~~**Fix Nested Mount Graph Traversal**~~: ✅ **COMPLETED**
+    *   ~~Debug and rewrite the `MountGraph` path resolution logic to correctly handle multi-level nesting (`app` -> `router` -> `sub-router`).~~
+    *   Fixed by enhancing `find_mount_for_child` to resolve name aliases via file location matching.
+
+3.  ~~**Implement Service Resolution**~~: ✅ **CLARIFIED** (Not needed as originally described)
+    *   The original proposal to automatically derive service names from env vars (e.g., `ORDER_SERVICE_URL` → `order-service`) was overly complex and fragile.
+    *   Instead, the existing `internalEnvVars`/`externalEnvVars` configuration is sufficient. Users explicitly classify their env vars, and internal ones are validated against all cross-repo endpoints.
+    *   Added `serviceName` field to `carrick.json` for future metadata use.
+    *   Improved error messages to guide users to update their configuration.
     *   ~~Debug and rewrite the `MountGraph` path resolution logic to correctly handle multi-level nesting (`app` -> `router` -> `sub-router`).~~
     *   Fixed by enhancing `find_mount_for_child` to resolve name aliases via file location matching.
 

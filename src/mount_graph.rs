@@ -46,6 +46,9 @@ pub struct ResolvedEndpoint {
     pub owner: String,
     pub file_location: String,
     pub middleware_chain: Vec<String>,
+    /// Optional repo identifier for cross-repo matching
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
 }
 
 /// Represents a data-fetching call with its target
@@ -404,6 +407,7 @@ impl MountGraph {
                 owner: resolved_owner,
                 file_location: endpoint.location.clone(),
                 middleware_chain: Vec::new(), // Will be populated during path resolution
+                repo_name: None,              // Will be set during cross-repo merge
             });
         }
     }
@@ -556,6 +560,7 @@ impl MountGraph {
             owner,
             file_location: site.call_site.location.clone(),
             middleware_chain: Vec::new(), // TODO: Could extract from handler_args if needed
+            repo_name: None,              // Will be set during cross-repo merge
         })
     }
 
@@ -919,10 +924,17 @@ impl MountGraph {
                 }
 
                 // Merge endpoints (deduplicate by method + full_path)
+                // Tag each endpoint with its source repo for cross-repo matching
                 for endpoint in &mount_graph.endpoints {
-                    let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                    let key = format!(
+                        "{}:{}:{}",
+                        repo_data.repo_name, endpoint.method, endpoint.full_path
+                    );
                     if seen_endpoints.insert(key) {
-                        merged.endpoints.push(endpoint.clone());
+                        let mut tagged_endpoint = endpoint.clone();
+                        // Tag endpoint with repo name for service resolution
+                        tagged_endpoint.repo_name = Some(repo_data.repo_name.clone());
+                        merged.endpoints.push(tagged_endpoint);
                     }
                 }
 
@@ -1125,10 +1137,12 @@ mod tests {
             owner: "userRouter".to_string(),
             file_location: "routes/users.js:10:1".to_string(),
             middleware_chain: vec![],
+            repo_name: None,
         });
 
         // Create config with internal domain
         let config = Config {
+            service_name: None,
             internal_domains: ["user-service.internal".to_string()].into_iter().collect(),
             external_domains: ["api.stripe.com".to_string()].into_iter().collect(),
             internal_env_vars: Default::default(),
@@ -1504,9 +1518,11 @@ mod tests {
             owner: "orderRouter".to_string(),
             file_location: "routes/orders.js:15:1".to_string(),
             middleware_chain: vec![],
+            repo_name: None,
         });
 
         let config = Config {
+            service_name: None,
             internal_domains: Default::default(),
             external_domains: Default::default(),
             internal_env_vars: ["ORDER_SERVICE_URL".to_string()].into_iter().collect(),
@@ -1544,9 +1560,11 @@ mod tests {
             owner: "orderRouter".to_string(),
             file_location: "routes/orders.js:20:1".to_string(),
             middleware_chain: vec![],
+            repo_name: None,
         });
 
         let config = Config {
+            service_name: None,
             internal_domains: Default::default(),
             external_domains: Default::default(),
             internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
@@ -1576,6 +1594,7 @@ mod tests {
             owner: "userRouter".to_string(),
             file_location: "routes/users.js:5:1".to_string(),
             middleware_chain: vec![],
+            repo_name: None,
         });
 
         let config = Config::default();

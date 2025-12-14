@@ -729,6 +729,7 @@ mod tests {
 
         let test_data = CloudRepoData {
             repo_name: "test-repo".to_string(),
+            service_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],
@@ -759,6 +760,7 @@ mod tests {
 
         let test_data = vec![CloudRepoData {
             repo_name: "test-repo".to_string(),
+            service_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -824,6 +826,7 @@ mod tests {
 
         let test_data = vec![CloudRepoData {
             repo_name: "test-repo".to_string(),
+            service_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],

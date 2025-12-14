@@ -24,6 +24,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
 
     CloudRepoData {
         repo_name: repo_name.to_string(),
+        service_name: None,
         endpoints: vec![],
         calls: vec![],
         mounts: vec![],

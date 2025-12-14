@@ -354,6 +354,7 @@ impl CloudStorage for AwsStorage {
                 println!("Warning: No metadata found for repo: {}", adjacent.repo);
                 let repo_data = CloudRepoData {
                     repo_name: adjacent.repo.clone(),
+                    service_name: None,
                     endpoints: Vec::new(),
                     calls: Vec::new(),
                     mounts: Vec::new(),

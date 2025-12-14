@@ -402,6 +402,7 @@ mod tests {
 
     fn create_test_config() -> Config {
         Config {
+            service_name: None,
             internal_domains: [
                 "user-service.internal",
                 "api.company.com",

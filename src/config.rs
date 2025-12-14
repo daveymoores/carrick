@@ -6,6 +6,9 @@ use serde_json::Value;
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Config {
     #[serde(default)]
+    #[serde(rename = "serviceName")]
+    pub service_name: Option<String>,
+    #[serde(default)]
     #[serde(rename = "internalEnvVars")]
     pub internal_env_vars: HashSet<String>,
     #[serde(default)]
@@ -27,6 +30,11 @@ impl Config {
             let config_content = std::fs::read_to_string(path)?;
             let config: Config = serde_json::from_str(&config_content)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            // Use first non-None service_name encountered
+            if merged_config.service_name.is_none() {
+                merged_config.service_name = config.service_name;
+            }
 
             merged_config
                 .internal_env_vars
@@ -147,4 +155,63 @@ pub fn create_dynamic_tsconfig(output_dir: &std::path::Path) -> Value {
             "node_modules"
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_with_service_name() {
+        let json = r#"{
+            "serviceName": "order-service",
+            "internalEnvVars": ["USER_SERVICE_URL"],
+            "externalEnvVars": ["STRIPE_API"]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.service_name, Some("order-service".to_string()));
+        assert!(config.internal_env_vars.contains("USER_SERVICE_URL"));
+        assert!(config.external_env_vars.contains("STRIPE_API"));
+    }
+
+    #[test]
+    fn test_is_internal_call() {
+        let config = Config {
+            service_name: None,
+            internal_env_vars: ["USER_SERVICE_URL".to_string()].into_iter().collect(),
+            internal_domains: ["https://api.internal.com".to_string()]
+                .into_iter()
+                .collect(),
+            external_env_vars: HashSet::new(),
+            external_domains: HashSet::new(),
+        };
+
+        // ENV_VAR pattern matching
+        assert!(config.is_internal_call("ENV_VAR:USER_SERVICE_URL:/users"));
+        assert!(!config.is_internal_call("ENV_VAR:UNKNOWN_URL:/users"));
+
+        // Domain matching (route must start with domain)
+        assert!(config.is_internal_call("https://api.internal.com/users"));
+        assert!(!config.is_internal_call("https://unknown.com/users"));
+    }
+
+    #[test]
+    fn test_is_external_call() {
+        let config = Config {
+            service_name: None,
+            internal_env_vars: HashSet::new(),
+            internal_domains: HashSet::new(),
+            external_env_vars: ["STRIPE_API".to_string()].into_iter().collect(),
+            external_domains: ["https://api.stripe.com".to_string()].into_iter().collect(),
+        };
+
+        // ENV_VAR pattern matching
+        assert!(config.is_external_call("ENV_VAR:STRIPE_API:/charges"));
+        assert!(!config.is_external_call("ENV_VAR:UNKNOWN_URL:/users"));
+
+        // Domain matching (route must start with domain)
+        assert!(config.is_external_call("https://api.stripe.com/charges"));
+        assert!(!config.is_external_call("https://unknown.com/users"));
+    }
 }

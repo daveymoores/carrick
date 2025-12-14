@@ -231,7 +231,7 @@ fn format_configuration_section(issues: &[String]) -> String {
         issues.len()
     ));
 
-    output.push_str("> These API calls use environment variables to construct the URL. To enable full analysis, consider adding them to your tool's external API configuration.\n\n");
+    output.push_str("> These API calls use environment variables to construct the URL. Add them to `internalEnvVars` (to validate routes) or `externalEnvVars` (to ignore) in your `carrick.json`.\n\n");
 
     for issue in issues {
         let (method, env_vars, path) = extract_env_var_info(issue);
@@ -551,7 +551,10 @@ fn extract_method_path(issue: &str) -> (String, String) {
 }
 
 fn extract_env_var_info(issue: &str) -> (String, String, String) {
-    // Parse issues like "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
+    // Parse issues in two formats:
+    // New: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars..."
+    // Old: "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
+
     let method = if issue.contains("GET") {
         "GET"
     } else if issue.contains("POST") {
@@ -574,14 +577,33 @@ fn extract_env_var_info(issue: &str) -> (String, String, String) {
         "UNKNOWN"
     };
 
-    // Extract just the path part after the env var
-    let path = if let Some(start) = issue.find("ENV_VAR:") {
+    // Try new format first: "Unclassified env var: GET /path using [ENV_VAR]"
+    // Path is between the method and " using"
+    let path = if issue.starts_with("Unclassified env var:") {
+        // Format: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - ..."
+        if let Some(using_pos) = issue.find(" using") {
+            // Find the method position and extract path after it
+            let after_method = if let Some(pos) = issue.find("GET ") {
+                &issue[pos + 4..using_pos]
+            } else if let Some(pos) = issue.find("POST ") {
+                &issue[pos + 5..using_pos]
+            } else if let Some(pos) = issue.find("PUT ") {
+                &issue[pos + 4..using_pos]
+            } else if let Some(pos) = issue.find("DELETE ") {
+                &issue[pos + 7..using_pos]
+            } else {
+                "UNKNOWN"
+            };
+            after_method.trim()
+        } else {
+            "UNKNOWN"
+        }
+    } else if let Some(start) = issue.find("ENV_VAR:") {
+        // Old format: "ENV_VAR:UNKNOWN_API:/data"
         let env_var_section = &issue[start..];
-        // Format: "ENV_VAR:UNKNOWN_API:/data"
-        // Find the second colon to get just the path part
         let parts: Vec<&str> = env_var_section.splitn(3, ':').collect();
         if parts.len() >= 3 {
-            parts[2] // The path part after "ENV_VAR:VARNAME:"
+            parts[2]
         } else {
             "UNKNOWN"
         }
@@ -683,5 +705,48 @@ mod tests {
         // Check that no issues message is displayed
         assert!(output.contains("No API inconsistencies detected"));
         assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
+    }
+
+    #[test]
+    fn test_extract_env_var_info_new_format() {
+        // Test the new format: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to..."
+        let issue = "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars or externalEnvVars in carrick.json";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "GET");
+        assert_eq!(env_var, "ORDER_SERVICE_URL");
+        assert_eq!(path, "/orders");
+    }
+
+    #[test]
+    fn test_extract_env_var_info_new_format_with_params() {
+        let issue = "Unclassified env var: POST /users/:id/comments using [USER_API] - add to internalEnvVars or externalEnvVars in carrick.json";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "POST");
+        assert_eq!(env_var, "USER_API");
+        assert_eq!(path, "/users/:id/comments");
+    }
+
+    #[test]
+    fn test_extract_env_var_info_old_format() {
+        // Test the old format: "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
+        let issue =
+            "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "GET");
+        assert_eq!(env_var, "API_URL");
+        assert_eq!(path, "/users");
+    }
+
+    #[test]
+    fn test_extract_env_var_info_old_format_complex_path() {
+        let issue = "Environment variable endpoint: DELETE using env vars [ORDER_SERVICE] in ENV_VAR:ORDER_SERVICE:/orders/123/items";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "DELETE");
+        assert_eq!(env_var, "ORDER_SERVICE");
+        assert_eq!(path, "/orders/123/items");
     }
 }

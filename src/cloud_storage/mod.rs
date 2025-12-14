@@ -21,6 +21,8 @@ pub use aws_storage::AwsStorage;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>, // Service name from carrick.json for cross-repo resolution
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub mounts: Vec<Mount>,
@@ -47,6 +49,16 @@ impl CloudRepoData {
         packages: Option<Packages>,
         function_definitions: HashMap<String, FunctionDefinition>,
     ) -> Self {
+        // Extract service_name from config_json if present
+        let service_name = config_json.as_ref().and_then(|json| {
+            serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|v| {
+                    v.get("serviceName")
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                })
+        });
         let mount_graph = &analysis_result.mount_graph;
 
         // Convert ResolvedEndpoints to ApiEndpointDetails
@@ -104,6 +116,7 @@ impl CloudRepoData {
 
         Self {
             repo_name,
+            service_name,
             endpoints,
             calls,
             mounts,

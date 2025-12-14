@@ -861,30 +861,63 @@ impl Analyzer {
             }
         }
 
+        // Create URL normalizer once for all calls
+        let normalizer = UrlNormalizer::new(&self.config);
+
         // For each call, try to find matching endpoint using mount graph
         for call in &unique_calls {
             // Check for environment variable URLs (framework-agnostic)
             // Use smarter detection to avoid false positives on path parameters
             if Self::is_env_var_base_url(&call.route) {
-                // Check if it's a configured external or internal call
+                // Check if it's a configured external call
                 if self.config.is_external_call(&call.route) {
                     continue; // Skip external calls
-                } else if !self.config.is_internal_call(&call.route) {
-                    // Unknown env var URL - format message for formatter to parse
-                    let env_var_name = Self::extract_env_var_name(&call.route);
-                    let path = Self::extract_path_from_env_var_route(&call.route);
-                    env_var_calls.push(format!(
-                        "Environment variable endpoint: {} using env vars [{}] in ENV_VAR:{}:{}",
-                        call.method, env_var_name, env_var_name, path
-                    ));
+                }
+
+                // Check if it's a configured internal call - validate the route
+                if self.config.is_internal_call(&call.route) {
+                    // Internal call - try normal matching
+                    match mount_graph.find_matching_endpoints_with_normalizer(
+                        &call.route,
+                        &call.method,
+                        &normalizer,
+                    ) {
+                        Some(matching_endpoints) => {
+                            if matching_endpoints.is_empty() {
+                                let normalized_path = normalizer.extract_path(&call.route);
+                                call_issues.push(format!(
+                                    "Missing endpoint for {} {} (normalized: {}) (called from {})",
+                                    call.method,
+                                    call.route,
+                                    normalized_path,
+                                    call.file_path.display()
+                                ));
+                            } else {
+                                for endpoint in matching_endpoints {
+                                    let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                                    matched_endpoints.insert(key);
+                                }
+                            }
+                        }
+                        None => {
+                            // Identified as external - skip
+                        }
+                    }
                     continue;
                 }
+
+                // Unknown env var URL - add as configuration suggestion
+                let env_var_name = Self::extract_env_var_name(&call.route);
+                let path = Self::extract_path_from_env_var_route(&call.route);
+                env_var_calls.push(format!(
+                    "Unclassified env var: {} {} using [{}] - add to internalEnvVars or externalEnvVars in carrick.json",
+                    call.method, path, env_var_name
+                ));
+                continue;
             }
 
             // Use mount graph to find matching endpoints with URL normalization
             // This handles full URLs, env var patterns, template literals, etc.
-            let normalizer = UrlNormalizer::new(&self.config);
-
             match mount_graph.find_matching_endpoints_with_normalizer(
                 &call.route,
                 &call.method,
