@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use swc_common::{SourceMap, SourceMapper, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
@@ -65,6 +65,250 @@ pub enum ArgumentType {
     ArrayLiteral,
     TemplateLiteral,
     Other,
+}
+
+#[allow(dead_code)]
+type DefinitionId = swc_ecma_ast::Id;
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+struct DefinitionIndex {
+    defs: HashMap<DefinitionId, DefinitionInfo>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DefinitionInfo {
+    source: DefinitionSource,
+    deps: Vec<DefinitionId>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum DefinitionSource {
+    VariableDecl(Span, Box<Expr>),
+    Import(Span),
+    CallbackParam {
+        param_span: Span,
+        parent_call_span: Span,
+    },
+}
+
+#[derive(Default)]
+#[allow(dead_code)]
+struct DefinitionIndexBuilder {
+    index: DefinitionIndex,
+}
+
+impl DefinitionIndexBuilder {
+    fn insert(&mut self, id: DefinitionId, source: DefinitionSource, deps: Vec<DefinitionId>) {
+        self.index.defs.insert(id, DefinitionInfo { source, deps });
+    }
+}
+
+#[derive(Default)]
+#[allow(dead_code)]
+struct UsedIdCollector {
+    ids: HashSet<DefinitionId>,
+}
+
+impl Visit for UsedIdCollector {
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.ids.insert(ident.to_id());
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        arrow.body.visit_with(self);
+    }
+
+    fn visit_function(&mut self, function: &Function) {
+        if let Some(body) = &function.body {
+            body.visit_with(self);
+        }
+    }
+
+    fn visit_catch_clause(&mut self, catch: &CatchClause) {
+        catch.body.visit_with(self);
+    }
+}
+
+#[allow(dead_code)]
+fn collect_bound_ids_from_pat(pat: &Pat, out: &mut Vec<DefinitionId>) {
+    match pat {
+        Pat::Ident(binding) => out.push(binding.id.to_id()),
+        Pat::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                collect_bound_ids_from_pat(elem, out);
+            }
+        }
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::Assign(assign) => out.push(assign.key.to_id()),
+                    ObjectPatProp::KeyValue(kv) => collect_bound_ids_from_pat(&kv.value, out),
+                    ObjectPatProp::Rest(rest) => collect_bound_ids_from_pat(&rest.arg, out),
+                }
+            }
+        }
+        Pat::Assign(assign) => collect_bound_ids_from_pat(&assign.left, out),
+        Pat::Rest(rest) => collect_bound_ids_from_pat(&rest.arg, out),
+        _ => {}
+    }
+}
+
+#[allow(dead_code)]
+fn collect_used_ids_in_expr_set(expr: &Expr, out: &mut HashSet<DefinitionId>) {
+    let mut collector = UsedIdCollector::default();
+    expr.visit_with(&mut collector);
+    out.extend(collector.ids);
+}
+
+#[allow(dead_code)]
+fn collect_used_ids_in_pat_defaults(pat: &Pat, out: &mut HashSet<DefinitionId>) {
+    match pat {
+        Pat::Assign(assign) => {
+            collect_used_ids_in_expr_set(&assign.right, out);
+            collect_used_ids_in_pat_defaults(&assign.left, out);
+        }
+        Pat::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                collect_used_ids_in_pat_defaults(elem, out);
+            }
+        }
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::Assign(assign) => {
+                        if let Some(value) = &assign.value {
+                            collect_used_ids_in_expr_set(value, out);
+                        }
+                    }
+                    ObjectPatProp::KeyValue(kv) => collect_used_ids_in_pat_defaults(&kv.value, out),
+                    ObjectPatProp::Rest(rest) => collect_used_ids_in_pat_defaults(&rest.arg, out),
+                }
+            }
+        }
+        Pat::Rest(rest) => collect_used_ids_in_pat_defaults(&rest.arg, out),
+        _ => {}
+    }
+}
+
+#[allow(dead_code)]
+fn collect_used_ids_from_call_context(call: &CallExpr) -> Vec<DefinitionId> {
+    let mut ids = HashSet::new();
+
+    if let Callee::Expr(expr) = &call.callee {
+        collect_used_ids_in_expr_set(expr, &mut ids);
+    }
+
+    for arg in &call.args {
+        match &*arg.expr {
+            Expr::Arrow(_) | Expr::Fn(_) => {}
+            _ => collect_used_ids_in_expr_set(&arg.expr, &mut ids),
+        }
+    }
+
+    ids.into_iter().collect()
+}
+
+impl Visit for DefinitionIndexBuilder {
+    fn visit_import_decl(&mut self, import: &ImportDecl) {
+        for specifier in &import.specifiers {
+            let id = match specifier {
+                ImportSpecifier::Named(named) => named.local.to_id(),
+                ImportSpecifier::Default(default) => default.local.to_id(),
+                ImportSpecifier::Namespace(namespace) => namespace.local.to_id(),
+            };
+
+            self.insert(id, DefinitionSource::Import(import.span), Vec::new());
+        }
+
+        import.visit_children_with(self);
+    }
+
+    fn visit_var_decl(&mut self, var_decl: &VarDecl) {
+        for decl in &var_decl.decls {
+            let Some(init) = &decl.init else {
+                continue;
+            };
+
+            let mut bound_ids = Vec::new();
+            collect_bound_ids_from_pat(&decl.name, &mut bound_ids);
+
+            if bound_ids.is_empty() {
+                continue;
+            }
+
+            let mut deps = HashSet::new();
+            collect_used_ids_in_expr_set(init, &mut deps);
+            collect_used_ids_in_pat_defaults(&decl.name, &mut deps);
+
+            let deps: Vec<DefinitionId> = deps.into_iter().collect();
+
+            for id in bound_ids {
+                self.insert(
+                    id,
+                    DefinitionSource::VariableDecl(var_decl.span, init.clone()),
+                    deps.clone(),
+                );
+            }
+        }
+
+        var_decl.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        let deps = collect_used_ids_from_call_context(call);
+
+        for arg in &call.args {
+            match &*arg.expr {
+                Expr::Arrow(arrow) => {
+                    for param in &arrow.params {
+                        let mut bound_ids = Vec::new();
+                        collect_bound_ids_from_pat(param, &mut bound_ids);
+
+                        for id in bound_ids {
+                            self.insert(
+                                id,
+                                DefinitionSource::CallbackParam {
+                                    param_span: param.span(),
+                                    parent_call_span: call.span,
+                                },
+                                deps.clone(),
+                            );
+                        }
+                    }
+                }
+                Expr::Fn(fn_expr) => {
+                    for param in &fn_expr.function.params {
+                        let mut bound_ids = Vec::new();
+                        collect_bound_ids_from_pat(&param.pat, &mut bound_ids);
+
+                        for id in bound_ids {
+                            self.insert(
+                                id,
+                                DefinitionSource::CallbackParam {
+                                    param_span: param.pat.span(),
+                                    parent_call_span: call.span,
+                                },
+                                deps.clone(),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        call.visit_children_with(self);
+    }
+}
+
+#[allow(dead_code)]
+fn build_definition_index(module: &Module) -> DefinitionIndex {
+    let mut builder = DefinitionIndexBuilder::default();
+    module.visit_with(&mut builder);
+    builder.index
 }
 
 /// Framework-agnostic visitor that extracts ALL member call expressions
@@ -689,5 +933,167 @@ impl CallSiteExtractionService {
             "call_sites": self.call_sites,
             "total_count": self.call_sites.len()
         })
+    }
+}
+
+#[cfg(test)]
+mod definition_index_tests {
+    use super::{DefinitionSource, build_definition_index};
+    use crate::parser::parse_file;
+    use swc_common::{
+        SourceMap, SourceMapper,
+        errors::{ColorConfig, Handler},
+        sync::Lrc,
+    };
+    use swc_ecma_ast::*;
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    fn parse_ts(source: &str) -> (Lrc<SourceMap>, Module) {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+
+        (cm, module)
+    }
+
+    #[derive(Default)]
+    struct IdFinder {
+        import_r: Option<Id>,
+        base: Option<Id>,
+        route: Option<Id>,
+        routes: Option<Id>,
+        arrow_param_r: Option<Id>,
+    }
+
+    impl Visit for IdFinder {
+        fn visit_import_decl(&mut self, import: &ImportDecl) {
+            for spec in &import.specifiers {
+                if let ImportSpecifier::Named(named) = spec {
+                    if named.local.sym.as_ref() == "r" {
+                        self.import_r = Some(named.local.to_id());
+                    }
+                }
+            }
+
+            import.visit_children_with(self);
+        }
+
+        fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
+            if let Pat::Ident(binding) = &decl.name {
+                match binding.id.sym.as_ref() {
+                    "base" => self.base = Some(binding.id.to_id()),
+                    "route" => self.route = Some(binding.id.to_id()),
+                    "routes" => self.routes = Some(binding.id.to_id()),
+                    _ => {}
+                }
+            }
+
+            decl.visit_children_with(self);
+        }
+
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            if self.arrow_param_r.is_none() {
+                for param in &arrow.params {
+                    if let Pat::Ident(binding) = param {
+                        if binding.id.sym.as_ref() == "r" {
+                            self.arrow_param_r = Some(binding.id.to_id());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            arrow.visit_children_with(self);
+        }
+    }
+
+    #[test]
+    fn test_definition_index_import_is_leaf() {
+        let (cm, module) = parse_ts(
+            r#"import { route as r } from "./x";
+app.get(r, handler);
+"#,
+        );
+
+        let mut finder = IdFinder::default();
+        module.visit_with(&mut finder);
+        let import_r = finder.import_r.expect("imported r id");
+
+        let index = build_definition_index(&module);
+        let info = index.defs.get(&import_r).expect("definition indexed");
+
+        match &info.source {
+            DefinitionSource::Import(span) => {
+                let snippet = cm.span_to_snippet(*span).expect("snippet");
+                assert!(snippet.contains("import"));
+                assert!(snippet.contains("route"));
+                assert!(snippet.contains("r"));
+                assert!(snippet.contains("./x"));
+            }
+            _ => panic!("expected Import source"),
+        }
+
+        assert!(info.deps.is_empty());
+    }
+
+    #[test]
+    fn test_definition_index_variable_decl_tracks_deps() {
+        let (_cm, module) = parse_ts(
+            r#"const base = "/api";
+const route = base + "/users";
+app.get(route, handler);
+"#,
+        );
+
+        let mut finder = IdFinder::default();
+        module.visit_with(&mut finder);
+        let base = finder.base.expect("base id");
+        let route = finder.route.expect("route id");
+
+        let index = build_definition_index(&module);
+        let info = index.defs.get(&route).expect("route indexed");
+
+        match &info.source {
+            DefinitionSource::VariableDecl(_, _) => {}
+            _ => panic!("expected VariableDecl source"),
+        }
+
+        assert!(info.deps.contains(&base));
+    }
+
+    #[test]
+    fn test_definition_index_callback_param_tracks_parent_context() {
+        let (cm, module) = parse_ts(
+            r#"const routes = ["/a"]; 
+routes.forEach((r) => {
+  app.get(r, handler);
+});
+"#,
+        );
+
+        let mut finder = IdFinder::default();
+        module.visit_with(&mut finder);
+        let routes = finder.routes.expect("routes id");
+        let r = finder.arrow_param_r.expect("arrow param r id");
+
+        let index = build_definition_index(&module);
+        let info = index.defs.get(&r).expect("callback param indexed");
+
+        match &info.source {
+            DefinitionSource::CallbackParam {
+                parent_call_span, ..
+            } => {
+                let snippet = cm.span_to_snippet(*parent_call_span).expect("snippet");
+                assert!(snippet.contains("forEach"));
+                assert!(snippet.contains("routes"));
+            }
+            _ => panic!("expected CallbackParam source"),
+        }
+
+        assert!(info.deps.contains(&routes));
     }
 }
