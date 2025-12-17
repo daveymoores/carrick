@@ -55,6 +55,7 @@ fn test_call_site_with_result_type() {
             utf16_offset: 200,
         }),
         correlated_fetch: None,
+        context_slice: None,
     };
 
     assert!(call_site.result_type.is_some());
@@ -79,6 +80,7 @@ fn test_call_site_without_result_type() {
         location: "server.ts:5:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     assert!(call_site.result_type.is_none());
@@ -309,6 +311,7 @@ async fn test_data_fetching_call_enrichment() {
             utf16_offset: 450,
         }),
         correlated_fetch: None,
+        context_slice: None,
     }];
 
     let framework_detection = DetectionResult {

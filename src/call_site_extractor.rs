@@ -33,6 +33,7 @@ pub struct CallSite {
     pub result_type: Option<ResultTypeInfo>,
     /// For .json() calls: info about the original fetch() call that was correlated
     pub correlated_fetch: Option<FetchCallInfo>,
+    pub context_slice: Option<String>,
 }
 
 /// Represents an argument to a call site
@@ -115,6 +116,13 @@ struct UsedIdCollector {
 impl Visit for UsedIdCollector {
     fn visit_ident(&mut self, ident: &Ident) {
         self.ids.insert(ident.to_id());
+    }
+
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        member.obj.visit_with(self);
+        if let MemberProp::Computed(computed) = &member.prop {
+            computed.expr.visit_with(self);
+        }
     }
 
     fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
@@ -322,6 +330,7 @@ pub struct CallSiteExtractor {
     /// When we see: const resp = await fetch(url)
     /// We store: fetch_result_vars["resp"] = FetchCallInfo { url, method, location }
     fetch_result_vars: HashMap<String, FetchCallInfo>,
+    definition_index: Option<DefinitionIndex>,
     current_file: PathBuf,
     source_map: Lrc<SourceMap>,
 }
@@ -334,6 +343,7 @@ impl CallSiteExtractor {
             argument_values: HashMap::new(),
             call_span_to_result_type: HashMap::new(),
             fetch_result_vars: HashMap::new(),
+            definition_index: None,
             current_file: file_path,
             source_map,
         }
@@ -642,6 +652,115 @@ impl CallSiteExtractor {
         "GET".to_string()
     }
 
+    fn span_contains(outer: Span, inner: Span) -> bool {
+        outer.lo <= inner.lo && outer.hi >= inner.hi
+    }
+
+    fn merge_overlapping_spans(mut spans: Vec<Span>) -> Vec<Span> {
+        spans.sort_by_key(|span| span.lo);
+
+        let mut merged: Vec<Span> = Vec::new();
+        for span in spans {
+            if let Some(last) = merged.last_mut() {
+                if span.lo <= last.hi {
+                    if span.hi > last.hi {
+                        last.hi = span.hi;
+                    }
+                    continue;
+                }
+            }
+
+            merged.push(span);
+        }
+
+        merged
+    }
+
+    fn compute_context_slice(&self, call_span: Span, seed_expr: Option<&Expr>) -> Option<String> {
+        const MAX_DEPTH: usize = 20;
+        const MAX_SPANS: usize = 50;
+
+        let definition_index = self.definition_index.as_ref()?;
+
+        let mut collected_spans: HashSet<Span> = HashSet::new();
+        collected_spans.insert(call_span);
+
+        let mut worklist: std::collections::VecDeque<(DefinitionId, usize)> =
+            std::collections::VecDeque::new();
+        if let Some(expr) = seed_expr {
+            let seed_span = expr.span();
+            if !Self::span_contains(call_span, seed_span) {
+                collected_spans.insert(seed_span);
+            }
+
+            let mut used_ids = HashSet::new();
+            collect_used_ids_in_expr_set(expr, &mut used_ids);
+            for id in used_ids {
+                worklist.push_back((id, 0));
+            }
+        }
+
+        let mut visited_ids: HashSet<DefinitionId> = HashSet::new();
+
+        while let Some((id, depth)) = worklist.pop_front() {
+            if collected_spans.len() >= MAX_SPANS {
+                break;
+            }
+
+            if depth > MAX_DEPTH {
+                continue;
+            }
+
+            if !visited_ids.insert(id.clone()) {
+                continue;
+            }
+
+            let Some(info) = definition_index.defs.get(&id) else {
+                continue;
+            };
+
+            match &info.source {
+                DefinitionSource::VariableDecl(span, _) => {
+                    collected_spans.insert(*span);
+                    for dep in &info.deps {
+                        worklist.push_back((dep.clone(), depth + 1));
+                    }
+                }
+                DefinitionSource::CallbackParam {
+                    parent_call_span, ..
+                } => {
+                    collected_spans.insert(*parent_call_span);
+                    for dep in &info.deps {
+                        worklist.push_back((dep.clone(), depth + 1));
+                    }
+                }
+                DefinitionSource::Import(span) => {
+                    collected_spans.insert(*span);
+                }
+            }
+        }
+
+        let mut spans: Vec<Span> = collected_spans.into_iter().collect();
+        spans.sort_by_key(|span| span.lo);
+        let spans = Self::merge_overlapping_spans(spans);
+
+        let mut snippets = Vec::new();
+        for span in spans {
+            if let Ok(snippet) = self.source_map.span_to_snippet(span) {
+                let snippet = snippet.trim();
+                if !snippet.is_empty() {
+                    snippets.push(snippet.to_string());
+                }
+            }
+        }
+
+        if snippets.is_empty() {
+            None
+        } else {
+            Some(snippets.join("\n"))
+        }
+    }
+
     fn extract_argument(&self, expr: &Expr) -> CallArgument {
         match expr {
             Expr::Lit(Lit::Str(str_lit)) => CallArgument {
@@ -715,6 +834,11 @@ impl CallSiteExtractor {
 }
 
 impl Visit for CallSiteExtractor {
+    fn visit_module(&mut self, module: &Module) {
+        self.definition_index = Some(build_definition_index(module));
+        module.visit_children_with(self);
+    }
+
     fn visit_var_decl(&mut self, var_decl: &VarDecl) {
         for decl in &var_decl.decls {
             if let Pat::Ident(ident) = &decl.name {
@@ -883,6 +1007,9 @@ impl Visit for CallSiteExtractor {
                 None
             };
 
+            let seed_expr = call.args.first().map(|arg| &*arg.expr);
+            let context_slice = self.compute_context_slice(call.span, seed_expr);
+
             self.call_sites.push(CallSite {
                 callee_object: object_name,
                 callee_property: property_name,
@@ -891,6 +1018,7 @@ impl Visit for CallSiteExtractor {
                 location,
                 result_type,
                 correlated_fetch,
+                context_slice,
             });
         }
 
@@ -1095,5 +1223,118 @@ routes.forEach((r) => {
         }
 
         assert!(info.deps.contains(&routes));
+    }
+}
+
+#[cfg(test)]
+mod context_slice_tests {
+    use super::{CallSite, CallSiteExtractor};
+    use crate::parser::parse_file;
+    use swc_common::{
+        SourceMap,
+        errors::{ColorConfig, Handler},
+        sync::Lrc,
+    };
+    use swc_ecma_visit::VisitWith;
+
+    fn extract_call_sites(source: &str) -> Vec<CallSite> {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+        let mut extractor = CallSiteExtractor::new(file_path, cm);
+        module.visit_with(&mut extractor);
+
+        extractor.call_sites
+    }
+
+    #[test]
+    fn test_context_slice_includes_variable_deps_and_anchor() {
+        let call_sites = extract_call_sites(
+            r#"const base = "/api";
+const route = base + "/users";
+app.get(route, handler);
+"#,
+        );
+
+        let call_site = call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "app" && cs.callee_property == "get")
+            .expect("expected app.get call site");
+
+        let slice = call_site.context_slice.as_deref().expect("context_slice");
+        assert!(slice.contains("const base"));
+        assert!(slice.contains("const route"));
+        assert!(slice.contains("app.get"));
+
+        let base_idx = slice.find("const base").expect("base idx");
+        let route_idx = slice.find("const route").expect("route idx");
+        let call_idx = slice.find("app.get").expect("call idx");
+        assert!(base_idx < route_idx);
+        assert!(route_idx < call_idx);
+    }
+
+    #[test]
+    fn test_context_slice_import_is_leaf() {
+        let call_sites = extract_call_sites(
+            r#"import { route } from "./x";
+app.get(route, handler);
+"#,
+        );
+
+        let call_site = call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "app" && cs.callee_property == "get")
+            .expect("expected app.get call site");
+
+        let slice = call_site.context_slice.as_deref().expect("context_slice");
+        assert!(slice.contains("import"));
+        assert!(slice.contains("./x"));
+        assert!(slice.contains("app.get"));
+    }
+
+    #[test]
+    fn test_context_slice_callback_param_includes_parent_call() {
+        let call_sites = extract_call_sites(
+            r#"const routes = ["/a"]; 
+routes.forEach((r) => {
+  app.get(r, handler);
+});
+"#,
+        );
+
+        let call_site = call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "app" && cs.callee_property == "get")
+            .expect("expected app.get call site");
+
+        let slice = call_site.context_slice.as_deref().expect("context_slice");
+        assert!(slice.contains("const routes"));
+        assert!(slice.contains("forEach"));
+        assert!(slice.contains("app.get"));
+    }
+
+    #[test]
+    fn test_context_slice_avoids_cycles() {
+        let call_sites = extract_call_sites(
+            r#"const a = b;
+const b = a;
+app.get(a, handler);
+"#,
+        );
+
+        let call_site = call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "app" && cs.callee_property == "get")
+            .expect("expected app.get call site");
+
+        let slice = call_site.context_slice.as_deref().expect("context_slice");
+        assert!(slice.contains("const a"));
+        assert!(slice.contains("const b"));
+        assert!(slice.contains("app.get"));
     }
 }

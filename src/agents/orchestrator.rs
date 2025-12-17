@@ -404,6 +404,7 @@ mod tests {
                 utf16_offset: 100,
             }),
             correlated_fetch,
+            context_slice: None,
         }
     }
 
@@ -634,6 +635,7 @@ mod tests {
                 method: "GET".to_string(),
                 location: "server.ts:55:18".to_string(),
             }),
+            context_slice: None,
         }];
 
         let location_to_call_site: std::collections::HashMap<String, &CallSite> = call_sites

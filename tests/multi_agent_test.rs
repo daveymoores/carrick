@@ -40,6 +40,7 @@ async fn test_multi_agent_orchestrator_mock_mode() {
             location: "app.ts:10:0".to_string(),
             result_type: None,
             correlated_fetch: None,
+            context_slice: None,
         },
         // router.get('/posts', handler) - should be classified as HttpEndpoint
         CallSite {
@@ -63,6 +64,7 @@ async fn test_multi_agent_orchestrator_mock_mode() {
             location: "routes/api.ts:6:0".to_string(),
             result_type: None,
             correlated_fetch: None,
+            context_slice: None,
         },
         // app.use(express.json()) - should be classified as Middleware
         CallSite {
@@ -78,6 +80,7 @@ async fn test_multi_agent_orchestrator_mock_mode() {
             location: "app.ts:7:0".to_string(),
             result_type: None,
             correlated_fetch: None,
+            context_slice: None,
         },
     ];
 
@@ -301,6 +304,7 @@ fn test_lean_call_site_preserves_mount_classification_info() {
         location: "server.ts:25:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     // Create a middleware call site: app.use(express.json())
@@ -317,6 +321,7 @@ fn test_lean_call_site_preserves_mount_classification_info() {
         location: "server.ts:10:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     // Convert to LeanCallSite (what gets sent to the LLM in production)
@@ -385,6 +390,7 @@ fn test_lean_call_site_nested_mount() {
         location: "api-router.ts:30:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     let lean: LeanCallSite = (&nested_mount).into();
@@ -423,6 +429,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         location: "repo-b_server.ts:112:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     // Pattern 2: app.use("/api", apiRouter)
@@ -447,6 +454,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         location: "repo-b_server.ts:113:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     // Pattern 3: router.use("/v1", v1Router) - nested mount
@@ -471,6 +479,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         location: "api-router.ts:31:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     // Pattern 4: app.use(express.json()) - this is middleware, NOT a mount
@@ -487,6 +496,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         location: "repo-b_server.ts:6:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     };
 
     // Convert all to LeanCallSite
@@ -692,6 +702,7 @@ async fn test_endpoint_enrichment_with_inline_types() {
         location: "server.ts:10:0".to_string(),
         result_type: None,
         correlated_fetch: None,
+        context_slice: None,
     }];
 
     let framework_detection = DetectionResult {
