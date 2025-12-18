@@ -79,6 +79,12 @@ EXTRACTION GOALS:
   - Estimate the start position (character index) of the type annotation
   - Extract the type string itself
 
+CONTEXT SLICE (IMPORTANT):
+- Each call site may include a `context_slice` field containing a minimal source snippet from the same file.
+- The `context_slice` includes the call itself (anchor) plus the local variable definitions/import statements that define identifiers used in the call.
+- Use `context_slice` to infer URLs/methods when they are not directly available in args or resolved fields.
+- Do NOT assume cross-file values beyond what appears in the `context_slice` (imports are a boundary).
+
 CRITICAL REQUIREMENTS:
 1. Return ONLY valid JSON array
 2. Extract details from ALL provided call sites (they're all data fetching calls)
@@ -160,8 +166,10 @@ Return JSON array with this structure:
 GUIDELINES:
 - These are all data fetching calls (already triaged)
 - Use the framework-specific data fetching patterns above to understand how each library makes HTTP calls
+- Prefer SWC-extracted values if present (e.g., `correlated_fetch.url` on response parsing calls)
 - Extract URL from string literals in arguments if present, otherwise set to null
 - If arguments are Identifiers, check the "resolved_value" field for the actual string value
+- If URL cannot be resolved from args/resolved_value/correlated_fetch, use the `context_slice` field to infer the URL
 - If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
 - Infer HTTP method from function name (get=GET, post=POST, etc.)
 - For response parsing calls (.json(), .text()), use "response_parsing" as library
@@ -171,5 +179,58 @@ GUIDELINES:
 - ofetch uses $fetch() function
 - Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    fn empty_detection() -> DetectionResult {
+        DetectionResult {
+            frameworks: vec![],
+            data_fetchers: vec![],
+            notes: "test".to_string(),
+        }
+    }
+
+    fn empty_guidance() -> FrameworkGuidance {
+        FrameworkGuidance {
+            mount_patterns: vec![],
+            endpoint_patterns: vec![],
+            middleware_patterns: vec![],
+            data_fetching_patterns: vec![],
+            triage_hints: String::new(),
+            parsing_notes: String::new(),
+        }
+    }
+
+    fn dummy_call_site() -> CallSite {
+        CallSite {
+            callee_object: "fetch".to_string(),
+            callee_property: "fetch".to_string(),
+            args: vec![],
+            definition: None,
+            location: "client.ts:1:1".to_string(),
+            result_type: None,
+            correlated_fetch: None,
+            context_slice: None,
+        }
+    }
+
+    #[test]
+    fn test_consumer_prompts_mention_context_slice() {
+        let gemini_service = GeminiService::new("mock".to_string());
+        let agent = ConsumerAgent::new(gemini_service);
+
+        let system_message = agent.build_system_message();
+        assert!(system_message.contains("context_slice"));
+
+        let prompt = agent.build_fetching_prompt(
+            &[dummy_call_site()],
+            &empty_detection(),
+            &empty_guidance(),
+        );
+        assert!(prompt.contains("`context_slice`"));
     }
 }

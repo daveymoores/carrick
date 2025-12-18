@@ -72,6 +72,12 @@ EXTRACTION GOALS:
 - Handler function name or description
 - Location information
 
+CONTEXT SLICE (IMPORTANT):
+- Each call site may include a `context_slice` field containing a minimal source snippet from the same file.
+- The `context_slice` includes the middleware registration call (anchor) plus local variable definitions/import statements relevant to its arguments.
+- Use `context_slice` to infer path_prefix/handler details when they are not directly available from args or resolved fields.
+- Do NOT assume cross-file values beyond what appears in the `context_slice` (imports are a boundary).
+
 CRITICAL REQUIREMENTS:
 1. Return ONLY valid JSON array
 2. Extract details from ALL provided call sites (they're all middleware registrations)
@@ -148,6 +154,7 @@ GUIDELINES:
 - These are all middleware registrations (already triaged)
 - Use the framework-specific middleware patterns above to understand how middleware works in each framework
 - Extract path prefix from string literals if present (e.g., app.use('/api', middleware))
+- If path prefix is not a direct literal and cannot be resolved from args/resolved_value, use the `context_slice` field to infer it
 - If no path prefix, set to null (applies to all routes)
 - Extract node_name from the callee_object field (e.g., "app", "router", "server")
 - Identify middleware type based on function name and context:
@@ -161,5 +168,58 @@ GUIDELINES:
 - For handler, use the actual function name if available
 - Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    fn empty_detection() -> DetectionResult {
+        DetectionResult {
+            frameworks: vec![],
+            data_fetchers: vec![],
+            notes: "test".to_string(),
+        }
+    }
+
+    fn empty_guidance() -> FrameworkGuidance {
+        FrameworkGuidance {
+            mount_patterns: vec![],
+            endpoint_patterns: vec![],
+            middleware_patterns: vec![],
+            data_fetching_patterns: vec![],
+            triage_hints: String::new(),
+            parsing_notes: String::new(),
+        }
+    }
+
+    fn dummy_call_site() -> CallSite {
+        CallSite {
+            callee_object: "app".to_string(),
+            callee_property: "use".to_string(),
+            args: vec![],
+            definition: None,
+            location: "server.ts:1:1".to_string(),
+            result_type: None,
+            correlated_fetch: None,
+            context_slice: None,
+        }
+    }
+
+    #[test]
+    fn test_middleware_prompts_mention_context_slice() {
+        let gemini_service = GeminiService::new("mock".to_string());
+        let agent = MiddlewareAgent::new(gemini_service);
+
+        let system_message = agent.build_system_message();
+        assert!(system_message.contains("context_slice"));
+
+        let prompt = agent.build_middleware_prompt(
+            &[dummy_call_site()],
+            &empty_detection(),
+            &empty_guidance(),
+        );
+        assert!(prompt.contains("`context_slice`"));
     }
 }

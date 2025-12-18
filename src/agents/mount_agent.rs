@@ -89,6 +89,12 @@ EXAMPLES OF MOUNT PATTERNS:
 - router.use('/users', userRouter) -> parent: "router", child: "userRouter", path: "/users"
 - server.mount('/v1', v1Router) -> parent: "server", child: "v1Router", path: "/v1"
 
+CONTEXT SLICE (IMPORTANT):
+- Each call site may include a `context_slice` field containing a minimal source snippet from the same file.
+- The `context_slice` includes the mount call itself (anchor) plus local variable definitions/import statements relevant to the mount arguments.
+- Use `context_slice` to infer mount_path/child_node when they are not directly available from args or resolved fields.
+- Do NOT assume cross-file values beyond what appears in the `context_slice` (imports are a boundary).
+
 CRITICAL REQUIREMENTS:
 1. Return ONLY valid JSON array
 2. Extract details from ALL provided call sites (they're all router mounts)
@@ -165,6 +171,7 @@ GUIDELINES:
 - Extract child_node from the second argument (usually an Identifier)
 - Extract mount_path from the first argument (usually a StringLiteral)
 - If arguments are Identifiers, check the "resolved_value" field for the actual string value
+- If mount_path cannot be resolved from args/resolved_value, use the `context_slice` field to infer the concrete mount path
 - If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
 - Common patterns:
 - Use the framework-specific mount patterns above to understand how mounts work in each framework
@@ -176,5 +183,55 @@ GUIDELINES:
   - fastify.register(routes, {{ prefix: '/path' }}) -> parent: fastify, child: routes, path: /path (Fastify)
 - Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    fn empty_detection() -> DetectionResult {
+        DetectionResult {
+            frameworks: vec![],
+            data_fetchers: vec![],
+            notes: "test".to_string(),
+        }
+    }
+
+    fn empty_guidance() -> FrameworkGuidance {
+        FrameworkGuidance {
+            mount_patterns: vec![],
+            endpoint_patterns: vec![],
+            middleware_patterns: vec![],
+            data_fetching_patterns: vec![],
+            triage_hints: String::new(),
+            parsing_notes: String::new(),
+        }
+    }
+
+    fn dummy_call_site() -> CallSite {
+        CallSite {
+            callee_object: "app".to_string(),
+            callee_property: "use".to_string(),
+            args: vec![],
+            definition: None,
+            location: "server.ts:1:1".to_string(),
+            result_type: None,
+            correlated_fetch: None,
+            context_slice: None,
+        }
+    }
+
+    #[test]
+    fn test_mount_prompts_mention_context_slice() {
+        let gemini_service = GeminiService::new("mock".to_string());
+        let agent = MountAgent::new(gemini_service);
+
+        let system_message = agent.build_system_message();
+        assert!(system_message.contains("context_slice"));
+
+        let prompt =
+            agent.build_mount_prompt(&[dummy_call_site()], &empty_detection(), &empty_guidance());
+        assert!(prompt.contains("`context_slice`"));
     }
 }

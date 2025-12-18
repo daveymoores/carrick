@@ -95,6 +95,12 @@ EXTRACTION GOALS:
   - Estimate the start position (character index) of the type annotation
   - Extract the type string itself
 
+CONTEXT SLICE (IMPORTANT):
+- Each call site may include a `context_slice` field containing a minimal source snippet from the same file.
+- The `context_slice` includes the endpoint call itself (anchor) plus the local variable definitions/import statements that define identifiers used in the call.
+- Use `context_slice` to resolve identifier-based route paths and handler references when the path is not directly a literal.
+- Do NOT assume cross-file values beyond what appears in the `context_slice` (imports are a boundary).
+
 CRITICAL REQUIREMENTS:
 1. Return ONLY valid JSON array
 2. Extract details from ALL provided call sites (they're all endpoints)
@@ -168,6 +174,7 @@ GUIDELINES:
 - Use the framework-specific patterns above to understand how endpoints are defined
 - Extract the actual path string from string literals in arguments
 - If an argument is an Identifier, use the "resolved_value" field if available to find the actual path string
+- If the identifier path cannot be resolved from args/resolved_value, use the `context_slice` field to infer the concrete route string
 - If an argument is a TemplateLiteral, use the "value" field which contains the reconstructed template string
 - Extract node_name from the callee_object field (e.g., "app", "router", "fastify")
 - If handler is an inline function, use "anonymous"
@@ -175,5 +182,58 @@ GUIDELINES:
 - Infer HTTP method from the callee_property (get=GET, post=POST, etc.)
 - Set confidence high (0.9+) for clear patterns, lower for ambiguous cases"#
         )
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    fn empty_detection() -> DetectionResult {
+        DetectionResult {
+            frameworks: vec![],
+            data_fetchers: vec![],
+            notes: "test".to_string(),
+        }
+    }
+
+    fn empty_guidance() -> FrameworkGuidance {
+        FrameworkGuidance {
+            mount_patterns: vec![],
+            endpoint_patterns: vec![],
+            middleware_patterns: vec![],
+            data_fetching_patterns: vec![],
+            triage_hints: String::new(),
+            parsing_notes: String::new(),
+        }
+    }
+
+    fn dummy_call_site() -> CallSite {
+        CallSite {
+            callee_object: "app".to_string(),
+            callee_property: "get".to_string(),
+            args: vec![],
+            definition: None,
+            location: "server.ts:1:1".to_string(),
+            result_type: None,
+            correlated_fetch: None,
+            context_slice: None,
+        }
+    }
+
+    #[test]
+    fn test_endpoint_prompts_mention_context_slice() {
+        let gemini_service = GeminiService::new("mock".to_string());
+        let agent = EndpointAgent::new(gemini_service);
+
+        let system_message = agent.build_system_message();
+        assert!(system_message.contains("context_slice"));
+
+        let prompt = agent.build_endpoint_prompt(
+            &[dummy_call_site()],
+            &empty_detection(),
+            &empty_guidance(),
+        );
+        assert!(prompt.contains("`context_slice`"));
     }
 }
