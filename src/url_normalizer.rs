@@ -125,7 +125,8 @@ impl UrlNormalizer {
         if parts.len() >= 2 {
             let env_var_name = parts[1];
             let path = if parts.len() >= 3 {
-                self.clean_path(parts[2])
+                let path_with_params = self.convert_interpolations_to_params(parts[2]);
+                self.clean_path(&path_with_params)
             } else {
                 "/".to_string()
             };
@@ -141,7 +142,6 @@ impl UrlNormalizer {
                 stripped_host: Some(format!("ENV_VAR:{}", env_var_name)),
             }
         } else {
-            // Malformed pattern, return as-is
             NormalizedUrl {
                 path: self.clean_path(url),
                 is_internal: false,
@@ -158,11 +158,10 @@ impl UrlNormalizer {
     /// - `process.env.API_URL + "/users"` → `/users`
     /// - `process.env.SERVICE_URL/users` → `/users`
     fn normalize_process_env_pattern(&self, url: &str, original: String) -> NormalizedUrl {
-        // Extract the env var name
         let env_var_name = self.extract_process_env_var(url);
 
-        // Try to extract the path portion
         let path = self.extract_path_from_process_env(url);
+        let path_with_params = self.convert_interpolations_to_params(&path);
 
         let is_internal = env_var_name
             .as_ref()
@@ -174,7 +173,7 @@ impl UrlNormalizer {
             .unwrap_or(false);
 
         NormalizedUrl {
-            path: self.clean_path(&path),
+            path: self.clean_path(&path_with_params),
             is_internal,
             is_external,
             original,
@@ -199,24 +198,24 @@ impl UrlNormalizer {
 
     /// Extract path from process.env pattern
     fn extract_path_from_process_env(&self, url: &str) -> String {
-        // Look for path after + "/path" or just /path
-        // Pattern: process.env.VAR + "/path" or process.env.VAR + '/path'
+        // Pattern: process.env.VAR + "/path" or process.env.VAR + '/path' or backticks
         if let Some(plus_idx) = url.find('+') {
             let after_plus = url[plus_idx + 1..].trim();
-            // Remove surrounding quotes
             let path = after_plus
-                .trim_start_matches('"')
-                .trim_start_matches('\'')
-                .trim_end_matches('"')
-                .trim_end_matches('\'');
+                .trim_start_matches(['"', '\'', '`'])
+                .trim_end_matches(['"', '\'', '`']);
             return path.to_string();
         }
 
-        // Look for /path directly after env var
-        if let Some(slash_idx) = url.rfind('/') {
-            // Make sure it's after process.env.VAR
-            if url[..slash_idx].contains("process.env.") {
-                return url[slash_idx..].to_string();
+        if let Some(env_idx) = url.find("process.env.") {
+            let after_prefix = &url[env_idx + 12..];
+            let var_end = after_prefix
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after_prefix.len());
+
+            let after_var = &after_prefix[var_end..];
+            if let Some(slash_idx) = after_var.find('/') {
+                return after_var[slash_idx..].to_string();
             }
         }
 
@@ -638,6 +637,50 @@ mod tests {
         let result = normalizer.normalize("process.env.API_URL + \"/users\"");
 
         assert_eq!(result.path, "/users");
+        assert!(result.is_internal);
+    }
+
+    #[test]
+    fn test_process_env_pattern_with_multiple_segments_and_template_params() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("${process.env.API_URL}/users/${userId}");
+
+        assert_eq!(result.path, "/users/:userId");
+        assert!(result.is_internal);
+    }
+
+    #[test]
+    fn test_process_env_pattern_with_backticks_and_template_params() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("process.env.API_URL + `/users/${userId}`");
+
+        assert_eq!(result.path, "/users/:userId");
+        assert!(result.is_internal);
+    }
+
+    #[test]
+    fn test_process_env_pattern_without_plus_multiple_segments() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("process.env.API_URL/users/123/orders");
+
+        assert_eq!(result.path, "/users/123/orders");
+        assert!(result.is_internal);
+    }
+
+    #[test]
+    fn test_env_var_pattern_with_template_params() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("ENV_VAR:API_URL:/users/${userId}");
+
+        assert_eq!(result.path, "/users/:userId");
         assert!(result.is_internal);
     }
 

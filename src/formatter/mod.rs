@@ -1,5 +1,5 @@
 use crate::analyzer::{ApiAnalysisResult, ApiIssues, ConflictSeverity, DependencyConflict};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub struct FormattedOutput {
     pub content: String,
@@ -89,23 +89,29 @@ fn format_no_issues(result: &ApiAnalysisResult) -> String {
     )
 }
 
+#[derive(Debug, Clone)]
+struct EnvVarSuggestionGroup {
+    method: String,
+    env_var: String,
+    path: String,
+    count: usize,
+    locations: Vec<String>,
+}
+
 struct CategorizedIssues {
     critical: Vec<String>,
     connectivity: Vec<String>,
-    configuration: Vec<String>,
+    configuration: Vec<EnvVarSuggestionGroup>,
     dependencies: Vec<DependencyConflict>,
 }
 
 fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
     let mut critical = Vec::new();
     let mut connectivity = Vec::new();
-    let mut configuration = Vec::new();
 
-    // Critical issues: mismatches and type mismatches
     critical.extend(issues.mismatches.clone());
     critical.extend(issues.type_mismatches.clone());
 
-    // Add method mismatches from call_issues to critical
     for issue in &issues.call_issues {
         if issue.contains("Method mismatch") {
             critical.push(issue.clone());
@@ -114,11 +120,9 @@ fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
         }
     }
 
-    // Connectivity issues: missing/orphaned endpoints
     connectivity.extend(issues.endpoint_issues.clone());
 
-    // Configuration issues: environment variables
-    configuration.extend(issues.env_var_calls.clone());
+    let configuration = group_env_var_suggestions(&issues.env_var_calls);
 
     CategorizedIssues {
         critical,
@@ -223,7 +227,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
     output
 }
 
-fn format_configuration_section(issues: &[String]) -> String {
+fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -234,11 +238,22 @@ fn format_configuration_section(issues: &[String]) -> String {
     output.push_str("> These API calls use environment variables to construct the URL. Add them to `internalEnvVars` (to validate routes) or `externalEnvVars` (to ignore) in your `carrick.json`.\n\n");
 
     for issue in issues {
-        let (method, env_vars, path) = extract_env_var_info(issue);
         output.push_str(&format!(
-            "  - `{}` using **[{}]** in `{}`\n",
-            method, env_vars, path
+            "  - `{} {}` using **[{}]** — {} call site{}\n",
+            issue.method,
+            issue.path,
+            issue.env_var,
+            issue.count,
+            if issue.count == 1 { "" } else { "s" }
         ));
+
+        let shown = issue.locations.len().min(3);
+        for loc in issue.locations.iter().take(shown) {
+            output.push_str(&format!("    - `{}`\n", loc));
+        }
+        if shown > 0 && issue.count > shown {
+            output.push_str(&format!("    - … +{} more\n", issue.count - shown));
+        }
     }
 
     output.push_str("</details>");
@@ -612,6 +627,55 @@ fn extract_env_var_info(issue: &str) -> (String, String, String) {
     };
 
     (method.to_string(), env_vars.to_string(), path.to_string())
+}
+
+fn extract_env_var_location(issue: &str) -> Option<String> {
+    let marker = "(from ";
+    let start = issue.find(marker)?;
+    let rest = &issue[start + marker.len()..];
+    let end = rest.find(')')?;
+    Some(rest[..end].to_string())
+}
+
+fn group_env_var_suggestions(issues: &[String]) -> Vec<EnvVarSuggestionGroup> {
+    #[derive(Default)]
+    struct Acc {
+        raw_count: usize,
+        locations: BTreeSet<String>,
+    }
+
+    let mut grouped: BTreeMap<(String, String, String), Acc> = BTreeMap::new();
+
+    for issue in issues {
+        let (method, env_var, path) = extract_env_var_info(issue);
+        let location = extract_env_var_location(issue);
+
+        let acc = grouped.entry((env_var, method, path)).or_default();
+        acc.raw_count += 1;
+        if let Some(loc) = location {
+            acc.locations.insert(loc);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|((env_var, method, path), acc)| {
+            let locations: Vec<String> = acc.locations.into_iter().collect();
+            let count = if locations.is_empty() {
+                acc.raw_count
+            } else {
+                locations.len()
+            };
+
+            EnvVarSuggestionGroup {
+                method,
+                env_var,
+                path,
+                count,
+                locations,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

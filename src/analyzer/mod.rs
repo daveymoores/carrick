@@ -57,6 +57,8 @@ impl ApiIssues {
     pub fn is_empty(&self) -> bool {
         self.call_issues.is_empty()
             && self.endpoint_issues.is_empty()
+            && self.env_var_calls.is_empty()
+            && self.mismatches.is_empty()
             && self.type_mismatches.is_empty()
             && self.dependency_conflicts.is_empty()
     }
@@ -573,36 +575,6 @@ impl Analyzer {
         false
     }
 
-    /// Extract path from environment variable route
-    /// Examples:
-    /// - "ENV_VAR:API_URL:/users" -> "/users"
-    /// - "${process.env.SERVICE_URL}/orders" -> "/orders"
-    /// - "${API_BASE}/users/123" -> "/users/123"
-    fn extract_path_from_env_var_route(route: &str) -> String {
-        // Handle ENV_VAR:NAME:/path format
-        if route.starts_with("ENV_VAR:") {
-            let parts: Vec<&str> = route.splitn(3, ':').collect();
-            if parts.len() >= 3 {
-                return parts[2].to_string();
-            }
-        }
-
-        // Handle ${VAR}/path patterns - extract after }
-        if let Some(idx) = route.find("}/") {
-            return route[idx + 1..].to_string();
-        }
-
-        // Handle process.env.VAR + "/path" patterns
-        if let Some(idx) = route.find("+ \"") {
-            let after = &route[idx + 3..];
-            if let Some(end) = after.find('"') {
-                return after[..end].to_string();
-            }
-        }
-
-        "/".to_string()
-    }
-
     /// Helper to process a TsTypeAnn and produce a TypeReference.
     /// This function encapsulates the logic to find the correct span,
     /// calculate the UTF-16 offset, and build the TypeReference struct.
@@ -869,22 +841,23 @@ impl Analyzer {
             // Check for environment variable URLs (framework-agnostic)
             // Use smarter detection to avoid false positives on path parameters
             if Self::is_env_var_base_url(&call.route) {
-                // Check if it's a configured external call
-                if self.config.is_external_call(&call.route) {
-                    continue; // Skip external calls
+                let env_var_name = Self::extract_env_var_name(&call.route);
+                let normalized_path = normalizer.extract_path(&call.route);
+                let canonical_env_var_route =
+                    format!("ENV_VAR:{}:{}", env_var_name, normalized_path);
+
+                if self.config.is_external_call(&canonical_env_var_route) {
+                    continue;
                 }
 
-                // Check if it's a configured internal call - validate the route
-                if self.config.is_internal_call(&call.route) {
-                    // Internal call - try normal matching
+                if self.config.is_internal_call(&canonical_env_var_route) {
                     match mount_graph.find_matching_endpoints_with_normalizer(
-                        &call.route,
+                        &canonical_env_var_route,
                         &call.method,
                         &normalizer,
                     ) {
                         Some(matching_endpoints) => {
                             if matching_endpoints.is_empty() {
-                                let normalized_path = normalizer.extract_path(&call.route);
                                 call_issues.push(format!(
                                     "Missing endpoint for {} {} (normalized: {}) (called from {})",
                                     call.method,
@@ -906,12 +879,12 @@ impl Analyzer {
                     continue;
                 }
 
-                // Unknown env var URL - add as configuration suggestion
-                let env_var_name = Self::extract_env_var_name(&call.route);
-                let path = Self::extract_path_from_env_var_route(&call.route);
                 env_var_calls.push(format!(
-                    "Unclassified env var: {} {} using [{}] - add to internalEnvVars or externalEnvVars in carrick.json",
-                    call.method, path, env_var_name
+                    "Unclassified env var: {} {} using [{}] (from {}) - add to internalEnvVars or externalEnvVars in carrick.json",
+                    call.method,
+                    normalized_path,
+                    env_var_name,
+                    call.file_path.display()
                 ));
                 continue;
             }
@@ -1707,38 +1680,6 @@ mod tests {
         // Unknown/fallback
         assert_eq!(Analyzer::extract_env_var_name("unknown"), "UNKNOWN_API");
         assert_eq!(Analyzer::extract_env_var_name("/users"), "UNKNOWN_API");
-    }
-
-    #[test]
-    fn test_extract_path_from_env_var_route() {
-        // ENV_VAR:NAME:/path format
-        assert_eq!(
-            Analyzer::extract_path_from_env_var_route("ENV_VAR:API_URL:/users"),
-            "/users"
-        );
-        assert_eq!(
-            Analyzer::extract_path_from_env_var_route("ENV_VAR:ORDER_SERVICE_URL:/orders/123"),
-            "/orders/123"
-        );
-
-        // ${VAR}/path format
-        assert_eq!(
-            Analyzer::extract_path_from_env_var_route("${process.env.SERVICE_URL}/orders"),
-            "/orders"
-        );
-        assert_eq!(
-            Analyzer::extract_path_from_env_var_route("${API_BASE}/users/456"),
-            "/users/456"
-        );
-
-        // process.env.VAR + "/path" format
-        assert_eq!(
-            Analyzer::extract_path_from_env_var_route("process.env.API_URL + \"/data\""),
-            "/data"
-        );
-
-        // Fallback
-        assert_eq!(Analyzer::extract_path_from_env_var_route("unknown"), "/");
     }
 
     #[test]
