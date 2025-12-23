@@ -360,20 +360,37 @@ impl CallSiteExtractor {
     fn expr_to_string(&self, expr: &Expr) -> String {
         match expr {
             Expr::Ident(ident) => ident.sym.to_string(),
+            Expr::This(_) => "this".to_string(),
             Expr::Member(member) => {
-                // Recursively build the full member expression
                 let obj_str = self.expr_to_string(&member.obj);
-                let prop_str = match &member.prop {
-                    MemberProp::Ident(ident) => ident.sym.to_string(),
+                match &member.prop {
+                    MemberProp::Ident(ident) => format!("{}.{}", obj_str, ident.sym),
+                    MemberProp::PrivateName(name) => format!("{}.#{}", obj_str, name.name),
                     MemberProp::Computed(computed) => {
-                        format!("[{}]", self.expr_to_string(&computed.expr))
+                        format!("{}[{}]", obj_str, self.expr_to_string(&computed.expr))
                     }
-                    MemberProp::PrivateName(name) => format!("#{}", name.name),
-                };
-                format!("{}.{}", obj_str, prop_str)
+                }
             }
+            Expr::Call(call) => {
+                let callee_str = match &call.callee {
+                    Callee::Expr(callee) => self.expr_to_string(callee),
+                    Callee::Super(_) => "super".to_string(),
+                    Callee::Import(_) => "import".to_string(),
+                };
+                format!("{}()", callee_str)
+            }
+            Expr::New(new_expr) => {
+                let callee_str = self.expr_to_string(&new_expr.callee);
+                format!("new {}()", callee_str)
+            }
+            Expr::Await(await_expr) => format!("await {}", self.expr_to_string(&await_expr.arg)),
+            Expr::Paren(paren) => self.expr_to_string(&paren.expr),
+            Expr::TsAs(ts_as) => self.expr_to_string(&ts_as.expr),
+            Expr::TsNonNull(non_null) => self.expr_to_string(&non_null.expr),
+            Expr::TsTypeAssertion(type_assertion) => self.expr_to_string(&type_assertion.expr),
             Expr::Lit(Lit::Str(s)) => s.value.to_string(),
             Expr::Lit(Lit::Num(n)) => n.value.to_string(),
+            Expr::Lit(Lit::Bool(b)) => b.value.to_string(),
             _ => "...".to_string(),
         }
     }
@@ -913,43 +930,10 @@ impl Visit for CallSiteExtractor {
                     }
 
                     let definition = match &**init {
-                        Expr::Call(call) => {
-                            if let Callee::Expr(callee) = &call.callee {
-                                match &**callee {
-                                    Expr::Ident(func_ident) => {
-                                        format!("{}()", func_ident.sym)
-                                    }
-                                    Expr::Member(member) => {
-                                        if let (Expr::Ident(obj), MemberProp::Ident(prop)) =
-                                            (&*member.obj, &member.prop)
-                                        {
-                                            format!("{}.{}()", obj.sym, prop.sym)
-                                        } else {
-                                            "member_call()".to_string()
-                                        }
-                                    }
-                                    _ => "call_expression()".to_string(),
-                                }
-                            } else {
-                                "function_call()".to_string()
-                            }
-                        }
-                        Expr::New(new_expr) => {
-                            if let Expr::Ident(ident) = &*new_expr.callee {
-                                format!("new {}()", ident.sym)
-                            } else {
-                                "new_expression()".to_string()
-                            }
-                        }
-                        Expr::Ident(ident) => {
-                            format!("= {}", ident.sym)
-                        }
-                        Expr::Lit(Lit::Str(str_lit)) => {
-                            format!("= \"{}\"", str_lit.value)
-                        }
-                        Expr::Tpl(tpl) => {
-                            format!("= `{}`", self.extract_template_literal(tpl))
-                        }
+                        Expr::Call(_) | Expr::New(_) => self.expr_to_string(init),
+                        Expr::Ident(ident) => format!("= {}", ident.sym),
+                        Expr::Lit(Lit::Str(str_lit)) => format!("= \"{}\"", str_lit.value),
+                        Expr::Tpl(tpl) => format!("= `{}`", self.extract_template_literal(tpl)),
                         _ => "variable_assignment".to_string(),
                     };
 
@@ -962,23 +946,30 @@ impl Visit for CallSiteExtractor {
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
-        // Extract ALL member call expressions AND direct function calls without filtering
         if let Callee::Expr(callee_expr) = &call.callee {
-            let (object_name, property_name) = match &**callee_expr {
+            let (object_name, property_name, callee_seed_expr) = match &**callee_expr {
                 Expr::Member(member) => {
-                    if let (Expr::Ident(obj_ident), MemberProp::Ident(prop_ident)) =
-                        (&*member.obj, &member.prop)
-                    {
-                        (obj_ident.sym.to_string(), prop_ident.sym.to_string())
-                    } else {
-                        return;
-                    }
+                    let object_name = self.expr_to_string(&member.obj);
+                    let property_name = match &member.prop {
+                        MemberProp::Ident(prop_ident) => prop_ident.sym.to_string(),
+                        MemberProp::PrivateName(name) => name.name.to_string(),
+                        MemberProp::Computed(computed) => match &*computed.expr {
+                            Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+                            Expr::Ident(ident) => ident.sym.to_string(),
+                            _ => self.expr_to_string(&computed.expr),
+                        },
+                    };
+                    (object_name, property_name, Some(&*member.obj))
                 }
-                Expr::Ident(ident) => ("global".to_string(), ident.sym.to_string()),
+                Expr::Ident(ident) => (
+                    "global".to_string(),
+                    ident.sym.to_string(),
+                    Some(&**callee_expr),
+                ),
                 _ => return,
             };
 
-            let args = call
+            let args: Vec<CallArgument> = call
                 .args
                 .iter()
                 .map(|arg| self.extract_argument(&arg.expr))
@@ -987,28 +978,66 @@ impl Visit for CallSiteExtractor {
             let (line, column) = self.get_line_and_column(call.span);
             let location = format!("{}:{}:{}", self.current_file.display(), line, column);
 
-            // For member calls, look up definition of object
-            // For global calls, look up definition of function
-            let definition_key = if object_name == "global" {
-                &property_name
+            let definition = if object_name == "global" {
+                self.variable_definitions.get(&property_name).cloned()
             } else {
-                &object_name
+                self.variable_definitions
+                    .get(&object_name)
+                    .cloned()
+                    .or_else(|| {
+                        let root = object_name.split(['.', '[', '(']).next().unwrap_or("");
+                        if root.is_empty() {
+                            None
+                        } else {
+                            self.variable_definitions.get(root).cloned()
+                        }
+                    })
             };
-            let definition = self.variable_definitions.get(definition_key).cloned();
 
-            // Look up result type from variable declaration if this call was assigned to a typed variable
             let result_type = self.call_span_to_result_type.get(&call.span).cloned();
 
-            // For .json() calls, try to correlate with the original fetch() call
-            // Pattern: resp.json() where resp was assigned from fetch()
             let correlated_fetch = if property_name == "json" {
-                self.fetch_result_vars.get(&object_name).cloned()
+                self.fetch_result_vars
+                    .get(&object_name)
+                    .cloned()
+                    .or_else(|| {
+                        let Expr::Member(member) = &**callee_expr else {
+                            return None;
+                        };
+
+                        let fetch_call = Self::find_call_expr_in_expr(&member.obj)?;
+                        if !self.is_fetch_call(fetch_call) {
+                            return None;
+                        }
+
+                        let url = self.extract_fetch_url(fetch_call);
+                        let method = self.extract_fetch_method(fetch_call);
+                        let (line, column) = self.get_line_and_column(fetch_call.span);
+                        let location =
+                            format!("{}:{}:{}", self.current_file.display(), line, column);
+
+                        Some(FetchCallInfo {
+                            url,
+                            method,
+                            location,
+                        })
+                    })
             } else {
                 None
             };
 
-            let seed_expr = call.args.first().map(|arg| &*arg.expr);
-            let context_slice = self.compute_context_slice(call.span, seed_expr);
+            let seed_expr = call.args.first().map(|arg| &*arg.expr).and_then(|expr| {
+                if matches!(expr, Expr::Arrow(_) | Expr::Fn(_)) {
+                    return None;
+                }
+
+                let mut ids = HashSet::new();
+                collect_used_ids_in_expr_set(expr, &mut ids);
+                if ids.is_empty() { None } else { Some(expr) }
+            });
+
+            let context_slice =
+                self.compute_context_slice(call.span, seed_expr.or(callee_seed_expr));
 
             self.call_sites.push(CallSite {
                 callee_object: object_name,
@@ -1336,5 +1365,108 @@ app.get(a, handler);
         assert!(slice.contains("const a"));
         assert!(slice.contains("const b"));
         assert!(slice.contains("app.get"));
+    }
+}
+
+#[cfg(test)]
+mod call_site_extraction_tests {
+    use super::{CallSite, CallSiteExtractor};
+    use crate::parser::parse_file;
+    use swc_common::{
+        SourceMap,
+        errors::{ColorConfig, Handler},
+        sync::Lrc,
+    };
+    use swc_ecma_visit::VisitWith;
+
+    fn extract_call_sites(source: &str) -> Vec<CallSite> {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+        let mut extractor = CallSiteExtractor::new(file_path, cm);
+        module.visit_with(&mut extractor);
+
+        extractor.call_sites
+    }
+
+    #[test]
+    fn test_extracts_namespaced_member_calls() {
+        let call_sites = extract_call_sites(
+            r#"api.client.get("/orders");
+api.client.post("/orders");
+"#,
+        );
+
+        let get_call = call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "api.client" && cs.callee_property == "get")
+            .expect("expected api.client.get call site");
+        assert_eq!(get_call.args.len(), 1);
+
+        let post_call = call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "api.client" && cs.callee_property == "post")
+            .expect("expected api.client.post call site");
+        assert_eq!(post_call.args.len(), 1);
+    }
+
+    #[test]
+    fn test_extracts_factory_member_calls() {
+        let call_sites = extract_call_sites(
+            r#"getClient().get("/orders");
+axios.create({ baseURL }).post("/orders");
+"#,
+        );
+
+        call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "getClient()" && cs.callee_property == "get")
+            .expect("expected getClient().get call site");
+
+        call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "axios.create()" && cs.callee_property == "post")
+            .expect("expected axios.create().post call site");
+    }
+
+    #[test]
+    fn test_extracts_chained_route_calls() {
+        let call_sites = extract_call_sites(
+            r#"router.route("/v1/users").get(handler);
+"#,
+        );
+
+        call_sites
+            .iter()
+            .find(|cs| cs.callee_object == "router.route()" && cs.callee_property == "get")
+            .expect("expected router.route().get call site");
+    }
+
+    #[test]
+    fn test_correlates_inline_fetch_for_json_calls() {
+        let call_sites = extract_call_sites(
+            r#"async function f() {
+  const data = await (await fetch("/orders")).json();
+  return data;
+}
+"#,
+        );
+
+        let json_call = call_sites
+            .iter()
+            .find(|cs| cs.callee_property == "json")
+            .expect("expected .json() call site");
+
+        let correlated = json_call
+            .correlated_fetch
+            .as_ref()
+            .expect("expected correlated fetch info");
+        assert_eq!(correlated.url.as_deref(), Some("/orders"));
+        assert_eq!(correlated.method, "GET");
     }
 }
