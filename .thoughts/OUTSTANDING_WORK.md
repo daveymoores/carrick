@@ -25,6 +25,12 @@ Work:
 - Reduce hard-coded `fetch()` and `.json()` assumptions in extraction and correlation logic.
 - Improve call-site capture coverage so it includes chained/factory/namespaced callees (not just `ident.method()`).
 - Treat “is this an HTTP call / endpoint / mount / middleware” as classification, powered by `context_slice`, rather than pattern matching.
+- Fix noisy/incorrect env-var configuration suggestions.
+  - Cause: `Analyzer::analyze_matches_with_mount_graph()` (`src/analyzer/mod.rs`) uses `is_env_var_base_url()` to detect env-var base URLs in multiple formats (e.g. `ENV_VAR:NAME:/path`, `${process.env.NAME}/path`, `process.env.NAME + "/path"`). But `Config::is_internal_call()` / `Config::is_external_call()` (`src/config.rs`) only recognize the canonical `ENV_VAR:` prefix (plus domain prefixes). So even *configured* env vars in `${process.env.NAME}` / `process.env.NAME + ...` form fall through to the “Unclassified env var” suggestion path.
+  - Solution:
+    - Canonicalize env-var routes before classification and suggestion generation: convert `${process.env.NAME}/path` and `process.env.NAME + "/path"` into `ENV_VAR:NAME:<normalized_path>`.
+    - Use `UrlNormalizer` to compute `<normalized_path>` (strip query strings, normalize template params) so suggestions don’t include noisy variants like `?userId=${...}`.
+    - Deduplicate/group suggestions (e.g. group by `(env_var, method, normalized_path)` and show a count + a few sample locations), rather than one suggestion per call site.
 
 ### 2) Make cross-repo type checking robust and deterministic
 
