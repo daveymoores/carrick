@@ -202,7 +202,7 @@ mod prompt_tests {
             definition: None,
             location: "server.ts:1:1".to_string(),
             result_type: None,
-            correlated_fetch: None,
+            correlated_call: None,
             context_slice: None,
         }
     }

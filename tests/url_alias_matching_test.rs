@@ -171,12 +171,12 @@ async function fetchUser(userId: string) {
         .expect("Should find resp.json() call");
 
     assert!(
-        json_call.correlated_fetch.is_some(),
-        "Should have correlated fetch info"
+        json_call.correlated_call.is_some(),
+        "Should have correlated call info"
     );
 
-    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
-    let url = fetch_info.url.as_ref().expect("Should have URL");
+    let info = json_call.correlated_call.as_ref().unwrap();
+    let url = info.url.as_ref().expect("Should have URL");
 
     // The URL should be normalized to :param style
     assert!(

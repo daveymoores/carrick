@@ -39,7 +39,7 @@ async fn test_multi_agent_orchestrator_mock_mode() {
             definition: Some("const app = express()".to_string()),
             location: "app.ts:10:0".to_string(),
             result_type: None,
-            correlated_fetch: None,
+            correlated_call: None,
             context_slice: None,
         },
         // router.get('/posts', handler) - should be classified as HttpEndpoint
@@ -63,7 +63,7 @@ async fn test_multi_agent_orchestrator_mock_mode() {
             definition: Some("const router = Router()".to_string()),
             location: "routes/api.ts:6:0".to_string(),
             result_type: None,
-            correlated_fetch: None,
+            correlated_call: None,
             context_slice: None,
         },
         // app.use(express.json()) - should be classified as Middleware
@@ -79,7 +79,7 @@ async fn test_multi_agent_orchestrator_mock_mode() {
             definition: Some("const app = express()".to_string()),
             location: "app.ts:7:0".to_string(),
             result_type: None,
-            correlated_fetch: None,
+            correlated_call: None,
             context_slice: None,
         },
     ];
@@ -303,7 +303,7 @@ fn test_lean_call_site_preserves_mount_classification_info() {
         definition: Some("const app = express()".to_string()),
         location: "server.ts:25:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -320,7 +320,7 @@ fn test_lean_call_site_preserves_mount_classification_info() {
         definition: Some("const app = express()".to_string()),
         location: "server.ts:10:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -389,7 +389,7 @@ fn test_lean_call_site_nested_mount() {
         definition: Some("const router = express.Router()".to_string()),
         location: "api-router.ts:30:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -428,7 +428,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         definition: None,
         location: "repo-b_server.ts:112:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -453,7 +453,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         definition: None,
         location: "repo-b_server.ts:113:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -478,7 +478,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         definition: None,
         location: "api-router.ts:31:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -495,7 +495,7 @@ fn test_repo_b_mount_patterns_in_lean_call_site() {
         definition: None,
         location: "repo-b_server.ts:6:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -701,7 +701,7 @@ async fn test_endpoint_enrichment_with_inline_types() {
         definition: Some("const app = express()".to_string()),
         location: "server.ts:10:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     }];
 

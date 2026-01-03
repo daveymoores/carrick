@@ -13,11 +13,13 @@ pub struct ResultTypeInfo {
     pub utf16_offset: u32,
 }
 
-/// Information about a fetch() call that can be correlated with .json() calls
+/// Information about an originating call expression that can be correlated with
+/// follow-up member calls (e.g., response parsing or decode steps).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FetchCallInfo {
+pub struct CorrelatedCallInfo {
+    pub callee: String,
     pub url: Option<String>,
-    pub method: String, // GET, POST, etc.
+    pub method: Option<String>,
     pub location: String,
 }
 
@@ -31,8 +33,7 @@ pub struct CallSite {
     pub location: String,
     /// Type annotation from variable declaration when this call is the initializer
     pub result_type: Option<ResultTypeInfo>,
-    /// For .json() calls: info about the original fetch() call that was correlated
-    pub correlated_fetch: Option<FetchCallInfo>,
+    pub correlated_call: Option<CorrelatedCallInfo>,
     pub context_slice: Option<String>,
 }
 
@@ -326,10 +327,8 @@ pub struct CallSiteExtractor {
     pub argument_values: HashMap<String, String>,
     /// Maps call expression spans to their result type info (from variable declarations)
     call_span_to_result_type: HashMap<Span, ResultTypeInfo>,
-    /// Maps variable names to their fetch call info
-    /// When we see: const resp = await fetch(url)
-    /// We store: fetch_result_vars["resp"] = FetchCallInfo { url, method, location }
-    fetch_result_vars: HashMap<String, FetchCallInfo>,
+    /// Maps variables initialized from a call expression to originating call info.
+    call_result_vars: HashMap<String, CorrelatedCallInfo>,
     definition_index: Option<DefinitionIndex>,
     current_file: PathBuf,
     source_map: Lrc<SourceMap>,
@@ -342,7 +341,7 @@ impl CallSiteExtractor {
             variable_definitions: HashMap::new(),
             argument_values: HashMap::new(),
             call_span_to_result_type: HashMap::new(),
-            fetch_result_vars: HashMap::new(),
+            call_result_vars: HashMap::new(),
             definition_index: None,
             current_file: file_path,
             source_map,
@@ -536,91 +535,132 @@ impl CallSiteExtractor {
         }
     }
 
-    /// Check if a call expression is a fetch() call
-    fn is_fetch_call(&self, call: &CallExpr) -> bool {
-        if let Callee::Expr(expr) = &call.callee {
-            match &**expr {
-                Expr::Ident(ident) => ident.sym.as_ref() == "fetch",
-                _ => false,
-            }
-        } else {
-            false
-        }
+    fn is_http_verb(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+        )
     }
 
-    /// Extract URL from fetch() call arguments
-    /// Handles: fetch("/path"), fetch(`${BASE}/path`), fetch(url)
-    fn extract_fetch_url(&self, call: &CallExpr) -> Option<String> {
-        if call.args.is_empty() {
-            return None;
-        }
-
-        let first_arg = &call.args[0].expr;
-        match &**first_arg {
-            // String literal: fetch("/orders")
+    fn extract_string_value(&self, expr: &Expr) -> Option<String> {
+        match expr {
             Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
-            // Template literal: fetch(`${BASE}/orders`)
-            Expr::Tpl(tpl) => {
-                let template_str = self.extract_template_literal(tpl);
-                // Extract the path portion from template literals
-                // e.g., "${process.env.ORDER_SERVICE_URL}/orders" -> "/orders"
-                self.extract_path_from_url(&template_str)
-            }
-            // Variable: fetch(url) - try to resolve
+            Expr::Tpl(tpl) => Some(self.extract_template_literal(tpl)),
             Expr::Ident(ident) => {
                 let var_name = ident.sym.to_string();
-                self.argument_values
-                    .get(&var_name)
-                    .cloned()
-                    .and_then(|v| self.extract_path_from_url(&v))
+                self.argument_values.get(&var_name).cloned()
             }
             _ => None,
         }
     }
 
-    /// Extract path portion from a URL string and normalize template expressions to :param style
-    /// Handles: "/orders", "http://localhost/orders", "${ENV}/orders", "/users/${userId}"
+    fn extract_http_method_from_object(&self, obj: &ObjectLit) -> Option<String> {
+        for prop in &obj.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+
+            let key_name = match &kv.key {
+                PropName::Ident(ident) => Some(ident.sym.as_ref()),
+                PropName::Str(s) => Some(s.value.as_ref()),
+                _ => None,
+            };
+            if key_name != Some("method") {
+                continue;
+            }
+
+            match &*kv.value {
+                Expr::Lit(Lit::Str(s)) => return Some(s.value.to_string().to_uppercase()),
+                Expr::Ident(ident) => {
+                    let var_name = ident.sym.to_string();
+                    if let Some(value) = self.argument_values.get(&var_name) {
+                        return Some(value.to_string().to_uppercase());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn extract_http_method_from_callee(&self, call: &CallExpr) -> Option<String> {
+        let Callee::Expr(expr) = &call.callee else {
+            return None;
+        };
+
+        match &**expr {
+            Expr::Ident(ident) => {
+                let name = ident.sym.as_ref();
+                if Self::is_http_verb(name) {
+                    Some(name.to_uppercase())
+                } else {
+                    None
+                }
+            }
+            Expr::Member(member) => {
+                let prop_name = match &member.prop {
+                    MemberProp::Ident(ident) => ident.sym.to_string(),
+                    MemberProp::PrivateName(name) => name.name.to_string(),
+                    MemberProp::Computed(computed) => match &*computed.expr {
+                        Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+                        Expr::Ident(ident) => ident.sym.to_string(),
+                        _ => self.expr_to_string(&computed.expr),
+                    },
+                };
+
+                if Self::is_http_verb(&prop_name) {
+                    Some(prop_name.to_uppercase())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn extract_path_from_url(&self, url: &str) -> Option<String> {
-        let path = if url.starts_with('/') {
-            // Already a path, use as-is
+        let mut path = if url.starts_with('/') {
             url.to_string()
         } else if let Some(idx) = url.find("}/") {
-            // Template expression prefix like ${ENV}/ - extract path after it
             url[idx + 1..].to_string()
         } else if url.starts_with("http://") || url.starts_with("https://") {
-            // Full URL - extract path portion
             if let Some(path_start) = url.find("://").and_then(|i| url[i + 3..].find('/')) {
                 let path_idx = url.find("://").unwrap() + 3 + path_start;
                 url[path_idx..].to_string()
             } else {
-                return Some(url.to_string());
+                url.to_string()
             }
         } else {
             url.to_string()
         };
 
-        // Normalize template expressions ${varName} to :varName style parameters
+        if let Some(query_idx) = path.find('?') {
+            path.truncate(query_idx);
+        }
+        if let Some(fragment_idx) = path.find('#') {
+            path.truncate(fragment_idx);
+        }
+
         Some(Self::normalize_template_params(&path))
     }
 
-    /// Convert template literal expressions like ${userId} to :userId style path parameters
-    /// This allows consumer paths to match producer paths that use :param notation
     fn normalize_template_params(path: &str) -> String {
         let mut result = String::new();
         let mut chars = path.chars().peekable();
 
         while let Some(c) = chars.next() {
             if c == '$' && chars.peek() == Some(&'{') {
-                // Consume the '{'
                 chars.next();
 
-                // Extract the variable name (everything until '}')
                 let mut var_name = String::new();
                 for inner_c in chars.by_ref() {
                     if inner_c == '}' {
                         break;
                     }
-                    // Only keep the last part if it's a member expression like process.env.VAR
                     if inner_c == '.' {
                         var_name.clear();
                     } else {
@@ -628,7 +668,6 @@ impl CallSiteExtractor {
                     }
                 }
 
-                // Convert to :param style if we got a variable name
                 if !var_name.is_empty() {
                     result.push(':');
                     result.push_str(&var_name);
@@ -641,32 +680,89 @@ impl CallSiteExtractor {
         result
     }
 
-    /// Extract HTTP method from fetch() call options
-    /// Defaults to "GET" if not specified
-    fn extract_fetch_method(&self, call: &CallExpr) -> String {
-        // Check if there's a second argument (options object)
-        if call.args.len() > 1 {
-            if let Expr::Object(obj) = &*call.args[1].expr {
-                for prop in &obj.props {
-                    if let PropOrSpread::Prop(prop) = prop {
-                        if let Prop::KeyValue(kv) = &**prop {
-                            let key_name = match &kv.key {
-                                PropName::Ident(ident) => Some(ident.sym.as_ref()),
-                                PropName::Str(s) => Some(s.value.as_ref()),
-                                _ => None,
-                            };
-                            if key_name == Some("method") {
-                                if let Expr::Lit(Lit::Str(s)) = &*kv.value {
-                                    return s.value.to_string().to_uppercase();
-                                }
-                            }
-                        }
-                    }
+    fn extract_url_from_object(&self, obj: &ObjectLit) -> Option<String> {
+        for prop in &obj.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+
+            let key_name = match &kv.key {
+                PropName::Ident(ident) => Some(ident.sym.as_ref()),
+                PropName::Str(s) => Some(s.value.as_ref()),
+                _ => None,
+            };
+
+            let Some(key_name) = key_name else {
+                continue;
+            };
+
+            if !matches!(key_name, "url" | "path" | "href") {
+                continue;
+            }
+
+            if let Some(raw) = self.extract_string_value(&kv.value) {
+                return self.extract_path_from_url(&raw);
+            }
+        }
+
+        None
+    }
+
+    fn extract_url_from_call(&self, call: &CallExpr) -> Option<String> {
+        if call.args.is_empty() {
+            return None;
+        }
+
+        let first = &call.args[0].expr;
+        match &**first {
+            Expr::Object(obj) => self.extract_url_from_object(obj),
+            _ => self
+                .extract_string_value(first)
+                .and_then(|raw| self.extract_path_from_url(&raw)),
+        }
+    }
+
+    fn extract_http_method_from_call(&self, call: &CallExpr) -> Option<String> {
+        for arg in &call.args {
+            if let Expr::Object(obj) = &*arg.expr {
+                if let Some(method) = self.extract_http_method_from_object(obj) {
+                    return Some(method);
                 }
             }
         }
-        // Default to GET
-        "GET".to_string()
+
+        self.extract_http_method_from_callee(call)
+    }
+
+    fn build_correlated_call_info(&self, call: &CallExpr) -> Option<CorrelatedCallInfo> {
+        let callee = match &call.callee {
+            Callee::Expr(expr) => self.expr_to_string(expr),
+            Callee::Super(_) => "super".to_string(),
+            Callee::Import(_) => "import".to_string(),
+        };
+
+        let url = self.extract_url_from_call(call);
+        let mut method = self.extract_http_method_from_call(call);
+        if method.is_none() && url.is_some() {
+            method = Some("GET".to_string());
+        }
+
+        if url.is_none() && method.is_none() {
+            return None;
+        }
+
+        let (line, column) = self.get_line_and_column(call.span);
+        let location = format!("{}:{}:{}", self.current_file.display(), line, column);
+
+        Some(CorrelatedCallInfo {
+            callee,
+            url,
+            method,
+            location,
+        })
     }
 
     fn span_contains(outer: Span, inner: Span) -> bool {
@@ -874,24 +970,9 @@ impl Visit for CallSiteExtractor {
                         _ => {}
                     }
 
-                    // Check if this is a fetch() call and track it for correlation
-                    // Pattern: const resp = await fetch(url) OR const resp = fetch(url)
                     if let Some(call_expr) = Self::find_call_expr_in_expr(init) {
-                        if self.is_fetch_call(call_expr) {
-                            let url = self.extract_fetch_url(call_expr);
-                            let method = self.extract_fetch_method(call_expr);
-                            let (line, column) = self.get_line_and_column(call_expr.span);
-                            let location =
-                                format!("{}:{}:{}", self.current_file.display(), line, column);
-
-                            self.fetch_result_vars.insert(
-                                var_name.clone(),
-                                FetchCallInfo {
-                                    url,
-                                    method,
-                                    location,
-                                },
-                            );
+                        if let Some(info) = self.build_correlated_call_info(call_expr) {
+                            self.call_result_vars.insert(var_name.clone(), info);
                         }
                     }
 
@@ -996,31 +1077,16 @@ impl Visit for CallSiteExtractor {
 
             let result_type = self.call_span_to_result_type.get(&call.span).cloned();
 
-            let correlated_fetch = if property_name == "json" {
-                self.fetch_result_vars
+            let correlated_call = if call.args.is_empty() {
+                self.call_result_vars
                     .get(&object_name)
                     .cloned()
                     .or_else(|| {
                         let Expr::Member(member) = &**callee_expr else {
                             return None;
                         };
-
-                        let fetch_call = Self::find_call_expr_in_expr(&member.obj)?;
-                        if !self.is_fetch_call(fetch_call) {
-                            return None;
-                        }
-
-                        let url = self.extract_fetch_url(fetch_call);
-                        let method = self.extract_fetch_method(fetch_call);
-                        let (line, column) = self.get_line_and_column(fetch_call.span);
-                        let location =
-                            format!("{}:{}:{}", self.current_file.display(), line, column);
-
-                        Some(FetchCallInfo {
-                            url,
-                            method,
-                            location,
-                        })
+                        let origin_call = Self::find_call_expr_in_expr(&member.obj)?;
+                        self.build_correlated_call_info(origin_call)
                     })
             } else {
                 None
@@ -1046,7 +1112,7 @@ impl Visit for CallSiteExtractor {
                 definition,
                 location,
                 result_type,
-                correlated_fetch,
+                correlated_call,
                 context_slice,
             });
         }
@@ -1463,10 +1529,10 @@ axios.create({ baseURL }).post("/orders");
             .expect("expected .json() call site");
 
         let correlated = json_call
-            .correlated_fetch
+            .correlated_call
             .as_ref()
-            .expect("expected correlated fetch info");
+            .expect("expected correlated call info");
         assert_eq!(correlated.url.as_deref(), Some("/orders"));
-        assert_eq!(correlated.method, "GET");
+        assert_eq!(correlated.method.as_deref(), Some("GET"));
     }
 }

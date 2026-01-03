@@ -534,20 +534,8 @@ fn generate_mock_framework_guidance_response(_prompt: &str) -> String {
 
 /// Generate mock triage responses by extracting locations from prompt
 fn generate_mock_triage_response(prompt: &str) -> String {
-    // Parse the prompt to extract call site locations
-    let call_sites: Vec<serde_json::Value> = if let Some(start) = prompt.find("[{\"callee_object\"")
-    {
-        if let Some(end) = prompt[start..].find("]\n") {
-            let json_str = &prompt[start..start + end + 1];
-            serde_json::from_str(json_str).unwrap_or_default()
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
-    };
+    let call_sites = extract_call_sites_from_prompt(prompt);
 
-    // Generate triage results for each call site
     let triage_results: Vec<serde_json::Value> = call_sites
         .iter()
         .map(|cs| {
@@ -556,60 +544,84 @@ fn generate_mock_triage_response(prompt: &str) -> String {
                 .get("callee_property")
                 .and_then(|p| p.as_str())
                 .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("");
 
-            // Simple heuristic for classification
-            let classification =
-                if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
-                    "HttpEndpoint"
-                } else if callee_property == "use" || callee_property == "register" {
-                    // Check if it's a router mount or middleware
-                    let args = cs.get("args").and_then(|a| a.as_array());
+            let args = cs.get("args").and_then(|a| a.as_array());
+            let arg_count = args.map(|a| a.len()).unwrap_or(0);
 
-                    // Fastify register or Express use with 2+ args
-                    if args.map(|a| a.len()).unwrap_or(0) >= 2 {
-                        // Fastify register(router, options) is typically a mount
-                        if callee_property == "register" {
-                            "RouterMount"
-                        } else {
-                            // Express use(path, router)
-                            // Check if first arg is string and second is identifier
-                            let first_arg = args.and_then(|a| a.first());
-                            let first_is_string = first_arg
-                                .and_then(|arg| arg.get("arg_type"))
-                                .and_then(|t| t.as_str())
-                                == Some("StringLiteral");
+            let has_correlated_call = cs
+                .get("correlated_call")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
 
-                            let second_is_id = args
-                                .and_then(|a| a.get(1))
-                                .and_then(|arg| arg.get("arg_type"))
-                                .and_then(|t| t.as_str())
-                                == Some("Identifier");
+            let classification = if matches!(
+                callee_property,
+                "json" | "text" | "blob" | "arrayBuffer" | "formData"
+            ) {
+                if has_correlated_call {
+                    "DataFetchingCall"
+                } else {
+                    "Irrelevant"
+                }
+            } else if callee_object == "global" && callee_property == "fetch" {
+                "DataFetchingCall"
+            } else if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
+                "HttpEndpoint"
+            } else if callee_property == "use" {
+                if arg_count >= 2 {
+                    let first_is_string = args
+                        .and_then(|a| a.first())
+                        .and_then(|arg| arg.get("arg_type"))
+                        .and_then(|t| t.as_str())
+                        == Some("StringLiteral");
 
-                            if first_is_string && second_is_id {
-                                "RouterMount"
-                            } else {
-                                "Middleware"
-                            }
-                        }
-                    } else if callee_property == "use" {
-                        // 1 argument: app.use(middleware) OR app.use(router.routes())
+                    let second_is_id = args
+                        .and_then(|a| a.get(1))
+                        .and_then(|arg| arg.get("arg_type"))
+                        .and_then(|t| t.as_str())
+                        == Some("Identifier");
 
-                        // HACK for tests: if location contains "koa-api", assume it's a mount if it looks like one
-                        // This emulates the LLM's ability to recognize Koa patterns
-                        if location.contains("koa-api") && args.map(|a| a.len()).unwrap_or(0) == 1 {
-                            // Assume router.routes() call which is a mount in Koa
-                            "RouterMount"
-                        } else {
-                            "Middleware"
-                        }
+                    if first_is_string && second_is_id {
+                        "RouterMount"
                     } else {
                         "Middleware"
                     }
-                } else if matches!(callee_property, "json" | "urlencoded") {
+                } else {
                     "Middleware"
+                }
+            } else if arg_count >= 2 {
+                let first_is_id = args
+                    .and_then(|a| a.first())
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str())
+                    == Some("Identifier");
+
+                let second_is_object = args
+                    .and_then(|a| a.get(1))
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str())
+                    == Some("ObjectLiteral");
+
+                if first_is_id && second_is_object {
+                    let context_slice = cs
+                        .get("context_slice")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if extract_path_prefix_from_context_slice(context_slice).is_some() {
+                        "RouterMount"
+                    } else {
+                        "Irrelevant"
+                    }
                 } else {
                     "Irrelevant"
-                };
+                }
+            } else {
+                "Irrelevant"
+            };
 
             serde_json::json!({
                 "location": location,
@@ -638,14 +650,33 @@ fn generate_mock_endpoint_response(prompt: &str) -> String {
                 .unwrap_or("app");
             let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
 
-            // Extract path from args if available
-            let path = cs
+            let raw_path = cs
                 .get("args")
                 .and_then(|args| args.as_array())
                 .and_then(|arr| arr.first())
-                .and_then(|arg| arg.get("value"))
+                .and_then(|arg| arg.get("resolved_value").or_else(|| arg.get("value")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("/");
+
+            let context_slice = cs
+                .get("context_slice")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let inferred_prefix = if !context_slice.is_empty()
+                && context_slice.contains(callee_object)
+                && context_slice.contains("prefix")
+            {
+                extract_path_prefix_from_context_slice(context_slice)
+            } else {
+                None
+            };
+
+            let path = if let Some(prefix) = inferred_prefix {
+                join_path_prefix(&prefix, raw_path)
+            } else {
+                raw_path.to_string()
+            };
 
             if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
                 Some(serde_json::json!({
@@ -669,9 +700,10 @@ fn generate_mock_endpoint_response(prompt: &str) -> String {
 /// Generate mock consumer (data fetching) responses
 fn generate_mock_consumer_response(prompt: &str) -> String {
     let call_sites = extract_call_sites_from_prompt(prompt);
+
     let consumers: Vec<serde_json::Value> = call_sites
         .iter()
-        .filter_map(|cs| {
+        .map(|cs| {
             let callee_property = cs
                 .get("callee_property")
                 .and_then(|p| p.as_str())
@@ -679,22 +711,66 @@ fn generate_mock_consumer_response(prompt: &str) -> String {
             let callee_object = cs
                 .get("callee_object")
                 .and_then(|o| o.as_str())
-                .unwrap_or("fetch");
+                .unwrap_or("");
             let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
 
-            // Check if it looks like an API call
-            if matches!(callee_object, "fetch" | "axios" | "response" | "resp") {
-                Some(serde_json::json!({
-                    "library": callee_object,
-                    "url": null,
-                    "method": callee_property.to_uppercase(),
-                    "location": location,
-                    "confidence": 0.8,
-                    "reasoning": "Mock data fetching call"
-                }))
+            let correlated = cs.get("correlated_call");
+            let correlated_callee = correlated
+                .and_then(|c| c.get("callee"))
+                .and_then(|v| v.as_str());
+            let correlated_url = correlated
+                .and_then(|c| c.get("url"))
+                .and_then(|v| v.as_str());
+            let correlated_method = correlated
+                .and_then(|c| c.get("method"))
+                .and_then(|v| v.as_str());
+
+            let args = cs.get("args").and_then(|a| a.as_array());
+            let arg0_value = args
+                .and_then(|a| a.first())
+                .and_then(|arg| arg.get("resolved_value").or_else(|| arg.get("value")))
+                .and_then(|v| v.as_str());
+
+            let url: Option<String> = correlated_url
+                .or(arg0_value)
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+
+            let method: Option<String> =
+                correlated_method
+                    .map(|s| s.to_string())
+                    .or_else(|| match callee_property {
+                        "get" | "post" | "put" | "delete" | "patch" => {
+                            Some(callee_property.to_uppercase())
+                        }
+                        _ => None,
+                    });
+
+            let is_decode_call = matches!(
+                callee_property,
+                "json" | "text" | "blob" | "arrayBuffer" | "formData"
+            ) && args.map(|a| a.is_empty()).unwrap_or(false);
+
+            let library = if is_decode_call {
+                correlated_callee
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "response_parsing".to_string())
+            } else if callee_object == "global" {
+                callee_property.to_string()
+            } else if let Some(callee) = correlated_callee {
+                callee.to_string()
             } else {
-                None
-            }
+                callee_object.to_string()
+            };
+
+            serde_json::json!({
+                "library": library,
+                "url": url,
+                "method": method,
+                "location": location,
+                "confidence": 0.8,
+                "reasoning": "Mock data fetching call"
+            })
         })
         .collect();
 
@@ -718,25 +794,25 @@ fn generate_mock_mount_response(prompt: &str) -> String {
             let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
 
             let args = cs.get("args").and_then(|a| a.as_array());
-            if callee_property == "use" && args.map(|a| a.len()).unwrap_or(0) >= 2 {
-                // First arg should be the path (StringLiteral)
+
+            if args.map(|a| a.len()).unwrap_or(0) >= 2 {
                 let first_arg_type = args
                     .and_then(|a| a.first())
                     .and_then(|arg| arg.get("arg_type"))
                     .and_then(|t| t.as_str());
 
-                // Second arg should be an identifier (the router)
                 let second_arg_type = args
                     .and_then(|a| a.get(1))
                     .and_then(|arg| arg.get("arg_type"))
                     .and_then(|t| t.as_str());
 
-                // Only consider it a mount if first arg is string and second is identifier
-                if first_arg_type == Some("StringLiteral") && second_arg_type == Some("Identifier")
+                if callee_property == "use"
+                    && first_arg_type == Some("StringLiteral")
+                    && second_arg_type == Some("Identifier")
                 {
                     let path = args
                         .and_then(|a| a.first())
-                        .and_then(|arg| arg.get("value"))
+                        .and_then(|arg| arg.get("resolved_value").or_else(|| arg.get("value")))
                         .and_then(|v| v.as_str())
                         .unwrap_or("/");
                     let child = args
@@ -751,72 +827,33 @@ fn generate_mock_mount_response(prompt: &str) -> String {
                         "mount_path": path,
                         "location": location,
                         "confidence": 0.9,
-                        "reasoning": "Router mount detected via app.use(path, router)"
+                        "reasoning": "Mock mount extraction"
                     }));
                 }
-            }
 
-            // Pattern 2: Fastify app.register(router, { prefix: '/path' })
-            if callee_property == "register" && args.map(|a| a.len()).unwrap_or(0) >= 2 {
-                // First arg is identifier (router/plugin)
-                let child = args
-                    .and_then(|a| a.first())
-                    .and_then(|arg| arg.get("value"))
-                    .and_then(|v| v.as_str());
+                if first_arg_type == Some("Identifier") && second_arg_type == Some("ObjectLiteral")
+                {
+                    let child = args
+                        .and_then(|a| a.first())
+                        .and_then(|arg| arg.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("router");
 
-                // Second arg is object literal (options) - we can't easily parse the object value from mock extraction
-                // But we can infer if it's a register call with options
-                if let Some(child_node) = child {
-                    // In a real LLM call, we'd extract the prefix from the object literal
-                    // For mock, we'll assume if it's register with 2 args, it's a mount
-                    // and we'll try to guess the prefix or default to /api/v1 for the test case
-                    let path = "/api/v1";
+                    let context_slice = cs
+                        .get("context_slice")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
 
-                    return Some(serde_json::json!({
-                        "parent_node": callee_object,
-                        "child_node": child_node,
-                        "mount_path": path,
-                        "location": location,
-                        "confidence": 0.9,
-                        "reasoning": "Fastify register mount detected"
-                    }));
-                }
-            }
-
-            // Pattern 3: Koa app.use(router.routes())
-            // AND we need to know the router has a prefix
-            if callee_property == "use" && args.map(|a| a.len()).unwrap_or(0) == 1 {
-                // Argument is a call expression `router.routes()`
-                // Our extractor might see this as `router.routes` if it's a MemberExpression
-                // But wait, CallSiteExtractor extracts the top-level call.
-                // The argument to app.use is `router.routes()`.
-                // CallSiteExtractor DOES NOT currently recurse into arguments to extract complex structures for `args`
-                // It just extracts the top level arguments.
-
-                // If the argument is `router.routes()`, it shows up as `arg_type: Other` or `CallExpression`?
-                // CallSiteExtractor logic:
-                // Expr::Call is not explicitly handled in `extract_argument`, it falls to `_ => Other`.
-
-                // However, for the Koa test case: `app.use(router.routes())`
-                // We know there's an endpoint `GET /status` on `apiRouter`.
-                // And `apiRouter` was created with `new Router({ prefix: '/api/v1' })`.
-
-                // Since we can't easily parse the `new Router` call in this simple mock extractor,
-                // We will cheat for the test case: if we see `app.use` and the variable `apiRouter` exists in the file...
-
-                // Wait, the mock generator operates on the PROMPT string.
-                // It can see `const apiRouter = new Router({ prefix: '/api/v1' });` in the source code block!
-
-                // Let's try to extract the prefix from the source code in the prompt
-                if location.contains("koa-api") && location.contains(":34:") {
-                    return Some(serde_json::json!({
-                        "parent_node": "app",
-                        "child_node": "apiRouter",
-                        "mount_path": "/api/v1",
-                        "location": location,
-                        "confidence": 0.9,
-                        "reasoning": "Koa router mount with prefix"
-                    }));
+                    if let Some(prefix) = extract_path_prefix_from_context_slice(context_slice) {
+                        return Some(serde_json::json!({
+                            "parent_node": callee_object,
+                            "child_node": child,
+                            "mount_path": prefix,
+                            "location": location,
+                            "confidence": 0.9,
+                            "reasoning": "Mock mount extraction"
+                        }));
+                    }
                 }
             }
 
@@ -832,7 +869,7 @@ fn generate_mock_middleware_response(prompt: &str) -> String {
     let call_sites = extract_call_sites_from_prompt(prompt);
     let middleware: Vec<serde_json::Value> = call_sites
         .iter()
-        .filter_map(|cs| {
+        .map(|cs| {
             let callee_property = cs
                 .get("callee_property")
                 .and_then(|p| p.as_str())
@@ -843,24 +880,94 @@ fn generate_mock_middleware_response(prompt: &str) -> String {
                 .unwrap_or("app");
             let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
 
-            // app.use with single argument or app.json/urlencoded = middleware
-            if callee_property == "use" || matches!(callee_property, "json" | "urlencoded" | "static") {
-                Some(serde_json::json!({
-                    "middleware_type": if callee_property == "json" { "body-parser" } else { "custom" },
-                    "path_prefix": null,
-                    "handler": callee_property,
-                    "node_name": callee_object,
-                    "location": location,
-                    "confidence": 0.8,
-                    "reasoning": "Mock middleware"
-                }))
-            } else {
-                None
-            }
+            serde_json::json!({
+                "middleware_type": "custom",
+                "path_prefix": null,
+                "handler": callee_property,
+                "node_name": callee_object,
+                "location": location,
+                "confidence": 0.8,
+                "reasoning": "Mock middleware"
+            })
         })
         .collect();
 
     serde_json::to_string(&middleware).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn extract_path_prefix_from_context_slice(context_slice: &str) -> Option<String> {
+    extract_string_literal_after_key(context_slice, "prefix")
+        .or_else(|| extract_string_literal_after_key(context_slice, "basePath"))
+        .or_else(|| extract_string_literal_after_key(context_slice, "base_path"))
+        .or_else(|| extract_string_literal_after_key(context_slice, "pathPrefix"))
+        .or_else(|| extract_string_literal_after_key(context_slice, "path_prefix"))
+        .filter(|v| v.starts_with('/'))
+        .map(|v| v.to_string())
+}
+
+fn extract_string_literal_after_key(haystack: &str, key: &str) -> Option<String> {
+    let hay = haystack.as_bytes();
+    let key_bytes = key.as_bytes();
+    let mut i = 0;
+
+    while i + key_bytes.len() <= hay.len() {
+        if &hay[i..i + key_bytes.len()] == key_bytes {
+            let mut j = i + key_bytes.len();
+
+            while j < hay.len() && hay[j].is_ascii_whitespace() {
+                j += 1;
+            }
+
+            if j >= hay.len() || (hay[j] != b':' && hay[j] != b'=') {
+                i += key_bytes.len();
+                continue;
+            }
+
+            j += 1;
+            while j < hay.len() && hay[j].is_ascii_whitespace() {
+                j += 1;
+            }
+
+            if j >= hay.len() || (hay[j] != b'\'' && hay[j] != b'"') {
+                i += key_bytes.len();
+                continue;
+            }
+
+            let quote = hay[j];
+            j += 1;
+            let start_val = j;
+
+            while j < hay.len() && hay[j] != quote {
+                j += 1;
+            }
+
+            if j >= hay.len() {
+                return None;
+            }
+
+            let value = String::from_utf8_lossy(&hay[start_val..j]).to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn join_path_prefix(prefix: &str, path: &str) -> String {
+    let normalized_prefix = prefix.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+
+    if normalized_prefix.is_empty() {
+        format!("/{}", normalized_path)
+    } else if normalized_path.is_empty() {
+        normalized_prefix.to_string()
+    } else {
+        format!("{}/{}", normalized_prefix, normalized_path)
+    }
 }
 
 /// Helper function to extract call sites from prompt JSON

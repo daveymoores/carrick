@@ -166,10 +166,10 @@ Return JSON array with this structure:
 GUIDELINES:
 - These are all data fetching calls (already triaged)
 - Use the framework-specific data fetching patterns above to understand how each library makes HTTP calls
-- Prefer SWC-extracted values if present (e.g., `correlated_fetch.url` on response parsing calls)
+- Prefer SWC-extracted values if present (e.g., `correlated_call.url` on response parsing calls)
 - Extract URL from string literals in arguments if present, otherwise set to null
 - If arguments are Identifiers, check the "resolved_value" field for the actual string value
-- If URL cannot be resolved from args/resolved_value/correlated_fetch, use the `context_slice` field to infer the URL
+- If URL cannot be resolved from args/resolved_value/correlated_call, use the `context_slice` field to infer the URL
 - If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
 - Infer HTTP method from function name (get=GET, post=POST, etc.)
 - For response parsing calls (.json(), .text()), use "response_parsing" as library
@@ -213,7 +213,7 @@ mod prompt_tests {
             definition: None,
             location: "client.ts:1:1".to_string(),
             result_type: None,
-            correlated_fetch: None,
+            correlated_call: None,
             context_slice: None,
         }
     }

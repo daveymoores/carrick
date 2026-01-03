@@ -54,7 +54,7 @@ fn test_call_site_with_result_type() {
             type_string: "Product[]".to_string(),
             utf16_offset: 200,
         }),
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -79,7 +79,7 @@ fn test_call_site_without_result_type() {
         definition: Some("const app = express()".to_string()),
         location: "server.ts:5:0".to_string(),
         result_type: None,
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     };
 
@@ -310,7 +310,7 @@ async fn test_data_fetching_call_enrichment() {
             type_string: "Order[]".to_string(),
             utf16_offset: 450,
         }),
-        correlated_fetch: None,
+        correlated_call: None,
         context_slice: None,
     }];
 
@@ -566,7 +566,7 @@ async function fetchData() {
 
 /// Test that fetch-to-json call correlation is correctly tracked
 /// When we see: const resp = await fetch(url); const data: T = await resp.json();
-/// The .json() call should have correlated_fetch with the original fetch URL
+/// The .json() call should have correlated_call with the originating URL/method
 #[test]
 fn test_fetch_to_json_correlation() {
     let code = r#"
@@ -600,14 +600,13 @@ async function fetchOrders() {
         "Order[]"
     );
 
-    // Should have correlated_fetch from the original fetch() call
     assert!(
-        json_call.correlated_fetch.is_some(),
-        "json() call should have correlated_fetch"
+        json_call.correlated_call.is_some(),
+        "json() call should have correlated_call"
     );
-    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
-    assert_eq!(fetch_info.url.as_deref(), Some("/orders"));
-    assert_eq!(fetch_info.method, "GET");
+    let info = json_call.correlated_call.as_ref().unwrap();
+    assert_eq!(info.url.as_deref(), Some("/orders"));
+    assert_eq!(info.method.as_deref(), Some("GET"));
 }
 
 /// Test fetch-to-json correlation with template literal URL
@@ -633,11 +632,10 @@ async function fetchUsers() {
         .find(|cs| cs.callee_object == "usersResp" && cs.callee_property == "json")
         .expect("Should find usersResp.json() call");
 
-    assert!(json_call.correlated_fetch.is_some());
-    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
-    // Should extract path portion from template literal
-    assert_eq!(fetch_info.url.as_deref(), Some("/users"));
-    assert_eq!(fetch_info.method, "GET");
+    assert!(json_call.correlated_call.is_some());
+    let info = json_call.correlated_call.as_ref().unwrap();
+    assert_eq!(info.url.as_deref(), Some("/users"));
+    assert_eq!(info.method.as_deref(), Some("GET"));
 }
 
 /// Test fetch-to-json correlation with POST method
@@ -662,10 +660,10 @@ async function createOrder(data: any) {
         .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
         .expect("Should find resp.json() call");
 
-    assert!(json_call.correlated_fetch.is_some());
-    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
-    assert_eq!(fetch_info.url.as_deref(), Some("/orders"));
-    assert_eq!(fetch_info.method, "POST");
+    assert!(json_call.correlated_call.is_some());
+    let info = json_call.correlated_call.as_ref().unwrap();
+    assert_eq!(info.url.as_deref(), Some("/orders"));
+    assert_eq!(info.method.as_deref(), Some("POST"));
 }
 
 /// Test multiple fetch-to-json correlations in same function
@@ -700,14 +698,9 @@ async function fetchData() {
         .expect("Should find usersResp.json() call");
 
     // Check orders correlation
-    assert!(orders_json.correlated_fetch.is_some());
+    assert!(orders_json.correlated_call.is_some());
     assert_eq!(
-        orders_json
-            .correlated_fetch
-            .as_ref()
-            .unwrap()
-            .url
-            .as_deref(),
+        orders_json.correlated_call.as_ref().unwrap().url.as_deref(),
         Some("/orders")
     );
     assert_eq!(
@@ -716,9 +709,9 @@ async function fetchData() {
     );
 
     // Check users correlation
-    assert!(users_json.correlated_fetch.is_some());
+    assert!(users_json.correlated_call.is_some());
     assert_eq!(
-        users_json.correlated_fetch.as_ref().unwrap().url.as_deref(),
+        users_json.correlated_call.as_ref().unwrap().url.as_deref(),
         Some("/users")
     );
     assert_eq!(
@@ -727,9 +720,9 @@ async function fetchData() {
     );
 }
 
-/// Test that non-json member calls don't get correlated_fetch
+/// Test that non-json member calls can still be correlated with an originating call
 #[test]
-fn test_non_json_call_no_correlation() {
+fn test_non_json_call_has_correlation() {
     let code = r#"
 async function fetchData() {
     const resp = await fetch("/data");
@@ -745,11 +738,13 @@ async function fetchData() {
         .find(|cs| cs.callee_object == "resp" && cs.callee_property == "text")
         .expect("Should find resp.text() call");
 
-    // text() call should NOT have correlated_fetch (only json() calls get it)
     assert!(
-        text_call.correlated_fetch.is_none(),
-        "text() call should not have correlated_fetch"
+        text_call.correlated_call.is_some(),
+        "text() call should have correlated_call"
     );
+    let info = text_call.correlated_call.as_ref().unwrap();
+    assert_eq!(info.url.as_deref(), Some("/data"));
+    assert_eq!(info.method.as_deref(), Some("GET"));
 }
 
 /// Test template literal with dynamic path parameter (e.g., ${userId})
@@ -776,12 +771,12 @@ async function fetchUserProfile(userId: string) {
         .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
         .expect("Should find resp.json() call");
 
-    assert!(json_call.correlated_fetch.is_some());
-    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
+    assert!(json_call.correlated_call.is_some());
+    let info = json_call.correlated_call.as_ref().unwrap();
 
     // The URL should have dynamic params converted to :param style
     // /users/${userId}/profile -> /users/:userId/profile
-    let url = fetch_info.url.as_ref().expect("Should have URL");
+    let url = info.url.as_ref().expect("Should have URL");
     assert!(
         url.contains(":userId") || url.contains(":param"),
         "Dynamic path param should be normalized. Got: {}",
@@ -817,9 +812,9 @@ async function fetchUserComments(userId: string, postId: string) {
         .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
         .expect("Should find resp.json() call");
 
-    assert!(json_call.correlated_fetch.is_some());
-    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
-    let url = fetch_info.url.as_ref().expect("Should have URL");
+    assert!(json_call.correlated_call.is_some());
+    let info = json_call.correlated_call.as_ref().unwrap();
+    let url = info.url.as_ref().expect("Should have URL");
 
     // Should have two distinct dynamic params, not duplicated names
     // /users/${userId}/posts/${postId}/comments -> /users/:userId/posts/:postId/comments
@@ -860,9 +855,9 @@ async function fetchOrder(orderId: string) {
         .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
         .expect("Should find resp.json() call");
 
-    assert!(json_call.correlated_fetch.is_some());
-    let fetch_info = json_call.correlated_fetch.as_ref().unwrap();
-    let url = fetch_info.url.as_ref().expect("Should have URL");
+    assert!(json_call.correlated_call.is_some());
+    let info = json_call.correlated_call.as_ref().unwrap();
+    let url = info.url.as_ref().expect("Should have URL");
 
     // Should extract /orders/:orderId, not the full URL
     assert!(

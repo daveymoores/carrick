@@ -346,16 +346,18 @@ impl CallSiteOrchestrator {
                 // The LLM often returns malformed URLs (e.g., template literals with env vars)
                 // while SWC properly normalizes them (e.g., /orders instead of ${process.env.URL}/orders)
                 // This is done FIRST, regardless of whether we have type info
-                if let Some(fetch_info) = &call_site.correlated_fetch {
-                    if fetch_info.url.is_some() {
-                        call.url = fetch_info.url.clone(); // Always use SWC URL
+                if let Some(info) = &call_site.correlated_call {
+                    if info.url.is_some() {
+                        call.url = info.url.clone();
                     }
                     if call.method.is_none() {
-                        call.method = Some(fetch_info.method.clone());
+                        if let Some(method) = &info.method {
+                            call.method = Some(method.clone());
+                        }
                     }
                     println!(
-                        "  Correlated .json() call with fetch: url={:?}, method={}",
-                        fetch_info.url, fetch_info.method
+                        "  Correlated member call with origin: url={:?}, method={:?}",
+                        info.url, info.method
                     );
                 }
 
@@ -389,10 +391,13 @@ impl CallSiteOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::call_site_extractor::{FetchCallInfo, ResultTypeInfo};
+    use crate::call_site_extractor::{CorrelatedCallInfo, ResultTypeInfo};
 
     /// Helper to create a minimal CallSite for testing
-    fn create_test_call_site(location: &str, correlated_fetch: Option<FetchCallInfo>) -> CallSite {
+    fn create_test_call_site(
+        location: &str,
+        correlated_call: Option<CorrelatedCallInfo>,
+    ) -> CallSite {
         CallSite {
             callee_object: "response".to_string(),
             callee_property: "json".to_string(),
@@ -403,7 +408,7 @@ mod tests {
                 type_string: "Order[]".to_string(),
                 utf16_offset: 100,
             }),
-            correlated_fetch,
+            correlated_call,
             context_slice: None,
         }
     }
@@ -439,9 +444,10 @@ mod tests {
         // Create a CallSite with properly normalized SWC URL
         let call_sites = vec![create_test_call_site(
             "server.ts:58:11",
-            Some(FetchCallInfo {
-                url: Some("/orders".to_string()), // SWC's good URL
-                method: "GET".to_string(),
+            Some(CorrelatedCallInfo {
+                callee: "fetch".to_string(),
+                url: Some("/orders".to_string()),
+                method: Some("GET".to_string()),
                 location: "server.ts:55:18".to_string(),
             }),
         )];
@@ -463,12 +469,14 @@ mod tests {
         for call in calls.iter_mut() {
             if let Some(call_site) = location_to_call_site.get(&call.location) {
                 // Apply the FIX: Always prefer SWC-extracted URL over LLM URL
-                if let Some(fetch_info) = &call_site.correlated_fetch {
-                    if fetch_info.url.is_some() {
-                        call.url = fetch_info.url.clone(); // Always use SWC URL
+                if let Some(info) = &call_site.correlated_call {
+                    if info.url.is_some() {
+                        call.url = info.url.clone();
                     }
                     if call.method.is_none() {
-                        call.method = Some(fetch_info.method.clone());
+                        if let Some(method) = &info.method {
+                            call.method = Some(method.clone());
+                        }
                     }
                 }
             }
@@ -490,9 +498,10 @@ mod tests {
         // Create a CallSite with SWC-extracted URL
         let call_sites = vec![create_test_call_site(
             "api.ts:23:5",
-            Some(FetchCallInfo {
+            Some(CorrelatedCallInfo {
+                callee: "request".to_string(),
                 url: Some("/users/:id".to_string()),
-                method: "POST".to_string(),
+                method: Some("POST".to_string()),
                 location: "api.ts:20:10".to_string(),
             }),
         )];
@@ -504,12 +513,14 @@ mod tests {
 
         for call in calls.iter_mut() {
             if let Some(call_site) = location_to_call_site.get(&call.location) {
-                if let Some(fetch_info) = &call_site.correlated_fetch {
-                    if fetch_info.url.is_some() {
-                        call.url = fetch_info.url.clone();
+                if let Some(info) = &call_site.correlated_call {
+                    if info.url.is_some() {
+                        call.url = info.url.clone();
                     }
                     if call.method.is_none() {
-                        call.method = Some(fetch_info.method.clone());
+                        if let Some(method) = &info.method {
+                            call.method = Some(method.clone());
+                        }
                     }
                 }
             }
@@ -520,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_correlated_fetch_preserves_llm_url() {
+    fn test_no_correlated_call_preserves_llm_url() {
         // Create a DataFetchingCall with an LLM URL
         let mut calls = [create_test_data_fetching_call(
             "client.ts:10:5",
@@ -541,18 +552,20 @@ mod tests {
 
         for call in calls.iter_mut() {
             if let Some(call_site) = location_to_call_site.get(&call.location) {
-                if let Some(fetch_info) = &call_site.correlated_fetch {
-                    if fetch_info.url.is_some() {
-                        call.url = fetch_info.url.clone();
+                if let Some(info) = &call_site.correlated_call {
+                    if info.url.is_some() {
+                        call.url = info.url.clone();
                     }
                     if call.method.is_none() {
-                        call.method = Some(fetch_info.method.clone());
+                        if let Some(method) = &info.method {
+                            call.method = Some(method.clone());
+                        }
                     }
                 }
             }
         }
 
-        // URL should remain unchanged since there's no correlated fetch
+        // URL should remain unchanged since there's no correlated call
         assert_eq!(calls[0].url, Some("/api/data".to_string()));
         assert_eq!(calls[0].method, Some("GET".to_string()));
     }
@@ -569,9 +582,10 @@ mod tests {
         // Create a CallSite with result type info
         let call_sites = vec![create_test_call_site(
             "server.ts:58:11",
-            Some(FetchCallInfo {
+            Some(CorrelatedCallInfo {
+                callee: "fetch".to_string(),
                 url: Some("/orders".to_string()),
-                method: "GET".to_string(),
+                method: Some("GET".to_string()),
                 location: "server.ts:55:18".to_string(),
             }),
         )];
@@ -596,12 +610,14 @@ mod tests {
                 }
 
                 // Apply the FIX: Always prefer SWC-extracted URL
-                if let Some(fetch_info) = &call_site.correlated_fetch {
-                    if fetch_info.url.is_some() {
-                        call.url = fetch_info.url.clone();
+                if let Some(info) = &call_site.correlated_call {
+                    if info.url.is_some() {
+                        call.url = info.url.clone();
                     }
                     if call.method.is_none() {
-                        call.method = Some(fetch_info.method.clone());
+                        if let Some(method) = &info.method {
+                            call.method = Some(method.clone());
+                        }
                     }
                 }
             }
@@ -630,9 +646,10 @@ mod tests {
             definition: None,
             location: "server.ts:58:11".to_string(),
             result_type: None, // No result type!
-            correlated_fetch: Some(FetchCallInfo {
-                url: Some("/orders".to_string()), // SWC's good URL
-                method: "GET".to_string(),
+            correlated_call: Some(CorrelatedCallInfo {
+                callee: "fetch".to_string(),
+                url: Some("/orders".to_string()),
+                method: Some("GET".to_string()),
                 location: "server.ts:55:18".to_string(),
             }),
             context_slice: None,
@@ -645,13 +662,14 @@ mod tests {
 
         for call in calls.iter_mut() {
             if let Some(call_site) = location_to_call_site.get(&call.location) {
-                // SWC URL preference should happen FIRST, regardless of result_type
-                if let Some(fetch_info) = &call_site.correlated_fetch {
-                    if fetch_info.url.is_some() {
-                        call.url = fetch_info.url.clone();
+                if let Some(info) = &call_site.correlated_call {
+                    if info.url.is_some() {
+                        call.url = info.url.clone();
                     }
                     if call.method.is_none() {
-                        call.method = Some(fetch_info.method.clone());
+                        if let Some(method) = &info.method {
+                            call.method = Some(method.clone());
+                        }
                     }
                 }
             }
