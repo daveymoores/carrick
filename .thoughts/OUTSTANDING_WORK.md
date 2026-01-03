@@ -12,6 +12,8 @@ For deeper analysis and rationale, see:
 
 - Single-file static slicing for call sites (`context_slice`).
 - Agent prompts updated to actively use `context_slice` during extraction.
+- Library/framework-agnostic call correlation via `correlated_call` (no `fetch()`/`.json()`-specific data model).
+- Mock-mode responses no longer use fixture/framework name checks; mounts/endpoints can be inferred using structural cues and `context_slice` (e.g. extracting `prefix: '/api/v1'`).
 
 ---
 
@@ -22,7 +24,7 @@ For deeper analysis and rationale, see:
 Goal: the core should not rely on fetch/axios/Express-specific assumptions beyond HTTP verbs + path normalization.
 
 Work:
-- Reduce hard-coded `fetch()` and `.json()` assumptions in extraction and correlation logic.
+- [x] Reduce hard-coded `fetch()` and `.json()` assumptions in extraction and correlation logic.
 - Improve call-site capture coverage so it includes chained/factory/namespaced callees (not just `ident.method()`).
 - Treat “is this an HTTP call / endpoint / mount / middleware” as classification, powered by `context_slice`, rather than pattern matching.
 - Fix noisy/incorrect env-var configuration suggestions.
@@ -45,7 +47,7 @@ Work:
 ### 3) Test and fixture hardening
 
 Work:
-- Reduce framework-specific heuristics embedded in mock-mode responses used by tests.
+- [x] Reduce framework-specific heuristics embedded in mock-mode responses used by tests.
 - Add fixtures that exercise non-trivial call shapes (chaining, wrappers, schema decoders) and validate coverage improvements.
 
 ---
