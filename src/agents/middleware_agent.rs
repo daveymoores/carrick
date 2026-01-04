@@ -45,20 +45,55 @@ impl MiddlewareAgent {
             call_sites.len()
         );
 
-        let prompt =
-            self.build_middleware_prompt(call_sites, framework_detection, framework_guidance);
-        let system_message = self.build_system_message();
+        // Batch size for parallel processing
+        const BATCH_SIZE: usize = 10;
+        let mut all_middleware = Vec::new();
+        let mut join_set = tokio::task::JoinSet::new();
+        let total_batches = call_sites.len().div_ceil(BATCH_SIZE);
 
-        let schema = AgentSchemas::middleware_schema();
-        let response = self
-            .gemini_service
-            .analyze_code_with_schema(&prompt, &system_message, Some(schema))
-            .await?;
+        for (batch_idx, batch) in call_sites.chunks(BATCH_SIZE).enumerate() {
+            let batch_num = batch_idx + 1;
+            println!(
+                "Preparing middleware batch {} of {} ({} call sites)",
+                batch_num,
+                total_batches,
+                batch.len()
+            );
 
-        let middleware: Vec<Middleware> = serde_json::from_str(&response)
-            .map_err(|e| format!("Failed to parse middleware detection response: {}", e))?;
+            let prompt =
+                self.build_middleware_prompt(batch, framework_detection, framework_guidance);
+            let system_message = self.build_system_message();
+            let gemini_service = self.gemini_service.clone();
 
-        Ok(middleware)
+            join_set.spawn(async move {
+                let schema = AgentSchemas::middleware_schema();
+                let response = gemini_service
+                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .await
+                    .map_err(|e| {
+                        format!("Gemini API error in middleware batch {}: {}", batch_num, e)
+                    })?;
+
+                let middleware: Vec<Middleware> = serde_json::from_str(&response).map_err(|e| {
+                    format!(
+                        "Failed to parse middleware detection response for batch {}: {}",
+                        batch_num, e
+                    )
+                })?;
+
+                Ok::<Vec<Middleware>, String>(middleware)
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(middleware)) => all_middleware.extend(middleware),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+
+        Ok(all_middleware)
     }
 
     fn build_system_message(&self) -> String {

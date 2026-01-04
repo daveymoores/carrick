@@ -47,20 +47,55 @@ impl ConsumerAgent {
             call_sites.len()
         );
 
-        let prompt =
-            self.build_fetching_prompt(call_sites, framework_detection, framework_guidance);
-        let system_message = self.build_system_message();
+        // Batch size for parallel processing
+        const BATCH_SIZE: usize = 10;
+        let mut all_calls = Vec::new();
+        let mut join_set = tokio::task::JoinSet::new();
+        let total_batches = call_sites.len().div_ceil(BATCH_SIZE);
 
-        let schema = AgentSchemas::consumer_schema();
-        let response = self
-            .gemini_service
-            .analyze_code_with_schema(&prompt, &system_message, Some(schema))
-            .await?;
+        for (batch_idx, batch) in call_sites.chunks(BATCH_SIZE).enumerate() {
+            let batch_num = batch_idx + 1;
+            println!(
+                "Preparing consumer batch {} of {} ({} call sites)",
+                batch_num,
+                total_batches,
+                batch.len()
+            );
 
-        let calls: Vec<DataFetchingCall> = serde_json::from_str(&response)
-            .map_err(|e| format!("Failed to parse data fetching detection response: {}", e))?;
+            let prompt = self.build_fetching_prompt(batch, framework_detection, framework_guidance);
+            let system_message = self.build_system_message();
+            let gemini_service = self.gemini_service.clone();
 
-        Ok(calls)
+            join_set.spawn(async move {
+                let schema = AgentSchemas::consumer_schema();
+                let response = gemini_service
+                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .await
+                    .map_err(|e| {
+                        format!("Gemini API error in consumer batch {}: {}", batch_num, e)
+                    })?;
+
+                let calls: Vec<DataFetchingCall> =
+                    serde_json::from_str(&response).map_err(|e| {
+                        format!(
+                            "Failed to parse data fetching detection response for batch {}: {}",
+                            batch_num, e
+                        )
+                    })?;
+
+                Ok::<Vec<DataFetchingCall>, String>(calls)
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(calls)) => all_calls.extend(calls),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+
+        Ok(all_calls)
     }
 
     fn build_system_message(&self) -> String {

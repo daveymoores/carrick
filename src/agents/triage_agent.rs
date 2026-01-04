@@ -96,57 +96,61 @@ impl TriageAgent {
         println!("=== TRIAGE AGENT DEBUG ===");
         println!("Triaging {} call sites", call_sites.len());
 
-        // Batch size to avoid 503 errors and rate limiting - reduced from 10 to 5
-        const BATCH_SIZE: usize = 5;
+        // Batch size for parallel processing
+        const BATCH_SIZE: usize = 10;
         let mut all_results = Vec::new();
+        let mut join_set = tokio::task::JoinSet::new();
+        let total_batches = call_sites.len().div_ceil(BATCH_SIZE);
 
-        for (batch_num, batch) in call_sites.chunks(BATCH_SIZE).enumerate() {
+        for (batch_idx, batch) in call_sites.chunks(BATCH_SIZE).enumerate() {
+            let batch_num = batch_idx + 1;
             println!(
-                "Processing batch {} of {} ({} call sites)",
-                batch_num + 1,
-                call_sites.len().div_ceil(BATCH_SIZE),
+                "Preparing batch {} of {} ({} call sites)",
+                batch_num,
+                total_batches,
                 batch.len()
             );
 
             let prompt = self.build_triage_prompt(batch, framework_detection, framework_guidance);
             let system_message = self.build_system_message();
+            let gemini_service = self.gemini_service.clone();
 
-            println!(
-                "Batch {} prompt length: {} chars",
-                batch_num + 1,
-                prompt.len()
-            );
+            join_set.spawn(async move {
+                println!("Batch {} prompt length: {} chars", batch_num, prompt.len());
 
-            let schema = AgentSchemas::triage_schema();
-            let response = self
-                .gemini_service
-                .analyze_code_with_schema(&prompt, &system_message, Some(schema))
-                .await?;
+                let schema = AgentSchemas::triage_schema();
+                let response = gemini_service
+                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .await
+                    .map_err(|e| format!("Gemini API error in batch {}: {}", batch_num, e))?;
 
-            println!("=== RAW GEMINI RESPONSE BATCH {} ===", batch_num + 1);
-            println!("{}", response);
-            println!("=== END RAW RESPONSE ===");
+                println!("=== RAW GEMINI RESPONSE BATCH {} ===", batch_num);
+                println!("{}", response);
+                println!("=== END RAW RESPONSE ===");
 
-            let batch_results: Vec<TriageResult> =
-                serde_json::from_str(&response).map_err(|e| {
-                    format!(
-                        "Failed to parse triage response for batch {}: {}. Raw response: {}",
-                        batch_num + 1,
-                        e,
-                        response
-                    )
-                })?;
+                let batch_results: Vec<TriageResult> =
+                    serde_json::from_str(&response).map_err(|e| {
+                        format!(
+                            "Failed to parse triage response for batch {}: {}. Raw response: {}",
+                            batch_num, e, response
+                        )
+                    })?;
 
-            println!(
-                "Batch {} classified {} call sites",
-                batch_num + 1,
-                batch_results.len()
-            );
-            all_results.extend(batch_results);
+                println!(
+                    "Batch {} classified {} call sites",
+                    batch_num,
+                    batch_results.len()
+                );
 
-            // Delay between batches to avoid rate limiting - increased from 500ms to 1000ms
-            if batch_num + 1 < call_sites.len().div_ceil(BATCH_SIZE) {
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                Ok::<Vec<TriageResult>, String>(batch_results)
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(batch_results)) => all_results.extend(batch_results),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(Box::new(e)),
             }
         }
 

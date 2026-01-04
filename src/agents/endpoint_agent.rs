@@ -48,25 +48,60 @@ impl EndpointAgent {
             call_sites.len()
         );
 
-        let prompt =
-            self.build_endpoint_prompt(call_sites, framework_detection, framework_guidance);
-        let system_message = self.build_system_message();
+        // Batch size for parallel processing
+        const BATCH_SIZE: usize = 10;
+        let mut all_endpoints = Vec::new();
+        let mut join_set = tokio::task::JoinSet::new();
+        let total_batches = call_sites.len().div_ceil(BATCH_SIZE);
 
-        let schema = AgentSchemas::endpoint_schema();
-        let response = self
-            .gemini_service
-            .analyze_code_with_schema(&prompt, &system_message, Some(schema))
-            .await?;
+        for (batch_idx, batch) in call_sites.chunks(BATCH_SIZE).enumerate() {
+            let batch_num = batch_idx + 1;
+            println!(
+                "Preparing endpoint batch {} of {} ({} call sites)",
+                batch_num,
+                total_batches,
+                batch.len()
+            );
 
-        println!("=== RAW GEMINI ENDPOINT RESPONSE ===");
-        println!("{}", response);
-        println!("=== END RAW RESPONSE ===");
+            let prompt = self.build_endpoint_prompt(batch, framework_detection, framework_guidance);
+            let system_message = self.build_system_message();
+            let gemini_service = self.gemini_service.clone();
 
-        let endpoints: Vec<HttpEndpoint> = serde_json::from_str(&response)
-            .map_err(|e| format!("Failed to parse endpoint detection response: {}", e))?;
+            join_set.spawn(async move {
+                let schema = AgentSchemas::endpoint_schema();
+                let response = gemini_service
+                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .await
+                    .map_err(|e| {
+                        format!("Gemini API error in endpoint batch {}: {}", batch_num, e)
+                    })?;
 
-        println!("Extracted {} endpoints:", endpoints.len());
-        for (i, endpoint) in endpoints.iter().enumerate() {
+                println!("=== RAW GEMINI ENDPOINT RESPONSE BATCH {} ===", batch_num);
+                println!("{}", response);
+                println!("=== END RAW RESPONSE ===");
+
+                let endpoints: Vec<HttpEndpoint> =
+                    serde_json::from_str(&response).map_err(|e| {
+                        format!(
+                            "Failed to parse endpoint detection response for batch {}: {}",
+                            batch_num, e
+                        )
+                    })?;
+
+                Ok::<Vec<HttpEndpoint>, String>(endpoints)
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(endpoints)) => all_endpoints.extend(endpoints),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+
+        println!("Extracted {} endpoints:", all_endpoints.len());
+        for (i, endpoint) in all_endpoints.iter().enumerate() {
             println!(
                 "  {}. {} {} (owner: {})",
                 i + 1,
@@ -76,7 +111,7 @@ impl EndpointAgent {
             );
         }
 
-        Ok(endpoints)
+        Ok(all_endpoints)
     }
 
     fn build_system_message(&self) -> String {

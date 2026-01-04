@@ -191,14 +191,55 @@ impl CallSiteOrchestrator {
         };
 
         for triage_result in triage_results {
-            let call_site = location_to_call_site
-                .get(&triage_result.location)
-                .ok_or_else(|| {
-                    format!(
-                        "Triage result location '{}' not found in original call sites",
-                        triage_result.location
+            // Try exact match first, then fuzzy match
+            let call_site = if let Some(site) = location_to_call_site.get(&triage_result.location) {
+                *site
+            } else {
+                // Fuzzy match: check if one location string ends with the other
+                // This handles cases where LLM adds/removes relative path prefixes (../)
+                let matches: Vec<&CallSite> = call_sites
+                    .iter()
+                    .filter(|cs| {
+                        // 1. Path suffix match (strongest fuzzy match)
+                        if cs.location.ends_with(&triage_result.location)
+                            || triage_result.location.ends_with(&cs.location)
+                        {
+                            return true;
+                        }
+
+                        // 2. Filename + Line:Col match (fallback for directory structure hallucinations)
+                        // Extract "filename:line:col" from end of strings
+                        // e.g. "src/utils/file.ts:10:5" -> "file.ts:10:5"
+                        let cs_suffix = cs
+                            .location
+                            .rsplit_once('/')
+                            .map(|(_, suffix)| suffix)
+                            .unwrap_or(&cs.location);
+                        let triage_suffix = triage_result
+                            .location
+                            .rsplit_once('/')
+                            .map(|(_, suffix)| suffix)
+                            .unwrap_or(&triage_result.location);
+
+                        cs_suffix == triage_suffix
+                    })
+                    .collect();
+
+                if matches.len() == 1 {
+                    println!(
+                        "WARNING: Fuzzy matched location '{}' to '{}'",
+                        triage_result.location, matches[0].location
+                    );
+                    matches[0]
+                } else {
+                    return Err(format!(
+                        "Triage result location '{}' not found in original call sites (found {} fuzzy matches)",
+                        triage_result.location,
+                        matches.len()
                     )
-                })?;
+                    .into());
+                }
+            };
 
             match triage_result.classification {
                 TriageClassification::HttpEndpoint => {

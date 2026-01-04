@@ -3,6 +3,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 
 /// Reusable service for making Gemini API calls
@@ -10,13 +12,22 @@ use tokio::time::{Duration, sleep};
 pub struct GeminiService {
     api_key: String,
     client: Client,
+    semaphore: Arc<Semaphore>,
 }
 
 impl GeminiService {
     pub fn new(api_key: String) -> Self {
+        // Limit concurrent requests to avoid rate limits
+        // Paid tier allows higher limits, but let's be safe with 20 concurrent requests
+        let concurrency_limit = env::var("CARRICK_CONCURRENCY_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+
         Self {
             api_key,
             client: Client::new(),
+            semaphore: Arc::new(Semaphore::new(concurrency_limit)),
         }
     }
 
@@ -37,6 +48,13 @@ impl GeminiService {
         system_message: &str,
         response_schema: Option<serde_json::Value>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // Acquire permit to limit concurrency
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
+
         // Skip API call in mock mode - return schema-appropriate mock data
         if env::var("CARRICK_MOCK_ALL").is_ok() {
             return Ok(generate_mock_response(&response_schema, prompt));
@@ -75,7 +93,8 @@ impl GeminiService {
             request_builder.header("Authorization", format!("Bearer {}", self.api_key));
 
         // Retry logic for transient failures (max 3 attempts)
-        for attempt in 1..=3 {
+        let max_retries = 5;
+        for attempt in 1..=max_retries {
             match request_builder.try_clone().unwrap().send().await {
                 Ok(response) => {
                     if response.status().is_success() {
@@ -96,8 +115,19 @@ impl GeminiService {
                     } else {
                         let status = response.status();
 
+                        // Retry on 429 Too Many Requests
+                        if status == 429 && attempt < max_retries {
+                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                            println!(
+                                "Gemini API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
+                                wait_time, attempt, max_retries
+                            );
+                            sleep(wait_time).await;
+                            continue;
+                        }
+
                         // Only retry on 503 Service Unavailable
-                        if status == 503 && attempt < 3 {
+                        if status == 503 && attempt < max_retries {
                             let delay_ms = 1000 * attempt;
                             eprintln!(
                                 "Gemini API returned 503, retrying in {}ms (attempt {}/3)",
@@ -550,7 +580,12 @@ fn generate_mock_triage_response(prompt: &str) -> String {
                 .unwrap_or("");
 
             let args = cs.get("args").and_then(|a| a.as_array());
-            let arg_count = args.map(|a| a.len()).unwrap_or(0);
+            let arg_count = cs
+                .get("arg_count")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as usize)
+                .or_else(|| args.map(|a| a.len()))
+                .unwrap_or(0);
 
             let has_correlated_call = cs
                 .get("correlated_call")
@@ -572,19 +607,28 @@ fn generate_mock_triage_response(prompt: &str) -> String {
                 "HttpEndpoint"
             } else if callee_property == "use" {
                 if arg_count >= 2 {
-                    let first_is_string = args
-                        .and_then(|a| a.first())
-                        .and_then(|arg| arg.get("arg_type"))
+                    let first_is_string = cs
+                        .get("first_arg_type")
                         .and_then(|t| t.as_str())
-                        == Some("StringLiteral");
+                        .map(|t| t == "StringLiteral")
+                        .or_else(|| {
+                            args.and_then(|a| a.first())
+                                .and_then(|arg| arg.get("arg_type"))
+                                .and_then(|t| t.as_str())
+                                .map(|t| t == "StringLiteral")
+                        })
+                        .unwrap_or(false);
 
+                    // For LeanCallSite we don't have second arg info, so we assume RouterMount
+                    // if first arg is string and arg_count >= 2.
+                    // For full CallSite we check second arg is Identifier.
                     let second_is_id = args
                         .and_then(|a| a.get(1))
                         .and_then(|arg| arg.get("arg_type"))
                         .and_then(|t| t.as_str())
                         == Some("Identifier");
 
-                    if first_is_string && second_is_id {
+                    if first_is_string && (args.is_none() || second_is_id) {
                         "RouterMount"
                     } else {
                         "Middleware"
@@ -989,6 +1033,26 @@ fn extract_call_sites_from_prompt(prompt: &str) -> Vec<serde_json::Value> {
                 }
             }
         }
+    }
+
+    // Fallback: iterate through all JSON arrays to find one that looks like call sites
+    // This handles cases where LeanCallSite serialization might differ slightly
+    // and avoids picking up other arrays (like frameworks list)
+    let mut current_pos = 0;
+    while let Some(start) = prompt[current_pos..].find('[') {
+        let abs_start = current_pos + start;
+        if let Some(end_offset) = find_matching_bracket(&prompt[abs_start..]) {
+            let json_str = &prompt[abs_start..abs_start + end_offset];
+            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                if !parsed.is_empty()
+                    && parsed[0].get("callee_object").is_some()
+                    && parsed[0].get("location").is_some()
+                {
+                    return parsed;
+                }
+            }
+        }
+        current_pos = abs_start + 1;
     }
 
     vec![]

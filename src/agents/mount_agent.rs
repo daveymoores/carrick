@@ -44,24 +44,58 @@ impl MountAgent {
             call_sites.len()
         );
 
-        let prompt = self.build_mount_prompt(call_sites, framework_detection, framework_guidance);
-        let system_message = self.build_system_message();
+        // Batch size for parallel processing
+        const BATCH_SIZE: usize = 10;
+        let mut all_mounts = Vec::new();
+        let mut join_set = tokio::task::JoinSet::new();
+        let total_batches = call_sites.len().div_ceil(BATCH_SIZE);
 
-        let schema = AgentSchemas::mount_schema();
-        let response = self
-            .gemini_service
-            .analyze_code_with_schema(&prompt, &system_message, Some(schema))
-            .await?;
+        for (batch_idx, batch) in call_sites.chunks(BATCH_SIZE).enumerate() {
+            let batch_num = batch_idx + 1;
+            println!(
+                "Preparing mount batch {} of {} ({} call sites)",
+                batch_num,
+                total_batches,
+                batch.len()
+            );
 
-        println!("=== RAW GEMINI MOUNT RESPONSE ===");
-        println!("{}", response);
-        println!("=== END RAW RESPONSE ===");
+            let prompt = self.build_mount_prompt(batch, framework_detection, framework_guidance);
+            let system_message = self.build_system_message();
+            let gemini_service = self.gemini_service.clone();
 
-        let mounts: Vec<MountRelationship> = serde_json::from_str(&response)
-            .map_err(|e| format!("Failed to parse mount detection response: {}", e))?;
+            join_set.spawn(async move {
+                let schema = AgentSchemas::mount_schema();
+                let response = gemini_service
+                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .await
+                    .map_err(|e| format!("Gemini API error in mount batch {}: {}", batch_num, e))?;
 
-        println!("Extracted {} mount relationships:", mounts.len());
-        for (i, mount) in mounts.iter().enumerate() {
+                println!("=== RAW GEMINI MOUNT RESPONSE BATCH {} ===", batch_num);
+                println!("{}", response);
+                println!("=== END RAW RESPONSE ===");
+
+                let mounts: Vec<MountRelationship> =
+                    serde_json::from_str(&response).map_err(|e| {
+                        format!(
+                            "Failed to parse mount detection response for batch {}: {}",
+                            batch_num, e
+                        )
+                    })?;
+
+                Ok::<Vec<MountRelationship>, String>(mounts)
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(mounts)) => all_mounts.extend(mounts),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+
+        println!("Extracted {} mount relationships:", all_mounts.len());
+        for (i, mount) in all_mounts.iter().enumerate() {
             println!(
                 "  {}. {} mounts {} at {}",
                 i + 1,
@@ -71,7 +105,7 @@ impl MountAgent {
             );
         }
 
-        Ok(mounts)
+        Ok(all_mounts)
     }
 
     fn build_system_message(&self) -> String {
