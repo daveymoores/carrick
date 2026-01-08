@@ -1,6 +1,5 @@
 use crate::{
-    agents::schemas::AgentSchemas, framework_detector::DetectionResult,
-    gemini_service::GeminiService,
+    agent_service::AgentService, agents::schemas::AgentSchemas, framework_detector::DetectionResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,12 +45,12 @@ pub struct FrameworkGuidance {
 /// patterns for whatever frameworks are detected, without any
 /// hardcoded framework knowledge.
 pub struct FrameworkGuidanceAgent {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
 }
 
 impl FrameworkGuidanceAgent {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        Self { gemini_service }
+    pub fn new(agent_service: AgentService) -> Self {
+        Self { agent_service }
     }
 
     /// Generate framework-specific guidance based on detected frameworks.
@@ -72,11 +71,11 @@ impl FrameworkGuidanceAgent {
 
         let schema = AgentSchemas::framework_guidance_schema();
         let response = self
-            .gemini_service
+            .agent_service
             .analyze_code_with_schema(&prompt, &system_message, Some(schema))
             .await?;
 
-        println!("=== RAW GEMINI FRAMEWORK GUIDANCE RESPONSE ===");
+        println!("=== RAW AGENT FRAMEWORK GUIDANCE RESPONSE ===");
         println!("{}", response);
         println!("=== END RAW RESPONSE ===");
 
@@ -225,8 +224,8 @@ mod tests {
 
     #[test]
     fn test_build_prompt_with_frameworks() {
-        let gemini_service = GeminiService::new("mock".to_string());
-        let agent = FrameworkGuidanceAgent::new(gemini_service);
+        let agent_service = crate::agent_service::AgentService::new("mock".to_string());
+        let agent = FrameworkGuidanceAgent::new(agent_service);
 
         let detection = DetectionResult {
             frameworks: vec!["someframework".to_string()],
@@ -242,8 +241,8 @@ mod tests {
 
     #[test]
     fn test_build_prompt_with_no_frameworks() {
-        let gemini_service = GeminiService::new("mock".to_string());
-        let agent = FrameworkGuidanceAgent::new(gemini_service);
+        let agent_service = crate::agent_service::AgentService::new("mock".to_string());
+        let agent = FrameworkGuidanceAgent::new(agent_service);
 
         let detection = DetectionResult {
             frameworks: vec![],

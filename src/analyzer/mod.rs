@@ -232,7 +232,7 @@ impl Analyzer {
     }
 
     pub async fn analyze_functions_for_fetch_calls(&mut self) {
-        use crate::gemini_service::extract_calls_from_async_expressions;
+        use crate::agent_service::extract_calls_from_async_expressions;
 
         let mut all_async_contexts = Vec::new();
 
@@ -533,6 +533,18 @@ impl Analyzer {
             }
         }
 
+        // Handle start-of-string variable (e.g. API_URL + "/path")
+        if let Some(first_char) = route.chars().next() {
+            if first_char.is_uppercase() {
+                let end = route
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(route.len());
+                if end > 0 {
+                    return route[..end].to_string();
+                }
+            }
+        }
+
         "UNKNOWN_API".to_string()
     }
 
@@ -568,6 +580,31 @@ impl Analyzer {
                         .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
                 {
                     return true;
+                }
+            }
+        }
+
+        // Check for start-of-string variables (e.g. API_URL + "/path")
+        // If it starts with an uppercase letter and is not a path (doesn't start with /),
+        // we treat it as a potential environment variable or constant base URL.
+        if let Some(first_char) = route.chars().next() {
+            if first_char.is_uppercase() {
+                // Extract the first identifier
+                let end = route
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(route.len());
+
+                // If the identifier is non-empty and looks like a constant (mostly uppercase/digits/underscore)
+                // we treat it as an env var.
+                // We verify it's at least 2 chars to avoid single letters being treated as vars excessively
+                if end >= 2 {
+                    let ident = &route[..end];
+                    if ident
+                        .chars()
+                        .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+                    {
+                        return true;
+                    }
                 }
             }
         }
@@ -1712,5 +1749,111 @@ mod tests {
         assert!(!Analyzer::is_env_var_base_url("${userId}")); // lowercase, not env var pattern
         assert!(!Analyzer::is_env_var_base_url("${camelCase}/path")); // camelCase, not env var
         assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
+    }
+    #[test]
+    fn test_analyze_matches_with_mount_graph_env_vars() {
+        // Setup config with internal env vars
+        let config = Config {
+            internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
+            ..Config::default()
+        };
+
+        // Create analyzer with dummy source map (not used for this analysis)
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(config, cm);
+
+        // Add calls that use env vars
+        // 1. Valid internal call (should match if endpoint exists, or report missing)
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "ENV_VAR:API_URL:/users".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        // 2. Unclassified env var (not in internal/external list)
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "ENV_VAR:UNKNOWN_VAR:/posts".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        // 3. Process.env pattern (should be detected as env var)
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "${process.env.OTHER_VAR}/comments".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        // 4. Raw code pattern with UPPERCASE var (common in legacy code)
+        // e.g. LEGACY_API_URL + "/users"
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "LEGACY_API_URL + \"/users\"".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        let mount_graph = MountGraph::new(); // Empty graph
+
+        // Run analysis
+        let (call_issues, _, env_var_calls) =
+            analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        // Check results
+        // 1. Valid internal call should be in call_issues (missing endpoint) because graph is empty
+        // Note: The analyzer normalizes the path for the error message
+        assert!(
+            call_issues
+                .iter()
+                .any(|i| i.contains("Missing endpoint") && i.contains("/users"))
+        );
+
+        // 2. Unclassified var should be in env_var_calls
+        assert!(
+            env_var_calls
+                .iter()
+                .any(|i| i.contains("Unclassified env var") && i.contains("UNKNOWN_VAR"))
+        );
+
+        // 3. Process.env var should be in env_var_calls
+        assert!(
+            env_var_calls
+                .iter()
+                .any(|i| i.contains("Unclassified env var") && i.contains("OTHER_VAR"))
+        );
+
+        // 4. Raw UPPERCASE var should be in env_var_calls
+        assert!(
+            env_var_calls
+                .iter()
+                .any(|i| i.contains("Unclassified env var") && i.contains("LEGACY_API_URL"))
+        );
     }
 }

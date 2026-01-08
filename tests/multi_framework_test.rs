@@ -1,8 +1,8 @@
 use carrick::{
+    agent_service::AgentService,
     agents::{CallSiteOrchestrator, FrameworkGuidance},
     call_site_extractor::{CallSiteExtractionService, CallSiteExtractor},
     framework_detector::FrameworkDetector,
-    gemini_service::GeminiService,
     mount_graph::MountGraph,
     packages::Packages,
     parser::parse_file,
@@ -40,8 +40,8 @@ async fn analyze_fixture(fixture_path: &str) -> (Vec<String>, Vec<String>) {
     imported_symbols.extend(extractor.imported_symbols);
 
     // Framework Detection
-    let gemini_service = GeminiService::new("mock_key".to_string());
-    let detector = FrameworkDetector::new(gemini_service.clone());
+    let agent_service = AgentService::new("mock_key".to_string());
+    let detector = FrameworkDetector::new(agent_service.clone());
     let detection = detector
         .detect_frameworks_and_libraries(&packages, &imported_symbols)
         .await
@@ -66,7 +66,7 @@ async fn analyze_fixture(fixture_path: &str) -> (Vec<String>, Vec<String>) {
     };
 
     // Orchestrator
-    let orchestrator = CallSiteOrchestrator::new(gemini_service.clone());
+    let orchestrator = CallSiteOrchestrator::new(agent_service.clone());
     let analysis_results = orchestrator
         .analyze_call_sites(call_sites, &detection, &framework_guidance)
         .await

@@ -1,3 +1,4 @@
+mod agent_service;
 mod agents;
 mod analyzer;
 mod app_context;
@@ -10,7 +11,6 @@ mod extractor;
 mod file_finder;
 mod formatter;
 mod framework_detector;
-mod gemini_service;
 mod mount_graph;
 mod multi_agent_orchestrator;
 mod packages;

@@ -1,4 +1,4 @@
-use crate::{gemini_service::GeminiService, packages::Packages, visitor::ImportedSymbol};
+use crate::{agent_service::AgentService, packages::Packages, visitor::ImportedSymbol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -26,12 +26,12 @@ struct PackageJsonSummary {
 
 /// Framework detector that combines package.json analysis with LLM classification
 pub struct FrameworkDetector {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
 }
 
 impl FrameworkDetector {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        Self { gemini_service }
+    pub fn new(agent_service: AgentService) -> Self {
+        Self { agent_service }
     }
 
     /// Main detection function that combines package.json and import analysis
@@ -153,7 +153,7 @@ impl FrameworkDetector {
     ) -> Result<DetectionResult, Box<dyn std::error::Error>> {
         let prompt = self.build_classification_prompt(&input);
 
-        let response = self.gemini_service.analyze_code(
+        let response = self.agent_service.analyze_code(
             &prompt,
             "You are analyzing a Node.js/TypeScript project to detect HTTP frameworks and data-fetching libraries."
         ).await?;

@@ -1,8 +1,8 @@
-const { GoogleGenAI, Type } = require("@google/genai");
+const Anthropic = require("@anthropic-ai/sdk");
 
-// Initialize Gemini client
-const client = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
+// Initialize Anthropic client
+const client = new Anthropic({
+  apiKey: process.env.AGENT_API_KEY,
 });
 
 // VALID_API_KEYS will be checked in handler
@@ -94,14 +94,13 @@ function validateRequest(body) {
     return { valid: false, error: "response_schema must be an object" };
   }
 
-  // Model is hardcoded to gemini-2.5-flash for simplicity
-
   return { valid: true };
 }
 
-// Convert Carrick message format to Gemini format
+// Convert Carrick message format to Anthropic format
 function convertMessages(messages) {
   const convertedMessages = [];
+  let systemMessage = null;
 
   for (const msg of messages) {
     if (typeof msg === "string") {
@@ -110,14 +109,11 @@ function convertMessages(messages) {
         content: msg,
       });
     } else if (msg.role === "system") {
-      // Convert system messages to user messages with prefix
-      convertedMessages.push({
-        role: "user",
-        content: `System: ${msg.content}`,
-      });
+      // Anthropic uses a separate system parameter
+      systemMessage = msg.content;
     } else {
-      // Map roles to Gemini-compatible roles
-      const role = msg.role === "assistant" ? "model" : "user";
+      // Map roles - Anthropic uses "assistant" not "model"
+      const role = msg.role === "model" ? "assistant" : msg.role;
       convertedMessages.push({
         role: role,
         content: msg.content || msg.text || "",
@@ -125,14 +121,65 @@ function convertMessages(messages) {
     }
   }
 
-  return convertedMessages;
+  return { messages: convertedMessages, system: systemMessage };
+}
+
+// Convert Carrick schema format to Anthropic JSON schema format
+function convertSchemaToAnthropic(schema) {
+  if (!schema) return null;
+
+  // Recursively convert type strings to lowercase as Anthropic expects
+  function normalizeSchema(obj) {
+    if (Array.isArray(obj)) {
+      return obj.map(normalizeSchema);
+    }
+
+    if (typeof obj !== "object" || obj === null) {
+      return obj;
+    }
+
+    const normalized = { ...obj };
+
+    // Convert TYPE constants (ARRAY, OBJECT, STRING, etc.) to lowercase
+    if (normalized.type && typeof normalized.type === "string") {
+      normalized.type = normalized.type.toLowerCase();
+    }
+
+    // Claude requires additionalProperties: false for all object types
+    if (normalized.type === "object" && normalized.properties) {
+      normalized.additionalProperties = false;
+    }
+
+    // Claude doesn't support minimum/maximum for number types
+    if (normalized.type === "number" || normalized.type === "integer") {
+      delete normalized.minimum;
+      delete normalized.maximum;
+    }
+
+    // Recursively normalize nested objects
+    if (normalized.items) {
+      normalized.items = normalizeSchema(normalized.items);
+    }
+
+    if (normalized.properties) {
+      const newProperties = {};
+      for (const [key, value] of Object.entries(normalized.properties)) {
+        newProperties[key] = normalizeSchema(value);
+      }
+      normalized.properties = newProperties;
+    }
+
+    return normalized;
+  }
+
+  return normalizeSchema(schema);
 }
 
 // Main Lambda handler
 exports.handler = async (event) => {
   const startTime = Date.now();
 
-  console.log("Gemini proxy request:", {
+  console.log("Agent proxy request:", {
     method: event.requestContext?.http?.method || event.httpMethod,
     path: event.requestContext?.http?.path || event.path,
     userAgent: event.headers?.["User-Agent"] || event.headers?.["user-agent"],
@@ -172,7 +219,7 @@ exports.handler = async (event) => {
 
   try {
     // Check required environment variables
-    if (!process.env.GEMINI_API_KEY || !process.env.VALID_API_KEYS) {
+    if (!process.env.AGENT_API_KEY || !process.env.VALID_API_KEYS) {
       return {
         statusCode: 500,
         headers: corsHeaders,
@@ -251,63 +298,67 @@ exports.handler = async (event) => {
       };
     }
 
-    // Use hardcoded model for simplicity
-    const model = "gemini-2.5-flash";
+    // Use Claude Haiku 4.5 model
+    const model = "claude-haiku-4-5";
 
-    // Convert messages to Gemini format
-    const geminiMessages = convertMessages(requestBody.messages);
+    // Convert messages to Anthropic format
+    const { messages: agentMessages, system: systemMessage } = convertMessages(
+      requestBody.messages
+    );
 
-    // Prepare generation config - disable thinking to speed up responses
-    const generationConfig = {
-      // Disable thinking mode (reasoning) to get faster responses
-      // Set thinkingConfig with budget of 0 to turn off thinking entirely
-      thinkingConfig: {
-        thinkingBudget: 0,
-      },
+    // Prepare API call parameters
+    const apiParams = {
+      model: model,
+      max_tokens: 4096,
+      messages: agentMessages,
     };
 
-    if (requestBody.options?.temperature !== undefined) {
-      generationConfig.temperature = requestBody.options.temperature;
+    // Add system message if present
+    if (systemMessage) {
+      apiParams.system = systemMessage;
     }
 
-    // Prepare config object for structured output
-    const config = {
-      generationConfig,
-    };
+    // Add temperature if specified
+    if (requestBody.options?.temperature !== undefined) {
+      apiParams.temperature = requestBody.options.temperature;
+    }
 
     // Add structured output schema if provided
     if (requestBody.response_schema) {
-      config.responseMimeType = "application/json";
-      config.responseSchema = convertStringTypesToGeminiTypes(requestBody.response_schema);
+      const normalizedSchema = convertSchemaToAnthropic(
+        requestBody.response_schema
+      );
+      apiParams.output_format = {
+        type: "json_schema",
+        schema: normalizedSchema,
+      };
     }
 
-    console.log("Calling Gemini API:", {
+    console.log("Calling Agent API:", {
       model,
-      messageCount: geminiMessages.length,
+      messageCount: agentMessages.length,
       dailyRemaining: limitCheck.remaining,
       httpMethod: httpMethod,
       hasSchema: !!requestBody.response_schema,
+      hasSystem: !!systemMessage,
     });
 
-    // Make the Gemini API call using new @google/genai package
-    const result = await client.models.generateContent({
-      model,
-      contents: geminiMessages.map((msg) => ({
-        role: msg.role,
-        parts: [{ text: msg.content }],
-      })),
-      config,
+    // Make the Agent API call using Anthropic SDK with structured outputs
+    const response = await client.beta.messages.create({
+      ...apiParams,
+      betas: ["structured-outputs-2025-11-13"],
     });
 
-    const text = result.text;
+    // Extract text from response
+    const text = response.content[0].text;
 
     const endTime = Date.now();
     const duration = endTime - startTime;
 
-    console.log("Gemini API success:", {
+    console.log("Agent API success:", {
       duration: `${duration}ms`,
       responseLength: text.length,
-      tokensUsed: result.usage || "unknown",
+      tokensUsed: response.usage || "unknown",
     });
 
     // Return successful response
@@ -322,7 +373,7 @@ exports.handler = async (event) => {
       body: JSON.stringify({
         success: true,
         text: text,
-        usage: result.usage,
+        usage: response.usage,
         responseTime: duration,
       }),
     };
@@ -330,7 +381,7 @@ exports.handler = async (event) => {
     const endTime = Date.now();
     const duration = endTime - startTime;
 
-    console.error("Gemini API error:", {
+    console.error("Agent API error:", {
       error: error.message,
       errorName: error.name,
       errorCode: error.code,
@@ -339,7 +390,7 @@ exports.handler = async (event) => {
       duration: `${duration}ms`,
     });
 
-    // Handle specific Gemini API errors
+    // Handle specific Agent API errors
     let statusCode = 500;
     let errorMessage = "Internal server error";
     let debugInfo = error.message;
@@ -347,7 +398,7 @@ exports.handler = async (event) => {
     if (error.message?.includes("quota") || error.message?.includes("limit")) {
       statusCode = 429;
       errorMessage = "API quota exceeded. Please try again later.";
-    } else if (error.message?.includes("API key")) {
+    } else if (error.message?.includes("API key") || error.message?.includes("authentication")) {
       statusCode = 401;
       errorMessage = "API authentication failed";
     } else if (
@@ -370,53 +421,3 @@ exports.handler = async (event) => {
     };
   }
 };
-
-// Convert string type names to Gemini Type constants
-function convertStringTypesToGeminiTypes(schema) {
-  if (Array.isArray(schema)) {
-    return schema.map(convertStringTypesToGeminiTypes);
-  }
-
-  if (typeof schema !== 'object' || schema === null) {
-    return schema;
-  }
-
-  const converted = { ...schema };
-
-  // Convert type field from string to Type constant
-  if (converted.type) {
-    switch (converted.type) {
-      case "ARRAY":
-        converted.type = Type.ARRAY;
-        break;
-      case "OBJECT":
-        converted.type = Type.OBJECT;
-        break;
-      case "STRING":
-        converted.type = Type.STRING;
-        break;
-      case "NUMBER":
-        converted.type = Type.NUMBER;
-        break;
-      case "BOOLEAN":
-        converted.type = Type.BOOLEAN;
-        break;
-      // Keep as-is if already a Type constant or unknown
-    }
-  }
-
-  // Recursively convert nested objects
-  if (converted.items) {
-    converted.items = convertStringTypesToGeminiTypes(converted.items);
-  }
-
-  if (converted.properties) {
-    const newProperties = {};
-    for (const [key, value] of Object.entries(converted.properties)) {
-      newProperties[key] = convertStringTypesToGeminiTypes(value);
-    }
-    converted.properties = newProperties;
-  }
-
-  return converted;
-}

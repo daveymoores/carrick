@@ -4,7 +4,7 @@ const { handler } = require("./index");
 function createMockEvent(httpMethod = "POST", body = null, headers = {}) {
   return {
     httpMethod,
-    path: "/gemini-proxy",
+    path: "/agent-proxy",
     headers: {
       "Content-Type": "application/json",
       "User-Agent": "carrick/1.0.0",
@@ -23,10 +23,10 @@ function createMockEvent(httpMethod = "POST", body = null, headers = {}) {
 
 // Test cases
 async function runTests() {
-  console.log("🧪 Running Gemini Proxy Lambda Tests\n");
+  console.log("🧪 Running Agent Proxy Lambda Tests\n");
 
   // Set up test environment with mock values
-  process.env.GEMINI_API_KEY = "mock-gemini-api-key-for-testing";
+  process.env.AGENT_API_KEY = "mock-agent-api-key-for-testing";
   process.env.VALID_API_KEYS = "test-api-key,another-key";
   console.log("✅ Mock environment variables set for testing\n");
 
@@ -169,33 +169,10 @@ async function runTests() {
     console.log(`   ❌ Error: ${error.message}\n`);
   }
 
-  // Test 8: Invalid model
-  console.log("8. Testing invalid model...");
-  try {
-    const event = createMockEvent("POST", {
-      messages: [{ role: "user", content: "test" }],
-      model: "invalid-model",
-    });
-    const result = await handler(event);
+  // Test 8 removed - model is hardcoded in the Lambda, no validation needed
 
-    console.log(`   Status: ${result.statusCode}`);
-    const response = JSON.parse(result.body);
-    console.log(`   Error message: ${response.message}`);
-
-    if (
-      result.statusCode === 400 &&
-      response.message.includes("Invalid model")
-    ) {
-      console.log("   ✅ Model validation test passed\n");
-    } else {
-      console.log("   ❌ Model validation test failed\n");
-    }
-  } catch (error) {
-    console.log(`   ❌ Error: ${error.message}\n`);
-  }
-
-  // Test 9: Authentication failure
-  console.log("9. Testing authentication failure...");
+  // Test 8: Authentication failure
+  console.log("8. Testing authentication failure...");
   try {
     const event = createMockEvent(
       "POST",
@@ -217,15 +194,14 @@ async function runTests() {
     console.log(`   ❌ Error: ${error.message}\n`);
   }
 
-  // Test 10: Valid request structure
-  console.log("10. Testing valid request structure...");
+  // Test 9: Valid request structure
+  console.log("9. Testing valid request structure...");
   try {
     const event = createMockEvent("POST", {
       messages: [
         { role: "system", content: "You are a helpful assistant." },
         { role: "user", content: "Say hello" },
       ],
-      model: "gemini-2.5-flash",
       options: {
         temperature: 0.7,
         maxOutputTokens: 100,
@@ -238,7 +214,7 @@ async function runTests() {
 
     if (result.statusCode === 401) {
       console.log(
-        "   ⚠️  Expected 401 (Mock GEMINI_API_KEY used) - structure test passed",
+        "   ⚠️  Expected 401 (Mock AGENT_API_KEY used) - structure test passed",
       );
     } else if (result.statusCode === 200) {
       const response = JSON.parse(result.body);
@@ -258,7 +234,7 @@ async function runTests() {
   console.log("🏁 Test suite completed!");
   console.log("\n📝 Notes:");
   console.log(
-    "   - Set GEMINI_API_KEY environment variable for full integration testing",
+    "   - Set AGENT_API_KEY environment variable for full integration testing",
   );
   console.log("   - Tests use 'test-api-key' for authentication");
   console.log("   - Deploy to AWS Lambda for production testing");

@@ -7,15 +7,15 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 
-/// Reusable service for making Gemini API calls
+/// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
-pub struct GeminiService {
+pub struct AgentService {
     api_key: String,
     client: Client,
     semaphore: Arc<Semaphore>,
 }
 
-impl GeminiService {
+impl AgentService {
     pub fn new(api_key: String) -> Self {
         // Limit concurrent requests to avoid rate limits
         // Paid tier allows higher limits, but let's be safe with 20 concurrent requests
@@ -31,7 +31,7 @@ impl GeminiService {
         }
     }
 
-    /// Generic method for making Gemini API calls
+    /// Generic method for making Agent API calls
     pub async fn analyze_code(
         &self,
         prompt: &str,
@@ -41,7 +41,7 @@ impl GeminiService {
             .await
     }
 
-    /// Generic method for making Gemini API calls with optional response schema
+    /// Generic method for making Agent API calls with optional response schema
     pub async fn analyze_code_with_schema(
         &self,
         prompt: &str,
@@ -62,7 +62,7 @@ impl GeminiService {
 
         // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
         let api_base = env!("CARRICK_API_ENDPOINT");
-        let proxy_endpoint = format!("{}/gemini/chat", api_base);
+        let proxy_endpoint = format!("{}/agent/chat", api_base);
 
         let proxy_request = ProxyRequest {
             messages: vec![
@@ -103,9 +103,7 @@ impl GeminiService {
                                 if proxy_response.success {
                                     return Ok(proxy_response.text);
                                 } else {
-                                    return Err(
-                                        "Gemini proxy returned unsuccessful response".into()
-                                    );
+                                    return Err("Agent proxy returned unsuccessful response".into());
                                 }
                             }
                             Err(e) => {
@@ -119,7 +117,7 @@ impl GeminiService {
                         if status == 429 && attempt < max_retries {
                             let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
                             println!(
-                                "Gemini API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
+                                "Agent API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
                                 wait_time, attempt, max_retries
                             );
                             sleep(wait_time).await;
@@ -130,7 +128,7 @@ impl GeminiService {
                         if status == 503 && attempt < max_retries {
                             let delay_ms = 1000 * attempt;
                             eprintln!(
-                                "Gemini API returned 503, retrying in {}ms (attempt {}/3)",
+                                "Agent API returned 503, retrying in {}ms (attempt {}/3)",
                                 delay_ms, attempt
                             );
                             sleep(Duration::from_millis(delay_ms)).await;
@@ -139,7 +137,7 @@ impl GeminiService {
 
                         let error_text = response.text().await.unwrap_or_default();
                         return Err(format!(
-                            "Gemini proxy call failed with status {}: {}",
+                            "Agent proxy call failed with status {}: {}",
                             status, error_text
                         )
                         .into());
@@ -150,14 +148,14 @@ impl GeminiService {
                     if attempt < 3 {
                         let delay_ms = 1000 * attempt;
                         eprintln!(
-                            "Gemini proxy call failed: {}, retrying in {}ms (attempt {}/3)",
+                            "Agent proxy call failed: {}, retrying in {}ms (attempt {}/3)",
                             e, delay_ms, attempt
                         );
                         sleep(Duration::from_millis(delay_ms)).await;
                         continue;
                     }
 
-                    return Err(format!("Gemini proxy call failed: {}", e).into());
+                    return Err(format!("Agent proxy call failed: {}", e).into());
                 }
             }
         }
@@ -205,7 +203,7 @@ pub struct AsyncCallContext {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GeminiCallResponse {
+pub struct AgentCallResponse {
     route: String,
     method: String,
     request_body: Option<serde_json::Value>,
@@ -259,9 +257,9 @@ pub async fn extract_calls_from_async_expressions(
         return Ok(vec![]);
     }
 
-    // Emergency disable option for Gemini API
-    if env::var("DISABLE_GEMINI").is_ok() {
-        println!("Gemini API disabled via DISABLE_GEMINI environment variable");
+    // Emergency disable option for Agent API
+    if env::var("DISABLE_AGENT").is_ok() {
+        println!("Agent API disabled via DISABLE_AGENT environment variable");
         return Ok(vec![]);
     }
 
@@ -284,23 +282,23 @@ pub async fn extract_calls_from_async_expressions(
     }
 
     println!(
-        "Found {} async expressions, sending to Gemini Flash 2.5 with framework context...",
+        "Found {} async expressions, sending to Agent Service with framework context...",
         async_calls.len()
     );
 
-    // Get API key and create GeminiService
+    // Get API key and create AgentService
     let api_key = env::var("CARRICK_API_KEY")
         .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
-    let gemini_service = GeminiService::new(api_key);
+    let agent_service = AgentService::new(api_key);
 
     let prompt = create_extraction_prompt(&async_calls);
     let system_message = create_extraction_system_message();
 
-    let response = gemini_service
+    let response = agent_service
         .analyze_async_calls_with_context(&prompt, &system_message, frameworks, data_fetchers)
         .await?;
 
-    Ok(parse_gemini_response(&response, &async_calls))
+    Ok(parse_agent_response(&response, &async_calls))
 }
 
 fn create_extraction_system_message() -> String {
@@ -388,11 +386,11 @@ fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
     prompt
 }
 
-fn convert_gemini_responses_to_calls(
-    gemini_calls: Vec<GeminiCallResponse>,
+fn convert_agent_responses_to_calls(
+    agent_calls: Vec<AgentCallResponse>,
     contexts: &[AsyncCallContext],
 ) -> Vec<Call> {
-    gemini_calls
+    agent_calls
         .into_iter()
         .enumerate()
         .map(|(i, gc)| {
@@ -405,7 +403,7 @@ fn convert_gemini_responses_to_calls(
             let request_type = gc.request_type_info.map(|type_info| {
                 TypeReference {
                     file_path: PathBuf::from(type_info.file_path),
-                    type_ann: None, // We don't have SWC AST node from Gemini
+                    type_ann: None, // We don't have SWC AST node from Agent
                     start_position: type_info.start_position as usize,
                     composite_type_string: type_info.composite_type_string,
                     alias: type_info.alias,
@@ -415,7 +413,7 @@ fn convert_gemini_responses_to_calls(
             let response_type = gc.response_type_info.map(|type_info| {
                 TypeReference {
                     file_path: PathBuf::from(type_info.file_path),
-                    type_ann: None, // We don't have SWC AST node from Gemini
+                    type_ann: None, // We don't have SWC AST node from Agent
                     start_position: type_info.start_position as usize,
                     composite_type_string: type_info.composite_type_string,
                     alias: type_info.alias,
@@ -438,7 +436,7 @@ fn convert_gemini_responses_to_calls(
         .collect()
 }
 
-fn parse_gemini_response(response: &str, contexts: &[AsyncCallContext]) -> Vec<Call> {
+fn parse_agent_response(response: &str, contexts: &[AsyncCallContext]) -> Vec<Call> {
     let json_str = response.trim();
 
     // Try multiple parsing strategies
@@ -455,8 +453,8 @@ fn parse_gemini_response(response: &str, contexts: &[AsyncCallContext]) -> Vec<C
     ];
 
     for attempt in extraction_attempts {
-        if let Ok(gemini_calls) = serde_json::from_str::<Vec<GeminiCallResponse>>(attempt) {
-            return convert_gemini_responses_to_calls(gemini_calls, contexts);
+        if let Ok(agent_calls) = serde_json::from_str::<Vec<AgentCallResponse>>(attempt) {
+            return convert_agent_responses_to_calls(agent_calls, contexts);
         }
     }
 
@@ -604,7 +602,12 @@ fn generate_mock_triage_response(prompt: &str) -> String {
             } else if callee_object == "global" && callee_property == "fetch" {
                 "DataFetchingCall"
             } else if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
-                "HttpEndpoint"
+                if callee_object == "axios" || callee_object == "request" || callee_object == "http"
+                {
+                    "DataFetchingCall"
+                } else {
+                    "HttpEndpoint"
+                }
             } else if callee_property == "use" {
                 if arg_count >= 2 {
                     let first_is_string = cs

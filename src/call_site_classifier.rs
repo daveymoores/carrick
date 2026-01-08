@@ -1,6 +1,5 @@
 use crate::{
-    call_site_extractor::CallSite, framework_detector::DetectionResult,
-    gemini_service::GeminiService,
+    agent_service::AgentService, call_site_extractor::CallSite, framework_detector::DetectionResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,16 +37,16 @@ pub enum CallSiteType {
     Irrelevant,
 }
 
-/// Service for classifying call sites using LLM with framework context
+/// Service for classifying call sites using Agent with framework context
 #[allow(dead_code)]
 pub struct CallSiteClassifier {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
 }
 
 #[allow(dead_code)]
 impl CallSiteClassifier {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        Self { gemini_service }
+    pub fn new(agent_service: AgentService) -> Self {
+        Self { agent_service }
     }
 
     /// Classify all call sites using framework context
@@ -75,18 +74,18 @@ impl CallSiteClassifier {
         let prompt = self.build_classification_prompt(call_sites, framework_detection);
         let system_message = self.build_system_message();
 
-        println!("=== PROMPT BEING SENT TO GEMINI ===");
+        println!("=== PROMPT BEING SENT TO AGENT ===");
         println!("System message length: {} chars", system_message.len());
         println!("Prompt length: {} chars", prompt.len());
         println!("Full prompt:\n{}", prompt);
         println!("=== END OF PROMPT ===");
 
         let response = self
-            .gemini_service
+            .agent_service
             .analyze_code(&prompt, &system_message)
             .await?;
 
-        println!("=== GEMINI RESPONSE ===");
+        println!("=== AGENT RESPONSE ===");
         println!("{}", response);
         println!("=== END OF RESPONSE ===");
 

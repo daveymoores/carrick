@@ -1,7 +1,7 @@
 use crate::{
+    agent_service::AgentService,
     call_site_extractor::{ArgumentType, CallSite},
     framework_detector::DetectionResult,
-    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -46,12 +46,12 @@ pub struct CallSiteOrchestrator {
 }
 
 impl CallSiteOrchestrator {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        let triage_agent = TriageAgent::new(gemini_service.clone());
-        let endpoint_agent = EndpointAgent::new(gemini_service.clone());
-        let consumer_agent = ConsumerAgent::new(gemini_service.clone());
-        let middleware_agent = MiddlewareAgent::new(gemini_service.clone());
-        let mount_agent = MountAgent::new(gemini_service.clone());
+    pub fn new(agent_service: AgentService) -> Self {
+        let triage_agent = TriageAgent::new(agent_service.clone());
+        let endpoint_agent = EndpointAgent::new(agent_service.clone());
+        let consumer_agent = ConsumerAgent::new(agent_service.clone());
+        let middleware_agent = MiddlewareAgent::new(agent_service.clone());
+        let mount_agent = MountAgent::new(agent_service.clone());
 
         Self {
             triage_agent,

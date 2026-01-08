@@ -1,12 +1,12 @@
 use serde_json::{Value, json};
 
-/// Gemini schema types for structured output
-/// These correspond to the Type constants from @google/genai
+/// Agent schema types for structured output
+/// These correspond to the Type constants from the LLM provider
 #[allow(dead_code)]
-pub struct GeminiType;
+pub struct AgentType;
 
 #[allow(dead_code)]
-impl GeminiType {
+impl AgentType {
     pub const ARRAY: &'static str = "ARRAY";
     pub const OBJECT: &'static str = "OBJECT";
     pub const STRING: &'static str = "STRING";
@@ -14,7 +14,7 @@ impl GeminiType {
     pub const BOOLEAN: &'static str = "BOOLEAN";
 }
 
-/// Gemini-format schemas for structured output from each agent
+/// Agent-format schemas for structured output from each agent
 pub struct AgentSchemas;
 
 impl AgentSchemas {

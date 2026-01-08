@@ -1,8 +1,8 @@
 use carrick::{
+    agent_service::AgentService,
     agents::{AnalysisResults, CallSiteOrchestrator, FrameworkGuidance, LeanCallSite},
     call_site_extractor::{ArgumentType, CallArgument, CallSite},
     framework_detector::DetectionResult,
-    gemini_service::GeminiService,
     mount_graph::MountGraph,
     visitor::ImportedSymbol,
 };
@@ -99,8 +99,8 @@ async fn test_multi_agent_orchestrator_mock_mode() {
         parsing_notes: String::new(),
     };
 
-    let gemini_service = GeminiService::new("mock".to_string());
-    let orchestrator = CallSiteOrchestrator::new(gemini_service);
+    let agent_service = AgentService::new("mock".to_string());
+    let orchestrator = CallSiteOrchestrator::new(agent_service);
 
     // Run the analysis
     let result = orchestrator
@@ -258,8 +258,8 @@ async fn test_empty_call_sites() {
         parsing_notes: String::new(),
     };
 
-    let gemini_service = GeminiService::new("mock".to_string());
-    let orchestrator = CallSiteOrchestrator::new(gemini_service);
+    let agent_service = AgentService::new("mock".to_string());
+    let orchestrator = CallSiteOrchestrator::new(agent_service);
 
     let result = orchestrator
         .analyze_call_sites(&[], &framework_detection, &framework_guidance)
@@ -720,8 +720,8 @@ async fn test_endpoint_enrichment_with_inline_types() {
         parsing_notes: String::new(),
     };
 
-    let gemini_service = GeminiService::new("mock".to_string());
-    let orchestrator = CallSiteOrchestrator::new(gemini_service);
+    let agent_service = AgentService::new("mock".to_string());
+    let orchestrator = CallSiteOrchestrator::new(agent_service);
 
     let result = orchestrator
         .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)

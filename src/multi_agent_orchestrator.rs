@@ -1,8 +1,8 @@
 use crate::{
+    agent_service::AgentService,
     agents::{AnalysisResults, CallSiteOrchestrator, FrameworkGuidance, FrameworkGuidanceAgent},
     call_site_extractor::{CallSiteExtractionService, CallSiteExtractor},
     framework_detector::{DetectionResult, FrameworkDetector},
-    gemini_service::GeminiService,
     mount_graph::MountGraph,
     packages::Packages,
     parser::parse_file,
@@ -28,14 +28,14 @@ pub struct MultiAgentAnalysisResult {
 
 /// Orchestrates the complete multi-agent workflow
 pub struct MultiAgentOrchestrator {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
     source_map: Lrc<SourceMap>,
 }
 
 impl MultiAgentOrchestrator {
     pub fn new(api_key: String, source_map: Lrc<SourceMap>) -> Self {
         Self {
-            gemini_service: GeminiService::new(api_key),
+            agent_service: AgentService::new(api_key),
             source_map,
         }
     }
@@ -51,7 +51,7 @@ impl MultiAgentOrchestrator {
 
         // Stage 0: Framework Detection
         println!("Stage 0: Framework Detection");
-        let framework_detector = FrameworkDetector::new(self.gemini_service.clone());
+        let framework_detector = FrameworkDetector::new(self.agent_service.clone());
         let framework_detection = framework_detector
             .detect_frameworks_and_libraries(packages, imported_symbols)
             .await?;
@@ -64,7 +64,7 @@ impl MultiAgentOrchestrator {
 
         // Stage 0.5: Framework Guidance Generation
         println!("Stage 0.5: Framework Guidance Generation");
-        let framework_guidance_agent = FrameworkGuidanceAgent::new(self.gemini_service.clone());
+        let framework_guidance_agent = FrameworkGuidanceAgent::new(self.agent_service.clone());
         let framework_guidance = framework_guidance_agent
             .generate_guidance(&framework_detection)
             .await?;
@@ -82,7 +82,7 @@ impl MultiAgentOrchestrator {
 
         // Stage 2: Call Site Classification using Classify-Then-Dispatch
         println!("Stage 2: Call Site Classification using Classify-Then-Dispatch");
-        let orchestrator = CallSiteOrchestrator::new(self.gemini_service.clone());
+        let orchestrator = CallSiteOrchestrator::new(self.agent_service.clone());
         let analysis_results = orchestrator
             .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
             .await?;

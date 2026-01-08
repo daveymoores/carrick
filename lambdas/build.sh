@@ -14,11 +14,11 @@ npm install --production
 zip -r ../check-or-upload.zip . -x "*.git*" "node_modules/.cache/*"
 cd ..
 
-# Build gemini-proxy function
-echo "Building gemini-proxy..."
-cd gemini-proxy
+# Build agent-proxy function
+echo "Building agent-proxy..."
+cd agent-proxy
 npm install --production
-zip -r ../gemini-proxy.zip . -x "*.git*" "node_modules/.cache/*"
+zip -r ../agent-proxy.zip . -x "*.git*" "node_modules/.cache/*"
 cd ..
 
 echo "Lambda functions built successfully:"

@@ -1,8 +1,8 @@
 use crate::{
+    agent_service::AgentService,
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
     call_site_extractor::CallSite,
     framework_detector::DetectionResult,
-    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -74,12 +74,12 @@ pub enum TriageClassification {
 
 /// First-pass agent that broadly classifies all call sites
 pub struct TriageAgent {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
 }
 
 impl TriageAgent {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        Self { gemini_service }
+    pub fn new(agent_service: AgentService) -> Self {
+        Self { agent_service }
     }
 
     /// Perform initial broad classification of all call sites with batching
@@ -113,16 +113,16 @@ impl TriageAgent {
 
             let prompt = self.build_triage_prompt(batch, framework_detection, framework_guidance);
             let system_message = self.build_system_message();
-            let gemini_service = self.gemini_service.clone();
+            let agent_service = self.agent_service.clone();
 
             join_set.spawn(async move {
                 println!("Batch {} prompt length: {} chars", batch_num, prompt.len());
 
                 let schema = AgentSchemas::triage_schema();
-                let response = gemini_service
+                let response = agent_service
                     .analyze_code_with_schema(&prompt, &system_message, Some(schema))
                     .await
-                    .map_err(|e| format!("Gemini API error in batch {}: {}", batch_num, e))?;
+                    .map_err(|e| format!("Agent API error in batch {}: {}", batch_num, e))?;
 
                 println!("=== RAW GEMINI RESPONSE BATCH {} ===", batch_num);
                 println!("{}", response);

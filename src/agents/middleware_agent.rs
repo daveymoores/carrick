@@ -1,8 +1,8 @@
 use crate::{
+    agent_service::AgentService,
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
     call_site_extractor::CallSite,
     framework_detector::DetectionResult,
-    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,12 +20,12 @@ pub struct Middleware {
 
 /// Specialized agent for detecting middleware registrations
 pub struct MiddlewareAgent {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
 }
 
 impl MiddlewareAgent {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        Self { gemini_service }
+    pub fn new(agent_service: AgentService) -> Self {
+        Self { agent_service }
     }
 
     /// Extract details from pre-triaged middleware call sites
@@ -63,15 +63,15 @@ impl MiddlewareAgent {
             let prompt =
                 self.build_middleware_prompt(batch, framework_detection, framework_guidance);
             let system_message = self.build_system_message();
-            let gemini_service = self.gemini_service.clone();
+            let agent_service = self.agent_service.clone();
 
             join_set.spawn(async move {
                 let schema = AgentSchemas::middleware_schema();
-                let response = gemini_service
+                let response = agent_service
                     .analyze_code_with_schema(&prompt, &system_message, Some(schema))
                     .await
                     .map_err(|e| {
-                        format!("Gemini API error in middleware batch {}: {}", batch_num, e)
+                        format!("Agent API error in middleware batch {}: {}", batch_num, e)
                     })?;
 
                 let middleware: Vec<Middleware> = serde_json::from_str(&response).map_err(|e| {
@@ -244,8 +244,8 @@ mod prompt_tests {
 
     #[test]
     fn test_middleware_prompts_mention_context_slice() {
-        let gemini_service = GeminiService::new("mock".to_string());
-        let agent = MiddlewareAgent::new(gemini_service);
+        let agent_service = crate::agent_service::AgentService::new("mock".to_string());
+        let agent = MiddlewareAgent::new(agent_service);
 
         let system_message = agent.build_system_message();
         assert!(system_message.contains("context_slice"));

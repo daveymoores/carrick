@@ -1,8 +1,8 @@
 use crate::{
+    agent_service::AgentService,
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
     call_site_extractor::CallSite,
     framework_detector::DetectionResult,
-    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,12 +23,12 @@ pub struct HttpEndpoint {
 
 /// Specialized agent for detecting HTTP endpoints (routes)
 pub struct EndpointAgent {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
 }
 
 impl EndpointAgent {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        Self { gemini_service }
+    pub fn new(agent_service: AgentService) -> Self {
+        Self { agent_service }
     }
 
     /// Detect HTTP endpoints from call sites
@@ -65,18 +65,18 @@ impl EndpointAgent {
 
             let prompt = self.build_endpoint_prompt(batch, framework_detection, framework_guidance);
             let system_message = self.build_system_message();
-            let gemini_service = self.gemini_service.clone();
+            let agent_service = self.agent_service.clone();
 
             join_set.spawn(async move {
                 let schema = AgentSchemas::endpoint_schema();
-                let response = gemini_service
+                let response = agent_service
                     .analyze_code_with_schema(&prompt, &system_message, Some(schema))
                     .await
                     .map_err(|e| {
-                        format!("Gemini API error in endpoint batch {}: {}", batch_num, e)
+                        format!("Agent API error in endpoint batch {}: {}", batch_num, e)
                     })?;
 
-                println!("=== RAW GEMINI ENDPOINT RESPONSE BATCH {} ===", batch_num);
+                println!("=== RAW AGENT ENDPOINT RESPONSE BATCH {} ===", batch_num);
                 println!("{}", response);
                 println!("=== END RAW RESPONSE ===");
 
@@ -258,8 +258,8 @@ mod prompt_tests {
 
     #[test]
     fn test_endpoint_prompts_mention_context_slice() {
-        let gemini_service = GeminiService::new("mock".to_string());
-        let agent = EndpointAgent::new(gemini_service);
+        let agent_service = crate::agent_service::AgentService::new("mock".to_string());
+        let agent = EndpointAgent::new(agent_service);
 
         let system_message = agent.build_system_message();
         assert!(system_message.contains("context_slice"));

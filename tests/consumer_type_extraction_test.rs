@@ -10,12 +10,12 @@
 //! The type `Order[]` should be captured and linked to the `response.json()` call.
 
 use carrick::{
+    agent_service::AgentService,
     agents::{AnalysisResults, CallSiteOrchestrator, FrameworkGuidance, TriageStats},
     call_site_extractor::{
         ArgumentType, CallArgument, CallSite, CallSiteExtractor, ResultTypeInfo,
     },
     framework_detector::DetectionResult,
-    gemini_service::GeminiService,
     multi_agent_orchestrator::MultiAgentOrchestrator,
     parser::parse_file,
 };
@@ -329,8 +329,8 @@ async fn test_data_fetching_call_enrichment() {
         parsing_notes: String::new(),
     };
 
-    let gemini_service = GeminiService::new("mock".to_string());
-    let orchestrator = CallSiteOrchestrator::new(gemini_service);
+    let agent_service = AgentService::new("mock".to_string());
+    let orchestrator = CallSiteOrchestrator::new(agent_service);
 
     let result = orchestrator
         .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)

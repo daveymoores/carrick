@@ -1,3 +1,4 @@
+pub mod agent_service;
 pub mod agents;
 pub mod analyzer;
 pub mod app_context;
@@ -10,7 +11,6 @@ pub mod extractor;
 pub mod file_finder;
 pub mod formatter;
 pub mod framework_detector;
-pub mod gemini_service;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;
 pub mod packages;

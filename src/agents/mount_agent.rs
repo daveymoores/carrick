@@ -1,8 +1,8 @@
 use crate::{
+    agent_service::AgentService,
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
     call_site_extractor::CallSite,
     framework_detector::DetectionResult,
-    gemini_service::GeminiService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,12 +19,12 @@ pub struct MountRelationship {
 
 /// Specialized agent for detecting router mount relationships
 pub struct MountAgent {
-    gemini_service: GeminiService,
+    agent_service: AgentService,
 }
 
 impl MountAgent {
-    pub fn new(gemini_service: GeminiService) -> Self {
-        Self { gemini_service }
+    pub fn new(agent_service: AgentService) -> Self {
+        Self { agent_service }
     }
 
     /// Extract mount relationships from pre-triaged RouterMount call sites
@@ -61,14 +61,14 @@ impl MountAgent {
 
             let prompt = self.build_mount_prompt(batch, framework_detection, framework_guidance);
             let system_message = self.build_system_message();
-            let gemini_service = self.gemini_service.clone();
+            let agent_service = self.agent_service.clone();
 
             join_set.spawn(async move {
                 let schema = AgentSchemas::mount_schema();
-                let response = gemini_service
+                let response = agent_service
                     .analyze_code_with_schema(&prompt, &system_message, Some(schema))
                     .await
-                    .map_err(|e| format!("Gemini API error in mount batch {}: {}", batch_num, e))?;
+                    .map_err(|e| format!("Agent API error in mount batch {}: {}", batch_num, e))?;
 
                 println!("=== RAW GEMINI MOUNT RESPONSE BATCH {} ===", batch_num);
                 println!("{}", response);
@@ -258,8 +258,8 @@ mod prompt_tests {
 
     #[test]
     fn test_mount_prompts_mention_context_slice() {
-        let gemini_service = GeminiService::new("mock".to_string());
-        let agent = MountAgent::new(gemini_service);
+        let agent_service = AgentService::new("mock".to_string());
+        let agent = MountAgent::new(agent_service);
 
         let system_message = agent.build_system_message();
         assert!(system_message.contains("context_slice"));
