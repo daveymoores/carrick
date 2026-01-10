@@ -4,14 +4,17 @@
 //! with the main orchestrator in subsequent commits.
 #![allow(dead_code)]
 //!
-//! This orchestrator implements the new analysis flow:
-//! 1. Read File: Load the full content of each file
-//! 2. Load Guidance: Retrieve FrameworkGuidance patterns
-//! 3. One-Shot Analysis: Send File + Patterns to Gemini
-//! 4. Direct Build: Deserialize JSON response directly into MountGraph structs
+//! This orchestrator implements the AST-Gated File-Centric architecture:
+//! 1. **Gatekeeper:** Run SWC Scanner to find potential API call sites
+//! 2. **Check Relevance:** If no candidates found → SKIP file (Cost: $0)
+//! 3. **Context:** Send Full File + Patterns + Candidate Targets to Gemini
+//! 4. **Direct Build:** Deserialize JSON response directly into MountGraph structs
 //!
-//! This approach utilizes Gemini's large context window for better alias resolution
-//! and reduces token costs compared to the batch-based approach.
+//! This approach:
+//! - Skips files with no API patterns (zero LLM cost)
+//! - Utilizes Gemini's large context window for better alias resolution
+//! - Passes AST-detected lines as "Candidate Targets" to ensure 100% recall
+//! - Produces deterministic results through strict schema enforcement
 
 use crate::{
     agent_service::AgentService,
@@ -21,6 +24,7 @@ use crate::{
     },
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
+    swc_scanner::SwcScanner,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,6 +45,8 @@ pub struct FileCentricAnalysisResult {
 pub struct ProcessingStats {
     pub files_processed: usize,
     pub files_skipped: usize,
+    /// Files skipped because SWC found no API candidates (zero-cost skips)
+    pub files_skipped_no_candidates: usize,
     pub total_mounts: usize,
     pub total_endpoints: usize,
     pub total_data_calls: usize,
@@ -49,24 +55,31 @@ pub struct ProcessingStats {
 
 /// Orchestrates file-centric analysis using the FileAnalyzerAgent.
 ///
-/// This orchestrator processes files one at a time, sending each file's
-/// complete content to the LLM for analysis. This approach:
-/// - Utilizes Gemini's large context window
-/// - Enables better alias resolution within each file
-/// - Reduces token costs compared to batch processing
-/// - Produces deterministic results through strict schema enforcement
+/// This orchestrator implements the AST-Gated architecture:
+/// 1. **Gatekeeper:** Use SWC Scanner to find potential API call sites
+/// 2. **Check Relevance:** If no candidates → skip file (zero cost)
+/// 3. **Context:** Send Full File + Patterns + Candidate Targets to Gemini
+/// 4. **Build:** Deserialize response directly into MountGraph
 pub struct FileOrchestrator {
     file_analyzer: FileAnalyzerAgent,
+    swc_scanner: SwcScanner,
 }
 
 impl FileOrchestrator {
     pub fn new(agent_service: AgentService) -> Self {
         Self {
             file_analyzer: FileAnalyzerAgent::new(agent_service),
+            swc_scanner: SwcScanner::new(),
         }
     }
 
-    /// Run file-centric analysis on all provided files.
+    /// Run AST-gated file-centric analysis on all provided files.
+    ///
+    /// **AST-Gated Architecture:**
+    /// 1. Run SWC Scanner on each file to find potential API call sites
+    /// 2. If no candidates found → SKIP file (zero LLM cost)
+    /// 3. If candidates exist → Send Full File + Patterns + Candidate Hints to Gemini
+    /// 4. Merge results into MountGraph
     ///
     /// # Arguments
     /// * `files` - List of file paths to analyze
@@ -81,13 +94,13 @@ impl FileOrchestrator {
         guidance: &FrameworkGuidance,
         _framework_detection: &DetectionResult,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
-        println!("=== FILE-CENTRIC ORCHESTRATOR ===");
-        println!("Processing {} files with one-shot analysis", files.len());
+        println!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
+        println!("Processing {} files with SWC gatekeeper", files.len());
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
 
-        // Process each file
+        // Process each file with AST gatekeeper
         for file_path in files {
             let path_str = file_path.to_string_lossy().to_string();
 
@@ -110,10 +123,34 @@ impl FileOrchestrator {
                 continue;
             }
 
-            // Analyze the file
+            // STEP 1: Run SWC Scanner (Gatekeeper)
+            let scan_result = self.swc_scanner.scan_content(file_path, &content);
+
+            // STEP 2: Check Relevance - if no candidates, SKIP (zero LLM cost)
+            if !scan_result.should_analyze {
+                println!("Skipped (no API patterns): {} [0 candidates]", path_str);
+                stats.files_skipped += 1;
+                stats.files_skipped_no_candidates += 1;
+                continue;
+            }
+
+            println!(
+                "Analyzing: {} [{} candidates detected by SWC]",
+                path_str,
+                scan_result.candidates.len()
+            );
+
+            // STEP 3: Prepare Candidate Targets as hints for the LLM
+            let candidate_hints: Vec<String> = scan_result
+                .candidates
+                .iter()
+                .map(|c| c.format_hint())
+                .collect();
+
+            // STEP 4: Call Gemini with Full File + Patterns + Candidate Targets
             match self
                 .file_analyzer
-                .analyze_file(&path_str, &content, guidance)
+                .analyze_file_with_candidates(&path_str, &content, guidance, &candidate_hints)
                 .await
             {
                 Ok(result) => {
@@ -132,14 +169,18 @@ impl FileOrchestrator {
             }
         }
 
-        println!("File processing complete:");
-        println!("  - Files processed: {}", stats.files_processed);
-        println!("  - Files skipped: {}", stats.files_skipped);
+        println!("\n=== FILE PROCESSING COMPLETE ===");
+        println!("  - Files processed (LLM calls): {}", stats.files_processed);
+        println!("  - Files skipped (total): {}", stats.files_skipped);
+        println!(
+            "  - Zero-cost skips (no API patterns): {}",
+            stats.files_skipped_no_candidates
+        );
         println!("  - Total mounts: {}", stats.total_mounts);
         println!("  - Total endpoints: {}", stats.total_endpoints);
         println!("  - Total data calls: {}", stats.total_data_calls);
 
-        // Build aggregated mount graph from all file results
+        // STEP 5: Build aggregated mount graph from all file results
         let mount_graph = self.build_mount_graph(&file_results);
 
         Ok(FileCentricAnalysisResult {

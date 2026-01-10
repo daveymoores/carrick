@@ -85,6 +85,7 @@ impl SwcScanner {
     ///
     /// Returns a ScanResult with candidates and whether the file should be analyzed.
     /// If no candidates are found, `should_analyze` is false and the file can be skipped.
+    #[allow(dead_code)]
     pub fn scan_file(&self, file_path: &Path) -> ScanResult {
         let handler = Handler::with_tty_emitter(
             ColorConfig::Never,

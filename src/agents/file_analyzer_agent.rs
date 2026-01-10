@@ -81,27 +81,64 @@ impl FileAnalyzerAgent {
     ///
     /// # Returns
     /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
+    /// Analyze a single file with the given framework patterns (legacy method without candidates).
+    ///
+    /// This method is kept for backward compatibility. Prefer `analyze_file_with_candidates`
+    /// for the AST-gated architecture.
     pub async fn analyze_file(
         &self,
         file_path: &str,
         file_content: &str,
         guidance: &FrameworkGuidance,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        // Delegate to the new method with empty candidates
+        self.analyze_file_with_candidates(file_path, file_content, guidance, &[])
+            .await
+    }
+
+    /// Analyze a single file with AST-detected candidate targets.
+    ///
+    /// This is the primary method for the AST-Gated architecture:
+    /// 1. SWC Scanner has already found candidate lines
+    /// 2. We send Full File + Patterns + Candidate Hints to the LLM
+    /// 3. The LLM uses candidates as "Focused Targets" to ensure 100% recall
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the file being analyzed (for context)
+    /// * `file_content` - Full content of the file
+    /// * `guidance` - Framework-specific patterns to use for matching
+    /// * `candidate_hints` - AST-detected candidate lines (formatted hints from SWC Scanner)
+    ///
+    /// # Returns
+    /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
+    pub async fn analyze_file_with_candidates(
+        &self,
+        file_path: &str,
+        file_content: &str,
+        guidance: &FrameworkGuidance,
+        candidate_hints: &[String],
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
             return Ok(FileAnalysisResult::default());
         }
 
-        let system_message = self.build_system_message();
-        let user_message = self.build_user_message(file_path, file_content, guidance);
+        let system_message = self.build_system_message_with_candidates();
+        let user_message = self.build_user_message_with_candidates(
+            file_path,
+            file_content,
+            guidance,
+            candidate_hints,
+        );
 
-        println!("=== FILE ANALYZER AGENT ===");
+        println!("=== FILE ANALYZER AGENT (AST-GATED) ===");
         println!("Analyzing file: {}", file_path);
         println!(
             "File size: {} chars, {} lines",
             file_content.len(),
             file_content.lines().count()
         );
+        println!("Candidate targets: {}", candidate_hints.len());
 
         let schema = AgentSchemas::file_analysis_schema();
         let response = self
@@ -130,33 +167,44 @@ impl FileAnalyzerAgent {
         Ok(result)
     }
 
-    /// Build the system message for the Carrick Static Analysis Engine.
+    /// Build the system message for the Carrick Static Analysis Engine (legacy).
     /// This prompt is strictly framework-agnostic.
+    #[allow(dead_code)]
     fn build_system_message(&self) -> String {
+        self.build_system_message_with_candidates()
+    }
+
+    /// Build the system message for AST-Gated analysis with Candidate Targets.
+    /// This prompt is strictly framework-agnostic and includes guidance for using AST hints.
+    fn build_system_message_with_candidates(&self) -> String {
         r#"You are the **Carrick Static Analysis Engine**.
 Your mission is to analyze a single source code file to extract structural API relationships.
 You function purely as a **Pattern Matcher** and **Alias Resolver**. You do NOT possess inherent knowledge of specific frameworks; you must rely strictly on the **ACTIVE PATTERNS** provided in the input.
 
+### INPUT DATA
+1. **Full Source Code**: The complete file content for context (imports, definitions).
+2. **Candidate Targets**: A list of specific lines where an AST parser detected potential API activity.
+3. **Active Patterns**: The specific code patterns to classify (e.g., Mounts, Endpoints).
+
 ### CORE OBJECTIVE
-Scan the provided **FILE CONTENT** and extract items matching the **ACTIVE PATTERNS**. Return a structured JSON object containing flat lists of findings.
+Analyze the **Full Source Code**. Focus specifically on the **Candidate Targets** to classify them, but use the surrounding code to resolve variables and imports.
 
 ### 1. ANALYSIS RULES
 
 #### A. Strict Pattern Matching
-* **Endpoints:** If code matches an `endpoint_pattern` from the input, extract it.
-* **Mounts:** If code matches a `mount_pattern` from the input, extract it.
-* **Data Calls:** If code matches a `data_fetching_pattern` from the input, extract it.
-* **No Hallucinations:** Do not infer endpoints from comments or vague code. If it doesn't match a pattern, ignore it.
+* **Endpoints:** If a target matches an `endpoint_pattern`, extract it.
+* **Mounts:** If a target matches a `mount_pattern`, extract it.
+* **Data Calls:** If a target matches a `data_fetching_pattern`, extract it.
+* **Filter Noise:** The AST parser is broad. If a "Candidate Target" does not strictly match an Active Pattern (e.g., it's just a comment or unrelated function call), IGNORE it.
 
 #### B. Variable & Alias Resolution (CRITICAL)
-Your extraction must be useful for a graph builder. You must resolve variable names to their definitions:
-* **Imports:** If a generic router is mounted (e.g., `parent.mount('/', child)`), and `child` is imported from `'./auth'`, you MUST record `'./auth'` as the `import_source`. This is the ONLY way we link files.
+Your extraction must be useful for a graph builder. You must resolve variable names:
+* **Imports:** If a router/controller is mounted (e.g., `parent.mount('/', child)`), and `child` is imported from `'./auth'`, you MUST record `'./auth'` as the `import_source`. This is the ONLY way we link files.
 * **Inline:** If a variable is defined in this file (e.g., `const api = createRouter()`), track that it is local (import_source = null).
-* **Chaining:** If a pattern is chained (e.g., `createApp().plugin(...)`), the `parent_node` is the root object (e.g., `createApp()`).
+* **Chaining:** If a pattern is chained (e.g., `createApp().plugin(...)`), the `parent_node` is the root object.
 
 ### 2. OUTPUT REQUIREMENTS (Flat Schema)
-* Do not nest details inside generic objects.
-* Every finding must be a top-level item in its respective list.
+* Do not nest details. Every finding must be a top-level item in its respective list.
 * Strings should be exact literals from the code.
 * Line numbers are 1-based.
 * For HTTP methods, use uppercase: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, ALL.
@@ -176,16 +224,38 @@ When a variable is used in a mount and that variable was imported, include the i
 * **response.json()/.text():** These are data_calls when they appear after fetch/axios calls to parse response data."#.to_string()
     }
 
-    /// Build the dynamic user message with patterns and file content.
+    /// Build the dynamic user message with patterns and file content (legacy).
+    #[allow(dead_code)]
     fn build_user_message(
         &self,
         file_path: &str,
         file_content: &str,
         guidance: &FrameworkGuidance,
     ) -> String {
+        self.build_user_message_with_candidates(file_path, file_content, guidance, &[])
+    }
+
+    /// Build the dynamic user message with patterns, file content, and candidate targets.
+    fn build_user_message_with_candidates(
+        &self,
+        file_path: &str,
+        file_content: &str,
+        guidance: &FrameworkGuidance,
+        candidate_hints: &[String],
+    ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
         let data_patterns = self.format_patterns(&guidance.data_fetching_patterns);
+
+        // Format candidate targets section
+        let candidates_section = if candidate_hints.is_empty() {
+            "No specific candidates provided - analyze the entire file for patterns.".to_string()
+        } else {
+            format!(
+                "The following lines triggered the AST parser. Analyze these specific locations:\n{}",
+                candidate_hints.join("\n")
+            )
+        };
 
         format!(
             r#"### ACTIVE PATTERNS (Derived from Framework Guidance)
@@ -200,6 +270,9 @@ When a variable is used in a mount and that variable was imported, include the i
     {}
   ]
 }}
+
+### CANDIDATE TARGETS (AST-Detected Hints)
+{}
 
 ### FRAMEWORK-SPECIFIC HINTS
 {}
@@ -222,6 +295,7 @@ Return ONLY the JSON object, no explanations."#,
             mount_patterns,
             endpoint_patterns,
             data_patterns,
+            candidates_section,
             guidance.triage_hints,
             file_path,
             file_content
@@ -468,6 +542,6 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
         // Verify it emphasizes pattern-based matching
         assert!(system_message.contains("Strict Pattern Matching"));
-        assert!(system_message.contains("No Hallucinations"));
+        assert!(system_message.contains("Filter Noise"));
     }
 }

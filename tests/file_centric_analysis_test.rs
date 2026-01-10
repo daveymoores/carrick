@@ -208,6 +208,7 @@ fn test_processing_stats_tracking() {
     let stats = ProcessingStats {
         files_processed: 5,
         files_skipped: 2,
+        files_skipped_no_candidates: 1,
         total_mounts: 3,
         total_endpoints: 10,
         total_data_calls: 4,
