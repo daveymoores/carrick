@@ -9,7 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARRICK_API_ENDPOINT: ${{ secrets.CARRICK_API_ENDPOINT }}
-  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
 jobs:
   test:
