@@ -16,6 +16,7 @@ pub mod multi_agent_orchestrator;
 pub mod packages;
 pub mod parser;
 pub mod router_context;
+pub mod swc_scanner;
 pub mod url_normalizer;
 pub mod utils;
 pub mod visitor;
