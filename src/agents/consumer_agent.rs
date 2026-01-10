@@ -47,6 +47,8 @@ impl ConsumerAgent {
             call_sites.len()
         );
 
+        let system_message = self.build_system_message();
+
         // Batch size for parallel processing
         const BATCH_SIZE: usize = 10;
         let mut all_calls = Vec::new();
@@ -63,13 +65,13 @@ impl ConsumerAgent {
             );
 
             let prompt = self.build_fetching_prompt(batch, framework_detection, framework_guidance);
-            let system_message = self.build_system_message();
+            let system_message_clone = system_message.clone();
             let agent_service = self.agent_service.clone();
 
             join_set.spawn(async move {
                 let schema = AgentSchemas::consumer_schema();
                 let response = agent_service
-                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .analyze_code_with_schema(&prompt, &system_message_clone, Some(schema))
                     .await
                     .map_err(|e| {
                         format!("Agent API error in consumer batch {}: {}", batch_num, e)

@@ -32,6 +32,7 @@ impl EndpointAgent {
     }
 
     /// Detect HTTP endpoints from call sites
+    /// Uses prompt caching to reduce costs when processing multiple batches
     pub async fn detect_endpoints(
         &self,
         call_sites: &[CallSite],
@@ -47,6 +48,8 @@ impl EndpointAgent {
             "Analyzing {} pre-triaged endpoint call sites",
             call_sites.len()
         );
+
+        let system_message = self.build_system_message();
 
         // Batch size for parallel processing
         const BATCH_SIZE: usize = 10;
@@ -64,13 +67,13 @@ impl EndpointAgent {
             );
 
             let prompt = self.build_endpoint_prompt(batch, framework_detection, framework_guidance);
-            let system_message = self.build_system_message();
+            let system_message_clone = system_message.clone();
             let agent_service = self.agent_service.clone();
 
             join_set.spawn(async move {
                 let schema = AgentSchemas::endpoint_schema();
                 let response = agent_service
-                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .analyze_code_with_schema(&prompt, &system_message_clone, Some(schema))
                     .await
                     .map_err(|e| {
                         format!("Agent API error in endpoint batch {}: {}", batch_num, e)

@@ -98,6 +98,7 @@ function validateRequest(body) {
 }
 
 // Convert Carrick message format to Anthropic format
+// Supports cache_control for prompt caching
 function convertMessages(messages) {
   const convertedMessages = [];
   let systemMessage = null;
@@ -110,14 +111,28 @@ function convertMessages(messages) {
       });
     } else if (msg.role === "system") {
       // Anthropic uses a separate system parameter
-      systemMessage = msg.content;
+      // Check if content has cache_control (array of content blocks)
+      if (Array.isArray(msg.content)) {
+        systemMessage = msg.content;
+      } else {
+        systemMessage = msg.content;
+      }
     } else {
       // Map roles - Anthropic uses "assistant" not "model"
       const role = msg.role === "model" ? "assistant" : msg.role;
-      convertedMessages.push({
-        role: role,
-        content: msg.content || msg.text || "",
-      });
+
+      // Check if content is an array of content blocks (for cache_control support)
+      if (Array.isArray(msg.content)) {
+        convertedMessages.push({
+          role: role,
+          content: msg.content,
+        });
+      } else {
+        convertedMessages.push({
+          role: role,
+          content: msg.content || msg.text || "",
+        });
+      }
     }
   }
 
@@ -318,8 +333,8 @@ exports.handler = async (event) => {
       apiParams.system = systemMessage;
     }
 
-    // Add temperature if specified
-    if (requestBody.options?.temperature !== undefined) {
+    // Add temperature if specified (must be a valid number, not null)
+    if (requestBody.options?.temperature != null) {
       apiParams.temperature = requestBody.options.temperature;
     }
 
@@ -334,6 +349,11 @@ exports.handler = async (event) => {
       };
     }
 
+    // Check if any messages have cache_control for logging
+    const hasCacheControl = agentMessages.some(
+      (m) => Array.isArray(m.content) && m.content.some((c) => c.cache_control)
+    ) || (Array.isArray(systemMessage) && systemMessage.some((c) => c.cache_control));
+
     console.log("Calling Agent API:", {
       model,
       messageCount: agentMessages.length,
@@ -341,6 +361,7 @@ exports.handler = async (event) => {
       httpMethod: httpMethod,
       hasSchema: !!requestBody.response_schema,
       hasSystem: !!systemMessage,
+      hasCacheControl: hasCacheControl,
     });
 
     // Make the Agent API call using Anthropic SDK with structured outputs
@@ -355,10 +376,19 @@ exports.handler = async (event) => {
     const endTime = Date.now();
     const duration = endTime - startTime;
 
+    // Log cache statistics if available
+    const cacheStats = response.usage?.cache_creation_input_tokens !== undefined
+      ? {
+        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+        cache_read_input_tokens: response.usage.cache_read_input_tokens,
+      }
+      : null;
+
     console.log("Agent API success:", {
       duration: `${duration}ms`,
       responseLength: text.length,
       tokensUsed: response.usage || "unknown",
+      cacheStats: cacheStats,
     });
 
     // Return successful response

@@ -16,6 +16,36 @@ pub struct PatternExample {
     pub framework: String,
 }
 
+/// Flattened response format using parallel arrays (faster for structured output)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlatPatternResponse {
+    patterns: Vec<String>,
+    descriptions: Vec<String>,
+    frameworks: Vec<String>,
+}
+
+impl FlatPatternResponse {
+    /// Convert parallel arrays back to Vec<PatternExample>
+    fn into_pattern_examples(self) -> Vec<PatternExample> {
+        self.patterns
+            .into_iter()
+            .zip(self.descriptions)
+            .zip(self.frameworks)
+            .map(|((pattern, description), framework)| PatternExample {
+                pattern,
+                description,
+                framework,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GeneralGuidanceResponse {
+    triage_hints: String,
+    parsing_notes: String,
+}
+
 /// Framework-specific guidance for downstream agents
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameworkGuidance {
@@ -54,7 +84,7 @@ impl FrameworkGuidanceAgent {
     }
 
     /// Generate framework-specific guidance based on detected frameworks.
-    /// Always calls the LLM to get guidance - no hardcoded patterns.
+    /// Uses parallel calls to the LLM for each category for improved speed.
     pub async fn generate_guidance(
         &self,
         framework_detection: &DetectionResult,
@@ -66,25 +96,40 @@ impl FrameworkGuidanceAgent {
         );
         println!("Data fetchers: {:?}", framework_detection.data_fetchers);
 
-        let prompt = self.build_guidance_prompt(framework_detection);
         let system_message = self.build_system_message();
+        let prompt_context = self.build_context_string(framework_detection);
 
-        let schema = AgentSchemas::framework_guidance_schema();
-        let response = self
-            .agent_service
-            .analyze_code_with_schema(&prompt, &system_message, Some(schema))
-            .await?;
+        // Execute calls in parallel for speed (flattened schema makes this fast enough)
+        println!("  Fetching all patterns in parallel...");
+        let mount_task = self.fetch_patterns("mount", &prompt_context, &system_message);
+        let endpoint_task = self.fetch_patterns("endpoint", &prompt_context, &system_message);
+        let middleware_task = self.fetch_patterns("middleware", &prompt_context, &system_message);
+        let fetching_task = self.fetch_patterns("data_fetching", &prompt_context, &system_message);
+        let general_task = self.fetch_general_guidance(&prompt_context, &system_message);
 
-        println!("=== RAW AGENT FRAMEWORK GUIDANCE RESPONSE ===");
-        println!("{}", response);
-        println!("=== END RAW RESPONSE ===");
+        // Wait for all tasks to complete
+        let (
+            mount_patterns,
+            endpoint_patterns,
+            middleware_patterns,
+            data_fetching_patterns,
+            general_guidance,
+        ) = tokio::try_join!(
+            mount_task,
+            endpoint_task,
+            middleware_task,
+            fetching_task,
+            general_task
+        )?;
 
-        let guidance: FrameworkGuidance = serde_json::from_str(&response).map_err(|e| {
-            format!(
-                "Failed to parse framework guidance response: {}. Raw response: {}",
-                e, response
-            )
-        })?;
+        let guidance = FrameworkGuidance {
+            mount_patterns,
+            endpoint_patterns,
+            middleware_patterns,
+            data_fetching_patterns,
+            triage_hints: general_guidance.triage_hints,
+            parsing_notes: general_guidance.parsing_notes,
+        };
 
         println!("Generated guidance with:");
         println!("  - {} mount patterns", guidance.mount_patterns.len());
@@ -101,19 +146,80 @@ impl FrameworkGuidanceAgent {
         Ok(guidance)
     }
 
-    fn build_system_message(&self) -> String {
-        r#"You are an expert in JavaScript/TypeScript web frameworks. Your task is to provide
-framework-specific patterns and guidance that will help other agents correctly
-identify and parse code from these frameworks.
+    async fn fetch_patterns(
+        &self,
+        category: &str,
+        context: &str,
+        system_message: &str,
+    ) -> Result<Vec<PatternExample>, Box<dyn std::error::Error>> {
+        let category_prompt = match category {
+            "mount" => {
+                "MOUNT PATTERNS: How does this framework mount sub-routers or sub-applications? Provide specific syntax."
+            }
+            "endpoint" => {
+                "ENDPOINT PATTERNS: How are HTTP endpoints defined? Provide specific syntax for routes/handlers."
+            }
+            "middleware" => {
+                "MIDDLEWARE PATTERNS: How is middleware registered? Provide specific syntax."
+            }
+            "data_fetching" => {
+                "DATA FETCHING PATTERNS: How are outbound HTTP calls made? Provide specific syntax."
+            }
+            _ => "Provide relevant code patterns.",
+        };
 
-You will be given a list of detected frameworks and data-fetching libraries.
-For each one, provide concrete code patterns with explanations.
+        let prompt = format!(
+            "{}\n\nTASK:\nProvide 2-3 concise examples for: {}\n\nReturn JSON with three parallel arrays: patterns (code), descriptions (what each does), frameworks (which framework).",
+            context, category_prompt
+        );
 
-Return ONLY valid JSON matching the required schema."#
-            .to_string()
+        let schema = AgentSchemas::pattern_list_schema();
+        let response = self
+            .agent_service
+            .analyze_code_with_schema(&prompt, system_message, Some(schema))
+            .await?;
+
+        let parsed: FlatPatternResponse = serde_json::from_str(&response).map_err(|e| {
+            format!(
+                "Failed to parse {} patterns: {}. Raw response: {}",
+                category, e, response
+            )
+        })?;
+
+        Ok(parsed.into_pattern_examples())
     }
 
-    fn build_guidance_prompt(&self, framework_detection: &DetectionResult) -> String {
+    async fn fetch_general_guidance(
+        &self,
+        context: &str,
+        system_message: &str,
+    ) -> Result<GeneralGuidanceResponse, Box<dyn std::error::Error>> {
+        let prompt = format!(
+            "{}\n\nTASK:\nProvide general guidance:\n1. TRIAGE HINTS: How to distinguish mounts vs middleware vs endpoints\n2. PARSING NOTES: AST/parsing considerations (decorators, chaining, etc.)\n\nReturn ONLY the JSON object.",
+            context
+        );
+
+        let schema = AgentSchemas::general_guidance_schema();
+        let response = self
+            .agent_service
+            .analyze_code_with_schema(&prompt, system_message, Some(schema))
+            .await?;
+
+        let parsed: GeneralGuidanceResponse = serde_json::from_str(&response).map_err(|e| {
+            format!(
+                "Failed to parse general guidance: {}. Raw response: {}",
+                e, response
+            )
+        })?;
+
+        Ok(parsed)
+    }
+
+    fn build_system_message(&self) -> String {
+        "You are an expert at web frameworks and HTTP client libraries. Provide concise, realistic code pattern examples.".to_string()
+    }
+
+    fn build_context_string(&self, framework_detection: &DetectionResult) -> String {
         let frameworks_list = if framework_detection.frameworks.is_empty() {
             "None detected".to_string()
         } else {
@@ -127,47 +233,8 @@ Return ONLY valid JSON matching the required schema."#
         };
 
         format!(
-            r#"Given the following detected frameworks and libraries, provide patterns and guidance
-for code analysis.
-
-DETECTED FRAMEWORKS: {frameworks_list}
-DETECTED DATA FETCHERS: {data_fetchers_list}
-
-For each framework/library detected, provide:
-
-1. MOUNT PATTERNS: How does this framework mount sub-routers or sub-applications?
-   Provide the specific syntax this framework uses.
-
-2. ENDPOINT PATTERNS: How are HTTP endpoints defined?
-   Provide the specific syntax for defining routes/handlers.
-
-3. MIDDLEWARE PATTERNS: How is middleware registered?
-   Provide the specific syntax for adding middleware.
-
-4. DATA FETCHING PATTERNS: How are outbound HTTP calls made?
-   Provide the specific syntax for making HTTP requests.
-
-5. TRIAGE HINTS: Any special notes for distinguishing between categories?
-   What makes a mount different from middleware in this framework?
-   What distinguishes endpoints from other function calls?
-
-6. PARSING NOTES: Any AST/parsing considerations?
-   Does this framework use decorators, method chaining, config objects, etc.?
-
-Return JSON with this structure:
-{{
-  "mount_patterns": [
-    {{ "pattern": "<code example>", "description": "<what it does>", "framework": "<framework name>" }}
-  ],
-  "endpoint_patterns": [...],
-  "middleware_patterns": [...],
-  "data_fetching_patterns": [...],
-  "triage_hints": "Free-form guidance for distinguishing between categories...",
-  "parsing_notes": "Notes about AST structure or special syntax..."
-}}
-
-Include at least 2-3 patterns for each category based on the detected frameworks.
-Be specific to the actual frameworks detected - provide their real syntax and idioms."#
+            "DETECTED FRAMEWORKS: {}\nDETECTED DATA FETCHERS: {}",
+            frameworks_list, data_fetchers_list
         )
     }
 }
@@ -223,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_prompt_with_frameworks() {
+    fn test_build_context_with_frameworks() {
         let agent_service = crate::agent_service::AgentService::new("mock".to_string());
         let agent = FrameworkGuidanceAgent::new(agent_service);
 
@@ -233,14 +300,14 @@ mod tests {
             notes: "test".to_string(),
         };
 
-        let prompt = agent.build_guidance_prompt(&detection);
+        let context = agent.build_context_string(&detection);
 
-        assert!(prompt.contains("someframework"));
-        assert!(prompt.contains("someclient"));
+        assert!(context.contains("someframework"));
+        assert!(context.contains("someclient"));
     }
 
     #[test]
-    fn test_build_prompt_with_no_frameworks() {
+    fn test_build_context_with_no_frameworks() {
         let agent_service = crate::agent_service::AgentService::new("mock".to_string());
         let agent = FrameworkGuidanceAgent::new(agent_service);
 
@@ -250,8 +317,8 @@ mod tests {
             notes: "test".to_string(),
         };
 
-        let prompt = agent.build_guidance_prompt(&detection);
+        let context = agent.build_context_string(&detection);
 
-        assert!(prompt.contains("None detected"));
+        assert!(context.contains("None detected"));
     }
 }

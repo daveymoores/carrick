@@ -92,8 +92,9 @@ impl AgentService {
         request_builder =
             request_builder.header("Authorization", format!("Bearer {}", self.api_key));
 
-        // Retry logic for transient failures (max 3 attempts)
-        let max_retries = 5;
+        // Retry logic for transient failures with exponential backoff
+        // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s (handles API Gateway 30s timeouts)
+        let max_retries = 7;
         for attempt in 1..=max_retries {
             match request_builder.try_clone().unwrap().send().await {
                 Ok(response) => {
@@ -113,10 +114,10 @@ impl AgentService {
                     } else {
                         let status = response.status();
 
-                        // Retry on 429 Too Many Requests
+                        // Retry on 429 Too Many Requests with exponential backoff
                         if status == 429 && attempt < max_retries {
                             let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                            println!(
+                            eprintln!(
                                 "Agent API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
                                 wait_time, attempt, max_retries
                             );
@@ -124,14 +125,15 @@ impl AgentService {
                             continue;
                         }
 
-                        // Only retry on 503 Service Unavailable
+                        // Retry on 503 Service Unavailable with exponential backoff
+                        // This handles API Gateway timeout issues
                         if status == 503 && attempt < max_retries {
-                            let delay_ms = 1000 * attempt;
+                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
                             eprintln!(
-                                "Agent API returned 503, retrying in {}ms (attempt {}/3)",
-                                delay_ms, attempt
+                                "Agent API returned 503, retrying in {:?} (attempt {}/{})",
+                                wait_time, attempt, max_retries
                             );
-                            sleep(Duration::from_millis(delay_ms)).await;
+                            sleep(wait_time).await;
                             continue;
                         }
 
@@ -144,14 +146,14 @@ impl AgentService {
                     }
                 }
                 Err(e) => {
-                    // Only retry network errors on first 2 attempts
-                    if attempt < 3 {
-                        let delay_ms = 1000 * attempt;
+                    // Retry network errors with exponential backoff
+                    if attempt < max_retries {
+                        let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
                         eprintln!(
-                            "Agent proxy call failed: {}, retrying in {}ms (attempt {}/3)",
-                            e, delay_ms, attempt
+                            "Agent proxy call failed: {}, retrying in {:?} (attempt {}/{})",
+                            e, wait_time, attempt, max_retries
                         );
-                        sleep(Duration::from_millis(delay_ms)).await;
+                        sleep(wait_time).await;
                         continue;
                     }
 
@@ -528,13 +530,27 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
                 // Default array response
                 "[]".to_string()
             } else if schema_val.get("type").and_then(|t| t.as_str()) == Some("OBJECT") {
-                // Check for framework guidance schema - has mount_patterns, endpoint_patterns, etc.
                 if let Some(props) = schema_val.get("properties") {
+                    // Check for framework guidance schema - has mount_patterns, endpoint_patterns, etc.
                     if props.get("mount_patterns").is_some()
                         && props.get("endpoint_patterns").is_some()
                         && props.get("triage_hints").is_some()
                     {
                         return generate_mock_framework_guidance_response(prompt);
+                    }
+                    // Check for pattern_list_schema - has patterns, descriptions, frameworks arrays
+                    if props.get("patterns").is_some()
+                        && props.get("descriptions").is_some()
+                        && props.get("frameworks").is_some()
+                    {
+                        return generate_mock_pattern_list_response();
+                    }
+                    // Check for general_guidance_schema - has triage_hints and parsing_notes
+                    if props.get("triage_hints").is_some()
+                        && props.get("parsing_notes").is_some()
+                        && props.get("mount_patterns").is_none()
+                    {
+                        return generate_mock_general_guidance_response();
                     }
                 }
                 // Framework detection or other object schema
@@ -558,6 +574,18 @@ fn generate_mock_framework_guidance_response(_prompt: &str) -> String {
     // In mock mode, return a valid but empty structure
     // The real LLM call will populate this with framework-specific patterns
     r#"{"mount_patterns":[],"endpoint_patterns":[],"middleware_patterns":[],"data_fetching_patterns":[],"triage_hints":"Mock mode - no guidance generated","parsing_notes":"Mock mode - no parsing notes"}"#.to_string()
+}
+
+/// Generate mock pattern list response for FrameworkGuidanceAgent pattern fetching
+/// Returns empty parallel arrays matching the flattened pattern_list_schema
+fn generate_mock_pattern_list_response() -> String {
+    r#"{"patterns":[],"descriptions":[],"frameworks":[]}"#.to_string()
+}
+
+/// Generate mock general guidance response for FrameworkGuidanceAgent
+/// Returns empty triage hints and parsing notes
+fn generate_mock_general_guidance_response() -> String {
+    r#"{"triage_hints":"Mock mode - no triage hints","parsing_notes":"Mock mode - no parsing notes"}"#.to_string()
 }
 
 /// Generate mock triage responses by extracting locations from prompt

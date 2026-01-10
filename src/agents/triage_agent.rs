@@ -83,6 +83,7 @@ impl TriageAgent {
     }
 
     /// Perform initial broad classification of all call sites with batching
+    /// Uses prompt caching to reduce costs when processing multiple batches
     pub async fn classify_call_sites(
         &self,
         call_sites: &[CallSite],
@@ -95,6 +96,8 @@ impl TriageAgent {
 
         println!("=== TRIAGE AGENT DEBUG ===");
         println!("Triaging {} call sites", call_sites.len());
+
+        let system_message = self.build_system_message();
 
         // Batch size for parallel processing
         const BATCH_SIZE: usize = 10;
@@ -112,15 +115,16 @@ impl TriageAgent {
             );
 
             let prompt = self.build_triage_prompt(batch, framework_detection, framework_guidance);
-            let system_message = self.build_system_message();
+            let system_message_clone = system_message.clone();
             let agent_service = self.agent_service.clone();
+            let batch_len = batch.len(); // Capture for validation
 
             join_set.spawn(async move {
                 println!("Batch {} prompt length: {} chars", batch_num, prompt.len());
 
                 let schema = AgentSchemas::triage_schema();
                 let response = agent_service
-                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .analyze_code_with_schema(&prompt, &system_message_clone, Some(schema))
                     .await
                     .map_err(|e| format!("Agent API error in batch {}: {}", batch_num, e))?;
 
@@ -141,6 +145,17 @@ impl TriageAgent {
                     batch_num,
                     batch_results.len()
                 );
+
+                // Validate result count matches input batch size
+                // Note: batch_len is captured from the batch.len() at spawn time
+                if batch_results.len() != batch_len {
+                    return Err(format!(
+                        "Batch {} classification count mismatch: expected {} call sites, got {}",
+                        batch_num,
+                        batch_len,
+                        batch_results.len()
+                    ));
+                }
 
                 Ok::<Vec<TriageResult>, String>(batch_results)
             });

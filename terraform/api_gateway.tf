@@ -37,6 +37,7 @@ resource "aws_apigatewayv2_integration" "agent_proxy_integration" {
   integration_uri        = aws_lambda_function.agent_proxy.invoke_arn
   integration_method     = "POST"
   payload_format_version = "2.0"
+  timeout_milliseconds   = 30000 # API Gateway HTTP API max timeout is 30s
 }
 
 resource "aws_apigatewayv2_route" "agent_proxy_route" {

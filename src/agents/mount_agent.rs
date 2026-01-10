@@ -44,6 +44,8 @@ impl MountAgent {
             call_sites.len()
         );
 
+        let system_message = self.build_system_message();
+
         // Batch size for parallel processing
         const BATCH_SIZE: usize = 10;
         let mut all_mounts = Vec::new();
@@ -60,13 +62,13 @@ impl MountAgent {
             );
 
             let prompt = self.build_mount_prompt(batch, framework_detection, framework_guidance);
-            let system_message = self.build_system_message();
+            let system_message_clone = system_message.clone();
             let agent_service = self.agent_service.clone();
 
             join_set.spawn(async move {
                 let schema = AgentSchemas::mount_schema();
                 let response = agent_service
-                    .analyze_code_with_schema(&prompt, &system_message, Some(schema))
+                    .analyze_code_with_schema(&prompt, &system_message_clone, Some(schema))
                     .await
                     .map_err(|e| format!("Agent API error in mount batch {}: {}", batch_num, e))?;
 
@@ -172,12 +174,6 @@ PARSING NOTES:
 ROUTER MOUNT CALL SITES:
 {call_sites_json}
 
-For each router mount call site, extract:
-1. Parent node (the object doing the mounting)
-2. Child node (the router/sub-app being mounted)
-3. Mount path (the path prefix where it's mounted)
-4. File location
-
 Return JSON array with this structure:
 [
   {{
@@ -207,7 +203,6 @@ GUIDELINES:
 - If arguments are Identifiers, check the "resolved_value" field for the actual string value
 - If mount_path cannot be resolved from args/resolved_value, use the `context_slice` field to infer the concrete mount path
 - If arguments are TemplateLiterals, use the "value" field which contains the reconstructed template string
-- Common patterns:
 - Use the framework-specific mount patterns above to understand how mounts work in each framework
 - Common patterns:
   - app.use('/path', router) -> parent: app, child: router, path: /path

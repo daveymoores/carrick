@@ -204,72 +204,38 @@ impl AgentSchemas {
         })
     }
 
-    /// Schema for FrameworkGuidanceAgent output
-    pub fn framework_guidance_schema() -> Value {
+    /// Flattened schema for parallel pattern fetching - uses parallel arrays instead of nested objects
+    /// Used by FrameworkGuidanceAgent for individual category requests
+    pub fn pattern_list_schema() -> Value {
         json!({
             "type": "OBJECT",
             "properties": {
-                "mount_patterns": {
+                "patterns": {
                     "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "pattern": {
-                                "type": "STRING",
-                                "description": "Code pattern example, e.g., app.route('/path', subApp)"
-                            },
-                            "description": {
-                                "type": "STRING",
-                                "description": "What this pattern represents"
-                            },
-                            "framework": {
-                                "type": "STRING",
-                                "description": "Which framework this pattern is for"
-                            }
-                        },
-                        "required": ["pattern", "description", "framework"]
-                    },
-                    "description": "Patterns for router/sub-app mounting"
+                    "items": { "type": "STRING" },
+                    "description": "Code pattern examples"
                 },
-                "endpoint_patterns": {
+                "descriptions": {
                     "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "pattern": { "type": "STRING" },
-                            "description": { "type": "STRING" },
-                            "framework": { "type": "STRING" }
-                        },
-                        "required": ["pattern", "description", "framework"]
-                    },
-                    "description": "Patterns for HTTP endpoint definitions"
+                    "items": { "type": "STRING" },
+                    "description": "What each pattern represents (same order as patterns)"
                 },
-                "middleware_patterns": {
+                "frameworks": {
                     "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "pattern": { "type": "STRING" },
-                            "description": { "type": "STRING" },
-                            "framework": { "type": "STRING" }
-                        },
-                        "required": ["pattern", "description", "framework"]
-                    },
-                    "description": "Patterns for middleware registration"
-                },
-                "data_fetching_patterns": {
-                    "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "pattern": { "type": "STRING" },
-                            "description": { "type": "STRING" },
-                            "framework": { "type": "STRING" }
-                        },
-                        "required": ["pattern", "description", "framework"]
-                    },
-                    "description": "Patterns for outbound HTTP calls"
-                },
+                    "items": { "type": "STRING" },
+                    "description": "Which framework each pattern is for (same order as patterns)"
+                }
+            },
+            "required": ["patterns", "descriptions", "frameworks"]
+        })
+    }
+
+    /// Schema for general guidance (triage hints and parsing notes)
+    /// Used by FrameworkGuidanceAgent for the general guidance request
+    pub fn general_guidance_schema() -> Value {
+        json!({
+            "type": "OBJECT",
+            "properties": {
                 "triage_hints": {
                     "type": "STRING",
                     "description": "Free-form hints for distinguishing between categories"
@@ -279,8 +245,7 @@ impl AgentSchemas {
                     "description": "Framework-specific notes that may affect parsing"
                 }
             },
-            "required": ["mount_patterns", "endpoint_patterns", "middleware_patterns",
-                        "data_fetching_patterns", "triage_hints", "parsing_notes"]
+            "required": ["triage_hints", "parsing_notes"]
         })
     }
 
@@ -336,17 +301,29 @@ mod tests {
         assert!(AgentSchemas::consumer_schema().is_object());
         assert!(AgentSchemas::middleware_schema().is_object());
         assert!(AgentSchemas::mount_schema().is_object());
-        assert!(AgentSchemas::framework_guidance_schema().is_object());
+        assert!(AgentSchemas::pattern_list_schema().is_object());
+        assert!(AgentSchemas::general_guidance_schema().is_object());
     }
 
     #[test]
-    fn test_framework_guidance_schema_structure() {
-        let schema = AgentSchemas::framework_guidance_schema();
+    fn test_pattern_list_schema_structure() {
+        let schema = AgentSchemas::pattern_list_schema();
         assert_eq!(schema["type"], "OBJECT");
-        assert!(schema["properties"]["mount_patterns"].is_object());
-        assert!(schema["properties"]["endpoint_patterns"].is_object());
-        assert!(schema["properties"]["middleware_patterns"].is_object());
-        assert!(schema["properties"]["data_fetching_patterns"].is_object());
+        // Flattened structure uses parallel arrays
+        assert!(schema["properties"]["patterns"].is_object());
+        assert_eq!(schema["properties"]["patterns"]["type"], "ARRAY");
+        assert_eq!(schema["properties"]["patterns"]["items"]["type"], "STRING");
+        assert!(schema["properties"]["descriptions"].is_object());
+        assert_eq!(schema["properties"]["descriptions"]["type"], "ARRAY");
+        assert!(schema["properties"]["frameworks"].is_object());
+        assert_eq!(schema["properties"]["frameworks"]["type"], "ARRAY");
+        assert!(schema["required"].is_array());
+    }
+
+    #[test]
+    fn test_general_guidance_schema_structure() {
+        let schema = AgentSchemas::general_guidance_schema();
+        assert_eq!(schema["type"], "OBJECT");
         assert!(schema["properties"]["triage_hints"].is_object());
         assert!(schema["properties"]["parsing_notes"].is_object());
         assert!(schema["required"].is_array());

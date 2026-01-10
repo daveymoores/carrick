@@ -23,7 +23,7 @@ resource "aws_lambda_function" "agent_proxy" {
   runtime          = "nodejs22.x"
   filename         = "../lambdas/agent-proxy.zip"
   source_code_hash = filebase64sha256("../lambdas/agent-proxy.zip")
-  timeout          = 60 # Agent API calls can take longer
+  timeout          = 120 # Increased for parallel LLM calls - API Gateway has 30s limit but Lambda can continue processing
 
   environment {
     variables = {
