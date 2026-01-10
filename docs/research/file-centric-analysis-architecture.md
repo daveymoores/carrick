@@ -147,6 +147,98 @@ The file-centric architecture coexists with the existing batch-based system:
 6. ⬜ Performance benchmarking against batch approach
 7. ⬜ Gradual migration with fallback support
 
+### ⚠️ CRITICAL: Do Not Hybridize Flows
+
+When integrating the file-centric approach, the old and new flows must be **mutually exclusive**:
+
+| Component | Old Flow (Batch) | New Flow (File-Centric) |
+|-----------|------------------|-------------------------|
+| Pre-scan | CallSiteExtractor (regex/AST) | **NONE** |
+| LLM Input | Extracted call sites only | Full file content |
+| LLM Task | Classify pre-identified sites | Find AND classify patterns |
+
+**Why this matters:**
+
+1. **Wasted CPU**: Running CallSiteExtractor before FileAnalyzerAgent wastes cycles on regex scanning that the LLM will redo anyway.
+
+2. **Limited Vision**: If you pass only regex-matched sections to the LLM, you defeat the purpose of file-centric analysis. The LLM needs full file context for alias resolution.
+
+3. **Correct Integration Pattern:**
+   ```rust
+   // ❌ WRONG - Hybridized (don't do this)
+   let call_sites = extract_all_call_sites(&files).await?;  // Old pre-scan
+   let result = file_orchestrator.analyze_files(&files, &guidance).await?;  // New analysis
+   
+   // ✅ CORRECT - Mutually exclusive paths
+   if use_file_centric_analysis {
+       // New flow: LLM receives full files, finds everything
+       let result = file_orchestrator.analyze_files(&files, &guidance, &detection).await?;
+   } else {
+       // Old flow: Regex pre-scan, then LLM classifies
+       let call_sites = extract_all_call_sites(&files).await?;
+       let result = call_site_orchestrator.analyze_call_sites(&call_sites, ...).await?;
+   }
+   ```
+
+The `FileOrchestrator.analyze_files()` method reads raw file content via `std::fs::read_to_string()` and sends it directly to the LLM—this is intentional and correct.
+
+### Suggested Guard Pattern for Integration
+
+When adding the file-centric path to `MultiAgentOrchestrator`, consider a compile-time or runtime guard:
+
+```rust
+// In multi_agent_orchestrator.rs
+
+pub enum AnalysisMode {
+    /// Old flow: CallSiteExtractor → Triage → Dispatch
+    CallSiteBased,
+    /// New flow: Full file → FileAnalyzerAgent → Direct build
+    FileCentric,
+}
+
+impl MultiAgentOrchestrator {
+    pub async fn run_complete_analysis(
+        &self,
+        files: Vec<PathBuf>,
+        packages: &Packages,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+        mode: AnalysisMode,  // Explicit mode selection
+    ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
+        // Stages 0 and 0.5 are shared (framework detection + guidance)
+        let framework_detection = self.detect_frameworks(packages, imported_symbols).await?;
+        let framework_guidance = self.generate_guidance(&framework_detection).await?;
+
+        // Mutually exclusive analysis paths
+        match mode {
+            AnalysisMode::FileCentric => {
+                // New flow: NO pre-scan, full files to LLM
+                let file_orchestrator = FileOrchestrator::new(self.agent_service.clone());
+                let result = file_orchestrator
+                    .analyze_files(&files, &framework_guidance, &framework_detection)
+                    .await?;
+                // Convert FileCentricAnalysisResult to MultiAgentAnalysisResult
+                self.convert_file_centric_result(result, &framework_detection, &framework_guidance)
+            }
+            AnalysisMode::CallSiteBased => {
+                // Old flow: Pre-scan then LLM triage
+                let call_sites = self.extract_all_call_sites(&files).await?;
+                let orchestrator = CallSiteOrchestrator::new(self.agent_service.clone());
+                let analysis_results = orchestrator
+                    .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
+                    .await?;
+                // ... rest of old flow
+            }
+        }
+    }
+}
+```
+
+This pattern ensures:
+1. Explicit mode selection at the call site
+2. No accidental hybridization
+3. Easy A/B testing and gradual rollout
+4. Clear separation of concerns
+
 ## Files Added
 
 - `src/agents/file_analyzer_agent.rs` - File-centric analysis agent
