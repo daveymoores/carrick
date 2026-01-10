@@ -6,7 +6,7 @@
 //! 3. Consumer aliases match producer aliases when paths are semantically equivalent
 
 use carrick::{
-    agents::consumer_agent::DataFetchingCall,
+    agents::legacy_types::DataFetchingCall,
     analyzer::Analyzer,
     call_site_extractor::{CallSite, CallSiteExtractor},
 };
@@ -199,12 +199,10 @@ fn test_enrichment_prefers_swc_url_over_llm_url() {
 
     // LLM returns a DataFetchingCall with malformed URL (template literal syntax)
     let mut call = DataFetchingCall {
-        library: "fetch".to_string(),
+        callee: "fetch".to_string(),
         url: Some("/users/${userId}/comments".to_string()), // Bad URL from LLM
         method: Some("GET".to_string()),
         location: "test.ts:10:5".to_string(),
-        confidence: 0.95,
-        reasoning: "fetch call".to_string(),
         expected_type_file: None,
         expected_type_position: None,
         expected_type_string: None,

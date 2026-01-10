@@ -17,6 +17,7 @@ impl AgentType {
 /// Agent-format schemas for structured output from each agent
 pub struct AgentSchemas;
 
+#[allow(dead_code)]
 impl AgentSchemas {
     /// Schema for TriageAgent output - array of TriageResult
     pub fn triage_schema() -> Value {

@@ -321,6 +321,7 @@ fn build_definition_index(module: &Module) -> DefinitionIndex {
 }
 
 /// Framework-agnostic visitor that extracts ALL member call expressions
+#[allow(dead_code)]
 pub struct CallSiteExtractor {
     pub call_sites: Vec<CallSite>,
     pub variable_definitions: HashMap<String, String>,
@@ -334,6 +335,7 @@ pub struct CallSiteExtractor {
     source_map: Lrc<SourceMap>,
 }
 
+#[allow(dead_code)]
 impl CallSiteExtractor {
     pub fn new(file_path: PathBuf, source_map: Lrc<SourceMap>) -> Self {
         Self {
@@ -1122,6 +1124,7 @@ impl Visit for CallSiteExtractor {
 }
 
 /// Service for extracting call sites from multiple files
+#[allow(dead_code)]
 pub struct CallSiteExtractionService {
     call_sites: Vec<CallSite>,
 }
@@ -1132,6 +1135,7 @@ impl Default for CallSiteExtractionService {
     }
 }
 
+#[allow(dead_code)]
 impl CallSiteExtractionService {
     pub fn new() -> Self {
         Self {
@@ -1291,7 +1295,7 @@ app.get(route, handler);
     #[test]
     fn test_definition_index_callback_param_tracks_parent_context() {
         let (cm, module) = parse_ts(
-            r#"const routes = ["/a"]; 
+            r#"const routes = ["/a"];
 routes.forEach((r) => {
   app.get(r, handler);
 });
@@ -1395,7 +1399,7 @@ app.get(route, handler);
     #[test]
     fn test_context_slice_callback_param_includes_parent_call() {
         let call_sites = extract_call_sites(
-            r#"const routes = ["/a"]; 
+            r#"const routes = ["/a"];
 routes.forEach((r) => {
   app.get(r, handler);
 });

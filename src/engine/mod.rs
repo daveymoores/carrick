@@ -304,9 +304,9 @@ async fn analyze_current_repo(
         .run_complete_analysis(files, &packages, &all_imported_symbols)
         .await?;
 
-    // 5. Extract types from agent analysis results
+    // 5. Extract types from file analysis results
     let agent_type_infos =
-        orchestrator.extract_types_from_analysis(&analysis_result.analysis_results);
+        orchestrator.extract_types_from_file_results(&analysis_result.file_results);
 
     // 6. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
     let cloud_data = CloudRepoData::from_multi_agent_results(

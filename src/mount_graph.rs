@@ -1,5 +1,5 @@
 use crate::{
-    agents::{
+    agents::legacy_types::{
         AnalysisResults, DataFetchingCall as AgentDataFetchingCall, HttpEndpoint, Middleware,
         MountRelationship,
     },
@@ -104,6 +104,7 @@ impl MountGraph {
     }
 
     /// Build the mount graph directly from analysis results (framework-agnostic)
+    #[allow(dead_code)]
     pub fn build_from_analysis_results(
         analysis_results: &AnalysisResults,
         imported_symbols: &HashMap<String, ImportedSymbol>,
@@ -420,7 +421,7 @@ impl MountGraph {
             self.data_calls.push(DataFetchingCall {
                 method,
                 target_url,
-                client: call.library.clone(),
+                client: call.callee.clone(),
                 file_location: call.location.clone(),
             });
         }
@@ -1163,8 +1164,6 @@ mod tests {
                 child_node: "apiRouter".to_string(),
                 mount_path: "/api".to_string(),
                 location: "server.ts:10:0".to_string(),
-                confidence: 0.95,
-                reasoning: "app mounting apiRouter".to_string(),
             },
             // routes/api.ts: router.use('/v1', v1Router)
             MountRelationship {
@@ -1172,8 +1171,6 @@ mod tests {
                 child_node: "v1Router".to_string(),
                 mount_path: "/v1".to_string(),
                 location: "routes/api.ts:5:0".to_string(),
-                confidence: 0.95,
-                reasoning: "router mounting v1Router".to_string(),
             },
         ];
 
@@ -1186,8 +1183,6 @@ mod tests {
                 handler: "chatHandler".to_string(),
                 node_name: "router".to_string(), // Same variable name as in api.ts!
                 location: "routes/v1.ts:3:0".to_string(),
-                confidence: 0.95,
-                reasoning: "GET endpoint".to_string(),
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,

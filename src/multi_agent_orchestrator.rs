@@ -1,19 +1,30 @@
+//! Multi-Agent Orchestrator using AST-Gated File-Centric Analysis.
+//!
+//! This orchestrator implements the new analysis workflow:
+//! 1. Framework Detection - Identify frameworks and data fetchers
+//! 2. Framework Guidance Generation - Get patterns for detected frameworks
+//! 3. AST-Gated File Analysis - Use SWC Scanner as gatekeeper, then LLM for relevant files
+//! 4. Mount Graph Construction - Build from file analysis results
+//!
+//! The AST-Gated approach:
+//! - Skips files with no API patterns (zero LLM cost)
+//! - Sends full file context for better alias resolution
+//! - Passes AST-detected candidate hints for 100% recall
+
 use crate::{
     agent_service::AgentService,
-    agents::{AnalysisResults, CallSiteOrchestrator, FrameworkGuidance, FrameworkGuidanceAgent},
-    call_site_extractor::{CallSiteExtractionService, CallSiteExtractor},
+    agents::{
+        file_analyzer_agent::FileAnalysisResult,
+        file_orchestrator::{FileCentricAnalysisResult, FileOrchestrator, ProcessingStats},
+        framework_guidance_agent::{FrameworkGuidance, FrameworkGuidanceAgent},
+    },
     framework_detector::{DetectionResult, FrameworkDetector},
     mount_graph::MountGraph,
     packages::Packages,
-    parser::parse_file,
     visitor::ImportedSymbol,
 };
 use std::collections::HashMap;
-use swc_common::{
-    SourceMap,
-    errors::{ColorConfig, Handler},
-    sync::Lrc,
-};
+use swc_common::{SourceMap, sync::Lrc};
 
 /// Complete analysis result from the multi-agent workflow
 #[derive(Debug)]
@@ -23,12 +34,24 @@ pub struct MultiAgentAnalysisResult {
     #[allow(dead_code)]
     pub framework_guidance: FrameworkGuidance,
     pub mount_graph: MountGraph,
-    pub analysis_results: AnalysisResults,
+    /// File-centric analysis results (replaces old AnalysisResults)
+    pub file_results: HashMap<String, FileAnalysisResult>,
+    /// Processing statistics
+    #[allow(dead_code)]
+    pub stats: ProcessingStats,
 }
 
-/// Orchestrates the complete multi-agent workflow
+/// Orchestrates the complete multi-agent workflow using AST-Gated File-Centric analysis.
+///
+/// This orchestrator:
+/// 1. Detects frameworks from package.json and imports
+/// 2. Generates framework-specific patterns via LLM
+/// 3. Uses SWC Scanner as gatekeeper to skip irrelevant files (zero cost)
+/// 4. Sends relevant files to LLM with full context + candidate hints
+/// 5. Builds MountGraph from aggregated results
 pub struct MultiAgentOrchestrator {
     agent_service: AgentService,
+    #[allow(dead_code)]
     source_map: Lrc<SourceMap>,
 }
 
@@ -40,17 +63,26 @@ impl MultiAgentOrchestrator {
         }
     }
 
-    /// Run the complete multi-agent analysis workflow
+    /// Run the complete multi-agent analysis workflow using AST-Gated File-Centric approach.
+    ///
+    /// ## Workflow:
+    /// 1. **Framework Detection** - Identify frameworks from packages and imports
+    /// 2. **Framework Guidance** - Generate patterns for detected frameworks
+    /// 3. **AST-Gated Analysis** - For each file:
+    ///    - Run SWC Scanner to find candidates
+    ///    - If no candidates → SKIP (zero LLM cost)
+    ///    - If candidates exist → Send full file + patterns + hints to LLM
+    /// 4. **Graph Construction** - Build MountGraph from all file results
     pub async fn run_complete_analysis(
         &self,
         files: Vec<std::path::PathBuf>,
         packages: &Packages,
         imported_symbols: &HashMap<String, ImportedSymbol>,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
-        println!("Starting multi-agent framework-agnostic analysis...");
+        println!("Starting AST-Gated File-Centric analysis...");
 
         // Stage 0: Framework Detection
-        println!("Stage 0: Framework Detection");
+        println!("\n=== Stage 0: Framework Detection ===");
         let framework_detector = FrameworkDetector::new(self.agent_service.clone());
         let framework_detection = framework_detector
             .detect_frameworks_and_libraries(packages, imported_symbols)
@@ -62,42 +94,32 @@ impl MultiAgentOrchestrator {
             framework_detection.data_fetchers
         );
 
-        // Stage 0.5: Framework Guidance Generation
-        println!("Stage 0.5: Framework Guidance Generation");
+        // Stage 1: Framework Guidance Generation
+        println!("\n=== Stage 1: Framework Guidance Generation ===");
         let framework_guidance_agent = FrameworkGuidanceAgent::new(self.agent_service.clone());
         let framework_guidance = framework_guidance_agent
             .generate_guidance(&framework_detection)
             .await?;
 
         println!(
-            "Generated guidance with {} mount patterns, {} endpoint patterns",
+            "Generated guidance with {} mount patterns, {} endpoint patterns, {} data fetching patterns",
             framework_guidance.mount_patterns.len(),
-            framework_guidance.endpoint_patterns.len()
+            framework_guidance.endpoint_patterns.len(),
+            framework_guidance.data_fetching_patterns.len()
         );
 
-        // Stage 1: Call Site Extraction
-        println!("Stage 1: Call Site Extraction");
-        let call_sites = self.extract_all_call_sites(&files).await?;
-        println!("Extracted {} call sites", call_sites.len());
-
-        // Stage 2: Call Site Classification using Classify-Then-Dispatch
-        println!("Stage 2: Call Site Classification using Classify-Then-Dispatch");
-        let orchestrator = CallSiteOrchestrator::new(self.agent_service.clone());
-        let analysis_results = orchestrator
-            .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
+        // Stage 2: AST-Gated File-Centric Analysis
+        println!("\n=== Stage 2: AST-Gated File-Centric Analysis ===");
+        let file_orchestrator = FileOrchestrator::new(self.agent_service.clone());
+        let file_centric_result = file_orchestrator
+            .analyze_files(&files, &framework_guidance, &framework_detection)
             .await?;
 
-        println!(
-            "Analysis complete - {} total call sites processed",
-            analysis_results.triage_stats.total_call_sites
-        );
-        self.print_analysis_summary(&analysis_results);
+        self.print_analysis_summary(&file_centric_result);
 
-        // Stage 3: Mount Graph Construction
-        println!("Stage 3: Mount Graph Construction");
-        let mount_graph =
-            MountGraph::build_from_analysis_results(&analysis_results, imported_symbols);
-
+        // Stage 3: Mount Graph is already built by FileOrchestrator
+        println!("\n=== Stage 3: Mount Graph Summary ===");
+        let mount_graph = &file_centric_result.mount_graph;
         println!("Built mount graph:");
         println!("  - {} nodes", mount_graph.get_nodes().len());
         println!("  - {} mounts", mount_graph.get_mounts().len());
@@ -110,221 +132,108 @@ impl MultiAgentOrchestrator {
         Ok(MultiAgentAnalysisResult {
             framework_detection,
             framework_guidance,
-            mount_graph,
-            analysis_results,
+            mount_graph: file_centric_result.mount_graph,
+            file_results: file_centric_result.file_results,
+            stats: file_centric_result.stats,
         })
     }
 
-    /// Extract call sites from all files using framework-agnostic approach
-    async fn extract_all_call_sites(
-        &self,
-        files: &[std::path::PathBuf],
-    ) -> Result<Vec<crate::call_site_extractor::CallSite>, Box<dyn std::error::Error>> {
-        let handler = Handler::with_tty_emitter(
-            ColorConfig::Auto,
-            true,
-            false,
-            Some(self.source_map.clone()),
+    fn print_analysis_summary(&self, result: &FileCentricAnalysisResult) {
+        println!("\n=== ANALYSIS SUMMARY ===");
+        println!("File Processing:");
+        println!(
+            "  - Files processed (LLM calls): {}",
+            result.stats.files_processed
         );
-        let mut extraction_service = CallSiteExtractionService::new();
-        let mut extractors = Vec::new();
+        println!("  - Files skipped (total): {}", result.stats.files_skipped);
+        println!(
+            "  - Zero-cost skips (no API patterns): {}",
+            result.stats.files_skipped_no_candidates
+        );
 
-        println!("DEBUG: Parsing {} files", files.len());
-        for file_path in files {
-            if let Some(module) = parse_file(file_path, &self.source_map, &handler) {
-                let mut extractor =
-                    CallSiteExtractor::new(file_path.clone(), self.source_map.clone());
-                swc_ecma_visit::VisitWith::visit_with(&module, &mut extractor);
-                println!(
-                    "DEBUG: File {:?} - extracted {} call sites",
-                    file_path,
-                    extractor.call_sites.len()
-                );
-                extractors.push(extractor);
-            } else {
-                println!("DEBUG: Failed to parse file {:?}", file_path);
+        println!("Extracted Items:");
+        println!("  - Total mounts: {}", result.stats.total_mounts);
+        println!("  - Total endpoints: {}", result.stats.total_endpoints);
+        println!("  - Total data calls: {}", result.stats.total_data_calls);
+
+        if !result.stats.errors.is_empty() {
+            println!("Errors ({}):", result.stats.errors.len());
+            for error in &result.stats.errors {
+                println!("  - {}", error);
             }
         }
-
-        extraction_service.extract_from_visitors(extractors);
-        let call_sites = extraction_service.get_call_sites().to_vec();
-        println!(
-            "DEBUG: Total call sites after aggregation: {}",
-            call_sites.len()
-        );
-        if !call_sites.is_empty() {
-            println!("DEBUG: Sample call sites (first 3):");
-            for (i, site) in call_sites.iter().take(3).enumerate() {
-                println!(
-                    "  {}. {}.{}() at {}",
-                    i + 1,
-                    site.callee_object,
-                    site.callee_property,
-                    site.location
-                );
-            }
-        }
-        Ok(call_sites)
     }
 
-    fn print_analysis_summary(&self, analysis_results: &AnalysisResults) {
-        println!("=== ANALYSIS SUMMARY ===");
-        println!("Triage Results:");
-        println!(
-            "  - HTTP Endpoints: {}",
-            analysis_results.triage_stats.endpoints_count
-        );
-        println!(
-            "  - Data Fetching Calls: {}",
-            analysis_results.triage_stats.data_fetching_count
-        );
-        println!(
-            "  - Middleware: {}",
-            analysis_results.triage_stats.middleware_count
-        );
-        println!(
-            "  - Irrelevant: {}",
-            analysis_results.triage_stats.irrelevant_count
-        );
-
-        println!("Detailed Extractions:");
-        println!(
-            "  - Endpoints extracted: {}",
-            analysis_results.endpoints.len()
-        );
-        println!(
-            "  - API calls extracted: {}",
-            analysis_results.data_fetching_calls.len()
-        );
-        println!(
-            "  - Middleware extracted: {}",
-            analysis_results.middleware.len()
-        );
-        println!(
-            "  - Mount relationships extracted: {}",
-            analysis_results.mount_relationships.len()
-        );
-    }
-
-    /// Get framework-aware endpoint analysis for comparison with existing system
-    #[allow(dead_code)]
-    pub fn get_endpoint_analysis(&self, result: &MultiAgentAnalysisResult) -> EndpointAnalysis {
-        let mount_graph = &result.mount_graph;
-
-        EndpointAnalysis {
-            producers: mount_graph.get_resolved_endpoints().to_vec(),
-            consumers: mount_graph.get_data_calls().to_vec(),
-            mount_relationships: mount_graph.get_mounts().to_vec(),
-        }
-    }
-
-    /// Extract type information from agent analysis results for type checking
-    pub fn extract_types_from_analysis(
+    /// Extract type information from file analysis results for type checking.
+    ///
+    /// This method extracts type positions from the file analysis results
+    /// for use in cross-repo type checking.
+    pub fn extract_types_from_file_results(
         &self,
-        analysis_results: &AnalysisResults,
+        file_results: &HashMap<String, FileAnalysisResult>,
     ) -> Vec<serde_json::Value> {
         use crate::analyzer::Analyzer;
         let mut type_infos = Vec::new();
 
-        println!("=== EXTRACT TYPES FROM ANALYSIS DEBUG ===");
-        println!(
-            "Endpoints to process: {}, Data fetching calls to process: {}",
-            analysis_results.endpoints.len(),
-            analysis_results.data_fetching_calls.len()
-        );
+        println!("=== EXTRACT TYPES FROM FILE ANALYSIS ===");
 
-        // 1. Extract types from endpoints (Producers)
-        let mut endpoints_with_types = 0;
-        for endpoint in &analysis_results.endpoints {
-            if let (Some(file), Some(pos), Some(type_str)) = (
-                &endpoint.response_type_file,
-                endpoint.response_type_position,
-                &endpoint.response_type_string,
-            ) {
+        let mut total_endpoints = 0;
+        let mut total_data_calls = 0;
+
+        for (file_path, result) in file_results {
+            total_endpoints += result.endpoints.len();
+            total_data_calls += result.data_calls.len();
+
+            // Extract types from endpoints
+            for endpoint in &result.endpoints {
                 let alias = Analyzer::generate_common_type_alias_name(
                     &endpoint.path,
                     &endpoint.method,
-                    false, // is_request_type (false = response)
-                    false, // is_consumer (false = producer)
+                    false, // is_request_type
+                    false, // is_consumer
                 );
 
                 type_infos.push(serde_json::json!({
-                    "filePath": file,
-                    "startPosition": pos,
-                    "compositeTypeString": type_str,
-                    "alias": alias
+                    "filePath": file_path,
+                    "lineNumber": endpoint.line_number,
+                    "alias": alias,
+                    "kind": "endpoint",
+                    "method": endpoint.method,
+                    "path": endpoint.path
                 }));
-                endpoints_with_types += 1;
-                println!(
-                    "  Endpoint type extracted: {} {} -> {} (file: {}, pos: {})",
-                    endpoint.method, endpoint.path, type_str, file, pos
-                );
             }
-        }
-        println!(
-            "Endpoints with type info: {}/{}",
-            endpoints_with_types,
-            analysis_results.endpoints.len()
-        );
 
-        // 2. Extract types from data fetching calls (Consumers)
-        // Group calls by (url, method) to assign call numbers matching Analyzer logic
-        let mut calls_by_endpoint: HashMap<(String, String), u32> = HashMap::new();
-        let mut calls_by_location: HashMap<String, u32> = HashMap::new();
-        let mut calls_with_types = 0;
-
-        for call in &analysis_results.data_fetching_calls {
-            // Check if this call has type info (file, position, and type string)
-            if let (Some(file), Some(pos), Some(type_str)) = (
-                &call.expected_type_file,
-                call.expected_type_position,
-                &call.expected_type_string,
-            ) {
-                // Generate alias based on URL/method if available, otherwise use location
-                let alias = if let (Some(url), Some(method)) = (&call.url, &call.method) {
-                    // Increment call counter for this endpoint
-                    let counter = calls_by_endpoint
-                        .entry((url.clone(), method.clone()))
-                        .or_insert(0);
-                    *counter += 1;
-
-                    Analyzer::generate_unique_call_alias_name(
-                        url, method, false,    // is_request_type (false = response)
-                        *counter, // call_number
-                        true,     // is_consumer (true = consumer)
+            // Extract types from data calls
+            for data_call in &result.data_calls {
+                let alias = if let Some(method) = &data_call.method {
+                    Analyzer::generate_common_type_alias_name(
+                        &data_call.target,
+                        method,
+                        false, // is_request_type
+                        true,  // is_consumer
                     )
                 } else {
-                    // For response parsing calls without URL (e.g., .json()), use location-based alias
-                    let counter = calls_by_location.entry(call.location.clone()).or_insert(0);
-                    *counter += 1;
-
-                    // Extract a simple identifier from location (file:line:col -> line_col)
-                    let location_parts: Vec<&str> = call.location.split(':').collect();
-                    let line = location_parts.get(1).unwrap_or(&"0");
-                    let col = location_parts.get(2).unwrap_or(&"0");
-                    format!("ResponseParsingConsumerL{}C{}", line, col)
+                    format!("DataCall_L{}", data_call.line_number)
                 };
 
                 type_infos.push(serde_json::json!({
-                    "filePath": file,
-                    "startPosition": pos,
-                    "compositeTypeString": type_str,
-                    "alias": alias
+                    "filePath": file_path,
+                    "lineNumber": data_call.line_number,
+                    "alias": alias,
+                    "kind": "data_call",
+                    "target": data_call.target
                 }));
-                calls_with_types += 1;
-                println!(
-                    "  Call type extracted: {} -> {} (file: {}, pos: {})",
-                    alias, type_str, file, pos
-                );
             }
         }
+
         println!(
-            "Calls with type info: {}/{}",
-            calls_with_types,
-            analysis_results.data_fetching_calls.len()
+            "Processed {} endpoints and {} data calls from {} files",
+            total_endpoints,
+            total_data_calls,
+            file_results.len()
         );
-        println!("Total type_infos extracted: {}", type_infos.len());
-        println!("=== END EXTRACT TYPES FROM ANALYSIS DEBUG ===");
+        println!("Extracted {} type infos", type_infos.len());
+        println!("=== END EXTRACT TYPES ===");
 
         type_infos
     }
