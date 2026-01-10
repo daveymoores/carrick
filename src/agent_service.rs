@@ -531,6 +531,13 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
                 "[]".to_string()
             } else if schema_val.get("type").and_then(|t| t.as_str()) == Some("OBJECT") {
                 if let Some(props) = schema_val.get("properties") {
+                    // Check for file_analysis_schema - has mounts, endpoints, data_calls arrays
+                    if props.get("mounts").is_some()
+                        && props.get("endpoints").is_some()
+                        && props.get("data_calls").is_some()
+                    {
+                        return generate_mock_file_analysis_response(prompt);
+                    }
                     // Check for framework guidance schema - has mount_patterns, endpoint_patterns, etc.
                     if props.get("mount_patterns").is_some()
                         && props.get("endpoint_patterns").is_some()
@@ -586,6 +593,115 @@ fn generate_mock_pattern_list_response() -> String {
 /// Returns empty triage hints and parsing notes
 fn generate_mock_general_guidance_response() -> String {
     r#"{"triage_hints":"Mock mode - no triage hints","parsing_notes":"Mock mode - no parsing notes"}"#.to_string()
+}
+
+/// Generate mock file analysis response for FileAnalyzerAgent
+/// Parses the file content from the prompt and extracts mock findings
+fn generate_mock_file_analysis_response(prompt: &str) -> String {
+    // Extract file path from prompt (format: "Path: path/to/file.ts")
+    let file_path = prompt
+        .lines()
+        .find(|line| line.contains("Path:"))
+        .and_then(|line| line.split("Path:").nth(1))
+        .map(|s| s.trim().trim_end_matches(')'))
+        .unwrap_or("unknown.ts");
+
+    // Look for common patterns in the file content to generate mock results
+    let mut mounts = Vec::new();
+    let mut endpoints = Vec::new();
+    let mut data_calls = Vec::new();
+
+    // Simple pattern matching on prompt content for mock generation
+    for (line_num, line) in prompt.lines().enumerate() {
+        let line_number = (line_num + 1) as i32;
+
+        // Detect .use() mounts
+        if line.contains(".use(") && line.contains("'/'") {
+            // Extract router name if possible
+            let parent = if line.contains("app.use") {
+                "app"
+            } else if line.contains("router.use") {
+                "router"
+            } else {
+                "app"
+            };
+            mounts.push(serde_json::json!({
+                "line_number": line_number,
+                "parent_node": parent,
+                "child_node": "childRouter",
+                "mount_path": "/",
+                "import_source": null,
+                "pattern_matched": ".use("
+            }));
+        }
+
+        // Detect endpoint patterns (.get, .post, .put, .delete)
+        if line.contains(".get(") && line.contains("'") {
+            endpoints.push(serde_json::json!({
+                "line_number": line_number,
+                "owner_node": "router",
+                "method": "GET",
+                "path": "/",
+                "handler_name": "anonymous",
+                "pattern_matched": ".get("
+            }));
+        }
+        if line.contains(".post(") && line.contains("'") {
+            endpoints.push(serde_json::json!({
+                "line_number": line_number,
+                "owner_node": "router",
+                "method": "POST",
+                "path": "/",
+                "handler_name": "anonymous",
+                "pattern_matched": ".post("
+            }));
+        }
+
+        // Detect fetch calls
+        if line.contains("fetch(") {
+            data_calls.push(serde_json::json!({
+                "line_number": line_number,
+                "target": "https://api.example.com",
+                "method": "GET",
+                "pattern_matched": "fetch("
+            }));
+        }
+
+        // Detect axios calls
+        if line.contains("axios.") {
+            let method = if line.contains("axios.post") {
+                "POST"
+            } else if line.contains("axios.put") {
+                "PUT"
+            } else if line.contains("axios.delete") {
+                "DELETE"
+            } else {
+                "GET"
+            };
+            data_calls.push(serde_json::json!({
+                "line_number": line_number,
+                "target": "https://api.example.com",
+                "method": method,
+                "pattern_matched": "axios."
+            }));
+        }
+    }
+
+    // Log mock generation for debugging
+    eprintln!(
+        "Mock file analysis for {}: {} mounts, {} endpoints, {} data_calls",
+        file_path,
+        mounts.len(),
+        endpoints.len(),
+        data_calls.len()
+    );
+
+    serde_json::json!({
+        "mounts": mounts,
+        "endpoints": endpoints,
+        "data_calls": data_calls
+    })
+    .to_string()
 }
 
 /// Generate mock triage responses by extracting locations from prompt
