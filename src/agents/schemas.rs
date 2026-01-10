@@ -249,6 +249,112 @@ impl AgentSchemas {
         })
     }
 
+    /// Schema for file-centric analysis output - flat structure with mounts, endpoints, and data_calls
+    /// Used by FileAnalyzerAgent for one-shot file analysis with Gemini 3.0 Flash
+    #[allow(dead_code)]
+    pub fn file_analysis_schema() -> Value {
+        json!({
+            "type": "OBJECT",
+            "properties": {
+                "mounts": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "line_number": {
+                                "type": "INTEGER",
+                                "description": "Line number in the source file"
+                            },
+                            "parent_node": {
+                                "type": "STRING",
+                                "description": "Name of variable accepting the mount (e.g., app, router)"
+                            },
+                            "child_node": {
+                                "type": "STRING",
+                                "description": "Name of variable being mounted (e.g., apiRouter, userRoutes)"
+                            },
+                            "mount_path": {
+                                "type": "STRING",
+                                "description": "The string literal path prefix (e.g., /api, /users)"
+                            },
+                            "import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "File path if child_node is imported (e.g., './routes/users'), otherwise null for local definitions"
+                            },
+                            "pattern_matched": {
+                                "type": "STRING",
+                                "description": "The specific pattern that triggered this result (e.g., .use(, .register()"
+                            }
+                        },
+                        "required": ["line_number", "parent_node", "child_node", "mount_path", "pattern_matched"]
+                    }
+                },
+                "endpoints": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "line_number": {
+                                "type": "INTEGER",
+                                "description": "Line number in the source file"
+                            },
+                            "owner_node": {
+                                "type": "STRING",
+                                "description": "Variable the endpoint is attached to (e.g., app, router, fastify)"
+                            },
+                            "method": {
+                                "type": "STRING",
+                                "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "ALL"],
+                                "description": "HTTP method"
+                            },
+                            "path": {
+                                "type": "STRING",
+                                "description": "Route path (e.g., /users, /users/:id)"
+                            },
+                            "handler_name": {
+                                "type": "STRING",
+                                "description": "Function name or 'anonymous' for inline handlers"
+                            },
+                            "pattern_matched": {
+                                "type": "STRING",
+                                "description": "The specific pattern that triggered this result"
+                            }
+                        },
+                        "required": ["line_number", "owner_node", "method", "path", "handler_name", "pattern_matched"]
+                    }
+                },
+                "data_calls": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "line_number": {
+                                "type": "INTEGER",
+                                "description": "Line number in the source file"
+                            },
+                            "target": {
+                                "type": "STRING",
+                                "description": "The URL or resource being accessed"
+                            },
+                            "method": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "HTTP method if detectable (GET, POST, etc.)"
+                            },
+                            "pattern_matched": {
+                                "type": "STRING",
+                                "description": "The specific pattern that triggered this result"
+                            }
+                        },
+                        "required": ["line_number", "target", "pattern_matched"]
+                    }
+                }
+            },
+            "required": ["mounts", "endpoints", "data_calls"]
+        })
+    }
+
     /// Schema for MountAgent output - array of MountRelationship
     pub fn mount_schema() -> Value {
         json!({
@@ -336,5 +442,15 @@ mod tests {
         assert!(schema["items"]["properties"]["location"].is_object());
         assert!(schema["items"]["properties"]["classification"]["enum"].is_array());
         assert!(schema["items"]["required"].is_array());
+    }
+
+    #[test]
+    fn test_file_analysis_schema_structure() {
+        let schema = AgentSchemas::file_analysis_schema();
+        assert_eq!(schema["type"], "OBJECT");
+        assert!(schema["properties"]["mounts"].is_object());
+        assert!(schema["properties"]["endpoints"].is_object());
+        assert!(schema["properties"]["data_calls"].is_object());
+        assert!(schema["required"].is_array());
     }
 }
