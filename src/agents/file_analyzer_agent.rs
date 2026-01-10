@@ -304,10 +304,10 @@ Look for type assertions or generic parameters on fetch/axios calls:
 * `const user = await fetch<User>('/api/user')` → response_type_string: "User"
 * `const orders: Order[] = await api.get('/orders')` → response_type_string: "Order[]"
 
-#### C. Position Calculation
-* response_type_position: Count characters from the start of the file to where the type annotation begins
-* response_type_file: Use the current file path being analyzed
-* If no type annotation is found, set all response_type_* fields to null"#.to_string()
+#### C. Important Notes
+* Only extract response_type_string - the exact type annotation text
+* Set response_type_file and response_type_position to null (these are computed separately using AST)
+* If no type annotation is found, set response_type_string to null"#.to_string()
     }
 
     /// Build the dynamic user message with patterns and file content (legacy).
@@ -375,17 +375,17 @@ Analyze this file and return a JSON object with:
 
 For each mount, include: line_number, parent_node, child_node, mount_path, import_source (null if local), pattern_matched
 
-For each endpoint, include: line_number, owner_node, method, path, handler_name, pattern_matched, response_type_file, response_type_position, response_type_string
-  - response_type_file: The file path where the response type is defined (use the current file path if inline)
-  - response_type_position: The character position (0-based index) where the response type annotation starts in the file
+For each endpoint, include: line_number, owner_node, method, path, handler_name, pattern_matched, response_type_string
   - response_type_string: The exact TypeScript type string from the code (e.g., "Response<User[]>", "Response<{{ id: number }}>")
   - CRITICAL: Look for Express/Fastify Response<T> generic type annotations on handler parameters. Extract the FULL type including Response<...> wrapper.
   - Example: `(req: Request, res: Response<User[]>)` → response_type_string: "Response<User[]>"
   - Example: `(req, res: Response<{{ userId: number; comments: Comment[] }}>)` → response_type_string: "Response<{{ userId: number; comments: Comment[] }}>"
+  - Set response_type_file and response_type_position to null (they will be computed separately)
 
-For each data_call, include: line_number, target, method (null if unknown), pattern_matched, response_type_file, response_type_position, response_type_string
+For each data_call, include: line_number, target, method (null if unknown), pattern_matched, response_type_string
   - For fetch/axios calls with typed responses like `await resp.json() as Comment[]`, extract the type assertion
   - For typed fetch wrappers, extract the generic type parameter
+  - Set response_type_file and response_type_position to null (they will be computed separately)
 
 Return ONLY the JSON object, no explanations."#,
             mount_patterns,

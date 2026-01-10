@@ -1,6 +1,6 @@
 import { TypeInfo } from "./types";
 import { ProjectManager } from "./project-utils";
-import { findTypeReferenceAtPosition, findTypeReferenceByString } from "./type-resolver";
+import { findTypeReferenceAtPosition } from "./type-resolver";
 import { ImportHandler } from "./import-handler";
 import { DeclarationCollector } from "./declaration-collector";
 import { DependencyManager } from "./dependency-manager";
@@ -40,34 +40,12 @@ export class TypeExtractor {
         continue;
       }
 
-      let typeRefNode = findTypeReferenceAtPosition(
+      const typeRefNode = findTypeReferenceAtPosition(
         sourceFile,
         startPosition,
       );
 
-      // Fallback: if position lookup failed, try searching for the type string
-      if (!typeRefNode && compositeTypeString) {
-        console.log(
-          `Position lookup failed at ${startPosition}, trying string search for: ${compositeTypeString}`,
-        );
-        typeRefNode = findTypeReferenceByString(sourceFile, compositeTypeString);
-      }
-
       if (!typeRefNode) {
-        // Still no luck - skip but don't error if we have compositeTypeString (we can still generate alias)
-        if (compositeTypeString && alias) {
-          console.log(
-            `Type node not found but generating alias anyway: ${alias} = ${compositeTypeString}`,
-          );
-          this.declarationCollector.addCompositeAlias({
-            aliasName: alias,
-            typeString: compositeTypeString,
-          });
-          console.log(
-            `Queued composite alias: export type ${alias} = ${compositeTypeString};`,
-          );
-          continue;
-        }
         console.error(
           `Type not found in '${sourceFile.getFilePath()}' at position ${startPosition}`,
         );

@@ -8,6 +8,10 @@
 //! The scanner is intentionally broad - it's better to have false positives
 //! (which the LLM will filter out) than false negatives (which would cause
 //! missed API patterns).
+//!
+//! Additionally, this module provides utilities for finding type annotations
+//! at specific line numbers, which is used to get accurate character positions
+//! for type extraction after LLM analysis.
 
 use std::path::Path;
 use swc_common::{
@@ -19,6 +23,277 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::parser::parse_file;
+
+/// Result of finding a type annotation at a specific line
+#[derive(Debug, Clone)]
+pub struct TypePositionInfo {
+    /// Character position (0-based byte offset) where the type starts
+    pub position: usize,
+    /// The full type string found (e.g., "Response<User[]>")
+    pub type_string: String,
+    /// The file path
+    pub file_path: String,
+}
+
+/// Find type annotation position on a specific line in a file.
+///
+/// This function parses the file with SWC and looks for type annotations
+/// (like `Response<User[]>`) on the specified line number. This is used
+/// to get accurate character positions after the LLM provides line numbers.
+///
+/// # Arguments
+/// * `file_path` - Path to the TypeScript/JavaScript file
+/// * `line_number` - 1-based line number to search
+/// * `type_hint` - Optional type string hint from LLM (e.g., "Response<User[]>")
+///
+/// # Returns
+/// `Some(TypePositionInfo)` if a type annotation is found, `None` otherwise
+#[allow(dead_code)]
+pub fn find_type_position_at_line(
+    file_path: &Path,
+    line_number: usize,
+    type_hint: Option<&str>,
+) -> Option<TypePositionInfo> {
+    let source_map: Lrc<SourceMap> = Lrc::new(SourceMap::default());
+    let handler =
+        Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(source_map.clone()));
+
+    let module = parse_file(file_path, &source_map, &handler)?;
+
+    let mut finder = TypePositionFinder {
+        source_map: source_map.clone(),
+        target_line: line_number,
+        type_hint: type_hint.map(|s| s.to_string()),
+        found: None,
+    };
+
+    module.visit_with(&mut finder);
+
+    finder.found.map(|(pos, type_str)| TypePositionInfo {
+        position: pos,
+        type_string: type_str,
+        file_path: file_path.to_string_lossy().to_string(),
+    })
+}
+
+/// Find type position from file content (without reading from disk)
+pub fn find_type_position_at_line_from_content(
+    file_path: &str,
+    content: &str,
+    line_number: usize,
+    type_hint: Option<&str>,
+) -> Option<TypePositionInfo> {
+    let source_map: Lrc<SourceMap> = Lrc::new(SourceMap::default());
+    let _handler =
+        Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(source_map.clone()));
+
+    // Create a source file from the content
+    let source_file = source_map.new_source_file(
+        swc_common::FileName::Custom(file_path.to_string()).into(),
+        content.to_string(),
+    );
+
+    let lexer = swc_ecma_parser::lexer::Lexer::new(
+        swc_ecma_parser::Syntax::Typescript(swc_ecma_parser::TsSyntax {
+            tsx: file_path.ends_with(".tsx"),
+            decorators: true,
+            ..Default::default()
+        }),
+        swc_ecma_ast::EsVersion::Es2022,
+        swc_ecma_parser::StringInput::from(&*source_file),
+        None,
+    );
+
+    let mut parser = swc_ecma_parser::Parser::new_from(lexer);
+    let module = match parser.parse_module() {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    let mut finder = TypePositionFinder {
+        source_map: source_map.clone(),
+        target_line: line_number,
+        type_hint: type_hint.map(|s| s.to_string()),
+        found: None,
+    };
+
+    module.visit_with(&mut finder);
+
+    finder.found.map(|(pos, type_str)| TypePositionInfo {
+        position: pos,
+        type_string: type_str,
+        file_path: file_path.to_string(),
+    })
+}
+
+/// AST visitor that finds type annotations at a specific line
+struct TypePositionFinder {
+    source_map: Lrc<SourceMap>,
+    target_line: usize,
+    type_hint: Option<String>,
+    found: Option<(usize, String)>,
+}
+
+impl TypePositionFinder {
+    fn check_type_ann(&mut self, type_ann: &TsTypeAnn) {
+        let loc = self.source_map.lookup_char_pos(type_ann.span.lo);
+        let line = loc.line; // 1-based
+
+        if line == self.target_line {
+            let type_str = self.get_type_string(&type_ann.type_ann);
+
+            // If we have a hint, check if it matches
+            if let Some(ref hint) = self.type_hint {
+                // Check if this type matches the hint (allowing for some variation)
+                if type_str.contains(hint)
+                    || hint.contains(&type_str)
+                    || self.types_match(&type_str, hint)
+                {
+                    let pos = type_ann.span.lo.0 as usize;
+                    self.found = Some((pos, type_str));
+                }
+            } else {
+                // No hint, just use the first type annotation on this line
+                let pos = type_ann.span.lo.0 as usize;
+                self.found = Some((pos, type_str));
+            }
+        }
+    }
+
+    fn types_match(&self, found: &str, hint: &str) -> bool {
+        // Extract the main type name from both
+        let found_main = found.split('<').next().unwrap_or(found).trim();
+        let hint_main = hint.split('<').next().unwrap_or(hint).trim();
+        found_main == hint_main
+    }
+
+    fn get_type_string(&self, ts_type: &TsType) -> String {
+        match ts_type {
+            TsType::TsTypeRef(type_ref) => {
+                let name = match &type_ref.type_name {
+                    TsEntityName::Ident(ident) => ident.sym.to_string(),
+                    TsEntityName::TsQualifiedName(qn) => {
+                        format!("{}.{}", Self::get_entity_name(&qn.left), qn.right.sym)
+                    }
+                };
+
+                if let Some(type_params) = &type_ref.type_params {
+                    let params: Vec<String> = type_params
+                        .params
+                        .iter()
+                        .map(|p| self.get_type_string(p))
+                        .collect();
+                    format!("{}<{}>", name, params.join(", "))
+                } else {
+                    name
+                }
+            }
+            TsType::TsArrayType(arr) => {
+                format!("{}[]", self.get_type_string(&arr.elem_type))
+            }
+            TsType::TsTypeLit(lit) => {
+                let members: Vec<String> = lit
+                    .members
+                    .iter()
+                    .filter_map(|m| self.get_type_element_string(m))
+                    .collect();
+                format!("{{ {} }}", members.join("; "))
+            }
+            TsType::TsKeywordType(kw) => match kw.kind {
+                TsKeywordTypeKind::TsStringKeyword => "string".to_string(),
+                TsKeywordTypeKind::TsNumberKeyword => "number".to_string(),
+                TsKeywordTypeKind::TsBooleanKeyword => "boolean".to_string(),
+                TsKeywordTypeKind::TsVoidKeyword => "void".to_string(),
+                TsKeywordTypeKind::TsAnyKeyword => "any".to_string(),
+                TsKeywordTypeKind::TsNullKeyword => "null".to_string(),
+                TsKeywordTypeKind::TsUndefinedKeyword => "undefined".to_string(),
+                _ => "unknown".to_string(),
+            },
+            TsType::TsUnionOrIntersectionType(union_or_inter) => match union_or_inter {
+                TsUnionOrIntersectionType::TsUnionType(union) => {
+                    let types: Vec<String> = union
+                        .types
+                        .iter()
+                        .map(|t| self.get_type_string(t))
+                        .collect();
+                    types.join(" | ")
+                }
+                TsUnionOrIntersectionType::TsIntersectionType(inter) => {
+                    let types: Vec<String> = inter
+                        .types
+                        .iter()
+                        .map(|t| self.get_type_string(t))
+                        .collect();
+                    types.join(" & ")
+                }
+            },
+            _ => "unknown".to_string(),
+        }
+    }
+
+    fn get_entity_name(name: &TsEntityName) -> String {
+        match name {
+            TsEntityName::Ident(ident) => ident.sym.to_string(),
+            TsEntityName::TsQualifiedName(qn) => {
+                format!("{}.{}", Self::get_entity_name(&qn.left), qn.right.sym)
+            }
+        }
+    }
+
+    fn get_type_element_string(&self, elem: &TsTypeElement) -> Option<String> {
+        match elem {
+            TsTypeElement::TsPropertySignature(prop) => {
+                let key = match &*prop.key {
+                    Expr::Ident(ident) => ident.sym.to_string(),
+                    _ => return None,
+                };
+                let type_str = prop
+                    .type_ann
+                    .as_ref()
+                    .map(|ta| self.get_type_string(&ta.type_ann))
+                    .unwrap_or_else(|| "any".to_string());
+                Some(format!("{}: {}", key, type_str))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Visit for TypePositionFinder {
+    fn visit_ts_type_ann(&mut self, type_ann: &TsTypeAnn) {
+        if self.found.is_none() {
+            self.check_type_ann(type_ann);
+        }
+        // Continue visiting children
+        type_ann.visit_children_with(self);
+    }
+
+    fn visit_param(&mut self, param: &Param) {
+        // Check parameter type annotations (e.g., res: Response<User[]>)
+        if self.found.is_none() {
+            if let Pat::Ident(ident) = &param.pat {
+                if let Some(type_ann) = &ident.type_ann {
+                    self.check_type_ann(type_ann);
+                }
+            }
+        }
+        param.visit_children_with(self);
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        // Check arrow function parameter types
+        if self.found.is_none() {
+            for param in &arrow.params {
+                if let Pat::Ident(ident) = param {
+                    if let Some(type_ann) = &ident.type_ann {
+                        self.check_type_ann(type_ann);
+                    }
+                }
+            }
+        }
+        arrow.visit_children_with(self);
+    }
+}
 
 /// A candidate API call site detected by the SWC scanner.
 /// This is passed as a "hint" to the LLM to ensure 100% recall.

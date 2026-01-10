@@ -24,7 +24,7 @@ use crate::{
     },
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
-    swc_scanner::SwcScanner,
+    swc_scanner::{SwcScanner, find_type_position_at_line_from_content},
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -153,7 +153,12 @@ impl FileOrchestrator {
                 .analyze_file_with_candidates(&path_str, &content, guidance, &candidate_hints)
                 .await
             {
-                Ok(result) => {
+                Ok(mut result) => {
+                    // STEP 5: Enrich type positions using SWC AST
+                    // The LLM provides line numbers accurately, but character positions are unreliable.
+                    // Use SWC to find accurate positions based on line numbers.
+                    Self::enrich_type_positions(&path_str, &content, &mut result);
+
                     stats.total_mounts += result.mounts.len();
                     stats.total_endpoints += result.endpoints.len();
                     stats.total_data_calls += result.data_calls.len();
@@ -326,6 +331,51 @@ impl FileOrchestrator {
     }
 
     /// Normalize import source paths for matching.
+    /// Enrich type positions in the analysis result using SWC AST.
+    ///
+    /// The LLM provides accurate line numbers but unreliable character positions.
+    /// This function uses SWC to find the actual type annotation positions based
+    /// on the line numbers, ensuring accurate type extraction downstream.
+    fn enrich_type_positions(file_path: &str, content: &str, result: &mut FileAnalysisResult) {
+        // Enrich endpoint type positions
+        for endpoint in &mut result.endpoints {
+            // Only enrich if we have a type string but position might be wrong
+            if let Some(ref type_hint) = endpoint.response_type_string {
+                if let Some(pos_info) = find_type_position_at_line_from_content(
+                    file_path,
+                    content,
+                    endpoint.line_number as usize,
+                    Some(type_hint),
+                ) {
+                    endpoint.response_type_position = Some(pos_info.position as i32);
+                    endpoint.response_type_file = Some(pos_info.file_path);
+                    // Update type string if SWC found a more accurate one
+                    if !pos_info.type_string.is_empty() {
+                        endpoint.response_type_string = Some(pos_info.type_string);
+                    }
+                }
+            }
+        }
+
+        // Enrich data call type positions
+        for data_call in &mut result.data_calls {
+            if let Some(ref type_hint) = data_call.response_type_string {
+                if let Some(pos_info) = find_type_position_at_line_from_content(
+                    file_path,
+                    content,
+                    data_call.line_number as usize,
+                    Some(type_hint),
+                ) {
+                    data_call.response_type_position = Some(pos_info.position as i32);
+                    data_call.response_type_file = Some(pos_info.file_path);
+                    if !pos_info.type_string.is_empty() {
+                        data_call.response_type_string = Some(pos_info.type_string);
+                    }
+                }
+            }
+        }
+    }
+
     fn normalize_import_source(source: &str) -> String {
         source
             .trim_start_matches("./")
