@@ -8,19 +8,20 @@ use crate::{
     app_context::AppContext,
     config::{Config, create_standard_tsconfig},
     extractor::CoreExtractor,
+    mount_graph::MountGraph,
     packages::Packages,
+    url_normalizer::UrlNormalizer,
     utils::{get_repository_name, join_prefix_and_path},
-    visitor::{
-        Call, DependencyVisitor, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType,
-        TypeReference,
-    },
+    visitor::{Call, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
 };
-use core::fmt;
 use std::collections::HashSet;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
+
+// Type aliases to reduce complexity
+type RouteFieldMap = HashMap<(String, String), Json>;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
@@ -56,6 +57,8 @@ impl ApiIssues {
     pub fn is_empty(&self) -> bool {
         self.call_issues.is_empty()
             && self.endpoint_issues.is_empty()
+            && self.env_var_calls.is_empty()
+            && self.mismatches.is_empty()
             && self.type_mismatches.is_empty()
             && self.dependency_conflicts.is_empty()
     }
@@ -82,27 +85,11 @@ pub struct ApiEndpointDetails {
     pub file_path: PathBuf,
 }
 
-impl fmt::Display for FieldMismatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FieldMismatch::MissingField(field) => write!(f, "Missing field: {}", field),
-            FieldMismatch::ExtraField(field) => write!(f, "Extra field: {}", field),
-            FieldMismatch::TypeMismatch(path, call_type, endpoint_type) => write!(
-                f,
-                "Type mismatch at {}: call has type {}, endpoint expects type {}",
-                path, call_type, endpoint_type
-            ),
-        }
-    }
-}
-
 pub struct ApiAnalysisResult {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub issues: ApiIssues,
 }
-
-pub type RouteFieldsMap = HashMap<(String, String), Json>;
 
 pub struct Analyzer {
     // <Route, http_method, handler_name, source>
@@ -117,13 +104,9 @@ pub struct Analyzer {
     endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
     source_map: Lrc<SourceMap>,
     all_repo_packages: HashMap<String, Packages>, // repo_name -> packages
-}
-
-#[derive(Debug)]
-pub enum FieldMismatch {
-    MissingField(String),
-    ExtraField(String),
-    TypeMismatch(String, String, String), // (path, call_type, endpoint_type)
+    detected_frameworks: Vec<String>,
+    detected_data_fetchers: Vec<String>,
+    mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
 }
 
 impl CoreExtractor for Analyzer {
@@ -146,7 +129,15 @@ impl Analyzer {
             endpoint_router: None,
             source_map,
             all_repo_packages: HashMap::new(),
+            detected_frameworks: Vec::new(),
+            detected_data_fetchers: Vec::new(),
+            mount_graph: None,
         }
+    }
+
+    /// Set the mount graph for framework-agnostic analysis
+    pub fn set_mount_graph(&mut self, mount_graph: MountGraph) {
+        self.mount_graph = Some(mount_graph);
     }
 
     pub fn fetch_calls(&self) -> &Vec<Call> {
@@ -155,6 +146,12 @@ impl Analyzer {
 
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
         self.all_repo_packages.insert(repo_name, packages);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_framework_detection(&mut self, frameworks: Vec<String>, data_fetchers: Vec<String>) {
+        self.detected_frameworks = frameworks;
+        self.detected_data_fetchers = data_fetchers;
     }
 
     pub fn analyze_dependencies(&self) -> Vec<DependencyConflict> {
@@ -232,53 +229,8 @@ impl Analyzer {
         ConflictSeverity::Info
     }
 
-    pub fn add_visitor_data(&mut self, visitor: DependencyVisitor) {
-        self.mounts.extend(visitor.mounts);
-        self.apps.extend(visitor.express_apps);
-
-        for endpoint in visitor.endpoints {
-            let params = self.extract_params_from_route(&endpoint.route);
-            self.endpoints.push(ApiEndpointDetails {
-                owner: Some(endpoint.owner.clone()),
-                route: endpoint.route.to_string(),
-                method: endpoint.method.to_string(),
-                params,
-                response_body: Some(endpoint.response),
-                request_body: endpoint.request,
-                handler_name: Some(endpoint.handler_name),
-                request_type: endpoint.request_type,
-                response_type: endpoint.response_type,
-                file_path: endpoint.handler_file,
-            });
-        }
-
-        // expected_fields being returned data from all CRUD calls
-        for call in visitor.calls {
-            let params = self.extract_params_from_route(&call.route);
-            self.calls.push(ApiEndpointDetails {
-                owner: None,
-                route: call.route.to_string(),
-                method: call.method.to_string(),
-                params,
-                response_body: Some(call.response),
-                request_body: call.request,
-                handler_name: None, // Calls don't typically have handlers
-                request_type: call.request_type,
-                response_type: call.response_type,
-                file_path: call.call_file,
-            })
-        }
-
-        self.imported_handlers
-            .extend(visitor.imported_handlers.clone());
-
-        for (name, def) in visitor.function_definitions {
-            self.function_definitions.insert(name, def);
-        }
-    }
-
     pub async fn analyze_functions_for_fetch_calls(&mut self) {
-        use crate::gemini_service::extract_calls_from_async_expressions;
+        use crate::agent_service::extract_calls_from_async_expressions;
 
         let mut all_async_contexts = Vec::new();
 
@@ -294,8 +246,14 @@ impl Analyzer {
             return;
         }
 
-        // Send to Gemini Flash 2.5 for analysis
-        let gemini_calls = match extract_calls_from_async_expressions(all_async_contexts).await {
+        // Send to Gemini Flash 2.5 for analysis with framework context
+        let gemini_calls = match extract_calls_from_async_expressions(
+            all_async_contexts,
+            &self.detected_frameworks,
+            &self.detected_data_fetchers,
+        )
+        .await
+        {
             Ok(calls) => calls,
             Err(e) => {
                 eprintln!("Failed to extract calls from async expressions: {}", e);
@@ -480,12 +438,26 @@ impl Analyzer {
     }
 
     fn sanitize_route_for_dynamic_paths(route: &str) -> String {
-        route
+        // Strip query parameters first
+        let route_without_query = if let Some(query_idx) = route.find('?') {
+            &route[..query_idx]
+        } else {
+            route
+        };
+
+        route_without_query
             .split('/')
             .filter(|segment| !segment.is_empty()) // Remove empty segments
             .map(|segment| {
                 if let Some(param_name) = segment.strip_prefix(':') {
                     // Convert :id -> ById, :userId -> ByUserId, :eventId -> ByEventId
+                    format!("By{}", Self::to_pascal_case(param_name))
+                } else if segment.starts_with("${") && segment.ends_with('}') {
+                    // Handle template literal syntax: ${userId} -> ByUserid
+                    // Extract the variable name from ${varName} or ${process.env.VAR}
+                    let inner = &segment[2..segment.len() - 1]; // Remove ${ and }
+                    // If it contains a dot (like process.env.VAR), take the last part
+                    let param_name = inner.rsplit('.').next().unwrap_or(inner);
                     format!("By{}", Self::to_pascal_case(param_name))
                 } else {
                     // Convert regular segments to PascalCase
@@ -519,6 +491,123 @@ impl Analyzer {
         }
 
         result
+    }
+
+    /// Extract environment variable name from a route
+    /// Examples:
+    /// - "ENV_VAR:API_URL:/users" -> "API_URL"
+    /// - "${process.env.SERVICE_URL}/orders" -> "SERVICE_URL"
+    /// - "${API_BASE}/users" -> "API_BASE"
+    /// - "unknown" -> "UNKNOWN_API"
+    fn extract_env_var_name(route: &str) -> String {
+        // Handle ENV_VAR:NAME:/path format
+        if route.starts_with("ENV_VAR:") {
+            let parts: Vec<&str> = route.splitn(3, ':').collect();
+            if parts.len() >= 2 {
+                return parts[1].to_string();
+            }
+        }
+
+        // Handle ${process.env.VAR} or ${VAR} patterns
+        if let Some(start) = route.find("${") {
+            if let Some(end) = route[start..].find('}') {
+                let inner = &route[start + 2..start + end];
+                // Handle process.env.VAR -> VAR
+                if let Some(last_dot) = inner.rfind('.') {
+                    return inner[last_dot + 1..].to_string();
+                }
+                return inner.to_string();
+            }
+        }
+
+        // Handle process.env.VAR patterns (without ${})
+        if let Some(idx) = route.find("process.env.") {
+            let after = &route[idx + 12..];
+            let end = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            if end > 0 {
+                return after[..end].to_string();
+            }
+        }
+
+        // Handle start-of-string variable (e.g. API_URL + "/path")
+        if let Some(first_char) = route.chars().next() {
+            if first_char.is_uppercase() {
+                let end = route
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(route.len());
+                if end > 0 {
+                    return route[..end].to_string();
+                }
+            }
+        }
+
+        "UNKNOWN_API".to_string()
+    }
+
+    /// Check if a route represents an environment variable base URL.
+    ///
+    /// Returns true for:
+    /// - "ENV_VAR:API_URL:/users" (explicit ENV_VAR format)
+    /// - "${process.env.API_URL}/users" (process.env pattern at start)
+    /// - "${API_BASE_URL}/users" (UPPER_CASE var at start)
+    ///
+    /// Returns false for:
+    /// - "/users/${userId}" (path parameter, not base URL)
+    /// - "/api/${version}/data" (path parameter in middle)
+    fn is_env_var_base_url(route: &str) -> bool {
+        // Check for explicit ENV_VAR: prefix format
+        if route.starts_with("ENV_VAR:") {
+            return true;
+        }
+
+        // Check for process.env pattern
+        if route.contains("process.env.") {
+            return true;
+        }
+
+        // Check for ${...} at the START of the route (not in the middle)
+        if route.starts_with("${") {
+            if let Some(end) = route.find('}') {
+                let var_name = &route[2..end];
+                // If it contains a dot (like process.env.X) or is UPPER_CASE, it's an env var
+                if var_name.contains('.')
+                    || var_name
+                        .chars()
+                        .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+                {
+                    return true;
+                }
+            }
+        }
+
+        // Check for start-of-string variables (e.g. API_URL + "/path")
+        // If it starts with an uppercase letter and is not a path (doesn't start with /),
+        // we treat it as a potential environment variable or constant base URL.
+        if let Some(first_char) = route.chars().next() {
+            if first_char.is_uppercase() {
+                // Extract the first identifier
+                let end = route
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(route.len());
+
+                // If the identifier is non-empty and looks like a constant (mostly uppercase/digits/underscore)
+                // we treat it as an env var.
+                // We verify it's at least 2 chars to avoid single letters being treated as vars excessively
+                if end >= 2 {
+                    let ident = &route[..end];
+                    if ident
+                        .chars()
+                        .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     /// Helper to process a TsTypeAnn and produce a TypeReference.
@@ -671,7 +760,7 @@ impl Analyzer {
         &self,
         imported_handlers: &[(String, String, String, String)],
         function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> (RouteFieldsMap, RouteFieldsMap) {
+    ) -> (RouteFieldMap, RouteFieldMap) {
         let mut response_fields = HashMap::new();
         let mut request_fields = HashMap::new();
 
@@ -751,341 +840,135 @@ impl Analyzer {
         self
     }
 
-    pub fn analyze_matches(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+    /// Framework-agnostic analysis using mount graph
+    /// Finds orphaned endpoints and missing API calls without pattern matching
+    fn analyze_matches_with_mount_graph(
+        &self,
+        mount_graph: &MountGraph,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut call_issues = Vec::new();
         let mut endpoint_issues = Vec::new();
         let mut env_var_calls = Vec::new();
 
-        // Initialize with all endpoints as potentially orphaned
-        let mut orphaned_endpoints: HashSet<(String, String)> = self
-            .endpoints
-            .iter()
-            .map(|api_endpoint_details| {
-                (
-                    api_endpoint_details.route.clone(),
-                    api_endpoint_details.method.clone(),
-                )
-            })
-            .collect();
+        // Track which endpoints have been matched
+        let mut matched_endpoints: HashSet<String> = HashSet::new();
 
-        // Deduplicate calls based on route, method, and file_path
+        // Deduplicate calls
         let mut unique_calls = Vec::new();
-        let mut seen_calls = std::collections::HashSet::new();
-
-        for api_call_details in &self.calls {
-            let call_key = (
-                api_call_details.route.clone(),
-                api_call_details.method.clone(),
-                api_call_details.file_path.clone(),
+        let mut seen_calls = HashSet::new();
+        for call in &self.calls {
+            let key = format!(
+                "{}:{}:{}",
+                call.method,
+                call.route,
+                call.file_path.display()
             );
-
-            if seen_calls.insert(call_key) {
-                unique_calls.push(api_call_details);
+            if seen_calls.insert(key) {
+                unique_calls.push(call);
             }
         }
 
-        // Check each call against endpoints
-        for api_call_details in &unique_calls {
-            // Process the call based on its type
-            let path_to_match = if api_call_details.route.contains("ENV_VAR:") {
-                // First check if this is a known external API call
-                if self.config.is_external_call(&api_call_details.route) {
-                    // Skip external API calls entirely
+        // Create URL normalizer once for all calls
+        let normalizer = UrlNormalizer::new(&self.config);
+
+        // For each call, try to find matching endpoint using mount graph
+        for call in &unique_calls {
+            // Check for environment variable URLs (framework-agnostic)
+            // Use smarter detection to avoid false positives on path parameters
+            if Self::is_env_var_base_url(&call.route) {
+                let env_var_name = Self::extract_env_var_name(&call.route);
+                let normalized_path = normalizer.extract_path(&call.route);
+                let canonical_env_var_route =
+                    format!("ENV_VAR:{}:{}", env_var_name, normalized_path);
+
+                if self.config.is_external_call(&canonical_env_var_route) {
                     continue;
                 }
-                // Then check if it's a known internal API call
-                else if self.config.is_internal_call(&api_call_details.route) {
-                    // For internal calls, extract the path portion without the ENV_VAR prefix
-                    let mut clean_path = String::new();
-                    let segments: Vec<&str> = api_call_details.route.split("ENV_VAR:").collect();
 
-                    // Add the part before any ENV_VAR marker
-                    clean_path.push_str(segments[0]);
-
-                    // Process each segment with an ENV_VAR marker
-                    for segment in segments.iter().skip(1) {
-                        let subparts: Vec<&str> = segment.splitn(2, ':').collect();
-                        if subparts.len() == 2 {
-                            clean_path.push_str(subparts[1]);
-                        }
-                    }
-
-                    clean_path
-                }
-                // Otherwise it's an unknown env var
-                else {
-                    // Extract the env var names for the error message
-                    let mut env_vars = Vec::new();
-                    let segments: Vec<&str> = api_call_details.route.split("ENV_VAR:").collect();
-                    let mut clean_path = String::new();
-
-                    // Add the part before any ENV_VAR marker
-                    clean_path.push_str(segments[0]);
-
-                    // Process each segment with an ENV_VAR marker
-                    for segment in segments.iter().skip(1) {
-                        let parts: Vec<&str> = segment.splitn(2, ':').collect();
-                        if !parts.is_empty() {
-                            env_vars.push(parts[0].to_string());
-                        }
-                        if parts.len() == 2 {
-                            clean_path.push_str(parts[1]);
-                        }
-                    }
-
-                    // Format the error message for configuration suggestion
-                    let env_var_list = env_vars.join(", ");
-                    env_var_calls.push(format!(
-                        "Environment variable endpoint: {} using env vars [{}] in {}",
-                        api_call_details.method, env_var_list, api_call_details.route
-                    ));
-
-                    // Continue with endpoint matching using the clean path
-                    clean_path
-                }
-            } else {
-                // Regular call - use the full route
-                api_call_details.route.clone()
-            };
-
-            // Try to find a matching endpoint using the determined path
-            let endpoint_match = self.find_matching_endpoint(
-                &path_to_match,
-                &api_call_details.method,
-                &self.endpoints,
-                &mut orphaned_endpoints,
-            );
-
-            // Check if we found a match and if methods are compatible
-            match endpoint_match {
-                Some((_, endpoint_method)) => {
-                    if &api_call_details.method != endpoint_method {
-                        call_issues.push(format!(
-                            "Method mismatch: {} {} is called but endpoint only supports {}",
-                            api_call_details.method, api_call_details.route, endpoint_method
-                        ));
-                    }
-                }
-                None => {
-                    call_issues.push(format!(
-                        "Missing endpoint: No endpoint defined for {} {}",
-                        api_call_details.method, api_call_details.route
-                    ));
-                }
-            }
-        }
-
-        // After checking all calls, anything left in orphaned_endpoints has no matching call
-        for (orphaned_endpoint, orphaned_method) in orphaned_endpoints {
-            endpoint_issues.push(format!(
-                "Orphaned endpoint: No call matching endpoint {} {}",
-                orphaned_method, orphaned_endpoint
-            ));
-        }
-
-        // TEMPORARY: Deduplicate environment-based API call warnings.
-        // TODO: Address root cause upstream so this is not needed.
-        let mut seen_env = std::collections::HashSet::new();
-        env_var_calls.retain(|msg| {
-            if seen_env.contains(msg) {
-                false
-            } else {
-                seen_env.insert(msg.clone());
-                true
-            }
-        });
-
-        (call_issues, endpoint_issues, env_var_calls)
-    }
-
-    // Helper method to find a matching endpoint using our various matching strategies
-    fn find_matching_endpoint<'a>(
-        &self,
-        route: &str,
-        method: &str,
-        endpoints: &'a [ApiEndpointDetails],
-        orphaned_endpoints: &mut HashSet<(String, String)>,
-    ) -> Option<(&'a String, &'a String)> {
-        // Safety check
-        let router = match &self.endpoint_router {
-            Some(r) => r,
-            None => return None,
-        };
-
-        // Try to match the route with matchit
-        match router.at(route) {
-            Ok(matched) => {
-                // Now we get back a Vec<(String, String)> of route-method pairs
-                let route_methods = matched.value;
-
-                // First look for an exact method match
-                for (endpoint_route, endpoint_method) in route_methods {
-                    if endpoint_method == method {
-                        // Find the actual endpoint for this route+method
-                        if let Some(endpoint) = endpoints
-                            .iter()
-                            .find(|ep| &ep.route == endpoint_route && &ep.method == endpoint_method)
-                        {
-                            // Remove from orphaned endpoints
-                            orphaned_endpoints
-                                .remove(&(endpoint.route.clone(), endpoint.method.clone()));
-
-                            return Some((&endpoint.route, &endpoint.method));
-                        }
-                    }
-                }
-
-                // If we didn't find an exact method match, return the first endpoint with this route
-                // (this is for reporting method mismatches)
-                if let Some((endpoint_route, endpoint_method)) = route_methods.first() {
-                    if let Some(endpoint) = endpoints
-                        .iter()
-                        .find(|ep| &ep.route == endpoint_route && &ep.method == endpoint_method)
-                    {
-                        // Remove from orphaned endpoints
-                        orphaned_endpoints
-                            .remove(&(endpoint.route.clone(), endpoint.method.clone()));
-
-                        return Some((&endpoint.route, &endpoint.method));
-                    }
-                }
-            }
-            Err(_) => {
-                // No match found via matchit
-            }
-        }
-
-        None
-    }
-
-    fn normalize_call_route(&self, route: &str) -> String {
-        // Remove ENV_VAR prefix if present
-        if route.starts_with("ENV_VAR:") {
-            // Find the second colon and take everything after it
-            if let Some(second_colon) = route.find(':').and_then(|first| {
-                route[first + 1..]
-                    .find(':')
-                    .map(|second| first + 1 + second)
-            }) {
-                route[second_colon + 1..].to_string()
-            } else {
-                route.to_string()
-            }
-        } else {
-            route.to_string()
-        }
-    }
-
-    pub fn compare_calls_to_endpoints(&self) -> Vec<String> {
-        let mut issues = Vec::new();
-
-        // Safety check
-        let router = match &self.endpoint_router {
-            Some(r) => r,
-            None => return issues,
-        };
-
-        for call in &self.calls {
-            let normalized_route = self.normalize_call_route(&call.route);
-
-            match router.at(&normalized_route) {
-                Ok(matched) => {
-                    // Get the endpoint routes and methods
-                    let route_methods = &matched.value;
-
-                    // Look for a method match
-                    let matching_endpoint = route_methods
-                        .iter()
-                        .filter(|(_, endpoint_method)| endpoint_method == &call.method)
-                        .find_map(|(endpoint_route, endpoint_method)| {
-                            self.endpoints.iter().find(|ep| {
-                                &ep.route == endpoint_route && &ep.method == endpoint_method
-                            })
-                        });
-
-                    if let Some(ep) = matching_endpoint {
-                        // Compare request bodies if both exist
-                        if let (Some(call_req), Some(ep_req)) =
-                            (&call.request_body, &ep.request_body)
-                        {
-                            let mismatches = self.compare_json_fields(call_req, ep_req, "");
-                            for mismatch in mismatches {
-                                issues.push(format!(
-                                    "Request body mismatch for {} {} -> {}",
-                                    call.method, call.route, mismatch
+                if self.config.is_internal_call(&canonical_env_var_route) {
+                    match mount_graph.find_matching_endpoints_with_normalizer(
+                        &canonical_env_var_route,
+                        &call.method,
+                        &normalizer,
+                    ) {
+                        Some(matching_endpoints) => {
+                            if matching_endpoints.is_empty() {
+                                call_issues.push(format!(
+                                    "Missing endpoint for {} {} (normalized: {}) (called from {})",
+                                    call.method,
+                                    call.route,
+                                    normalized_path,
+                                    call.file_path.display()
                                 ));
+                            } else {
+                                for endpoint in matching_endpoints {
+                                    let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                                    matched_endpoints.insert(key);
+                                }
                             }
                         }
+                        None => {
+                            // Identified as external - skip
+                        }
+                    }
+                    continue;
+                }
+
+                env_var_calls.push(format!(
+                    "Unclassified env var: {} {} using [{}] (from {}) - add to internalEnvVars or externalEnvVars in carrick.json",
+                    call.method,
+                    normalized_path,
+                    env_var_name,
+                    call.file_path.display()
+                ));
+                continue;
+            }
+
+            // Use mount graph to find matching endpoints with URL normalization
+            // This handles full URLs, env var patterns, template literals, etc.
+            match mount_graph.find_matching_endpoints_with_normalizer(
+                &call.route,
+                &call.method,
+                &normalizer,
+            ) {
+                None => {
+                    // URL was identified as external - skip it
+                    continue;
+                }
+                Some(matching_endpoints) => {
+                    if matching_endpoints.is_empty() {
+                        // Extract normalized path for better error message
+                        let normalized_path = normalizer.extract_path(&call.route);
+                        call_issues.push(format!(
+                            "Missing endpoint for {} {} (normalized: {}) (called from {})",
+                            call.method,
+                            call.route,
+                            normalized_path,
+                            call.file_path.display()
+                        ));
+                    } else {
+                        // Mark endpoints as matched
+                        for endpoint in matching_endpoints {
+                            let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                            matched_endpoints.insert(key);
+                        }
                     }
                 }
-                Err(_) => {
-                    // No matching endpoint found via matchit
-                    // Already reported by analyze_matches()
-                }
             }
         }
 
-        issues
-    }
-
-    #[allow(clippy::only_used_in_recursion)]
-    pub fn compare_json_fields(
-        &self,
-        call_json: &Json,
-        endpoint_json: &Json,
-        path: &str,
-    ) -> Vec<FieldMismatch> {
-        let mut mismatches = Vec::new();
-
-        match (call_json, endpoint_json) {
-            (Json::Object(call_map), Json::Object(endpoint_map)) => {
-                let call_keys: HashSet<_> = call_map.keys().collect();
-                let endpoint_keys: HashSet<_> = endpoint_map.keys().collect();
-
-                // Fields required by endpoint but missing in call
-                for key in endpoint_keys.difference(&call_keys) {
-                    let field_path = if path.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{}.{}", path, key)
-                    };
-                    mismatches.push(FieldMismatch::MissingField(field_path));
-                }
-                // Fields present in call but not expected by endpoint
-                for key in call_keys.difference(&endpoint_keys) {
-                    let field_path = if path.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{}.{}", path, key)
-                    };
-                    mismatches.push(FieldMismatch::ExtraField(field_path));
-                }
-                // Compare common fields recursively
-                for key in call_keys.intersection(&endpoint_keys) {
-                    let sub_path = if path.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{}.{}", path, key)
-                    };
-                    let sub_mismatches =
-                        self.compare_json_fields(&call_map[*key], &endpoint_map[*key], &sub_path);
-                    mismatches.extend(sub_mismatches);
-                }
-            }
-            (Json::Array(_), Json::Array(_)) => {
-                // You could compare element types here if desired
-            }
-            (a, b) if std::mem::discriminant(a) != std::mem::discriminant(b) => {
-                mismatches.push(FieldMismatch::TypeMismatch(
-                    path.to_string(),
-                    format!("{:?}", a),
-                    format!("{:?}", b),
+        // Find orphaned endpoints (not matched by any call)
+        for endpoint in mount_graph.get_resolved_endpoints() {
+            let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+            if !matched_endpoints.contains(&key) {
+                endpoint_issues.push(format!(
+                    "Orphaned endpoint: {} {} in {}",
+                    endpoint.method, endpoint.full_path, endpoint.file_location
                 ));
             }
-            _ => {}
         }
 
-        mismatches
+        (call_issues, endpoint_issues, env_var_calls)
     }
 
     pub fn compute_full_paths_for_endpoint(
@@ -1369,8 +1252,14 @@ impl Analyzer {
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
-        let (call_issues, endpoint_issues, env_var_calls) = self.analyze_matches();
-        let mismatches = self.compare_calls_to_endpoints();
+        // Framework-agnostic analysis using mount graph (required)
+        let mount_graph = self.mount_graph.as_ref()
+            .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
+
+        let (call_issues, endpoint_issues, env_var_calls) =
+            self.analyze_matches_with_mount_graph(mount_graph);
+        // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
+        let mismatches = Vec::new();
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 
@@ -1403,6 +1292,35 @@ impl Analyzer {
         let output_dir = Path::new("ts_check/output");
         fs::create_dir_all(output_dir)
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
+
+        // Check if there are any type files to check
+        let type_files: Vec<_> = fs::read_dir(output_dir)
+            .map_err(|e| format!("Failed to read output directory: {}", e))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().is_some_and(|ext| ext == "ts")
+                    && entry
+                        .path()
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().ends_with("_types.ts"))
+            })
+            .collect();
+
+        if type_files.is_empty() {
+            println!("⚠️  No type files found in ts_check/output/ - skipping type checking");
+            println!("   This may happen if:");
+            println!("   - Source code lacks explicit TypeScript type annotations");
+            println!("   - Type extraction agents couldn't identify response/request types");
+            println!("   - This is the first run and no cross-repo data exists yet");
+            println!("   Type checking will work when type annotations are present in the source.");
+            return Ok(());
+        }
+
+        println!(
+            "Found {} type file(s) to check: {:?}",
+            type_files.len(),
+            type_files.iter().map(|f| f.file_name()).collect::<Vec<_>>()
+        );
 
         let tsconfig_path = output_dir.join("tsconfig.json");
         let tsconfig_content = create_standard_tsconfig();
@@ -1517,6 +1435,9 @@ impl Analyzer {
     }
 
     /// Extract repository prefix from endpoint owner information
+    /// Note: Currently unused but kept for future multi-repo scenarios where
+    /// owner names might contain repo prefixes (format: "repo_prefix:name")
+    #[allow(dead_code)]
     pub fn extract_repo_prefix_from_owner(&self, owner: &Option<OwnerType>) -> String {
         if let Some(owner) = owner {
             match owner {
@@ -1612,5 +1533,325 @@ impl Analyzer {
         if let Some(resp_type) = &api_detail.response_type {
             self.add_type_to_repo_map(resp_type, repo_prefix, repo_type_map);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_route_colon_params() {
+        // Standard :param style path parameters
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:id"),
+            "UsersById"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:userId/comments"),
+            "UsersByUseridComments"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/:id/comments/:commentId"),
+            "ApiByIdCommentsByCommentid"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_template_literal_params() {
+        // Template literal ${param} style path parameters
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/${userId}"),
+            "UsersByUserid"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/${userId}/comments"),
+            "UsersByUseridComments"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/${postId}/comments/${commentId}"),
+            "ApiByPostidCommentsByCommentid"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_template_literal_with_dot_notation() {
+        // Template literals with process.env or object property access
+        // Should use the last part (the actual variable name)
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/orders/${process.env.ORDER_ID}"),
+            "OrdersByOrderId"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_mixed_params() {
+        // Mix of :param and ${param} styles (unlikely but should work)
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:id/posts/${postId}"),
+            "UsersByIdPostsByPostid"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_no_params() {
+        // Paths without any parameters
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/users"),
+            "ApiUsers"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/health"),
+            "Health"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_root_path() {
+        assert_eq!(Analyzer::sanitize_route_for_dynamic_paths("/"), "");
+    }
+
+    #[test]
+    fn test_sanitize_route_empty_segments() {
+        // Should handle double slashes gracefully
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api//users"),
+            "ApiUsers"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_route_strips_query_params() {
+        // Query parameters should be stripped before processing
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/orders?userId=123"),
+            "Orders"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/users/:id?include=posts"),
+            "UsersById"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/api/data?page=1&limit=10"),
+            "ApiData"
+        );
+        assert_eq!(
+            Analyzer::sanitize_route_for_dynamic_paths("/orders?userId=:userId"),
+            "Orders"
+        );
+    }
+
+    #[test]
+    fn test_to_pascal_case() {
+        assert_eq!(Analyzer::to_pascal_case("userId"), "Userid");
+        assert_eq!(Analyzer::to_pascal_case("user_id"), "UserId");
+        assert_eq!(Analyzer::to_pascal_case("user-id"), "UserId");
+        assert_eq!(Analyzer::to_pascal_case("USER"), "User");
+        assert_eq!(Analyzer::to_pascal_case(""), "");
+    }
+
+    #[test]
+    fn test_generate_unique_call_alias_name_with_template_params() {
+        // Verify the full alias generation works with template literal paths
+        let alias = Analyzer::generate_unique_call_alias_name(
+            "/users/${userId}/comments",
+            "GET",
+            false, // is_request_type
+            1,     // call_number
+            true,  // is_consumer
+        );
+
+        assert!(
+            alias.contains("ByUserid"),
+            "Alias should contain 'ByUserid'. Got: {}",
+            alias
+        );
+        assert!(
+            alias.starts_with("Get"),
+            "Alias should start with 'Get'. Got: {}",
+            alias
+        );
+        assert!(
+            alias.contains("Consumer"),
+            "Alias should contain 'Consumer'. Got: {}",
+            alias
+        );
+    }
+
+    #[test]
+    fn test_extract_env_var_name() {
+        // ENV_VAR:NAME:/path format
+        assert_eq!(
+            Analyzer::extract_env_var_name("ENV_VAR:API_URL:/users"),
+            "API_URL"
+        );
+        assert_eq!(
+            Analyzer::extract_env_var_name("ENV_VAR:ORDER_SERVICE_URL:/orders"),
+            "ORDER_SERVICE_URL"
+        );
+
+        // ${process.env.VAR} format
+        assert_eq!(
+            Analyzer::extract_env_var_name("${process.env.SERVICE_URL}/orders"),
+            "SERVICE_URL"
+        );
+        assert_eq!(
+            Analyzer::extract_env_var_name("${process.env.API_BASE}/users/123"),
+            "API_BASE"
+        );
+
+        // ${VAR} format (without process.env)
+        assert_eq!(
+            Analyzer::extract_env_var_name("${BASE_URL}/orders"),
+            "BASE_URL"
+        );
+
+        // process.env.VAR without ${}
+        assert_eq!(
+            Analyzer::extract_env_var_name("process.env.MY_API_URL + \"/data\""),
+            "MY_API_URL"
+        );
+
+        // Unknown/fallback
+        assert_eq!(Analyzer::extract_env_var_name("unknown"), "UNKNOWN_API");
+        assert_eq!(Analyzer::extract_env_var_name("/users"), "UNKNOWN_API");
+    }
+
+    #[test]
+    fn test_is_env_var_base_url() {
+        // Should return true for env var base URLs
+        assert!(Analyzer::is_env_var_base_url("ENV_VAR:API_URL:/users"));
+        assert!(Analyzer::is_env_var_base_url(
+            "ENV_VAR:ORDER_SERVICE_URL:/orders"
+        ));
+        assert!(Analyzer::is_env_var_base_url(
+            "${process.env.API_URL}/users"
+        ));
+        assert!(Analyzer::is_env_var_base_url(
+            "${process.env.SERVICE_URL}/orders"
+        ));
+        assert!(Analyzer::is_env_var_base_url("${API_BASE_URL}/users"));
+        assert!(Analyzer::is_env_var_base_url("${ORDER_SERVICE}/orders"));
+        assert!(Analyzer::is_env_var_base_url(
+            "process.env.API_URL + \"/data\""
+        ));
+
+        // Should return false for path parameters (not base URL env vars)
+        assert!(!Analyzer::is_env_var_base_url("/users/${userId}"));
+        assert!(!Analyzer::is_env_var_base_url("/api/${version}/data"));
+        assert!(!Analyzer::is_env_var_base_url("/orders/${orderId}/items"));
+        assert!(!Analyzer::is_env_var_base_url("/users/:id"));
+        assert!(!Analyzer::is_env_var_base_url("/api/users"));
+
+        // Edge cases
+        assert!(!Analyzer::is_env_var_base_url("${userId}")); // lowercase, not env var pattern
+        assert!(!Analyzer::is_env_var_base_url("${camelCase}/path")); // camelCase, not env var
+        assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
+    }
+    #[test]
+    fn test_analyze_matches_with_mount_graph_env_vars() {
+        // Setup config with internal env vars
+        let config = Config {
+            internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
+            ..Config::default()
+        };
+
+        // Create analyzer with dummy source map (not used for this analysis)
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(config, cm);
+
+        // Add calls that use env vars
+        // 1. Valid internal call (should match if endpoint exists, or report missing)
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "ENV_VAR:API_URL:/users".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        // 2. Unclassified env var (not in internal/external list)
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "ENV_VAR:UNKNOWN_VAR:/posts".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        // 3. Process.env pattern (should be detected as env var)
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "${process.env.OTHER_VAR}/comments".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        // 4. Raw code pattern with UPPERCASE var (common in legacy code)
+        // e.g. LEGACY_API_URL + "/users"
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            route: "LEGACY_API_URL + \"/users\"".to_string(),
+            method: "GET".to_string(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("test.ts"),
+        });
+
+        let mount_graph = MountGraph::new(); // Empty graph
+
+        // Run analysis
+        let (call_issues, _, env_var_calls) =
+            analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        // Check results
+        // 1. Valid internal call should be in call_issues (missing endpoint) because graph is empty
+        // Note: The analyzer normalizes the path for the error message
+        assert!(
+            call_issues
+                .iter()
+                .any(|i| i.contains("Missing endpoint") && i.contains("/users"))
+        );
+
+        // 2. Unclassified var should be in env_var_calls
+        assert!(
+            env_var_calls
+                .iter()
+                .any(|i| i.contains("Unclassified env var") && i.contains("UNKNOWN_VAR"))
+        );
+
+        // 3. Process.env var should be in env_var_calls
+        assert!(
+            env_var_calls
+                .iter()
+                .any(|i| i.contains("Unclassified env var") && i.contains("OTHER_VAR"))
+        );
+
+        // 4. Raw UPPERCASE var should be in env_var_calls
+        assert!(
+            env_var_calls
+                .iter()
+                .any(|i| i.contains("Unclassified env var") && i.contains("LEGACY_API_URL"))
+        );
     }
 }

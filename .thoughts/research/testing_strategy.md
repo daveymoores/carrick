@@ -1,7 +1,7 @@
 # Carrick Testing Strategy & Coverage
 
-**Last Updated**: 2025-11-15
-**Status**: Production-ready test suite with 43 passing tests
+**Last Updated**: January 2025
+**Status**: Production-ready test suite with 70+ passing tests
 
 ## Table of Contents
 1. [Testing Philosophy](#testing-philosophy)
@@ -57,22 +57,28 @@ fn test_dependency_conflicts_detected() {
 
 | Category | Tests | Status | Coverage |
 |----------|-------|--------|----------|
-| **Unit Tests** | 12 | ✅ All passing | Good |
-| **Dependency Analysis** | 8 | ✅ All passing | Excellent |
-| **Endpoint Matching** | 13 | ✅ All passing | Excellent |
-| **Cloud Storage** | 10 | ✅ All passing | Excellent |
-| **Total** | **43** | ✅ **All passing** | **Strong** |
+| **Unit Tests** | 11+ | ✅ All passing | Good |
+| **Integration Tests** | 3 | ✅ All passing | Good |
+| **Multi-Agent Tests** | 4+ | ✅ All passing | Good |
+| **Multi-Framework Tests** | 1 | ✅ All passing | Good |
+| **Dependency Analysis** | 4 | ✅ All passing | Excellent |
+| **Mock Storage** | 10 | ✅ All passing | Excellent |
+| **Output Contract** | 4 | ✅ All passing | Excellent |
+| **URL Normalizer** | 19 | ✅ All passing | Excellent |
+| **Mount Graph Matching** | 6 | ✅ All passing | Excellent |
+| **Total** | **70+** | ✅ **All passing** | **Strong** |
 
 ### Test Execution Time
 
 ```
-Unit tests:        < 0.1s
-Output tests:      < 0.1s
-Endpoint tests:    < 0.1s
-MockStorage tests: < 0.1s
-Integration tests: ~7s (runs full binary)
+Unit tests:         < 0.1s
+Output tests:       < 0.1s
+URL normalizer:     < 0.1s
+Mount graph tests:  < 0.1s
+MockStorage tests:  < 0.1s
+Integration tests:  ~7s (runs full binary)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total:             ~7.5s
+Total:              ~8s
 ```
 
 ### Test Files
@@ -80,16 +86,19 @@ Total:             ~7.5s
 ```
 tests/
 ├── output_contract_test.rs       (4 tests)  - Dependency conflict outputs
-├── endpoint_matching_test.rs     (10 tests) - API matching logic
 ├── mock_storage_test.rs          (10 tests) - Cloud storage workflows
-├── dependency_analysis_test.rs   (4 tests)  - Dependency analysis (original)
+├── dependency_analysis_test.rs   (4 tests)  - Dependency analysis
 ├── integration_test.rs           (3 tests)  - Full binary tests
+├── multi_agent_test.rs           (4+ tests) - Multi-agent pipeline
+├── multi_framework_test.rs       (1 test)   - Framework support
 └── fixtures/
     ├── scenario-1-dependency-conflicts/
     ├── scenario-2-api-mismatches/
     └── scenario-3-cross-repo-success/
 
 src/
+├── url_normalizer.rs (19 inline tests) - URL normalization
+├── mount_graph.rs (6+ inline tests)    - Mount graph matching
 ├── analyzer/mod.rs (inline tests)
 ├── engine/mod.rs (inline tests)
 └── formatter/mod.rs (inline tests)

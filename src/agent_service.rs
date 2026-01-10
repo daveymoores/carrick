@@ -1,0 +1,1118 @@
+use crate::visitor::{Call, Json, TypeReference};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, sleep};
+
+/// Reusable service for making Agent API calls
+#[derive(Debug, Clone)]
+pub struct AgentService {
+    api_key: String,
+    client: Client,
+    semaphore: Arc<Semaphore>,
+}
+
+impl AgentService {
+    pub fn new(api_key: String) -> Self {
+        // Limit concurrent requests to avoid rate limits
+        // Paid tier allows higher limits, but let's be safe with 20 concurrent requests
+        let concurrency_limit = env::var("CARRICK_CONCURRENCY_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+
+        Self {
+            api_key,
+            client: Client::new(),
+            semaphore: Arc::new(Semaphore::new(concurrency_limit)),
+        }
+    }
+
+    /// Generic method for making Agent API calls
+    pub async fn analyze_code(
+        &self,
+        prompt: &str,
+        system_message: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.analyze_code_with_schema(prompt, system_message, None)
+            .await
+    }
+
+    /// Generic method for making Agent API calls with optional response schema
+    pub async fn analyze_code_with_schema(
+        &self,
+        prompt: &str,
+        system_message: &str,
+        response_schema: Option<serde_json::Value>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Acquire permit to limit concurrency
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
+
+        // Skip API call in mock mode - return schema-appropriate mock data
+        if env::var("CARRICK_MOCK_ALL").is_ok() {
+            return Ok(generate_mock_response(&response_schema, prompt));
+        }
+
+        // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
+        let api_base = env!("CARRICK_API_ENDPOINT");
+        let proxy_endpoint = format!("{}/agent/chat", api_base);
+
+        let proxy_request = ProxyRequest {
+            messages: vec![
+                ProxyMessage {
+                    role: "system".to_string(),
+                    content: system_message.to_string(),
+                },
+                ProxyMessage {
+                    role: "user".to_string(),
+                    content: prompt.to_string(),
+                },
+            ],
+            options: ProxyOptions {
+                temperature: None,
+                max_output_tokens: None,
+            },
+            response_schema,
+        };
+
+        let mut request_builder = self
+            .client
+            .post(&proxy_endpoint)
+            .json(&proxy_request)
+            .timeout(std::time::Duration::from_secs(60));
+
+        // Add API key for authentication
+        request_builder =
+            request_builder.header("Authorization", format!("Bearer {}", self.api_key));
+
+        // Retry logic for transient failures with exponential backoff
+        // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s (handles API Gateway 30s timeouts)
+        let max_retries = 7;
+        for attempt in 1..=max_retries {
+            match request_builder.try_clone().unwrap().send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.json::<ProxyResponse>().await {
+                            Ok(proxy_response) => {
+                                if proxy_response.success {
+                                    return Ok(proxy_response.text);
+                                } else {
+                                    return Err("Agent proxy returned unsuccessful response".into());
+                                }
+                            }
+                            Err(e) => {
+                                return Err(format!("Failed to parse proxy response: {}", e).into());
+                            }
+                        }
+                    } else {
+                        let status = response.status();
+
+                        // Retry on 429 Too Many Requests with exponential backoff
+                        if status == 429 && attempt < max_retries {
+                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                            eprintln!(
+                                "Agent API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
+                                wait_time, attempt, max_retries
+                            );
+                            sleep(wait_time).await;
+                            continue;
+                        }
+
+                        // Retry on 503 Service Unavailable with exponential backoff
+                        // This handles API Gateway timeout issues
+                        if status == 503 && attempt < max_retries {
+                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                            eprintln!(
+                                "Agent API returned 503, retrying in {:?} (attempt {}/{})",
+                                wait_time, attempt, max_retries
+                            );
+                            sleep(wait_time).await;
+                            continue;
+                        }
+
+                        let error_text = response.text().await.unwrap_or_default();
+                        return Err(format!(
+                            "Agent proxy call failed with status {}: {}",
+                            status, error_text
+                        )
+                        .into());
+                    }
+                }
+                Err(e) => {
+                    // Retry network errors with exponential backoff
+                    if attempt < max_retries {
+                        let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                        eprintln!(
+                            "Agent proxy call failed: {}, retrying in {:?} (attempt {}/{})",
+                            e, wait_time, attempt, max_retries
+                        );
+                        sleep(wait_time).await;
+                        continue;
+                    }
+
+                    return Err(format!("Agent proxy call failed: {}", e).into());
+                }
+            }
+        }
+
+        Err("Maximum retry attempts exceeded".into())
+    }
+
+    /// Specialized method for analyzing async calls with framework context
+    pub async fn analyze_async_calls_with_context(
+        &self,
+        prompt: &str,
+        system_message: &str,
+        frameworks: &[String],
+        data_fetchers: &[String],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Skip API call in mock mode
+        if env::var("CARRICK_MOCK_ALL").is_ok() {
+            return Ok("[]".to_string());
+        }
+
+        // Build enhanced system message with framework context
+        let context_info = if !data_fetchers.is_empty() {
+            format!(
+                "\n\nFRAMEWORK CONTEXT:\n- HTTP Client Libraries: {}\n- HTTP Frameworks: {}\n\nFocus analysis on these specific libraries when extracting HTTP calls.",
+                data_fetchers.join(", "),
+                frameworks.join(", ")
+            )
+        } else {
+            String::new()
+        };
+
+        let enhanced_system_message = format!("{}{}", system_message, context_info);
+
+        self.analyze_code(prompt, &enhanced_system_message).await
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AsyncCallContext {
+    pub kind: String,
+    pub function_source: String,
+    pub file: String,
+    pub line: u32,
+    pub function_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentCallResponse {
+    route: String,
+    method: String,
+    request_body: Option<serde_json::Value>,
+    request_type_info: Option<TypeInfo>,
+    response_type_info: Option<TypeInfo>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TypeInfo {
+    pub file_path: String,
+    pub start_position: u32,
+    pub composite_type_string: String,
+    pub alias: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxyRequest {
+    messages: Vec<ProxyMessage>,
+    options: ProxyOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxyMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxyOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyResponse {
+    success: bool,
+    text: String,
+}
+
+pub async fn extract_calls_from_async_expressions(
+    async_calls: Vec<AsyncCallContext>,
+    frameworks: &[String],
+    data_fetchers: &[String],
+) -> Result<Vec<Call>, Box<dyn std::error::Error>> {
+    // If CARRICK_MOCK_ALL is set, bypass the actual API call for testing purposes
+    if env::var("CARRICK_MOCK_ALL").is_ok() {
+        return Ok(vec![]);
+    }
+
+    // Emergency disable option for Agent API
+    if env::var("DISABLE_AGENT").is_ok() {
+        println!("Agent API disabled via DISABLE_AGENT environment variable");
+        return Ok(vec![]);
+    }
+
+    if async_calls.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Size protection: warn if function sources are very large (high token usage)
+    let total_size: usize = async_calls
+        .iter()
+        .map(|call| call.function_source.len())
+        .sum();
+
+    const MAX_REASONABLE_SIZE: usize = 200_000; // 200KB - warn above this
+    if total_size > MAX_REASONABLE_SIZE {
+        eprintln!(
+            "Warning: Large amount of source code to analyze ({:.1}KB total). This may result in high token usage.",
+            total_size as f64 / 1024.0
+        );
+    }
+
+    println!(
+        "Found {} async expressions, sending to Agent Service with framework context...",
+        async_calls.len()
+    );
+
+    // Get API key and create AgentService
+    let api_key = env::var("CARRICK_API_KEY")
+        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
+    let agent_service = AgentService::new(api_key);
+
+    let prompt = create_extraction_prompt(&async_calls);
+    let system_message = create_extraction_system_message();
+
+    let response = agent_service
+        .analyze_async_calls_with_context(&prompt, &system_message, frameworks, data_fetchers)
+        .await?;
+
+    Ok(parse_agent_response(&response, &async_calls))
+}
+
+fn create_extraction_system_message() -> String {
+    r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
+
+CRITICAL REQUIREMENTS:
+1. Extract ONLY HTTP requests (fetch, axios, request libraries) - ignore setTimeout, file I/O, database calls
+2. Return ONLY valid JSON array starting with [ and ending with ]
+3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean), request_type_info (object or null), response_type_info (object or null)
+
+IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handler parameters (such as req: Request<T>, res: Response<T>). These describe incoming HTTP requests to the server, NOT outgoing HTTP calls made by the server.
+When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
+
+TYPE EXTRACTION REQUIREMENTS:
+4. For outgoing HTTP calls (fetch, axios, etc.):
+   a. For the response type, extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
+
+   CRITICAL:
+   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
+   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
+   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
+
+   BAD EXAMPLE:
+     const raw: Foo[] = await resp.json();
+     const filtered: Foo[] = filter(raw);
+     // Only extract Foo[], not both.
+
+   BAD EXAMPLE:
+     const a: Bar[] = await resp.json();
+     const b: Bar[] = a.filter(...);
+     // Only extract Bar[], not both.
+
+   GOOD EXAMPLE:
+     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
+     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
+     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
+   b. For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
+5. NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
+6. Calculate approximate character position where the type appears in the source
+7. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
+
+TYPE INFO OBJECT FORMAT:
+- file_path: The source file path
+- start_position: Approximate character position of type annotation (number)
+- composite_type_string: Full type string (e.g., "Response<User[]>", "CreateUserRequest")
+- alias: Generated alias name (e.g., "GetUsersResponse", "PostUserRequest")
+
+ENVIRONMENT VARIABLE HANDLING:
+- Format: "ENV_VAR:VARIABLE_NAME:path"
+- process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
+- `${process.env.BASE_URL}/api/data` → "ENV_VAR:BASE_URL:/api/data"
+- env.SERVICE_URL + "/health" → "ENV_VAR:SERVICE_URL:/health"
+
+TEMPLATE LITERAL HANDLING:
+- Convert ALL template literals to :id but PRESERVE ALL PATH PARTS: `/api/users/${{userId}}` → "/api/users/:id"
+- Convert ALL template literals to :id: `/users/${{user_id}}` → "/users/:id"
+- Convert ALL template literals to :id: `/orders/${{orderId}}/items/${{itemId}}` → "/orders/:id/items/:id"
+- PRESERVE PATH PREFIXES: `/api/orders/${{orderId}}` → "/api/orders/:id"
+- Remove query parameters from paths: `/orders?userId=${{userId}}` → "/orders"
+
+URL CONSTRUCTION:
+- String concatenation: "/api" + "/users" → "/api/users"
+- Mixed env vars: process.env.API + "/v1" + path → "ENV_VAR:API:/v1" + path
+- Template literals with env vars: `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
+- Complex template literals: `${{BASE_URL}}/api/users/${{id}}` → "ENV_VAR:BASE_URL:/api/users/:id"
+
+NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
+}
+
+fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
+    let mut prompt =
+        String::from("Extract HTTP calls from these async JavaScript/TypeScript functions:\n\n");
+
+    for (i, call) in async_calls.iter().enumerate() {
+        prompt.push_str(&format!(
+            "## Function {} ({}:{})\n```{}\n{}\n```\n\n",
+            i + 1,
+            call.file,
+            call.line,
+            call.kind,
+            call.function_source
+        ));
+    }
+
+    prompt
+}
+
+fn convert_agent_responses_to_calls(
+    agent_calls: Vec<AgentCallResponse>,
+    contexts: &[AsyncCallContext],
+) -> Vec<Call> {
+    agent_calls
+        .into_iter()
+        .enumerate()
+        .map(|(i, gc)| {
+            let file_path = contexts
+                .get(i)
+                .map(|c| PathBuf::from(&c.file))
+                .unwrap_or_default();
+
+            // Convert TypeInfo to TypeReference if present
+            let request_type = gc.request_type_info.map(|type_info| {
+                TypeReference {
+                    file_path: PathBuf::from(type_info.file_path),
+                    type_ann: None, // We don't have SWC AST node from Agent
+                    start_position: type_info.start_position as usize,
+                    composite_type_string: type_info.composite_type_string,
+                    alias: type_info.alias,
+                }
+            });
+
+            let response_type = gc.response_type_info.map(|type_info| {
+                TypeReference {
+                    file_path: PathBuf::from(type_info.file_path),
+                    type_ann: None, // We don't have SWC AST node from Agent
+                    start_position: type_info.start_position as usize,
+                    composite_type_string: type_info.composite_type_string,
+                    alias: type_info.alias,
+                }
+            });
+
+            Call {
+                route: gc.route,
+                method: gc.method.to_uppercase(),
+                response: Json::Null,
+                request: gc.request_body.and_then(|v| serde_json::from_value(v).ok()),
+                response_type,
+                request_type,
+                call_file: file_path,
+                call_id: None,
+                call_number: None,
+                common_type_name: None,
+            }
+        })
+        .collect()
+}
+
+fn parse_agent_response(response: &str, contexts: &[AsyncCallContext]) -> Vec<Call> {
+    let json_str = response.trim();
+
+    // Try multiple parsing strategies
+    let cleaned = clean_response(json_str);
+    let extraction_attempts = vec![
+        // Direct parse (clean response)
+        json_str,
+        // Extract from code blocks
+        extract_from_code_block(json_str),
+        // Extract JSON array bounds
+        extract_json_array(json_str),
+        // Clean and retry
+        &cleaned,
+    ];
+
+    for attempt in extraction_attempts {
+        if let Ok(agent_calls) = serde_json::from_str::<Vec<AgentCallResponse>>(attempt) {
+            return convert_agent_responses_to_calls(agent_calls, contexts);
+        }
+    }
+
+    eprintln!("All JSON parsing attempts failed. Response: {}", json_str);
+    vec![]
+}
+
+fn extract_from_code_block(text: &str) -> &str {
+    if let Some(start) = text.find("```json") {
+        if let Some(end) = text[start + 7..].find("```") {
+            return text[start + 7..start + 7 + end].trim();
+        }
+    } else if let Some(start) = text.find("```") {
+        if let Some(end) = text[start + 3..].find("```") {
+            return text[start + 3..start + 3 + end].trim();
+        }
+    }
+    text
+}
+
+fn extract_json_array(text: &str) -> &str {
+    if let Some(start) = text.find('[') {
+        if let Some(end) = text.rfind(']') {
+            if end > start {
+                return &text[start..=end];
+            }
+        }
+    }
+    "[]"
+}
+
+fn clean_response(text: &str) -> String {
+    text.lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Generate mock response based on schema type
+fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> String {
+    match schema {
+        Some(schema_val) => {
+            // Check if schema is for an array
+            if schema_val.get("type").and_then(|t| t.as_str()) == Some("ARRAY") {
+                // Check what kind of array based on the items schema
+                if let Some(items) = schema_val.get("items") {
+                    if let Some(props) = items.get("properties") {
+                        // Triage schema - has location, classification, confidence
+                        if props.get("classification").is_some() {
+                            return generate_mock_triage_response(prompt);
+                        }
+                        // Endpoint schema - has method, path, handler, node_name
+                        if props.get("node_name").is_some() && props.get("path").is_some() {
+                            return generate_mock_endpoint_response(prompt);
+                        }
+                        // Consumer schema - has library, url, method
+                        if props.get("library").is_some() {
+                            return generate_mock_consumer_response(prompt);
+                        }
+                        // Mount schema - has parent_node, child_node, mount_path
+                        if props.get("parent_node").is_some() && props.get("child_node").is_some() {
+                            return generate_mock_mount_response(prompt);
+                        }
+                        // Middleware schema - has middleware_type
+                        if props.get("middleware_type").is_some() {
+                            return generate_mock_middleware_response(prompt);
+                        }
+                    }
+                }
+                // Default array response
+                "[]".to_string()
+            } else if schema_val.get("type").and_then(|t| t.as_str()) == Some("OBJECT") {
+                if let Some(props) = schema_val.get("properties") {
+                    // Check for framework guidance schema - has mount_patterns, endpoint_patterns, etc.
+                    if props.get("mount_patterns").is_some()
+                        && props.get("endpoint_patterns").is_some()
+                        && props.get("triage_hints").is_some()
+                    {
+                        return generate_mock_framework_guidance_response(prompt);
+                    }
+                    // Check for pattern_list_schema - has patterns, descriptions, frameworks arrays
+                    if props.get("patterns").is_some()
+                        && props.get("descriptions").is_some()
+                        && props.get("frameworks").is_some()
+                    {
+                        return generate_mock_pattern_list_response();
+                    }
+                    // Check for general_guidance_schema - has triage_hints and parsing_notes
+                    if props.get("triage_hints").is_some()
+                        && props.get("parsing_notes").is_some()
+                        && props.get("mount_patterns").is_none()
+                    {
+                        return generate_mock_general_guidance_response();
+                    }
+                }
+                // Framework detection or other object schema
+                r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#.to_string()
+            } else {
+                // Framework detection or other object schema
+                r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#.to_string()
+            }
+        }
+        None => {
+            // No schema - return framework detection format
+            r#"{"frameworks": ["express"], "data_fetchers": ["axios"], "notes": "Mock response"}"#
+                .to_string()
+        }
+    }
+}
+
+/// Generate mock framework guidance response - returns empty structure for testing
+/// The real LLM will provide actual patterns based on detected frameworks
+fn generate_mock_framework_guidance_response(_prompt: &str) -> String {
+    // In mock mode, return a valid but empty structure
+    // The real LLM call will populate this with framework-specific patterns
+    r#"{"mount_patterns":[],"endpoint_patterns":[],"middleware_patterns":[],"data_fetching_patterns":[],"triage_hints":"Mock mode - no guidance generated","parsing_notes":"Mock mode - no parsing notes"}"#.to_string()
+}
+
+/// Generate mock pattern list response for FrameworkGuidanceAgent pattern fetching
+/// Returns empty parallel arrays matching the flattened pattern_list_schema
+fn generate_mock_pattern_list_response() -> String {
+    r#"{"patterns":[],"descriptions":[],"frameworks":[]}"#.to_string()
+}
+
+/// Generate mock general guidance response for FrameworkGuidanceAgent
+/// Returns empty triage hints and parsing notes
+fn generate_mock_general_guidance_response() -> String {
+    r#"{"triage_hints":"Mock mode - no triage hints","parsing_notes":"Mock mode - no parsing notes"}"#.to_string()
+}
+
+/// Generate mock triage responses by extracting locations from prompt
+fn generate_mock_triage_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+
+    let triage_results: Vec<serde_json::Value> = call_sites
+        .iter()
+        .map(|cs| {
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("");
+
+            let args = cs.get("args").and_then(|a| a.as_array());
+            let arg_count = cs
+                .get("arg_count")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as usize)
+                .or_else(|| args.map(|a| a.len()))
+                .unwrap_or(0);
+
+            let has_correlated_call = cs
+                .get("correlated_call")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+
+            let classification = if matches!(
+                callee_property,
+                "json" | "text" | "blob" | "arrayBuffer" | "formData"
+            ) {
+                if has_correlated_call {
+                    "DataFetchingCall"
+                } else {
+                    "Irrelevant"
+                }
+            } else if callee_object == "global" && callee_property == "fetch" {
+                "DataFetchingCall"
+            } else if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
+                if callee_object == "axios" || callee_object == "request" || callee_object == "http"
+                {
+                    "DataFetchingCall"
+                } else {
+                    "HttpEndpoint"
+                }
+            } else if callee_property == "use" {
+                if arg_count >= 2 {
+                    let first_is_string = cs
+                        .get("first_arg_type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "StringLiteral")
+                        .or_else(|| {
+                            args.and_then(|a| a.first())
+                                .and_then(|arg| arg.get("arg_type"))
+                                .and_then(|t| t.as_str())
+                                .map(|t| t == "StringLiteral")
+                        })
+                        .unwrap_or(false);
+
+                    // For LeanCallSite we don't have second arg info, so we assume RouterMount
+                    // if first arg is string and arg_count >= 2.
+                    // For full CallSite we check second arg is Identifier.
+                    let second_is_id = args
+                        .and_then(|a| a.get(1))
+                        .and_then(|arg| arg.get("arg_type"))
+                        .and_then(|t| t.as_str())
+                        == Some("Identifier");
+
+                    if first_is_string && (args.is_none() || second_is_id) {
+                        "RouterMount"
+                    } else {
+                        "Middleware"
+                    }
+                } else {
+                    "Middleware"
+                }
+            } else if arg_count >= 2 {
+                let first_is_id = args
+                    .and_then(|a| a.first())
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str())
+                    == Some("Identifier");
+
+                let second_is_object = args
+                    .and_then(|a| a.get(1))
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str())
+                    == Some("ObjectLiteral");
+
+                if first_is_id && second_is_object {
+                    let context_slice = cs
+                        .get("context_slice")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if extract_path_prefix_from_context_slice(context_slice).is_some() {
+                        "RouterMount"
+                    } else {
+                        "Irrelevant"
+                    }
+                } else {
+                    "Irrelevant"
+                }
+            } else {
+                "Irrelevant"
+            };
+
+            serde_json::json!({
+                "location": location,
+                "classification": classification,
+                "confidence": 0.9
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&triage_results).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock endpoint responses
+fn generate_mock_endpoint_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+    let endpoints: Vec<serde_json::Value> = call_sites
+        .iter()
+        .filter_map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("app");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+
+            let raw_path = cs
+                .get("args")
+                .and_then(|args| args.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|arg| arg.get("resolved_value").or_else(|| arg.get("value")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("/");
+
+            let context_slice = cs
+                .get("context_slice")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let inferred_prefix = if !context_slice.is_empty()
+                && context_slice.contains(callee_object)
+                && context_slice.contains("prefix")
+            {
+                extract_path_prefix_from_context_slice(context_slice)
+            } else {
+                None
+            };
+
+            let path = if let Some(prefix) = inferred_prefix {
+                join_path_prefix(&prefix, raw_path)
+            } else {
+                raw_path.to_string()
+            };
+
+            if matches!(callee_property, "get" | "post" | "put" | "delete" | "patch") {
+                Some(serde_json::json!({
+                    "method": callee_property.to_uppercase(),
+                    "path": path,
+                    "handler": "handler",
+                    "node_name": callee_object,
+                    "location": location,
+                    "confidence": 0.9,
+                    "reasoning": "Mock endpoint extraction"
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    serde_json::to_string(&endpoints).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock consumer (data fetching) responses
+fn generate_mock_consumer_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+
+    let consumers: Vec<serde_json::Value> = call_sites
+        .iter()
+        .map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+
+            let correlated = cs.get("correlated_call");
+            let correlated_callee = correlated
+                .and_then(|c| c.get("callee"))
+                .and_then(|v| v.as_str());
+            let correlated_url = correlated
+                .and_then(|c| c.get("url"))
+                .and_then(|v| v.as_str());
+            let correlated_method = correlated
+                .and_then(|c| c.get("method"))
+                .and_then(|v| v.as_str());
+
+            let args = cs.get("args").and_then(|a| a.as_array());
+            let arg0_value = args
+                .and_then(|a| a.first())
+                .and_then(|arg| arg.get("resolved_value").or_else(|| arg.get("value")))
+                .and_then(|v| v.as_str());
+
+            let url: Option<String> = correlated_url
+                .or(arg0_value)
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+
+            let method: Option<String> =
+                correlated_method
+                    .map(|s| s.to_string())
+                    .or_else(|| match callee_property {
+                        "get" | "post" | "put" | "delete" | "patch" => {
+                            Some(callee_property.to_uppercase())
+                        }
+                        _ => None,
+                    });
+
+            let is_decode_call = matches!(
+                callee_property,
+                "json" | "text" | "blob" | "arrayBuffer" | "formData"
+            ) && args.map(|a| a.is_empty()).unwrap_or(false);
+
+            let library = if is_decode_call {
+                correlated_callee
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "response_parsing".to_string())
+            } else if callee_object == "global" {
+                callee_property.to_string()
+            } else if let Some(callee) = correlated_callee {
+                callee.to_string()
+            } else {
+                callee_object.to_string()
+            };
+
+            serde_json::json!({
+                "library": library,
+                "url": url,
+                "method": method,
+                "location": location,
+                "confidence": 0.8,
+                "reasoning": "Mock data fetching call"
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&consumers).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock mount relationship responses
+fn generate_mock_mount_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+    let mounts: Vec<serde_json::Value> = call_sites
+        .iter()
+        .filter_map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("app");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+
+            let args = cs.get("args").and_then(|a| a.as_array());
+
+            if args.map(|a| a.len()).unwrap_or(0) >= 2 {
+                let first_arg_type = args
+                    .and_then(|a| a.first())
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str());
+
+                let second_arg_type = args
+                    .and_then(|a| a.get(1))
+                    .and_then(|arg| arg.get("arg_type"))
+                    .and_then(|t| t.as_str());
+
+                if callee_property == "use"
+                    && first_arg_type == Some("StringLiteral")
+                    && second_arg_type == Some("Identifier")
+                {
+                    let path = args
+                        .and_then(|a| a.first())
+                        .and_then(|arg| arg.get("resolved_value").or_else(|| arg.get("value")))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("/");
+                    let child = args
+                        .and_then(|a| a.get(1))
+                        .and_then(|arg| arg.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("router");
+
+                    return Some(serde_json::json!({
+                        "parent_node": callee_object,
+                        "child_node": child,
+                        "mount_path": path,
+                        "location": location,
+                        "confidence": 0.9,
+                        "reasoning": "Mock mount extraction"
+                    }));
+                }
+
+                if first_arg_type == Some("Identifier") && second_arg_type == Some("ObjectLiteral")
+                {
+                    let child = args
+                        .and_then(|a| a.first())
+                        .and_then(|arg| arg.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("router");
+
+                    let context_slice = cs
+                        .get("context_slice")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if let Some(prefix) = extract_path_prefix_from_context_slice(context_slice) {
+                        return Some(serde_json::json!({
+                            "parent_node": callee_object,
+                            "child_node": child,
+                            "mount_path": prefix,
+                            "location": location,
+                            "confidence": 0.9,
+                            "reasoning": "Mock mount extraction"
+                        }));
+                    }
+                }
+            }
+
+            None
+        })
+        .collect();
+
+    serde_json::to_string(&mounts).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Generate mock middleware responses
+fn generate_mock_middleware_response(prompt: &str) -> String {
+    let call_sites = extract_call_sites_from_prompt(prompt);
+    let middleware: Vec<serde_json::Value> = call_sites
+        .iter()
+        .map(|cs| {
+            let callee_property = cs
+                .get("callee_property")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let callee_object = cs
+                .get("callee_object")
+                .and_then(|o| o.as_str())
+                .unwrap_or("app");
+            let location = cs.get("location").and_then(|l| l.as_str()).unwrap_or("");
+
+            serde_json::json!({
+                "middleware_type": "custom",
+                "path_prefix": null,
+                "handler": callee_property,
+                "node_name": callee_object,
+                "location": location,
+                "confidence": 0.8,
+                "reasoning": "Mock middleware"
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&middleware).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn extract_path_prefix_from_context_slice(context_slice: &str) -> Option<String> {
+    extract_string_literal_after_key(context_slice, "prefix")
+        .or_else(|| extract_string_literal_after_key(context_slice, "basePath"))
+        .or_else(|| extract_string_literal_after_key(context_slice, "base_path"))
+        .or_else(|| extract_string_literal_after_key(context_slice, "pathPrefix"))
+        .or_else(|| extract_string_literal_after_key(context_slice, "path_prefix"))
+        .filter(|v| v.starts_with('/'))
+        .map(|v| v.to_string())
+}
+
+fn extract_string_literal_after_key(haystack: &str, key: &str) -> Option<String> {
+    let hay = haystack.as_bytes();
+    let key_bytes = key.as_bytes();
+    let mut i = 0;
+
+    while i + key_bytes.len() <= hay.len() {
+        if &hay[i..i + key_bytes.len()] == key_bytes {
+            let mut j = i + key_bytes.len();
+
+            while j < hay.len() && hay[j].is_ascii_whitespace() {
+                j += 1;
+            }
+
+            if j >= hay.len() || (hay[j] != b':' && hay[j] != b'=') {
+                i += key_bytes.len();
+                continue;
+            }
+
+            j += 1;
+            while j < hay.len() && hay[j].is_ascii_whitespace() {
+                j += 1;
+            }
+
+            if j >= hay.len() || (hay[j] != b'\'' && hay[j] != b'"') {
+                i += key_bytes.len();
+                continue;
+            }
+
+            let quote = hay[j];
+            j += 1;
+            let start_val = j;
+
+            while j < hay.len() && hay[j] != quote {
+                j += 1;
+            }
+
+            if j >= hay.len() {
+                return None;
+            }
+
+            let value = String::from_utf8_lossy(&hay[start_val..j]).to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn join_path_prefix(prefix: &str, path: &str) -> String {
+    let normalized_prefix = prefix.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+
+    if normalized_prefix.is_empty() {
+        format!("/{}", normalized_path)
+    } else if normalized_path.is_empty() {
+        normalized_prefix.to_string()
+    } else {
+        format!("{}/{}", normalized_prefix, normalized_path)
+    }
+}
+
+/// Helper function to extract call sites from prompt JSON
+fn extract_call_sites_from_prompt(prompt: &str) -> Vec<serde_json::Value> {
+    // Try multiple search patterns for compact and pretty-printed JSON
+    let patterns = [
+        "[{\"callee_object\"",           // Compact JSON
+        "[\n  {\n    \"callee_object\"", // Pretty-printed JSON
+        "[\n  {\n   \"callee_object\"",  // Alternative indentation
+    ];
+
+    for pattern in &patterns {
+        if let Some(start) = prompt.find(pattern) {
+            // Find matching closing bracket
+            if let Some(end_offset) = find_matching_bracket(&prompt[start..]) {
+                let json_str = &prompt[start..start + end_offset];
+                if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                    return parsed;
+                }
+            }
+        }
+    }
+
+    // Fallback: iterate through all JSON arrays to find one that looks like call sites
+    // This handles cases where LeanCallSite serialization might differ slightly
+    // and avoids picking up other arrays (like frameworks list)
+    let mut current_pos = 0;
+    while let Some(start) = prompt[current_pos..].find('[') {
+        let abs_start = current_pos + start;
+        if let Some(end_offset) = find_matching_bracket(&prompt[abs_start..]) {
+            let json_str = &prompt[abs_start..abs_start + end_offset];
+            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                if !parsed.is_empty()
+                    && parsed[0].get("callee_object").is_some()
+                    && parsed[0].get("location").is_some()
+                {
+                    return parsed;
+                }
+            }
+        }
+        current_pos = abs_start + 1;
+    }
+
+    vec![]
+}
+
+/// Find the matching closing bracket for a JSON array
+fn find_matching_bracket(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, ch) in s.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '[' if !in_string => depth += 1,
+            ']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}

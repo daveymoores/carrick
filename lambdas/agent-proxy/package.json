@@ -1,7 +1,7 @@
 {
-  "name": "carrick-gemini-proxy",
+  "name": "carrick-agent-proxy",
   "version": "1.0.0",
-  "description": "Lambda proxy for Gemini API calls from Carrick",
+  "description": "Lambda proxy for Agent API calls from Carrick",
   "main": "index.js",
   "scripts": {
     "test": "node test.js"
@@ -15,7 +15,7 @@
   "author": "Carrick Team",
   "license": "MIT",
   "dependencies": {
-    "@google/genai": "^0.4.0"
+    "@anthropic-ai/sdk": "^0.32.0"
   },
   "devDependencies": {
     "aws-lambda-test-utils": "^1.3.0"

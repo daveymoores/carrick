@@ -1,0 +1,12 @@
+{
+  "name": "fastify-api",
+  "version": "1.0.0",
+  "description": "Fastify implementation of the demo API",
+  "main": "server.ts",
+  "dependencies": {
+    "fastify": "^4.26.0"
+  },
+  "scripts": {
+    "start": "ts-node server.ts"
+  }
+}

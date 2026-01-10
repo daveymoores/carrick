@@ -244,16 +244,41 @@ Runs analysis on both main branch deployments and pull requests. On main, shares
 
 ## Configuration
 
-Create a `carrick.json` to help classify your API calls:
+Create a `carrick.json` in your repository root to help classify your API calls:
 
 ```json
 {
-  "internalEnvVars": ["API_URL", "SERVICE_URL"],
+  "serviceName": "order-service",
+  "internalEnvVars": ["USER_SERVICE_URL", "INVENTORY_API"],
   "externalEnvVars": ["STRIPE_API", "GITHUB_API"],
-  "internalDomains": ["api.yourcompany.com"],
-  "externalDomains": ["api.stripe.com", "api.github.com"]
+  "internalDomains": ["https://api.yourcompany.com"],
+  "externalDomains": ["https://api.stripe.com", "https://api.github.com"]
 }
 ```
+
+### Configuration Options
+
+| Field | Description |
+| :--- | :--- |
+| `serviceName` | Optional. A friendly name for this service (for future cross-repo features) |
+| `internalEnvVars` | Env vars pointing to **internal** services. Routes using these will be validated against known endpoints |
+| `externalEnvVars` | Env vars pointing to **external** APIs (Stripe, GitHub, etc). These calls are ignored |
+| `internalDomains` | Full URL prefixes for internal services |
+| `externalDomains` | Full URL prefixes for external APIs to ignore |
+
+### Why Classify Environment Variables?
+
+When Carrick finds a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`, it needs to know:
+
+1. **Internal service?** → Validate that `/orders` exists as an endpoint in your organization's repos
+2. **External API?** → Ignore it (we can't validate Stripe's API)
+
+If an env var isn't classified, you'll see a "Configuration Suggestion" in the output:
+```
+Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars or externalEnvVars in carrick.json
+```
+
+Add it to `internalEnvVars` if it points to one of your services, or `externalEnvVars` if it's a third-party API.
 
 ## What Carrick Catches
 

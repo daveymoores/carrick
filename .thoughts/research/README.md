@@ -1,10 +1,15 @@
 # Research Documentation
 
-This directory contains research and analysis documents for the Carrick project.
+This directory contains detailed reference documentation for the Carrick project.
+
+**For the project overview and current status, see [../README.md](../README.md)**
+
+---
 
 ## Available Documents
 
 ### 1. [Cloud Infrastructure](./cloud_infrastructure.md)
+
 **Purpose**: Complete architecture documentation for AWS cloud integration
 
 **Contents**:
@@ -15,14 +20,12 @@ This directory contains research and analysis documents for the Carrick project.
 - Security architecture
 - Cost optimization
 
-**When to read**:
-- Understanding how cloud storage works
-- Debugging AWS integration issues
-- Planning infrastructure changes
+**When to read**: Understanding cloud storage, debugging AWS issues, planning infrastructure changes
 
 ---
 
 ### 2. [TypeScript Type Checking System](./ts_check.md)
+
 **Purpose**: Documentation of the `ts_check` TypeScript type compatibility system
 
 **Contents**:
@@ -32,69 +35,35 @@ This directory contains research and analysis documents for the Carrick project.
 - ts-morph integration
 - Workflow and algorithms
 
-**When to read**:
-- Understanding type mismatch detection
-- Debugging type checking issues
-- Planning type system changes
+**When to read**: Understanding type mismatch detection, debugging type checking, modifying the type system
 
 ---
 
-### 3. [Testing Strategy](./testing_strategy.md) ⭐ **NEW**
+### 3. [Testing Strategy](./testing_strategy.md)
+
 **Purpose**: Comprehensive testing strategy and coverage documentation
 
 **Contents**:
 - Testing philosophy (output-focused)
-- Test coverage summary (43 tests)
+- Test coverage summary (70+ tests)
 - Test architecture (unit, integration, output contract)
 - What is tested vs not tested
 - Running tests
 - CI/CD integration
 - Adding new tests
 
-**When to read**:
-- Before refactoring (understand test coverage)
-- Adding new tests
-- Understanding test failures
-- CI/CD debugging
-
----
-
-## Related Documentation
-
-### In `.thoughts/` Directory
-
-**Test Coverage Implementation**:
-- `test-coverage-complete.md` - Full implementation report
-- `test-coverage-progress.md` - Initial progress tracking
-- `adding-output-tests-guide.md` - Step-by-step guide for adding tests
-- `test-implementation-summary.md` - Quick summary
-
-**Project State**:
-- `project_state_2025.md` - Overall project architecture and state
+**When to read**: Before refactoring, adding new tests, understanding test failures
 
 ---
 
 ## Quick Navigation
 
-### I want to...
-
-**Understand how tests work**
-→ Read `testing_strategy.md`
-
-**Add a new test**
-→ Read `../adding-output-tests-guide.md`
-
-**Understand AWS integration**
-→ Read `cloud_infrastructure.md`
-
-**Debug type checking**
-→ Read `ts_check.md`
-
-**See test implementation details**
-→ Read `../test-coverage-complete.md`
-
-**Get a quick test overview**
-→ Read `../test-implementation-summary.md`
+| I want to... | Read this |
+|--------------|-----------|
+| Understand project status | [../README.md](../README.md) |
+| Understand AWS integration | [cloud_infrastructure.md](./cloud_infrastructure.md) |
+| Debug type checking | [ts_check.md](./ts_check.md) |
+| Add or understand tests | [testing_strategy.md](./testing_strategy.md) |
 
 ---
 
@@ -102,34 +71,6 @@ This directory contains research and analysis documents for the Carrick project.
 
 | Document | Status | Last Updated |
 |----------|--------|--------------|
-| cloud_infrastructure.md | ✅ Current | 2025 |
-| ts_check.md | ✅ Current | 2025 |
-| testing_strategy.md | ✅ Current | 2025-11-15 |
-
----
-
-## Contributing
-
-When adding new research documents:
-
-1. Place them in `.thoughts/research/`
-2. Update this README with a summary
-3. Link to related documents
-4. Update the "Document Status" table
-5. Add to "Quick Navigation" if applicable
-
----
-
-## Document Maintenance
-
-### When to Update
-
-- **cloud_infrastructure.md**: When AWS architecture changes
-- **ts_check.md**: When type checking system changes
-- **testing_strategy.md**: When tests are added/removed or strategy changes
-
-### Review Schedule
-
-- Review quarterly for accuracy
-- Update after major refactoring
-- Update after infrastructure changes
+| cloud_infrastructure.md | ✅ Current | January 2025 |
+| ts_check.md | ✅ Current | January 2025 |
+| testing_strategy.md | ✅ Current | January 2025 |

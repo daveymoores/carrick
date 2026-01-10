@@ -14,16 +14,16 @@ pub struct MockStorage {
 
 impl Default for MockStorage {
     fn default() -> Self {
-        Self {
-            data: Mutex::new(HashMap::new()),
-            type_files: Mutex::new(HashMap::new()),
-        }
+        Self::new()
     }
 }
 
 impl MockStorage {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            data: Mutex::new(HashMap::new()),
+            type_files: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -84,6 +84,7 @@ impl CloudStorage for MockStorage {
             let mock_repos = vec![
                 CloudRepoData {
                     repo_name: "repo-a".to_string(),
+                    service_name: None,
                     endpoints: vec![],
                     calls: vec![],
                     mounts: vec![],
@@ -95,9 +96,11 @@ impl CloudStorage for MockStorage {
                     packages: Some(mock_packages_a),
                     last_updated: Utc::now(),
                     commit_hash: "abc123".to_string(),
+                    mount_graph: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
+                    service_name: None,
                     endpoints: vec![],
                     calls: vec![],
                     mounts: vec![],
@@ -109,6 +112,7 @@ impl CloudStorage for MockStorage {
                     packages: Some(mock_packages_b),
                     last_updated: Utc::now(),
                     commit_hash: "def456".to_string(),
+                    mount_graph: None,
                 },
             ];
             result.extend(mock_repos);

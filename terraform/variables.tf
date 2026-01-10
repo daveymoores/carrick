@@ -22,8 +22,8 @@ variable "domain_name" {
   default     = "carrick.tools"
 }
 
-variable "gemini_api_key" {
-  description = "Google Gemini API key for AI-powered code analysis"
+variable "agent_api_key" {
+  description = "Anthropic API key for AI-powered code analysis"
   type        = string
   sensitive   = true
 }

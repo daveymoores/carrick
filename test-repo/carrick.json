@@ -1,4 +1,5 @@
 {
+  "serviceName": "test-service",
   "internalEnvVars": ["CORE_API"],
   "internalDomains": ["core-api.company.com"],
   "externalDomains": ["api.stripe.com"]

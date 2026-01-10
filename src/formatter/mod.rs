@@ -1,5 +1,5 @@
 use crate::analyzer::{ApiAnalysisResult, ApiIssues, ConflictSeverity, DependencyConflict};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub struct FormattedOutput {
     pub content: String,
@@ -89,23 +89,29 @@ fn format_no_issues(result: &ApiAnalysisResult) -> String {
     )
 }
 
+#[derive(Debug, Clone)]
+struct EnvVarSuggestionGroup {
+    method: String,
+    env_var: String,
+    path: String,
+    count: usize,
+    locations: Vec<String>,
+}
+
 struct CategorizedIssues {
     critical: Vec<String>,
     connectivity: Vec<String>,
-    configuration: Vec<String>,
+    configuration: Vec<EnvVarSuggestionGroup>,
     dependencies: Vec<DependencyConflict>,
 }
 
 fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
     let mut critical = Vec::new();
     let mut connectivity = Vec::new();
-    let mut configuration = Vec::new();
 
-    // Critical issues: mismatches and type mismatches
     critical.extend(issues.mismatches.clone());
     critical.extend(issues.type_mismatches.clone());
 
-    // Add method mismatches from call_issues to critical
     for issue in &issues.call_issues {
         if issue.contains("Method mismatch") {
             critical.push(issue.clone());
@@ -114,11 +120,9 @@ fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
         }
     }
 
-    // Connectivity issues: missing/orphaned endpoints
     connectivity.extend(issues.endpoint_issues.clone());
 
-    // Configuration issues: environment variables
-    configuration.extend(issues.env_var_calls.clone());
+    let configuration = group_env_var_suggestions(&issues.env_var_calls);
 
     CategorizedIssues {
         critical,
@@ -164,6 +168,22 @@ fn format_critical_section(issues: &[String]) -> String {
     output
 }
 
+/// Separates endpoint issues into missing and orphaned categories
+fn separate_missing_orphaned(issues: &[String]) -> (Vec<&String>, Vec<&String>) {
+    let mut missing = Vec::new();
+    let mut orphaned = Vec::new();
+
+    for issue in issues {
+        if issue.starts_with("Missing endpoint:") {
+            missing.push(issue);
+        } else if issue.starts_with("Orphaned endpoint:") {
+            orphaned.push(issue);
+        }
+    }
+
+    (missing, orphaned)
+}
+
 fn format_connectivity_section(issues: &[String]) -> String {
     let mut output = String::new();
 
@@ -184,7 +204,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
         ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in missing {
-            let (method, path) = extract_method_path(&endpoint);
+            let (method, path) = extract_method_path(endpoint);
             output.push_str(&format!("| `{}` | `{}` |\n", method, path));
         }
         output.push_str("\n<br>\n\n");
@@ -198,7 +218,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
         ));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for endpoint in orphaned {
-            let (method, path) = extract_method_path(&endpoint);
+            let (method, path) = extract_method_path(endpoint);
             output.push_str(&format!("| `{}` | `{}` |\n", method, path));
         }
     }
@@ -207,7 +227,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
     output
 }
 
-fn format_configuration_section(issues: &[String]) -> String {
+fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -215,14 +235,25 @@ fn format_configuration_section(issues: &[String]) -> String {
         issues.len()
     ));
 
-    output.push_str("> These API calls use environment variables to construct the URL. To enable full analysis, consider adding them to your tool's external API configuration.\n\n");
+    output.push_str("> These API calls use environment variables to construct the URL. Add them to `internalEnvVars` (to validate routes) or `externalEnvVars` (to ignore) in your `carrick.json`.\n\n");
 
     for issue in issues {
-        let (method, env_vars, path) = extract_env_var_info(issue);
         output.push_str(&format!(
-            "  - `{}` using **[{}]** in `{}`\n",
-            method, env_vars, path
+            "  - `{} {}` using **[{}]** — {} call site{}\n",
+            issue.method,
+            issue.path,
+            issue.env_var,
+            issue.count,
+            if issue.count == 1 { "" } else { "s" }
         ));
+
+        let shown = issue.locations.len().min(3);
+        for loc in issue.locations.iter().take(shown) {
+            output.push_str(&format!("    - `{}`\n", loc));
+        }
+        if shown > 0 && issue.count > shown {
+            output.push_str(&format!("    - … +{} more\n", issue.count - shown));
+        }
     }
 
     output.push_str("</details>");
@@ -496,21 +527,6 @@ fn parse_structured_type_error(issue: &str) -> (String, String, String, String) 
     (endpoint, producer, consumer, error)
 }
 
-fn separate_missing_orphaned(issues: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut missing = Vec::new();
-    let mut orphaned = Vec::new();
-
-    for issue in issues {
-        if issue.contains("Missing endpoint") {
-            missing.push(issue.clone());
-        } else if issue.contains("Orphaned endpoint") {
-            orphaned.push(issue.clone());
-        }
-    }
-
-    (missing, orphaned)
-}
-
 fn extract_method_path(issue: &str) -> (String, String) {
     // Extract method and path from issues like "Missing endpoint: No endpoint defined for GET /api/users"
     // or "Orphaned endpoint: No call matching endpoint GET /api/users"
@@ -550,7 +566,10 @@ fn extract_method_path(issue: &str) -> (String, String) {
 }
 
 fn extract_env_var_info(issue: &str) -> (String, String, String) {
-    // Parse issues like "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
+    // Parse issues in two formats:
+    // New: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars..."
+    // Old: "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
+
     let method = if issue.contains("GET") {
         "GET"
     } else if issue.contains("POST") {
@@ -573,14 +592,33 @@ fn extract_env_var_info(issue: &str) -> (String, String, String) {
         "UNKNOWN"
     };
 
-    // Extract just the path part after the env var
-    let path = if let Some(start) = issue.find("ENV_VAR:") {
+    // Try new format first: "Unclassified env var: GET /path using [ENV_VAR]"
+    // Path is between the method and " using"
+    let path = if issue.starts_with("Unclassified env var:") {
+        // Format: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - ..."
+        if let Some(using_pos) = issue.find(" using") {
+            // Find the method position and extract path after it
+            let after_method = if let Some(pos) = issue.find("GET ") {
+                &issue[pos + 4..using_pos]
+            } else if let Some(pos) = issue.find("POST ") {
+                &issue[pos + 5..using_pos]
+            } else if let Some(pos) = issue.find("PUT ") {
+                &issue[pos + 4..using_pos]
+            } else if let Some(pos) = issue.find("DELETE ") {
+                &issue[pos + 7..using_pos]
+            } else {
+                "UNKNOWN"
+            };
+            after_method.trim()
+        } else {
+            "UNKNOWN"
+        }
+    } else if let Some(start) = issue.find("ENV_VAR:") {
+        // Old format: "ENV_VAR:UNKNOWN_API:/data"
         let env_var_section = &issue[start..];
-        // Format: "ENV_VAR:UNKNOWN_API:/data"
-        // Find the second colon to get just the path part
         let parts: Vec<&str> = env_var_section.splitn(3, ':').collect();
         if parts.len() >= 3 {
-            parts[2] // The path part after "ENV_VAR:VARNAME:"
+            parts[2]
         } else {
             "UNKNOWN"
         }
@@ -589,6 +627,55 @@ fn extract_env_var_info(issue: &str) -> (String, String, String) {
     };
 
     (method.to_string(), env_vars.to_string(), path.to_string())
+}
+
+fn extract_env_var_location(issue: &str) -> Option<String> {
+    let marker = "(from ";
+    let start = issue.find(marker)?;
+    let rest = &issue[start + marker.len()..];
+    let end = rest.find(')')?;
+    Some(rest[..end].to_string())
+}
+
+fn group_env_var_suggestions(issues: &[String]) -> Vec<EnvVarSuggestionGroup> {
+    #[derive(Default)]
+    struct Acc {
+        raw_count: usize,
+        locations: BTreeSet<String>,
+    }
+
+    let mut grouped: BTreeMap<(String, String, String), Acc> = BTreeMap::new();
+
+    for issue in issues {
+        let (method, env_var, path) = extract_env_var_info(issue);
+        let location = extract_env_var_location(issue);
+
+        let acc = grouped.entry((env_var, method, path)).or_default();
+        acc.raw_count += 1;
+        if let Some(loc) = location {
+            acc.locations.insert(loc);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|((env_var, method, path), acc)| {
+            let locations: Vec<String> = acc.locations.into_iter().collect();
+            let count = if locations.is_empty() {
+                acc.raw_count
+            } else {
+                locations.len()
+            };
+
+            EnvVarSuggestionGroup {
+                method,
+                env_var,
+                path,
+                count,
+                locations,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -682,5 +769,48 @@ mod tests {
         // Check that no issues message is displayed
         assert!(output.contains("No API inconsistencies detected"));
         assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
+    }
+
+    #[test]
+    fn test_extract_env_var_info_new_format() {
+        // Test the new format: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to..."
+        let issue = "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars or externalEnvVars in carrick.json";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "GET");
+        assert_eq!(env_var, "ORDER_SERVICE_URL");
+        assert_eq!(path, "/orders");
+    }
+
+    #[test]
+    fn test_extract_env_var_info_new_format_with_params() {
+        let issue = "Unclassified env var: POST /users/:id/comments using [USER_API] - add to internalEnvVars or externalEnvVars in carrick.json";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "POST");
+        assert_eq!(env_var, "USER_API");
+        assert_eq!(path, "/users/:id/comments");
+    }
+
+    #[test]
+    fn test_extract_env_var_info_old_format() {
+        // Test the old format: "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
+        let issue =
+            "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "GET");
+        assert_eq!(env_var, "API_URL");
+        assert_eq!(path, "/users");
+    }
+
+    #[test]
+    fn test_extract_env_var_info_old_format_complex_path() {
+        let issue = "Environment variable endpoint: DELETE using env vars [ORDER_SERVICE] in ENV_VAR:ORDER_SERVICE:/orders/123/items";
+        let (method, env_var, path) = extract_env_var_info(issue);
+
+        assert_eq!(method, "DELETE");
+        assert_eq!(env_var, "ORDER_SERVICE");
+        assert_eq!(path, "/orders/123/items");
     }
 }

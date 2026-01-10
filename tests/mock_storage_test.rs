@@ -24,6 +24,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
 
     CloudRepoData {
         repo_name: repo_name.to_string(),
+        service_name: None,
         endpoints: vec![],
         calls: vec![],
         mounts: vec![],
@@ -35,6 +36,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         packages: Some(packages),
         last_updated: Utc::now(),
         commit_hash: commit_hash.to_string(),
+        mount_graph: None,
     }
 }
 

@@ -16,18 +16,18 @@ resource "aws_lambda_function" "check_or_upload" {
   }
 }
 
-resource "aws_lambda_function" "gemini_proxy" {
-  function_name    = "carrick-gemini-proxy"
+resource "aws_lambda_function" "agent_proxy" {
+  function_name    = "carrick-agent-proxy"
   role             = aws_iam_role.lambda_exec.arn
   handler          = "index.handler"
   runtime          = "nodejs22.x"
-  filename         = "../lambdas/gemini-proxy.zip"
-  source_code_hash = filebase64sha256("../lambdas/gemini-proxy.zip")
-  timeout          = 60 # Gemini API calls can take longer
+  filename         = "../lambdas/agent-proxy.zip"
+  source_code_hash = filebase64sha256("../lambdas/agent-proxy.zip")
+  timeout          = 120 # Increased for parallel LLM calls - API Gateway has 30s limit but Lambda can continue processing
 
   environment {
     variables = {
-      GEMINI_API_KEY = var.gemini_api_key
+      AGENT_API_KEY  = var.agent_api_key
       VALID_API_KEYS = var.carrick_api_keys
     }
   }

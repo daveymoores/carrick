@@ -1,15 +1,22 @@
+mod agent_service;
+mod agents;
 mod analyzer;
 mod app_context;
+mod call_site_classifier;
+mod call_site_extractor;
 mod cloud_storage;
 mod config;
 mod engine;
 mod extractor;
 mod file_finder;
 mod formatter;
-mod gemini_service;
+mod framework_detector;
+mod mount_graph;
+mod multi_agent_orchestrator;
 mod packages;
 mod parser;
 mod router_context;
+mod url_normalizer;
 mod utils;
 mod visitor;
 

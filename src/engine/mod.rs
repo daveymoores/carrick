@@ -1,14 +1,16 @@
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
-use crate::cloud_storage::{CloudRepoData, CloudStorage, get_current_commit_hash};
+use crate::cloud_storage::{CloudRepoData, CloudStorage};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
+use crate::mount_graph::MountGraph;
+use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
-use crate::utils::{get_repository_name, resolve_import_path};
-use crate::visitor::DependencyVisitor;
-use chrono::Utc;
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::utils::get_repository_name;
+use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
+use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 
 use swc_common::{
     SourceMap,
@@ -16,6 +18,17 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_visit::VisitWith;
+
+// Type aliases to reduce complexity
+type FileDiscoveryResult = Result<
+    (
+        Vec<PathBuf>,
+        HashMap<String, crate::visitor::ImportedSymbol>,
+        HashMap<String, FunctionDefinition>,
+        String,
+    ),
+    Box<dyn std::error::Error>,
+>;
 
 /// Determine if we should upload data based on GitHub context
 /// Only upload on main/master branch, not on PRs
@@ -181,11 +194,8 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
 }
 
 /// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
-/// Extract file discovery and parsing logic from analyze_current_repo
-fn discover_and_parse_files(
-    repo_path: &str,
-    cm: Lrc<SourceMap>,
-) -> Result<(Vec<DependencyVisitor>, String), Box<dyn std::error::Error>> {
+/// Discover files and extract symbols for MultiAgentOrchestrator
+fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
@@ -199,70 +209,37 @@ fn discover_and_parse_files(
         repo_path
     );
 
-    // Track processed files to avoid duplicates
-    let mut processed_file_paths = HashSet::new();
-    let mut file_queue = VecDeque::new();
+    // Extract imported symbols and function definitions by parsing files
+    let mut all_imported_symbols = HashMap::new();
+    let mut all_function_definitions = HashMap::new();
 
-    // Queue all discovered files for processing
-    for file_path in files {
-        file_queue.push_back((file_path, repo_name.clone(), None));
-    }
+    for file_path in &files {
+        if let Some(module) = parse_file(file_path, &cm, &handler) {
+            // Extract import symbols
+            let mut import_extractor = ImportSymbolExtractor::new();
+            module.visit_with(&mut import_extractor);
+            all_imported_symbols.extend(import_extractor.imported_symbols);
 
-    // Process all files in the queue (including newly discovered imports)
-    let mut visitors = Vec::new();
-
-    while let Some((file_path, repo_prefix, imported_router_name)) = file_queue.pop_front() {
-        let path_str = file_path.to_string_lossy().to_string();
-        let processing_key = match &imported_router_name {
-            Some(name) => format!("{}#{}", path_str, name),
-            None => path_str.clone(),
-        };
-        if processed_file_paths.contains(&processing_key) {
-            continue;
-        }
-        processed_file_paths.insert(processing_key);
-
-        println!("Parsing: {}", file_path.display());
-
-        if let Some(module) = parse_file(&file_path, &cm, &handler) {
-            let mut visitor = DependencyVisitor::new(
-                file_path.clone(),
-                &repo_prefix,
-                imported_router_name,
-                cm.clone(),
-            );
-            module.visit_with(&mut visitor);
-
-            // Queue imported router files that might be used with app.use or router.use
-            for (name, symbol) in &visitor.imported_symbols {
-                let is_router = visitor.mounts.iter().any(|mount| match &mount.child {
-                    crate::visitor::OwnerType::Router(router_name) => {
-                        let parts: Vec<_> = router_name.split(':').collect();
-                        let local_name = parts.last().unwrap_or(&"");
-                        local_name == name
-                    }
-                    _ => false,
-                });
-
-                if is_router {
-                    println!("Following import '{}' from '{}'", name, symbol.source);
-
-                    if let Some(resolved_path) = resolve_import_path(&file_path, &symbol.source) {
-                        println!("Resolved to: {}", resolved_path.display());
-                        file_queue.push_back((
-                            resolved_path,
-                            repo_prefix.clone(),
-                            Some(name.clone()),
-                        ));
-                    }
-                }
-            }
-
-            visitors.push(visitor);
+            // Extract function definitions with type annotations
+            let mut func_extractor = FunctionDefinitionExtractor::new(file_path.clone());
+            module.visit_with(&mut func_extractor);
+            all_function_definitions.extend(func_extractor.function_definitions);
         }
     }
 
-    Ok((visitors, repo_name))
+    println!(
+        "Extracted {} imported symbols and {} function definitions from {} files",
+        all_imported_symbols.len(),
+        all_function_definitions.len(),
+        files.len()
+    );
+
+    Ok((
+        files,
+        all_imported_symbols,
+        all_function_definitions,
+        repo_name,
+    ))
 }
 
 /// Extract config and package loading logic
@@ -299,74 +276,146 @@ async fn analyze_current_repo(
     repo_path: &str,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     println!(
-        "---> Analyzing JavaScript/TypeScript files in: {}",
+        "---> Running multi-agent framework-agnostic analysis on: {}",
         repo_path
     );
 
-    // 1. Create shared SourceMap for consistent byte position tracking
+    // 1. Create shared SourceMap and discover files and symbols
     let cm: Lrc<SourceMap> = Default::default();
+    let (files, all_imported_symbols, function_definitions, repo_name) =
+        discover_files_and_symbols(repo_path, cm.clone())?;
+    println!(
+        "Extracted repository name: '{}' from {} files ({} function definitions)",
+        repo_name,
+        files.len(),
+        function_definitions.len()
+    );
 
-    // 2. Discover and parse files using shared SourceMap
-    let (visitors, repo_name) = discover_and_parse_files(repo_path, cm.clone())?;
-    println!("Extracted repository name: '{}'", repo_name);
-
-    // 3. Load config and packages
+    // 2. Load config and packages using existing logic
     let (config, packages) = load_config_and_packages(repo_path)?;
 
-    // 4. Build analyzer using shared logic with same SourceMap
-    let builder = AnalyzerBuilder::new(config.clone(), cm);
-    let analyzer = builder.build_from_visitors(visitors).await?;
+    // 3. Get API key and create MultiAgentOrchestrator
+    let api_key = env::var("CARRICK_API_KEY")
+        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
+    let orchestrator = MultiAgentOrchestrator::new(api_key, cm.clone());
 
-    // 5. Extract types for current repo
-    extract_types_for_current_repo(&analyzer, repo_path, &packages)?;
+    // 4. Run the complete multi-agent analysis
+    let analysis_result = orchestrator
+        .run_complete_analysis(files, &packages, &all_imported_symbols)
+        .await?;
 
-    // 6. Build CloudRepoData (AST stripping handled by caller)
-    let cloud_data = CloudRepoData {
-        repo_name: repo_name.clone(),
-        endpoints: analyzer.endpoints,
-        calls: analyzer.calls,
-        mounts: analyzer.mounts,
-        apps: analyzer.apps,
-        imported_handlers: analyzer.imported_handlers,
-        function_definitions: analyzer.function_definitions,
-        config_json: serde_json::to_string(&config).ok(),
-        package_json: serde_json::to_string(&packages).ok(),
-        packages: Some(packages),
-        last_updated: Utc::now(),
-        commit_hash: get_current_commit_hash(),
-    };
+    // 5. Extract types from agent analysis results
+    let agent_type_infos =
+        orchestrator.extract_types_from_analysis(&analysis_result.analysis_results);
+
+    // 6. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
+    let cloud_data = CloudRepoData::from_multi_agent_results(
+        repo_name.clone(),
+        &analysis_result,
+        serde_json::to_string(&config).ok(),
+        serde_json::to_string(&packages).ok(),
+        Some(packages.clone()),
+        function_definitions.clone(),
+    );
+
+    // 7. Create a minimal Analyzer for type extraction
+    let mut analyzer = Analyzer::new(config.clone(), cm.clone());
+    analyzer.endpoints = cloud_data.endpoints.clone();
+    analyzer.calls = cloud_data.calls.clone();
+    analyzer.mounts = cloud_data.mounts.clone();
+    analyzer.function_definitions = function_definitions;
+    analyzer.build_endpoint_router();
+
+    // 7a. Resolve types for endpoints using SWC AST (accurate position extraction)
+    analyzer.resolve_types_for_endpoints(cm);
+
+    // 8. Extract types for current repo (critical for cross-repo type checking)
+    extract_types_for_current_repo(&analyzer, repo_path, &packages, agent_type_infos)?;
 
     Ok(cloud_data)
 }
 
+/// Extract types for current repo - restored from the old system
 fn extract_types_for_current_repo(
     analyzer: &Analyzer,
     repo_path: &str,
     packages: &Packages,
+    agent_type_infos: Vec<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     let mut repo_type_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let repo_paths = vec![repo_path.to_string()];
 
-    // Group type information by repository using endpoint owner information
-    for endpoint in &analyzer.endpoints {
-        let repo_prefix = analyzer.extract_repo_prefix_from_owner(&endpoint.owner);
+    println!("=== TYPE EXTRACTION DIAGNOSTIC START ===");
+    println!("Repository path: {}", repo_path);
+    println!("Agent type_infos count: {}", agent_type_infos.len());
 
+    // Log agent type infos for debugging
+    for (i, type_info) in agent_type_infos.iter().enumerate() {
+        println!(
+            "  Agent type_info[{}]: filePath={}, alias={}, typeString={}",
+            i,
+            type_info["filePath"].as_str().unwrap_or("NONE"),
+            type_info["alias"].as_str().unwrap_or("NONE"),
+            type_info["compositeTypeString"].as_str().unwrap_or("NONE")
+        );
+    }
+
+    // Count endpoints and calls with type info (for diagnostics)
+    let endpoints_with_types = analyzer
+        .endpoints
+        .iter()
+        .filter(|e| e.request_type.is_some() || e.response_type.is_some())
+        .count();
+    let calls_with_types = analyzer
+        .calls
+        .iter()
+        .filter(|c| c.request_type.is_some() || c.response_type.is_some())
+        .count();
+
+    println!(
+        "Analyzer endpoints: {} total, {} with type info",
+        analyzer.endpoints.len(),
+        endpoints_with_types
+    );
+    println!(
+        "Analyzer calls: {} total, {} with type info",
+        analyzer.calls.len(),
+        calls_with_types
+    );
+    println!("Analyzer fetch_calls: {}", analyzer.fetch_calls().len());
+
+    // Group type information by repository using endpoint file path
+    // This ensures types are keyed by repo name (e.g., "repo-a") not owner (e.g., "app")
+    for endpoint in &analyzer.endpoints {
+        let repo_prefix =
+            analyzer.extract_repo_prefix_from_file_path(&endpoint.file_path, &repo_paths);
         analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
     }
 
     // Group type information by repository using call file information
+    // NOTE: Same issue - type info is None from the adapter layer
     for call in &analyzer.calls {
         let repo_prefix = analyzer.extract_repo_prefix_from_file_path(&call.file_path, &repo_paths);
         analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
     }
 
-    // Collect type information from Gemini-extracted fetch_calls
+    // Collect type information from Gemini-extracted fetch_calls (legacy path)
     let gemini_type_infos = analyzer.collect_type_infos_from_calls(analyzer.fetch_calls());
-    for type_info in gemini_type_infos {
+    println!(
+        "Gemini type_infos from fetch_calls: {}",
+        gemini_type_infos.len()
+    );
+
+    // Combine Gemini async types AND Agent types
+    // This is the primary source of type info in the multi-agent architecture
+    for type_info in gemini_type_infos
+        .into_iter()
+        .chain(agent_type_infos.into_iter())
+    {
         let file_path = type_info["filePath"].as_str().unwrap_or("");
-        let repo_prefix = analyzer
-            .extract_repo_prefix_from_file_path(&std::path::PathBuf::from(file_path), &repo_paths);
+        let repo_prefix =
+            analyzer.extract_repo_prefix_from_file_path(&PathBuf::from(file_path), &repo_paths);
         repo_type_map
             .entry(repo_prefix)
             .or_default()
@@ -375,8 +424,15 @@ fn extract_types_for_current_repo(
 
     // Extract types for current repository
     let repo_name = get_repository_name(repo_path);
-
     let type_infos = repo_type_map.get(&repo_name).cloned().unwrap_or_default();
+
+    println!(
+        "Repo type map keys: {:?}",
+        repo_type_map.keys().collect::<Vec<_>>()
+    );
+    println!("Looking for repo_name: '{}'", repo_name);
+    println!("Final type_infos count for this repo: {}", type_infos.len());
+    println!("=== TYPE EXTRACTION DIAGNOSTIC END ===");
 
     if !type_infos.is_empty() {
         println!(
@@ -385,6 +441,11 @@ fn extract_types_for_current_repo(
             repo_path
         );
         analyzer.extract_types_for_repo(repo_path, type_infos.clone(), packages);
+    } else {
+        println!(
+            "WARNING: No types to extract for repository: {} - type file will not be generated",
+            repo_path
+        );
     }
 
     Ok(())
@@ -408,18 +469,22 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     let builder = AnalyzerBuilder::new_for_cross_repo(combined_config, cm);
     let mut analyzer = builder.build_from_repo_data(all_repo_data.clone()).await?;
 
-    // 3. Add packages data from all repos for dependency analysis
+    // 3. Merge mount graphs from all repos for framework-agnostic analysis
+    let merged_mount_graph = MountGraph::merge_from_repos(&all_repo_data);
+    analyzer.set_mount_graph(merged_mount_graph);
+
+    // 4. Add packages data from all repos for dependency analysis
     for repo_data in &all_repo_data {
         if let Some(packages) = &repo_data.packages {
             analyzer.add_repo_packages(repo_data.repo_name.clone(), packages.clone());
         }
     }
 
-    // 4. Recreate type files from S3 and run type checking
+    // 5. Recreate type files from S3 and run type checking
     recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
         .await?;
 
-    // 5. Run final type checking
+    // 6. Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
         println!("⚠️  Warning: Type checking failed: {}", e);
     }
@@ -664,6 +729,7 @@ mod tests {
 
         let test_data = CloudRepoData {
             repo_name: "test-repo".to_string(),
+            service_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],
@@ -675,6 +741,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            mount_graph: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -693,6 +760,7 @@ mod tests {
 
         let test_data = vec![CloudRepoData {
             repo_name: "test-repo".to_string(),
+            service_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -704,6 +772,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            mount_graph: None,
         }];
 
         // Test Config merging
@@ -757,6 +826,7 @@ mod tests {
 
         let test_data = vec![CloudRepoData {
             repo_name: "test-repo".to_string(),
+            service_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],
@@ -768,6 +838,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            mount_graph: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues

@@ -1,14 +1,17 @@
 use crate::{
     analyzer::ApiEndpointDetails,
     app_context::AppContext,
+    mount_graph::MountGraph,
+    multi_agent_orchestrator::MultiAgentAnalysisResult,
     packages::Packages,
-    visitor::{FunctionDefinition, Mount},
+    visitor::{FunctionDefinition, Mount, OwnerType},
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::PathBuf;
 
 mod mock_storage;
 pub use mock_storage::MockStorage;
@@ -18,6 +21,8 @@ pub use aws_storage::AwsStorage;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>, // Service name from carrick.json for cross-repo resolution
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub mounts: Vec<Mount>,
@@ -29,6 +34,103 @@ pub struct CloudRepoData {
     pub packages: Option<Packages>, // Structured package data for dependency analysis
     pub last_updated: DateTime<Utc>,
     pub commit_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
+}
+
+impl CloudRepoData {
+    /// Create CloudRepoData directly from multi-agent analysis results
+    /// This bypasses the legacy Analyzer adapter layer
+    pub fn from_multi_agent_results(
+        repo_name: String,
+        analysis_result: &MultiAgentAnalysisResult,
+        config_json: Option<String>,
+        package_json: Option<String>,
+        packages: Option<Packages>,
+        function_definitions: HashMap<String, FunctionDefinition>,
+    ) -> Self {
+        // Extract service_name from config_json if present
+        let service_name = config_json.as_ref().and_then(|json| {
+            serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|v| {
+                    v.get("serviceName")
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                })
+        });
+        let mount_graph = &analysis_result.mount_graph;
+
+        // Convert ResolvedEndpoints to ApiEndpointDetails
+        let endpoints: Vec<ApiEndpointDetails> = mount_graph
+            .get_resolved_endpoints()
+            .iter()
+            .map(|endpoint| ApiEndpointDetails {
+                owner: Some(OwnerType::App(endpoint.owner.clone())),
+                route: endpoint.full_path.clone(),
+                method: endpoint.method.clone(),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: endpoint.handler.clone(),
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from(&endpoint.file_location),
+            })
+            .collect();
+
+        // Convert DataFetchingCalls to ApiEndpointDetails
+        let calls: Vec<ApiEndpointDetails> = mount_graph
+            .get_data_calls()
+            .iter()
+            .map(|call| ApiEndpointDetails {
+                owner: None,
+                route: call.target_url.clone(),
+                method: call.method.clone(),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: Some(call.client.clone()),
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from(&call.file_location),
+            })
+            .collect();
+
+        // Convert MountEdges to Mount
+        let mounts: Vec<Mount> = mount_graph
+            .get_mounts()
+            .iter()
+            .map(|mount| Mount {
+                parent: OwnerType::App(mount.parent.clone()),
+                child: OwnerType::Router(mount.child.clone()),
+                prefix: mount.path_prefix.clone(),
+            })
+            .collect();
+
+        println!("Created CloudRepoData directly from multi-agent results:");
+        println!("  - {} endpoints", endpoints.len());
+        println!("  - {} calls", calls.len());
+        println!("  - {} mounts", mounts.len());
+        println!("  - {} function definitions", function_definitions.len());
+
+        Self {
+            repo_name,
+            service_name,
+            endpoints,
+            calls,
+            mounts,
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions,
+            config_json,
+            package_json,
+            packages,
+            last_updated: Utc::now(),
+            commit_hash: get_current_commit_hash(),
+            mount_graph: Some(mount_graph.clone()), // Store mount graph for cross-repo analysis
+        }
+    }
 }
 
 #[derive(Debug)]

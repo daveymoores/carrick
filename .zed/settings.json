@@ -1,0 +1,30 @@
+{
+  "languages": {
+    "JavaScript": {
+      "language_servers": ["typescript-language-server", "eslint"]
+    },
+    "TypeScript": {
+      "language_servers": ["typescript-language-server", "eslint"]
+    },
+    "TSX": {
+      "language_servers": ["typescript-language-server", "eslint"]
+    },
+    "Rust": {
+      "language_servers": ["rust-analyzer"]
+    }
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "buildScripts": {
+            "enable": true
+          },
+          "extraEnv": {
+            "CARRICK_API_ENDPOINT": "http://localhost:3000"
+          }
+        }
+      }
+    }
+  }
+}

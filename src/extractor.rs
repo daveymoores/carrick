@@ -333,9 +333,7 @@ pub trait CoreExtractor {
                 if let Some(left_json) = self.extract_req_body_from_expr(&bin.left) {
                     return Some(left_json);
                 }
-                if let Some(right_json) = self.extract_req_body_from_expr(&bin.right) {
-                    return Some(right_json);
-                }
+                return self.extract_req_body_from_expr(&bin.right);
             }
 
             // Direct field access
@@ -345,11 +343,11 @@ pub trait CoreExtractor {
         None
     }
 
-    // Async call extraction methods for Gemini Flash integration
+    // Async call extraction methods for Agent integration
     fn extract_async_calls_from_function(
         &self,
         func: &crate::visitor::FunctionDefinition,
-    ) -> Vec<crate::gemini_service::AsyncCallContext> {
+    ) -> Vec<crate::agent_service::AsyncCallContext> {
         use swc_common::{SourceMapper, Spanned};
 
         let mut contexts = Vec::new();
@@ -388,11 +386,11 @@ pub trait CoreExtractor {
             || function_source.contains("fetch")
             || function_source.contains("axios")
         {
-            contexts.push(crate::gemini_service::AsyncCallContext {
+            contexts.push(crate::agent_service::AsyncCallContext {
                 kind: "function_analysis".to_string(),
                 function_source,
                 file: func.file_path.to_string_lossy().to_string(),
-                line: 1, // We'll let Gemini figure out the specific line
+                line: 1, // We'll let Agent figure out the specific line
                 function_name,
             });
         }
@@ -401,6 +399,7 @@ pub trait CoreExtractor {
     }
 }
 
+#[allow(dead_code)]
 pub trait RouteExtractor: CoreExtractor {
     fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
     fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;

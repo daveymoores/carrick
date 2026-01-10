@@ -68,6 +68,7 @@ fn test_imported_router_endpoint_resolution() {
         .arg(test_project_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_ORG", "test-org")
+        .env("CARRICK_API_KEY", "mock")
         .output()
         .expect("Failed to execute carrick");
 
@@ -144,6 +145,7 @@ fn test_basic_endpoint_detection() {
         .arg(test_repo_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_ORG", "test-org")
+        .env("CARRICK_API_KEY", "mock")
         .output()
         .expect("Failed to execute carrick");
 
@@ -212,6 +214,7 @@ fn test_no_duplicate_processing_regression() {
         .arg(fixture_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_ORG", "test-org")
+        .env("CARRICK_API_KEY", "mock")
         .output()
         .expect("Failed to execute carrick");
 
