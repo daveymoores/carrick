@@ -440,9 +440,7 @@ pub trait RouteExtractor: CoreExtractor {
             // Try to resolve the object
             if let Some(Expr::Object(obj_lit)) = self.resolve_variable(&obj_name) {
                 // If it's an object literal, extract the property
-                if let (Expr::Object(obj_lit), MemberProp::Ident(prop_ident)) =
-                    (resolved_obj, &member.prop)
-                {
+                if let MemberProp::Ident(prop_ident) = &member.prop {
                     let prop_name = prop_ident.sym.to_string();
 
                     // Find the property in the object

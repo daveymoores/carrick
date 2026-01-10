@@ -27,12 +27,6 @@ impl MockStorage {
     }
 }
 
-impl MockStorage {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 #[async_trait]
 impl CloudStorage for MockStorage {
     async fn download_type_file_content(&self, s3_url: &str) -> Result<String, StorageError> {

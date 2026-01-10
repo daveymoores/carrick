@@ -91,8 +91,6 @@ pub struct ApiAnalysisResult {
     pub issues: ApiIssues,
 }
 
-pub type RouteFieldsMap = HashMap<(String, String), Json>;
-
 pub struct Analyzer {
     // <Route, http_method, handler_name, source>
     pub imported_handlers: Vec<(String, String, String, String)>,
