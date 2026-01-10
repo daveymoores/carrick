@@ -85,6 +85,70 @@ export function findTypeDeclarationByPosition(
   return symbol.getDeclarations()[0];
 }
 
+/**
+ * Search for a type reference by looking for the type string in the source file.
+ * This is a fallback when position-based lookup fails (e.g., LLM gave wrong position).
+ */
+export function findTypeReferenceByString(
+  sf: SourceFile,
+  typeString: string,
+): Node | undefined {
+  // Extract the main type name from strings like "Response<User[]>" -> "Response"
+  const mainTypeName = typeString.match(/^([A-Z][a-zA-Z0-9]*)/)?.[1];
+  if (!mainTypeName) return undefined;
+
+  // Search the file text for the type string
+  const fileText = sf.getFullText();
+  const searchIndex = fileText.indexOf(typeString);
+
+  if (searchIndex !== -1) {
+    // Found the exact string, try to get node at this position
+    const node = sf.getDescendantAtPos(searchIndex);
+    if (node) {
+      // Walk up to find a TypeReference
+      let current: Node | undefined = node;
+      while (current) {
+        if (Node.isTypeReference(current)) {
+          return current;
+        }
+        current = current.getParent();
+        if (!current) break;
+      }
+      return node;
+    }
+  }
+
+  // Fallback: Search for the main type name in type annotations
+  // Look for patterns like ": Response<" or "as Response<"
+  const patterns = [
+    `: ${mainTypeName}<`,
+    `: ${mainTypeName}>`,
+    `as ${mainTypeName}<`,
+    `as ${mainTypeName}`,
+  ];
+
+  for (const pattern of patterns) {
+    const idx = fileText.indexOf(pattern);
+    if (idx !== -1) {
+      // Position at the type name (after the colon/as and space)
+      const typeNamePos = idx + pattern.indexOf(mainTypeName);
+      const node = sf.getDescendantAtPos(typeNamePos);
+      if (node) {
+        let current: Node | undefined = node;
+        while (current) {
+          if (Node.isTypeReference(current)) {
+            return current;
+          }
+          current = current.getParent();
+          if (!current) break;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
 export function getModuleSpecifierFromNodeModulesPath(
   filePath: string,
 ): string | undefined {
