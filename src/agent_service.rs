@@ -689,7 +689,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "method": "GET",
                 "path": path,
                 "handler_name": "anonymous",
-                "pattern_matched": ".get("
+                "pattern_matched": ".get(",
+                "response_type_file": null,
+                "response_type_position": null,
+                "response_type_string": null
             }));
         }
 
@@ -709,7 +712,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "method": "POST",
                 "path": path,
                 "handler_name": "anonymous",
-                "pattern_matched": ".post("
+                "pattern_matched": ".post(",
+                "response_type_file": null,
+                "response_type_position": null,
+                "response_type_string": null
             }));
         }
 
@@ -730,7 +736,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "method": "DELETE",
                 "path": path,
                 "handler_name": "anonymous",
-                "pattern_matched": ".delete("
+                "pattern_matched": ".delete(",
+                "response_type_file": null,
+                "response_type_position": null,
+                "response_type_string": null
             }));
         }
 
@@ -751,7 +760,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "method": "PUT",
                 "path": path,
                 "handler_name": "anonymous",
-                "pattern_matched": ".put("
+                "pattern_matched": ".put(",
+                "response_type_file": null,
+                "response_type_position": null,
+                "response_type_string": null
             }));
         }
 
@@ -768,7 +780,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "line_number": line_number,
                 "target": target,
                 "method": method,
-                "pattern_matched": "fetch("
+                "pattern_matched": "fetch(",
+                "response_type_file": null,
+                "response_type_position": null,
+                "response_type_string": null
             }));
         }
 
@@ -791,7 +806,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "line_number": line_number,
                 "target": "https://api.example.com",
                 "method": method,
-                "pattern_matched": "axios."
+                "pattern_matched": "axios.",
+                "response_type_file": null,
+                "response_type_position": null,
+                "response_type_string": null
             }));
         }
     }

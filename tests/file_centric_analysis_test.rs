@@ -107,6 +107,9 @@ fn test_file_analysis_result_structures() {
         path: "/:id".to_string(),
         handler_name: "getUserById".to_string(),
         pattern_matched: ".get(".to_string(),
+        response_type_file: None,
+        response_type_position: None,
+        response_type_string: None,
     };
     assert_eq!(endpoint.method, "GET");
     assert_eq!(endpoint.path, "/:id");
@@ -117,6 +120,9 @@ fn test_file_analysis_result_structures() {
         target: "https://api.example.com/users".to_string(),
         method: Some("POST".to_string()),
         pattern_matched: "fetch(".to_string(),
+        response_type_file: None,
+        response_type_position: None,
+        response_type_string: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -149,6 +155,9 @@ fn test_file_analysis_result_serialization() {
                 path: "/health".to_string(),
                 handler_name: "healthCheck".to_string(),
                 pattern_matched: ".get(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
             EndpointResult {
                 line_number: 15,
@@ -157,6 +166,9 @@ fn test_file_analysis_result_serialization() {
                 path: "/data".to_string(),
                 handler_name: "createData".to_string(),
                 pattern_matched: ".post(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
         ],
         data_calls: vec![DataCallResult {
@@ -164,6 +176,9 @@ fn test_file_analysis_result_serialization() {
             target: "https://external-api.com/data".to_string(),
             method: Some("GET".to_string()),
             pattern_matched: "fetch(".to_string(),
+            response_type_file: None,
+            response_type_position: None,
+            response_type_string: None,
         }],
     };
 
@@ -306,6 +321,9 @@ fn test_cross_file_import_resolution() {
                     path: "/".to_string(),
                     handler_name: "listUsers".to_string(),
                     pattern_matched: ".get(".to_string(),
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: None,
                 },
                 EndpointResult {
                     line_number: 10,
@@ -314,6 +332,9 @@ fn test_cross_file_import_resolution() {
                     path: "/:id".to_string(),
                     handler_name: "getUserById".to_string(),
                     pattern_matched: ".get(".to_string(),
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: None,
                 },
                 EndpointResult {
                     line_number: 15,
@@ -322,6 +343,9 @@ fn test_cross_file_import_resolution() {
                     path: "/".to_string(),
                     handler_name: "createUser".to_string(),
                     pattern_matched: ".post(".to_string(),
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: None,
                 },
             ],
             data_calls: vec![],
@@ -341,6 +365,9 @@ fn test_cross_file_import_resolution() {
                     path: "/posts".to_string(),
                     handler_name: "getPosts".to_string(),
                     pattern_matched: ".get(".to_string(),
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: None,
                 },
                 EndpointResult {
                     line_number: 10,
@@ -349,6 +376,9 @@ fn test_cross_file_import_resolution() {
                     path: "/posts".to_string(),
                     handler_name: "createPost".to_string(),
                     pattern_matched: ".post(".to_string(),
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: None,
                 },
             ],
             data_calls: vec![],
@@ -383,21 +413,30 @@ fn test_data_call_extraction() {
         data_calls: vec![
             DataCallResult {
                 line_number: 10,
-                target: "https://api.users.com/users".to_string(),
+                target: "https://api.example.com/users".to_string(),
                 method: Some("GET".to_string()),
                 pattern_matched: "fetch(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
             DataCallResult {
                 line_number: 15,
-                target: "https://api.orders.com/orders".to_string(),
+                target: "/api/posts".to_string(),
                 method: Some("POST".to_string()),
                 pattern_matched: "axios.post(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
             DataCallResult {
                 line_number: 20,
-                target: "/internal/api/data".to_string(),
+                target: "${baseUrl}/data".to_string(),
                 method: None,
                 pattern_matched: "fetch(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
         ],
     };
@@ -483,6 +522,9 @@ fn test_nested_router_mounts() {
                 path: "/:id".to_string(),
                 handler_name: "getUser".to_string(),
                 pattern_matched: ".get(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             }],
             data_calls: vec![],
         },
@@ -510,6 +552,9 @@ fn test_multiple_http_methods_on_same_path() {
                 path: "/users".to_string(),
                 handler_name: "getUsers".to_string(),
                 pattern_matched: ".get(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
             EndpointResult {
                 line_number: 10,
@@ -518,6 +563,9 @@ fn test_multiple_http_methods_on_same_path() {
                 path: "/users".to_string(),
                 handler_name: "createUser".to_string(),
                 pattern_matched: ".post(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
             EndpointResult {
                 line_number: 15,
@@ -526,6 +574,9 @@ fn test_multiple_http_methods_on_same_path() {
                 path: "/users/:id".to_string(),
                 handler_name: "updateUser".to_string(),
                 pattern_matched: ".put(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
             EndpointResult {
                 line_number: 20,
@@ -534,6 +585,9 @@ fn test_multiple_http_methods_on_same_path() {
                 path: "/users/:id".to_string(),
                 handler_name: "deleteUser".to_string(),
                 pattern_matched: ".delete(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             },
         ],
         data_calls: vec![],

@@ -39,6 +39,12 @@ pub struct EndpointResult {
     pub path: String,
     pub handler_name: String,
     pub pattern_matched: String,
+    /// File path containing the response type definition
+    pub response_type_file: Option<String>,
+    /// Start position (character index) of the response type in the file
+    pub response_type_position: Option<i32>,
+    /// The type string itself (e.g., "User[]", "Response<Order>")
+    pub response_type_string: Option<String>,
 }
 
 /// Result of analyzing a single data-fetching call
@@ -48,6 +54,12 @@ pub struct DataCallResult {
     pub target: String,
     pub method: Option<String>,
     pub pattern_matched: String,
+    /// File path containing the response type definition
+    pub response_type_file: Option<String>,
+    /// Start position (character index) of the response type in the file
+    pub response_type_position: Option<i32>,
+    /// The type string itself (e.g., "User[]", "Response<Order>")
+    pub response_type_string: Option<String>,
 }
 
 /// Complete analysis result for a single file
@@ -221,7 +233,27 @@ When a variable is used in a mount and that variable was imported, include the i
 * **Default exports:** If the file exports a router/app as default and it's mounted elsewhere, the child_node should be the imported name.
 * **Re-exports:** Track the original source, not intermediate re-exports.
 * **Dynamic imports:** Record import_source as the string literal if available, otherwise null.
-* **response.json()/.text():** These are data_calls when they appear after fetch/axios calls to parse response data."#.to_string()
+* **response.json()/.text():** These are data_calls when they appear after fetch/axios calls to parse response data.
+
+### 5. RESPONSE TYPE EXTRACTION (CRITICAL FOR TYPE CHECKING)
+For endpoints and data calls, you MUST extract TypeScript type annotations when present:
+
+#### A. Endpoint Response Types
+Look for Response<T> or similar generic type annotations on handler parameters:
+* `app.get('/users', (req: Request, res: Response<User[]>) => ...)` → response_type_string: "Response<User[]>"
+* `router.post('/order', async (req, res: Response<{ orderId: string }>) => ...)` → response_type_string: "Response<{ orderId: string }>"
+* `app.get('/data', handler as RequestHandler<{}, DynamicResponse>)` → response_type_string: "Response<DynamicResponse>"
+
+#### B. Data Call Response Types
+Look for type assertions or generic parameters on fetch/axios calls:
+* `const data = await resp.json() as Comment[]` → response_type_string: "Comment[]"
+* `const user = await fetch<User>('/api/user')` → response_type_string: "User"
+* `const orders: Order[] = await api.get('/orders')` → response_type_string: "Order[]"
+
+#### C. Position Calculation
+* response_type_position: Count characters from the start of the file to where the type annotation begins
+* response_type_file: Use the current file path being analyzed
+* If no type annotation is found, set all response_type_* fields to null"#.to_string()
     }
 
     /// Build the dynamic user message with patterns and file content (legacy).
@@ -288,8 +320,18 @@ Analyze this file and return a JSON object with:
 - "data_calls": array of data fetching calls found
 
 For each mount, include: line_number, parent_node, child_node, mount_path, import_source (null if local), pattern_matched
-For each endpoint, include: line_number, owner_node, method, path, handler_name, pattern_matched
-For each data_call, include: line_number, target, method (null if unknown), pattern_matched
+
+For each endpoint, include: line_number, owner_node, method, path, handler_name, pattern_matched, response_type_file, response_type_position, response_type_string
+  - response_type_file: The file path where the response type is defined (use the current file path if inline)
+  - response_type_position: The character position (0-based index) where the response type annotation starts in the file
+  - response_type_string: The exact TypeScript type string from the code (e.g., "Response<User[]>", "Response<{{ id: number }}>")
+  - CRITICAL: Look for Express/Fastify Response<T> generic type annotations on handler parameters. Extract the FULL type including Response<...> wrapper.
+  - Example: `(req: Request, res: Response<User[]>)` → response_type_string: "Response<User[]>"
+  - Example: `(req, res: Response<{{ userId: number; comments: Comment[] }}>)` → response_type_string: "Response<{{ userId: number; comments: Comment[] }}>"
+
+For each data_call, include: line_number, target, method (null if unknown), pattern_matched, response_type_file, response_type_position, response_type_string
+  - For fetch/axios calls with typed responses like `await resp.json() as Comment[]`, extract the type assertion
+  - For typed fetch wrappers, extract the generic type parameter
 
 Return ONLY the JSON object, no explanations."#,
             mount_patterns,
@@ -416,6 +458,9 @@ mod tests {
             path: "/users/:id".to_string(),
             handler_name: "getUserById".to_string(),
             pattern_matched: ".get(".to_string(),
+            response_type_file: Some("test.ts".to_string()),
+            response_type_position: Some(100),
+            response_type_string: Some("Response<User>".to_string()),
         };
 
         let json = serde_json::to_string(&endpoint).unwrap();
@@ -434,6 +479,9 @@ mod tests {
             target: "https://api.example.com/data".to_string(),
             method: Some("POST".to_string()),
             pattern_matched: "fetch(".to_string(),
+            response_type_file: None,
+            response_type_position: None,
+            response_type_string: Some("Comment[]".to_string()),
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -463,6 +511,9 @@ mod tests {
                 path: "/health".to_string(),
                 handler_name: "healthCheck".to_string(),
                 pattern_matched: ".get(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
             }],
             data_calls: vec![],
         };

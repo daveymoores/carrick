@@ -193,14 +193,33 @@ impl MultiAgentOrchestrator {
                     false, // is_consumer
                 );
 
-                type_infos.push(serde_json::json!({
-                    "filePath": file_path,
+                // Use the response_type_file from the LLM if available, otherwise use the current file
+                let type_file = endpoint
+                    .response_type_file
+                    .clone()
+                    .unwrap_or_else(|| file_path.clone());
+
+                // Build type info with response type information if available
+                let mut type_info = serde_json::json!({
+                    "filePath": type_file,
                     "lineNumber": endpoint.line_number,
                     "alias": alias,
                     "kind": "endpoint",
                     "method": endpoint.method,
                     "path": endpoint.path
-                }));
+                });
+
+                // Add response type position if available
+                if let Some(pos) = endpoint.response_type_position {
+                    type_info["position"] = serde_json::json!(pos);
+                }
+
+                // Add the type string if the LLM extracted it
+                if let Some(ref type_str) = endpoint.response_type_string {
+                    type_info["compositeTypeString"] = serde_json::json!(type_str);
+                }
+
+                type_infos.push(type_info);
             }
 
             // Extract types from data calls
@@ -216,13 +235,31 @@ impl MultiAgentOrchestrator {
                     format!("DataCall_L{}", data_call.line_number)
                 };
 
-                type_infos.push(serde_json::json!({
-                    "filePath": file_path,
+                // Use the response_type_file from the LLM if available, otherwise use the current file
+                let type_file = data_call
+                    .response_type_file
+                    .clone()
+                    .unwrap_or_else(|| file_path.clone());
+
+                let mut type_info = serde_json::json!({
+                    "filePath": type_file,
                     "lineNumber": data_call.line_number,
                     "alias": alias,
                     "kind": "data_call",
                     "target": data_call.target
-                }));
+                });
+
+                // Add response type position if available
+                if let Some(pos) = data_call.response_type_position {
+                    type_info["position"] = serde_json::json!(pos);
+                }
+
+                // Add the type string if the LLM extracted it
+                if let Some(ref type_str) = data_call.response_type_string {
+                    type_info["compositeTypeString"] = serde_json::json!(type_str);
+                }
+
+                type_infos.push(type_info);
             }
         }
 

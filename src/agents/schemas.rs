@@ -320,6 +320,21 @@ impl AgentSchemas {
                             "pattern_matched": {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
+                            },
+                            "response_type_file": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "File path containing the response type definition (same as current file if type is inline)"
+                            },
+                            "response_type_position": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Character position (0-based index) where the response type annotation starts in the file"
+                            },
+                            "response_type_string": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The exact type string from the code (e.g., 'Response<User[]>', 'Response<{ id: number }>')"
                             }
                         },
                         "required": ["line_number", "owner_node", "method", "path", "handler_name", "pattern_matched"]
@@ -346,6 +361,21 @@ impl AgentSchemas {
                             "pattern_matched": {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
+                            },
+                            "response_type_file": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "File path containing the response type definition"
+                            },
+                            "response_type_position": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Character position (0-based index) where the response type annotation starts"
+                            },
+                            "response_type_string": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The exact type string from the code (e.g., 'Comment[]', 'Promise<User>')"
                             }
                         },
                         "required": ["line_number", "target", "pattern_matched"]

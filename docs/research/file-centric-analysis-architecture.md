@@ -1,11 +1,11 @@
 # File-Centric Analysis Architecture
 
-**Status:** Implementation In Progress  
-**Last Updated:** 2024-01
+**Status:** Implemented (AST-Gated)  
+**Last Updated:** 2025-01
 
 ## Overview
 
-This document describes the refactored Carrick Static Analysis Engine architecture that uses a file-centric approach with Gemini 3.0 Flash for high-speed, framework-agnostic code analysis.
+This document describes the refactored Carrick Static Analysis Engine architecture that uses an **AST-Gated File-Centric** approach with Gemini 3.0 Flash for high-speed, framework-agnostic code analysis.
 
 ## Motivation
 
@@ -16,17 +16,11 @@ The previous "Batch-of-10" architecture had several limitations:
 3. **Complex Orchestration**: Triage → Dispatch flow added latency and complexity
 4. **Hardcoded Framework Knowledge**: System prompts contained framework-specific logic
 
-## New Architecture
-
-### Core Principle: Framework Agnosticism
-
-The system must be **Strictly Framework Agnostic**. All detection logic is derived dynamically from injected patterns, with no hardcoded references to specific libraries (e.g., Express, Fastify) in the system prompts.
-
-### Analysis Flow
+## Architecture Evolution
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Old Flow (Deprecated)                        │
+│                    Old Flow (REMOVED)                           │
 ├─────────────────────────────────────────────────────────────────┤
 │  Regex → Batch (10 sites) → LLM Triage → LLM Dispatch          │
 │  • High token cost                                              │
@@ -35,24 +29,66 @@ The system must be **Strictly Framework Agnostic**. All detection logic is deriv
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
-│                    New Flow (File-Centric)                      │
+│                Current Flow (AST-Gated File-Centric)            │
 ├─────────────────────────────────────────────────────────────────┤
-│  1. Read File      → Load full content of target_file.ts       │
-│  2. Load Guidance  → Retrieve FrameworkGuidance patterns       │
-│  3. One-Shot       → Send File + Patterns to Gemini            │
-│  4. Direct Build   → Deserialize JSON into MountGraph structs  │
+│  1. SWC AST Scan  → Gatekeeper: find candidate call sites      │
+│     └─ If NO candidates → SKIP file (ZERO LLM cost)            │
+│  2. Read File     → Load full content of target_file.ts        │
+│  3. Load Guidance → Retrieve FrameworkGuidance patterns        │
+│  4. Inject Hints  → Include Candidate Targets in LLM prompt    │
+│  5. One-Shot LLM  → Send File + Patterns + Hints to Gemini     │
+│  6. Direct Build  → Deserialize JSON into MountGraph structs   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Components
+## Core Principles
 
-#### 1. FileAnalyzerAgent (`src/agents/file_analyzer_agent.rs`)
+### 1. Framework Agnosticism
+
+The system is **Strictly Framework Agnostic**. All detection logic is derived dynamically from injected patterns, with no hardcoded references to specific libraries (e.g., Express, Fastify) in the system prompts.
+
+### 2. AST Gatekeeper (Zero-Cost Filtering)
+
+The SWC Scanner acts as a cheap gatekeeper:
+- **Purpose**: Identify files that *might* contain API patterns before invoking the LLM
+- **Cost**: Near-zero (fast AST parse, no network call)
+- **Benefit**: Files with no candidates are skipped entirely—no LLM tokens consumed
+
+### 3. Candidate-Focused LLM Analysis
+
+When a file passes the gatekeeper:
+- Full file content is sent to the LLM (for alias/import resolution)
+- Candidate line numbers are injected as "hints" to focus the LLM's attention
+- The LLM acts as a Pattern Matcher + Alias Resolver, not a general code analyzer
+
+## Key Components
+
+### 1. SWC Scanner / Gatekeeper (`src/swc_scanner.rs`)
+
+A lightweight AST-based scanner that identifies potential API call sites:
+
+```rust
+pub struct CandidateTarget {
+    pub line_number: u32,
+    pub callee_object: Option<String>,  // e.g., "app", "router", "axios"
+    pub callee_property: Option<String>, // e.g., "get", "post", "use"
+    pub code_snippet: String,            // The actual code at this line
+}
+```
+
+**Detection rules** (intentionally broad to avoid false negatives):
+- Method calls on `app`, `router`, `axios`, `fetch`, `res`, etc.
+- Chained calls (e.g., `express().use(...)`)
+- Custom router names and HTTP method patterns
+
+### 2. FileAnalyzerAgent (`src/agents/file_analyzer_agent.rs`)
 
 The core analysis agent that processes one file at a time:
 
-- **Input**: File path, file content, FrameworkGuidance patterns
+- **Input**: File path, file content, FrameworkGuidance patterns, Candidate Targets
 - **Output**: `FileAnalysisResult` containing mounts, endpoints, and data_calls
 - **System Prompt**: Framework-agnostic, relies strictly on provided patterns
+- **Method**: `analyze_file_with_candidates(file_path, file_content, guidance, candidate_hints)`
 
 ```rust
 pub struct FileAnalysisResult {
@@ -62,16 +98,28 @@ pub struct FileAnalysisResult {
 }
 ```
 
-#### 2. FileOrchestrator (`src/agents/file_orchestrator.rs`)
+### 3. FileOrchestrator (`src/agents/file_orchestrator.rs`)
 
 Coordinates file-centric analysis across multiple files:
 
-- Processes files sequentially or in parallel
+- Runs the SWC Scanner on each file (gatekeeper)
+- Skips files with no candidates (tracks `files_skipped_no_candidates`)
+- For files with candidates: formats hints and calls FileAnalyzerAgent
 - Aggregates results into a unified `MountGraph`
 - Handles cross-file resolution via `import_source` tracking
-- Provides processing statistics and error reporting
 
-#### 3. Flat Output Schema (`src/agents/schemas.rs`)
+```rust
+pub struct ProcessingStats {
+    pub files_processed: usize,
+    pub files_skipped_no_candidates: usize,  // Zero LLM cost
+    pub files_with_errors: usize,
+    pub total_mounts: usize,
+    pub total_endpoints: usize,
+    pub total_data_calls: usize,
+}
+```
+
+### 4. Flat Output Schema (`src/agents/schemas.rs`)
 
 Uses a flat JSON schema to avoid recursion errors and ensure deterministic parsing:
 
@@ -83,7 +131,34 @@ Uses a flat JSON schema to avoid recursion errors and ensure deterministic parsi
 }
 ```
 
-### Cross-File Resolution
+## LLM Prompt Structure
+
+The FileAnalyzerAgent prompt includes:
+
+1. **INPUT DATA Section**:
+   - Full Source Code (complete file content)
+   - Candidate Targets (SWC-detected line hints)
+   - Active Patterns (framework-specific patterns from guidance)
+
+2. **Instructions**:
+   - Focus on Candidate Targets but use full file context for alias resolution
+   - Match only against Active Patterns
+   - Resolve variable definitions and imports
+   - Filter noise (skip candidates that don't match patterns)
+
+3. **Output Requirements**:
+   - Flat JSON schema (mounts, endpoints, data_calls arrays)
+   - Exact string literals (no inferred paths)
+   - Include `import_source` for cross-file linking
+
+Example candidate hints in prompt:
+```
+CANDIDATE TARGETS (SWC-detected lines to focus on):
+- Line 12: app.use - `app.use('/api', apiRouter)`
+- Line 25: router.get - `router.get('/users', getUsers)`
+```
+
+## Cross-File Resolution
 
 The key innovation is the `import_source` field in mount results:
 
@@ -106,143 +181,109 @@ app.use('/users', userRouter);
 
 It records `import_source: Some("./routes/users")`, which allows the orchestrator to link endpoints defined in `routes/users.ts` to the `/users` prefix.
 
-## System Prompt Design
-
-The system prompt emphasizes:
-
-1. **Pattern Matching**: Only extract what matches provided patterns
-2. **No Hallucinations**: Don't infer from comments or vague code
-3. **Alias Resolution**: Track imports and resolve variable definitions
-4. **Flat Output**: All findings as top-level items in respective lists
-
-Key sections:
-- `CORE OBJECTIVE`: Scan and extract based on patterns
-- `ANALYSIS RULES`: Strict pattern matching, variable resolution
-- `OUTPUT REQUIREMENTS`: Flat schema, exact literals
-- `IMPORT TRACKING`: How to record import sources
-
 ## Benefits
 
-1. **Better Context**: Full file content enables accurate alias resolution
-2. **Lower Token Cost**: One LLM call per file vs. multiple for batching
-3. **Framework Agnostic**: Patterns injected at runtime, not hardcoded
-4. **Deterministic**: Flat schema ensures consistent JSON parsing
-5. **Simpler Flow**: Direct file → result mapping
+1. **Zero-Cost Filtering**: Files without API patterns skip LLM entirely
+2. **Better Context**: Full file content enables accurate alias resolution
+3. **Focused Analysis**: Candidate hints improve LLM accuracy and reduce hallucination
+4. **Lower Token Cost**: One LLM call per relevant file vs. multiple for batching
+5. **Framework Agnostic**: Patterns injected at runtime, not hardcoded
+6. **Deterministic**: Flat schema ensures consistent JSON parsing
+7. **Simpler Flow**: Direct file → result mapping (no triage/dispatch)
 
 ## Testing Strategy
 
-1. **Unit Tests**: Schema validation, serialization, pattern formatting
+1. **Unit Tests**: Schema validation, serialization, pattern formatting, SWC scanner detection
 2. **Integration Tests**: Mock agent responses, cross-file resolution
-3. **Edge Cases**: Empty files, missing files, nested mounts
+3. **Edge Cases**: Empty files, missing files, nested mounts, files with no candidates
 
-## Migration Path
+## Implementation Status
 
-The file-centric architecture coexists with the existing batch-based system:
+### Completed
 
-1. ✅ Add FileAnalyzerAgent and schema
-2. ✅ Add FileOrchestrator for file processing
-3. ✅ Add mock response generation for testing
-4. ✅ Add comprehensive tests
-5. ⬜ Integrate with main analysis pipeline (optional feature flag)
-6. ⬜ Performance benchmarking against batch approach
-7. ⬜ Gradual migration with fallback support
+1. ✅ SWC Scanner (AST Gatekeeper) - `src/swc_scanner.rs`
+2. ✅ FileAnalyzerAgent with candidate hints support
+3. ✅ FileOrchestrator with AST gating integration
+4. ✅ Flat output schema (`file_analysis_schema()`)
+5. ✅ Mock response generation for testing
+6. ✅ Comprehensive unit and integration tests
+7. ✅ Removal of old Batch-of-10 orchestration (TriageAgent, CallSiteOrchestrator, etc.)
+8. ✅ Integration with MultiAgentOrchestrator
 
-### ⚠️ CRITICAL: Do Not Hybridize Flows
+### Remaining Work
 
-When integrating the file-centric approach, the old and new flows must be **mutually exclusive**:
+1. ⬜ Import source extraction via SWC (for automatic cross-file linking)
+2. ⬜ End-to-end validation with real Gemini 3.0 Flash (not mock)
+3. ⬜ Performance/cost metrics telemetry
+4. ⬜ Remove `legacy_types.rs` after full migration of dependent code
 
-| Component | Old Flow (Batch) | New Flow (File-Centric) |
-|-----------|------------------|-------------------------|
-| Pre-scan | CallSiteExtractor (regex/AST) | **NONE** |
-| LLM Input | Extracted call sites only | Full file content |
-| LLM Task | Classify pre-identified sites | Find AND classify patterns |
+## Files
 
-**Why this matters:**
+### Added/Modified for AST-Gated Architecture
 
-1. **Wasted CPU**: Running CallSiteExtractor before FileAnalyzerAgent wastes cycles on regex scanning that the LLM will redo anyway.
+- `src/swc_scanner.rs` - SWC-based AST gatekeeper
+- `src/agents/file_analyzer_agent.rs` - File-centric analysis agent with candidate hints
+- `src/agents/file_orchestrator.rs` - Multi-file orchestration with AST gating
+- `src/agents/schemas.rs` - Extended with `file_analysis_schema()`
+- `src/agents/multi_agent_orchestrator.rs` - Updated to use file-centric flow
+- `src/agents/legacy_types.rs` - Compatibility types for transition
+- `tests/file_centric_analysis_test.rs` - Integration tests
 
-2. **Limited Vision**: If you pass only regex-matched sections to the LLM, you defeat the purpose of file-centric analysis. The LLM needs full file context for alias resolution.
+### Removed (Old Batch Architecture)
 
-3. **Correct Integration Pattern:**
-   ```rust
-   // ❌ WRONG - Hybridized (don't do this)
-   let call_sites = extract_all_call_sites(&files).await?;  // Old pre-scan
-   let result = file_orchestrator.analyze_files(&files, &guidance).await?;  // New analysis
-   
-   // ✅ CORRECT - Mutually exclusive paths
-   if use_file_centric_analysis {
-       // New flow: LLM receives full files, finds everything
-       let result = file_orchestrator.analyze_files(&files, &guidance, &detection).await?;
-   } else {
-       // Old flow: Regex pre-scan, then LLM classifies
-       let call_sites = extract_all_call_sites(&files).await?;
-       let result = call_site_orchestrator.analyze_call_sites(&call_sites, ...).await?;
-   }
-   ```
+- `src/agents/triage_agent.rs` - Old triage agent
+- `src/agents/call_site_orchestrator.rs` - Old batch orchestrator
+- `src/agents/consumer_agent.rs` - Old dispatch agent
+- `src/agents/endpoint_agent.rs` - Old dispatch agent
+- `src/agents/middleware_agent.rs` - Old dispatch agent
+- `src/agents/mount_agent.rs` - Old dispatch agent
 
-The `FileOrchestrator.analyze_files()` method reads raw file content via `std::fs::read_to_string()` and sends it directly to the LLM—this is intentional and correct.
+## Architecture Diagram
 
-### Suggested Guard Pattern for Integration
-
-When adding the file-centric path to `MultiAgentOrchestrator`, consider a compile-time or runtime guard:
-
-```rust
-// In multi_agent_orchestrator.rs
-
-pub enum AnalysisMode {
-    /// Old flow: CallSiteExtractor → Triage → Dispatch
-    CallSiteBased,
-    /// New flow: Full file → FileAnalyzerAgent → Direct build
-    FileCentric,
-}
-
-impl MultiAgentOrchestrator {
-    pub async fn run_complete_analysis(
-        &self,
-        files: Vec<PathBuf>,
-        packages: &Packages,
-        imported_symbols: &HashMap<String, ImportedSymbol>,
-        mode: AnalysisMode,  // Explicit mode selection
-    ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
-        // Stages 0 and 0.5 are shared (framework detection + guidance)
-        let framework_detection = self.detect_frameworks(packages, imported_symbols).await?;
-        let framework_guidance = self.generate_guidance(&framework_detection).await?;
-
-        // Mutually exclusive analysis paths
-        match mode {
-            AnalysisMode::FileCentric => {
-                // New flow: NO pre-scan, full files to LLM
-                let file_orchestrator = FileOrchestrator::new(self.agent_service.clone());
-                let result = file_orchestrator
-                    .analyze_files(&files, &framework_guidance, &framework_detection)
-                    .await?;
-                // Convert FileCentricAnalysisResult to MultiAgentAnalysisResult
-                self.convert_file_centric_result(result, &framework_detection, &framework_guidance)
-            }
-            AnalysisMode::CallSiteBased => {
-                // Old flow: Pre-scan then LLM triage
-                let call_sites = self.extract_all_call_sites(&files).await?;
-                let orchestrator = CallSiteOrchestrator::new(self.agent_service.clone());
-                let analysis_results = orchestrator
-                    .analyze_call_sites(&call_sites, &framework_detection, &framework_guidance)
-                    .await?;
-                // ... rest of old flow
-            }
-        }
-    }
-}
+```
+                    ┌──────────────────┐
+                    │   Source Files   │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │   SWC Scanner    │  ◄── Gatekeeper (ZERO LLM cost)
+                    │  (AST Analysis)  │
+                    └────────┬─────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+              ▼                             ▼
+     ┌────────────────┐           ┌────────────────┐
+     │  No Candidates │           │ Has Candidates │
+     │    (SKIP)      │           │                │
+     └────────────────┘           └───────┬────────┘
+                                          │
+                                          ▼
+                                 ┌────────────────┐
+                                 │ FileAnalyzer   │
+                                 │    Agent       │
+                                 │ (Gemini 3.0)   │
+                                 └───────┬────────┘
+                                         │
+                                         ▼
+                                 ┌────────────────┐
+                                 │ FileAnalysis   │
+                                 │    Result      │
+                                 └───────┬────────┘
+                                         │
+                                         ▼
+                                 ┌────────────────┐
+                                 │  MountGraph    │
+                                 │  (Aggregated)  │
+                                 └────────────────┘
 ```
 
-This pattern ensures:
-1. Explicit mode selection at the call site
-2. No accidental hybridization
-3. Easy A/B testing and gradual rollout
-4. Clear separation of concerns
+## Configuration
 
-## Files Added
+The AST-gated file-centric analysis is now the **default and only** analysis mode. The old batch-based flow has been removed.
 
-- `src/agents/file_analyzer_agent.rs` - File-centric analysis agent
-- `src/agents/file_orchestrator.rs` - Multi-file orchestration
-- `src/agents/schemas.rs` - Extended with `file_analysis_schema()`
-- `tests/file_centric_analysis_test.rs` - Integration tests
-- `docs/research/file-centric-analysis-architecture.md` - This document
+LLM Configuration:
+- **Model**: Gemini 3.0 Flash
+- **Temperature**: 0.0 (deterministic)
+- **Response Schema**: Strict flat JSON schema enforced
