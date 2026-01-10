@@ -211,7 +211,7 @@ impl MultiAgentOrchestrator {
 
                 // Add response type position if available
                 if let Some(pos) = endpoint.response_type_position {
-                    type_info["position"] = serde_json::json!(pos);
+                    type_info["startPosition"] = serde_json::json!(pos);
                 }
 
                 // Add the type string if the LLM extracted it
@@ -251,7 +251,7 @@ impl MultiAgentOrchestrator {
 
                 // Add response type position if available
                 if let Some(pos) = data_call.response_type_position {
-                    type_info["position"] = serde_json::json!(pos);
+                    type_info["startPosition"] = serde_json::json!(pos);
                 }
 
                 // Add the type string if the LLM extracted it

@@ -162,12 +162,15 @@ impl FileAnalyzerAgent {
         println!("{}", response);
         println!("=== END RAW RESPONSE ===");
 
-        let result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
+        let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
             format!(
                 "Failed to parse file analysis response: {}. Raw response: {}",
                 e, response
             )
         })?;
+
+        // Sanitize LLM response: Gemini sometimes returns "+null" as a string instead of null
+        Self::sanitize_result(&mut result);
 
         println!(
             "File analysis complete: {} mounts, {} endpoints, {} data_calls",
@@ -177,6 +180,57 @@ impl FileAnalyzerAgent {
         );
 
         Ok(result)
+    }
+
+    /// Sanitize the LLM response to fix common issues like "+null" strings
+    fn sanitize_result(result: &mut FileAnalysisResult) {
+        // Helper to check if a string represents null
+        fn is_null_string(s: &str) -> bool {
+            s == "+null" || s == "null" || s == "NULL" || s.is_empty()
+        }
+
+        // Sanitize endpoints
+        for endpoint in &mut result.endpoints {
+            if let Some(ref s) = endpoint.response_type_file {
+                if is_null_string(s) {
+                    endpoint.response_type_file = None;
+                }
+            }
+            if let Some(ref s) = endpoint.response_type_string {
+                if is_null_string(s) {
+                    endpoint.response_type_string = None;
+                }
+            }
+            // Position of 0 with no file likely means null
+            if endpoint.response_type_file.is_none() && endpoint.response_type_position == Some(0) {
+                endpoint.response_type_position = None;
+            }
+        }
+
+        // Sanitize data calls
+        for data_call in &mut result.data_calls {
+            // Fix method field
+            if let Some(ref s) = data_call.method {
+                if is_null_string(s) {
+                    data_call.method = None;
+                }
+            }
+            if let Some(ref s) = data_call.response_type_file {
+                if is_null_string(s) {
+                    data_call.response_type_file = None;
+                }
+            }
+            if let Some(ref s) = data_call.response_type_string {
+                if is_null_string(s) {
+                    data_call.response_type_string = None;
+                }
+            }
+            // Position of 0 with no file likely means null
+            if data_call.response_type_file.is_none() && data_call.response_type_position == Some(0)
+            {
+                data_call.response_type_position = None;
+            }
+        }
     }
 
     /// Build the system message for the Carrick Static Analysis Engine (legacy).
