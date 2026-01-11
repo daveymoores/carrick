@@ -37,6 +37,8 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         last_updated: Utc::now(),
         commit_hash: commit_hash.to_string(),
         mount_graph: None,
+        bundled_types: None,
+        type_manifest: None,
     }
 }
 

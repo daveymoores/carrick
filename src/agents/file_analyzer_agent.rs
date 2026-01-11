@@ -45,6 +45,10 @@ pub struct EndpointResult {
     pub response_type_position: Option<i32>,
     /// The type string itself (e.g., "User[]", "Response<Order>")
     pub response_type_string: Option<String>,
+    /// The primary type symbol name without wrappers (e.g., "User" from "Response<User[]>")
+    pub primary_type_symbol: Option<String>,
+    /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
+    pub type_import_source: Option<String>,
 }
 
 /// Result of analyzing a single data-fetching call
@@ -60,6 +64,10 @@ pub struct DataCallResult {
     pub response_type_position: Option<i32>,
     /// The type string itself (e.g., "User[]", "Response<Order>")
     pub response_type_string: Option<String>,
+    /// The primary type symbol name without wrappers (e.g., "User" from "Promise<User>")
+    pub primary_type_symbol: Option<String>,
+    /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
+    pub type_import_source: Option<String>,
 }
 
 /// Complete analysis result for a single file
@@ -304,10 +312,26 @@ Look for type assertions or generic parameters on fetch/axios calls:
 * `const user = await fetch<User>('/api/user')` → response_type_string: "User"
 * `const orders: Order[] = await api.get('/orders')` → response_type_string: "Order[]"
 
-#### C. Important Notes
+#### C. Type Symbol Extraction (NEW - CRITICAL)
+For every response_type_string you extract, also extract:
+
+* **primary_type_symbol**: The core type identifier WITHOUT wrappers or generics:
+  - `Response<User[]>` → primary_type_symbol: "User"
+  - `Promise<Order>` → primary_type_symbol: "Order"
+  - `ApiResponse<{ users: User[] }>` → primary_type_symbol: null (inline type)
+  - `string` → primary_type_symbol: null (primitive)
+  - `Comment[]` → primary_type_symbol: "Comment"
+
+* **type_import_source**: Where the primary type is imported from (look at imports at top of file):
+  - If you see `import { User } from './types/user'` and use User → type_import_source: "./types/user"
+  - If you see `import type { Order } from '../models'` and use Order → type_import_source: "../models"
+  - If the type is defined in the same file → type_import_source: null
+  - If the type is inline (e.g., `{ id: string }`) → type_import_source: null
+
+#### D. Important Notes
 * Only extract response_type_string - the exact type annotation text
 * Set response_type_file and response_type_position to null (these are computed separately using AST)
-* If no type annotation is found, set response_type_string to null"#.to_string()
+* If no type annotation is found, set response_type_string, primary_type_symbol, and type_import_source all to null"#.to_string()
     }
 
     /// Build the dynamic user message with patterns and file content (legacy).
@@ -515,6 +539,8 @@ mod tests {
             response_type_file: Some("test.ts".to_string()),
             response_type_position: Some(100),
             response_type_string: Some("Response<User>".to_string()),
+            primary_type_symbol: Some("User".to_string()),
+            type_import_source: Some("./types/user".to_string()),
         };
 
         let json = serde_json::to_string(&endpoint).unwrap();
@@ -536,6 +562,8 @@ mod tests {
             response_type_file: None,
             response_type_position: None,
             response_type_string: Some("Comment[]".to_string()),
+            primary_type_symbol: Some("Comment".to_string()),
+            type_import_source: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -568,6 +596,8 @@ mod tests {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             }],
             data_calls: vec![],
         };

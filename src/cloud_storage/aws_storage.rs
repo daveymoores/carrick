@@ -367,6 +367,8 @@ impl CloudStorage for AwsStorage {
                     last_updated: chrono::Utc::now(),
                     commit_hash: adjacent.hash,
                     mount_graph: None,
+                    bundled_types: None,
+                    type_manifest: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);

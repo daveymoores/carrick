@@ -742,6 +742,8 @@ mod tests {
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
             mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -773,6 +775,8 @@ mod tests {
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
             mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
         }];
 
         // Test Config merging
@@ -839,6 +843,8 @@ mod tests {
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
             mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues

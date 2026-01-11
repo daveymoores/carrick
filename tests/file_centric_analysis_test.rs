@@ -110,6 +110,8 @@ fn test_file_analysis_result_structures() {
         response_type_file: None,
         response_type_position: None,
         response_type_string: None,
+        primary_type_symbol: None,
+        type_import_source: None,
     };
     assert_eq!(endpoint.method, "GET");
     assert_eq!(endpoint.path, "/:id");
@@ -123,6 +125,8 @@ fn test_file_analysis_result_structures() {
         response_type_file: None,
         response_type_position: None,
         response_type_string: None,
+        primary_type_symbol: None,
+        type_import_source: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -158,6 +162,8 @@ fn test_file_analysis_result_serialization() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
             EndpointResult {
                 line_number: 15,
@@ -169,6 +175,8 @@ fn test_file_analysis_result_serialization() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
         ],
         data_calls: vec![DataCallResult {
@@ -179,6 +187,8 @@ fn test_file_analysis_result_serialization() {
             response_type_file: None,
             response_type_position: None,
             response_type_string: None,
+            primary_type_symbol: None,
+            type_import_source: None,
         }],
     };
 
@@ -324,6 +334,8 @@ fn test_cross_file_import_resolution() {
                     response_type_file: None,
                     response_type_position: None,
                     response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
                 },
                 EndpointResult {
                     line_number: 10,
@@ -335,6 +347,8 @@ fn test_cross_file_import_resolution() {
                     response_type_file: None,
                     response_type_position: None,
                     response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
                 },
                 EndpointResult {
                     line_number: 15,
@@ -346,6 +360,8 @@ fn test_cross_file_import_resolution() {
                     response_type_file: None,
                     response_type_position: None,
                     response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
                 },
             ],
             data_calls: vec![],
@@ -368,6 +384,8 @@ fn test_cross_file_import_resolution() {
                     response_type_file: None,
                     response_type_position: None,
                     response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
                 },
                 EndpointResult {
                     line_number: 10,
@@ -379,6 +397,8 @@ fn test_cross_file_import_resolution() {
                     response_type_file: None,
                     response_type_position: None,
                     response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
                 },
             ],
             data_calls: vec![],
@@ -419,6 +439,8 @@ fn test_data_call_extraction() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
             DataCallResult {
                 line_number: 15,
@@ -428,6 +450,8 @@ fn test_data_call_extraction() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
             DataCallResult {
                 line_number: 20,
@@ -437,6 +461,8 @@ fn test_data_call_extraction() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
         ],
     };
@@ -525,6 +551,8 @@ fn test_nested_router_mounts() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             }],
             data_calls: vec![],
         },
@@ -555,6 +583,8 @@ fn test_multiple_http_methods_on_same_path() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
             EndpointResult {
                 line_number: 10,
@@ -566,6 +596,8 @@ fn test_multiple_http_methods_on_same_path() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
             EndpointResult {
                 line_number: 15,
@@ -577,6 +609,8 @@ fn test_multiple_http_methods_on_same_path() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
             EndpointResult {
                 line_number: 20,
@@ -588,6 +622,8 @@ fn test_multiple_http_methods_on_same_path() {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
             },
         ],
         data_calls: vec![],

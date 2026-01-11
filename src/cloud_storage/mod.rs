@@ -18,6 +18,25 @@ pub use mock_storage::MockStorage;
 mod aws_storage;
 pub use aws_storage::AwsStorage;
 
+/// Entry in the type manifest mapping endpoints to their type information
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TypeManifestEntry {
+    /// The alias used in the bundled .d.ts file
+    pub alias: String,
+    /// The original symbol name
+    pub original_name: String,
+    /// The source file where the type was found
+    pub source_file: String,
+    /// Whether this was an explicit annotation or inferred
+    pub is_explicit: bool,
+    /// Associated endpoint path (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_path: Option<String>,
+    /// Associated HTTP method (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_method: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
@@ -36,6 +55,12 @@ pub struct CloudRepoData {
     pub commit_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
+    /// Bundled TypeScript type definitions (.d.ts content)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundled_types: Option<String>,
+    /// Type manifest mapping endpoints/calls to their type aliases
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_manifest: Option<Vec<TypeManifestEntry>>,
 }
 
 impl CloudRepoData {
@@ -129,6 +154,8 @@ impl CloudRepoData {
             last_updated: Utc::now(),
             commit_hash: get_current_commit_hash(),
             mount_graph: Some(mount_graph.clone()), // Store mount graph for cross-repo analysis
+            bundled_types: None,
+            type_manifest: None,
         }
     }
 }

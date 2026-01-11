@@ -24,6 +24,9 @@ use crate::{
     },
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
+    services::type_sidecar::{
+        InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult, TypeSidecar,
+    },
     swc_scanner::{SwcScanner, find_type_position_at_line_from_content},
 };
 use std::collections::HashMap;
@@ -38,6 +41,10 @@ pub struct FileCentricAnalysisResult {
     pub mount_graph: MountGraph,
     /// Processing statistics
     pub stats: ProcessingStats,
+    /// Bundled type definitions (if sidecar was used)
+    pub bundled_types: Option<String>,
+    /// Type resolution result from sidecar
+    pub type_resolution: Option<TypeResolutionResult>,
 }
 
 /// Statistics about the file-centric analysis
@@ -192,7 +199,178 @@ impl FileOrchestrator {
             file_results,
             mount_graph,
             stats,
+            bundled_types: None,
+            type_resolution: None,
         })
+    }
+
+    /// Collect type requests from analysis results for sidecar processing.
+    ///
+    /// Returns two vectors:
+    /// - `SymbolRequest`: For entries WITH explicit type annotations (primary_type_symbol + type_import_source)
+    /// - `InferRequestItem`: For entries WITHOUT explicit type annotations (need inference)
+    pub fn collect_type_requests(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+    ) -> (Vec<SymbolRequest>, Vec<InferRequestItem>) {
+        let mut explicit_requests: Vec<SymbolRequest> = Vec::new();
+        let mut infer_requests: Vec<InferRequestItem> = Vec::new();
+        let mut alias_counter: u32 = 0;
+
+        for (file_path, result) in file_results {
+            // Process endpoints
+            for endpoint in &result.endpoints {
+                if let (Some(symbol), Some(import_source)) =
+                    (&endpoint.primary_type_symbol, &endpoint.type_import_source)
+                {
+                    // Explicit type with import source - bundle it
+                    alias_counter += 1;
+                    explicit_requests.push(SymbolRequest {
+                        symbol_name: symbol.clone(),
+                        source_file: Self::resolve_import_path(file_path, import_source),
+                        alias: Some(format!("Endpoint{}_{}", alias_counter, symbol)),
+                    });
+                } else if endpoint.primary_type_symbol.is_some()
+                    && endpoint.type_import_source.is_none()
+                {
+                    // Type symbol exists but no import - it might be in the same file
+                    if let Some(ref symbol) = endpoint.primary_type_symbol {
+                        alias_counter += 1;
+                        explicit_requests.push(SymbolRequest {
+                            symbol_name: symbol.clone(),
+                            source_file: file_path.clone(),
+                            alias: Some(format!("Endpoint{}_{}", alias_counter, symbol)),
+                        });
+                    }
+                } else if endpoint.response_type_string.is_none() {
+                    // No explicit type - try to infer it
+                    alias_counter += 1;
+                    // Try response_body inference first, then function_return
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path.clone(),
+                        line_number: endpoint.line_number as u32,
+                        infer_kind: InferKind::ResponseBody,
+                        alias: Some(format!("InferredEndpoint{}", alias_counter)),
+                    });
+                }
+            }
+
+            // Process data calls
+            for data_call in &result.data_calls {
+                if let (Some(symbol), Some(import_source)) = (
+                    &data_call.primary_type_symbol,
+                    &data_call.type_import_source,
+                ) {
+                    // Explicit type with import source - bundle it
+                    alias_counter += 1;
+                    explicit_requests.push(SymbolRequest {
+                        symbol_name: symbol.clone(),
+                        source_file: Self::resolve_import_path(file_path, import_source),
+                        alias: Some(format!("DataCall{}_{}", alias_counter, symbol)),
+                    });
+                } else if data_call.primary_type_symbol.is_some()
+                    && data_call.type_import_source.is_none()
+                {
+                    // Type symbol exists but no import - it might be in the same file
+                    if let Some(ref symbol) = data_call.primary_type_symbol {
+                        alias_counter += 1;
+                        explicit_requests.push(SymbolRequest {
+                            symbol_name: symbol.clone(),
+                            source_file: file_path.clone(),
+                            alias: Some(format!("DataCall{}_{}", alias_counter, symbol)),
+                        });
+                    }
+                } else if data_call.response_type_string.is_none() {
+                    // No explicit type - try to infer it
+                    alias_counter += 1;
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path.clone(),
+                        line_number: data_call.line_number as u32,
+                        infer_kind: InferKind::CallResult,
+                        alias: Some(format!("InferredDataCall{}", alias_counter)),
+                    });
+                }
+            }
+        }
+
+        eprintln!(
+            "[FileOrchestrator] Collected {} explicit type requests, {} inference requests",
+            explicit_requests.len(),
+            infer_requests.len()
+        );
+
+        (explicit_requests, infer_requests)
+    }
+
+    /// Resolve types using the TypeSidecar.
+    ///
+    /// This method collects type requests from the analysis results and sends them
+    /// to the sidecar for bundling (explicit) and inference (implicit).
+    pub fn resolve_types_with_sidecar(
+        &self,
+        sidecar: &TypeSidecar,
+        file_results: &HashMap<String, FileAnalysisResult>,
+    ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
+        let (explicit, infer) = self.collect_type_requests(file_results);
+
+        eprintln!(
+            "[FileOrchestrator] Resolving types: {} explicit, {} inferred",
+            explicit.len(),
+            infer.len()
+        );
+
+        let result = sidecar
+            .resolve_all_types(&explicit, &infer)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+        // Log results
+        eprintln!(
+            "[FileOrchestrator] Type resolution complete: {} manifest entries, {} inferred types, {} failures",
+            result.explicit_manifest.len(),
+            result.inferred_types.len(),
+            result.symbol_failures.len()
+        );
+
+        if !result.errors.is_empty() {
+            eprintln!(
+                "[FileOrchestrator] Type resolution warnings: {:?}",
+                result.errors
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Resolve an import path relative to a file.
+    ///
+    /// Converts relative import paths like "./types/user" to absolute paths
+    /// relative to the repository root.
+    fn resolve_import_path(current_file: &str, import_source: &str) -> String {
+        use std::path::Path;
+
+        // If import source is already absolute or doesn't start with ., return as-is
+        if !import_source.starts_with('.') {
+            return import_source.to_string();
+        }
+
+        // Get the directory of the current file
+        let current_path = Path::new(current_file);
+        let current_dir = current_path.parent().unwrap_or(Path::new(""));
+
+        // Join with the import source and normalize
+        let resolved = current_dir.join(import_source);
+
+        // Add .ts extension if not present
+        let resolved_str = resolved.to_string_lossy().to_string();
+        if !resolved_str.ends_with(".ts")
+            && !resolved_str.ends_with(".tsx")
+            && !resolved_str.ends_with(".js")
+            && !resolved_str.ends_with(".jsx")
+        {
+            format!("{}.ts", resolved_str)
+        } else {
+            resolved_str
+        }
     }
 
     /// Build a MountGraph from aggregated file analysis results.
@@ -543,6 +721,8 @@ mod tests {
                     response_type_file: None,
                     response_type_position: None,
                     response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
                 }],
                 data_calls: vec![],
             },
@@ -576,6 +756,8 @@ mod tests {
                     response_type_file: None,
                     response_type_position: None,
                     response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
                 }],
             },
         );
@@ -630,6 +812,8 @@ mod tests {
                         response_type_file: None,
                         response_type_position: None,
                         response_type_string: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
                     },
                     EndpointResult {
                         line_number: 10,
@@ -641,6 +825,8 @@ mod tests {
                         response_type_file: None,
                         response_type_position: None,
                         response_type_string: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
                     },
                 ],
                 data_calls: vec![],

@@ -335,6 +335,16 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "nullable": true,
                                 "description": "The exact type string from the code (e.g., 'Response<User[]>', 'Response<{ id: number }>')"
+                            },
+                            "primary_type_symbol": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The primary type symbol name without wrappers (e.g., 'User' from 'Response<User[]>'). Extract just the identifier, not the full type."
+                            },
+                            "type_import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
                             }
                         },
                         "required": ["line_number", "owner_node", "method", "path", "handler_name", "pattern_matched"]
@@ -376,6 +386,16 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "nullable": true,
                                 "description": "The exact type string from the code (e.g., 'Comment[]', 'Promise<User>')"
+                            },
+                            "primary_type_symbol": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The primary type symbol name without wrappers (e.g., 'User' from 'Promise<User>'). Extract just the identifier, not the full type."
+                            },
+                            "type_import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
                             }
                         },
                         "required": ["line_number", "target", "pattern_matched"]
