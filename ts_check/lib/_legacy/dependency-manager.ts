@@ -1,4 +1,4 @@
-import { Dependencies, PackageJsonContent } from "./types";
+import { Dependencies, PackageJsonContent } from "../types";
 import {
   extractPackageName,
   getTypesPackageName,
@@ -6,12 +6,12 @@ import {
   DEFAULT_PACKAGE_NAME,
   DEFAULT_PACKAGE_VERSION,
   DEFAULT_PACKAGE_TYPE,
-} from "./constants";
+} from "../constants";
 
 export class DependencyManager {
   private usedDependencies: Record<string, string> = {};
 
-  constructor(private allDependencies: Dependencies) {}
+  constructor(private allDependencies: Dependencies) { }
 
   extractUsedDependencies(externalTypeImports: Map<string, Set<string>>): void {
     for (const [moduleSpecifier] of externalTypeImports.entries()) {
@@ -94,7 +94,7 @@ export class DependencyManager {
     try {
       const fs = require("fs");
       const entries = fs.readdirSync(outputDir);
-      
+
       for (const fileName of entries) {
         if (fileName.endsWith("_types.ts")) {
           const baseName = fileName.replace(".ts", "");

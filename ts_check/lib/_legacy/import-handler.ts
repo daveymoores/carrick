@@ -5,7 +5,7 @@ import {
   extractPackageName,
   getTypesPackageName,
   getMainPackageFromTypes,
-} from "./constants";
+} from "../constants";
 
 export class ImportHandler {
   private externalTypeImports = new Map<string, Set<string>>();
@@ -27,9 +27,9 @@ export class ImportHandler {
     // Get the type name
     const typeName =
       Node.isInterfaceDeclaration(node) ||
-      Node.isClassDeclaration(node) ||
-      Node.isTypeAliasDeclaration(node) ||
-      Node.isEnumDeclaration(node)
+        Node.isClassDeclaration(node) ||
+        Node.isTypeAliasDeclaration(node) ||
+        Node.isEnumDeclaration(node)
         ? node.getName?.()
         : undefined;
 

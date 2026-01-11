@@ -1,5 +1,5 @@
 import { Project, SourceFile, Node } from "ts-morph";
-import { CompositeAliasInfo, ProcessingResult, TypeInfo } from "./types";
+import { CompositeAliasInfo, ProcessingResult, TypeInfo } from "../types";
 
 export class OutputGenerator {
   generateOutput(

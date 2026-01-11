@@ -1,5 +1,5 @@
 import { Node } from "ts-morph";
-import { CompositeAliasInfo } from "./types";
+import { CompositeAliasInfo } from "../types";
 import { ImportHandler } from "./import-handler";
 import { TypeProcessor } from "./type-processor";
 

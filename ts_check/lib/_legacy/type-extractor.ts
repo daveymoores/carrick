@@ -1,5 +1,5 @@
-import { TypeInfo } from "./types";
-import { ProjectManager } from "./project-utils";
+import { TypeInfo } from "../types";
+import { ProjectManager } from "../project-utils";
 import { findTypeReferenceAtPosition } from "./type-resolver";
 import { ImportHandler } from "./import-handler";
 import { DeclarationCollector } from "./declaration-collector";

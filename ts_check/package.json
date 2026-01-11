@@ -5,12 +5,12 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "check-types": "ts-node simple-type-checker.ts",
-    "extract": "ts-node extract-type-definitions.ts"
+    "extract": "echo 'DEPRECATED: Use TypeSidecar (src/sidecar) instead' && ts-node _legacy/extract-type-definitions.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "TypeScript type checking utilities for Carrick. Type extraction is now handled by the TypeSidecar (src/sidecar).",
   "dependencies": {
     "ts-morph": "^25.0.1",
     "ts-node": "^10.9.2",

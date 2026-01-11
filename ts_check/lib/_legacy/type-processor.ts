@@ -3,7 +3,7 @@ import {
   MAX_PROPERTY_DEPTH,
   MAX_PROPERTIES_LIMIT,
   isNodeModulesPath,
-} from "./constants";
+} from "../constants";
 
 export class TypeProcessor {
   private seenNodesForRecursion = new Set<Node>();
@@ -14,7 +14,7 @@ export class TypeProcessor {
       node: Node | undefined,
       isRoot?: boolean,
     ) => void,
-  ) {}
+  ) { }
 
   processTypeNode(typeNode: TypeNode | undefined): void {
     if (!typeNode || this.seenNodesForRecursion.has(typeNode)) {

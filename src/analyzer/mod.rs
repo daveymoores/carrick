@@ -1127,10 +1127,13 @@ impl Analyzer {
         println!("Extracting {} types from {}", type_infos.len(), repo_path);
 
         // Run the extract-type-definitions script with all types at once
-        let script_path = match std::fs::canonicalize("ts_check/extract-type-definitions.ts") {
-            Ok(path) => path,
-            Err(e) => panic!("Script not found: {}", e),
-        };
+        // NOTE: This script is DEPRECATED and archived in _legacy/
+        // Type extraction should be migrated to use TypeSidecar (src/sidecar) instead.
+        let script_path =
+            match std::fs::canonicalize("ts_check/_legacy/extract-type-definitions.ts") {
+                Ok(path) => path,
+                Err(e) => panic!("Script not found: {}", e),
+            };
 
         let ts_config = match std::fs::canonicalize(&ts_config) {
             Ok(path) => path,

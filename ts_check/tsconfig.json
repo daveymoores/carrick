@@ -13,6 +13,6 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": ["lib/**/*.ts", "*.ts"],
+  "include": ["lib/**/*.ts", "*.ts", "_legacy/extract-type-definitions.ts"],
   "exclude": ["node_modules", "dist", "output", "**/*.test.ts"]
 }

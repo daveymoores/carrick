@@ -1,15 +1,15 @@
 #!/usr/bin/env ts-node
 
-import { parseArguments } from "./lib/argument-parser";
-import { TypeExtractor } from "./lib/type-extractor";
-import { TypeCompatibilityChecker } from "./lib/type-checker";
+import { parseArguments } from "../lib/argument-parser";
+import { TypeExtractor } from "../lib/_legacy/type-extractor";
+import { TypeCompatibilityChecker } from "../lib/type-checker";
 import * as path from "path";
 
 async function main() {
   try {
     // Parse command line arguments
     const args = parseArguments();
-    
+
     // Get the output directory
     const outputDir = path.dirname(args.outputFile);
     // Create type extractor instance
