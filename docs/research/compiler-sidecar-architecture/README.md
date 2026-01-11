@@ -66,9 +66,10 @@ CLI Start ───────────────────────�
 1. **No position lookup** - Just need symbol name and import source
 2. **Compiler-accurate** - TypeScript itself resolves all dependencies
 3. **Implicit type inference** - Extract types even without annotations (major!)
-4. **Parallel startup** - No added CI latency (sidecar init overlaps with SWC/LLM)
-5. **Framework agnostic** - Works with Express, Fastify, Koa, Hono, tRPC, etc.
-6. **Flattened output** - Single .d.ts file with everything bundled
+4. **Scope-based search** - Searches entire function body, not fixed line windows
+5. **Parallel startup** - No added CI latency (sidecar init overlaps with SWC/LLM)
+6. **Framework agnostic** - Works with Express, Fastify, Koa, Hono, tRPC, etc.
+7. **Flattened output** - Single .d.ts file with everything bundled
 
 ## Quick Start
 
@@ -151,8 +152,14 @@ A: TypeScript project initialization is expensive (~500ms). A warm sidecar amort
 **Q: What about implicit types—how does that work?**  
 A: The TypeScript compiler infers types even when developers don't write annotations. For `res.json(users)`, TypeScript knows `users` is `User[]`. The sidecar asks TypeScript "what's the type at this location?" and gets back the inferred type.
 
+**Q: How does scope-based search work?**  
+A: Instead of searching ±15 lines from the target, the sidecar finds the *containing function* and searches its *entire body* for response statements. This handles large handlers with 50+ lines of middleware, validation, and logging before the actual `res.json()` call.
+
 **Q: How is this framework-agnostic?**  
 A: Instead of hardcoding "Express uses res.json()", we look for common patterns: `.json()` method calls, `ctx.body` assignments, `return` statements, etc. The sidecar doesn't know or care if it's Express, Fastify, Koa, or Hono.
+
+**Q: Why does the virtual entry need to be a physical file?**  
+A: `dts-bundle-generator` requires a physical file path to resolve relative imports. An in-memory file has no "parent directory", so `./types/user` would fail to resolve. We write `.carrick_virtual_entry.ts` to the repo root (deleted immediately after bundling).
 
 **Q: What about dts-bundle-generator alternatives?**  
 A: We could use ts-morph's emit, but dts-bundle-generator handles more edge cases (external types, circular deps). We can swap implementations inside the sidecar without changing the Rust interface.
@@ -161,4 +168,4 @@ A: We could use ts-morph's emit, but dts-bundle-generator handles more edge case
 A: No! The sidecar spawns immediately and initializes in parallel with SWC scanning and LLM analysis. By the time we need types, the sidecar is already ready. Total time = MAX(sidecar_init, swc+llm), not the SUM.
 
 **Q: Will this break CI?**  
-A: CI needs Node.js 18+ and npm. The sidecar is built as part of `cargo build` (or separate npm script).
+A: CI needs Node.js 18+ and npm. The sidecar is built as part of `cargo build` (or separate npm script). Add `.carrick_*` to `.gitignore` to prevent temp file commits.

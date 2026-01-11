@@ -215,9 +215,12 @@ interface SidecarRequest {
 
 interface SymbolRequest {
   symbol_name: string;      // e.g., "User", "Order[]", "Response<User>"
-  source_file: string;      // e.g., "./types/user.ts"
+  source_file: string;      // e.g., "./types/user.ts" (relative to repo root)
   alias?: string;           // Optional alias for the output
 }
+
+// NOTE: source_file paths are relative to repo_root. The sidecar resolves them
+// correctly because the virtual entry file is written to the repo root directory.
 
 // NEW: Request to infer types at specific code locations
 interface InferRequest {
@@ -275,10 +278,13 @@ interface InferredType {
 import { Project, SourceFile, Node, Type } from 'ts-morph';
 import { generateDtsBundle } from 'dts-bundle-generator';
 import * as readline from 'readline';
+import * as fs from 'fs';
+import * as path from 'path';
 import { z } from 'zod';
 import { RequestSchema, type SidecarRequest, type SidecarResponse, type InferRequest, type InferredType } from './types';
 
 let project: Project | null = null;
+let repoRoot: string | null = null;  // Store repo root for physical file placement
 let initStartTime: number = 0;
 let initEndTime: number = 0;
 
@@ -302,6 +308,9 @@ async function handleMessage(request: SidecarRequest): Promise<SidecarResponse> 
 function initProject(request: SidecarRequest): SidecarResponse {
   initStartTime = Date.now();
   try {
+    // Store repo root for later use (physical file placement)
+    repoRoot = request.repo_root || process.cwd();
+    
     project = new Project({
       tsConfigFilePath: request.tsconfig_path,
       skipAddingFilesFromTsConfig: false,
@@ -452,28 +461,37 @@ function inferResponseBody(sf: SourceFile, line: number, alias?: string): Inferr
 // ... similar implementations for inferExpression, inferCallResult, inferVariable ...
 
 async function bundleTypes(request: SidecarRequest): Promise<SidecarResponse> {
-  if (!project) {
+  if (!project || !repoRoot) {
     return { request_id: request.request_id, status: 'error', error: 'Project not initialized' };
   }
 
   // Generate virtual entrypoint content
   const entryContent = generateVirtualEntry(request.symbols || []);
   
-  // Create temporary file in project
-  const virtualEntry = project.createSourceFile('__virtual_entry__.ts', entryContent, {
-    overwrite: true
-  });
-
+  // IMPORTANT: Write virtual entry to a PHYSICAL FILE in the repo root
+  // This is required because dts-bundle-generator needs a real file path
+  // to resolve relative imports correctly (e.g., './types/user' must resolve
+  // relative to the repo root, not some temp directory)
+  const virtualEntryPath = path.join(repoRoot, '.carrick_virtual_entry.ts');
+  
   try {
+    // Write the virtual entry file to disk
+    fs.writeFileSync(virtualEntryPath, entryContent, 'utf-8');
+    
+    // Also add to ts-morph project so it's aware of the file
+    const virtualEntry = project.addSourceFileAtPath(virtualEntryPath);
+
     // Use dts-bundle-generator for flattening
+    // The physical file ensures relative imports resolve correctly
     const dtsContent = generateDtsBundle([{
-      filePath: virtualEntry.getFilePath(),
+      filePath: virtualEntryPath,
     }], {
       preferredConfigPath: project.getCompilerOptions().configFilePath as string,
     })[0];
 
-    // Clean up virtual file
+    // Clean up: remove from project and delete physical file
     project.removeSourceFile(virtualEntry);
+    fs.unlinkSync(virtualEntryPath);
 
     return {
       request_id: request.request_id,
@@ -482,7 +500,8 @@ async function bundleTypes(request: SidecarRequest): Promise<SidecarResponse> {
       symbols_resolved: (request.symbols || []).map(s => s.symbol_name),
     };
   } catch (e) {
-    project.removeSourceFile(virtualEntry);
+    // Clean up on error
+    try { fs.unlinkSync(virtualEntryPath); } catch {}
     return { request_id: request.request_id, status: 'error', error: String(e) };
   }
 }
@@ -1064,9 +1083,48 @@ The sidecar uses multiple inference strategies that work regardless of framework
 | Strategy | What It Does | Works With |
 |----------|--------------|------------|
 | `function_return` | Get return type of handler function | All frameworks |
-| `response_body` | Find `.json()`, `.send()` calls and get argument type | Express, Fastify, Koa, etc. |
+| `response_body` | Find `.json()`, `.send()` calls within function scope | Express, Fastify, Koa, etc. |
 | `call_result` | Get return type of a call expression | fetch, axios, custom clients |
 | `variable` | Get type of variable declaration | All |
+
+### Critical Design Decision: Scope-Based Search (Not Line Windows)
+
+**Problem:** Large controllers often have middleware, logging, validation, and error handling before the `res.json()` call. A fixed line window (e.g., ±15 lines) would miss response statements in longer handlers.
+
+**Solution:** The sidecar finds the **function body** associated with the line number Gemini provided and scans the **entire scope** of that function for terminal statements (`return`, `res.json()`, `res.send()`, etc.), regardless of line count.
+
+```typescript
+// Example: Handler with 50+ lines of setup before response
+app.get('/orders/:id', async (req, res) => {
+  // Line 10: Gemini reports this line as the endpoint
+  const { id } = req.params;
+  
+  // Lines 11-30: Validation, auth checks, logging...
+  const user = await validateAuth(req);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+  
+  const canAccess = await checkPermissions(user, id);
+  if (!canAccess) return res.status(403).json({ error: 'Forbidden' });
+  
+  logger.info('Fetching order', { userId: user.id, orderId: id });
+  
+  // Lines 31-50: Database queries, transformations...
+  const order = await prisma.order.findUnique({ where: { id } });
+  if (!order) return res.status(404).json({ error: 'Not found' });
+  
+  const enrichedOrder = await enrichWithCustomerData(order);
+  
+  // Line 55: The actual response - sidecar MUST find this!
+  res.json(enrichedOrder);  // TypeScript knows: EnrichedOrder
+});
+```
+
+The sidecar algorithm:
+1. Find the function/arrow function containing the target line
+2. Get the function's full body (start to end)
+3. Find ALL terminal statements within that scope
+4. Infer types from each terminal statement
+5. Return union type if multiple response types exist
 
 ### Implementation Details
 
@@ -1079,54 +1137,138 @@ export class TypeInferrer {
   /**
    * Framework-agnostic response body inference
    * 
+   * IMPORTANT: Uses SCOPE-BASED search, not line windows!
+   * Finds the containing function and searches its ENTIRE body.
+   * 
    * Looks for common response patterns:
    * - res.json(data)
    * - res.send(data)
    * - ctx.body = data
    * - return data (for Hono, tRPC, etc.)
    */
-  inferResponseBody(sourceFile: SourceFile, nearLine: number): InferredType | null {
-    // Strategy 1: Find res.json() or res.send() calls
-    const jsonSendCalls = this.findMethodCalls(sourceFile, ['json', 'send'], nearLine);
-    if (jsonSendCalls.length > 0) {
-      const arg = jsonSendCalls[0].getArguments()[0];
-      if (arg) {
-        return {
-          alias: `ResponseBody_L${nearLine}`,
-          type_string: arg.getType().getText(),
-          is_explicit: false,
-          source_location: `${sourceFile.getFilePath()}:${jsonSendCalls[0].getStartLineNumber()}`,
-        };
+  inferResponseBody(sourceFile: SourceFile, targetLine: number): InferredType | null {
+    // Step 1: Find the function containing this line (SCOPE-BASED, not line window)
+    const containingFunction = this.findContainingFunction(sourceFile, targetLine);
+    if (!containingFunction) {
+      // Fallback: search nearby if no function found
+      return this.inferResponseBodyFallback(sourceFile, targetLine);
+    }
+
+    // Step 2: Search the ENTIRE function body for terminal statements
+    const responseTypes: Array<{ type: Type; location: number }> = [];
+
+    // Strategy 1: Find all res.json() / res.send() calls in function scope
+    const jsonSendCalls = this.findMethodCallsInScope(containingFunction, ['json', 'send']);
+    for (const call of jsonSendCalls) {
+      const args = call.getArguments();
+      if (args.length > 0) {
+        responseTypes.push({
+          type: args[0].getType(),
+          location: call.getStartLineNumber(),
+        });
       }
     }
 
-    // Strategy 2: Find ctx.body assignment (Koa style)
-    const bodyAssignments = this.findPropertyAssignments(sourceFile, 'body', nearLine);
-    if (bodyAssignments.length > 0) {
-      const value = bodyAssignments[0].getRight();
-      return {
-        alias: `ResponseBody_L${nearLine}`,
-        type_string: value.getType().getText(),
-        is_explicit: false,
-        source_location: `${sourceFile.getFilePath()}:${bodyAssignments[0].getStartLineNumber()}`,
-      };
+    // Strategy 2: Find ctx.body assignments in function scope (Koa style)
+    const bodyAssignments = this.findPropertyAssignmentsInScope(containingFunction, 'body');
+    for (const assignment of bodyAssignments) {
+      responseTypes.push({
+        type: assignment.getRight().getType(),
+        location: assignment.getStartLineNumber(),
+      });
     }
 
-    // Strategy 3: Find return statements in handler (Hono, tRPC, plain functions)
-    const handler = this.findHandlerNearLine(sourceFile, nearLine);
-    if (handler) {
-      const returnType = this.getHandlerReturnType(handler);
-      if (returnType) {
-        return {
-          alias: `ResponseBody_L${nearLine}`,
-          type_string: returnType,
-          is_explicit: false,
-          source_location: `${sourceFile.getFilePath()}:${handler.getStartLineNumber()}`,
-        };
+    // Strategy 3: Find return statements in function scope (Hono, tRPC, plain functions)
+    const returnStatements = this.findReturnStatementsInScope(containingFunction);
+    for (const ret of returnStatements) {
+      const expr = ret.getExpression();
+      if (expr) {
+        responseTypes.push({
+          type: expr.getType(),
+          location: ret.getStartLineNumber(),
+        });
       }
     }
 
-    return null;
+    if (responseTypes.length === 0) return null;
+
+    // Step 3: Build result - union type if multiple responses
+    const uniqueTypes = this.deduplicateTypes(responseTypes.map(r => r.type));
+    const typeString = uniqueTypes.length === 1 
+      ? uniqueTypes[0].getText()
+      : uniqueTypes.map(t => t.getText()).join(' | ');
+
+    return {
+      alias: `ResponseBody_L${targetLine}`,
+      type_string: typeString,
+      is_explicit: false,
+      source_location: `${sourceFile.getFilePath()}:${responseTypes[0].location}`,
+    };
+  }
+
+  /**
+   * Find the function (arrow, declaration, or method) containing the target line
+   */
+  private findContainingFunction(sourceFile: SourceFile, targetLine: number): Node | null {
+    // Find all functions in the file
+    const functions = [
+      ...sourceFile.getDescendantsOfKind(SyntaxKind.FunctionDeclaration),
+      ...sourceFile.getDescendantsOfKind(SyntaxKind.ArrowFunction),
+      ...sourceFile.getDescendantsOfKind(SyntaxKind.MethodDeclaration),
+      ...sourceFile.getDescendantsOfKind(SyntaxKind.FunctionExpression),
+    ];
+
+    // Find the innermost function containing our target line
+    let bestMatch: Node | null = null;
+    let bestSize = Infinity;
+
+    for (const func of functions) {
+      const startLine = func.getStartLineNumber();
+      const endLine = func.getEndLineNumber();
+      
+      if (targetLine >= startLine && targetLine <= endLine) {
+        const size = endLine - startLine;
+        // Prefer the smallest (innermost) function
+        if (size < bestSize) {
+          bestSize = size;
+          bestMatch = func;
+        }
+      }
+    }
+
+    return bestMatch;
+  }
+
+  /**
+   * Find method calls within a function's scope (searches entire function body)
+   */
+  private findMethodCallsInScope(func: Node, methodNames: string[]): CallExpression[] {
+    return func.getDescendantsOfKind(SyntaxKind.CallExpression)
+      .filter(call => {
+        const expr = call.getExpression();
+        if (!Node.isPropertyAccessExpression(expr)) return false;
+        return methodNames.includes(expr.getName());
+      });
+  }
+
+  /**
+   * Find property assignments within a function's scope
+   */
+  private findPropertyAssignmentsInScope(func: Node, propertyName: string): BinaryExpression[] {
+    return func.getDescendantsOfKind(SyntaxKind.BinaryExpression)
+      .filter(expr => {
+        const left = expr.getLeft();
+        if (!Node.isPropertyAccessExpression(left)) return false;
+        return left.getName() === propertyName && 
+               expr.getOperatorToken().getKind() === SyntaxKind.EqualsToken;
+      });
+  }
+
+  /**
+   * Find return statements within a function's scope
+   */
+  private findReturnStatementsInScope(func: Node): ReturnStatement[] {
+    return func.getDescendantsOfKind(SyntaxKind.ReturnStatement);
   }
 
   /**
@@ -1164,21 +1306,14 @@ export class TypeInferrer {
     return typeText;
   }
 
-  private findMethodCalls(
-    sourceFile: SourceFile, 
-    methodNames: string[], 
-    nearLine: number,
-    lineWindow: number = 15
-  ): CallExpression[] {
-    return sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression)
-      .filter(call => {
-        const expr = call.getExpression();
-        if (!Node.isPropertyAccessExpression(expr)) return false;
-        const methodName = expr.getName();
-        const callLine = call.getStartLineNumber();
-        return methodNames.includes(methodName) && 
-               Math.abs(callLine - nearLine) <= lineWindow;
-      });
+  private deduplicateTypes(types: Type[]): Type[] {
+    const seen = new Set<string>();
+    return types.filter(t => {
+      const text = t.getText();
+      if (seen.has(text)) return false;
+      seen.add(text);
+      return true;
+    });
   }
 }
 ```
@@ -1197,11 +1332,34 @@ app.get('/user/:id', async (req, res) => {
   res.json(user);
 });
 
-// Inferred type (union)
+// Inferred type (union) - sidecar finds BOTH responses in function scope
 type GetUserByIdResponse = User | { error: string };
 ```
 
 This is actually **more accurate** than an explicit single type annotation would be!
+
+### Critical: Physical File for Virtual Entry
+
+**Problem:** `dts-bundle-generator` requires a physical file path to resolve relative imports. An in-memory virtual file via ts-morph doesn't have a "real" parent directory, so imports like `./types/user` fail to resolve.
+
+**Solution:** The sidecar writes the virtual entry to a temporary physical file in the **repo root**:
+
+```typescript
+// Virtual entry written to: {repo_root}/.carrick_virtual_entry.ts
+export type { User } from './types/user';      // Resolves correctly!
+export type { Order } from './models/order';   // Resolves correctly!
+```
+
+This ensures relative paths resolve exactly as they do in the source code. The file is deleted immediately after bundling.
+
+```typescript
+// File lifecycle:
+// 1. Write to {repo_root}/.carrick_virtual_entry.ts
+// 2. Run dts-bundle-generator
+// 3. Delete the file (in finally block, even on error)
+```
+
+**Gitignore:** The pattern `.carrick_*` should be added to `.gitignore` to prevent accidental commits.
 
 ### Performance Optimization
 

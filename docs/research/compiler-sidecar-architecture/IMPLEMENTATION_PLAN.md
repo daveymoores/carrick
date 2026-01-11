@@ -105,39 +105,50 @@ This document provides sequential prompts for implementing the Compiler Sidecar 
 
 ---
 
-### Prompt 1.4: Implement Type Bundler
+### Prompt 1.4: Implement Type Bundler (Physical File Strategy)
 
 > In `src/sidecar/src/bundler.ts`, create a `TypeBundler` class that:
 > 
-> 1. Takes a ts-morph `Project` in its constructor
+> 1. Takes a ts-morph `Project` and `repoRoot: string` in its constructor
 > 2. Has a method `bundle(symbols: SymbolRequest[]): BundleResult`
 > 3. Generates a "virtual entrypoint" string with export statements for each symbol
-> 4. Creates a temporary source file in the project
-> 5. Uses `dts-bundle-generator` to bundle the types
-> 6. Cleans up the temporary file
-> 7. Returns the bundled `.d.ts` content or error information
+> 
+> **CRITICAL: Write to a PHYSICAL FILE, not in-memory!**
+> 
+> 4. Write the virtual entry to `{repoRoot}/.carrick_virtual_entry.ts`
+>    - dts-bundle-generator REQUIRES a physical file to resolve relative imports
+>    - Relative paths like `./types/user` must resolve from the repo root
+>    - An in-memory file has no "parent directory" and imports will fail
+> 
+> 5. Add the file to ts-morph project via `project.addSourceFileAtPath()`
+> 6. Use `dts-bundle-generator` to bundle the types
+> 7. Clean up: remove from project AND delete physical file (use try/finally)
+> 8. Returns the bundled `.d.ts` content or error information
 > 
 > Handle edge cases:
 > - Symbol not found in source file
 > - Circular type dependencies
 > - External/node_modules types
+> - **Always clean up the physical file, even on error**
 > 
 > The virtual entrypoint should look like:
 > ```typescript
-> // Generated virtual entrypoint
-> export type { User } from './types/user';
+> // Generated virtual entrypoint - written to {repoRoot}/.carrick_virtual_entry.ts
+> export type { User } from './types/user';        // Resolves correctly!
 > export type { Order as OrderResponse } from './types/order';
 > ```
 
 **Acceptance Criteria:**
 - [ ] Can generate correct virtual entrypoint strings
+- [ ] **PHYSICAL FILE: Writes to `{repoRoot}/.carrick_virtual_entry.ts`**
+- [ ] **RELATIVE IMPORTS: `./types/user` resolves correctly from repo root**
 - [ ] Successfully bundles simple types
 - [ ] Reports errors for missing symbols
-- [ ] Cleans up temporary files on success and failure
+- [ ] **CLEANUP: Deletes physical file on success AND failure (try/finally)**
 
 ---
 
-### Prompt 1.5: Implement Type Inferrer (Framework-Agnostic)
+### Prompt 1.5: Implement Type Inferrer (Scope-Based, Framework-Agnostic)
 
 > In `src/sidecar/src/type-inferrer.ts`, create a `TypeInferrer` class that can extract types even when not explicitly annotated:
 > 
@@ -148,12 +159,23 @@ This document provides sequential prompts for implementing the Compiler Sidecar 
 >    - `inferResponseBody(file, line)` - Find .json()/.send()/ctx.body and get argument type
 >    - `inferCallResult(file, line)` - Get return type of call expression (for fetch/axios)
 >    - `inferVariable(file, line)` - Get type of variable declaration
+> 
+> **CRITICAL: Use SCOPE-BASED search, NOT line windows!**
+> 
 > 4. Each method should:
->    - Search within a ±15 line window of the target
+>    - Find the CONTAINING FUNCTION for the target line (not a ±N line window)
+>    - Search the ENTIRE function body for terminal statements
+>    - This handles large handlers with middleware, validation, logging before response
 >    - Report whether type was explicit or inferred (`is_explicit` field)
 >    - Handle Promise unwrapping (Promise<T> → T)
+>    - Return union type if multiple response types exist (e.g., success vs error)
 > 
-> **Framework-agnostic patterns to detect:**
+> 5. Implement `findContainingFunction(sourceFile, targetLine)`:
+>    - Find all functions (arrow, declaration, method, expression) in file
+>    - Return the innermost function whose range contains the target line
+>    - This ensures we search the right scope even for nested functions
+> 
+> **Framework-agnostic patterns to detect (within function scope):**
 > - `res.json(data)` / `res.send(data)` - Express/Fastify style
 > - `ctx.body = data` - Koa style
 > - `return data` / `return Response.json(data)` - Hono/Web API style
@@ -166,6 +188,8 @@ This document provides sequential prompts for implementing the Compiler Sidecar 
 - [ ] Correctly unwraps Promise<T> to T
 - [ ] Reports is_explicit=false for inferred types
 - [ ] Works with Express, Fastify, Koa, Hono patterns (framework-agnostic)
+- [ ] **SCOPE-BASED: Works for handlers with 50+ lines of setup before response**
+- [ ] **UNION TYPES: Returns `User | { error: string }` for handlers with multiple responses**
 
 ---
 
@@ -605,3 +629,6 @@ If the sidecar approach encounters unforeseen issues:
 6. **Framework Agnostic**: Never hardcode Express/Fastify/etc patterns - use generic method detection
 7. **Implicit Types**: This is a major differentiator - extract types even when developers don't annotate
 8. **CI First**: Design for headless execution, deterministic output, fast failure
+9. **Scope-Based Search**: NEVER use fixed line windows (±15) - always find containing function and search entire body
+10. **Physical Virtual Entry**: Write `.carrick_virtual_entry.ts` to repo root - dts-bundle-generator needs real file for relative imports
+11. **Gitignore**: Add `.carrick_*` pattern to `.gitignore` to prevent accidental commits of temp files
