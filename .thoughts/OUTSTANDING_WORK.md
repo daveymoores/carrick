@@ -1,10 +1,11 @@
 # Outstanding work
 
-This is the single “what’s left to do” document for Carrick.
+This is the single "what's left to do" document for Carrick.
 
 For deeper analysis and rationale, see:
 - `research/next-steps/rest-only-mvp-heuristics.md`
 - `research/next-steps/cross-repo-type-checking.md`
+- `docs/research/compiler-sidecar-architecture/` - **NEW**: Proposed solution for type extraction
 
 ---
 
@@ -38,11 +39,30 @@ Work:
 
 Goal: type checking should not depend on alias naming conventions or a single wrapper type.
 
+**Status:** New architecture proposed - see `docs/research/compiler-sidecar-architecture/`
+
+The current position-based type extraction approach (SWC + ts_check TypeExtractor) has proven unreliable:
+- LLM provides line numbers, but type annotations span multiple lines
+- SWC visitor pattern for finding positions is complex and error-prone
+- Alias naming conventions drive type matching via brittle regex parsing
+
+**Proposed Solution: Compiler Sidecar Architecture**
+
+Replace with a warm-standby Node.js process using ts-morph + dts-bundle-generator:
+1. LLM extracts `primary_type_symbol` (e.g., "User") and `type_import_source` (e.g., "./types/user")
+2. Rust constructs "virtual entrypoint" and sends to sidecar
+3. Sidecar uses TypeScript compiler to bundle all type dependencies
+4. Flat `.d.ts` file returned, uploaded to S3
+
 Work:
-- Manifest-driven endpoint identity (pair producers/consumers using a stable endpoint key from Rust, not derived from alias strings).
-- Configurable wrapper/envelope unwrapping (remove the hard-coded `Response<T>` assumption).
-- Support inferred/implicit types by emitting inferred aliases when explicit annotations are missing.
-- Expand the contract to check request + response types per endpoint (then iterate to params/query/status variants).
+- [ ] Build Node.js sidecar (`src/sidecar/`) with ts-morph + dts-bundle-generator
+- [ ] Create Rust `TypeSidecar` struct to manage the process
+- [ ] Update LLM schema to extract `primary_type_symbol` and `type_import_source`
+- [ ] Integrate sidecar into FileOrchestrator
+- [ ] Manifest-driven endpoint identity (pair producers/consumers using endpoint key, not alias strings)
+- [ ] Configurable wrapper/envelope unwrapping (remove hard-coded `Response<T>` assumption)
+- [ ] Support inferred/implicit types by emitting inferred aliases when explicit annotations are missing
+- [ ] Expand the contract to check request + response types per endpoint
 
 ### 3) Test and fixture hardening
 

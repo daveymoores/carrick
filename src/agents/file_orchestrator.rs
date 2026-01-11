@@ -337,6 +337,9 @@ impl FileOrchestrator {
     /// This function uses SWC to find the actual type annotation positions based
     /// on the line numbers, ensuring accurate type extraction downstream.
     fn enrich_type_positions(file_path: &str, content: &str, result: &mut FileAnalysisResult) {
+        let mut enriched_count = 0;
+        let mut not_found_count = 0;
+
         // Enrich endpoint type positions
         for endpoint in &mut result.endpoints {
             // Only enrich if we have a type string but position might be wrong
@@ -353,6 +356,16 @@ impl FileOrchestrator {
                     if !pos_info.type_string.is_empty() {
                         endpoint.response_type_string = Some(pos_info.type_string);
                     }
+                    enriched_count += 1;
+                } else {
+                    // Debug: Log when we can't find a type position
+                    // This helps diagnose cases where the LLM provides a type string
+                    // but there's no actual type annotation in the source code
+                    eprintln!(
+                        "[DEBUG enrich_type_positions] Endpoint type NOT FOUND: file={}, line={}, hint='{}', method={}, path={}",
+                        file_path, endpoint.line_number, type_hint, endpoint.method, endpoint.path
+                    );
+                    not_found_count += 1;
                 }
             }
         }
@@ -371,8 +384,24 @@ impl FileOrchestrator {
                     if !pos_info.type_string.is_empty() {
                         data_call.response_type_string = Some(pos_info.type_string);
                     }
+                    enriched_count += 1;
+                } else {
+                    // Debug: Log when we can't find a type position for data calls
+                    eprintln!(
+                        "[DEBUG enrich_type_positions] DataCall type NOT FOUND: file={}, line={}, hint='{}', target={}",
+                        file_path, data_call.line_number, type_hint, data_call.target
+                    );
+                    not_found_count += 1;
                 }
             }
+        }
+
+        // Summary logging
+        if enriched_count > 0 || not_found_count > 0 {
+            eprintln!(
+                "[DEBUG enrich_type_positions] Summary for {}: enriched={}, not_found={}",
+                file_path, enriched_count, not_found_count
+            );
         }
     }
 

@@ -51,12 +51,17 @@ export class TypeCompatibilityChecker {
       return { endpoint, type: "producer" };
     }
 
-    // Handle consumer pattern
-    const consumerMatch = typeName.match(/(.+)Consumer(Call\d+)$/);
+    // Handle consumer pattern - accept both "Consumer" and "ConsumerCallN" formats
+    // The file-centric flow uses "Consumer" without CallN, while the old flow used "ConsumerCallN"
+    const consumerMatch = typeName.match(/(.+)Consumer(Call\d+)?$/);
     if (consumerMatch) {
-      const [, baseType, callId] = consumerMatch;
+      const [, baseType, callId = "Call0"] = consumerMatch; // Default to "Call0" if no CallN suffix
       // For EnvVar types, extract the actual endpoint part after the env var
+      // Pattern 1 (old): "GetEnvVarCommentServiceUrlApiCommentsResponse"
+      // Pattern 2 (new file-centric): "GetByOrderServiceUrlOrdersResponse"
       let endpointBase = baseType;
+
+      // Check for old EnvVar pattern
       if (baseType.startsWith("GetEnvVar") && baseType.includes("Url")) {
         // Extract everything after the last "Url" - this is the actual endpoint
         const urlIndex = baseType.lastIndexOf("Url");
@@ -64,6 +69,18 @@ export class TypeCompatibilityChecker {
           endpointBase = "Get" + baseType.slice(urlIndex + 3);
         }
       }
+      // Check for new By{EnvVar}Url pattern from file-centric flow
+      // Pattern: "GetByOrderServiceUrlOrders" -> extract "Orders" after "Url"
+      else if (this.hasEnvVarUrlPatternInBase(baseType)) {
+        const urlIndex = baseType.lastIndexOf("Url");
+        if (urlIndex !== -1) {
+          // Extract the method prefix (Get, Post, etc.)
+          const methodMatch = baseType.match(/^(Get|Post|Put|Delete|Patch|Head|Options)/);
+          const method = methodMatch ? methodMatch[1] : "Get";
+          endpointBase = method + baseType.slice(urlIndex + 3);
+        }
+      }
+
       const endpoint = this.convertToEndpoint(endpointBase);
       return { endpoint, type: "consumer", callId };
     }
@@ -263,8 +280,11 @@ const tempVar: ${nodeText} = null as any;`,
     }
 
     // Handle env var patterns more flexibly
-    if (withoutSuffix.includes("EnvVar")) {
+    // Pattern 1: "GetEnvVarCommentServiceUrlApiComments" (old format)
+    // Pattern 2: "GetByOrderServiceUrlOrders" (new file-centric format with By{EnvVar}Url{Path})
+    if (withoutSuffix.includes("EnvVar") || this.hasEnvVarUrlPattern(withoutSuffix)) {
       // For "GetEnvVarCommentServiceUrlApiComments", we want "ApiComments"
+      // For "GetByOrderServiceUrlOrders", we want "Orders"
       const urlIndex = withoutSuffix.lastIndexOf("Url");
 
       if (urlIndex !== -1) {
@@ -272,7 +292,13 @@ const tempVar: ${nodeText} = null as any;`,
 
         const path = this.camelCaseToPath(pathPart);
 
-        const result = `GET ${path}`;
+        // Extract the HTTP method from the beginning
+        const methodMatch = withoutSuffix.match(
+          /^(Get|Post|Put|Delete|Patch|Head|Options)/,
+        );
+        const method = methodMatch ? methodMatch[1].toUpperCase() : "GET";
+
+        const result = `${method} ${path}`;
 
         return result;
       }
@@ -293,6 +319,28 @@ const tempVar: ${nodeText} = null as any;`,
     const result = `${method} ${path}`;
 
     return result;
+  }
+
+  /**
+   * Check if a type name has the By{EnvVar}Url{Path} pattern from file-centric flow
+   * Examples: "GetByOrderServiceUrlOrders", "PostByApiUrlUsers"
+   */
+  private hasEnvVarUrlPattern(typeName: string): boolean {
+    // Look for pattern: Method + By + SomethingUrl + Path
+    // The "By" followed by something ending in "Url" indicates an env var pattern
+    const pattern = /^(Get|Post|Put|Delete|Patch|Head|Options)By[A-Z][a-zA-Z]*Url[A-Z]/;
+    return pattern.test(typeName);
+  }
+
+  /**
+   * Check if a base type (without Consumer/Producer suffix) has the By{EnvVar}Url pattern
+   * This is used in parseTypeName to detect env var patterns in consumer types
+   * Examples: "GetByOrderServiceUrlOrdersResponse" -> true
+   */
+  private hasEnvVarUrlPatternInBase(baseType: string): boolean {
+    // Look for pattern: Method + By + SomethingUrl (where Url is followed by more path)
+    const pattern = /^(Get|Post|Put|Delete|Patch|Head|Options)By[A-Z][a-zA-Z]*Url[A-Z]/;
+    return pattern.test(baseType);
   }
 
   /**

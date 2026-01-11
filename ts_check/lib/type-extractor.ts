@@ -37,28 +37,46 @@ export class TypeExtractor {
       const sourceFile = this.projectManager.getSourceFile(filePath);
       if (!sourceFile) {
         console.error(`Input file '${filePath}' could not be found or loaded.`);
+        // Still add composite alias if we have the type string directly
+        if (compositeTypeString && alias) {
+          this.declarationCollector.addCompositeAlias({
+            aliasName: alias,
+            typeString: compositeTypeString,
+          });
+          console.log(
+            `Queued composite alias (no source file): export type ${alias} = ${compositeTypeString};`,
+          );
+        }
         continue;
       }
 
-      const typeRefNode = findTypeReferenceAtPosition(
-        sourceFile,
-        startPosition,
-      );
-
-      if (!typeRefNode) {
-        console.error(
-          `Type not found in '${sourceFile.getFilePath()}' at position ${startPosition}`,
+      // Only attempt position-based extraction if we have a valid startPosition
+      if (startPosition !== undefined && startPosition !== null) {
+        const typeRefNode = findTypeReferenceAtPosition(
+          sourceFile,
+          startPosition,
         );
-        continue;
+
+        if (typeRefNode) {
+          console.log(
+            `Found type reference at ${startPosition} in ${filePath}: ${typeRefNode.getText()}`,
+          );
+
+          // Process the type reference to collect its declaration and dependencies
+          this.declarationCollector.processTypeReference(typeRefNode);
+        } else {
+          console.warn(
+            `Type not found in '${sourceFile.getFilePath()}' at position ${startPosition}`,
+          );
+        }
+      } else {
+        console.log(
+          `No startPosition for ${alias} in ${filePath}, using compositeTypeString directly`,
+        );
       }
 
-      console.log(
-        `Found type reference at ${startPosition} in ${filePath}: ${typeRefNode.getText()}`,
-      );
-
-      // Process the type reference
-      this.declarationCollector.processTypeReference(typeRefNode);
-
+      // Always add composite alias if we have the type string
+      // This ensures type aliases are generated even when position-based extraction fails
       if (compositeTypeString && alias) {
         this.declarationCollector.addCompositeAlias({
           aliasName: alias,

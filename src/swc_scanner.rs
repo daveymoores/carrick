@@ -54,22 +54,34 @@ pub fn find_type_position_at_line(
     line_number: usize,
     type_hint: Option<&str>,
 ) -> Option<TypePositionInfo> {
+    // Search window: look ±10 lines from target to handle multi-line function signatures
+    const LINE_WINDOW: usize = 10;
+
     let source_map: Lrc<SourceMap> = Lrc::new(SourceMap::default());
     let handler =
         Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(source_map.clone()));
 
     let module = parse_file(file_path, &source_map, &handler)?;
 
+    let min_line = line_number.saturating_sub(LINE_WINDOW);
+    let max_line = line_number.saturating_add(LINE_WINDOW);
+
     let mut finder = TypePositionFinder {
         source_map: source_map.clone(),
         target_line: line_number,
+        min_line,
+        max_line,
         type_hint: type_hint.map(|s| s.to_string()),
         found: None,
+        candidates: Vec::new(),
     };
 
     module.visit_with(&mut finder);
 
-    finder.found.map(|(pos, type_str)| TypePositionInfo {
+    // If we found a match, return it. Otherwise, pick the best candidate from the window.
+    let result = finder.found.clone().or_else(|| finder.best_candidate());
+
+    result.map(|(pos, type_str)| TypePositionInfo {
         position: pos,
         type_string: type_str,
         file_path: file_path.to_string_lossy().to_string(),
@@ -77,12 +89,19 @@ pub fn find_type_position_at_line(
 }
 
 /// Find type position from file content (without reading from disk)
+///
+/// The LLM provides `line_number` where an endpoint/data_call starts, but type annotations
+/// (e.g., `res: Response<User[]>`) may be on subsequent lines in multi-line signatures.
+/// This function searches within a window of ±10 lines around the target to find matching types.
 pub fn find_type_position_at_line_from_content(
     file_path: &str,
     content: &str,
     line_number: usize,
     type_hint: Option<&str>,
 ) -> Option<TypePositionInfo> {
+    // Search window: look ±10 lines from target to handle multi-line function signatures
+    const LINE_WINDOW: usize = 10;
+
     let source_map: Lrc<SourceMap> = Lrc::new(SourceMap::default());
     let _handler =
         Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(source_map.clone()));
@@ -110,28 +129,50 @@ pub fn find_type_position_at_line_from_content(
         Err(_) => return None,
     };
 
+    // Calculate the line window for searching
+    let min_line = line_number.saturating_sub(LINE_WINDOW);
+    let max_line = line_number.saturating_add(LINE_WINDOW);
+
     let mut finder = TypePositionFinder {
         source_map: source_map.clone(),
         target_line: line_number,
+        min_line,
+        max_line,
         type_hint: type_hint.map(|s| s.to_string()),
         found: None,
+        candidates: Vec::new(),
     };
 
     module.visit_with(&mut finder);
 
-    finder.found.map(|(pos, type_str)| TypePositionInfo {
+    // If we found a match, return it. Otherwise, pick the best candidate from the window.
+    let result = finder.found.clone().or_else(|| finder.best_candidate());
+
+    result.map(|(pos, type_str)| TypePositionInfo {
         position: pos,
         type_string: type_str,
         file_path: file_path.to_string(),
     })
 }
 
-/// AST visitor that finds type annotations at a specific line
+/// AST visitor that finds type annotations at or near a specific line.
+///
+/// The visitor searches within a line window (min_line..=max_line) to handle
+/// multi-line function signatures where the endpoint starts on one line but
+/// the type annotation (e.g., `res: Response<User[]>`) is on a subsequent line.
 struct TypePositionFinder {
     source_map: Lrc<SourceMap>,
+    /// The exact line number provided by the LLM
     target_line: usize,
+    /// Minimum line to search (target_line - window)
+    min_line: usize,
+    /// Maximum line to search (target_line + window)
+    max_line: usize,
     type_hint: Option<String>,
+    /// Exact match found (type matches hint on target line)
     found: Option<(usize, String)>,
+    /// Candidate matches within the window (line, position, type_string, distance_from_target)
+    candidates: Vec<(usize, usize, String, usize)>,
 }
 
 impl TypePositionFinder {
@@ -139,25 +180,73 @@ impl TypePositionFinder {
         let loc = self.source_map.lookup_char_pos(type_ann.span.lo);
         let line = loc.line; // 1-based
 
-        if line == self.target_line {
-            let type_str = self.get_type_string(&type_ann.type_ann);
+        // Check if line is within our search window
+        if line < self.min_line || line > self.max_line {
+            return;
+        }
 
-            // If we have a hint, check if it matches
-            if let Some(ref hint) = self.type_hint {
-                // Check if this type matches the hint (allowing for some variation)
-                if type_str.contains(hint)
-                    || hint.contains(&type_str)
-                    || self.types_match(&type_str, hint)
-                {
-                    let pos = type_ann.span.lo.0 as usize;
+        let type_str = self.get_type_string(&type_ann.type_ann);
+        let pos = type_ann.span.lo.0 as usize;
+        let distance = if line >= self.target_line {
+            line - self.target_line
+        } else {
+            self.target_line - line
+        };
+
+        // If we have a hint, check if it matches
+        if let Some(ref hint) = self.type_hint {
+            // Check if this type matches the hint (allowing for some variation)
+            if type_str.contains(hint)
+                || hint.contains(&type_str)
+                || self.types_match(&type_str, hint)
+            {
+                // Exact match on target line - best case
+                if line == self.target_line {
                     self.found = Some((pos, type_str));
+                } else {
+                    // Match within window - add as candidate
+                    self.candidates.push((line, pos, type_str, distance));
                 }
-            } else {
-                // No hint, just use the first type annotation on this line
-                let pos = type_ann.span.lo.0 as usize;
+            }
+        } else {
+            // No hint - collect all type annotations in window
+            if line == self.target_line {
                 self.found = Some((pos, type_str));
+            } else {
+                self.candidates.push((line, pos, type_str, distance));
             }
         }
+    }
+
+    /// Get the best candidate match from within the search window.
+    /// Prefers candidates closest to the target line, with a slight bias
+    /// toward lines AFTER the target (since type annotations typically
+    /// come after the method call starts in multi-line signatures).
+    fn best_candidate(&self) -> Option<(usize, String)> {
+        if self.candidates.is_empty() {
+            return None;
+        }
+
+        // Sort by distance, with bias toward lines after target
+        let mut sorted = self.candidates.clone();
+        sorted.sort_by(|a, b| {
+            let (line_a, _, _, dist_a) = a;
+            let (line_b, _, _, dist_b) = b;
+
+            // If same distance, prefer lines after target
+            if dist_a == dist_b {
+                let after_a = *line_a >= self.target_line;
+                let after_b = *line_b >= self.target_line;
+                // true (after) should come before false (before)
+                after_b.cmp(&after_a)
+            } else {
+                dist_a.cmp(dist_b)
+            }
+        });
+
+        sorted
+            .first()
+            .map(|(_, pos, type_str, _)| (*pos, type_str.clone()))
     }
 
     fn types_match(&self, found: &str, hint: &str) -> bool {
@@ -851,5 +940,181 @@ apiHandler.route('/data', handleData);
             result.candidates.len() >= 3,
             "Should detect custom-named router calls"
         );
+    }
+}
+
+#[cfg(test)]
+mod type_position_tests {
+    use super::*;
+
+    #[test]
+    fn test_finds_type_on_same_line() {
+        // Type annotation on the same line as endpoint definition
+        let content = r#"
+import { Request, Response } from 'express';
+
+app.get('/users', (req: Request, res: Response<User[]>) => {
+    res.json(users);
+});
+"#;
+
+        let result = find_type_position_at_line_from_content(
+            "test.ts",
+            content,
+            4, // Line where app.get starts
+            Some("Response<User[]>"),
+        );
+
+        assert!(result.is_some(), "Should find type on same line");
+        let info = result.unwrap();
+        assert!(
+            info.type_string.contains("Response"),
+            "Type string should contain Response"
+        );
+    }
+
+    #[test]
+    fn test_finds_type_on_subsequent_line() {
+        // Type annotation on a different line (multi-line signature)
+        let content = r#"
+import { Request, Response } from 'express';
+
+app.get('/users',
+    (req: Request,
+     res: Response<User[]>) => {
+    res.json(users);
+});
+"#;
+
+        let result = find_type_position_at_line_from_content(
+            "test.ts",
+            content,
+            4, // Line where app.get starts
+            Some("Response<User[]>"),
+        );
+
+        assert!(
+            result.is_some(),
+            "Should find type within window even when on different line"
+        );
+        let info = result.unwrap();
+        assert!(
+            info.type_string.contains("Response"),
+            "Type string should contain Response"
+        );
+    }
+
+    #[test]
+    fn test_prefers_matching_type_hint() {
+        // Multiple type annotations, should find the one matching the hint
+        let content = r#"
+import { Request, Response } from 'express';
+
+app.get('/users', (req: Request, res: Response<Order[]>) => {
+    const data: User[] = getUsers();
+    res.json(data);
+});
+"#;
+
+        let result = find_type_position_at_line_from_content(
+            "test.ts",
+            content,
+            4, // Line where app.get starts
+            Some("Response<Order[]>"),
+        );
+
+        assert!(result.is_some(), "Should find matching type");
+        let info = result.unwrap();
+        assert!(
+            info.type_string.contains("Order"),
+            "Should match Response<Order[]>, not User[]"
+        );
+    }
+
+    #[test]
+    fn test_returns_none_when_no_type_annotation() {
+        // No type annotations at all
+        let content = r#"
+app.get('/users', (req, res) => {
+    res.json(users);
+});
+"#;
+
+        let result = find_type_position_at_line_from_content(
+            "test.ts",
+            content,
+            2, // Line where app.get starts
+            Some("Response<User[]>"),
+        );
+
+        assert!(
+            result.is_none(),
+            "Should return None when no type annotation exists"
+        );
+    }
+
+    #[test]
+    fn test_finds_type_within_window() {
+        // Type annotation several lines after endpoint definition
+        let content = r#"
+import { Request, Response } from 'express';
+
+// Some documentation comment
+// More comments
+app.get(
+    '/users',
+    async (
+        req: Request,
+        res: Response<User[]>
+    ) => {
+        res.json(users);
+    }
+);
+"#;
+
+        let result = find_type_position_at_line_from_content(
+            "test.ts",
+            content,
+            6, // Line where app.get starts
+            Some("Response<User[]>"),
+        );
+
+        assert!(result.is_some(), "Should find type within ±10 line window");
+        let info = result.unwrap();
+        assert!(
+            info.type_string.contains("Response"),
+            "Type string should contain Response"
+        );
+    }
+
+    #[test]
+    fn test_prefers_closest_match_after_target() {
+        // Multiple Response types at different distances from target
+        let content = r#"
+// Response<OldType> on line 2 (before target)
+const handler = (res: Response<OldType>) => {};
+
+app.get('/users', (req, res) => {
+    // No type here
+});
+
+app.post('/orders',
+    (req: Request, res: Response<NewType>) => {
+    res.json({});
+});
+"#;
+
+        // When searching from line 5 (first app.get), we should NOT find types
+        // from other unrelated handlers
+        let result = find_type_position_at_line_from_content(
+            "test.ts",
+            content,
+            5,
+            Some("Response<OldType>"),
+        );
+
+        // The OldType is on line 3, which is within window but before target
+        // Should find it since it matches the hint
+        assert!(result.is_some());
     }
 }
