@@ -2,7 +2,7 @@
  * Tests for TypeCompatibilityChecker
  *
  * Tests cover:
- * - Mode switching between legacy and manifest
+ * - Manifest loading and parsing
  * - Manifest-based type checking
  * - Type resolution from projects
  * - Integration with ManifestMatcher
@@ -14,17 +14,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { Project } from 'ts-morph';
-import {
-  TypeCompatibilityChecker,
-  TypeCheckMode,
-} from './type-checker';
-import {
-  TypeManifest,
-  createManifestEntry,
-} from './manifest-matcher';
+import { TypeCompatibilityChecker } from './type-checker';
+import { TypeManifest, createManifestEntry } from './manifest-matcher';
 
 // ============================================================================
-// Mode Tests
+// TypeCompatibilityChecker Tests
 // ============================================================================
 
 describe('TypeCompatibilityChecker', () => {
@@ -50,22 +44,9 @@ describe('TypeCompatibilityChecker', () => {
     }
   });
 
-  describe('mode handling', () => {
-    it('should default to legacy mode', () => {
-      assert.strictEqual(typeChecker.getMode(), 'legacy');
-    });
-
-    it('should allow setting mode to manifest', () => {
-      typeChecker.setMode('manifest');
-      assert.strictEqual(typeChecker.getMode(), 'manifest');
-    });
-
-    it('should allow switching back to legacy', () => {
-      typeChecker.setMode('manifest');
-      typeChecker.setMode('legacy');
-      assert.strictEqual(typeChecker.getMode(), 'legacy');
-    });
-  });
+  // --------------------------------------------------------------------------
+  // Manifest Loading Tests
+  // --------------------------------------------------------------------------
 
   describe('loadManifest', () => {
     it('should load a valid manifest file', () => {
@@ -73,7 +54,14 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'test-api',
         commit_hash: 'abc123def',
         entries: [
-          createManifestEntry('GET', '/api/users', 'GetUsersResponse', 'producer', 'routes.ts', 10),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'GetUsersResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
         ],
       };
 
@@ -106,7 +94,29 @@ describe('TypeCompatibilityChecker', () => {
     });
   });
 
-  describe('checkCompatibilityWithManifests', () => {
+  describe('createEmptyManifest', () => {
+    it('should create an empty manifest with correct fields', () => {
+      const manifest = typeChecker.createEmptyManifest('my-repo', 'sha256hash');
+
+      assert.strictEqual(manifest.repo_name, 'my-repo');
+      assert.strictEqual(manifest.commit_hash, 'sha256hash');
+      assert.deepStrictEqual(manifest.entries, []);
+    });
+  });
+
+  describe('getMatcher', () => {
+    it('should return the ManifestMatcher instance', () => {
+      const matcher = typeChecker.getMatcher();
+      assert.ok(matcher);
+      assert.strictEqual(typeof matcher.loadManifest, 'function');
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // checkCompatibility Tests
+  // --------------------------------------------------------------------------
+
+  describe('checkCompatibility', () => {
     it('should return empty result for empty manifests', async () => {
       const producers: TypeManifest = {
         repo_name: 'producer-api',
@@ -120,12 +130,8 @@ describe('TypeCompatibilityChecker', () => {
         entries: [],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
-        producers,
-        consumers
-      );
+      const result = await typeChecker.checkCompatibility(producers, consumers);
 
-      assert.strictEqual(result.mode, 'manifest');
       assert.strictEqual(result.totalProducers, 0);
       assert.strictEqual(result.totalConsumers, 0);
       assert.strictEqual(result.compatiblePairs, 0);
@@ -138,7 +144,14 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'producer-api',
         commit_hash: 'abc',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersResponse', 'producer', 'routes.ts', 10),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
         ],
       };
 
@@ -146,17 +159,27 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'consumer-app',
         commit_hash: 'def',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersData', 'consumer', 'api.ts', 5),
-          createManifestEntry('DELETE', '/api/users/:id', 'DeleteResult', 'consumer', 'api.ts', 15),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersData',
+            'consumer',
+            'api.ts',
+            5
+          ),
+          createManifestEntry(
+            'DELETE',
+            '/api/users/:id',
+            'DeleteResult',
+            'consumer',
+            'api.ts',
+            15
+          ),
         ],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
-        producers,
-        consumers
-      );
+      const result = await typeChecker.checkCompatibility(producers, consumers);
 
-      assert.strictEqual(result.mode, 'manifest');
       assert.strictEqual(result.orphanedConsumers.length, 1);
       assert.ok(result.orphanedConsumers[0].includes('DELETE'));
     });
@@ -166,8 +189,22 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'producer-api',
         commit_hash: 'abc',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersResponse', 'producer', 'routes.ts', 10),
-          createManifestEntry('POST', '/api/users', 'CreateResponse', 'producer', 'routes.ts', 20),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
+          createManifestEntry(
+            'POST',
+            '/api/users',
+            'CreateResponse',
+            'producer',
+            'routes.ts',
+            20
+          ),
         ],
       };
 
@@ -175,14 +212,18 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'consumer-app',
         commit_hash: 'def',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersData', 'consumer', 'api.ts', 5),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersData',
+            'consumer',
+            'api.ts',
+            5
+          ),
         ],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
-        producers,
-        consumers
-      );
+      const result = await typeChecker.checkCompatibility(producers, consumers);
 
       assert.strictEqual(result.orphanedProducers.length, 1);
       assert.ok(result.orphanedProducers[0].includes('POST'));
@@ -193,7 +234,14 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'producer-api',
         commit_hash: 'abc',
         entries: [
-          createManifestEntry('GET', '/api/users/:id', 'UserResponse', 'producer', 'routes.ts', 10),
+          createManifestEntry(
+            'GET',
+            '/api/users/:id',
+            'UserResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
         ],
       };
 
@@ -201,14 +249,18 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'consumer-app',
         commit_hash: 'def',
         entries: [
-          createManifestEntry('GET', '/api/users/{userId}', 'UserData', 'consumer', 'api.ts', 5),
+          createManifestEntry(
+            'GET',
+            '/api/users/{userId}',
+            'UserData',
+            'consumer',
+            'api.ts',
+            5
+          ),
         ],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
-        producers,
-        consumers
-      );
+      const result = await typeChecker.checkCompatibility(producers, consumers);
 
       // Should match despite different param formats
       assert.strictEqual(result.orphanedProducers.length, 0);
@@ -222,7 +274,14 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'producer-api',
         commit_hash: 'abc',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersResponse', 'producer', 'routes.ts', 10),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
         ],
       };
 
@@ -230,14 +289,18 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'consumer-app',
         commit_hash: 'def',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersData', 'consumer', 'api.ts', 5),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersData',
+            'consumer',
+            'api.ts',
+            5
+          ),
         ],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
-        producers,
-        consumers
-      );
+      const result = await typeChecker.checkCompatibility(producers, consumers);
 
       // Types not in project, so should report as mismatch with "not found" error
       assert.strictEqual(result.incompatiblePairs, 1);
@@ -272,7 +335,14 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'producer-api',
         commit_hash: 'abc',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersResponse', 'producer', 'routes.ts', 10),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
         ],
       };
 
@@ -280,11 +350,18 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'consumer-app',
         commit_hash: 'def',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersData', 'consumer', 'api.ts', 5),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersData',
+            'consumer',
+            'api.ts',
+            5
+          ),
         ],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
+      const result = await typeChecker.checkCompatibility(
         producers,
         consumers,
         typesProject
@@ -327,7 +404,14 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'producer-api',
         commit_hash: 'abc',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersResponse', 'producer', 'routes.ts', 10),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
         ],
       };
 
@@ -335,11 +419,18 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'consumer-app',
         commit_hash: 'def',
         entries: [
-          createManifestEntry('GET', '/api/users', 'UsersData', 'consumer', 'api.ts', 5),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersData',
+            'consumer',
+            'api.ts',
+            5
+          ),
         ],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
+      const result = await typeChecker.checkCompatibility(
         producers,
         consumers,
         typesProject
@@ -356,8 +447,22 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'api',
         commit_hash: 'abc',
         entries: [
-          createManifestEntry('GET', '/api/users', 'GetUsers', 'producer', 'a.ts', 1),
-          createManifestEntry('POST', '/api/users', 'CreateUser', 'producer', 'a.ts', 10),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'GetUsers',
+            'producer',
+            'a.ts',
+            1
+          ),
+          createManifestEntry(
+            'POST',
+            '/api/users',
+            'CreateUser',
+            'producer',
+            'a.ts',
+            10
+          ),
         ],
       };
 
@@ -365,84 +470,79 @@ describe('TypeCompatibilityChecker', () => {
         repo_name: 'frontend',
         commit_hash: 'def',
         entries: [
-          createManifestEntry('GET', '/api/users', 'FetchUsers', 'consumer', 'b.ts', 1),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'FetchUsers',
+            'consumer',
+            'b.ts',
+            1
+          ),
         ],
       };
 
-      const result = await typeChecker.checkCompatibilityWithManifests(
-        producers,
-        consumers
-      );
+      const result = await typeChecker.checkCompatibility(producers, consumers);
 
       assert.ok(result.matchDetails);
       assert.strictEqual(result.matchDetails.length, 1);
       assert.strictEqual(result.matchDetails[0].method, 'GET');
       assert.strictEqual(result.matchDetails[0].producer.type_alias, 'GetUsers');
-      assert.strictEqual(result.matchDetails[0].consumer.type_alias, 'FetchUsers');
-    });
-  });
-
-  describe('autoCheck', () => {
-    it('should throw error when no options provided', async () => {
-      await assert.rejects(
-        () => typeChecker.autoCheck({}),
-        /Either outputDir or both manifest paths must be provided/
+      assert.strictEqual(
+        result.matchDetails[0].consumer.type_alias,
+        'FetchUsers'
       );
     });
 
-    it('should use manifest mode when manifest paths provided', async () => {
-      const producerManifest: TypeManifest = {
-        repo_name: 'producer',
+    it('should handle multiple consumers for same endpoint', async () => {
+      const producers: TypeManifest = {
+        repo_name: 'api',
         commit_hash: 'abc',
-        entries: [],
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'GetUsersResponse',
+            'producer',
+            'routes.ts',
+            10
+          ),
+        ],
       };
-      const consumerManifest: TypeManifest = {
-        repo_name: 'consumer',
+
+      const consumers: TypeManifest = {
+        repo_name: 'frontend',
         commit_hash: 'def',
-        entries: [],
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersListData',
+            'consumer',
+            'users.ts',
+            5
+          ),
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'AdminUsersData',
+            'consumer',
+            'admin.ts',
+            15
+          ),
+        ],
       };
 
-      const producerPath = path.join(tempDir, 'producer.json');
-      const consumerPath = path.join(tempDir, 'consumer.json');
+      const result = await typeChecker.checkCompatibility(producers, consumers);
 
-      fs.writeFileSync(producerPath, JSON.stringify(producerManifest));
-      fs.writeFileSync(consumerPath, JSON.stringify(consumerManifest));
-
-      const result = await typeChecker.autoCheck({
-        producerManifestPath: producerPath,
-        consumerManifestPath: consumerPath,
-      });
-
-      assert.ok('mode' in result);
-      assert.strictEqual((result as any).mode, 'manifest');
-    });
-  });
-
-  describe('parseTypeName', () => {
-    it('should parse producer type names', () => {
-      const result = typeChecker.parseTypeName('GetApiUsersResponseProducer');
-      assert.ok(result);
-      assert.strictEqual(result.type, 'producer');
-      assert.ok(result.endpoint.includes('GET'));
-    });
-
-    it('should parse consumer type names', () => {
-      const result = typeChecker.parseTypeName('GetApiUsersResponseConsumerCall1');
-      assert.ok(result);
-      assert.strictEqual(result.type, 'consumer');
-      assert.strictEqual(result.callId, 'Call1');
-    });
-
-    it('should parse consumer type names without call number', () => {
-      const result = typeChecker.parseTypeName('GetApiUsersResponseConsumer');
-      assert.ok(result);
-      assert.strictEqual(result.type, 'consumer');
-      assert.strictEqual(result.callId, 'Call0');
-    });
-
-    it('should return null for invalid type names', () => {
-      const result = typeChecker.parseTypeName('SomeRandomType');
-      assert.strictEqual(result, null);
+      // Both consumers should match the same producer
+      assert.strictEqual(result.matchDetails?.length, 2);
+      assert.ok(
+        result.matchDetails?.every(
+          (m) => m.producer.type_alias === 'GetUsersResponse'
+        )
+      );
+      assert.strictEqual(result.orphanedProducers.length, 0);
+      assert.strictEqual(result.orphanedConsumers.length, 0);
     });
   });
 });

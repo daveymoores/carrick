@@ -3,16 +3,13 @@
 /**
  * Type Checking Runner
  *
- * Supports two modes:
- * 1. Legacy mode: Uses generated *_types.ts files and alias-based matching
- * 2. Manifest mode: Uses manifest JSON files for explicit endpoint matching
+ * Runs manifest-based type checking between producer and consumer APIs.
  *
  * Usage:
- *   Legacy mode:  npx ts-node run-type-checking.ts <tsconfig-path> [--legacy]
- *   Manifest mode: npx ts-node run-type-checking.ts <tsconfig-path> --manifest --producer <path> --consumer <path>
+ *   npx ts-node run-type-checking.ts <tsconfig-path> --producer <path> --consumer <path> [options]
  */
 
-import { TypeCompatibilityChecker, TypeCheckMode } from "./lib/type-checker";
+import { TypeCompatibilityChecker } from "./lib/type-checker";
 import { Project } from "ts-morph";
 import * as path from "path";
 import * as fs from "fs";
@@ -26,80 +23,61 @@ function cleanupPaths(text: string): string {
     (match, fullPath, fileName) => {
       const cleanName = fileName.replace("_", "-");
       return `import("${cleanName}")`;
-    },
+    }
   );
 }
 
 interface CliArgs {
   tsconfigPath: string;
-  mode: TypeCheckMode;
   outputDir: string;
-  producerManifest?: string;
-  consumerManifest?: string;
+  producerManifest: string;
+  consumerManifest: string;
   typesDir?: string;
 }
 
 function parseArgs(): CliArgs {
   const args = process.argv.slice(2);
 
-  if (args.length === 0) {
+  if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     printUsage();
-    process.exit(1);
+    process.exit(args.length === 0 ? 1 : 0);
   }
 
-  const result: CliArgs = {
+  const result: Partial<CliArgs> = {
     tsconfigPath: args[0],
-    mode: 'legacy',
-    outputDir: 'ts_check/output',
+    outputDir: "ts_check/output",
   };
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
 
     switch (arg) {
-      case '--legacy':
-        result.mode = 'legacy';
-        break;
-      case '--manifest':
-        result.mode = 'manifest';
-        break;
-      case '--producer':
+      case "--producer":
         result.producerManifest = args[++i];
         break;
-      case '--consumer':
+      case "--consumer":
         result.consumerManifest = args[++i];
         break;
-      case '--output':
-      case '-o':
+      case "--output":
+      case "-o":
         result.outputDir = args[++i];
         break;
-      case '--types-dir':
+      case "--types-dir":
         result.typesDir = args[++i];
         break;
-      case '--help':
-      case '-h':
-        printUsage();
-        process.exit(0);
-      default:
-        if (!arg.startsWith('-')) {
-          // Assume it's the tsconfig path if not already set
-          if (i === 0) {
-            result.tsconfigPath = arg;
-          }
-        }
     }
   }
 
-  // Validate manifest mode arguments
-  if (result.mode === 'manifest') {
-    if (!result.producerManifest || !result.consumerManifest) {
-      console.error('Error: Manifest mode requires both --producer and --consumer paths');
-      printUsage();
-      process.exit(1);
-    }
+  // Validate required arguments
+  if (!result.producerManifest || !result.consumerManifest) {
+    console.error(
+      "Error: Both --producer and --consumer manifest paths are required"
+    );
+    printUsage();
+    process.exit(1);
   }
 
-  return result;
+  return result as CliArgs;
 }
 
 function printUsage(): void {
@@ -107,158 +85,24 @@ function printUsage(): void {
 Type Checking Runner
 
 Usage:
-  Legacy mode (default):
-    npx ts-node run-type-checking.ts <tsconfig-path> [options]
+  npx ts-node run-type-checking.ts <tsconfig-path> --producer <path> --consumer <path> [options]
 
-  Manifest mode:
-    npx ts-node run-type-checking.ts <tsconfig-path> --manifest --producer <path> --consumer <path> [options]
+Required Arguments:
+  <tsconfig-path>       Path to tsconfig.json for the types project
+  --producer <path>     Path to producer manifest JSON
+  --consumer <path>     Path to consumer manifest JSON
 
 Options:
-  --legacy              Use legacy alias-based type matching (default)
-  --manifest            Use manifest-based type matching
-  --producer <path>     Path to producer manifest JSON (required for manifest mode)
-  --consumer <path>     Path to consumer manifest JSON (required for manifest mode)
   --output, -o <dir>    Output directory for results (default: ts_check/output)
-  --types-dir <dir>     Directory containing bundled .d.ts files (manifest mode)
+  --types-dir <dir>     Directory containing bundled .d.ts files
   --help, -h            Show this help message
 
-Examples:
-  # Legacy mode
-  npx ts-node run-type-checking.ts ts_check/output/tsconfig.json
-
-  # Manifest mode
+Example:
   npx ts-node run-type-checking.ts ts_check/output/tsconfig.json \\
-    --manifest \\
     --producer ./producer-manifest.json \\
-    --consumer ./consumer-manifest.json
+    --consumer ./consumer-manifest.json \\
+    --types-dir ./bundled-types
 `);
-}
-
-async function installDependencies(outputDir: string): Promise<void> {
-  console.log("Installing dependencies for type checking...");
-
-  const { execSync } = await import("child_process");
-
-  try {
-    execSync("npm install", {
-      cwd: outputDir,
-      stdio: "inherit",
-      timeout: 60000, // 60 second timeout
-    });
-    console.log("Dependencies installed successfully");
-  } catch (installError) {
-    console.warn(
-      "⚠️  Warning: Failed to install dependencies:",
-      (installError as Error).message,
-    );
-    console.warn("Type checking may not work correctly without dependencies");
-  }
-}
-
-async function runLegacyMode(
-  typeChecker: TypeCompatibilityChecker,
-  outputDir: string
-): Promise<void> {
-  console.log("\n🔍 Starting type compatibility checking (LEGACY MODE)...");
-  console.log(`[mode] Using alias-based type matching from generated files`);
-
-  const typeCheckResult = await typeChecker.checkGeneratedTypes(outputDir);
-
-  // Create a simplified result format for the Rust analyzer
-  const simplifiedResult = {
-    mode: 'legacy',
-    mismatches: typeCheckResult.mismatches.map((mismatch) => ({
-      endpoint: mismatch.endpoint,
-      producerType: cleanupPaths(mismatch.producerType),
-      consumerType: cleanupPaths(mismatch.consumerType),
-      error: cleanupPaths(mismatch.errorDetails),
-      isCompatible: mismatch.isAssignable,
-    })),
-    compatibleCount: typeCheckResult.compatiblePairs,
-    totalChecked:
-      typeCheckResult.compatiblePairs + typeCheckResult.incompatiblePairs,
-  };
-
-  // Write type check results
-  const typeCheckOutputPath = path.join(outputDir, "type-check-results.json");
-  fs.writeFileSync(
-    typeCheckOutputPath,
-    JSON.stringify(simplifiedResult, null, 2),
-  );
-
-  logResults(typeCheckResult);
-}
-
-async function runManifestMode(
-  typeChecker: TypeCompatibilityChecker,
-  args: CliArgs
-): Promise<void> {
-  console.log("\n🔍 Starting type compatibility checking (MANIFEST MODE)...");
-  console.log(`[mode] Using manifest-based type matching`);
-  console.log(`[manifest] Producer: ${args.producerManifest}`);
-  console.log(`[manifest] Consumer: ${args.consumerManifest}`);
-
-  // Load manifests
-  const producerManifest = typeChecker.loadManifest(args.producerManifest!);
-  const consumerManifest = typeChecker.loadManifest(args.consumerManifest!);
-
-  // Create a types project if types directory is specified
-  let typesProject: Project | undefined;
-  if (args.typesDir && fs.existsSync(args.typesDir)) {
-    console.log(`[types] Loading bundled types from: ${args.typesDir}`);
-    typesProject = new Project({
-      compilerOptions: {
-        strict: true,
-        skipLibCheck: true,
-      },
-    });
-
-    // Add all .d.ts files from the types directory
-    const dtsFiles = fs.readdirSync(args.typesDir)
-      .filter(f => f.endsWith('.d.ts'))
-      .map(f => path.join(args.typesDir!, f));
-
-    for (const dtsFile of dtsFiles) {
-      typesProject.addSourceFileAtPath(dtsFile);
-    }
-    console.log(`[types] Loaded ${dtsFiles.length} type definition files`);
-  }
-
-  // Run manifest-based type checking
-  const typeCheckResult = await typeChecker.checkCompatibilityWithManifests(
-    producerManifest,
-    consumerManifest,
-    typesProject
-  );
-
-  // Create a simplified result format
-  const simplifiedResult = {
-    mode: 'manifest',
-    producerRepo: producerManifest.repo_name,
-    consumerRepo: consumerManifest.repo_name,
-    mismatches: typeCheckResult.mismatches.map((mismatch) => ({
-      endpoint: mismatch.endpoint,
-      producerType: cleanupPaths(mismatch.producerType),
-      consumerType: cleanupPaths(mismatch.consumerType),
-      error: cleanupPaths(mismatch.errorDetails),
-      isCompatible: mismatch.isAssignable,
-      producerLocation: mismatch.producerLocation,
-      consumerLocation: mismatch.consumerLocation,
-    })),
-    compatibleCount: typeCheckResult.compatiblePairs,
-    totalChecked:
-      typeCheckResult.compatiblePairs + typeCheckResult.incompatiblePairs,
-    matchDetails: typeCheckResult.matchDetails?.length || 0,
-  };
-
-  // Write type check results
-  const typeCheckOutputPath = path.join(args.outputDir, "type-check-results.json");
-  fs.writeFileSync(
-    typeCheckOutputPath,
-    JSON.stringify(simplifiedResult, null, 2),
-  );
-
-  logResults(typeCheckResult);
 }
 
 function logResults(typeCheckResult: {
@@ -273,11 +117,11 @@ function logResults(typeCheckResult: {
     console.log("\n✅ All types are compatible!");
   } else {
     console.log(
-      `\n❌ Found ${typeCheckResult.mismatches.length} type compatibility issues:`,
+      `\n❌ Found ${typeCheckResult.mismatches.length} type compatibility issues:`
     );
     typeCheckResult.mismatches.forEach((mismatch) => {
       console.log(
-        `  - ${mismatch.endpoint}: ${cleanupPaths(mismatch.errorDetails)}`,
+        `  - ${mismatch.endpoint}: ${cleanupPaths(mismatch.errorDetails)}`
       );
     });
   }
@@ -286,20 +130,20 @@ function logResults(typeCheckResult: {
   console.log(`  Compatible pairs: ${typeCheckResult.compatiblePairs}`);
   console.log(`  Incompatible pairs: ${typeCheckResult.incompatiblePairs}`);
   console.log(
-    `  Orphaned producers: ${typeCheckResult.orphanedProducers.length}`,
+    `  Orphaned producers: ${typeCheckResult.orphanedProducers.length}`
   );
   console.log(
-    `  Orphaned consumers: ${typeCheckResult.orphanedConsumers.length}`,
+    `  Orphaned consumers: ${typeCheckResult.orphanedConsumers.length}`
   );
 
   if (typeCheckResult.orphanedProducers.length > 0) {
     console.log(
-      `  Orphaned producers: ${typeCheckResult.orphanedProducers.join(", ")}`,
+      `  Orphaned producers: ${typeCheckResult.orphanedProducers.join(", ")}`
     );
   }
   if (typeCheckResult.orphanedConsumers.length > 0) {
     console.log(
-      `  Orphaned consumers: ${typeCheckResult.orphanedConsumers.join(", ")}`,
+      `  Orphaned consumers: ${typeCheckResult.orphanedConsumers.join(", ")}`
     );
   }
 }
@@ -310,13 +154,9 @@ async function main() {
 
     console.log(`📋 Type Checking Configuration:`);
     console.log(`   TSConfig: ${args.tsconfigPath}`);
-    console.log(`   Mode: ${args.mode.toUpperCase()}`);
+    console.log(`   Producer manifest: ${args.producerManifest}`);
+    console.log(`   Consumer manifest: ${args.consumerManifest}`);
     console.log(`   Output: ${args.outputDir}`);
-
-    // Install dependencies in legacy mode
-    if (args.mode === 'legacy') {
-      await installDependencies(args.outputDir);
-    }
 
     // Create ts-morph project
     const project = new Project({
@@ -325,14 +165,80 @@ async function main() {
 
     // Create type checker instance
     const typeChecker = new TypeCompatibilityChecker(project);
-    typeChecker.setMode(args.mode);
 
-    // Run appropriate mode
-    if (args.mode === 'manifest') {
-      await runManifestMode(typeChecker, args);
-    } else {
-      await runLegacyMode(typeChecker, args.outputDir);
+    console.log("\n🔍 Starting manifest-based type compatibility checking...");
+    console.log(`[manifest] Producer: ${args.producerManifest}`);
+    console.log(`[manifest] Consumer: ${args.consumerManifest}`);
+
+    // Load manifests
+    const producerManifest = typeChecker.loadManifest(args.producerManifest);
+    const consumerManifest = typeChecker.loadManifest(args.consumerManifest);
+
+    // Create a types project if types directory is specified
+    let typesProject: Project | undefined;
+    if (args.typesDir && fs.existsSync(args.typesDir)) {
+      console.log(`[types] Loading bundled types from: ${args.typesDir}`);
+      typesProject = new Project({
+        compilerOptions: {
+          strict: true,
+          skipLibCheck: true,
+        },
+      });
+
+      // Add all .d.ts files from the types directory
+      const dtsFiles = fs
+        .readdirSync(args.typesDir)
+        .filter((f) => f.endsWith(".d.ts"))
+        .map((f) => path.join(args.typesDir!, f));
+
+      for (const dtsFile of dtsFiles) {
+        typesProject.addSourceFileAtPath(dtsFile);
+      }
+      console.log(`[types] Loaded ${dtsFiles.length} type definition files`);
     }
+
+    // Run manifest-based type checking
+    const typeCheckResult = await typeChecker.checkCompatibility(
+      producerManifest,
+      consumerManifest,
+      typesProject
+    );
+
+    // Create result output
+    const simplifiedResult = {
+      producerRepo: producerManifest.repo_name,
+      consumerRepo: consumerManifest.repo_name,
+      mismatches: typeCheckResult.mismatches.map((mismatch) => ({
+        endpoint: mismatch.endpoint,
+        producerType: cleanupPaths(mismatch.producerType),
+        consumerType: cleanupPaths(mismatch.consumerType),
+        error: cleanupPaths(mismatch.errorDetails),
+        isCompatible: mismatch.isAssignable,
+        producerLocation: mismatch.producerLocation,
+        consumerLocation: mismatch.consumerLocation,
+      })),
+      compatibleCount: typeCheckResult.compatiblePairs,
+      totalChecked:
+        typeCheckResult.compatiblePairs + typeCheckResult.incompatiblePairs,
+      matchDetails: typeCheckResult.matchDetails?.length || 0,
+    };
+
+    // Ensure output directory exists
+    if (!fs.existsSync(args.outputDir)) {
+      fs.mkdirSync(args.outputDir, { recursive: true });
+    }
+
+    // Write type check results
+    const typeCheckOutputPath = path.join(
+      args.outputDir,
+      "type-check-results.json"
+    );
+    fs.writeFileSync(
+      typeCheckOutputPath,
+      JSON.stringify(simplifiedResult, null, 2)
+    );
+
+    logResults(typeCheckResult);
 
     process.exit(0);
   } catch (error) {

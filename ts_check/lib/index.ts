@@ -22,9 +22,6 @@ export {
   TypeCompatibilityChecker,
   TypeCheckResult,
   TypeMismatch,
-  ParsedTypeName,
-  TypeCheckMode,
-  ManifestTypeCheckResult,
 } from "./type-checker";
 export {
   ManifestMatcher,
