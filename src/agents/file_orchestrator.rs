@@ -27,7 +27,7 @@ use crate::{
     services::type_sidecar::{
         InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult, TypeSidecar,
     },
-    swc_scanner::{SwcScanner, find_type_position_at_line_from_content},
+    swc_scanner::SwcScanner,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -160,11 +160,9 @@ impl FileOrchestrator {
                 .analyze_file_with_candidates(&path_str, &content, guidance, &candidate_hints)
                 .await
             {
-                Ok(mut result) => {
-                    // STEP 5: Enrich type positions using SWC AST
-                    // The LLM provides line numbers accurately, but character positions are unreliable.
-                    // Use SWC to find accurate positions based on line numbers.
-                    Self::enrich_type_positions(&path_str, &content, &mut result);
+                Ok(result) => {
+                    // Note: Type positions are now resolved by the TypeSidecar (src/sidecar)
+                    // using the compiler-based approach instead of position-based extraction.
 
                     stats.total_mounts += result.mounts.len();
                     stats.total_endpoints += result.endpoints.len();
@@ -506,81 +504,6 @@ impl FileOrchestrator {
         self.resolve_endpoint_paths(&mut graph);
 
         graph
-    }
-
-    /// Normalize import source paths for matching.
-    /// Enrich type positions in the analysis result using SWC AST.
-    ///
-    /// The LLM provides accurate line numbers but unreliable character positions.
-    /// This function uses SWC to find the actual type annotation positions based
-    /// on the line numbers, ensuring accurate type extraction downstream.
-    fn enrich_type_positions(file_path: &str, content: &str, result: &mut FileAnalysisResult) {
-        let mut enriched_count = 0;
-        let mut not_found_count = 0;
-
-        // Enrich endpoint type positions
-        for endpoint in &mut result.endpoints {
-            // Only enrich if we have a type string but position might be wrong
-            if let Some(ref type_hint) = endpoint.response_type_string {
-                if let Some(pos_info) = find_type_position_at_line_from_content(
-                    file_path,
-                    content,
-                    endpoint.line_number as usize,
-                    Some(type_hint),
-                ) {
-                    endpoint.response_type_position = Some(pos_info.position as i32);
-                    endpoint.response_type_file = Some(pos_info.file_path);
-                    // Update type string if SWC found a more accurate one
-                    if !pos_info.type_string.is_empty() {
-                        endpoint.response_type_string = Some(pos_info.type_string);
-                    }
-                    enriched_count += 1;
-                } else {
-                    // Debug: Log when we can't find a type position
-                    // This helps diagnose cases where the LLM provides a type string
-                    // but there's no actual type annotation in the source code
-                    eprintln!(
-                        "[DEBUG enrich_type_positions] Endpoint type NOT FOUND: file={}, line={}, hint='{}', method={}, path={}",
-                        file_path, endpoint.line_number, type_hint, endpoint.method, endpoint.path
-                    );
-                    not_found_count += 1;
-                }
-            }
-        }
-
-        // Enrich data call type positions
-        for data_call in &mut result.data_calls {
-            if let Some(ref type_hint) = data_call.response_type_string {
-                if let Some(pos_info) = find_type_position_at_line_from_content(
-                    file_path,
-                    content,
-                    data_call.line_number as usize,
-                    Some(type_hint),
-                ) {
-                    data_call.response_type_position = Some(pos_info.position as i32);
-                    data_call.response_type_file = Some(pos_info.file_path);
-                    if !pos_info.type_string.is_empty() {
-                        data_call.response_type_string = Some(pos_info.type_string);
-                    }
-                    enriched_count += 1;
-                } else {
-                    // Debug: Log when we can't find a type position for data calls
-                    eprintln!(
-                        "[DEBUG enrich_type_positions] DataCall type NOT FOUND: file={}, line={}, hint='{}', target={}",
-                        file_path, data_call.line_number, type_hint, data_call.target
-                    );
-                    not_found_count += 1;
-                }
-            }
-        }
-
-        // Summary logging
-        if enriched_count > 0 || not_found_count > 0 {
-            eprintln!(
-                "[DEBUG enrich_type_positions] Summary for {}: enriched={}, not_found={}",
-                file_path, enriched_count, not_found_count
-            );
-        }
     }
 
     fn normalize_import_source(source: &str) -> String {
