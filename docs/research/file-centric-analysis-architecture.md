@@ -279,6 +279,58 @@ It records `import_source: Some("./routes/users")`, which allows the orchestrato
                                  └────────────────┘
 ```
 
+## Type Extraction via Compiler Sidecar
+
+The file-centric analysis integrates with a **Compiler Sidecar** for type extraction. This replaces the legacy position-based type extraction approach.
+
+### How It Works
+
+1. **LLM Extracts Type Symbols**: The FileAnalyzerAgent extracts `primary_type_symbol` and `type_import_source` for each endpoint and data call (e.g., `User`, `./types/user`).
+
+2. **Sidecar Resolves Types**: The TypeSidecar (spawned at CLI startup) uses the TypeScript compiler to:
+   - Resolve symbol names to actual type definitions
+   - Infer types when no explicit annotations exist
+   - Bundle all dependencies into a flat `.d.ts` file
+
+3. **Manifest-Based Matching**: The `manifest-matcher.ts` module pairs producers and consumers by (method, path) tuples instead of alias naming conventions.
+
+### Integration Points
+
+```
+FileOrchestrator
+       │
+       ├──► analyze_files() ──► FileAnalyzerAgent
+       │                              │
+       │                              ▼
+       │                      FileAnalysisResult
+       │                      (includes type symbols)
+       │
+       └──► resolve_types_with_sidecar() ──► TypeSidecar
+                                                   │
+                                                   ▼
+                                           TypeResolutionResult
+                                           (bundled .d.ts + manifest)
+```
+
+### Key Methods
+
+- `FileOrchestrator::resolve_types_with_sidecar()` - Collects type requests and sends to sidecar
+- `FileOrchestrator::collect_type_requests()` - Extracts explicit and implicit type requests
+- `TypeSidecar::resolve_all_types()` - Handles both bundling and inference
+
+### Benefits Over Position-Based Extraction
+
+| Aspect | Position-Based (Legacy) | Symbol-Based (Sidecar) |
+|--------|------------------------|------------------------|
+| Accuracy | UTF-16 offsets easily break | Symbol names are reliable |
+| Implicit Types | Not supported | Full type inference |
+| Dependencies | Manual traversal | Automatic bundling |
+| Framework Support | Framework-specific patterns | Framework-agnostic |
+
+For detailed architecture documentation, see: `docs/research/compiler-sidecar-architecture/ARCHITECTURE.md`
+
+---
+
 ## Configuration
 
 The AST-gated file-centric analysis is now the **default and only** analysis mode. The old batch-based flow has been removed.

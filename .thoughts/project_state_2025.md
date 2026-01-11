@@ -350,83 +350,89 @@ pub struct CloudRepoData {
 
 ---
 
-### 6. Type Checking System (`ts_check/`)
+### 6. Type Checking System
 
 **Purpose**: Validates TypeScript type compatibility between API producers and consumers across repositories.
+
+#### Current Architecture: Compiler Sidecar (2025)
+
+The type extraction system uses a **Compiler Sidecar** architecture that spawns a warm-standby Node.js process with full TypeScript compiler capabilities.
 
 **Architecture**:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                  Rust Analyzer                            │
-│  Extracts TypeScript type references with positions       │
-└───────────────────────┬──────────────────────────────────┘
-                        │
-                        ▼
-                ┌───────────────┐
-                │  TypeInfo[]   │
-                │  (JSON)       │
-                └───────┬───────┘
-                        │
-                        ▼
-┌───────────────────────────────────────────────────────────┐
-│  extract-type-definitions.ts (TypeScript)                 │
-│  - Uses ts-morph to parse TypeScript AST                  │
-│  - Resolves types at specified positions                  │
-│  - Collects transitive dependencies                       │
-│  - Generates standalone type files                        │
-└───────────────────────┬───────────────────────────────────┘
-                        │
-                        ▼
-          ┌─────────────────────────────┐
-          │  {repo}_types.ts files      │
-          │  package.json               │
-          └─────────────┬───────────────┘
-                        │
-                        ▼
-┌───────────────────────────────────────────────────────────┐
-│  run-type-checking.ts (TypeScript)                        │
-│  - Installs npm dependencies                              │
-│  - Loads all type files                                   │
-│  - Matches producers with consumers                       │
-│  - Runs TypeScript compiler checks                        │
-│  - Reports compatibility results                          │
-└───────────────────────┬───────────────────────────────────┘
-                        │
-                        ▼
-          ┌─────────────────────────────┐
-          │  type-check-results.json    │
-          └─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         RUST CLI                                         │
+│                                                                          │
+│  ┌─────────────────┐                         ┌─────────────────────┐    │
+│  │ main.rs         │──spawn immediately────►│ TypeSidecar Client   │    │
+│  │ (CLI entry)     │                         │ (Rust struct)        │    │
+│  └────────┬────────┘                         └──────────┬──────────┘    │
+│           │                                             │                │
+│           ▼                                             │ JSON/stdio     │
+│  ┌─────────────────┐    ┌───────────────────┐          │                │
+│  │ SWC Scanner     │───►│ FileOrchestrator  │◄─────────┘                │
+│  │ (parallel)      │    │                   │                            │
+│  └─────────────────┘    └────────┬──────────┘                            │
+│                                  │                                        │
+│                                  ▼                                        │
+│                         ┌───────────────────┐                            │
+│                         │ Type Resolution   │                            │
+│                         │ (when ready)      │                            │
+│                         └───────────────────┘                            │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ JSON requests/responses
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     NODE.JS SIDECAR (src/sidecar/)                       │
+│                                                                          │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────────┐  │
+│  │ ts-morph        │    │ TypeScript      │    │ dts-bundle-generator│  │
+│  │ Project         │───►│ Type Checker    │───►│                     │  │
+│  │                 │    │ (inference)     │    │                     │  │
+│  └─────────────────┘    └─────────────────┘    └─────────────────────┘  │
+│                                                                          │
+│  Capabilities:                                                           │
+│  - Symbol-based type resolution (not position-based)                     │
+│  - Type inference for implicit types                                     │
+│  - Flat .d.ts bundle generation with all dependencies                    │
+│  - Manifest generation for endpoint matching                             │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Key Features**:
 
-1. **Naming Convention**:
-   - Producers: `{Method}{Endpoint}ResponseProducer`
-   - Consumers: `{Method}{Endpoint}ResponseConsumerCall{N}`
-   - Example: `GetApiUsersResponseProducer` vs `GetApiUsersResponseConsumerCall1`
+1. **Symbol-Based Resolution** (replaces position-based):
+   - LLM extracts `primary_type_symbol` (e.g., "User") and `type_import_source`
+   - Sidecar uses TypeScript compiler to resolve symbols
+   - No more UTF-16 offset calculations
 
-2. **Path Normalization**:
-   - Converts camelCase type names to HTTP endpoints
-   - `GetApiUsersById` → `GET /api/users/:id`
-   - Handles environment variable patterns: `ENV_VAR:API_URL:/users`
+2. **Type Inference**:
+   - Uses TypeScript's inference engine for implicit types
+   - Extracts types even when developers don't annotate
+   - Framework-agnostic (works with Express, Fastify, Hono, etc.)
 
-3. **Type Unwrapping**:
-   - Automatically unwraps `Response<T>` wrappers
-   - Compares inner types for compatibility
+3. **Manifest-Based Matching**:
+   - Endpoints identified by (method, path) tuples
+   - No dependency on alias naming conventions
+   - `ts_check/lib/manifest-matcher.ts` handles matching
 
-4. **TypeScript Diagnostics Integration**:
-   - Creates temporary type assignments
-   - Captures actual TypeScript compiler error messages
-   - Provides detailed incompatibility explanations
+4. **Parallel Startup**:
+   - Sidecar spawns immediately at CLI start
+   - TypeScript compiler initializes while SWC scanning proceeds
+   - No added latency to analysis pipeline
 
-**Files**:
-- `ts_check/extract-type-definitions.ts` - Type extraction entry point
+**Active Files**:
+- `src/sidecar/` - Node.js sidecar implementation
+- `src/services/type_sidecar.rs` - Rust client for sidecar
+- `ts_check/lib/type-checker.ts` - Compatibility validation
+- `ts_check/lib/manifest-matcher.ts` - Manifest-based endpoint matching
 - `ts_check/run-type-checking.ts` - Type validation entry point
-- `ts_check/lib/type-extractor.ts` - Extraction orchestration
-- `ts_check/lib/type-checker.ts` - Compatibility validation (682 lines)
-- `ts_check/lib/argument-parser.ts` - CLI argument parsing
-- `ts_check/lib/types.ts` - Type definitions
+
+**Legacy Files** (archived in `ts_check/lib/_legacy/`):
+- `type-extractor.ts` - Position-based extraction (deprecated)
+- `type-processor.ts`, `declaration-collector.ts` - Legacy support
 
 ---
 
@@ -1099,19 +1105,17 @@ TypeScript type checking only runs when:
 
 ## Current Limitations & Known Issues
 
-### 1. Naming Convention Dependency
+### 1. Naming Convention Dependency (Partially Resolved)
 
-Type checking relies on specific naming patterns:
-- `{Method}{Endpoint}ResponseProducer`
-- `{Method}{Endpoint}ResponseConsumerCall{N}`
+~~Type checking relies on specific naming patterns.~~
 
-**Impact**: Custom naming breaks type matching.
+**Status**: The new manifest-based matching uses (method, path) tuples instead of alias names. However, some legacy code paths still use naming conventions.
 
-### 2. Position-Based Type Extraction
+### 2. Position-Based Type Extraction (Resolved)
 
-TypeScript type extraction requires precise UTF-16 offsets.
+~~TypeScript type extraction requires precise UTF-16 offsets.~~
 
-**Impact**: Position calculation must be exact; off-by-one errors cause failures.
+**Status**: Replaced by the Compiler Sidecar architecture which uses symbol-based resolution. Legacy position-based code archived to `ts_check/lib/_legacy/`.
 
 ### 3. Cold Start Latency
 
