@@ -6,6 +6,19 @@ import {
   Type,
   SyntaxKind,
 } from "ts-morph";
+import {
+  ManifestMatcher,
+  TypeManifest,
+  ManifestEntry,
+  MatchResult,
+  normalizePath,
+  normalizeMethod,
+} from "./manifest-matcher";
+
+/**
+ * Mode for type checking operations
+ */
+export type TypeCheckMode = 'legacy' | 'manifest';
 
 export interface TypeMismatch {
   endpoint: string;
@@ -34,8 +47,39 @@ export interface ParsedTypeName {
   callId?: string;
 }
 
+/**
+ * Result from manifest-based type checking
+ */
+export interface ManifestTypeCheckResult extends TypeCheckResult {
+  /** The mode used for type checking */
+  mode: TypeCheckMode;
+  /** Match details from manifest matching */
+  matchDetails?: MatchResult[];
+}
+
 export class TypeCompatibilityChecker {
-  constructor(private project: Project) { }
+  private manifestMatcher: ManifestMatcher;
+  private mode: TypeCheckMode = 'legacy';
+
+  constructor(private project: Project) {
+    this.manifestMatcher = new ManifestMatcher();
+  }
+
+  /**
+   * Set the type checking mode
+   * @param mode - 'legacy' for alias-based matching, 'manifest' for manifest-based matching
+   */
+  setMode(mode: TypeCheckMode): void {
+    this.mode = mode;
+    console.log(`[type-checker] Mode set to: ${mode}`);
+  }
+
+  /**
+   * Get the current type checking mode
+   */
+  getMode(): TypeCheckMode {
+    return this.mode;
+  }
 
   /**
    * Parse type name to extract endpoint and type info
@@ -599,6 +643,196 @@ const tempVar: ${nodeText} = null as any;`,
   }
 
   /**
+   * Check type compatibility using manifest files
+   *
+   * This is the new manifest-based approach that:
+   * 1. Uses ManifestMatcher to find endpoint matches
+   * 2. Loads corresponding type aliases from bundled .d.ts files
+   * 3. Uses ts-morph's type assignability checking
+   *
+   * @param producerManifest - Manifest containing producer types
+   * @param consumerManifest - Manifest containing consumer types
+   * @param typesProject - Optional ts-morph Project for the bundled types
+   * @returns TypeCheckResult with compatibility information
+   */
+  async checkCompatibilityWithManifests(
+    producerManifest: TypeManifest,
+    consumerManifest: TypeManifest,
+    typesProject?: Project
+  ): Promise<ManifestTypeCheckResult> {
+    console.log(`[type-checker:manifest] Starting manifest-based type checking`);
+    console.log(`[type-checker:manifest] Producer repo: ${producerManifest.repo_name} (${producerManifest.entries.length} entries)`);
+    console.log(`[type-checker:manifest] Consumer repo: ${consumerManifest.repo_name} (${consumerManifest.entries.length} entries)`);
+
+    // Use provided project or fall back to instance project
+    const project = typesProject || this.project;
+
+    // Match endpoints using the manifest matcher
+    const { matches, orphanedProducers, orphanedConsumers } =
+      this.manifestMatcher.matchEndpoints(producerManifest, consumerManifest);
+
+    console.log(`[type-checker:manifest] Found ${matches.length} endpoint matches`);
+    console.log(`[type-checker:manifest] Orphaned producers: ${orphanedProducers.length}`);
+    console.log(`[type-checker:manifest] Orphaned consumers: ${orphanedConsumers.length}`);
+
+    const result: ManifestTypeCheckResult = {
+      mode: 'manifest',
+      totalProducers: producerManifest.entries.filter(e => e.role === 'producer').length,
+      totalConsumers: consumerManifest.entries.filter(e => e.role === 'consumer').length,
+      compatiblePairs: 0,
+      incompatiblePairs: 0,
+      mismatches: [],
+      orphanedProducers: orphanedProducers.map(o => `${o.entry.method} ${o.entry.path} (${o.entry.type_alias})`),
+      orphanedConsumers: orphanedConsumers.map(o => `${o.entry.method} ${o.entry.path} (${o.entry.type_alias})`),
+      matchDetails: matches,
+    };
+
+    // For each match, compare the types
+    for (const match of matches) {
+      const endpoint = `${match.method} ${match.path}`;
+
+      try {
+        const mismatch = await this.compareManifestTypes(
+          project,
+          endpoint,
+          match.producer,
+          match.consumer
+        );
+
+        if (mismatch) {
+          result.mismatches.push(mismatch);
+          result.incompatiblePairs++;
+        } else {
+          result.compatiblePairs++;
+        }
+      } catch (error) {
+        console.error(`[type-checker:manifest] Error comparing types for ${endpoint}:`, error);
+        result.mismatches.push({
+          endpoint,
+          producerType: match.producer.type_alias,
+          consumerCall: match.consumer.type_alias,
+          consumerType: 'UNKNOWN',
+          isAssignable: false,
+          errorDetails: `Failed to compare types: ${error instanceof Error ? error.message : String(error)}`,
+          producerLocation: `${match.producer.file_path}:${match.producer.line_number}`,
+          consumerLocation: `${match.consumer.file_path}:${match.consumer.line_number}`,
+        });
+        result.incompatiblePairs++;
+      }
+    }
+
+    console.log(`[type-checker:manifest] Type checking complete`);
+    console.log(`[type-checker:manifest] Compatible: ${result.compatiblePairs}, Incompatible: ${result.incompatiblePairs}`);
+
+    return result;
+  }
+
+  /**
+   * Compare types from manifest entries
+   *
+   * @param project - The ts-morph project containing bundled types
+   * @param endpoint - The endpoint being checked
+   * @param producer - The producer manifest entry
+   * @param consumer - The consumer manifest entry
+   * @returns TypeMismatch if incompatible, null if compatible
+   */
+  private async compareManifestTypes(
+    project: Project,
+    endpoint: string,
+    producer: ManifestEntry,
+    consumer: ManifestEntry
+  ): Promise<TypeMismatch | null> {
+    // Try to find the type aliases in the project
+    const producerType = this.findTypeInProject(project, producer.type_alias);
+    const consumerType = this.findTypeInProject(project, consumer.type_alias);
+
+    if (!producerType) {
+      return {
+        endpoint,
+        producerType: producer.type_alias,
+        consumerCall: consumer.type_alias,
+        consumerType: consumer.type_alias,
+        isAssignable: false,
+        errorDetails: `Producer type '${producer.type_alias}' not found in project`,
+        producerLocation: `${producer.file_path}:${producer.line_number}`,
+        consumerLocation: `${consumer.file_path}:${consumer.line_number}`,
+      };
+    }
+
+    if (!consumerType) {
+      return {
+        endpoint,
+        producerType: producer.type_alias,
+        consumerCall: consumer.type_alias,
+        consumerType: consumer.type_alias,
+        isAssignable: false,
+        errorDetails: `Consumer type '${consumer.type_alias}' not found in project`,
+        producerLocation: `${producer.file_path}:${producer.line_number}`,
+        consumerLocation: `${consumer.file_path}:${consumer.line_number}`,
+      };
+    }
+
+    // Check assignability: consumer type should be assignable from producer type
+    // This means the producer should provide at least what the consumer expects
+    const diagnosticMessage = this.getTypeCompatibilityError(
+      producerType,
+      consumerType
+    );
+
+    const isAssignable = !diagnosticMessage;
+
+    if (!isAssignable) {
+      return {
+        endpoint,
+        producerType: producerType.getText(),
+        consumerCall: consumer.type_alias,
+        consumerType: consumerType.getText(),
+        isAssignable: false,
+        errorDetails: diagnosticMessage || 'Types are not compatible',
+        producerLocation: `${producer.file_path}:${producer.line_number}`,
+        consumerLocation: `${consumer.file_path}:${consumer.line_number}`,
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Find a type alias or interface in the project by name
+   */
+  private findTypeInProject(project: Project, typeName: string): Type | null {
+    for (const sourceFile of project.getSourceFiles()) {
+      // Check type aliases
+      const typeAlias = sourceFile.getTypeAlias(typeName);
+      if (typeAlias) {
+        return typeAlias.getType();
+      }
+
+      // Check interfaces
+      const iface = sourceFile.getInterface(typeName);
+      if (iface) {
+        return iface.getType();
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Load manifest from file path
+   */
+  loadManifest(filePath: string): TypeManifest {
+    return this.manifestMatcher.loadManifest(filePath);
+  }
+
+  /**
+   * Parse manifest from JSON string
+   */
+  parseManifest(jsonContent: string): TypeManifest {
+    return this.manifestMatcher.parseManifest(jsonContent);
+  }
+
+  /**
    * Normalize path parameters to a consistent format for matching
    * Examples:
    * "/users/:id" -> "/users/{param}"
@@ -738,5 +972,40 @@ const tempVar: ${nodeText} = null as any;`,
     }
 
     return Array.from(typeNames);
+  }
+
+  /**
+   * Auto-detect and run type checking in the appropriate mode
+   *
+   * @param options - Options for type checking
+   * @returns TypeCheckResult or ManifestTypeCheckResult
+   *
+   * @deprecated Use checkCompatibility for legacy mode or checkCompatibilityWithManifests for manifest mode
+   */
+  async autoCheck(options: {
+    outputDir?: string;
+    producerManifestPath?: string;
+    consumerManifestPath?: string;
+    typesProject?: Project;
+  }): Promise<TypeCheckResult | ManifestTypeCheckResult> {
+    // If manifest paths provided, use manifest mode
+    if (options.producerManifestPath && options.consumerManifestPath) {
+      console.log('[type-checker] Auto-detected manifest mode');
+      const producerManifest = this.loadManifest(options.producerManifestPath);
+      const consumerManifest = this.loadManifest(options.consumerManifestPath);
+      return this.checkCompatibilityWithManifests(
+        producerManifest,
+        consumerManifest,
+        options.typesProject
+      );
+    }
+
+    // Otherwise use legacy mode with output directory
+    if (options.outputDir) {
+      console.log('[type-checker] Auto-detected legacy mode');
+      return this.checkGeneratedTypes(options.outputDir);
+    }
+
+    throw new Error('Either outputDir or both manifest paths must be provided');
   }
 }
