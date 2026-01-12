@@ -4,6 +4,7 @@
 - Build a framework- and library-agnostic REST analysis tool for TypeScript services.
 - Validate producer/consumer request/response/body compatibility across disparate repositories.
 - Prioritize correctness in cross-repo matching over framework-specific heuristics.
+- Remove legacy code paths; backwards compatibility is not required and dead code should not be kept.
 
 ## Project Structure & Module Organization
 - `src/` is the main Rust crate (engine, parser, analysis, cloud storage).
