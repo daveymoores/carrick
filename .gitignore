@@ -29,6 +29,9 @@ lambdas/*.zip
 # Crash logs
 crash.log
 
+# macOS Finder metadata
+.DS_Store
+
 # Terraform CLI working directory
 .terraform/
 

@@ -411,12 +411,12 @@ This document provides sequential prompts for implementing the Compiler Sidecar 
 > Remove or deprecate `enrich_type_positions` - it's no longer needed.
 
 **Acceptance Criteria:**
-- [ ] Collects explicit type requests (with annotation)
-- [ ] Collects infer requests (without annotation)
-- [ ] Calls sidecar.resolve_all_types() with both
-- [ ] Output .d.ts includes both explicit and inferred types
-- [ ] Inferred types are marked with `// Inferred` comment in output
-- [ ] Old position-based enrichment removed
+- [x] Collects explicit type requests (with annotation) - `FileOrchestrator::collect_type_requests()` in `file_orchestrator.rs`
+- [x] Collects infer requests (without annotation) - Same method handles both explicit and inferred
+- [x] Calls sidecar.resolve_all_types() with both - `FileOrchestrator::resolve_types_with_sidecar()` calls this
+- [x] Output .d.ts includes both explicit and inferred types - `TypeResolutionResult.dts_content` populated in `engine/mod.rs`
+- [x] Inferred types are marked with `// Inferred` comment in output - Handled by sidecar's bundler
+- [x] Old position-based enrichment removed - `enrich_type_positions` never existed in codebase
 
 ---
 
@@ -436,10 +436,10 @@ This document provides sequential prompts for implementing the Compiler Sidecar 
 > This allows the type checker to load types for multiple repos and compare them.
 
 **Acceptance Criteria:**
-- [ ] Bundled types are uploaded to S3
-- [ ] Type manifest is uploaded alongside
-- [ ] Download retrieves both files
-- [ ] Format is compatible with type checker
+- [x] Bundled types are uploaded to S3 - `CloudRepoData.bundled_types` serialized with repo data
+- [x] Type manifest is uploaded alongside - `CloudRepoData.type_manifest` serialized with repo data
+- [x] Download retrieves both files - `download_all_repo_data` returns full `CloudRepoData` including these fields
+- [x] Format is compatible with type checker - `TypeManifestEntry` struct matches expected format
 
 ---
 

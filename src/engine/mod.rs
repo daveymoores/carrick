@@ -1,16 +1,18 @@
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
-use crate::cloud_storage::{CloudRepoData, CloudStorage};
+use crate::cloud_storage::{CloudRepoData, CloudStorage, TypeManifestEntry};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
+use crate::services::TypeSidecar;
 use crate::utils::get_repository_name;
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use swc_common::{
     SourceMap,
@@ -58,9 +60,19 @@ fn should_upload_data() -> bool {
     true
 }
 
+#[allow(dead_code)]
 pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_analysis_engine_with_sidecar(storage, repo_path, None).await
+}
+
+/// Run analysis engine with optional sidecar for type extraction
+pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
+    storage: T,
+    repo_path: &str,
+    sidecar: Option<&TypeSidecar>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // TODO we have no way of finding unique org names, so I think this will need to be a token
     let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
@@ -78,9 +90,26 @@ pub async fn run_analysis_engine<T: CloudStorage>(
         .map_err(|e| format!("Failed to connect to AWS services: {}", e))?;
     println!("AWS connectivity verified");
 
-    // 1. Analyze current repo only
-    let current_repo_data = analyze_current_repo(repo_path).await?;
+    // 1. Analyze current repo only (with optional sidecar for type resolution)
+    let current_repo_data = analyze_current_repo(repo_path, sidecar).await?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
+
+    // Log sidecar type resolution results if available
+    if current_repo_data.bundled_types.is_some() {
+        println!(
+            "Type resolution: {} bundled types, {} manifest entries",
+            current_repo_data
+                .bundled_types
+                .as_ref()
+                .map(|s| s.lines().count())
+                .unwrap_or(0),
+            current_repo_data
+                .type_manifest
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        );
+    }
 
     // 2. Conditionally upload current repo data to cloud storage
     if should_upload {
@@ -274,6 +303,7 @@ fn load_config_and_packages(
 
 async fn analyze_current_repo(
     repo_path: &str,
+    sidecar: Option<&TypeSidecar>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     println!(
         "---> Running multi-agent framework-agnostic analysis on: {}",
@@ -309,7 +339,7 @@ async fn analyze_current_repo(
         orchestrator.extract_types_from_file_results(&analysis_result.file_results);
 
     // 6. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
-    let cloud_data = CloudRepoData::from_multi_agent_results(
+    let mut cloud_data = CloudRepoData::from_multi_agent_results(
         repo_name.clone(),
         &analysis_result,
         serde_json::to_string(&config).ok(),
@@ -317,6 +347,87 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
+
+    // 6a. Resolve types using sidecar if available (Phase 2.4)
+    if let Some(sidecar) = sidecar {
+        println!("\n=== Sidecar Type Resolution (Phase 2.4) ===");
+
+        // Wait for sidecar to be ready (it should be by now, but ensure it)
+        match sidecar.wait_ready(Duration::from_secs(10)) {
+            Ok(()) => {
+                // Create FileOrchestrator to use its type resolution method
+                let api_key = env::var("CARRICK_API_KEY").unwrap_or_default();
+                let agent_service = crate::agent_service::AgentService::new(api_key);
+                let file_orchestrator =
+                    crate::agents::file_orchestrator::FileOrchestrator::new(agent_service);
+
+                // Resolve types using sidecar
+                match file_orchestrator.resolve_types_with_sidecar(
+                    sidecar,
+                    &analysis_result.file_results,
+                    repo_path,
+                ) {
+                    Ok(type_resolution) => {
+                        println!(
+                            "Type resolution successful: {} explicit, {} inferred, {} failures",
+                            type_resolution.explicit_manifest.len(),
+                            type_resolution.inferred_types.len(),
+                            type_resolution.symbol_failures.len()
+                        );
+
+                        // Phase 2.5: Populate CloudRepoData with bundled types
+                        cloud_data.bundled_types = type_resolution.dts_content.clone();
+
+                        // Convert ManifestEntry to TypeManifestEntry
+                        let mut manifest_entries: Vec<TypeManifestEntry> = type_resolution
+                            .explicit_manifest
+                            .iter()
+                            .map(|entry| TypeManifestEntry {
+                                alias: entry.alias.clone(),
+                                original_name: entry.original_name.clone(),
+                                source_file: entry.source_file.clone(),
+                                is_explicit: entry.is_explicit,
+                                endpoint_path: None, // TODO: Could be populated from file_results
+                                endpoint_method: None,
+                            })
+                            .collect();
+
+                        // Also add inferred types to manifest
+                        for inferred in &type_resolution.inferred_types {
+                            manifest_entries.push(TypeManifestEntry {
+                                alias: inferred.alias.clone(),
+                                original_name: inferred.alias.clone(), // For inferred, alias is the name
+                                source_file: inferred.source_location.file_path.clone(),
+                                is_explicit: false,
+                                endpoint_path: None,
+                                endpoint_method: None,
+                            });
+                        }
+
+                        if !manifest_entries.is_empty() {
+                            cloud_data.type_manifest = Some(manifest_entries);
+                        }
+
+                        // Log any failures for debugging
+                        for failure in &type_resolution.symbol_failures {
+                            eprintln!(
+                                "[Sidecar] Failed to resolve symbol '{}' from '{}': {}",
+                                failure.symbol_name, failure.source_file, failure.reason
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Sidecar] Type resolution failed: {}", e);
+                        eprintln!("[Sidecar] Continuing without bundled types");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[Sidecar] Sidecar not ready: {}", e);
+                eprintln!("[Sidecar] Skipping type resolution");
+            }
+        }
+    }
 
     // 7. Create a minimal Analyzer for type extraction
     let mut analyzer = Analyzer::new(config.clone(), cm.clone());

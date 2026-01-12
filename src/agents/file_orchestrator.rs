@@ -207,15 +207,35 @@ impl FileOrchestrator {
     /// Returns two vectors:
     /// - `SymbolRequest`: For entries WITH explicit type annotations (primary_type_symbol + type_import_source)
     /// - `InferRequestItem`: For entries WITHOUT explicit type annotations (need inference)
+    ///
+    /// # Arguments
+    /// * `file_results` - Analysis results keyed by file path
+    /// * `repo_path` - Path to the repository root (used to convert relative paths to absolute)
     pub fn collect_type_requests(
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
+        repo_path: &str,
     ) -> (Vec<SymbolRequest>, Vec<InferRequestItem>) {
+        // Convert repo_path to absolute for path resolution
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
         let mut explicit_requests: Vec<SymbolRequest> = Vec::new();
         let mut infer_requests: Vec<InferRequestItem> = Vec::new();
         let mut alias_counter: u32 = 0;
 
         for (file_path, result) in file_results {
+            // Convert file_path to absolute path relative to repo root
+            let file_path_absolute = Self::to_absolute_path(file_path, &repo_root_absolute);
+
             // Process endpoints
             for endpoint in &result.endpoints {
                 if let (Some(symbol), Some(import_source)) =
@@ -225,7 +245,7 @@ impl FileOrchestrator {
                     alias_counter += 1;
                     explicit_requests.push(SymbolRequest {
                         symbol_name: symbol.clone(),
-                        source_file: Self::resolve_import_path(file_path, import_source),
+                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
                         alias: Some(format!("Endpoint{}_{}", alias_counter, symbol)),
                     });
                 } else if endpoint.primary_type_symbol.is_some()
@@ -236,7 +256,7 @@ impl FileOrchestrator {
                         alias_counter += 1;
                         explicit_requests.push(SymbolRequest {
                             symbol_name: symbol.clone(),
-                            source_file: file_path.clone(),
+                            source_file: file_path_absolute.clone(),
                             alias: Some(format!("Endpoint{}_{}", alias_counter, symbol)),
                         });
                     }
@@ -245,7 +265,7 @@ impl FileOrchestrator {
                     alias_counter += 1;
                     // Try response_body inference first, then function_return
                     infer_requests.push(InferRequestItem {
-                        file_path: file_path.clone(),
+                        file_path: file_path_absolute.clone(),
                         line_number: endpoint.line_number as u32,
                         infer_kind: InferKind::ResponseBody,
                         alias: Some(format!("InferredEndpoint{}", alias_counter)),
@@ -263,7 +283,7 @@ impl FileOrchestrator {
                     alias_counter += 1;
                     explicit_requests.push(SymbolRequest {
                         symbol_name: symbol.clone(),
-                        source_file: Self::resolve_import_path(file_path, import_source),
+                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
                         alias: Some(format!("DataCall{}_{}", alias_counter, symbol)),
                     });
                 } else if data_call.primary_type_symbol.is_some()
@@ -274,7 +294,7 @@ impl FileOrchestrator {
                         alias_counter += 1;
                         explicit_requests.push(SymbolRequest {
                             symbol_name: symbol.clone(),
-                            source_file: file_path.clone(),
+                            source_file: file_path_absolute.clone(),
                             alias: Some(format!("DataCall{}_{}", alias_counter, symbol)),
                         });
                     }
@@ -282,7 +302,7 @@ impl FileOrchestrator {
                     // No explicit type - try to infer it
                     alias_counter += 1;
                     infer_requests.push(InferRequestItem {
-                        file_path: file_path.clone(),
+                        file_path: file_path_absolute.clone(),
                         line_number: data_call.line_number as u32,
                         infer_kind: InferKind::CallResult,
                         alias: Some(format!("InferredDataCall{}", alias_counter)),
@@ -304,12 +324,18 @@ impl FileOrchestrator {
     ///
     /// This method collects type requests from the analysis results and sends them
     /// to the sidecar for bundling (explicit) and inference (implicit).
+    ///
+    /// # Arguments
+    /// * `sidecar` - The TypeSidecar instance for type resolution
+    /// * `file_results` - Analysis results keyed by file path
+    /// * `repo_path` - Path to the repository root (used to convert relative paths to absolute)
     pub fn resolve_types_with_sidecar(
         &self,
         sidecar: &TypeSidecar,
         file_results: &HashMap<String, FileAnalysisResult>,
+        repo_path: &str,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (explicit, infer) = self.collect_type_requests(file_results);
+        let (explicit, infer) = self.collect_type_requests(file_results, repo_path);
 
         eprintln!(
             "[FileOrchestrator] Resolving types: {} explicit, {} inferred",
@@ -339,10 +365,36 @@ impl FileOrchestrator {
         Ok(result)
     }
 
+    /// Convert a file path to an absolute path.
+    ///
+    /// If the path is already absolute, returns it as-is.
+    /// Otherwise, resolves it relative to the repo root and canonicalizes.
+    fn to_absolute_path(file_path: &str, repo_root_absolute: &std::path::Path) -> String {
+        use std::path::Path;
+
+        let path = Path::new(file_path);
+        if path.is_absolute() {
+            return file_path.to_string();
+        }
+
+        // Resolve relative to current directory (which should be where cargo run was executed)
+        let resolved = std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+
+        // Canonicalize to resolve .. and . components
+        resolved
+            .canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| {
+                // If canonicalize fails, try joining with repo root
+                repo_root_absolute.join(path).to_string_lossy().to_string()
+            })
+    }
+
     /// Resolve an import path relative to a file.
     ///
-    /// Converts relative import paths like "./types/user" to absolute paths
-    /// relative to the repository root.
+    /// Converts relative import paths like "./types/user" to absolute paths.
     fn resolve_import_path(current_file: &str, import_source: &str) -> String {
         use std::path::Path;
 
@@ -360,7 +412,7 @@ impl FileOrchestrator {
 
         // Add .ts extension if not present
         let resolved_str = resolved.to_string_lossy().to_string();
-        if !resolved_str.ends_with(".ts")
+        let with_extension = if !resolved_str.ends_with(".ts")
             && !resolved_str.ends_with(".tsx")
             && !resolved_str.ends_with(".js")
             && !resolved_str.ends_with(".jsx")
@@ -368,7 +420,13 @@ impl FileOrchestrator {
             format!("{}.ts", resolved_str)
         } else {
             resolved_str
-        }
+        };
+
+        // Canonicalize to resolve .. and . components
+        Path::new(&with_extension)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(with_extension)
     }
 
     /// Build a MountGraph from aggregated file analysis results.
