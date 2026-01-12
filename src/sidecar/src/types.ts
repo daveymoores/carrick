@@ -15,7 +15,8 @@ export type InferKind =
   | 'expression'        // Get type of an expression
   | 'call_result'       // Get return type of a call expression
   | 'variable'          // Get type of a variable declaration
-  | 'response_body';    // Find response body (.json()/.send()/ctx.body)
+  | 'response_body'     // Find response body (.json()/.send()/ctx.body)
+  | 'request_body';     // Find request body (req.body/ctx.request.body or call payloads)
 
 // ============================================================================
 // Request Types

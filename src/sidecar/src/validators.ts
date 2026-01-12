@@ -21,6 +21,7 @@ export const InferKindSchema = z.enum([
   'call_result',
   'variable',
   'response_body',
+  'request_body',
 ]);
 
 // ============================================================================

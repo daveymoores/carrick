@@ -397,6 +397,65 @@ describe('Type Sidecar Integration Tests', () => {
       }
     });
 
+    it('should infer request body type from handler usage', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-2b',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/request-bodies.ts'),
+            line_number: 14,
+            infer_kind: 'request_body',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-2b');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'request_body');
+        assert.ok(inferred.type_string.includes('RequestBody'));
+      }
+    });
+
+    it('should infer request body type from call payloads', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-2c',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/request-bodies.ts'),
+            line_number: 20,
+            infer_kind: 'request_body',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-2c');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'request_body');
+        assert.ok(inferred.type_string.includes('RequestBody'));
+      }
+    });
+
     it('should support custom aliases for inferred types', async () => {
       const response = await client.send<{
         request_id: string;

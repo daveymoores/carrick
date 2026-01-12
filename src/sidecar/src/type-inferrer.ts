@@ -20,6 +20,7 @@ import {
   type ArrowFunction,
   type FunctionExpression,
   type MethodDeclaration,
+  type ParameterDeclaration,
   type CallExpression,
   type BinaryExpression,
   type ReturnStatement,
@@ -120,6 +121,8 @@ export class TypeInferrer {
         return this.inferVariable(sourceFile, request);
       case 'expression':
         return this.inferExpression(sourceFile, request);
+      case 'request_body':
+        return this.inferRequestBody(sourceFile, request);
       default:
         this.logError(`Unknown infer kind: ${request.infer_kind}`);
         return null;
@@ -345,6 +348,79 @@ export class TypeInferrer {
     );
   }
 
+  /**
+   * Infer request body type from handlers or call payloads
+   */
+  private inferRequestBody(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): InferredType | null {
+    const node = this.findNodeAtLine(sourceFile, request.line_number);
+    const callExpr =
+      node?.getKind() === SyntaxKind.CallExpression
+        ? (node as CallExpression)
+        : node?.getFirstAncestorByKind(SyntaxKind.CallExpression);
+
+    if (callExpr) {
+      const payloadType = this.extractRequestPayloadFromCall(callExpr);
+      if (payloadType) {
+        return this.createInferredType(
+          request,
+          payloadType,
+          false,
+          this.getNodeLocation(callExpr, sourceFile)
+        );
+      }
+    }
+
+    const func = this.findContainingFunction(sourceFile, request.line_number);
+    if (!func) {
+      this.log(`No function found at line ${request.line_number}`);
+      return null;
+    }
+
+    const requestTypes: string[] = [];
+    let firstNode: Node | undefined;
+
+    const propertyAccesses = func.getDescendantsOfKind(
+      SyntaxKind.PropertyAccessExpression
+    );
+    for (const access of propertyAccesses) {
+      if (!this.isRequestBodyAccess(access)) {
+        continue;
+      }
+      if (!firstNode) {
+        firstNode = access;
+      }
+      const typeText = access.getType().getText(access);
+      if (typeText && !requestTypes.includes(typeText)) {
+        requestTypes.push(typeText);
+      }
+    }
+
+    if (requestTypes.length === 0) {
+      const paramResult = this.extractRequestBodyFromParams(func);
+      if (paramResult.types.length > 0) {
+        requestTypes.push(...paramResult.types);
+        firstNode = firstNode ?? paramResult.node ?? func;
+      }
+    }
+
+    if (requestTypes.length === 0) {
+      return null;
+    }
+
+    const typeString =
+      requestTypes.length === 1 ? requestTypes[0] : requestTypes.join(' | ');
+
+    return this.createInferredType(
+      request,
+      typeString,
+      false,
+      this.getNodeLocation(firstNode ?? func, sourceFile)
+    );
+  }
+
   // ===========================================================================
   // Response Pattern Extractors
   // ===========================================================================
@@ -430,6 +506,132 @@ export class TypeInferrer {
     }
 
     return typeText;
+  }
+
+  // ===========================================================================
+  // Request Pattern Extractors
+  // ===========================================================================
+
+  private extractRequestPayloadFromCall(call: CallExpression): string | null {
+    const expression = call.getExpression();
+    const args = call.getArguments();
+
+    if (Node.isIdentifier(expression)) {
+      const name = expression.getText();
+      if (name === 'fetch') {
+        return this.extractBodyFromFetchArgs(args);
+      }
+    }
+
+    if (Node.isPropertyAccessExpression(expression)) {
+      const name = expression.getName();
+
+      if (name === 'fetch') {
+        return this.extractBodyFromFetchArgs(args);
+      }
+
+      if (['post', 'put', 'patch', 'delete'].includes(name)) {
+        if (args.length >= 2) {
+          return args[1].getType().getText(args[1]);
+        }
+      }
+
+      if (name === 'request' && args.length >= 1) {
+        return this.extractBodyFromConfigArg(args[0]);
+      }
+    }
+
+    return null;
+  }
+
+  private extractBodyFromFetchArgs(args: Node[]): string | null {
+    if (args.length < 2) {
+      return null;
+    }
+
+    return this.extractBodyFromConfigArg(args[1]);
+  }
+
+  private extractBodyFromConfigArg(configArg: Node): string | null {
+    if (!Node.isObjectLiteralExpression(configArg)) {
+      return null;
+    }
+
+    const bodyProp =
+      configArg.getProperty('body') ?? configArg.getProperty('data');
+    if (!bodyProp) {
+      return null;
+    }
+
+    if (Node.isPropertyAssignment(bodyProp)) {
+      const initializer = bodyProp.getInitializer();
+      if (!initializer) {
+        return null;
+      }
+      return initializer.getType().getText(initializer);
+    }
+
+    if (Node.isShorthandPropertyAssignment(bodyProp)) {
+      const nameNode = bodyProp.getNameNode();
+      return nameNode.getType().getText(nameNode);
+    }
+
+    return null;
+  }
+
+  private extractRequestBodyFromParams(
+    func: FunctionLike
+  ): { types: string[]; node?: Node } {
+    const types: string[] = [];
+    let node: Node | undefined;
+
+    for (const param of func.getParameters()) {
+      const bodyType = this.getBodyTypeFromParam(param);
+      if (bodyType && !types.includes(bodyType)) {
+        types.push(bodyType);
+        node = node ?? param;
+      }
+    }
+
+    return { types, node };
+  }
+
+  private getBodyTypeFromParam(param: ParameterDeclaration): string | null {
+    const paramType = param.getType();
+
+    const directBody = paramType.getProperty('body');
+    if (directBody) {
+      const bodyType = directBody.getTypeAtLocation(param);
+      return bodyType.getText(param);
+    }
+
+    const requestProp = paramType.getProperty('request');
+    if (requestProp) {
+      const requestType = requestProp.getTypeAtLocation(param);
+      const nestedBody = requestType.getProperty('body');
+      if (nestedBody) {
+        const bodyType = nestedBody.getTypeAtLocation(param);
+        return bodyType.getText(param);
+      }
+    }
+
+    return null;
+  }
+
+  private isRequestBodyAccess(access: Node): boolean {
+    if (!Node.isPropertyAccessExpression(access)) {
+      return false;
+    }
+
+    if (access.getName() !== 'body') {
+      return false;
+    }
+
+    const expressionText = access.getExpression().getText();
+    return (
+      /^(req|request)$/.test(expressionText) ||
+      /^(ctx|context)\.(request|req)$/.test(expressionText)
+    );
   }
 
   // ===========================================================================
@@ -590,6 +792,8 @@ export class TypeInferrer {
         return 'Return';
       case 'response_body':
         return 'Response';
+      case 'request_body':
+        return 'Request';
       case 'call_result':
         return 'Result';
       case 'variable':

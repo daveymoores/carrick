@@ -166,6 +166,17 @@ export class TypeBundler {
   private validateSymbol(
     symbol: SymbolRequest
   ): { valid: boolean; reason?: string } {
+    if (this.isPlaceholderSource(symbol.source_file)) {
+      return {
+        valid: false,
+        reason: `Unsupported source placeholder: ${symbol.source_file}`,
+      };
+    }
+
+    if (!this.isPathSource(symbol.source_file)) {
+      return { valid: true };
+    }
+
     // Resolve the source file path
     const absolutePath = path.isAbsolute(symbol.source_file)
       ? symbol.source_file
@@ -237,35 +248,54 @@ export class TypeBundler {
     ];
 
     for (const symbol of symbols) {
-      // Calculate relative path from repo root to source file
-      const absolutePath = path.isAbsolute(symbol.source_file)
-        ? symbol.source_file
-        : path.resolve(this.repoRoot, symbol.source_file);
-
-      // Make relative to repo root (where virtual entry is)
-      let relativePath = path.relative(this.repoRoot, absolutePath);
-
-      // Ensure it starts with ./ for relative imports
-      if (!relativePath.startsWith('.')) {
-        relativePath = './' + relativePath;
+      if (this.isPlaceholderSource(symbol.source_file)) {
+        continue;
       }
 
-      // Remove .ts/.tsx extension for import
-      relativePath = relativePath.replace(/\.tsx?$/, '');
+      const importSource = this.isPathSource(symbol.source_file)
+        ? this.toRelativeImportPath(symbol.source_file)
+        : symbol.source_file;
 
       // Generate export statement
       if (symbol.alias && symbol.alias !== symbol.symbol_name) {
         lines.push(
-          `export type { ${symbol.symbol_name} as ${symbol.alias} } from '${relativePath}';`
+          `export type { ${symbol.symbol_name} as ${symbol.alias} } from '${importSource}';`
         );
       } else {
         lines.push(
-          `export type { ${symbol.symbol_name} } from '${relativePath}';`
+          `export type { ${symbol.symbol_name} } from '${importSource}';`
         );
       }
     }
 
     return lines.join('\n');
+  }
+
+  private isPathSource(sourceFile: string): boolean {
+    return (
+      sourceFile.startsWith('.') ||
+      sourceFile.startsWith('/') ||
+      path.isAbsolute(sourceFile)
+    );
+  }
+
+  private isPlaceholderSource(sourceFile: string): boolean {
+    const trimmed = sourceFile.trim();
+    return trimmed === '' || trimmed === '%none%' || trimmed === '%inline%';
+  }
+
+  private toRelativeImportPath(sourceFile: string): string {
+    const absolutePath = path.isAbsolute(sourceFile)
+      ? sourceFile
+      : path.resolve(this.repoRoot, sourceFile);
+
+    let relativePath = path.relative(this.repoRoot, absolutePath);
+
+    if (!relativePath.startsWith('.')) {
+      relativePath = './' + relativePath;
+    }
+
+    return relativePath.replace(/\.tsx?$/, '');
   }
 
   /**
