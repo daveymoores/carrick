@@ -1425,7 +1425,7 @@ When extracting response types:
 
 ### Phase 3: Switch Default (Week 3-4)
 - Make sidecar the default
-- Keep old pipeline as `--legacy-type-extraction` fallback
+- Remove the old pipeline (no legacy fallback)
 - Monitor for issues
 
 ### Phase 4: Cleanup (Week 4+)

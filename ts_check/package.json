@@ -4,8 +4,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "check-types": "ts-node simple-type-checker.ts",
-    "extract": "echo 'DEPRECATED: Use TypeSidecar (src/sidecar) instead' && ts-node _legacy/extract-type-definitions.ts"
+    "check-types": "ts-node simple-type-checker.ts"
   },
   "keywords": [],
   "author": "",

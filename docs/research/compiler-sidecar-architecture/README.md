@@ -138,7 +138,7 @@ carrick/
 |-------|------|------|
 | 1 | Build sidecar, run in parallel | `--sidecar-type-extraction` |
 | 2 | Compare old vs new output | Both enabled |
-| 3 | Make sidecar default | `--legacy-type-extraction` for old |
+| 3 | Make sidecar default | No legacy fallback |
 | 4 | Remove legacy code | N/A |
 
 ## FAQ

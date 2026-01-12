@@ -21,6 +21,7 @@ use crate::{
     framework_detector::{DetectionResult, FrameworkDetector},
     mount_graph::MountGraph,
     packages::Packages,
+    url_normalizer::UrlNormalizer,
     visitor::ImportedSymbol,
 };
 use std::collections::HashMap;
@@ -163,117 +164,6 @@ impl MultiAgentOrchestrator {
             }
         }
     }
-
-    /// Extract type information from file analysis results for type checking.
-    ///
-    /// This method extracts type positions from the file analysis results
-    /// for use in cross-repo type checking.
-    pub fn extract_types_from_file_results(
-        &self,
-        file_results: &HashMap<String, FileAnalysisResult>,
-    ) -> Vec<serde_json::Value> {
-        use crate::analyzer::Analyzer;
-        let mut type_infos = Vec::new();
-
-        println!("=== EXTRACT TYPES FROM FILE ANALYSIS ===");
-
-        let mut total_endpoints = 0;
-        let mut total_data_calls = 0;
-
-        for (file_path, result) in file_results {
-            total_endpoints += result.endpoints.len();
-            total_data_calls += result.data_calls.len();
-
-            // Extract types from endpoints
-            for endpoint in &result.endpoints {
-                let alias = Analyzer::generate_common_type_alias_name(
-                    &endpoint.path,
-                    &endpoint.method,
-                    false, // is_request_type
-                    false, // is_consumer
-                );
-
-                // Use the response_type_file from the LLM if available, otherwise use the current file
-                let type_file = endpoint
-                    .response_type_file
-                    .clone()
-                    .unwrap_or_else(|| file_path.clone());
-
-                // Build type info with response type information if available
-                let mut type_info = serde_json::json!({
-                    "filePath": type_file,
-                    "lineNumber": endpoint.line_number,
-                    "alias": alias,
-                    "kind": "endpoint",
-                    "method": endpoint.method,
-                    "path": endpoint.path
-                });
-
-                // Add response type position if available
-                if let Some(pos) = endpoint.response_type_position {
-                    type_info["startPosition"] = serde_json::json!(pos);
-                }
-
-                // Add the type string if the LLM extracted it
-                if let Some(ref type_str) = endpoint.response_type_string {
-                    type_info["compositeTypeString"] = serde_json::json!(type_str);
-                }
-
-                type_infos.push(type_info);
-            }
-
-            // Extract types from data calls
-            for data_call in &result.data_calls {
-                let alias = if let Some(method) = &data_call.method {
-                    Analyzer::generate_common_type_alias_name(
-                        &data_call.target,
-                        method,
-                        false, // is_request_type
-                        true,  // is_consumer
-                    )
-                } else {
-                    format!("DataCall_L{}", data_call.line_number)
-                };
-
-                // Use the response_type_file from the LLM if available, otherwise use the current file
-                let type_file = data_call
-                    .response_type_file
-                    .clone()
-                    .unwrap_or_else(|| file_path.clone());
-
-                let mut type_info = serde_json::json!({
-                    "filePath": type_file,
-                    "lineNumber": data_call.line_number,
-                    "alias": alias,
-                    "kind": "data_call",
-                    "target": data_call.target
-                });
-
-                // Add response type position if available
-                if let Some(pos) = data_call.response_type_position {
-                    type_info["startPosition"] = serde_json::json!(pos);
-                }
-
-                // Add the type string if the LLM extracted it
-                if let Some(ref type_str) = data_call.response_type_string {
-                    type_info["compositeTypeString"] = serde_json::json!(type_str);
-                }
-
-                type_infos.push(type_info);
-            }
-        }
-
-        println!(
-            "Processed {} endpoints and {} data calls from {} files",
-            total_endpoints,
-            total_data_calls,
-            file_results.len()
-        );
-        println!("Extracted {} type infos", type_infos.len());
-        println!("=== END EXTRACT TYPES ===");
-
-        type_infos
-    }
 }
 
 /// Analysis result in a format compatible with existing systems
@@ -341,20 +231,97 @@ impl EndpointAnalysis {
     }
 
     fn urls_could_match(&self, endpoint_path: &str, call_url: &str) -> bool {
-        // Simple heuristic - could be enhanced
-        if call_url.starts_with("http") {
-            // Extract path from full URL
-            if let Some(url_path) = call_url
-                .split('/')
-                .skip(3) // Skip protocol and domain
-                .collect::<Vec<_>>()
-                .first()
-            {
-                return endpoint_path.contains(url_path);
+        let normalizer = UrlNormalizer::default_permissive();
+        let normalized_endpoint = normalizer.normalize(endpoint_path);
+        let normalized_call = normalizer.normalize(call_url);
+
+        if normalized_call.is_external {
+            return false;
+        }
+
+        self.paths_match(&normalized_endpoint.path, &normalized_call.path)
+    }
+
+    fn paths_match(&self, endpoint_path: &str, call_path: &str) -> bool {
+        if endpoint_path == call_path {
+            return true;
+        }
+
+        if self.path_matches_with_params(endpoint_path, call_path) {
+            return true;
+        }
+
+        self.path_matches_with_wildcards(endpoint_path, call_path)
+    }
+
+    fn path_matches_with_params(&self, endpoint_path: &str, call_path: &str) -> bool {
+        let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
+        let call_segments: Vec<&str> = call_path.split('/').collect();
+
+        let endpoint_required_count = endpoint_segments
+            .iter()
+            .filter(|s| !s.ends_with('?'))
+            .count();
+
+        if call_segments.len() < endpoint_required_count
+            || call_segments.len() > endpoint_segments.len()
+        {
+            return false;
+        }
+
+        for (i, endpoint_seg) in endpoint_segments.iter().enumerate() {
+            let is_optional = endpoint_seg.ends_with('?');
+            let seg = endpoint_seg.trim_end_matches('?');
+
+            if i >= call_segments.len() {
+                if !is_optional {
+                    return false;
+                }
+                continue;
+            }
+
+            let call_seg = call_segments[i];
+
+            if seg.starts_with(':') {
+                continue;
+            }
+
+            if seg != call_seg {
+                return false;
             }
         }
 
-        endpoint_path == call_url || call_url.contains(endpoint_path)
+        true
+    }
+
+    fn path_matches_with_wildcards(&self, endpoint_path: &str, call_path: &str) -> bool {
+        if endpoint_path.ends_with("/*") || endpoint_path.ends_with("/**") {
+            let prefix = endpoint_path.trim_end_matches("/**").trim_end_matches("/*");
+            return call_path.starts_with(prefix);
+        }
+
+        if endpoint_path.ends_with("/(.*)") {
+            let prefix = endpoint_path.trim_end_matches("/(.*)");
+            return call_path.starts_with(prefix);
+        }
+
+        let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
+        let call_segments: Vec<&str> = call_path.split('/').collect();
+
+        if endpoint_segments.len() != call_segments.len() {
+            return false;
+        }
+
+        for (endpoint_seg, call_seg) in endpoint_segments.iter().zip(call_segments.iter()) {
+            if *endpoint_seg == "*" {
+                continue;
+            }
+            if endpoint_seg != call_seg {
+                return false;
+            }
+        }
+
+        true
     }
 }
 

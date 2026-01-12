@@ -32,24 +32,32 @@ Do not run Terraform commands in this repo.
 
 1) `run_final_type_checking` calls `run-type-checking.ts` without the required
    `--producer` and `--consumer` manifest paths. This always fails.
+   - Status: resolved (manifests + `--types-dir` wired)
 
 2) No manifest with method/path/role/type_kind is produced. Sidecar outputs only
    `alias/type_string` and Rust drops endpoint metadata.
+   - Status: resolved (manifest schema aligned + generated from mount graph)
 
 3) Upload/download of type files still uses legacy `ts_check/output/*_types.ts`,
    not `cloud_data.bundled_types` from the sidecar.
+   - Status: resolved (bundled `.d.ts` is the source of truth)
 
 4) Inferred types are never emitted into a `.d.ts`, so implicit types never
    reach the checker.
+   - Status: resolved (sidecar appends inferred + unknown aliases to `.d.ts`)
 
 5) Bundling assumes file paths only; module specifiers like `express` or
    `%none%` fail validation and cause missing types.
+   - Status: resolved (sidecar bundler handles module specifiers/placeholders)
 
 6) There is no consistent canonical URL normalization path. The analyzer uses
    `UrlNormalizer`, but `EndpointAnalysis::urls_could_match` still uses a
    separate heuristic.
+   - Status: resolved (UrlNormalizer now used for mismatch matching)
 
 7) Request types are not extracted; only response types exist in the LLM schema.
+   - Status: mostly resolved (compiler infers request bodies via sidecar,
+     including handler parameter body types; validate coverage)
 
 Legacy code paths should be removed, not preserved. This tool is not live, and
 backwards compatibility is not required.
@@ -115,23 +123,27 @@ as first-class entries.
 - For a repo with endpoints and calls, manifests contain entries for both
   request and response.
 
-## Phase 2: Extend LLM Schema to Capture Request Types (Explicit Only)
+## Phase 2: Compiler-Driven Request Type Inference
+
+Status: in progress (request inference wired; needs verification)
 
 ### Tasks
-- Update `FileAnalysisResult` schema to include:
-  - `request_type_string`
-  - `request_primary_type_symbol`
-  - `request_type_import_source`
-  - `request_type_position` (optional)
-- Update the LLM prompt/schema to extract request types when explicitly
-  annotated (do not infer).
-- Keep response body inference in the sidecar for implicit types.
+- Keep LLM focused on *classification* (locations + endpoints), not type strings.
+- Add sidecar request body inference via `InferKind::request_body`:
+  - Producers: infer from `req.body`/`ctx.request.body` usage.
+  - Consumers: infer from call payloads (`fetch(..., { body })`, `axios.post(..., data)`).
+- Feed request body inference requests using hashed manifest aliases so bundled
+  `.d.ts` defines `Endpoint_<hash>_Request`.
+- Add explicit handler-generic support when no `req.body` access exists:
+  - Example: `Request<Params, ResBody, ReqBody>` should yield ReqBody.
 
 ### Acceptance Criteria
-- When request types are explicitly annotated, they appear in analysis results.
-- No inference is attempted for request types in the LLM layer.
+- Bundled `.d.ts` includes request aliases for both explicit and implicit cases.
+- Request types are compiler-inferred (ts-morph), not LLM-inferred.
 
 ## Phase 3: Update Sidecar Type Requests + Bundle Module Specifiers
+
+Status: complete (pending verification)
 
 ### Tasks
 - Extend `SymbolRequest` to allow module specifiers (e.g., `express`) in
@@ -174,6 +186,7 @@ as first-class entries.
 - Cross-repo checking uses sidecar-generated types only.
 
 ## Phase 6: Enforce Canonical URL Normalization
+Status: complete
 
 ### Tasks
 - Replace `EndpointAnalysis::urls_could_match` with `UrlNormalizer`.
@@ -186,6 +199,7 @@ as first-class entries.
 - There is exactly one canonical normalization path in Rust.
 
 ## Phase 7: Remove Legacy Extraction and Matching Code
+Status: complete (legacy extraction removed and legacy scripts deleted)
 
 ### Tasks
 - Remove `extract_types_for_current_repo` and any legacy extraction paths.
