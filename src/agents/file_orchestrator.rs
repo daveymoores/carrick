@@ -22,12 +22,16 @@ use crate::{
         file_analyzer_agent::{FileAnalysisResult, FileAnalyzerAgent},
         framework_guidance_agent::FrameworkGuidance,
     },
+    cloud_storage::{ManifestRole, ManifestTypeKind},
+    config::Config,
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     services::type_sidecar::{
         InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult, TypeSidecar,
     },
     swc_scanner::SwcScanner,
+    type_manifest::{build_manifest_type_alias, normalize_manifest_method, parse_file_location},
+    url_normalizer::UrlNormalizer,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -211,10 +215,14 @@ impl FileOrchestrator {
     /// # Arguments
     /// * `file_results` - Analysis results keyed by file path
     /// * `repo_path` - Path to the repository root (used to convert relative paths to absolute)
+    /// * `mount_graph` - Resolved mount graph for canonical method/path aliases
+    /// * `config` - Config used for URL normalization
     pub fn collect_type_requests(
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
         repo_path: &str,
+        mount_graph: &MountGraph,
+        config: &Config,
     ) -> (Vec<SymbolRequest>, Vec<InferRequestItem>) {
         // Convert repo_path to absolute for path resolution
         let repo_root = std::path::Path::new(repo_path);
@@ -228,9 +236,33 @@ impl FileOrchestrator {
                 .unwrap_or_else(|_| repo_root.to_path_buf())
         };
 
+        let normalizer = UrlNormalizer::new(config);
         let mut explicit_requests: Vec<SymbolRequest> = Vec::new();
         let mut infer_requests: Vec<InferRequestItem> = Vec::new();
-        let mut alias_counter: u32 = 0;
+        let mut endpoint_lookup: HashMap<(String, u32), (String, String)> = HashMap::new();
+        let mut data_call_lookup: HashMap<(String, u32), (String, String)> = HashMap::new();
+        let should_infer_request_body = |method: &str| {
+            matches!(
+                method,
+                "POST" | "PUT" | "PATCH" | "DELETE" | "ALL" | "UNKNOWN"
+            )
+        };
+
+        for endpoint in mount_graph.get_resolved_endpoints() {
+            let (file_path, line_number) = parse_file_location(&endpoint.file_location);
+            let method = normalize_manifest_method(&endpoint.method);
+            endpoint_lookup.insert(
+                (file_path, line_number),
+                (method, endpoint.full_path.clone()),
+            );
+        }
+
+        for data_call in mount_graph.get_data_calls() {
+            let (file_path, line_number) = parse_file_location(&data_call.file_location);
+            let method = normalize_manifest_method(&data_call.method);
+            let path = normalizer.extract_path(&data_call.target_url);
+            data_call_lookup.insert((file_path, line_number), (method, path));
+        }
 
         for (file_path, result) in file_results {
             // Convert file_path to absolute path relative to repo root
@@ -238,74 +270,143 @@ impl FileOrchestrator {
 
             // Process endpoints
             for endpoint in &result.endpoints {
+                let line_number = if endpoint.line_number <= 0 {
+                    1
+                } else {
+                    endpoint.line_number as u32
+                };
+                let lookup_key = (file_path.clone(), line_number);
+                let (method, path) =
+                    endpoint_lookup
+                        .get(&lookup_key)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            let method = normalize_manifest_method(&endpoint.method);
+                            (method, endpoint.path.clone())
+                        });
+                let response_alias = build_manifest_type_alias(
+                    &method,
+                    &path,
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Response,
+                );
+                let request_alias = build_manifest_type_alias(
+                    &method,
+                    &path,
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Request,
+                );
+
                 if let (Some(symbol), Some(import_source)) =
                     (&endpoint.primary_type_symbol, &endpoint.type_import_source)
                 {
                     // Explicit type with import source - bundle it
-                    alias_counter += 1;
                     explicit_requests.push(SymbolRequest {
                         symbol_name: symbol.clone(),
                         source_file: Self::resolve_import_path(&file_path_absolute, import_source),
-                        alias: Some(format!("Endpoint{}_{}", alias_counter, symbol)),
+                        alias: Some(response_alias.clone()),
                     });
                 } else if endpoint.primary_type_symbol.is_some()
                     && endpoint.type_import_source.is_none()
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = endpoint.primary_type_symbol {
-                        alias_counter += 1;
                         explicit_requests.push(SymbolRequest {
                             symbol_name: symbol.clone(),
                             source_file: file_path_absolute.clone(),
-                            alias: Some(format!("Endpoint{}_{}", alias_counter, symbol)),
+                            alias: Some(response_alias.clone()),
                         });
                     }
                 } else if endpoint.response_type_string.is_none() {
                     // No explicit type - try to infer it
-                    alias_counter += 1;
                     // Try response_body inference first, then function_return
                     infer_requests.push(InferRequestItem {
                         file_path: file_path_absolute.clone(),
-                        line_number: endpoint.line_number as u32,
+                        line_number,
                         infer_kind: InferKind::ResponseBody,
-                        alias: Some(format!("InferredEndpoint{}", alias_counter)),
+                        alias: Some(response_alias.clone()),
+                    });
+                }
+
+                if should_infer_request_body(&method) {
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path_absolute.clone(),
+                        line_number,
+                        infer_kind: InferKind::RequestBody,
+                        alias: Some(request_alias.clone()),
                     });
                 }
             }
 
             // Process data calls
             for data_call in &result.data_calls {
+                let line_number = if data_call.line_number <= 0 {
+                    1
+                } else {
+                    data_call.line_number as u32
+                };
+                let lookup_key = (file_path.clone(), line_number);
+                let (method, path) =
+                    data_call_lookup
+                        .get(&lookup_key)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            let method = normalize_manifest_method(
+                                data_call.method.as_deref().unwrap_or("GET"),
+                            );
+                            let path = normalizer.extract_path(&data_call.target);
+                            (method, path)
+                        });
+                let response_alias = build_manifest_type_alias(
+                    &method,
+                    &path,
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Response,
+                );
+                let request_alias = build_manifest_type_alias(
+                    &method,
+                    &path,
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Request,
+                );
+
                 if let (Some(symbol), Some(import_source)) = (
                     &data_call.primary_type_symbol,
                     &data_call.type_import_source,
                 ) {
                     // Explicit type with import source - bundle it
-                    alias_counter += 1;
                     explicit_requests.push(SymbolRequest {
                         symbol_name: symbol.clone(),
                         source_file: Self::resolve_import_path(&file_path_absolute, import_source),
-                        alias: Some(format!("DataCall{}_{}", alias_counter, symbol)),
+                        alias: Some(response_alias.clone()),
                     });
                 } else if data_call.primary_type_symbol.is_some()
                     && data_call.type_import_source.is_none()
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = data_call.primary_type_symbol {
-                        alias_counter += 1;
                         explicit_requests.push(SymbolRequest {
                             symbol_name: symbol.clone(),
                             source_file: file_path_absolute.clone(),
-                            alias: Some(format!("DataCall{}_{}", alias_counter, symbol)),
+                            alias: Some(response_alias.clone()),
                         });
                     }
                 } else if data_call.response_type_string.is_none() {
                     // No explicit type - try to infer it
-                    alias_counter += 1;
                     infer_requests.push(InferRequestItem {
                         file_path: file_path_absolute.clone(),
-                        line_number: data_call.line_number as u32,
+                        line_number,
                         infer_kind: InferKind::CallResult,
-                        alias: Some(format!("InferredDataCall{}", alias_counter)),
+                        alias: Some(response_alias.clone()),
+                    });
+                }
+
+                if should_infer_request_body(&method) {
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path_absolute.clone(),
+                        line_number,
+                        infer_kind: InferKind::RequestBody,
+                        alias: Some(request_alias.clone()),
                     });
                 }
             }
@@ -329,13 +430,18 @@ impl FileOrchestrator {
     /// * `sidecar` - The TypeSidecar instance for type resolution
     /// * `file_results` - Analysis results keyed by file path
     /// * `repo_path` - Path to the repository root (used to convert relative paths to absolute)
+    /// * `mount_graph` - Resolved mount graph for canonical method/path aliases
+    /// * `config` - Config used for URL normalization
     pub fn resolve_types_with_sidecar(
         &self,
         sidecar: &TypeSidecar,
         file_results: &HashMap<String, FileAnalysisResult>,
         repo_path: &str,
+        mount_graph: &MountGraph,
+        config: &Config,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (explicit, infer) = self.collect_type_requests(file_results, repo_path);
+        let (explicit, infer) =
+            self.collect_type_requests(file_results, repo_path, mount_graph, config);
 
         eprintln!(
             "[FileOrchestrator] Resolving types: {} explicit, {} inferred",

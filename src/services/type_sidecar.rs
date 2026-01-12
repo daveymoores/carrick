@@ -13,6 +13,7 @@
 //! - **JSON message protocol**: All communication is via stdin/stdout JSON messages
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -55,6 +56,8 @@ pub enum InferKind {
     Variable,
     /// Find response body (.json()/.send()/ctx.body)
     ResponseBody,
+    /// Find request body (req.body/ctx.request.body or call payloads)
+    RequestBody,
 }
 
 /// Request for a specific symbol to be bundled
@@ -544,6 +547,57 @@ impl TypeSidecar {
             }
         }
 
+        let had_explicit_dts = result.dts_content.is_some();
+        let mut combined_dts = result.dts_content.take().unwrap_or_default();
+        let mut appended_aliases: HashSet<String> = HashSet::new();
+
+        let mut append_alias = |alias: &str, type_string: &str| -> bool {
+            if !appended_aliases.insert(alias.to_string()) {
+                return false;
+            }
+            if !combined_dts.is_empty() && !combined_dts.ends_with('\n') {
+                combined_dts.push('\n');
+            }
+            combined_dts.push_str("export type ");
+            combined_dts.push_str(alias);
+            combined_dts.push_str(" = ");
+            combined_dts.push_str(type_string.trim().trim_end_matches(';'));
+            combined_dts.push_str(";\n");
+            true
+        };
+
+        let mut inferred_aliases = HashSet::new();
+        for inferred in &result.inferred_types {
+            inferred_aliases.insert(inferred.alias.clone());
+            append_alias(&inferred.alias, &inferred.type_string);
+        }
+
+        for failure in &result.symbol_failures {
+            if let Some(request) = explicit.iter().find(|req| {
+                req.symbol_name == failure.symbol_name && req.source_file == failure.source_file
+            }) {
+                let alias = request
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| request.symbol_name.clone());
+                append_alias(&alias, "unknown");
+            }
+        }
+
+        if !infer.is_empty() {
+            for request in infer {
+                if let Some(alias) = &request.alias {
+                    if !inferred_aliases.contains(alias) {
+                        append_alias(alias, "unknown");
+                    }
+                }
+            }
+        }
+
+        if had_explicit_dts || !combined_dts.is_empty() {
+            result.dts_content = Some(combined_dts);
+        }
+
         Ok(result)
     }
 
@@ -725,6 +779,10 @@ mod tests {
         let kind = InferKind::ResponseBody;
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(json, r#""response_body""#);
+
+        let kind = InferKind::RequestBody;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, r#""request_body""#);
     }
 
     #[test]

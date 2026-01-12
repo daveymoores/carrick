@@ -17,6 +17,9 @@ export {
   ManifestMatcher,
   TypeManifest,
   ManifestEntry,
+  ManifestRole,
+  ManifestTypeKind,
+  ManifestTypeState,
   MatchResult,
   OrphanedEntry,
   normalizePath,
@@ -55,18 +58,3 @@ export {
   createLogger,
   defaultLogger,
 } from "./logger";
-
-// Legacy exports (archived in _legacy/ directory)
-// These are kept for backward compatibility but are deprecated.
-// Type extraction is now handled by the TypeSidecar (src/sidecar).
-export {
-  findTypeReferenceAtPosition,
-  findTypeDeclarationByPosition,
-  getModuleSpecifierFromNodeModulesPath,
-} from "./_legacy/type-resolver";
-export { ImportHandler } from "./_legacy/import-handler";
-export { TypeProcessor } from "./_legacy/type-processor";
-export { DeclarationCollector } from "./_legacy/declaration-collector";
-export { DependencyManager } from "./_legacy/dependency-manager";
-export { OutputGenerator } from "./_legacy/output-generator";
-export { TypeExtractor } from "./_legacy/type-extractor";

@@ -129,8 +129,11 @@ describe('ManifestMatcher', () => {
             path: '/api/users',
             type_alias: 'GetUsersResponse',
             role: 'producer',
+            type_kind: 'response',
             file_path: 'src/routes.ts',
             line_number: 10,
+            is_explicit: true,
+            type_state: 'explicit',
           },
         ],
       };

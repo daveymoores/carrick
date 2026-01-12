@@ -134,17 +134,19 @@ export class TypeCompatibilityChecker {
       incompatiblePairs: 0,
       mismatches: [],
       orphanedProducers: orphanedProducers.map(
-        (o) => `${o.entry.method} ${o.entry.path} (${o.entry.type_alias})`
+        (o) =>
+          `${o.entry.method} ${o.entry.path} (${o.entry.type_kind}, ${o.entry.type_alias})`
       ),
       orphanedConsumers: orphanedConsumers.map(
-        (o) => `${o.entry.method} ${o.entry.path} (${o.entry.type_alias})`
+        (o) =>
+          `${o.entry.method} ${o.entry.path} (${o.entry.type_kind}, ${o.entry.type_alias})`
       ),
       matchDetails: matches,
     };
 
     // For each match, compare the types
     for (const match of matches) {
-      const endpoint = `${match.method} ${match.path}`;
+      const endpoint = `${match.method} ${match.path} (${match.type_kind})`;
 
       try {
         const mismatch = await this.compareTypes(

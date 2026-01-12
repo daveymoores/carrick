@@ -18,23 +18,49 @@ pub use mock_storage::MockStorage;
 mod aws_storage;
 pub use aws_storage::AwsStorage;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestRole {
+    Producer,
+    Consumer,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestTypeKind {
+    Request,
+    Response,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestTypeState {
+    Explicit,
+    Implicit,
+    Unknown,
+}
+
 /// Entry in the type manifest mapping endpoints to their type information
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TypeManifestEntry {
-    /// The alias used in the bundled .d.ts file
-    pub alias: String,
-    /// The original symbol name
-    pub original_name: String,
-    /// The source file where the type was found
-    pub source_file: String,
-    /// Whether this was an explicit annotation or inferred
+    /// HTTP method (GET, POST, PUT, DELETE, etc.)
+    pub method: String,
+    /// API path (e.g., /api/users/:id)
+    pub path: String,
+    /// Whether this is a producer or consumer
+    pub role: ManifestRole,
+    /// Whether this entry represents request or response
+    pub type_kind: ManifestTypeKind,
+    /// The type alias used in the bundled .d.ts file
+    pub type_alias: String,
+    /// Source file path where the type was found
+    pub file_path: String,
+    /// Line number in the source file
+    pub line_number: u32,
+    /// Whether the type was explicitly annotated
     pub is_explicit: bool,
-    /// Associated endpoint path (if applicable)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint_path: Option<String>,
-    /// Associated HTTP method (if applicable)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint_method: Option<String>,
+    /// Current state of the type extraction
+    pub type_state: ManifestTypeState,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -198,7 +224,6 @@ pub trait CloudStorage {
         content: &str,
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
-    async fn download_type_file_content(&self, s3_url: &str) -> Result<String, StorageError>;
 }
 
 pub fn get_current_commit_hash() -> String {

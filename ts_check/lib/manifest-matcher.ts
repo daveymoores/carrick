@@ -28,6 +28,10 @@ export interface TypeManifest {
 /**
  * A single entry in the type manifest
  */
+export type ManifestRole = 'producer' | 'consumer';
+export type ManifestTypeKind = 'request' | 'response';
+export type ManifestTypeState = 'explicit' | 'implicit' | 'unknown';
+
 export interface ManifestEntry {
   /** HTTP method (GET, POST, PUT, DELETE, etc.) */
   method: string;
@@ -36,11 +40,17 @@ export interface ManifestEntry {
   /** The type alias for this endpoint */
   type_alias: string;
   /** Whether this is a producer or consumer */
-  role: 'producer' | 'consumer';
+  role: ManifestRole;
+  /** Whether this entry represents request or response */
+  type_kind: ManifestTypeKind;
   /** Source file path where the type was found */
   file_path: string;
   /** Line number in the source file */
   line_number: number;
+  /** Whether the type was explicitly annotated */
+  is_explicit: boolean;
+  /** Current state of the type extraction */
+  type_state: ManifestTypeState;
 }
 
 /**
@@ -51,6 +61,8 @@ export interface MatchResult {
   method: string;
   /** The normalized API path */
   path: string;
+  /** The type kind being matched */
+  type_kind: ManifestTypeKind;
   /** The producer manifest entry */
   producer: ManifestEntry;
   /** The consumer manifest entry */
@@ -219,11 +231,20 @@ export class ManifestMatcher {
     if (!entry.role || !['producer', 'consumer'].includes(entry.role)) {
       throw new Error('ManifestEntry missing or invalid field: role (must be "producer" or "consumer")');
     }
+    if (!entry.type_kind || !['request', 'response'].includes(entry.type_kind)) {
+      throw new Error('ManifestEntry missing or invalid field: type_kind (must be "request" or "response")');
+    }
     if (!entry.file_path) {
       throw new Error('ManifestEntry missing required field: file_path');
     }
     if (typeof entry.line_number !== 'number') {
       throw new Error('ManifestEntry missing required field: line_number (must be a number)');
+    }
+    if (typeof entry.is_explicit !== 'boolean') {
+      throw new Error('ManifestEntry missing required field: is_explicit (must be a boolean)');
+    }
+    if (!entry.type_state || !['explicit', 'implicit', 'unknown'].includes(entry.type_state)) {
+      throw new Error('ManifestEntry missing or invalid field: type_state (must be "explicit", "implicit", or "unknown")');
     }
   }
 
@@ -238,13 +259,15 @@ export class ManifestMatcher {
   findProducersForEndpoint(
     manifest: TypeManifest,
     method: string,
-    inputPath: string
+    inputPath: string,
+    typeKind?: ManifestTypeKind
   ): ManifestEntry[] {
     const normalizedMethod = normalizeMethod(method);
     const normalizedPath = normalizePath(inputPath);
 
     return manifest.entries.filter((entry) => {
       if (entry.role !== 'producer') return false;
+      if (typeKind && entry.type_kind !== typeKind) return false;
 
       const entryMethod = normalizeMethod(entry.method);
       const entryPath = normalizePath(entry.path);
@@ -264,13 +287,15 @@ export class ManifestMatcher {
   findConsumersForEndpoint(
     manifest: TypeManifest,
     method: string,
-    inputPath: string
+    inputPath: string,
+    typeKind?: ManifestTypeKind
   ): ManifestEntry[] {
     const normalizedMethod = normalizeMethod(method);
     const normalizedPath = normalizePath(inputPath);
 
     return manifest.entries.filter((entry) => {
       if (entry.role !== 'consumer') return false;
+      if (typeKind && entry.type_kind !== typeKind) return false;
 
       const entryMethod = normalizeMethod(entry.method);
       const entryPath = normalizePath(entry.path);
@@ -285,18 +310,24 @@ export class ManifestMatcher {
    * @param manifest - The manifest to process
    * @returns Array of unique {method, path} pairs
    */
-  getUniqueEndpoints(manifest: TypeManifest): Array<{ method: string; path: string }> {
+  getUniqueEndpoints(
+    manifest: TypeManifest
+  ): Array<{ method: string; path: string; type_kind: ManifestTypeKind }> {
     const seen = new Set<string>();
-    const endpoints: Array<{ method: string; path: string }> = [];
+    const endpoints: Array<{ method: string; path: string; type_kind: ManifestTypeKind }> = [];
 
     for (const entry of manifest.entries) {
       const normalizedMethod = normalizeMethod(entry.method);
       const normalizedPath = normalizePath(entry.path);
-      const key = `${normalizedMethod} ${normalizedPath}`;
+      const key = `${normalizedMethod} ${normalizedPath} ${entry.type_kind}`;
 
       if (!seen.has(key)) {
         seen.add(key);
-        endpoints.push({ method: normalizedMethod, path: normalizedPath });
+        endpoints.push({
+          method: normalizedMethod,
+          path: normalizedPath,
+          type_kind: entry.type_kind,
+        });
       }
     }
 
@@ -343,10 +374,15 @@ export class ManifestMatcher {
         const producerMethod = normalizeMethod(producer.method);
         const producerPath = normalizePath(producer.path);
 
-        if (consumerMethod === producerMethod && consumerPath === producerPath) {
+        if (
+          consumerMethod === producerMethod &&
+          consumerPath === producerPath &&
+          consumer.type_kind === producer.type_kind
+        ) {
           matches.push({
             method: consumerMethod,
             path: consumerPath,
+            type_kind: consumer.type_kind,
             producer,
             consumer,
             match_score: this.calculateMatchScore(producer, consumer),
@@ -362,7 +398,7 @@ export class ManifestMatcher {
       if (!foundMatch) {
         orphanedConsumers.push({
           entry: consumer,
-          reason: `No producer found for ${consumer.method} ${consumer.path}`,
+          reason: `No producer found for ${consumer.method} ${consumer.path} (${consumer.type_kind})`,
         });
       }
     }
@@ -373,7 +409,7 @@ export class ManifestMatcher {
         const producer = producerEntries[pi];
         orphanedProducers.push({
           entry: producer,
-          reason: `No consumer found for ${producer.method} ${producer.path}`,
+          reason: `No consumer found for ${producer.method} ${producer.path} (${producer.type_kind})`,
         });
       }
     }
@@ -480,17 +516,23 @@ export function createManifestEntry(
   method: string,
   entryPath: string,
   typeAlias: string,
-  role: 'producer' | 'consumer',
+  role: ManifestRole,
   filePath: string,
-  lineNumber: number
+  lineNumber: number,
+  typeKind: ManifestTypeKind = 'response',
+  isExplicit: boolean = true,
+  typeState: ManifestTypeState = isExplicit ? 'explicit' : 'implicit'
 ): ManifestEntry {
   return {
     method: normalizeMethod(method),
     path: entryPath,
     type_alias: typeAlias,
     role,
+    type_kind: typeKind,
     file_path: filePath,
     line_number: lineNumber,
+    is_explicit: isExplicit,
+    type_state: typeState,
   };
 }
 

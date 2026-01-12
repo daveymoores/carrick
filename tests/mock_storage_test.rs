@@ -199,25 +199,6 @@ async fn test_upload_type_file() {
 }
 
 #[tokio::test]
-async fn test_download_type_file_content() {
-    // Given: a MockStorage instance
-    let storage = MockStorage::new();
-
-    // When: we download type file content
-    let result = storage
-        .download_type_file_content("s3://bucket/test-repo/types.ts")
-        .await;
-
-    // Then: it should return mock content
-    assert!(result.is_ok(), "Type file download should succeed");
-    let content = result.unwrap();
-    assert!(
-        content.contains("MockType"),
-        "Should contain mock type definition"
-    );
-}
-
-#[tokio::test]
 async fn test_concurrent_uploads() {
     // Given: a MockStorage instance
     let storage = std::sync::Arc::new(MockStorage::new());
