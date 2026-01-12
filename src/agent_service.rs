@@ -23,10 +23,18 @@ impl AgentService {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(20);
+        let use_system_proxy = env::var("CARRICK_USE_SYSTEM_PROXY").is_ok();
+        let mut client_builder = Client::builder();
+        if !use_system_proxy {
+            client_builder = client_builder.no_proxy();
+        }
+        let client = client_builder
+            .build()
+            .expect("Failed to build agent HTTP client");
 
         Self {
             api_key,
-            client: Client::new(),
+            client,
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
         }
     }

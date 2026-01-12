@@ -35,13 +35,13 @@ cat > "$HOOKS_DIR/pre-commit" << 'EOF'
 # Runs formatting checks, linter, and tests before allowing a commit
 #
 
-set -e  # Exit on error
+set -euo pipefail  # Exit on error and fail pipelines
 
 echo "🪢 Carrick Pre-Commit Hook"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Check if CARRICK_API_ENDPOINT is set
-if [ -z "$CARRICK_API_ENDPOINT" ]; then
+if [ -z "${CARRICK_API_ENDPOINT:-}" ]; then
     echo "⚠️  CARRICK_API_ENDPOINT not set, using default for testing"
     export CARRICK_API_ENDPOINT="https://test.example.com"
 fi
