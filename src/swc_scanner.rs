@@ -15,7 +15,7 @@
 
 use std::path::Path;
 use swc_common::{
-    SourceMap, SourceMapper,
+    SourceMap, SourceMapper, Spanned,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
@@ -34,6 +34,10 @@ pub struct CandidateTarget {
     pub callee_object: String,
     /// The callee property/method (e.g., "get", "post", "use")
     pub callee_property: Option<String>,
+    /// Name of the enclosing function (if any)
+    pub enclosing_function: Option<String>,
+    /// First-argument snippet (e.g., URL/path literal/template)
+    pub path_snippet: Option<String>,
     /// A snippet of the code at this location
     pub code_snippet: String,
 }
@@ -41,16 +45,20 @@ pub struct CandidateTarget {
 impl CandidateTarget {
     /// Format as a hint string for the LLM prompt
     pub fn format_hint(&self) -> String {
-        match &self.callee_property {
-            Some(prop) => format!(
-                "- Line {}: {}.{}(...) - `{}`",
-                self.line_number, self.callee_object, prop, self.code_snippet
-            ),
-            None => format!(
-                "- Line {}: {}(...) - `{}`",
-                self.line_number, self.callee_object, self.code_snippet
-            ),
-        }
+        let callee = match &self.callee_property {
+            Some(prop) => format!("{}.{}", self.callee_object, prop),
+            None => self.callee_object.clone(),
+        };
+        let func = self
+            .enclosing_function
+            .as_deref()
+            .unwrap_or("unknown_function");
+        let path = self.path_snippet.as_deref().unwrap_or("<path unavailable>");
+
+        format!(
+            "- Line {}: {} [fn: {}] [path: {}] - `{}`",
+            self.line_number, callee, func, path, self.code_snippet
+        )
     }
 }
 
@@ -183,6 +191,7 @@ impl SwcScanner {
 struct CandidateVisitor {
     candidates: Vec<CandidateTarget>,
     source_map: Lrc<SourceMap>,
+    function_stack: Vec<String>,
 }
 
 impl CandidateVisitor {
@@ -190,6 +199,7 @@ impl CandidateVisitor {
         Self {
             candidates: Vec::new(),
             source_map,
+            function_stack: Vec::new(),
         }
     }
 
@@ -306,6 +316,19 @@ impl CandidateVisitor {
         self.source_map.lookup_char_pos(span.lo).line
     }
 
+    fn current_function(&self) -> Option<String> {
+        self.function_stack.last().cloned()
+    }
+
+    fn extract_first_arg_snippet(&self, call: &CallExpr) -> Option<String> {
+        let arg = call.args.first()?;
+        self.source_map
+            .span_to_snippet(arg.expr.span())
+            .ok()
+            .map(|s| s.lines().next().unwrap_or("").to_string())
+            .map(|s| s.chars().take(120).collect())
+    }
+
     /// Extract callee object name from expression
     fn extract_callee_object(expr: &Expr) -> Option<String> {
         match expr {
@@ -325,16 +348,70 @@ impl CandidateVisitor {
 }
 
 impl Visit for CandidateVisitor {
+    fn visit_fn_decl(&mut self, node: &FnDecl) {
+        let name = Some(node.ident.sym.to_string());
+        self.function_stack.push(name.clone().unwrap());
+        node.visit_children_with(self);
+        self.function_stack.pop();
+    }
+
+    fn visit_fn_expr(&mut self, node: &FnExpr) {
+        if let Some(ident) = &node.ident {
+            self.function_stack.push(ident.sym.to_string());
+        }
+        node.visit_children_with(self);
+        if node.ident.is_some() {
+            self.function_stack.pop();
+        }
+    }
+
+    fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
+        self.function_stack.push("<arrow>".to_string());
+        node.visit_children_with(self);
+        self.function_stack.pop();
+    }
+
+    fn visit_class_method(&mut self, node: &ClassMethod) {
+        if let Some(name) = match &node.key {
+            PropName::Ident(id) => Some(id.sym.to_string()),
+            PropName::Str(s) => Some(s.value.to_string()),
+            _ => None,
+        } {
+            self.function_stack.push(name);
+            node.visit_children_with(self);
+            self.function_stack.pop();
+        } else {
+            node.visit_children_with(self);
+        }
+    }
+
+    fn visit_method_prop(&mut self, node: &MethodProp) {
+        if let Some(name) = match &node.key {
+            PropName::Ident(id) => Some(id.sym.to_string()),
+            PropName::Str(s) => Some(s.value.to_string()),
+            _ => None,
+        } {
+            self.function_stack.push(name);
+            node.visit_children_with(self);
+            self.function_stack.pop();
+        } else {
+            node.visit_children_with(self);
+        }
+    }
+
     fn visit_call_expr(&mut self, call: &CallExpr) {
         // Check for global fetch
         if self.is_global_fetch(&call.callee) {
             let line_number = self.get_line_number(call.span);
             let code_snippet = self.get_code_snippet(call.span);
+            let path_snippet = self.extract_first_arg_snippet(call);
 
             self.candidates.push(CandidateTarget {
                 line_number,
                 callee_object: "fetch".to_string(),
                 callee_property: None,
+                enclosing_function: self.current_function(),
+                path_snippet,
                 code_snippet,
             });
         }
@@ -371,11 +448,14 @@ impl Visit for CandidateVisitor {
                     if is_api_call {
                         let line_number = self.get_line_number(call.span);
                         let code_snippet = self.get_code_snippet(call.span);
+                        let path_snippet = self.extract_first_arg_snippet(call);
 
                         self.candidates.push(CandidateTarget {
                             line_number,
                             callee_object: obj_name.unwrap_or_else(|| "<chain>".to_string()),
                             callee_property: Some(method),
+                            enclosing_function: self.current_function(),
+                            path_snippet,
                             code_snippet,
                         });
                     }
@@ -530,12 +610,16 @@ async function fetchUser(id: string) {
             line_number: 15,
             callee_object: "app".to_string(),
             callee_property: Some("get".to_string()),
+            enclosing_function: Some("handler".to_string()),
+            path_snippet: Some("'/users'".to_string()),
             code_snippet: "app.get('/users', handler)".to_string(),
         };
 
         let hint = candidate.format_hint();
         assert!(hint.contains("Line 15"));
         assert!(hint.contains("app.get"));
+        assert!(hint.contains("handler"));
+        assert!(hint.contains("[path: '/users']"));
         assert!(hint.contains("app.get('/users', handler)"));
     }
 
