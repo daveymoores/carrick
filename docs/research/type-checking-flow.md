@@ -25,7 +25,8 @@ matching.
 
 2) AST-gated file analysis
    - SWC gatekeeper finds candidate lines.
-   - LLM extracts mounts/endpoints/data_calls from those targets.
+   - SWC also gathers call-chain context (callee text, method literal when present, URL/path literal/template, enclosing function name, argument shapes, return variable names, nearby imports) so the agent can classify without hardcoded heuristics.
+   - LLM extracts mounts/endpoints/data_calls from those targets using the provided context bundle instead of baked-in fetch/axios/`.json()` rules.
    - If the initial LLM output is suspicious, a retry is attempted.
    - We now keep the richer result if a retry drops findings.
 
@@ -100,7 +101,7 @@ filled with `unknown` during alias padding.
 - LLM sometimes sets `primary_type_symbol` to inline shapes.
   - Inline types should use `response_type_string` and skip bundling.
 - Data calls created for `.json()` parsing with malformed `method`.
-  - These should be treated as data calls but often become noisy consumers.
+  - New approach: supply the full call-chain context to the agent (upstream call, path/method literal, parsing chain, enclosing function) and have the agent classify whether a downstream consumer exists. Avoid heuristic suppression or fetch/axios hardcoding; rely on the structured context.
 
 ## How to Debug a Run
 
@@ -118,3 +119,11 @@ filled with `unknown` during alias padding.
 - Matching is based on normalized method + path + type_kind only.
 - Call-site suffixes only prevent alias collisions.
 - Type checking is only as strong as the resolved aliases in `*_types.d.ts`.
+
+## Planned Direction (Agnostic + Context-First)
+
+- Feed the agent the exact import table, AST span, and call-chain facts so it can decide if a parsing chain is an HTTP consumer. No framework- or client-specific heuristics.
+- Tighten the agent schema to require explicit classification (consumer vs. not-a-consumer) with rationale tied to the provided context bundle.
+- Keep inline payloads authoritative: when `response_type_string` is present, skip symbol bundling; if a symbol is requested, validate it against imports/locals and fall back to inference when it fails.
+- Use the sidecar/compiler to derive inline aliases from real type nodes (no LLM guesses) and to infer when symbol lookup is invalid.
+- Record stable AST coordinates (file, start, span, callee text) from SWC so the sidecar can walk to the true call expression before asking the checker for types.
