@@ -179,7 +179,13 @@ impl FileOrchestrator {
             // STEP 4: Call Gemini with Full File + Patterns + Candidate Targets
             match self
                 .file_analyzer
-                .analyze_file_with_candidates(&path_str, &content, guidance, &candidate_hints)
+                .analyze_file_with_candidates(
+                    &path_str,
+                    &content,
+                    guidance,
+                    &candidate_hints,
+                    &import_map,
+                )
                 .await
             {
                 Ok(result) => {

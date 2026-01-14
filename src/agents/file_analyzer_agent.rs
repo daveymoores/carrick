@@ -18,6 +18,7 @@ use crate::{
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Result of analyzing a single mount relationship
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +113,7 @@ impl FileAnalyzerAgent {
         guidance: &FrameworkGuidance,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Delegate to the new method with empty candidates
-        self.analyze_file_with_candidates(file_path, file_content, guidance, &[])
+        self.analyze_file_with_candidates(file_path, file_content, guidance, &[], &HashMap::new())
             .await
     }
 
@@ -137,6 +138,7 @@ impl FileAnalyzerAgent {
         file_content: &str,
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
+        import_map: &HashMap<String, String>,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -149,6 +151,7 @@ impl FileAnalyzerAgent {
             file_content,
             guidance,
             candidate_hints,
+            import_map,
         );
 
         println!("=== FILE ANALYZER AGENT (AST-GATED) ===");
@@ -400,12 +403,13 @@ impl FileAnalyzerAgent {
     fn build_system_message_with_candidates(&self) -> String {
         r#"You are the **Carrick Static Analysis Engine**.
 Your mission is to analyze a single source code file to extract structural API relationships.
-You function purely as a **Pattern Matcher** and **Alias Resolver**. You do NOT possess inherent knowledge of specific frameworks; you must rely strictly on the **ACTIVE PATTERNS** provided in the input.
+You function purely as a **Pattern Matcher** and **Alias Resolver**. You do NOT possess inherent knowledge of specific frameworks; you must rely strictly on the **ACTIVE PATTERNS** provided in the input. For data_calls, you must use the provided call-chain context and import table to decide whether the call is a downstream HTTP consumer or just parsing; do not infer from client names alone.
 
 ### INPUT DATA
 1. **Full Source Code**: The complete file content for context (imports, definitions).
 2. **Candidate Targets**: A list of specific lines where an AST parser detected potential API activity.
-3. **Active Patterns**: The specific code patterns to classify (e.g., Mounts, Endpoints).
+3. **Import Table**: AST-derived mapping of local identifiers to module sources (do not invent new sources).
+4. **Active Patterns**: The specific code patterns to classify (e.g., Mounts, Endpoints).
 
 ### CORE OBJECTIVE
 Analyze the **Full Source Code**. Focus specifically on the **Candidate Targets** to classify them, but use the surrounding code to resolve variables and imports.
@@ -415,7 +419,7 @@ Analyze the **Full Source Code**. Focus specifically on the **Candidate Targets*
 #### A. Strict Pattern Matching
 * **Endpoints:** If a target matches an `endpoint_pattern`, extract it.
 * **Mounts:** If a target matches a `mount_pattern`, extract it.
-* **Data Calls:** If a target matches a `data_fetching_pattern`, extract it.
+* **Data Calls:** If a target matches a `data_fetching_pattern`, extract it. Use the provided call-chain context and import table; decide if it is a downstream HTTP consumer vs. pure parsing. Do not rely on hardcoded client heuristics.
 * **Filter Noise:** The AST parser is broad. If a "Candidate Target" does not strictly match an Active Pattern (e.g., it's just a comment or unrelated function call), IGNORE it.
 
 #### B. Variable & Alias Resolution (CRITICAL)
@@ -442,7 +446,7 @@ When a variable is used in a mount and that variable was imported, include the i
 * **Default exports:** If the file exports a router/app as default and it's mounted elsewhere, the child_node should be the imported name.
 * **Re-exports:** Track the original source, not intermediate re-exports.
 * **Dynamic imports:** Record import_source as the string literal if available, otherwise null.
-* **response.json()/.text():** These are data_calls when they appear after fetch/axios calls to parse response data.
+* **response.json()/.text():** Treat these as data_calls only when they are part of an actual downstream HTTP consumer. Use the provided call-chain context (upstream call, path/method literal, enclosing function) to decide; avoid framework/client-specific heuristics.
 
 ### 5. RESPONSE TYPE EXTRACTION (CRITICAL FOR TYPE CHECKING)
 For endpoints and data calls, you MUST extract TypeScript type annotations when present:
@@ -489,7 +493,13 @@ For every response_type_string you extract, also extract:
         file_content: &str,
         guidance: &FrameworkGuidance,
     ) -> String {
-        self.build_user_message_with_candidates(file_path, file_content, guidance, &[])
+        self.build_user_message_with_candidates(
+            file_path,
+            file_content,
+            guidance,
+            &[],
+            &HashMap::new(),
+        )
     }
 
     /// Build the dynamic user message with patterns, file content, and candidate targets.
@@ -499,6 +509,7 @@ For every response_type_string you extract, also extract:
         file_content: &str,
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
+        import_map: &HashMap<String, String>,
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
@@ -511,6 +522,23 @@ For every response_type_string you extract, also extract:
             format!(
                 "The following lines triggered the AST parser. Analyze these specific locations:\n{}",
                 candidate_hints.join("\n")
+            )
+        };
+
+        // Deterministic import map formatting
+        let mut imports: Vec<_> = import_map.iter().collect();
+        imports.sort_by(|a, b| a.0.cmp(b.0));
+        let imports_section = if imports.is_empty() {
+            "No imports detected by AST; treat all symbols as local unless resolved in code."
+                .to_string()
+        } else {
+            let lines: Vec<String> = imports
+                .iter()
+                .map(|(local, source)| format!(r#"  - "{}" -> "{}""#, local, source))
+                .collect();
+            format!(
+                "Resolved import table (AST-derived):\n{}\nUse this table for symbol grounding; do NOT invent sources.",
+                lines.join("\n")
             )
         };
 
@@ -529,6 +557,9 @@ For every response_type_string you extract, also extract:
 }}
 
 ### CANDIDATE TARGETS (AST-Detected Hints)
+{}
+
+### IMPORT TABLE (Do not hallucinate sources)
 {}
 
 ### FRAMEWORK-SPECIFIC HINTS
@@ -563,6 +594,7 @@ Return ONLY the JSON object, no explanations."#,
             endpoint_patterns,
             data_patterns,
             candidates_section,
+            imports_section,
             guidance.triage_hints,
             file_path,
             file_content
@@ -596,6 +628,7 @@ Return ONLY the JSON object, no explanations."#,
 mod tests {
     use super::*;
     use crate::agents::framework_guidance_agent::PatternExample;
+    use std::collections::HashMap;
 
     fn create_test_guidance() -> FrameworkGuidance {
         FrameworkGuidance {
@@ -909,6 +942,34 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
     }
 
     #[test]
+    fn test_build_user_message_includes_import_table_and_candidates() {
+        let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
+        let guidance = create_test_guidance();
+        let file_content = r#"
+import { User } from './types';
+const data = await fetch('/api/users').then(resp => resp.json());
+"#;
+
+        let candidates = vec!["- Line 3: fetch(...) - `fetch('/api/users')`".to_string()];
+        let mut import_map = HashMap::new();
+        import_map.insert("User".to_string(), "./types".to_string());
+        import_map.insert("useUsers".to_string(), "../hooks".to_string());
+
+        let message = agent.build_user_message_with_candidates(
+            "test.ts",
+            file_content,
+            &guidance,
+            &candidates,
+            &import_map,
+        );
+
+        assert!(message.contains("IMPORT TABLE"));
+        assert!(message.contains(r#""User" -> "./types""#));
+        assert!(message.contains("CANDIDATE TARGETS"));
+        assert!(message.contains("Line 3"));
+    }
+
+    #[test]
     fn test_system_message_is_framework_agnostic() {
         let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
         let system_message = agent.build_system_message();
@@ -919,6 +980,8 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
         assert!(system_message.contains("Alias Resolver"));
         assert!(system_message.contains("ACTIVE PATTERNS"));
         assert!(system_message.contains("import_source"));
+        assert!(system_message.contains("call-chain context"));
+        assert!(system_message.contains("Import Table"));
 
         // Verify it emphasizes pattern-based matching
         assert!(system_message.contains("Strict Pattern Matching"));
