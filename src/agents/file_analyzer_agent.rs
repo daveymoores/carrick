@@ -113,8 +113,15 @@ impl FileAnalyzerAgent {
         guidance: &FrameworkGuidance,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Delegate to the new method with empty candidates
-        self.analyze_file_with_candidates(file_path, file_content, guidance, &[], &HashMap::new())
-            .await
+        self.analyze_file_with_candidates(
+            file_path,
+            file_content,
+            guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+        )
+        .await
     }
 
     /// Analyze a single file with AST-detected candidate targets.
@@ -129,6 +136,7 @@ impl FileAnalyzerAgent {
     /// * `file_content` - Full content of the file
     /// * `guidance` - Framework-specific patterns to use for matching
     /// * `candidate_hints` - AST-detected candidate lines (formatted hints from SWC Scanner)
+    /// * `candidate_contexts` - Structured candidate details (JSON strings)
     ///
     /// # Returns
     /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
@@ -138,6 +146,7 @@ impl FileAnalyzerAgent {
         file_content: &str,
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
+        candidate_contexts: &[String],
         import_map: &HashMap<String, String>,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
@@ -151,6 +160,7 @@ impl FileAnalyzerAgent {
             file_content,
             guidance,
             candidate_hints,
+            candidate_contexts,
             import_map,
         );
 
@@ -498,6 +508,7 @@ For every response_type_string you extract, also extract:
             file_content,
             guidance,
             &[],
+            &[],
             &HashMap::new(),
         )
     }
@@ -509,6 +520,7 @@ For every response_type_string you extract, also extract:
         file_content: &str,
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
+        candidate_contexts: &[String],
         import_map: &HashMap<String, String>,
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
@@ -522,6 +534,15 @@ For every response_type_string you extract, also extract:
             format!(
                 "The following lines triggered the AST parser. Analyze these specific locations:\n{}",
                 candidate_hints.join("\n")
+            )
+        };
+
+        let candidate_contexts_section = if candidate_contexts.is_empty() {
+            "No structured candidate contexts provided.".to_string()
+        } else {
+            format!(
+                "Structured candidate contexts (JSON, one per candidate):\n{}",
+                candidate_contexts.join("\n")
             )
         };
 
@@ -559,6 +580,9 @@ For every response_type_string you extract, also extract:
 ### CANDIDATE TARGETS (AST-Detected Hints)
 {}
 
+### CANDIDATE CONTEXT (Structured JSON)
+{}
+
 ### IMPORT TABLE (Do not hallucinate sources)
 {}
 
@@ -594,6 +618,7 @@ Return ONLY the JSON object, no explanations."#,
             endpoint_patterns,
             data_patterns,
             candidates_section,
+            candidate_contexts_section,
             imports_section,
             guidance.triage_hints,
             file_path,
@@ -951,6 +976,8 @@ const data = await fetch('/api/users').then(resp => resp.json());
 "#;
 
         let candidates = vec!["- Line 3: fetch(...) - `fetch('/api/users')`".to_string()];
+        let candidate_contexts: Vec<String> =
+            vec![r#"{"line":3,"callee":"fetch","path":"/api/users","fn":"getData"}"#.to_string()];
         let mut import_map = HashMap::new();
         import_map.insert("User".to_string(), "./types".to_string());
         import_map.insert("useUsers".to_string(), "../hooks".to_string());
@@ -960,6 +987,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             file_content,
             &guidance,
             &candidates,
+            &candidate_contexts,
             &import_map,
         );
 
@@ -967,6 +995,8 @@ const data = await fetch('/api/users').then(resp => resp.json());
         assert!(message.contains(r#""User" -> "./types""#));
         assert!(message.contains("CANDIDATE TARGETS"));
         assert!(message.contains("Line 3"));
+        assert!(message.contains("CANDIDATE CONTEXT"));
+        assert!(message.contains("/api/users"));
     }
 
     #[test]

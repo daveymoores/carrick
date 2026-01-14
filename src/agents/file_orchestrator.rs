@@ -173,6 +173,11 @@ impl FileOrchestrator {
                 .iter()
                 .map(|c| c.format_hint())
                 .collect();
+            let candidate_contexts: Vec<String> = scan_result
+                .candidates
+                .iter()
+                .map(|c| serde_json::to_string(c).unwrap_or_default())
+                .collect();
 
             let import_map = Self::extract_import_map(file_path, &cm, &handler);
 
@@ -184,6 +189,7 @@ impl FileOrchestrator {
                     &content,
                     guidance,
                     &candidate_hints,
+                    &candidate_contexts,
                     &import_map,
                 )
                 .await

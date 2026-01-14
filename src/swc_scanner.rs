@@ -13,6 +13,7 @@
 //! The legacy TypePositionFinder and related code has been removed as part
 //! of the compiler sidecar architecture migration.
 
+use serde::Serialize;
 use std::path::Path;
 use swc_common::{
     SourceMap, SourceMapper, Spanned,
@@ -26,7 +27,7 @@ use crate::parser::parse_file;
 
 /// A candidate API call site detected by the SWC scanner.
 /// This is passed as a "hint" to the LLM to ensure 100% recall.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CandidateTarget {
     /// 1-based line number where the call was detected
     pub line_number: usize,
