@@ -11,7 +11,8 @@ use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::services::TypeSidecar;
 use crate::type_manifest::{
-    build_manifest_type_alias, normalize_manifest_method, parse_file_location,
+    build_call_site_id, build_manifest_type_alias_with_call_id, normalize_manifest_method,
+    parse_file_location,
 };
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
@@ -327,13 +328,18 @@ fn build_type_manifest_entries(
             ManifestRole::Producer,
             &file_path,
             line_number,
+            None,
         );
     }
 
     for call in mount_graph.get_data_calls() {
+        if !normalizer.is_probable_url(&call.target_url) {
+            continue;
+        }
+        let (file_path, line_number) = parse_file_location(&call.file_location);
         let method = normalize_manifest_method(&call.method);
         let path = normalizer.extract_path(&call.target_url);
-        let (file_path, line_number) = parse_file_location(&call.file_location);
+        let call_id = build_call_site_id(&file_path, line_number, &method, &path);
 
         add_manifest_pair(
             &mut entries,
@@ -342,6 +348,7 @@ fn build_type_manifest_entries(
             ManifestRole::Consumer,
             &file_path,
             line_number,
+            Some(&call_id),
         );
     }
 
@@ -355,9 +362,11 @@ fn add_manifest_pair(
     role: ManifestRole,
     file_path: &str,
     line_number: u32,
+    call_id: Option<&str>,
 ) {
     for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
-        let type_alias = build_manifest_type_alias(method, path, role, type_kind);
+        let type_alias =
+            build_manifest_type_alias_with_call_id(method, path, role, type_kind, call_id);
         entries.push(TypeManifestEntry {
             method: method.to_string(),
             path: path.to_string(),

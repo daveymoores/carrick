@@ -387,6 +387,35 @@ impl UrlNormalizer {
     pub fn extract_path(&self, url: &str) -> String {
         self.normalize(url).path
     }
+
+    /// Heuristic check for URL-like inputs to avoid matching variable names as paths.
+    pub fn is_probable_url(&self, url: &str) -> bool {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if trimmed.starts_with("ENV_VAR:") {
+            return true;
+        }
+
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("//")
+        {
+            return true;
+        }
+
+        if trimmed.contains("process.env.") || trimmed.contains("${") {
+            return true;
+        }
+
+        if trimmed.starts_with('/') || trimmed.contains('/') {
+            return true;
+        }
+
+        false
+    }
 }
 
 impl Default for UrlNormalizer {
@@ -587,6 +616,22 @@ mod tests {
         let path = normalizer.extract_path("https://example.com/api/users?page=1");
 
         assert_eq!(path, "/api/users");
+    }
+
+    #[test]
+    fn test_is_probable_url() {
+        let normalizer = UrlNormalizer::default_permissive();
+
+        assert!(normalizer.is_probable_url("/users/123"));
+        assert!(normalizer.is_probable_url("https://example.com/api/users"));
+        assert!(normalizer.is_probable_url("ENV_VAR:API_URL:/users"));
+        assert!(normalizer.is_probable_url("process.env.API_URL + \"/users\""));
+        assert!(normalizer.is_probable_url("${API_URL}/users/${userId}"));
+        assert!(normalizer.is_probable_url("api/users"));
+
+        assert!(!normalizer.is_probable_url("ordersResp"));
+        assert!(!normalizer.is_probable_url("resp.json()"));
+        assert!(!normalizer.is_probable_url(""));
     }
 
     #[test]

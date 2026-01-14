@@ -256,15 +256,10 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const node = this.findNodeAtLine(sourceFile, request.line_number);
-    if (!node) return null;
-
-    // Find the nearest call expression
-    const callExpr =
-      node.getKind() === SyntaxKind.CallExpression
-        ? (node as CallExpression)
-        : node.getFirstAncestorByKind(SyntaxKind.CallExpression);
-
+    const callExpr = this.findCallExpressionAtLine(
+      sourceFile,
+      request.line_number
+    );
     if (!callExpr) {
       this.log(`No call expression found at line ${request.line_number}`);
       return null;
@@ -355,12 +350,10 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const node = this.findNodeAtLine(sourceFile, request.line_number);
-    const callExpr =
-      node?.getKind() === SyntaxKind.CallExpression
-        ? (node as CallExpression)
-        : node?.getFirstAncestorByKind(SyntaxKind.CallExpression);
-
+    const callExpr = this.findCallExpressionAtLine(
+      sourceFile,
+      request.line_number
+    );
     if (callExpr) {
       const payloadType = this.extractRequestPayloadFromCall(callExpr);
       if (payloadType) {
@@ -692,6 +685,43 @@ export class TypeInferrer {
 
     // Return the first meaningful node on this line
     return nodesOnLine[0];
+  }
+
+  /**
+   * Find the most specific call expression that covers a given line.
+   */
+  private findCallExpressionAtLine(
+    sourceFile: SourceFile,
+    line: number
+  ): CallExpression | null {
+    const callExpressions = sourceFile.getDescendantsOfKind(
+      SyntaxKind.CallExpression
+    );
+    const candidates = callExpressions.filter((call) => {
+      const start = call.getStartLineNumber();
+      const end = call.getEndLineNumber();
+      return line >= start && line <= end;
+    });
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    return candidates.reduce((best, current) => {
+      const bestRange =
+        best.getEndLineNumber() - best.getStartLineNumber();
+      const currentRange =
+        current.getEndLineNumber() - current.getStartLineNumber();
+      if (currentRange !== bestRange) {
+        return currentRange < bestRange ? current : best;
+      }
+      const bestDelta = Math.abs(line - best.getStartLineNumber());
+      const currentDelta = Math.abs(line - current.getStartLineNumber());
+      if (currentDelta !== bestDelta) {
+        return currentDelta < bestDelta ? current : best;
+      }
+      return best;
+    });
   }
 
   // ===========================================================================

@@ -26,15 +26,26 @@ use crate::{
     config::Config,
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
+    parser::parse_file,
     services::type_sidecar::{
         InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult, TypeSidecar,
     },
     swc_scanner::SwcScanner,
-    type_manifest::{build_manifest_type_alias, normalize_manifest_method, parse_file_location},
+    type_manifest::{
+        build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
+        normalize_manifest_method, parse_file_location,
+    },
     url_normalizer::UrlNormalizer,
+    visitor::ImportSymbolExtractor,
 };
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use swc_common::{
+    SourceMap,
+    errors::{ColorConfig, Handler},
+    sync::Lrc,
+};
+use swc_ecma_visit::VisitWith;
 
 /// Complete result of file-centric analysis
 #[derive(Debug)]
@@ -63,6 +74,9 @@ pub struct ProcessingStats {
     pub total_data_calls: usize,
     pub errors: Vec<String>,
 }
+
+type EndpointLookup = HashMap<(String, u32), Vec<(String, String)>>;
+type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
 
 /// Orchestrates file-centric analysis using the FileAnalyzerAgent.
 ///
@@ -110,6 +124,8 @@ impl FileOrchestrator {
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
         // Process each file with AST gatekeeper
         for file_path in files {
@@ -158,6 +174,8 @@ impl FileOrchestrator {
                 .map(|c| c.format_hint())
                 .collect();
 
+            let import_map = Self::extract_import_map(file_path, &cm, &handler);
+
             // STEP 4: Call Gemini with Full File + Patterns + Candidate Targets
             match self
                 .file_analyzer
@@ -168,11 +186,14 @@ impl FileOrchestrator {
                     // Note: Type positions are now resolved by the TypeSidecar (src/sidecar)
                     // using the compiler-based approach instead of position-based extraction.
 
-                    stats.total_mounts += result.mounts.len();
-                    stats.total_endpoints += result.endpoints.len();
-                    stats.total_data_calls += result.data_calls.len();
+                    let mut adjusted = result;
+                    Self::reconcile_type_import_sources(&mut adjusted, &import_map);
+
+                    stats.total_mounts += adjusted.mounts.len();
+                    stats.total_endpoints += adjusted.endpoints.len();
+                    stats.total_data_calls += adjusted.data_calls.len();
                     stats.files_processed += 1;
-                    file_results.insert(path_str, result);
+                    file_results.insert(path_str, adjusted);
                 }
                 Err(e) => {
                     stats
@@ -223,7 +244,11 @@ impl FileOrchestrator {
         repo_path: &str,
         mount_graph: &MountGraph,
         config: &Config,
-    ) -> (Vec<SymbolRequest>, Vec<InferRequestItem>) {
+    ) -> (
+        Vec<SymbolRequest>,
+        Vec<InferRequestItem>,
+        Vec<(String, String)>,
+    ) {
         // Convert repo_path to absolute for path resolution
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
@@ -239,8 +264,9 @@ impl FileOrchestrator {
         let normalizer = UrlNormalizer::new(config);
         let mut explicit_requests: Vec<SymbolRequest> = Vec::new();
         let mut infer_requests: Vec<InferRequestItem> = Vec::new();
-        let mut endpoint_lookup: HashMap<(String, u32), (String, String)> = HashMap::new();
-        let mut data_call_lookup: HashMap<(String, u32), (String, String)> = HashMap::new();
+        let mut endpoint_lookup: EndpointLookup = HashMap::new();
+        let mut data_call_lookup: DataCallLookup = HashMap::new();
+        let mut inline_aliases: Vec<(String, String)> = Vec::new();
         let should_infer_request_body = |method: &str| {
             matches!(
                 method,
@@ -251,17 +277,24 @@ impl FileOrchestrator {
         for endpoint in mount_graph.get_resolved_endpoints() {
             let (file_path, line_number) = parse_file_location(&endpoint.file_location);
             let method = normalize_manifest_method(&endpoint.method);
-            endpoint_lookup.insert(
-                (file_path, line_number),
-                (method, endpoint.full_path.clone()),
-            );
+            endpoint_lookup
+                .entry((file_path, line_number))
+                .or_default()
+                .push((method, endpoint.full_path.clone()));
         }
 
         for data_call in mount_graph.get_data_calls() {
+            if !normalizer.is_probable_url(&data_call.target_url) {
+                continue;
+            }
             let (file_path, line_number) = parse_file_location(&data_call.file_location);
             let method = normalize_manifest_method(&data_call.method);
             let path = normalizer.extract_path(&data_call.target_url);
-            data_call_lookup.insert((file_path, line_number), (method, path));
+            let call_id = build_call_site_id(&file_path, line_number, &method, &path);
+            data_call_lookup
+                .entry((file_path, line_number))
+                .or_default()
+                .push((method, path, call_id));
         }
 
         for (file_path, result) in file_results {
@@ -276,14 +309,28 @@ impl FileOrchestrator {
                     endpoint.line_number as u32
                 };
                 let lookup_key = (file_path.clone(), line_number);
-                let (method, path) =
-                    endpoint_lookup
-                        .get(&lookup_key)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let method = normalize_manifest_method(&endpoint.method);
-                            (method, endpoint.path.clone())
-                        });
+                let method_fallback = normalize_manifest_method(&endpoint.method);
+                let (method, path) = endpoint_lookup
+                    .get(&lookup_key)
+                    .and_then(|entries| {
+                        if entries.len() == 1 {
+                            return Some(entries[0].clone());
+                        }
+                        entries
+                            .iter()
+                            .find(|(entry_method, entry_path)| {
+                                entry_method == &method_fallback
+                                    && (entry_path == &endpoint.path
+                                        || entry_path.ends_with(&endpoint.path))
+                            })
+                            .or_else(|| {
+                                entries
+                                    .iter()
+                                    .find(|(entry_method, _)| entry_method == &method_fallback)
+                            })
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| (method_fallback.clone(), endpoint.path.clone()));
                 let response_alias = build_manifest_type_alias(
                     &method,
                     &path,
@@ -297,35 +344,54 @@ impl FileOrchestrator {
                     ManifestTypeKind::Request,
                 );
 
-                if let (Some(symbol), Some(import_source)) =
-                    (&endpoint.primary_type_symbol, &endpoint.type_import_source)
-                {
-                    // Explicit type with import source - bundle it
-                    explicit_requests.push(SymbolRequest {
-                        symbol_name: symbol.clone(),
-                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
-                        alias: Some(response_alias.clone()),
-                    });
-                } else if endpoint.primary_type_symbol.is_some()
-                    && endpoint.type_import_source.is_none()
-                {
-                    // Type symbol exists but no import - it might be in the same file
-                    if let Some(ref symbol) = endpoint.primary_type_symbol {
+                let inline_override = endpoint
+                    .response_type_string
+                    .as_deref()
+                    .map(Self::should_use_inline_type)
+                    .unwrap_or(false);
+
+                if let Some(ref response_type_string) = endpoint.response_type_string {
+                    if inline_override {
+                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
+                    }
+                }
+
+                if !inline_override {
+                    if let (Some(symbol), Some(import_source)) =
+                        (&endpoint.primary_type_symbol, &endpoint.type_import_source)
+                    {
+                        // Explicit type with import source - bundle it
                         explicit_requests.push(SymbolRequest {
                             symbol_name: symbol.clone(),
-                            source_file: file_path_absolute.clone(),
+                            source_file: Self::resolve_import_path(
+                                &file_path_absolute,
+                                import_source,
+                            ),
+                            alias: Some(response_alias.clone()),
+                        });
+                    } else if endpoint.primary_type_symbol.is_some()
+                        && endpoint.type_import_source.is_none()
+                    {
+                        // Type symbol exists but no import - it might be in the same file
+                        if let Some(ref symbol) = endpoint.primary_type_symbol {
+                            explicit_requests.push(SymbolRequest {
+                                symbol_name: symbol.clone(),
+                                source_file: file_path_absolute.clone(),
+                                alias: Some(response_alias.clone()),
+                            });
+                        }
+                    } else if let Some(ref response_type_string) = endpoint.response_type_string {
+                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
+                    } else if endpoint.response_type_string.is_none() {
+                        // No explicit type - try to infer it
+                        // Try response_body inference first, then function_return
+                        infer_requests.push(InferRequestItem {
+                            file_path: file_path_absolute.clone(),
+                            line_number,
+                            infer_kind: InferKind::ResponseBody,
                             alias: Some(response_alias.clone()),
                         });
                     }
-                } else if endpoint.response_type_string.is_none() {
-                    // No explicit type - try to infer it
-                    // Try response_body inference first, then function_return
-                    infer_requests.push(InferRequestItem {
-                        file_path: file_path_absolute.clone(),
-                        line_number,
-                        infer_kind: InferKind::ResponseBody,
-                        alias: Some(response_alias.clone()),
-                    });
                 }
 
                 if should_infer_request_body(&method) {
@@ -345,60 +411,106 @@ impl FileOrchestrator {
                 } else {
                     data_call.line_number as u32
                 };
+                if !normalizer.is_probable_url(&data_call.target) {
+                    continue;
+                }
                 let lookup_key = (file_path.clone(), line_number);
-                let (method, path) =
-                    data_call_lookup
-                        .get(&lookup_key)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let method = normalize_manifest_method(
-                                data_call.method.as_deref().unwrap_or("GET"),
-                            );
-                            let path = normalizer.extract_path(&data_call.target);
-                            (method, path)
-                        });
-                let response_alias = build_manifest_type_alias(
+                let method_fallback =
+                    normalize_manifest_method(data_call.method.as_deref().unwrap_or("GET"));
+                let target_path = normalizer.extract_path(&data_call.target);
+                let (method, path, call_id) = data_call_lookup
+                    .get(&lookup_key)
+                    .and_then(|entries| {
+                        if entries.len() == 1 {
+                            return Some(entries[0].clone());
+                        }
+                        entries
+                            .iter()
+                            .find(|(entry_method, entry_path, _)| {
+                                entry_method == &method_fallback && entry_path == &target_path
+                            })
+                            .or_else(|| {
+                                entries
+                                    .iter()
+                                    .find(|(entry_method, _, _)| entry_method == &method_fallback)
+                            })
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            method_fallback.clone(),
+                            target_path.clone(),
+                            build_call_site_id(
+                                file_path,
+                                line_number,
+                                &method_fallback,
+                                &target_path,
+                            ),
+                        )
+                    });
+                let response_alias = build_manifest_type_alias_with_call_id(
                     &method,
                     &path,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Response,
+                    Some(&call_id),
                 );
-                let request_alias = build_manifest_type_alias(
+                let request_alias = build_manifest_type_alias_with_call_id(
                     &method,
                     &path,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Request,
+                    Some(&call_id),
                 );
 
-                if let (Some(symbol), Some(import_source)) = (
-                    &data_call.primary_type_symbol,
-                    &data_call.type_import_source,
-                ) {
-                    // Explicit type with import source - bundle it
-                    explicit_requests.push(SymbolRequest {
-                        symbol_name: symbol.clone(),
-                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
-                        alias: Some(response_alias.clone()),
-                    });
-                } else if data_call.primary_type_symbol.is_some()
-                    && data_call.type_import_source.is_none()
-                {
-                    // Type symbol exists but no import - it might be in the same file
-                    if let Some(ref symbol) = data_call.primary_type_symbol {
+                let inline_override = data_call
+                    .response_type_string
+                    .as_deref()
+                    .map(Self::should_use_inline_type)
+                    .unwrap_or(false);
+
+                if let Some(ref response_type_string) = data_call.response_type_string {
+                    if inline_override {
+                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
+                    }
+                }
+
+                if !inline_override {
+                    if let (Some(symbol), Some(import_source)) = (
+                        &data_call.primary_type_symbol,
+                        &data_call.type_import_source,
+                    ) {
+                        // Explicit type with import source - bundle it
                         explicit_requests.push(SymbolRequest {
                             symbol_name: symbol.clone(),
-                            source_file: file_path_absolute.clone(),
+                            source_file: Self::resolve_import_path(
+                                &file_path_absolute,
+                                import_source,
+                            ),
+                            alias: Some(response_alias.clone()),
+                        });
+                    } else if data_call.primary_type_symbol.is_some()
+                        && data_call.type_import_source.is_none()
+                    {
+                        // Type symbol exists but no import - it might be in the same file
+                        if let Some(ref symbol) = data_call.primary_type_symbol {
+                            explicit_requests.push(SymbolRequest {
+                                symbol_name: symbol.clone(),
+                                source_file: file_path_absolute.clone(),
+                                alias: Some(response_alias.clone()),
+                            });
+                        }
+                    } else if let Some(ref response_type_string) = data_call.response_type_string {
+                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
+                    } else if data_call.response_type_string.is_none() {
+                        // No explicit type - try to infer it
+                        infer_requests.push(InferRequestItem {
+                            file_path: file_path_absolute.clone(),
+                            line_number,
+                            infer_kind: InferKind::CallResult,
                             alias: Some(response_alias.clone()),
                         });
                     }
-                } else if data_call.response_type_string.is_none() {
-                    // No explicit type - try to infer it
-                    infer_requests.push(InferRequestItem {
-                        file_path: file_path_absolute.clone(),
-                        line_number,
-                        infer_kind: InferKind::CallResult,
-                        alias: Some(response_alias.clone()),
-                    });
                 }
 
                 if should_infer_request_body(&method) {
@@ -413,12 +525,80 @@ impl FileOrchestrator {
         }
 
         eprintln!(
-            "[FileOrchestrator] Collected {} explicit type requests, {} inference requests",
+            "[FileOrchestrator] Collected {} explicit type requests, {} inference requests, {} inline aliases",
             explicit_requests.len(),
-            infer_requests.len()
+            infer_requests.len(),
+            inline_aliases.len()
         );
 
-        (explicit_requests, infer_requests)
+        (explicit_requests, infer_requests, inline_aliases)
+    }
+
+    fn extract_import_map(
+        file_path: &Path,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) -> HashMap<String, String> {
+        let mut import_map = HashMap::new();
+        let Some(module) = parse_file(file_path, cm, handler) else {
+            return import_map;
+        };
+
+        let mut import_extractor = ImportSymbolExtractor::new();
+        module.visit_with(&mut import_extractor);
+
+        for (local_name, symbol) in import_extractor.imported_symbols {
+            import_map.insert(local_name, symbol.source);
+        }
+
+        import_map
+    }
+
+    fn reconcile_type_import_sources(
+        result: &mut FileAnalysisResult,
+        import_map: &HashMap<String, String>,
+    ) {
+        let import_sources: HashSet<String> = import_map.values().cloned().collect();
+
+        let reconcile = |primary: &mut Option<String>, source: &mut Option<String>| {
+            if let Some(symbol) = primary.as_ref() {
+                if let Some(actual_source) = import_map.get(symbol) {
+                    *source = Some(actual_source.clone());
+                    return;
+                }
+            }
+
+            let Some(value) = source.as_ref() else {
+                return;
+            };
+
+            if value.starts_with('.') || value.starts_with('/') {
+                return;
+            }
+
+            if import_sources.contains(value) {
+                return;
+            }
+
+            *source = None;
+            if primary.is_some() {
+                *primary = None;
+            }
+        };
+
+        for endpoint in &mut result.endpoints {
+            reconcile(
+                &mut endpoint.primary_type_symbol,
+                &mut endpoint.type_import_source,
+            );
+        }
+
+        for data_call in &mut result.data_calls {
+            reconcile(
+                &mut data_call.primary_type_symbol,
+                &mut data_call.type_import_source,
+            );
+        }
     }
 
     /// Resolve types using the TypeSidecar.
@@ -440,7 +620,7 @@ impl FileOrchestrator {
         mount_graph: &MountGraph,
         config: &Config,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (explicit, infer) =
+        let (explicit, infer, inline_aliases) =
             self.collect_type_requests(file_results, repo_path, mount_graph, config);
 
         eprintln!(
@@ -452,6 +632,8 @@ impl FileOrchestrator {
         let result = sidecar
             .resolve_all_types(&explicit, &infer)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+        let result = self.append_inline_aliases(result, inline_aliases);
 
         // Log results
         eprintln!(
@@ -469,6 +651,42 @@ impl FileOrchestrator {
         }
 
         Ok(result)
+    }
+
+    fn append_inline_aliases(
+        &self,
+        mut result: TypeResolutionResult,
+        inline_aliases: Vec<(String, String)>,
+    ) -> TypeResolutionResult {
+        if inline_aliases.is_empty() {
+            return result;
+        }
+
+        let mut combined = result.dts_content.take().unwrap_or_default();
+        let mut seen = HashSet::new();
+
+        for (alias, type_string) in inline_aliases {
+            if !seen.insert(alias.clone()) {
+                continue;
+            }
+            if Self::dts_defines_alias(&combined, &alias) {
+                continue;
+            }
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str("export type ");
+            combined.push_str(&alias);
+            combined.push_str(" = ");
+            combined.push_str(type_string.trim().trim_end_matches(';'));
+            combined.push_str(";\n");
+        }
+
+        if !combined.is_empty() {
+            result.dts_content = Some(combined);
+        }
+
+        result
     }
 
     /// Convert a file path to an absolute path.
@@ -533,6 +751,19 @@ impl FileOrchestrator {
             .canonicalize()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or(with_extension)
+    }
+
+    fn dts_defines_alias(content: &str, alias: &str) -> bool {
+        let escaped = regex::escape(alias);
+        let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
+        match regex::Regex::new(&pattern) {
+            Ok(re) => re.is_match(content),
+            Err(_) => false,
+        }
+    }
+
+    fn should_use_inline_type(response_type: &str) -> bool {
+        response_type.contains('{') || response_type.contains('|') || response_type.contains('&')
     }
 
     /// Build a MountGraph from aggregated file analysis results.
@@ -750,8 +981,25 @@ impl FileOrchestrator {
         // Apply prefixes to endpoints
         for endpoint in &mut graph.endpoints {
             if let Some(prefix) = owner_prefixes.get(&endpoint.owner) {
-                endpoint.full_path = format!("{}{}", prefix, endpoint.path);
+                endpoint.full_path = Self::join_paths(prefix, &endpoint.path);
             }
+        }
+    }
+
+    fn join_paths(prefix: &str, path: &str) -> String {
+        let trimmed_prefix = prefix.trim_end_matches('/');
+        let trimmed_path = path.trim_start_matches('/');
+
+        if trimmed_prefix.is_empty() {
+            if trimmed_path.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", trimmed_path)
+            }
+        } else if trimmed_path.is_empty() {
+            trimmed_prefix.to_string()
+        } else {
+            format!("{}/{}", trimmed_prefix, trimmed_path)
         }
     }
 }
@@ -825,6 +1073,18 @@ mod tests {
     }
 
     #[test]
+    fn test_join_paths_avoids_double_slashes() {
+        assert_eq!(FileOrchestrator::join_paths("/", "/users"), "/users");
+        assert_eq!(FileOrchestrator::join_paths("/api", "/users"), "/api/users");
+        assert_eq!(
+            FileOrchestrator::join_paths("/api/", "/users"),
+            "/api/users"
+        );
+        assert_eq!(FileOrchestrator::join_paths("", "/users"), "/users");
+        assert_eq!(FileOrchestrator::join_paths("/api", "/"), "/api");
+    }
+
+    #[test]
     fn test_build_mount_graph_with_data_calls() {
         let agent_service = AgentService::new("mock".to_string());
         let orchestrator = FileOrchestrator::new(agent_service);
@@ -857,6 +1117,150 @@ mod tests {
             "https://api.example.com/data"
         );
         assert_eq!(graph.data_calls[0].method, "POST");
+    }
+
+    #[test]
+    fn test_collect_type_requests_skips_non_url_data_calls() {
+        let agent_service = AgentService::new("mock".to_string());
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    DataCallResult {
+                        line_number: 12,
+                        target: "ordersResp".to_string(),
+                        method: Some("GET".to_string()),
+                        pattern_matched: "resp.json()".to_string(),
+                        response_type_file: None,
+                        response_type_position: None,
+                        response_type_string: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    },
+                    DataCallResult {
+                        line_number: 15,
+                        target: "https://api.example.com/data".to_string(),
+                        method: Some("GET".to_string()),
+                        pattern_matched: "fetch(".to_string(),
+                        response_type_file: None,
+                        response_type_position: None,
+                        response_type_string: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    },
+                ],
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(&file_results);
+        let config = Config::default();
+        let (_explicit, infer, _inline) =
+            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+
+        assert_eq!(infer.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_type_requests_assigns_call_ids() {
+        let agent_service = AgentService::new("mock".to_string());
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    DataCallResult {
+                        line_number: 10,
+                        target: "https://api.example.com/orders".to_string(),
+                        method: Some("GET".to_string()),
+                        pattern_matched: "fetch(".to_string(),
+                        response_type_file: None,
+                        response_type_position: None,
+                        response_type_string: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    },
+                    DataCallResult {
+                        line_number: 20,
+                        target: "https://api.example.com/orders".to_string(),
+                        method: Some("GET".to_string()),
+                        pattern_matched: "fetch(".to_string(),
+                        response_type_file: None,
+                        response_type_position: None,
+                        response_type_string: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    },
+                ],
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(&file_results);
+        let config = Config::default();
+        let (_explicit, infer, _inline) =
+            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+
+        let mut aliases: Vec<String> = infer.into_iter().filter_map(|item| item.alias).collect();
+        aliases.sort();
+
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases[0].contains("_Call"));
+        assert!(aliases[1].contains("_Call"));
+        assert_ne!(aliases[0], aliases[1]);
+    }
+
+    #[test]
+    fn test_reconcile_type_import_sources_uses_import_map() {
+        let mut result = FileAnalysisResult {
+            mounts: vec![],
+            endpoints: vec![EndpointResult {
+                line_number: 10,
+                owner_node: "app".to_string(),
+                method: "GET".to_string(),
+                path: "/users".to_string(),
+                handler_name: "handler".to_string(),
+                pattern_matched: "app.get".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: Some("Response<User[]>".to_string()),
+                primary_type_symbol: Some("Response".to_string()),
+                type_import_source: Some("react".to_string()),
+            }],
+            data_calls: vec![DataCallResult {
+                line_number: 12,
+                target: "/users".to_string(),
+                method: Some("GET".to_string()),
+                pattern_matched: "fetch(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
+                primary_type_symbol: Some("User".to_string()),
+                type_import_source: Some("react".to_string()),
+            }],
+        };
+
+        let mut import_map = HashMap::new();
+        import_map.insert("Response".to_string(), "express".to_string());
+        import_map.insert("User".to_string(), "./repo-a_types".to_string());
+
+        FileOrchestrator::reconcile_type_import_sources(&mut result, &import_map);
+
+        let endpoint = &result.endpoints[0];
+        assert_eq!(endpoint.type_import_source, Some("express".to_string()));
+
+        let data_call = &result.data_calls[0];
+        assert_eq!(
+            data_call.type_import_source,
+            Some("./repo-a_types".to_string())
+        );
     }
 
     #[test]
@@ -932,6 +1336,18 @@ mod tests {
             .keys()
             .any(|k| k.starts_with("__import_map__::"));
         assert!(has_import_map, "Should have import mapping node");
+    }
+
+    #[test]
+    fn test_should_use_inline_type() {
+        assert!(FileOrchestrator::should_use_inline_type(
+            "Response<{ id: string }>"
+        ));
+        assert!(FileOrchestrator::should_use_inline_type("Foo | Bar"));
+        assert!(FileOrchestrator::should_use_inline_type("A & B"));
+        assert!(!FileOrchestrator::should_use_inline_type(
+            "Response<User[]>"
+        ));
     }
 
     #[test]

@@ -163,7 +163,7 @@ impl FileAnalyzerAgent {
         let schema = AgentSchemas::file_analysis_schema();
         let response = self
             .agent_service
-            .analyze_code_with_schema(&user_message, &system_message, Some(schema))
+            .analyze_code_with_schema(&user_message, &system_message, Some(schema.clone()))
             .await?;
 
         println!("=== RAW FILE ANALYSIS RESPONSE ===");
@@ -178,7 +178,39 @@ impl FileAnalyzerAgent {
         })?;
 
         // Sanitize LLM response: Gemini sometimes returns "+null" as a string instead of null
-        Self::sanitize_result(&mut result);
+        let needs_retry = Self::sanitize_result(&mut result);
+        let initial_result = result.clone();
+        if needs_retry {
+            println!("[FileAnalyzerAgent] Suspicious fields detected in LLM output; retrying once");
+            let response = self
+                .agent_service
+                .analyze_code_with_schema(&user_message, &system_message, Some(schema))
+                .await?;
+
+            println!("=== RAW FILE ANALYSIS RESPONSE ===");
+            println!("{}", response);
+            println!("=== END RAW RESPONSE ===");
+
+            let mut retry_result: FileAnalysisResult =
+                serde_json::from_str(&response).map_err(|e| {
+                    format!(
+                        "Failed to parse file analysis response: {}. Raw response: {}",
+                        e, response
+                    )
+                })?;
+
+            Self::sanitize_result(&mut retry_result);
+            let chosen = Self::choose_best_result(initial_result, retry_result);
+
+            println!(
+                "File analysis complete: {} mounts, {} endpoints, {} data_calls",
+                chosen.mounts.len(),
+                chosen.endpoints.len(),
+                chosen.data_calls.len()
+            );
+
+            return Ok(chosen);
+        }
 
         println!(
             "File analysis complete: {} mounts, {} endpoints, {} data_calls",
@@ -190,23 +222,130 @@ impl FileAnalyzerAgent {
         Ok(result)
     }
 
+    fn result_score(result: &FileAnalysisResult) -> usize {
+        result.mounts.len() + result.endpoints.len() + result.data_calls.len()
+    }
+
+    fn choose_best_result(
+        initial: FileAnalysisResult,
+        retry: FileAnalysisResult,
+    ) -> FileAnalysisResult {
+        let initial_score = Self::result_score(&initial);
+        let retry_score = Self::result_score(&retry);
+
+        if retry_score >= initial_score {
+            retry
+        } else {
+            println!("[FileAnalyzerAgent] Retry produced fewer findings; keeping original result");
+            initial
+        }
+    }
+
     /// Sanitize the LLM response to fix common issues like "+null" strings
-    fn sanitize_result(result: &mut FileAnalysisResult) {
+    fn sanitize_result(result: &mut FileAnalysisResult) -> bool {
         // Helper to check if a string represents null
         fn is_null_string(s: &str) -> bool {
-            s == "+null" || s == "null" || s == "NULL" || s.is_empty()
+            s == "+null" || s == "null" || s == "NULL" || s == "-" || s.is_empty()
         }
+
+        fn normalize_optional_string(value: &mut Option<String>) {
+            let Some(current) = value.as_deref() else {
+                return;
+            };
+            let trimmed = current.trim();
+            if is_null_string(trimmed) {
+                *value = None;
+            } else if trimmed != current {
+                *value = Some(trimmed.to_string());
+            }
+        }
+
+        fn is_suspicious_import_source(value: &str) -> bool {
+            if value.contains("primary_type_symbol")
+                || value.contains("response_type_string")
+                || value.contains("response_type_file")
+                || value.contains("type_import_source")
+            {
+                return true;
+            }
+
+            value.chars().any(|ch| {
+                ch.is_whitespace()
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '`'
+                    || ch == '{'
+                    || ch == '}'
+                    || ch == '('
+                    || ch == ')'
+                    || ch == ':'
+                    || ch == ','
+                    || ch == '['
+                    || ch == ']'
+            })
+        }
+
+        fn is_invalid_relative_source(value: &str) -> bool {
+            value.starts_with('.')
+                && !value.starts_with("./")
+                && !value.starts_with("../")
+                && !value.starts_with(".\\")
+                && !value.starts_with("..\\")
+        }
+
+        fn is_valid_identifier(value: &str) -> bool {
+            let mut chars = value.chars();
+            let Some(first) = chars.next() else {
+                return false;
+            };
+            if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+                return false;
+            }
+            chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+        }
+
+        fn normalize_import_source(value: &mut Option<String>) -> bool {
+            let mut suspicious = false;
+            normalize_optional_string(value);
+            if let Some(source) = value.as_deref() {
+                if source.starts_with("node:") {
+                    *value = None;
+                } else if is_suspicious_import_source(source) || is_invalid_relative_source(source)
+                {
+                    *value = None;
+                    suspicious = true;
+                }
+            }
+            suspicious
+        }
+
+        fn normalize_response_file(value: &mut Option<String>) -> bool {
+            let mut suspicious = false;
+            normalize_optional_string(value);
+            if let Some(source) = value.as_deref() {
+                if is_suspicious_import_source(source) || is_invalid_relative_source(source) {
+                    *value = None;
+                    suspicious = true;
+                }
+            }
+            suspicious
+        }
+
+        let mut needs_retry = false;
 
         // Sanitize endpoints
         for endpoint in &mut result.endpoints {
-            if let Some(ref s) = endpoint.response_type_file {
-                if is_null_string(s) {
-                    endpoint.response_type_file = None;
-                }
+            normalize_optional_string(&mut endpoint.primary_type_symbol);
+            if normalize_import_source(&mut endpoint.type_import_source) {
+                needs_retry = true;
             }
-            if let Some(ref s) = endpoint.response_type_string {
-                if is_null_string(s) {
-                    endpoint.response_type_string = None;
+            if normalize_response_file(&mut endpoint.response_type_file) {
+                needs_retry = true;
+            }
+            normalize_optional_string(&mut endpoint.response_type_string);
+            if let Some(ref symbol) = endpoint.primary_type_symbol {
+                if !is_valid_identifier(symbol) {
+                    endpoint.primary_type_symbol = None;
                 }
             }
             // Position of 0 with no file likely means null
@@ -218,19 +357,25 @@ impl FileAnalyzerAgent {
         // Sanitize data calls
         for data_call in &mut result.data_calls {
             // Fix method field
-            if let Some(ref s) = data_call.method {
-                if is_null_string(s) {
+            if let Some(ref mut s) = data_call.method {
+                let trimmed = s.trim();
+                if is_null_string(trimmed) {
                     data_call.method = None;
+                } else if trimmed != s.as_str() {
+                    *s = trimmed.to_string();
                 }
             }
-            if let Some(ref s) = data_call.response_type_file {
-                if is_null_string(s) {
-                    data_call.response_type_file = None;
-                }
+            normalize_optional_string(&mut data_call.primary_type_symbol);
+            if normalize_import_source(&mut data_call.type_import_source) {
+                needs_retry = true;
             }
-            if let Some(ref s) = data_call.response_type_string {
-                if is_null_string(s) {
-                    data_call.response_type_string = None;
+            if normalize_response_file(&mut data_call.response_type_file) {
+                needs_retry = true;
+            }
+            normalize_optional_string(&mut data_call.response_type_string);
+            if let Some(ref symbol) = data_call.primary_type_symbol {
+                if !is_valid_identifier(symbol) {
+                    data_call.primary_type_symbol = None;
                 }
             }
             // Position of 0 with no file likely means null
@@ -239,6 +384,8 @@ impl FileAnalyzerAgent {
                 data_call.response_type_position = None;
             }
         }
+
+        needs_retry
     }
 
     /// Build the system message for the Carrick Static Analysis Engine (legacy).
@@ -576,6 +723,55 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_result_filters_placeholders() {
+        let mut result = FileAnalysisResult {
+            mounts: vec![],
+            endpoints: vec![EndpointResult {
+                line_number: 1,
+                owner_node: "app".to_string(),
+                method: "GET".to_string(),
+                path: "/test".to_string(),
+                handler_name: "handler".to_string(),
+                pattern_matched: ".get(".to_string(),
+                response_type_file: Some("null".to_string()),
+                response_type_position: Some(0),
+                response_type_string: Some("+null".to_string()),
+                primary_type_symbol: Some("-".to_string()),
+                type_import_source: Some(".repo-a_types.ts".to_string()),
+            }],
+            data_calls: vec![DataCallResult {
+                line_number: 2,
+                target: "https://example.com".to_string(),
+                method: Some("  POST  ".to_string()),
+                pattern_matched: "fetch(".to_string(),
+                response_type_file: Some("NULL".to_string()),
+                response_type_position: Some(0),
+                response_type_string: Some("null".to_string()),
+                primary_type_symbol: Some("NULL".to_string()),
+                type_import_source: Some("bad import (oops)".to_string()),
+            }],
+        };
+
+        let needs_retry = FileAnalyzerAgent::sanitize_result(&mut result);
+        assert!(needs_retry);
+
+        let endpoint = &result.endpoints[0];
+        assert!(endpoint.response_type_file.is_none());
+        assert!(endpoint.response_type_string.is_none());
+        assert!(endpoint.primary_type_symbol.is_none());
+        assert!(endpoint.type_import_source.is_none());
+        assert!(endpoint.response_type_position.is_none());
+
+        let data_call = &result.data_calls[0];
+        assert_eq!(data_call.method, Some("POST".to_string()));
+        assert!(data_call.response_type_file.is_none());
+        assert!(data_call.response_type_string.is_none());
+        assert!(data_call.primary_type_symbol.is_none());
+        assert!(data_call.type_import_source.is_none());
+        assert!(data_call.response_type_position.is_none());
+    }
+
+    #[test]
     fn test_file_analysis_result_serialization() {
         let result = FileAnalysisResult {
             mounts: vec![MountResult {
@@ -611,6 +807,55 @@ mod tests {
         assert_eq!(deserialized.mounts.len(), 1);
         assert_eq!(deserialized.endpoints.len(), 1);
         assert!(deserialized.data_calls.is_empty());
+    }
+
+    #[test]
+    fn test_choose_best_result_prefers_richer_output() {
+        let initial = FileAnalysisResult {
+            mounts: vec![MountResult {
+                line_number: 1,
+                parent_node: "app".to_string(),
+                child_node: "router".to_string(),
+                mount_path: "/api".to_string(),
+                import_source: None,
+                pattern_matched: "app.use".to_string(),
+            }],
+            endpoints: vec![EndpointResult {
+                line_number: 2,
+                owner_node: "router".to_string(),
+                method: "GET".to_string(),
+                path: "/users".to_string(),
+                handler_name: "handler".to_string(),
+                pattern_matched: ".get(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            }],
+            data_calls: vec![DataCallResult {
+                line_number: 3,
+                target: "/users".to_string(),
+                method: Some("GET".to_string()),
+                pattern_matched: "fetch(".to_string(),
+                response_type_file: None,
+                response_type_position: None,
+                response_type_string: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            }],
+        };
+
+        let retry = FileAnalysisResult {
+            mounts: vec![],
+            endpoints: vec![],
+            data_calls: vec![],
+        };
+
+        let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry);
+        assert_eq!(chosen.mounts.len(), initial.mounts.len());
+        assert_eq!(chosen.endpoints.len(), initial.endpoints.len());
+        assert_eq!(chosen.data_calls.len(), initial.data_calls.len());
     }
 
     #[test]

@@ -272,11 +272,25 @@ export class TypeBundler {
   }
 
   private isPathSource(sourceFile: string): boolean {
-    return (
+    if (
       sourceFile.startsWith('.') ||
       sourceFile.startsWith('/') ||
       path.isAbsolute(sourceFile)
-    );
+    ) {
+      return true;
+    }
+
+    const basePath = path.resolve(this.repoRoot, sourceFile);
+    if (fs.existsSync(basePath)) {
+      return true;
+    }
+
+    if (path.extname(sourceFile) !== '') {
+      return false;
+    }
+
+    const extensions = ['.ts', '.tsx', '.js', '.jsx', '.d.ts'];
+    return extensions.some((ext) => fs.existsSync(basePath + ext));
   }
 
   private isPlaceholderSource(sourceFile: string): boolean {

@@ -118,6 +118,9 @@ export function normalizePath(inputPath: string): string {
   normalized = normalized.replace(/\{([^}]+)\}/g, ':$1');
   normalized = normalized.replace(/\[([^\]]+)\]/g, ':$1');
 
+  // Normalize numeric path segments to :param
+  normalized = normalized.replace(/\/\d+(?=\/|$)/g, '/:param');
+
   // Normalize path parameters to a generic placeholder for matching
   // This allows :id, :userId, :user_id to all match
   normalized = normalized.replace(/:[\w-]+/g, ':param');

@@ -30,6 +30,25 @@ pub fn build_manifest_type_alias(
     format!("Endpoint_{:016x}_{}", hash, type_label)
 }
 
+pub fn build_call_site_id(file_path: &str, line_number: u32, method: &str, path: &str) -> String {
+    let key = format!("{}|{}|{}|{}", file_path, line_number, method, path);
+    format!("{:016x}", fnv1a_hash(&key))
+}
+
+pub fn build_manifest_type_alias_with_call_id(
+    method: &str,
+    path: &str,
+    role: ManifestRole,
+    type_kind: ManifestTypeKind,
+    call_id: Option<&str>,
+) -> String {
+    let base = build_manifest_type_alias(method, path, role, type_kind);
+    match call_id {
+        Some(id) if !id.trim().is_empty() => format!("{}_Call{}", base, id.trim()),
+        _ => base,
+    }
+}
+
 pub fn parse_file_location(location: &str) -> (String, u32) {
     let segments: Vec<&str> = location.split(':').collect();
     if segments.len() < 2 {
@@ -73,4 +92,30 @@ fn fnv1a_hash(input: &str) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_manifest_type_alias_with_call_id() {
+        let base = build_manifest_type_alias(
+            "GET",
+            "/users",
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+        );
+        let call_id = build_call_site_id("src/service.ts", 12, "GET", "/users");
+        let with_call = build_manifest_type_alias_with_call_id(
+            "GET",
+            "/users",
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&call_id),
+        );
+
+        assert_ne!(base, with_call);
+        assert!(with_call.contains("_Call"));
+    }
 }

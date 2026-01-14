@@ -508,6 +508,41 @@ describe('Type Sidecar Integration Tests', () => {
         assert.strictEqual(response.inferred_types[0].infer_kind, 'variable');
       }
     });
+
+    it('should infer call result from the innermost call expression', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-5',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/call-site.ts'),
+            line_number: 21,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-5');
+      assert.ok(
+        response.status === 'success' || response.inferred_types,
+        'Should succeed or have inferred types'
+      );
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'call_result');
+        assert.ok(inferred.type_string.includes('User'));
+        assert.ok(!inferred.type_string.includes('RegisterHandle'));
+      }
+    });
   });
 
   describe('error handling', () => {

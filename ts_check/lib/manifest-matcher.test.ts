@@ -259,6 +259,19 @@ describe('ManifestMatcher', () => {
       assert.strictEqual(producers2.length, 1);
     });
 
+    it('should match numeric path segments to params', () => {
+      const manifest: TypeManifest = {
+        repo_name: 'api-service',
+        commit_hash: 'abc123',
+        entries: [
+          createManifestEntry('GET', '/api/users/:id', 'GetUserResponse', 'producer', 'routes.ts', 10),
+        ],
+      };
+
+      const producers = matcher.findProducersForEndpoint(manifest, 'GET', '/api/users/123');
+      assert.strictEqual(producers.length, 1);
+    });
+
     it('should return empty array for no matches', () => {
       const manifest: TypeManifest = {
         repo_name: 'api-service',
