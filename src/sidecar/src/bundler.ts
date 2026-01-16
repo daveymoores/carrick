@@ -62,7 +62,8 @@ export class TypeBundler {
     const errors: string[] = [];
 
     // Phase 1: Validate all symbols exist
-    const validatedSymbols = this.validateSymbols(symbols, symbolFailures);
+    const uniqueSymbols = this.dedupeSymbols(symbols);
+    const validatedSymbols = this.validateSymbols(uniqueSymbols, symbolFailures);
 
     if (validatedSymbols.length === 0) {
       return {
@@ -158,6 +159,22 @@ export class TypeBundler {
     }
 
     return validated;
+  }
+
+  private dedupeSymbols(symbols: SymbolRequest[]): SymbolRequest[] {
+    const seen = new Set<string>();
+    const unique: SymbolRequest[] = [];
+
+    for (const symbol of symbols) {
+      const key = `${symbol.source_file}::${symbol.symbol_name}::${symbol.alias || ''}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      unique.push(symbol);
+    }
+
+    return unique;
   }
 
   /**

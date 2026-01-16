@@ -278,6 +278,7 @@ impl FileOrchestrator {
 
         let normalizer = UrlNormalizer::new(config);
         let mut explicit_requests: Vec<SymbolRequest> = Vec::new();
+        let mut explicit_seen: HashSet<String> = HashSet::new();
         let mut infer_requests: Vec<InferRequestItem> = Vec::new();
         let mut endpoint_lookup: EndpointLookup = HashMap::new();
         let mut data_call_lookup: DataCallLookup = HashMap::new();
@@ -288,6 +289,22 @@ impl FileOrchestrator {
                 "POST" | "PUT" | "PATCH" | "DELETE" | "ALL" | "UNKNOWN"
             )
         };
+        let mut push_explicit =
+            |symbol_name: String, source_file: String, alias: Option<String>| {
+                let key = format!(
+                    "{}|{}|{}",
+                    source_file,
+                    symbol_name,
+                    alias.as_deref().unwrap_or("")
+                );
+                if explicit_seen.insert(key) {
+                    explicit_requests.push(SymbolRequest {
+                        symbol_name,
+                        source_file,
+                        alias,
+                    });
+                }
+            };
 
         for endpoint in mount_graph.get_resolved_endpoints() {
             let (file_path, line_number) = parse_file_location(&endpoint.file_location);
@@ -370,11 +387,11 @@ impl FileOrchestrator {
                     (&endpoint.primary_type_symbol, &endpoint.type_import_source)
                 {
                     // Explicit type with import source - bundle it
-                    explicit_requests.push(SymbolRequest {
-                        symbol_name: symbol.clone(),
-                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
-                        alias: None,
-                    });
+                    push_explicit(
+                        symbol.clone(),
+                        Self::resolve_import_path(&file_path_absolute, import_source),
+                        None,
+                    );
                     if endpoint.response_type_string.is_none() {
                         inline_aliases.push((response_alias.clone(), symbol.clone()));
                     }
@@ -383,11 +400,7 @@ impl FileOrchestrator {
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = endpoint.primary_type_symbol {
-                        explicit_requests.push(SymbolRequest {
-                            symbol_name: symbol.clone(),
-                            source_file: file_path_absolute.clone(),
-                            alias: None,
-                        });
+                        push_explicit(symbol.clone(), file_path_absolute.clone(), None);
                         if endpoint.response_type_string.is_none() {
                             inline_aliases.push((response_alias.clone(), symbol.clone()));
                         }
@@ -486,11 +499,11 @@ impl FileOrchestrator {
                     &data_call.type_import_source,
                 ) {
                     // Explicit type with import source - bundle it
-                    explicit_requests.push(SymbolRequest {
-                        symbol_name: symbol.clone(),
-                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
-                        alias: None,
-                    });
+                    push_explicit(
+                        symbol.clone(),
+                        Self::resolve_import_path(&file_path_absolute, import_source),
+                        None,
+                    );
                     if data_call.response_type_string.is_none() {
                         inline_aliases.push((response_alias.clone(), symbol.clone()));
                     }
@@ -499,11 +512,7 @@ impl FileOrchestrator {
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = data_call.primary_type_symbol {
-                        explicit_requests.push(SymbolRequest {
-                            symbol_name: symbol.clone(),
-                            source_file: file_path_absolute.clone(),
-                            alias: None,
-                        });
+                        push_explicit(symbol.clone(), file_path_absolute.clone(), None);
                         if data_call.response_type_string.is_none() {
                             inline_aliases.push((response_alias.clone(), symbol.clone()));
                         }
