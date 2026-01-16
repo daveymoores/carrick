@@ -620,8 +620,11 @@ impl FileOrchestrator {
         let scrub_endpoint = |endpoint: &mut EndpointResult| {
             // Drop framework imports or empty Response wrappers; force inference later.
             let bad_source = matches!(endpoint.type_import_source.as_deref(), Some("express"));
-            let bare_response =
-                matches!(endpoint.response_type_string.as_deref(), Some("Response"));
+            let bare_response = endpoint
+                .response_type_string
+                .as_deref()
+                .map(Self::is_untyped_response_type)
+                .unwrap_or(false);
             if bad_source || bare_response {
                 endpoint.type_import_source = None;
                 endpoint.primary_type_symbol = None;
@@ -636,7 +639,12 @@ impl FileOrchestrator {
                 call.primary_type_symbol = None;
             }
             // Bare json()/Response with no symbol should trigger inference.
-            if matches!(call.response_type_string.as_deref(), Some("Response")) {
+            if call
+                .response_type_string
+                .as_deref()
+                .map(Self::is_untyped_response_type)
+                .unwrap_or(false)
+            {
                 call.response_type_string = None;
                 call.primary_type_symbol = None;
             }
@@ -846,11 +854,56 @@ impl FileOrchestrator {
     }
 
     fn derive_body_type(type_string: &str) -> String {
-        let trimmed = type_string.trim().trim_end_matches(';');
-        match Self::unwrap_single_generic(trimmed) {
-            Some(inner) => inner.trim().to_string(),
-            None => trimmed.to_string(),
+        let mut trimmed = type_string.trim().trim_end_matches(';').to_string();
+        let mut unwrapped = false;
+
+        loop {
+            let Some((outer, inner)) = Self::split_single_generic(&trimmed) else {
+                break;
+            };
+            let outer_name = Self::normalize_type_name(&outer);
+            if matches!(outer_name, "Promise" | "Response") {
+                trimmed = inner.trim().to_string();
+                unwrapped = true;
+                continue;
+            }
+            if !unwrapped {
+                return inner.trim().to_string();
+            }
+            break;
         }
+
+        trimmed
+    }
+
+    fn split_single_generic(type_string: &str) -> Option<(String, String)> {
+        let trimmed = type_string.trim();
+        let start = trimmed.find('<')?;
+        let inner = Self::unwrap_single_generic(trimmed)?;
+        let outer = trimmed[..start].trim().to_string();
+        Some((outer, inner))
+    }
+
+    fn normalize_type_name(type_name: &str) -> &str {
+        type_name.rsplit('.').next().unwrap_or(type_name)
+    }
+
+    fn is_untyped_response_type(type_string: &str) -> bool {
+        let trimmed = type_string.trim().trim_end_matches(';');
+        if trimmed.is_empty() {
+            return false;
+        }
+        if Self::normalize_type_name(trimmed) == "Response" {
+            return true;
+        }
+        let Some((outer, inner)) = Self::split_single_generic(trimmed) else {
+            return false;
+        };
+        let outer_name = Self::normalize_type_name(&outer);
+        if matches!(outer_name, "Promise" | "Response") {
+            return Self::is_untyped_response_type(&inner);
+        }
+        false
     }
 
     fn unwrap_single_generic(type_string: &str) -> Option<String> {
@@ -1505,6 +1558,10 @@ mod tests {
         assert_eq!(
             FileOrchestrator::derive_body_type("Promise<User[]>"),
             "User[]"
+        );
+        assert_eq!(
+            FileOrchestrator::derive_body_type("Promise<Response<User>>"),
+            "User"
         );
         assert_eq!(
             FileOrchestrator::derive_body_type("Result<User, Error>"),

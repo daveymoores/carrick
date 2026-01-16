@@ -569,7 +569,12 @@ impl TypeSidecar {
         let mut inferred_aliases = HashSet::new();
         for inferred in &result.inferred_types {
             inferred_aliases.insert(inferred.alias.clone());
-            append_alias(&inferred.alias, &inferred.type_string);
+            let type_string = if Self::is_untyped_response_type(&inferred.type_string) {
+                "unknown"
+            } else {
+                inferred.type_string.as_str()
+            };
+            append_alias(&inferred.alias, type_string);
         }
 
         for failure in &result.symbol_failures {
@@ -630,6 +635,15 @@ impl TypeSidecar {
         let mut counter = self.request_counter.lock().unwrap();
         *counter += 1;
         format!("req-{}", counter)
+    }
+
+    fn is_untyped_response_type(type_string: &str) -> bool {
+        let trimmed = type_string.trim().trim_end_matches(';');
+        if trimmed.is_empty() {
+            return false;
+        }
+        let base = trimmed.rsplit('.').next().unwrap_or(trimmed);
+        base == "Response"
     }
 
     fn ensure_ready(&self) -> Result<(), SidecarError> {
