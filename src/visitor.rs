@@ -163,11 +163,16 @@ impl Visit for ImportSymbolExtractor {
             match specifier {
                 ImportSpecifier::Named(named) => {
                     let local_name = named.local.sym.to_string();
+                    let imported_name = match &named.imported {
+                        Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
+                        Some(ModuleExportName::Str(str)) => str.value.to_string(),
+                        None => local_name.clone(),
+                    };
                     self.imported_symbols.insert(
                         local_name.to_string(),
                         ImportedSymbol {
                             local_name: local_name.clone(),
-                            imported_name: local_name,
+                            imported_name,
                             source: source.clone(),
                             kind: SymbolKind::Named,
                         },

@@ -422,20 +422,42 @@ export class TypeInferrer {
    * Extract response type from call expressions like res.json(data), res.send(data), Response.json(data)
    */
   private extractResponseFromCall(call: CallExpression): string | null {
-    const callText = call.getExpression().getText();
+    const expression = call.getExpression();
+    let methodName: string | null = null;
+    let receiverName: string | null = null;
 
-    // Match patterns: res.json, res.send, Response.json, c.json (Hono)
-    const responsePatterns = [
-      /\bres\.json\b/,
-      /\bres\.send\b/,
-      /\bresponse\.json\b/i,
-      /\bResponse\.json\b/,
-      /\bc\.json\b/, // Hono context
-      /\bctx\.json\b/, // Some frameworks use ctx
-    ];
+    if (Node.isPropertyAccessExpression(expression)) {
+      methodName = expression.getName();
+      receiverName = this.getRootIdentifierName(expression.getExpression());
+    } else if (Node.isIdentifier(expression)) {
+      methodName = expression.getText();
+    }
 
-    const isResponseCall = responsePatterns.some((p) => p.test(callText));
-    if (!isResponseCall) return null;
+    if (!methodName) {
+      return null;
+    }
+
+    const methodLower = methodName.toLowerCase();
+    if (methodLower !== 'json' && methodLower !== 'send') {
+      return null;
+    }
+
+    if (receiverName) {
+      const receiverLower = receiverName.toLowerCase();
+      const allowedReceivers = new Set([
+        'res',
+        'response',
+        'reply',
+        'ctx',
+        'context',
+        'c',
+      ]);
+      if (!allowedReceivers.has(receiverLower)) {
+        return null;
+      }
+    } else {
+      return null;
+    }
 
     // Get the first argument's type
     const args = call.getArguments();
@@ -499,6 +521,22 @@ export class TypeInferrer {
     }
 
     return typeText;
+  }
+
+  private getRootIdentifierName(node: Node): string | null {
+    if (Node.isIdentifier(node)) {
+      return node.getText();
+    }
+
+    if (Node.isPropertyAccessExpression(node)) {
+      return this.getRootIdentifierName(node.getExpression());
+    }
+
+    if (Node.isCallExpression(node)) {
+      return this.getRootIdentifierName(node.getExpression());
+    }
+
+    return null;
   }
 
   // ===========================================================================

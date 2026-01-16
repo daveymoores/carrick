@@ -19,7 +19,9 @@
 use crate::{
     agent_service::AgentService,
     agents::{
-        file_analyzer_agent::{FileAnalysisResult, FileAnalyzerAgent},
+        file_analyzer_agent::{
+            DataCallResult, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
+        },
         framework_guidance_agent::FrameworkGuidance,
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
@@ -33,7 +35,7 @@ use crate::{
     swc_scanner::SwcScanner,
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
-        normalize_manifest_method, parse_file_location,
+        is_http_method, normalize_manifest_method, parse_file_location,
     },
     url_normalizer::UrlNormalizer,
     visitor::ImportSymbolExtractor,
@@ -200,6 +202,7 @@ impl FileOrchestrator {
 
                     let mut adjusted = result;
                     Self::reconcile_type_import_sources(&mut adjusted, &import_map);
+                    Self::normalize_unusable_types(&mut adjusted);
 
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
@@ -300,7 +303,9 @@ impl FileOrchestrator {
                 continue;
             }
             let (file_path, line_number) = parse_file_location(&data_call.file_location);
-            let method = normalize_manifest_method(&data_call.method);
+            let Some(method) = Self::normalize_consumer_method(Some(&data_call.method)) else {
+                continue;
+            };
             let path = normalizer.extract_path(&data_call.target_url);
             let call_id = build_call_site_id(&file_path, line_number, &method, &path);
             data_call_lookup
@@ -356,54 +361,47 @@ impl FileOrchestrator {
                     ManifestTypeKind::Request,
                 );
 
-                let inline_override = endpoint
-                    .response_type_string
-                    .as_deref()
-                    .map(Self::should_use_inline_type)
-                    .unwrap_or(false);
-
                 if let Some(ref response_type_string) = endpoint.response_type_string {
-                    if inline_override {
-                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
+                    let body_type = Self::derive_body_type(response_type_string);
+                    inline_aliases.push((response_alias.clone(), body_type));
+                }
+
+                if let (Some(symbol), Some(import_source)) =
+                    (&endpoint.primary_type_symbol, &endpoint.type_import_source)
+                {
+                    // Explicit type with import source - bundle it
+                    explicit_requests.push(SymbolRequest {
+                        symbol_name: symbol.clone(),
+                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
+                        alias: None,
+                    });
+                    if endpoint.response_type_string.is_none() {
+                        inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    }
+                } else if endpoint.primary_type_symbol.is_some()
+                    && endpoint.type_import_source.is_none()
+                {
+                    // Type symbol exists but no import - it might be in the same file
+                    if let Some(ref symbol) = endpoint.primary_type_symbol {
+                        explicit_requests.push(SymbolRequest {
+                            symbol_name: symbol.clone(),
+                            source_file: file_path_absolute.clone(),
+                            alias: None,
+                        });
+                        if endpoint.response_type_string.is_none() {
+                            inline_aliases.push((response_alias.clone(), symbol.clone()));
+                        }
                     }
                 }
 
-                if !inline_override {
-                    if let (Some(symbol), Some(import_source)) =
-                        (&endpoint.primary_type_symbol, &endpoint.type_import_source)
-                    {
-                        // Explicit type with import source - bundle it
-                        explicit_requests.push(SymbolRequest {
-                            symbol_name: symbol.clone(),
-                            source_file: Self::resolve_import_path(
-                                &file_path_absolute,
-                                import_source,
-                            ),
-                            alias: Some(response_alias.clone()),
-                        });
-                    } else if endpoint.primary_type_symbol.is_some()
-                        && endpoint.type_import_source.is_none()
-                    {
-                        // Type symbol exists but no import - it might be in the same file
-                        if let Some(ref symbol) = endpoint.primary_type_symbol {
-                            explicit_requests.push(SymbolRequest {
-                                symbol_name: symbol.clone(),
-                                source_file: file_path_absolute.clone(),
-                                alias: Some(response_alias.clone()),
-                            });
-                        }
-                    } else if let Some(ref response_type_string) = endpoint.response_type_string {
-                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
-                    } else if endpoint.response_type_string.is_none() {
-                        // No explicit type - try to infer it
-                        // Try response_body inference first, then function_return
-                        infer_requests.push(InferRequestItem {
-                            file_path: file_path_absolute.clone(),
-                            line_number,
-                            infer_kind: InferKind::ResponseBody,
-                            alias: Some(response_alias.clone()),
-                        });
-                    }
+                if endpoint.response_type_string.is_none() {
+                    // No explicit type - try to infer the response body.
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path_absolute.clone(),
+                        line_number,
+                        infer_kind: InferKind::ResponseBody,
+                        alias: Some(response_alias.clone()),
+                    });
                 }
 
                 if should_infer_request_body(&method) {
@@ -427,8 +425,11 @@ impl FileOrchestrator {
                     continue;
                 }
                 let lookup_key = (file_path.clone(), line_number);
-                let method_fallback =
-                    normalize_manifest_method(data_call.method.as_deref().unwrap_or("GET"));
+                let Some(method_fallback) =
+                    Self::normalize_consumer_method(data_call.method.as_deref())
+                else {
+                    continue;
+                };
                 let target_path = normalizer.extract_path(&data_call.target);
                 let (method, path, call_id) = data_call_lookup
                     .get(&lookup_key)
@@ -475,54 +476,46 @@ impl FileOrchestrator {
                     Some(&call_id),
                 );
 
-                let inline_override = data_call
-                    .response_type_string
-                    .as_deref()
-                    .map(Self::should_use_inline_type)
-                    .unwrap_or(false);
-
                 if let Some(ref response_type_string) = data_call.response_type_string {
-                    if inline_override {
-                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
-                    }
+                    let body_type = Self::derive_body_type(response_type_string);
+                    inline_aliases.push((response_alias.clone(), body_type));
                 }
 
-                if !inline_override {
-                    if let (Some(symbol), Some(import_source)) = (
-                        &data_call.primary_type_symbol,
-                        &data_call.type_import_source,
-                    ) {
-                        // Explicit type with import source - bundle it
+                if let (Some(symbol), Some(import_source)) = (
+                    &data_call.primary_type_symbol,
+                    &data_call.type_import_source,
+                ) {
+                    // Explicit type with import source - bundle it
+                    explicit_requests.push(SymbolRequest {
+                        symbol_name: symbol.clone(),
+                        source_file: Self::resolve_import_path(&file_path_absolute, import_source),
+                        alias: None,
+                    });
+                    if data_call.response_type_string.is_none() {
+                        inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    }
+                } else if data_call.primary_type_symbol.is_some()
+                    && data_call.type_import_source.is_none()
+                {
+                    // Type symbol exists but no import - it might be in the same file
+                    if let Some(ref symbol) = data_call.primary_type_symbol {
                         explicit_requests.push(SymbolRequest {
                             symbol_name: symbol.clone(),
-                            source_file: Self::resolve_import_path(
-                                &file_path_absolute,
-                                import_source,
-                            ),
-                            alias: Some(response_alias.clone()),
+                            source_file: file_path_absolute.clone(),
+                            alias: None,
                         });
-                    } else if data_call.primary_type_symbol.is_some()
-                        && data_call.type_import_source.is_none()
-                    {
-                        // Type symbol exists but no import - it might be in the same file
-                        if let Some(ref symbol) = data_call.primary_type_symbol {
-                            explicit_requests.push(SymbolRequest {
-                                symbol_name: symbol.clone(),
-                                source_file: file_path_absolute.clone(),
-                                alias: Some(response_alias.clone()),
-                            });
+                        if data_call.response_type_string.is_none() {
+                            inline_aliases.push((response_alias.clone(), symbol.clone()));
                         }
-                    } else if let Some(ref response_type_string) = data_call.response_type_string {
-                        inline_aliases.push((response_alias.clone(), response_type_string.clone()));
-                    } else if data_call.response_type_string.is_none() {
-                        // No explicit type - try to infer it
-                        infer_requests.push(InferRequestItem {
-                            file_path: file_path_absolute.clone(),
-                            line_number,
-                            infer_kind: InferKind::CallResult,
-                            alias: Some(response_alias.clone()),
-                        });
                     }
+                } else if data_call.response_type_string.is_none() {
+                    // No explicit type - try to infer it
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path_absolute.clone(),
+                        line_number,
+                        infer_kind: InferKind::CallResult,
+                        alias: Some(response_alias.clone()),
+                    });
                 }
 
                 if should_infer_request_body(&method) {
@@ -613,6 +606,41 @@ impl FileOrchestrator {
         }
     }
 
+    /// Normalize unusable type hints from the LLM so we can force inference instead of padding unknowns.
+    fn normalize_unusable_types(result: &mut FileAnalysisResult) {
+        let scrub_endpoint = |endpoint: &mut EndpointResult| {
+            // Drop framework imports or empty Response wrappers; force inference later.
+            let bad_source = matches!(endpoint.type_import_source.as_deref(), Some("express"));
+            let bare_response =
+                matches!(endpoint.response_type_string.as_deref(), Some("Response"));
+            if bad_source || bare_response {
+                endpoint.type_import_source = None;
+                endpoint.primary_type_symbol = None;
+                endpoint.response_type_string = None;
+            }
+        };
+
+        let scrub_data_call = |call: &mut DataCallResult| {
+            let bad_source = matches!(call.type_import_source.as_deref(), Some("express"));
+            if bad_source {
+                call.type_import_source = None;
+                call.primary_type_symbol = None;
+            }
+            // Bare json()/Response with no symbol should trigger inference.
+            if matches!(call.response_type_string.as_deref(), Some("Response")) {
+                call.response_type_string = None;
+                call.primary_type_symbol = None;
+            }
+        };
+
+        for endpoint in &mut result.endpoints {
+            scrub_endpoint(endpoint);
+        }
+        for call in &mut result.data_calls {
+            scrub_data_call(call);
+        }
+    }
+
     /// Resolve types using the TypeSidecar.
     ///
     /// This method collects type requests from the analysis results and sends them
@@ -682,6 +710,9 @@ impl FileOrchestrator {
                 continue;
             }
             if Self::dts_defines_alias(&combined, &alias) {
+                if Self::replace_unknown_alias(&mut combined, &alias, &type_string) {
+                    continue;
+                }
                 continue;
             }
             if !combined.is_empty() && !combined.ends_with('\n') {
@@ -774,8 +805,78 @@ impl FileOrchestrator {
         }
     }
 
-    fn should_use_inline_type(response_type: &str) -> bool {
-        response_type.contains('{') || response_type.contains('|') || response_type.contains('&')
+    fn replace_unknown_alias(content: &mut String, alias: &str, type_string: &str) -> bool {
+        let escaped = regex::escape(alias);
+        let pattern = format!(r"export\s+type\s+{}\s*=\s*unknown\s*;", escaped);
+        let Ok(re) = regex::Regex::new(&pattern) else {
+            return false;
+        };
+        if !re.is_match(content) {
+            return false;
+        }
+        let replacement = format!(
+            "export type {} = {};",
+            alias,
+            type_string.trim().trim_end_matches(';')
+        );
+        *content = re.replace(content, replacement).to_string();
+        true
+    }
+
+    fn normalize_consumer_method(method: Option<&str>) -> Option<String> {
+        let raw = method.unwrap_or("").trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("unknown") {
+            return Some("GET".to_string());
+        }
+        let normalized = normalize_manifest_method(raw);
+        if is_http_method(&normalized) {
+            Some(normalized)
+        } else {
+            None
+        }
+    }
+
+    fn derive_body_type(type_string: &str) -> String {
+        let trimmed = type_string.trim().trim_end_matches(';');
+        match Self::unwrap_single_generic(trimmed) {
+            Some(inner) => inner.trim().to_string(),
+            None => trimmed.to_string(),
+        }
+    }
+
+    fn unwrap_single_generic(type_string: &str) -> Option<String> {
+        let trimmed = type_string.trim();
+        let start = trimmed.find('<')?;
+        let mut depth: usize = 0;
+        let mut end = None;
+        for (idx, ch) in trimmed.char_indices().skip(start) {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        if !trimmed[end + 1..].trim().is_empty() {
+            return None;
+        }
+        let inner = &trimmed[start + 1..end];
+        let mut arg_depth: usize = 0;
+        for ch in inner.chars() {
+            match ch {
+                '<' => arg_depth += 1,
+                '>' => arg_depth = arg_depth.saturating_sub(1),
+                ',' if arg_depth == 0 => return None,
+                _ => {}
+            }
+        }
+        Some(inner.to_string())
     }
 
     /// Build a MountGraph from aggregated file analysis results.
@@ -895,11 +996,12 @@ impl FileOrchestrator {
         // Fifth pass: add data calls
         for (file_path, result) in file_results {
             for data_call in &result.data_calls {
+                let Some(method) = Self::normalize_consumer_method(data_call.method.as_deref())
+                else {
+                    continue;
+                };
                 graph.data_calls.push(DataFetchingCall {
-                    method: data_call
-                        .method
-                        .clone()
-                        .unwrap_or_else(|| "GET".to_string()),
+                    method,
                     target_url: data_call.target.clone(),
                     client: data_call.pattern_matched.clone(),
                     file_location: format!("{}:{}", file_path, data_call.line_number),
@@ -1178,6 +1280,41 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_type_requests_skips_non_http_methods() {
+        let agent_service = AgentService::new("mock".to_string());
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![DataCallResult {
+                    line_number: 12,
+                    target: "https://api.example.com/data".to_string(),
+                    method: Some(".json()".to_string()),
+                    pattern_matched: "resp.json()".to_string(),
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                }],
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(&file_results);
+        let config = Config::default();
+        let (explicit, infer, inline) =
+            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+
+        assert!(explicit.is_empty());
+        assert!(infer.is_empty());
+        assert!(inline.is_empty());
+    }
+
+    #[test]
     fn test_collect_type_requests_assigns_call_ids() {
         let agent_service = AgentService::new("mock".to_string());
         let orchestrator = FileOrchestrator::new(agent_service);
@@ -1351,15 +1488,20 @@ mod tests {
     }
 
     #[test]
-    fn test_should_use_inline_type() {
-        assert!(FileOrchestrator::should_use_inline_type(
-            "Response<{ id: string }>"
-        ));
-        assert!(FileOrchestrator::should_use_inline_type("Foo | Bar"));
-        assert!(FileOrchestrator::should_use_inline_type("A & B"));
-        assert!(!FileOrchestrator::should_use_inline_type(
-            "Response<User[]>"
-        ));
+    fn test_derive_body_type() {
+        assert_eq!(
+            FileOrchestrator::derive_body_type("Response<{ id: string }>"),
+            "{ id: string }"
+        );
+        assert_eq!(
+            FileOrchestrator::derive_body_type("Promise<User[]>"),
+            "User[]"
+        );
+        assert_eq!(
+            FileOrchestrator::derive_body_type("Result<User, Error>"),
+            "Result<User, Error>"
+        );
+        assert_eq!(FileOrchestrator::derive_body_type("User"), "User");
     }
 
     #[test]

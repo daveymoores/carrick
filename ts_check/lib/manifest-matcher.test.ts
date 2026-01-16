@@ -257,6 +257,9 @@ describe('ManifestMatcher', () => {
 
       const producers2 = matcher.findProducersForEndpoint(manifest, 'GET', '/api/users/[id]');
       assert.strictEqual(producers2.length, 1);
+
+      const producers3 = matcher.findProducersForEndpoint(manifest, 'GET', '/api/users/:order.userId');
+      assert.strictEqual(producers3.length, 1);
     });
 
     it('should match numeric path segments to params', () => {

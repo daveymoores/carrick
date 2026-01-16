@@ -9,6 +9,13 @@ pub fn normalize_manifest_method(method: &str) -> String {
     }
 }
 
+pub fn is_http_method(method: &str) -> bool {
+    matches!(
+        method.trim().to_uppercase().as_str(),
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE"
+    )
+}
+
 pub fn build_manifest_type_alias(
     method: &str,
     path: &str,
@@ -117,5 +124,14 @@ mod tests {
 
         assert_ne!(base, with_call);
         assert!(with_call.contains("_Call"));
+    }
+
+    #[test]
+    fn test_is_http_method() {
+        assert!(is_http_method("get"));
+        assert!(is_http_method("POST"));
+        assert!(is_http_method("delete"));
+        assert!(!is_http_method("unknown"));
+        assert!(!is_http_method(".json()"));
     }
 }

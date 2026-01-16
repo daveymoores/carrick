@@ -11,8 +11,8 @@ use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::services::TypeSidecar;
 use crate::type_manifest::{
-    build_call_site_id, build_manifest_type_alias_with_call_id, normalize_manifest_method,
-    parse_file_location,
+    build_call_site_id, build_manifest_type_alias_with_call_id, is_http_method,
+    normalize_manifest_method, parse_file_location,
 };
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
@@ -338,6 +338,9 @@ fn build_type_manifest_entries(
         }
         let (file_path, line_number) = parse_file_location(&call.file_location);
         let method = normalize_manifest_method(&call.method);
+        if !is_http_method(&method) {
+            continue;
+        }
         let path = normalizer.extract_path(&call.target_url);
         let call_id = build_call_site_id(&file_path, line_number, &method, &path);
 

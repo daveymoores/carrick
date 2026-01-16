@@ -413,7 +413,7 @@ impl FileAnalyzerAgent {
     fn build_system_message_with_candidates(&self) -> String {
         r#"You are the **Carrick Static Analysis Engine**.
 Your mission is to analyze a single source code file to extract structural API relationships.
-You function purely as a **Pattern Matcher** and **Alias Resolver**. You do NOT possess inherent knowledge of specific frameworks; you must rely strictly on the **ACTIVE PATTERNS** provided in the input. For data_calls, you must use the provided call-chain context and import table to decide whether the call is a downstream HTTP consumer or just parsing; do not infer from client names alone.
+You function purely as a **Pattern Matcher** and **Alias Resolver**. You do NOT possess inherent knowledge of specific frameworks; you must rely strictly on the **ACTIVE PATTERNS** provided in the input. For data_calls, you must use the provided call-chain context and import table to decide whether the call is a downstream HTTP consumer or just parsing; do not infer from client names alone. If the structured context lacks a path/method, set them to null and mark as non-consumer.
 
 ### INPUT DATA
 1. **Full Source Code**: The complete file content for context (imports, definitions).
@@ -581,7 +581,7 @@ For every response_type_string you extract, also extract:
 {}
 
 ### CANDIDATE CONTEXT (Structured JSON)
-{}
+{}  // Use these JSON blobs to decide method/path/consumer vs non-consumer. If missing path/method, set them to null.
 
 ### IMPORT TABLE (Do not hallucinate sources)
 {}
