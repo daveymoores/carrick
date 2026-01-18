@@ -296,6 +296,10 @@ impl AgentSchemas {
                     "items": {
                         "type": "OBJECT",
                         "properties": {
+                            "candidate_id": {
+                                "type": "STRING",
+                                "description": "Stable identifier for the AST call site candidate"
+                            },
                             "line_number": {
                                 "type": "INTEGER",
                                 "description": "Line number in the source file"
@@ -367,7 +371,7 @@ impl AgentSchemas {
                                 "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
                             }
                         },
-                        "required": ["line_number", "owner_node", "method", "path", "handler_name", "pattern_matched"]
+                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched"]
                     }
                 },
                 "data_calls": {
@@ -375,6 +379,10 @@ impl AgentSchemas {
                     "items": {
                         "type": "OBJECT",
                         "properties": {
+                            "candidate_id": {
+                                "type": "STRING",
+                                "description": "Stable identifier for the AST call site candidate"
+                            },
                             "line_number": {
                                 "type": "INTEGER",
                                 "description": "Line number in the source file"
@@ -428,7 +436,7 @@ impl AgentSchemas {
                                 "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
                             }
                         },
-                        "required": ["line_number", "target", "pattern_matched"]
+                        "required": ["candidate_id", "line_number", "target", "pattern_matched"]
                     }
                 }
             },
@@ -532,10 +540,16 @@ mod tests {
         assert!(schema["properties"]["mounts"].is_object());
         assert!(schema["properties"]["endpoints"].is_object());
         assert!(schema["properties"]["data_calls"].is_object());
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["candidate_id"].is_object()
+        );
         assert!(schema["properties"]["endpoints"]["items"]["properties"]["span_start"].is_object());
         assert!(schema["properties"]["endpoints"]["items"]["properties"]["span_end"].is_object());
         assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_start"].is_object());
         assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_end"].is_object());
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["candidate_id"].is_object()
+        );
         assert!(
             schema["properties"]["data_calls"]["items"]["properties"]["span_start"].is_object()
         );

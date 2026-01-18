@@ -101,6 +101,7 @@ fn test_file_analysis_result_structures() {
 
     // Test EndpointResult structure
     let endpoint = EndpointResult {
+        candidate_id: "span:100-140".to_string(),
         line_number: 15,
         owner_node: "router".to_string(),
         method: "GET".to_string(),
@@ -122,6 +123,7 @@ fn test_file_analysis_result_structures() {
 
     // Test DataCallResult structure
     let data_call = DataCallResult {
+        candidate_id: "span:200-260".to_string(),
         line_number: 25,
         target: "https://api.example.com/users".to_string(),
         method: Some("POST".to_string()),
@@ -159,6 +161,7 @@ fn test_file_analysis_result_serialization() {
         }],
         endpoints: vec![
             EndpointResult {
+                candidate_id: "span:300-340".to_string(),
                 line_number: 10,
                 owner_node: "router".to_string(),
                 method: "GET".to_string(),
@@ -176,6 +179,7 @@ fn test_file_analysis_result_serialization() {
                 type_import_source: None,
             },
             EndpointResult {
+                candidate_id: "span:350-400".to_string(),
                 line_number: 15,
                 owner_node: "router".to_string(),
                 method: "POST".to_string(),
@@ -194,6 +198,7 @@ fn test_file_analysis_result_serialization() {
             },
         ],
         data_calls: vec![DataCallResult {
+            candidate_id: "span:410-460".to_string(),
             line_number: 20,
             target: "https://external-api.com/data".to_string(),
             method: Some("GET".to_string()),
@@ -341,6 +346,7 @@ fn test_cross_file_import_resolution() {
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    candidate_id: "span:470-500".to_string(),
                     line_number: 5,
                     owner_node: "router".to_string(),
                     method: "GET".to_string(),
@@ -358,6 +364,7 @@ fn test_cross_file_import_resolution() {
                     type_import_source: None,
                 },
                 EndpointResult {
+                    candidate_id: "span:510-540".to_string(),
                     line_number: 10,
                     owner_node: "router".to_string(),
                     method: "GET".to_string(),
@@ -375,6 +382,7 @@ fn test_cross_file_import_resolution() {
                     type_import_source: None,
                 },
                 EndpointResult {
+                    candidate_id: "span:550-580".to_string(),
                     line_number: 15,
                     owner_node: "router".to_string(),
                     method: "POST".to_string(),
@@ -403,6 +411,7 @@ fn test_cross_file_import_resolution() {
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    candidate_id: "span:590-620".to_string(),
                     line_number: 5,
                     owner_node: "router".to_string(),
                     method: "GET".to_string(),
@@ -420,6 +429,7 @@ fn test_cross_file_import_resolution() {
                     type_import_source: None,
                 },
                 EndpointResult {
+                    candidate_id: "span:630-660".to_string(),
                     line_number: 10,
                     owner_node: "router".to_string(),
                     method: "POST".to_string(),
@@ -468,6 +478,7 @@ fn test_data_call_extraction() {
         endpoints: vec![],
         data_calls: vec![
             DataCallResult {
+                candidate_id: "span:670-700".to_string(),
                 line_number: 10,
                 target: "https://api.example.com/users".to_string(),
                 method: Some("GET".to_string()),
@@ -481,6 +492,7 @@ fn test_data_call_extraction() {
                 type_import_source: None,
             },
             DataCallResult {
+                candidate_id: "span:750-780".to_string(),
                 line_number: 15,
                 target: "/api/posts".to_string(),
                 method: Some("POST".to_string()),
@@ -494,6 +506,7 @@ fn test_data_call_extraction() {
                 type_import_source: None,
             },
             DataCallResult {
+                candidate_id: "span:790-820".to_string(),
                 line_number: 20,
                 target: "${baseUrl}/data".to_string(),
                 method: None,
@@ -584,6 +597,7 @@ fn test_nested_router_mounts() {
         FileAnalysisResult {
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                candidate_id: "span:830-860".to_string(),
                 line_number: 5,
                 owner_node: "router".to_string(),
                 method: "GET".to_string(),
@@ -620,6 +634,7 @@ fn test_multiple_http_methods_on_same_path() {
         mounts: vec![],
         endpoints: vec![
             EndpointResult {
+                candidate_id: "span:870-900".to_string(),
                 line_number: 5,
                 owner_node: "router".to_string(),
                 method: "GET".to_string(),
@@ -637,6 +652,7 @@ fn test_multiple_http_methods_on_same_path() {
                 type_import_source: None,
             },
             EndpointResult {
+                candidate_id: "span:910-940".to_string(),
                 line_number: 10,
                 owner_node: "router".to_string(),
                 method: "POST".to_string(),
@@ -654,6 +670,7 @@ fn test_multiple_http_methods_on_same_path() {
                 type_import_source: None,
             },
             EndpointResult {
+                candidate_id: "span:950-980".to_string(),
                 line_number: 15,
                 owner_node: "router".to_string(),
                 method: "PUT".to_string(),
@@ -671,6 +688,7 @@ fn test_multiple_http_methods_on_same_path() {
                 type_import_source: None,
             },
             EndpointResult {
+                candidate_id: "span:990-1020".to_string(),
                 line_number: 20,
                 owner_node: "router".to_string(),
                 method: "DELETE".to_string(),

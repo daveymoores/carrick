@@ -34,6 +34,7 @@ pub struct MountResult {
 /// Result of analyzing a single endpoint definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResult {
+    pub candidate_id: String,
     pub line_number: i32,
     pub owner_node: String,
     pub method: String,
@@ -63,6 +64,7 @@ pub struct EndpointResult {
 /// Result of analyzing a single data-fetching call
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataCallResult {
+    pub candidate_id: String,
     pub line_number: i32,
     pub target: String,
     pub method: Option<String>,
@@ -455,6 +457,7 @@ Your extraction must be useful for a graph builder. You must resolve variable na
 * Strings should be exact literals from the code.
 * Line numbers are 1-based.
 * If candidate context includes span_start/span_end, echo them for the matching endpoint/data_call.
+* Always include the candidate_id from the candidate context for each endpoint/data_call.
 * For HTTP methods, use uppercase: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, ALL.
 
 ### 3. IMPORT TRACKING
@@ -614,19 +617,21 @@ Analyze this file and return a JSON object with:
 
 For each mount, include: line_number, parent_node, child_node, mount_path, import_source (null if local), pattern_matched
 
-For each endpoint, include: line_number, owner_node, method, path, handler_name, pattern_matched, response_type_string
+For each endpoint, include: candidate_id, line_number, owner_node, method, path, handler_name, pattern_matched, response_type_string
   - response_type_string: The exact TypeScript type string from the code (e.g., "Response<User[]>", "Response<{{ id: number }}>")
   - CRITICAL: Look for Express/Fastify Response<T> generic type annotations on handler parameters. Extract the FULL type including Response<...> wrapper.
   - Example: `(req: Request, res: Response<User[]>)` → response_type_string: "Response<User[]>"
   - Example: `(req, res: Response<{{ userId: number; comments: Comment[] }}>)` → response_type_string: "Response<{{ userId: number; comments: Comment[] }}>"
   - Set response_type_file and response_type_position to null (they will be computed separately)
+  - Echo candidate_id from the candidate context
   - Include span_start/span_end from candidate context when available
   - If you can detect a response emission expression (res.json(), reply.send(), return ...), include response_expression_span_start/response_expression_span_end
 
-For each data_call, include: line_number, target, method (null if unknown), pattern_matched, response_type_string
+For each data_call, include: candidate_id, line_number, target, method (null if unknown), pattern_matched, response_type_string
   - For fetch/axios calls with typed responses like `await resp.json() as Comment[]`, extract the type assertion
   - For typed fetch wrappers, extract the generic type parameter
   - Set response_type_file and response_type_position to null (they will be computed separately)
+  - Echo candidate_id from the candidate context
   - Include span_start/span_end from candidate context when available
 
 Return ONLY the JSON object, no explanations."#,
@@ -751,6 +756,7 @@ mod tests {
     #[test]
     fn test_endpoint_result_serialization() {
         let endpoint = EndpointResult {
+            candidate_id: "span:100-140".to_string(),
             line_number: 15,
             owner_node: "router".to_string(),
             method: "GET".to_string(),
@@ -780,6 +786,7 @@ mod tests {
     #[test]
     fn test_data_call_result_serialization() {
         let data_call = DataCallResult {
+            candidate_id: "span:200-260".to_string(),
             line_number: 25,
             target: "https://api.example.com/data".to_string(),
             method: Some("POST".to_string()),
@@ -807,6 +814,7 @@ mod tests {
         let mut result = FileAnalysisResult {
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                candidate_id: "span:10-50".to_string(),
                 line_number: 1,
                 owner_node: "app".to_string(),
                 method: "GET".to_string(),
@@ -824,6 +832,7 @@ mod tests {
                 type_import_source: Some(".repo-a_types.ts".to_string()),
             }],
             data_calls: vec![DataCallResult {
+                candidate_id: "span:60-120".to_string(),
                 line_number: 2,
                 target: "https://example.com".to_string(),
                 method: Some("  POST  ".to_string()),
@@ -869,6 +878,7 @@ mod tests {
                 pattern_matched: ".use(".to_string(),
             }],
             endpoints: vec![EndpointResult {
+                candidate_id: "span:80-120".to_string(),
                 line_number: 10,
                 owner_node: "router".to_string(),
                 method: "GET".to_string(),
@@ -911,6 +921,7 @@ mod tests {
                 pattern_matched: "app.use".to_string(),
             }],
             endpoints: vec![EndpointResult {
+                candidate_id: "span:130-180".to_string(),
                 line_number: 2,
                 owner_node: "router".to_string(),
                 method: "GET".to_string(),
@@ -928,6 +939,7 @@ mod tests {
                 type_import_source: None,
             }],
             data_calls: vec![DataCallResult {
+                candidate_id: "span:190-240".to_string(),
                 line_number: 3,
                 target: "/users".to_string(),
                 method: Some("GET".to_string()),

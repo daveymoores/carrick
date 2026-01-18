@@ -1,6 +1,7 @@
 use crate::visitor::{Call, Json, TypeReference};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -614,6 +615,44 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         .map(|s| s.trim().trim_end_matches(')'))
         .unwrap_or("unknown.ts");
 
+    let mut candidate_by_line: HashMap<i32, (String, Option<u32>, Option<u32>)> = HashMap::new();
+    let mut candidate_snippets: Vec<(String, Option<u32>, Option<u32>, String)> = Vec::new();
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(candidate_id) = value.get("candidate_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(line_number) = value.get("line_number").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let span_start = value
+            .get("span_start")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let span_end = value
+            .get("span_end")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        if let Some(code_snippet) = value.get("code_snippet").and_then(|v| v.as_str()) {
+            candidate_snippets.push((
+                candidate_id.to_string(),
+                span_start,
+                span_end,
+                code_snippet.to_string(),
+            ));
+        }
+        candidate_by_line.insert(
+            line_number as i32,
+            (candidate_id.to_string(), span_start, span_end),
+        );
+    }
+
     // Look for common patterns in the file content to generate mock results
     let mut mounts = Vec::new();
     let mut endpoints = Vec::new();
@@ -626,7 +665,32 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         .or_else(|| prompt.find("FILE CONTENT"))
         .unwrap_or(0);
 
-    let content_to_analyze = &prompt[file_content_start..];
+    let content_section = &prompt[file_content_start..];
+    let content_to_analyze = if let Some(fence_start) = content_section.find("```") {
+        let after_fence = &content_section[fence_start + 3..];
+        if let Some(fence_end) = after_fence.find("```") {
+            &after_fence[..fence_end]
+        } else {
+            after_fence
+        }
+    } else {
+        content_section
+    };
+
+    let resolve_candidate = |line_number: i32, line_text: &str| {
+        if let Some(entry) = candidate_by_line.get(&line_number) {
+            return entry.clone();
+        }
+        let trimmed_line = line_text.trim();
+        if !trimmed_line.is_empty() {
+            if let Some(entry) = candidate_snippets.iter().find(|(_, _, _, snippet)| {
+                snippet.contains(trimmed_line) || trimmed_line.contains(snippet)
+            }) {
+                return (entry.0.clone(), entry.1, entry.2);
+            }
+        }
+        (format!("line:{}", line_number), None, None)
+    };
 
     // Simple pattern matching on prompt content for mock generation
     // Only look at lines that are likely actual code (not comments, not in strings)
@@ -691,13 +755,17 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_endpoint_call {
             let owner = extract_owner_from_line(line, "get");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
                 "line_number": line_number,
                 "owner_node": owner,
                 "method": "GET",
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".get(",
+                "span_start": span_start,
+                "span_end": span_end,
                 "response_type_file": null,
                 "response_type_position": null,
                 "response_type_string": null
@@ -714,13 +782,17 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_post_call {
             let owner = extract_owner_from_line(line, "post");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
                 "line_number": line_number,
                 "owner_node": owner,
                 "method": "POST",
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".post(",
+                "span_start": span_start,
+                "span_end": span_end,
                 "response_type_file": null,
                 "response_type_position": null,
                 "response_type_string": null
@@ -738,13 +810,17 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_delete_call {
             let owner = extract_owner_from_line(line, "delete");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
                 "line_number": line_number,
                 "owner_node": owner,
                 "method": "DELETE",
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".delete(",
+                "span_start": span_start,
+                "span_end": span_end,
                 "response_type_file": null,
                 "response_type_position": null,
                 "response_type_string": null
@@ -762,13 +838,17 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_put_call {
             let owner = extract_owner_from_line(line, "put");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
                 "line_number": line_number,
                 "owner_node": owner,
                 "method": "PUT",
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".put(",
+                "span_start": span_start,
+                "span_end": span_end,
                 "response_type_file": null,
                 "response_type_position": null,
                 "response_type_string": null
@@ -784,11 +864,15 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
             } else {
                 "GET"
             };
+            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
             data_calls.push(serde_json::json!({
+                "candidate_id": candidate_id,
                 "line_number": line_number,
                 "target": target,
                 "method": method,
                 "pattern_matched": "fetch(",
+                "span_start": span_start,
+                "span_end": span_end,
                 "response_type_file": null,
                 "response_type_position": null,
                 "response_type_string": null
@@ -810,11 +894,15 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
             } else {
                 "GET"
             };
+            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
             data_calls.push(serde_json::json!({
+                "candidate_id": candidate_id,
                 "line_number": line_number,
                 "target": "https://api.example.com",
                 "method": method,
                 "pattern_matched": "axios.",
+                "span_start": span_start,
+                "span_end": span_end,
                 "response_type_file": null,
                 "response_type_position": null,
                 "response_type_string": null

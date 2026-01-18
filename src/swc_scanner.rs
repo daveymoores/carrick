@@ -29,6 +29,12 @@ use crate::parser::parse_file;
 /// This is passed as a "hint" to the LLM to ensure 100% recall.
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateTarget {
+    /// Stable identifier for this call site within the file
+    pub candidate_id: String,
+    /// Start byte offset of the call expression
+    pub span_start: u32,
+    /// End byte offset of the call expression
+    pub span_end: u32,
     /// 1-based line number where the call was detected
     pub line_number: usize,
     /// The callee object (e.g., "app", "router", "fetch")
@@ -57,8 +63,15 @@ impl CandidateTarget {
         let path = self.path_snippet.as_deref().unwrap_or("<path unavailable>");
 
         format!(
-            "- Line {}: {} [fn: {}] [path: {}] - `{}`",
-            self.line_number, callee, func, path, self.code_snippet
+            "- Candidate {}: Line {} (span {}-{}) {} [fn: {}] [path: {}] - `{}`",
+            self.candidate_id,
+            self.line_number,
+            self.span_start,
+            self.span_end,
+            callee,
+            func,
+            path,
+            self.code_snippet
         )
     }
 }
@@ -317,6 +330,14 @@ impl CandidateVisitor {
         self.source_map.lookup_char_pos(span.lo).line
     }
 
+    fn span_range(&self, span: swc_common::Span) -> (u32, u32) {
+        (span.lo.0, span.hi.0)
+    }
+
+    fn candidate_id(&self, span_start: u32, span_end: u32) -> String {
+        format!("span:{}-{}", span_start, span_end)
+    }
+
     fn current_function(&self) -> Option<String> {
         self.function_stack.last().cloned()
     }
@@ -404,10 +425,15 @@ impl Visit for CandidateVisitor {
         // Check for global fetch
         if self.is_global_fetch(&call.callee) {
             let line_number = self.get_line_number(call.span);
+            let (span_start, span_end) = self.span_range(call.span);
+            let candidate_id = self.candidate_id(span_start, span_end);
             let code_snippet = self.get_code_snippet(call.span);
             let path_snippet = self.extract_first_arg_snippet(call);
 
             self.candidates.push(CandidateTarget {
+                candidate_id,
+                span_start,
+                span_end,
                 line_number,
                 callee_object: "fetch".to_string(),
                 callee_property: None,
@@ -448,10 +474,15 @@ impl Visit for CandidateVisitor {
 
                     if is_api_call {
                         let line_number = self.get_line_number(call.span);
+                        let (span_start, span_end) = self.span_range(call.span);
+                        let candidate_id = self.candidate_id(span_start, span_end);
                         let code_snippet = self.get_code_snippet(call.span);
                         let path_snippet = self.extract_first_arg_snippet(call);
 
                         self.candidates.push(CandidateTarget {
+                            candidate_id,
+                            span_start,
+                            span_end,
                             line_number,
                             callee_object: obj_name.unwrap_or_else(|| "<chain>".to_string()),
                             callee_property: Some(method),
@@ -533,6 +564,21 @@ async function getData() {
     }
 
     #[test]
+    fn test_candidate_spans_and_ids() {
+        let content = "fetch('/api/users');";
+        let result = scan_test_content(content);
+        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
+
+        let candidate = &result.candidates[0];
+        assert!(candidate.span_start < candidate.span_end);
+        assert_eq!(
+            candidate.candidate_id,
+            format!("span:{}-{}", candidate.span_start, candidate.span_end)
+        );
+    }
+
+    #[test]
     fn test_detects_router_mounts() {
         let content = r#"
 import userRouter from './routes/users';
@@ -608,6 +654,9 @@ async function fetchUser(id: string) {
     #[test]
     fn test_candidate_format_hint() {
         let candidate = CandidateTarget {
+            candidate_id: "span:100-140".to_string(),
+            span_start: 100,
+            span_end: 140,
             line_number: 15,
             callee_object: "app".to_string(),
             callee_property: Some("get".to_string()),
@@ -618,6 +667,7 @@ async function fetchUser(id: string) {
 
         let hint = candidate.format_hint();
         assert!(hint.contains("Line 15"));
+        assert!(hint.contains("span:100-140"));
         assert!(hint.contains("app.get"));
         assert!(hint.contains("handler"));
         assert!(hint.contains("[path: '/users']"));

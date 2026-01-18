@@ -32,7 +32,7 @@ use crate::{
     services::type_sidecar::{
         InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult, TypeSidecar,
     },
-    swc_scanner::SwcScanner,
+    swc_scanner::{CandidateTarget, SwcScanner},
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
         is_http_method, normalize_manifest_method, parse_file_location,
@@ -180,6 +180,11 @@ impl FileOrchestrator {
                 .iter()
                 .map(|c| serde_json::to_string(c).unwrap_or_default())
                 .collect();
+            let candidate_map: HashMap<String, CandidateTarget> = scan_result
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
+                .collect();
 
             let import_map = Self::extract_import_map(file_path, &cm, &handler);
 
@@ -201,6 +206,7 @@ impl FileOrchestrator {
                     // using the compiler-based approach instead of position-based extraction.
 
                     let mut adjusted = result;
+                    Self::apply_candidate_map(&mut adjusted, &candidate_map);
                     Self::reconcile_type_import_sources(&mut adjusted, &import_map);
                     Self::normalize_unusable_types(&mut adjusted);
 
@@ -656,6 +662,35 @@ impl FileOrchestrator {
         for call in &mut result.data_calls {
             scrub_data_call(call);
         }
+    }
+
+    fn apply_candidate_map(
+        result: &mut FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+    ) {
+        result.endpoints = result
+            .endpoints
+            .drain(..)
+            .filter_map(|mut endpoint| {
+                let candidate = candidate_map.get(&endpoint.candidate_id)?;
+                endpoint.line_number = candidate.line_number as i32;
+                endpoint.span_start = Some(candidate.span_start);
+                endpoint.span_end = Some(candidate.span_end);
+                Some(endpoint)
+            })
+            .collect();
+
+        result.data_calls = result
+            .data_calls
+            .drain(..)
+            .filter_map(|mut data_call| {
+                let candidate = candidate_map.get(&data_call.candidate_id)?;
+                data_call.line_number = candidate.line_number as i32;
+                data_call.span_start = Some(candidate.span_start);
+                data_call.span_end = Some(candidate.span_end);
+                Some(data_call)
+            })
+            .collect();
     }
 
     /// Resolve types using the TypeSidecar.
@@ -1223,6 +1258,7 @@ mod tests {
                     pattern_matched: ".use(".to_string(),
                 }],
                 endpoints: vec![EndpointResult {
+                    candidate_id: "span:100-140".to_string(),
                     line_number: 5,
                     owner_node: "app".to_string(),
                     method: "GET".to_string(),
@@ -1276,6 +1312,7 @@ mod tests {
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![DataCallResult {
+                    candidate_id: "span:200-260".to_string(),
                     line_number: 15,
                     target: "https://api.example.com/data".to_string(),
                     method: Some("POST".to_string()),
@@ -1314,6 +1351,7 @@ mod tests {
                 endpoints: vec![],
                 data_calls: vec![
                     DataCallResult {
+                        candidate_id: "span:300-340".to_string(),
                         line_number: 12,
                         target: "ordersResp".to_string(),
                         method: Some("GET".to_string()),
@@ -1327,6 +1365,7 @@ mod tests {
                         type_import_source: None,
                     },
                     DataCallResult {
+                        candidate_id: "span:350-400".to_string(),
                         line_number: 15,
                         target: "https://api.example.com/data".to_string(),
                         method: Some("GET".to_string()),
@@ -1363,6 +1402,7 @@ mod tests {
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![DataCallResult {
+                    candidate_id: "span:410-460".to_string(),
                     line_number: 12,
                     target: "https://api.example.com/data".to_string(),
                     method: Some(".json()".to_string()),
@@ -1401,6 +1441,7 @@ mod tests {
                 endpoints: vec![],
                 data_calls: vec![
                     DataCallResult {
+                        candidate_id: "span:470-520".to_string(),
                         line_number: 10,
                         target: "https://api.example.com/orders".to_string(),
                         method: Some("GET".to_string()),
@@ -1414,6 +1455,7 @@ mod tests {
                         type_import_source: None,
                     },
                     DataCallResult {
+                        candidate_id: "span:530-580".to_string(),
                         line_number: 20,
                         target: "https://api.example.com/orders".to_string(),
                         method: Some("GET".to_string()),
@@ -1449,6 +1491,7 @@ mod tests {
         let mut result = FileAnalysisResult {
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                candidate_id: "span:590-650".to_string(),
                 line_number: 10,
                 owner_node: "app".to_string(),
                 method: "GET".to_string(),
@@ -1466,6 +1509,7 @@ mod tests {
                 type_import_source: Some("react".to_string()),
             }],
             data_calls: vec![DataCallResult {
+                candidate_id: "span:660-700".to_string(),
                 line_number: 12,
                 target: "/users".to_string(),
                 method: Some("GET".to_string()),
@@ -1527,6 +1571,7 @@ mod tests {
                 mounts: vec![],
                 endpoints: vec![
                     EndpointResult {
+                        candidate_id: "span:710-740".to_string(),
                         line_number: 5,
                         owner_node: "router".to_string(),
                         method: "GET".to_string(),
@@ -1544,6 +1589,7 @@ mod tests {
                         type_import_source: None,
                     },
                     EndpointResult {
+                        candidate_id: "span:750-780".to_string(),
                         line_number: 10,
                         owner_node: "router".to_string(),
                         method: "POST".to_string(),
