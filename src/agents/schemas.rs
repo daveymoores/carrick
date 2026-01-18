@@ -83,21 +83,6 @@ impl AgentSchemas {
                     "reasoning": {
                         "type": "STRING",
                         "description": "Brief explanation of the extraction"
-                    },
-                    "response_type_file": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "File path containing the response type definition"
-                    },
-                    "response_type_position": {
-                        "type": "NUMBER",
-                        "nullable": true,
-                        "description": "Start position (index) of the response type definition in the file"
-                    },
-                    "response_type_string": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "The type string itself (e.g. 'User[]', 'Response<Order>')"
                     }
                 },
                 "required": ["method", "path", "handler", "node_name", "location", "confidence", "reasoning"]
@@ -139,21 +124,6 @@ impl AgentSchemas {
                     "reasoning": {
                         "type": "STRING",
                         "description": "Brief explanation of the extraction"
-                    },
-                    "expected_type_file": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "File path containing the expected response type definition"
-                    },
-                    "expected_type_position": {
-                        "type": "NUMBER",
-                        "nullable": true,
-                        "description": "Start position (index) of the expected response type definition in the file"
-                    },
-                    "expected_type_string": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "The type string expected (e.g. 'User[]')"
                     }
                 },
                 "required": ["library", "url", "method", "location", "confidence", "reasoning"]
@@ -325,15 +295,25 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
                             },
-                            "span_start": {
+                            "call_expression_span_start": {
                                 "type": "INTEGER",
                                 "nullable": true,
                                 "description": "Start byte offset of the endpoint definition call expression"
                             },
-                            "span_end": {
+                            "call_expression_span_end": {
                                 "type": "INTEGER",
                                 "nullable": true,
                                 "description": "End byte offset of the endpoint definition call expression"
+                            },
+                            "payload_expression_span_start": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Start byte offset of the request payload expression, if detected"
+                            },
+                            "payload_expression_span_end": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "End byte offset of the request payload expression, if detected"
                             },
                             "response_expression_span_start": {
                                 "type": "INTEGER",
@@ -344,21 +324,6 @@ impl AgentSchemas {
                                 "type": "INTEGER",
                                 "nullable": true,
                                 "description": "End byte offset of the response emission expression, if detected"
-                            },
-                            "response_type_file": {
-                                "type": "STRING",
-                                "nullable": true,
-                                "description": "File path containing the response type definition (same as current file if type is inline)"
-                            },
-                            "response_type_position": {
-                                "type": "INTEGER",
-                                "nullable": true,
-                                "description": "Character position (0-based index) where the response type annotation starts in the file"
-                            },
-                            "response_type_string": {
-                                "type": "STRING",
-                                "nullable": true,
-                                "description": "The exact type string from the code (e.g., 'Response<User[]>', 'Response<{ id: number }>')"
                             },
                             "primary_type_symbol": {
                                 "type": "STRING",
@@ -400,30 +365,25 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
                             },
-                            "span_start": {
+                            "call_expression_span_start": {
                                 "type": "INTEGER",
                                 "nullable": true,
                                 "description": "Start byte offset of the data call expression"
                             },
-                            "span_end": {
+                            "call_expression_span_end": {
                                 "type": "INTEGER",
                                 "nullable": true,
                                 "description": "End byte offset of the data call expression"
                             },
-                            "response_type_file": {
-                                "type": "STRING",
-                                "nullable": true,
-                                "description": "File path containing the response type definition"
-                            },
-                            "response_type_position": {
+                            "payload_expression_span_start": {
                                 "type": "INTEGER",
                                 "nullable": true,
-                                "description": "Character position (0-based index) where the response type annotation starts"
+                                "description": "Start byte offset of the request payload expression, if detected"
                             },
-                            "response_type_string": {
-                                "type": "STRING",
+                            "payload_expression_span_end": {
+                                "type": "INTEGER",
                                 "nullable": true,
-                                "description": "The exact type string from the code (e.g., 'Comment[]', 'Promise<User>')"
+                                "description": "End byte offset of the request payload expression, if detected"
                             },
                             "primary_type_symbol": {
                                 "type": "STRING",
@@ -543,17 +503,43 @@ mod tests {
         assert!(
             schema["properties"]["endpoints"]["items"]["properties"]["candidate_id"].is_object()
         );
-        assert!(schema["properties"]["endpoints"]["items"]["properties"]["span_start"].is_object());
-        assert!(schema["properties"]["endpoints"]["items"]["properties"]["span_end"].is_object());
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["call_expression_span_start"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["call_expression_span_end"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_span_start"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_span_end"]
+                .is_object()
+        );
         assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_start"].is_object());
         assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_end"].is_object());
         assert!(
             schema["properties"]["data_calls"]["items"]["properties"]["candidate_id"].is_object()
         );
         assert!(
-            schema["properties"]["data_calls"]["items"]["properties"]["span_start"].is_object()
+            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_span_start"]
+                .is_object()
         );
-        assert!(schema["properties"]["data_calls"]["items"]["properties"]["span_end"].is_object());
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_span_end"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_span_start"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_span_end"]
+                .is_object()
+        );
         assert!(schema["required"].is_array());
     }
 }

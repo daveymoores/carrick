@@ -42,19 +42,17 @@ pub struct EndpointResult {
     pub handler_name: String,
     pub pattern_matched: String,
     /// Start byte offset of the endpoint definition call expression
-    pub span_start: Option<u32>,
+    pub call_expression_span_start: Option<u32>,
     /// End byte offset of the endpoint definition call expression
-    pub span_end: Option<u32>,
+    pub call_expression_span_end: Option<u32>,
+    /// Start byte offset of the request payload expression (if detected)
+    pub payload_expression_span_start: Option<u32>,
+    /// End byte offset of the request payload expression (if detected)
+    pub payload_expression_span_end: Option<u32>,
     /// Start byte offset of the response emission expression (if detected)
     pub response_expression_span_start: Option<u32>,
     /// End byte offset of the response emission expression (if detected)
     pub response_expression_span_end: Option<u32>,
-    /// File path containing the response type definition
-    pub response_type_file: Option<String>,
-    /// Start position (character index) of the response type in the file
-    pub response_type_position: Option<i32>,
-    /// The type string itself (e.g., "User[]", "Response<Order>")
-    pub response_type_string: Option<String>,
     /// The primary type symbol name without wrappers (e.g., "User" from "Response<User[]>")
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
@@ -70,15 +68,13 @@ pub struct DataCallResult {
     pub method: Option<String>,
     pub pattern_matched: String,
     /// Start byte offset of the data call expression
-    pub span_start: Option<u32>,
+    pub call_expression_span_start: Option<u32>,
     /// End byte offset of the data call expression
-    pub span_end: Option<u32>,
-    /// File path containing the response type definition
-    pub response_type_file: Option<String>,
-    /// Start position (character index) of the response type in the file
-    pub response_type_position: Option<i32>,
-    /// The type string itself (e.g., "User[]", "Response<Order>")
-    pub response_type_string: Option<String>,
+    pub call_expression_span_end: Option<u32>,
+    /// Start byte offset of the request payload expression (if detected)
+    pub payload_expression_span_start: Option<u32>,
+    /// End byte offset of the request payload expression (if detected)
+    pub payload_expression_span_end: Option<u32>,
     /// The primary type symbol name without wrappers (e.g., "User" from "Promise<User>")
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
@@ -288,11 +284,7 @@ impl FileAnalyzerAgent {
         }
 
         fn is_suspicious_import_source(value: &str) -> bool {
-            if value.contains("primary_type_symbol")
-                || value.contains("response_type_string")
-                || value.contains("response_type_file")
-                || value.contains("type_import_source")
-            {
+            if value.contains("primary_type_symbol") || value.contains("type_import_source") {
                 return true;
             }
 
@@ -346,18 +338,6 @@ impl FileAnalyzerAgent {
             suspicious
         }
 
-        fn normalize_response_file(value: &mut Option<String>) -> bool {
-            let mut suspicious = false;
-            normalize_optional_string(value);
-            if let Some(source) = value.as_deref() {
-                if is_suspicious_import_source(source) || is_invalid_relative_source(source) {
-                    *value = None;
-                    suspicious = true;
-                }
-            }
-            suspicious
-        }
-
         let mut needs_retry = false;
 
         // Sanitize endpoints
@@ -366,18 +346,10 @@ impl FileAnalyzerAgent {
             if normalize_import_source(&mut endpoint.type_import_source) {
                 needs_retry = true;
             }
-            if normalize_response_file(&mut endpoint.response_type_file) {
-                needs_retry = true;
-            }
-            normalize_optional_string(&mut endpoint.response_type_string);
             if let Some(ref symbol) = endpoint.primary_type_symbol {
                 if !is_valid_identifier(symbol) {
                     endpoint.primary_type_symbol = None;
                 }
-            }
-            // Position of 0 with no file likely means null
-            if endpoint.response_type_file.is_none() && endpoint.response_type_position == Some(0) {
-                endpoint.response_type_position = None;
             }
         }
 
@@ -396,19 +368,10 @@ impl FileAnalyzerAgent {
             if normalize_import_source(&mut data_call.type_import_source) {
                 needs_retry = true;
             }
-            if normalize_response_file(&mut data_call.response_type_file) {
-                needs_retry = true;
-            }
-            normalize_optional_string(&mut data_call.response_type_string);
             if let Some(ref symbol) = data_call.primary_type_symbol {
                 if !is_valid_identifier(symbol) {
                     data_call.primary_type_symbol = None;
                 }
-            }
-            // Position of 0 with no file likely means null
-            if data_call.response_type_file.is_none() && data_call.response_type_position == Some(0)
-            {
-                data_call.response_type_position = None;
             }
         }
 
@@ -456,7 +419,7 @@ Your extraction must be useful for a graph builder. You must resolve variable na
 * Do not nest details. Every finding must be a top-level item in its respective list.
 * Strings should be exact literals from the code.
 * Line numbers are 1-based.
-* If candidate context includes span_start/span_end, echo them for the matching endpoint/data_call.
+* If candidate context includes span_start/span_end, use them for call_expression_span_start/end.
 * Always include the candidate_id from the candidate context for each endpoint/data_call.
 * For HTTP methods, use uppercase: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, ALL.
 
@@ -474,41 +437,27 @@ When a variable is used in a mount and that variable was imported, include the i
 * **Dynamic imports:** Record import_source as the string literal if available, otherwise null.
 * **response.json()/.text():** Treat these as data_calls only when they are part of an actual downstream HTTP consumer. Use the provided call-chain context (upstream call, path/method literal, enclosing function) to decide; avoid framework/client-specific heuristics.
 
-### 5. RESPONSE TYPE EXTRACTION (CRITICAL FOR TYPE CHECKING)
-For endpoints and data calls, you MUST extract TypeScript type annotations when present:
+### 5. TYPE LOCATION EXTRACTION (CRITICAL FOR TYPE CHECKING)
+For endpoints and data calls, emit spans that tell the compiler where to infer types.
 
-#### A. Endpoint Response Types
-Look for Response<T> or similar generic type annotations on handler parameters:
-* `app.get('/users', (req: Request, res: Response<User[]>) => ...)` → response_type_string: "Response<User[]>"
-* `router.post('/order', async (req, res: Response<{ orderId: string }>) => ...)` → response_type_string: "Response<{ orderId: string }>"
-* `app.get('/data', handler as RequestHandler<{}, DynamicResponse>)` → response_type_string: "Response<DynamicResponse>"
+#### A. Response Body Expressions
+Identify the expression that sends/returns the response body (res.json(...), reply.send(...), return ...).
+Emit response_expression_span_start/response_expression_span_end when detected.
 
-#### B. Data Call Response Types
-Look for type assertions or generic parameters on fetch/axios calls:
-* `const data = await resp.json() as Comment[]` → response_type_string: "Comment[]"
-* `const user = await fetch<User>('/api/user')` → response_type_string: "User"
-* `const orders: Order[] = await api.get('/orders')` → response_type_string: "Order[]"
+#### B. Request Payload Expressions
+Identify the expression representing request payloads:
+* Endpoints: req.body / ctx.request.body or payload forwarded into downstream calls.
+* Data calls: the payload argument passed to fetch/axios/etc.
+Emit payload_expression_span_start/payload_expression_span_end when detected.
 
-#### C. Type Symbol Extraction (NEW - CRITICAL)
-For every response_type_string you extract, also extract:
+#### C. Call Result Expressions (Consumers)
+For data calls, emit call_expression_span_start/call_expression_span_end for the call expression whose result is consumed.
 
-* **primary_type_symbol**: The core type identifier WITHOUT wrappers or generics:
-  - `Response<User[]>` → primary_type_symbol: "User"
-  - `Promise<Order>` → primary_type_symbol: "Order"
-  - `ApiResponse<{ users: User[] }>` → primary_type_symbol: null (inline type)
-  - `string` → primary_type_symbol: null (primitive)
-  - `Comment[]` → primary_type_symbol: "Comment"
-
-* **type_import_source**: Where the primary type is imported from (look at imports at top of file):
-  - If you see `import { User } from './types/user'` and use User → type_import_source: "./types/user"
-  - If you see `import type { Order } from '../models'` and use Order → type_import_source: "../models"
-  - If the type is defined in the same file → type_import_source: null
-  - If the type is inline (e.g., `{ id: string }`) → type_import_source: null
-
-#### D. Important Notes
-* Only extract response_type_string - the exact type annotation text
-* Set response_type_file and response_type_position to null (these are computed separately using AST)
-* If no type annotation is found, set response_type_string, primary_type_symbol, and type_import_source all to null"#.to_string()
+#### D. Explicit Type Symbols (optional)
+If you see explicit TypeScript type annotations, extract:
+* primary_type_symbol (core identifier, no wrappers)
+* type_import_source (matching import source, or null if local)
+Do NOT emit full type strings. If no explicit annotation is found, set both to null."#.to_string()
     }
 
     /// Build the dynamic user message with patterns and file content (legacy).
@@ -617,22 +566,20 @@ Analyze this file and return a JSON object with:
 
 For each mount, include: line_number, parent_node, child_node, mount_path, import_source (null if local), pattern_matched
 
-For each endpoint, include: candidate_id, line_number, owner_node, method, path, handler_name, pattern_matched, response_type_string
-  - response_type_string: The exact TypeScript type string from the code (e.g., "Response<User[]>", "Response<{{ id: number }}>")
-  - CRITICAL: Look for Express/Fastify Response<T> generic type annotations on handler parameters. Extract the FULL type including Response<...> wrapper.
-  - Example: `(req: Request, res: Response<User[]>)` → response_type_string: "Response<User[]>"
-  - Example: `(req, res: Response<{{ userId: number; comments: Comment[] }}>)` → response_type_string: "Response<{{ userId: number; comments: Comment[] }}>"
-  - Set response_type_file and response_type_position to null (they will be computed separately)
+For each endpoint, include: candidate_id, line_number, owner_node, method, path, handler_name, pattern_matched,
+call_expression_span_start/call_expression_span_end, payload_expression_span_start/payload_expression_span_end,
+response_expression_span_start/response_expression_span_end, primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
-  - Include span_start/span_end from candidate context when available
-  - If you can detect a response emission expression (res.json(), reply.send(), return ...), include response_expression_span_start/response_expression_span_end
+  - Use candidate context spans for call_expression_span_* when available
+  - If you can detect a request payload expression, include payload_expression_span_start/End
+  - If you can detect a response emission expression (res.json(), reply.send(), return ...), include response_expression_span_start/End
 
-For each data_call, include: candidate_id, line_number, target, method (null if unknown), pattern_matched, response_type_string
-  - For fetch/axios calls with typed responses like `await resp.json() as Comment[]`, extract the type assertion
-  - For typed fetch wrappers, extract the generic type parameter
-  - Set response_type_file and response_type_position to null (they will be computed separately)
+For each data_call, include: candidate_id, line_number, target, method (null if unknown), pattern_matched,
+call_expression_span_start/call_expression_span_end, payload_expression_span_start/payload_expression_span_end,
+primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
-  - Include span_start/span_end from candidate context when available
+  - Use candidate context spans for call_expression_span_* when available
+  - If you can detect a payload argument, include payload_expression_span_start/End
 
 Return ONLY the JSON object, no explanations."#,
             mount_patterns,
@@ -763,13 +710,12 @@ mod tests {
             path: "/users/:id".to_string(),
             handler_name: "getUserById".to_string(),
             pattern_matched: ".get(".to_string(),
-            span_start: None,
-            span_end: None,
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_span_start: None,
+            payload_expression_span_end: None,
             response_expression_span_start: None,
             response_expression_span_end: None,
-            response_type_file: Some("test.ts".to_string()),
-            response_type_position: Some(100),
-            response_type_string: Some("Response<User>".to_string()),
             primary_type_symbol: Some("User".to_string()),
             type_import_source: Some("./types/user".to_string()),
         };
@@ -791,11 +737,10 @@ mod tests {
             target: "https://api.example.com/data".to_string(),
             method: Some("POST".to_string()),
             pattern_matched: "fetch(".to_string(),
-            span_start: None,
-            span_end: None,
-            response_type_file: None,
-            response_type_position: None,
-            response_type_string: Some("Comment[]".to_string()),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_span_start: None,
+            payload_expression_span_end: None,
             primary_type_symbol: Some("Comment".to_string()),
             type_import_source: None,
         };
@@ -821,13 +766,12 @@ mod tests {
                 path: "/test".to_string(),
                 handler_name: "handler".to_string(),
                 pattern_matched: ".get(".to_string(),
-                span_start: None,
-                span_end: None,
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_span_start: None,
+                payload_expression_span_end: None,
                 response_expression_span_start: None,
                 response_expression_span_end: None,
-                response_type_file: Some("null".to_string()),
-                response_type_position: Some(0),
-                response_type_string: Some("+null".to_string()),
                 primary_type_symbol: Some("-".to_string()),
                 type_import_source: Some(".repo-a_types.ts".to_string()),
             }],
@@ -837,11 +781,10 @@ mod tests {
                 target: "https://example.com".to_string(),
                 method: Some("  POST  ".to_string()),
                 pattern_matched: "fetch(".to_string(),
-                span_start: None,
-                span_end: None,
-                response_type_file: Some("NULL".to_string()),
-                response_type_position: Some(0),
-                response_type_string: Some("null".to_string()),
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_span_start: None,
+                payload_expression_span_end: None,
                 primary_type_symbol: Some("NULL".to_string()),
                 type_import_source: Some("bad import (oops)".to_string()),
             }],
@@ -851,19 +794,13 @@ mod tests {
         assert!(needs_retry);
 
         let endpoint = &result.endpoints[0];
-        assert!(endpoint.response_type_file.is_none());
-        assert!(endpoint.response_type_string.is_none());
         assert!(endpoint.primary_type_symbol.is_none());
         assert!(endpoint.type_import_source.is_none());
-        assert!(endpoint.response_type_position.is_none());
 
         let data_call = &result.data_calls[0];
         assert_eq!(data_call.method, Some("POST".to_string()));
-        assert!(data_call.response_type_file.is_none());
-        assert!(data_call.response_type_string.is_none());
         assert!(data_call.primary_type_symbol.is_none());
         assert!(data_call.type_import_source.is_none());
-        assert!(data_call.response_type_position.is_none());
     }
 
     #[test]
@@ -885,13 +822,12 @@ mod tests {
                 path: "/health".to_string(),
                 handler_name: "healthCheck".to_string(),
                 pattern_matched: ".get(".to_string(),
-                span_start: None,
-                span_end: None,
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_span_start: None,
+                payload_expression_span_end: None,
                 response_expression_span_start: None,
                 response_expression_span_end: None,
-                response_type_file: None,
-                response_type_position: None,
-                response_type_string: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],
@@ -928,13 +864,12 @@ mod tests {
                 path: "/users".to_string(),
                 handler_name: "handler".to_string(),
                 pattern_matched: ".get(".to_string(),
-                span_start: None,
-                span_end: None,
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_span_start: None,
+                payload_expression_span_end: None,
                 response_expression_span_start: None,
                 response_expression_span_end: None,
-                response_type_file: None,
-                response_type_position: None,
-                response_type_string: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],
@@ -944,11 +879,10 @@ mod tests {
                 target: "/users".to_string(),
                 method: Some("GET".to_string()),
                 pattern_matched: "fetch(".to_string(),
-                span_start: None,
-                span_end: None,
-                response_type_file: None,
-                response_type_position: None,
-                response_type_string: None,
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_span_start: None,
+                payload_expression_span_end: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],

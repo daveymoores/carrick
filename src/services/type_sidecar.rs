@@ -79,6 +79,12 @@ pub struct InferRequestItem {
     pub file_path: String,
     /// Line number (1-based) where inference should occur
     pub line_number: u32,
+    /// Start byte offset of the target expression
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_start: Option<u32>,
+    /// End byte offset of the target expression
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_end: Option<u32>,
     /// The kind of inference to perform
     pub infer_kind: InferKind,
     /// Optional alias for the inferred type
@@ -816,12 +822,16 @@ mod tests {
         let request = InferRequestItem {
             file_path: "src/routes.ts".to_string(),
             line_number: 42,
+            span_start: Some(128),
+            span_end: Some(196),
             infer_kind: InferKind::ResponseBody,
             alias: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
         assert!(json.contains(r#""line_number":42"#));
+        assert!(json.contains(r#""span_start":128"#));
+        assert!(json.contains(r#""span_end":196"#));
         assert!(json.contains(r#""infer_kind":"response_body""#));
         assert!(!json.contains("alias")); // Should be skipped when None
     }

@@ -764,11 +764,14 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".get(",
-                "span_start": span_start,
-                "span_end": span_end,
-                "response_type_file": null,
-                "response_type_position": null,
-                "response_type_string": null
+                "call_expression_span_start": span_start,
+                "call_expression_span_end": span_end,
+                "payload_expression_span_start": null,
+                "payload_expression_span_end": null,
+                "response_expression_span_start": null,
+                "response_expression_span_end": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
             }));
         }
 
@@ -791,11 +794,14 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".post(",
-                "span_start": span_start,
-                "span_end": span_end,
-                "response_type_file": null,
-                "response_type_position": null,
-                "response_type_string": null
+                "call_expression_span_start": span_start,
+                "call_expression_span_end": span_end,
+                "payload_expression_span_start": null,
+                "payload_expression_span_end": null,
+                "response_expression_span_start": null,
+                "response_expression_span_end": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
             }));
         }
 
@@ -819,11 +825,14 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".delete(",
-                "span_start": span_start,
-                "span_end": span_end,
-                "response_type_file": null,
-                "response_type_position": null,
-                "response_type_string": null
+                "call_expression_span_start": span_start,
+                "call_expression_span_end": span_end,
+                "payload_expression_span_start": null,
+                "payload_expression_span_end": null,
+                "response_expression_span_start": null,
+                "response_expression_span_end": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
             }));
         }
 
@@ -847,11 +856,14 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".put(",
-                "span_start": span_start,
-                "span_end": span_end,
-                "response_type_file": null,
-                "response_type_position": null,
-                "response_type_string": null
+                "call_expression_span_start": span_start,
+                "call_expression_span_end": span_end,
+                "payload_expression_span_start": null,
+                "payload_expression_span_end": null,
+                "response_expression_span_start": null,
+                "response_expression_span_end": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
             }));
         }
 
@@ -871,11 +883,12 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "target": target,
                 "method": method,
                 "pattern_matched": "fetch(",
-                "span_start": span_start,
-                "span_end": span_end,
-                "response_type_file": null,
-                "response_type_position": null,
-                "response_type_string": null
+                "call_expression_span_start": span_start,
+                "call_expression_span_end": span_end,
+                "payload_expression_span_start": null,
+                "payload_expression_span_end": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
             }));
         }
 
@@ -901,11 +914,12 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "target": "https://api.example.com",
                 "method": method,
                 "pattern_matched": "axios.",
-                "span_start": span_start,
-                "span_end": span_end,
-                "response_type_file": null,
-                "response_type_position": null,
-                "response_type_string": null
+                "call_expression_span_start": span_start,
+                "call_expression_span_end": span_end,
+                "payload_expression_span_start": null,
+                "payload_expression_span_end": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
             }));
         }
     }

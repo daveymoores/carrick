@@ -328,6 +328,25 @@ impl FileOrchestrator {
                     });
                 }
             };
+        let mut push_infer = |file_path: &str,
+                              line_number: u32,
+                              infer_kind: InferKind,
+                              alias: String,
+                              span_start: Option<u32>,
+                              span_end: Option<u32>| {
+            let (Some(start), Some(end)) = (span_start, span_end) else {
+                return false;
+            };
+            infer_requests.push(InferRequestItem {
+                file_path: file_path.to_string(),
+                line_number,
+                infer_kind,
+                span_start: Some(start),
+                span_end: Some(end),
+                alias: Some(alias),
+            });
+            true
+        };
 
         for endpoint in mount_graph.get_resolved_endpoints() {
             let (file_path, line_number) = parse_file_location(&endpoint.file_location);
@@ -401,11 +420,6 @@ impl FileOrchestrator {
                     ManifestTypeKind::Request,
                 );
 
-                if let Some(ref response_type_string) = endpoint.response_type_string {
-                    let body_type = Self::derive_body_type(response_type_string);
-                    inline_aliases.push((response_alias.clone(), body_type));
-                }
-
                 if let (Some(symbol), Some(import_source)) =
                     (&endpoint.primary_type_symbol, &endpoint.type_import_source)
                 {
@@ -415,38 +429,38 @@ impl FileOrchestrator {
                         Self::resolve_import_path(&file_path_absolute, import_source),
                         None,
                     );
-                    if endpoint.response_type_string.is_none() {
-                        inline_aliases.push((response_alias.clone(), symbol.clone()));
-                    }
                 } else if endpoint.primary_type_symbol.is_some()
                     && endpoint.type_import_source.is_none()
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = endpoint.primary_type_symbol {
                         push_explicit(symbol.clone(), file_path_absolute.clone(), None);
-                        if endpoint.response_type_string.is_none() {
-                            inline_aliases.push((response_alias.clone(), symbol.clone()));
-                        }
                     }
                 }
 
-                if endpoint.response_type_string.is_none() {
-                    // No explicit type - try to infer the response body.
-                    infer_requests.push(InferRequestItem {
-                        file_path: file_path_absolute.clone(),
-                        line_number,
-                        infer_kind: InferKind::ResponseBody,
-                        alias: Some(response_alias.clone()),
-                    });
+                let response_inferred = push_infer(
+                    &file_path_absolute,
+                    line_number,
+                    InferKind::ResponseBody,
+                    response_alias.clone(),
+                    endpoint.response_expression_span_start,
+                    endpoint.response_expression_span_end,
+                );
+                if !response_inferred {
+                    if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
+                        inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    }
                 }
 
                 if should_infer_request_body(&method) {
-                    infer_requests.push(InferRequestItem {
-                        file_path: file_path_absolute.clone(),
+                    push_infer(
+                        &file_path_absolute,
                         line_number,
-                        infer_kind: InferKind::RequestBody,
-                        alias: Some(request_alias.clone()),
-                    });
+                        InferKind::RequestBody,
+                        request_alias.clone(),
+                        endpoint.payload_expression_span_start,
+                        endpoint.payload_expression_span_end,
+                    );
                 }
             }
 
@@ -512,11 +526,6 @@ impl FileOrchestrator {
                     Some(&call_id),
                 );
 
-                if let Some(ref response_type_string) = data_call.response_type_string {
-                    let body_type = Self::derive_body_type(response_type_string);
-                    inline_aliases.push((response_alias.clone(), body_type));
-                }
-
                 if let (Some(symbol), Some(import_source)) = (
                     &data_call.primary_type_symbol,
                     &data_call.type_import_source,
@@ -527,36 +536,38 @@ impl FileOrchestrator {
                         Self::resolve_import_path(&file_path_absolute, import_source),
                         None,
                     );
-                    if data_call.response_type_string.is_none() {
-                        inline_aliases.push((response_alias.clone(), symbol.clone()));
-                    }
                 } else if data_call.primary_type_symbol.is_some()
                     && data_call.type_import_source.is_none()
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = data_call.primary_type_symbol {
                         push_explicit(symbol.clone(), file_path_absolute.clone(), None);
-                        if data_call.response_type_string.is_none() {
-                            inline_aliases.push((response_alias.clone(), symbol.clone()));
-                        }
                     }
-                } else if data_call.response_type_string.is_none() {
-                    // No explicit type - try to infer it
-                    infer_requests.push(InferRequestItem {
-                        file_path: file_path_absolute.clone(),
-                        line_number,
-                        infer_kind: InferKind::CallResult,
-                        alias: Some(response_alias.clone()),
-                    });
+                }
+
+                let call_inferred = push_infer(
+                    &file_path_absolute,
+                    line_number,
+                    InferKind::CallResult,
+                    response_alias.clone(),
+                    data_call.call_expression_span_start,
+                    data_call.call_expression_span_end,
+                );
+                if !call_inferred {
+                    if let Some(symbol) = data_call.primary_type_symbol.as_ref() {
+                        inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    }
                 }
 
                 if should_infer_request_body(&method) {
-                    infer_requests.push(InferRequestItem {
-                        file_path: file_path_absolute.clone(),
+                    push_infer(
+                        &file_path_absolute,
                         line_number,
-                        infer_kind: InferKind::RequestBody,
-                        alias: Some(request_alias.clone()),
-                    });
+                        InferKind::RequestBody,
+                        request_alias.clone(),
+                        data_call.payload_expression_span_start,
+                        data_call.payload_expression_span_end,
+                    );
                 }
             }
         }
@@ -645,17 +656,11 @@ impl FileOrchestrator {
     /// Normalize unusable type hints from the LLM so we can force inference instead of padding unknowns.
     fn normalize_unusable_types(result: &mut FileAnalysisResult) {
         let scrub_endpoint = |endpoint: &mut EndpointResult| {
-            // Drop framework imports or empty Response wrappers; force inference later.
+            // Drop framework imports to force inference later.
             let bad_source = matches!(endpoint.type_import_source.as_deref(), Some("express"));
-            let bare_response = endpoint
-                .response_type_string
-                .as_deref()
-                .map(Self::is_untyped_response_type)
-                .unwrap_or(false);
-            if bad_source || bare_response {
+            if bad_source {
                 endpoint.type_import_source = None;
                 endpoint.primary_type_symbol = None;
-                endpoint.response_type_string = None;
             }
         };
 
@@ -663,16 +668,6 @@ impl FileOrchestrator {
             let bad_source = matches!(call.type_import_source.as_deref(), Some("express"));
             if bad_source {
                 call.type_import_source = None;
-                call.primary_type_symbol = None;
-            }
-            // Bare json()/Response with no symbol should trigger inference.
-            if call
-                .response_type_string
-                .as_deref()
-                .map(Self::is_untyped_response_type)
-                .unwrap_or(false)
-            {
-                call.response_type_string = None;
                 call.primary_type_symbol = None;
             }
         };
@@ -695,8 +690,8 @@ impl FileOrchestrator {
             .filter_map(|mut endpoint| {
                 let candidate = candidate_map.get(&endpoint.candidate_id)?;
                 endpoint.line_number = candidate.line_number as i32;
-                endpoint.span_start = Some(candidate.span_start);
-                endpoint.span_end = Some(candidate.span_end);
+                endpoint.call_expression_span_start = Some(candidate.span_start);
+                endpoint.call_expression_span_end = Some(candidate.span_end);
                 Some(endpoint)
             })
             .collect();
@@ -707,8 +702,8 @@ impl FileOrchestrator {
             .filter_map(|mut data_call| {
                 let candidate = candidate_map.get(&data_call.candidate_id)?;
                 data_call.line_number = candidate.line_number as i32;
-                data_call.span_start = Some(candidate.span_start);
-                data_call.span_end = Some(candidate.span_end);
+                data_call.call_expression_span_start = Some(candidate.span_start);
+                data_call.call_expression_span_end = Some(candidate.span_end);
                 Some(data_call)
             })
             .collect();
@@ -907,94 +902,6 @@ impl FileOrchestrator {
         } else {
             None
         }
-    }
-
-    fn derive_body_type(type_string: &str) -> String {
-        let mut trimmed = type_string.trim().trim_end_matches(';').to_string();
-        let mut unwrapped = false;
-
-        loop {
-            let Some((outer, inner)) = Self::split_single_generic(&trimmed) else {
-                break;
-            };
-            let outer_name = Self::normalize_type_name(&outer);
-            if matches!(outer_name, "Promise" | "Response") {
-                trimmed = inner.trim().to_string();
-                unwrapped = true;
-                continue;
-            }
-            if !unwrapped {
-                return inner.trim().to_string();
-            }
-            break;
-        }
-
-        trimmed
-    }
-
-    fn split_single_generic(type_string: &str) -> Option<(String, String)> {
-        let trimmed = type_string.trim();
-        let start = trimmed.find('<')?;
-        let inner = Self::unwrap_single_generic(trimmed)?;
-        let outer = trimmed[..start].trim().to_string();
-        Some((outer, inner))
-    }
-
-    fn normalize_type_name(type_name: &str) -> &str {
-        type_name.rsplit('.').next().unwrap_or(type_name)
-    }
-
-    fn is_untyped_response_type(type_string: &str) -> bool {
-        let trimmed = type_string.trim().trim_end_matches(';');
-        if trimmed.is_empty() {
-            return false;
-        }
-        if Self::normalize_type_name(trimmed) == "Response" {
-            return true;
-        }
-        let Some((outer, inner)) = Self::split_single_generic(trimmed) else {
-            return false;
-        };
-        let outer_name = Self::normalize_type_name(&outer);
-        if matches!(outer_name, "Promise" | "Response") {
-            return Self::is_untyped_response_type(&inner);
-        }
-        false
-    }
-
-    fn unwrap_single_generic(type_string: &str) -> Option<String> {
-        let trimmed = type_string.trim();
-        let start = trimmed.find('<')?;
-        let mut depth: usize = 0;
-        let mut end = None;
-        for (idx, ch) in trimmed.char_indices().skip(start) {
-            match ch {
-                '<' => depth += 1,
-                '>' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        end = Some(idx);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let end = end?;
-        if !trimmed[end + 1..].trim().is_empty() {
-            return None;
-        }
-        let inner = &trimmed[start + 1..end];
-        let mut arg_depth: usize = 0;
-        for ch in inner.chars() {
-            match ch {
-                '<' => arg_depth += 1,
-                '>' => arg_depth = arg_depth.saturating_sub(1),
-                ',' if arg_depth == 0 => return None,
-                _ => {}
-            }
-        }
-        Some(inner.to_string())
     }
 
     /// Build a MountGraph from aggregated file analysis results.
@@ -1286,13 +1193,12 @@ mod tests {
                     path: "/health".to_string(),
                     handler_name: "healthCheck".to_string(),
                     pattern_matched: ".get(".to_string(),
-                    span_start: None,
-                    span_end: None,
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_span_start: None,
+                    payload_expression_span_end: None,
                     response_expression_span_start: None,
                     response_expression_span_end: None,
-                    response_type_file: None,
-                    response_type_position: None,
-                    response_type_string: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -1338,11 +1244,10 @@ mod tests {
                     target: "https://api.example.com/data".to_string(),
                     method: Some("POST".to_string()),
                     pattern_matched: "fetch(".to_string(),
-                    span_start: None,
-                    span_end: None,
-                    response_type_file: None,
-                    response_type_position: None,
-                    response_type_string: None,
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_span_start: None,
+                    payload_expression_span_end: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -1377,11 +1282,10 @@ mod tests {
                         target: "ordersResp".to_string(),
                         method: Some("GET".to_string()),
                         pattern_matched: "resp.json()".to_string(),
-                        span_start: None,
-                        span_end: None,
-                        response_type_file: None,
-                        response_type_position: None,
-                        response_type_string: None,
+                        call_expression_span_start: None,
+                        call_expression_span_end: None,
+                        payload_expression_span_start: None,
+                        payload_expression_span_end: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1391,11 +1295,10 @@ mod tests {
                         target: "https://api.example.com/data".to_string(),
                         method: Some("GET".to_string()),
                         pattern_matched: "fetch(".to_string(),
-                        span_start: None,
-                        span_end: None,
-                        response_type_file: None,
-                        response_type_position: None,
-                        response_type_string: None,
+                        call_expression_span_start: Some(350),
+                        call_expression_span_end: Some(400),
+                        payload_expression_span_start: None,
+                        payload_expression_span_end: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1428,11 +1331,10 @@ mod tests {
                     target: "https://api.example.com/data".to_string(),
                     method: Some(".json()".to_string()),
                     pattern_matched: "resp.json()".to_string(),
-                    span_start: None,
-                    span_end: None,
-                    response_type_file: None,
-                    response_type_position: None,
-                    response_type_string: None,
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_span_start: None,
+                    payload_expression_span_end: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -1467,11 +1369,10 @@ mod tests {
                         target: "https://api.example.com/orders".to_string(),
                         method: Some("GET".to_string()),
                         pattern_matched: "fetch(".to_string(),
-                        span_start: None,
-                        span_end: None,
-                        response_type_file: None,
-                        response_type_position: None,
-                        response_type_string: None,
+                        call_expression_span_start: Some(470),
+                        call_expression_span_end: Some(520),
+                        payload_expression_span_start: None,
+                        payload_expression_span_end: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1481,11 +1382,10 @@ mod tests {
                         target: "https://api.example.com/orders".to_string(),
                         method: Some("GET".to_string()),
                         pattern_matched: "fetch(".to_string(),
-                        span_start: None,
-                        span_end: None,
-                        response_type_file: None,
-                        response_type_position: None,
-                        response_type_string: None,
+                        call_expression_span_start: Some(530),
+                        call_expression_span_end: Some(580),
+                        payload_expression_span_start: None,
+                        payload_expression_span_end: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1520,13 +1420,12 @@ mod tests {
                     path: "/users".to_string(),
                     handler_name: "handler".to_string(),
                     pattern_matched: "app.get".to_string(),
-                    span_start: None,
-                    span_end: None,
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_span_start: None,
+                    payload_expression_span_end: None,
                     response_expression_span_start: None,
                     response_expression_span_end: None,
-                    response_type_file: None,
-                    response_type_position: None,
-                    response_type_string: Some("Response<User[]>".to_string()),
                     primary_type_symbol: Some("User".to_string()),
                     type_import_source: Some("react".to_string()),
                 },
@@ -1538,13 +1437,12 @@ mod tests {
                     path: "/models".to_string(),
                     handler_name: "handler".to_string(),
                     pattern_matched: "app.get".to_string(),
-                    span_start: None,
-                    span_end: None,
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_span_start: None,
+                    payload_expression_span_end: None,
                     response_expression_span_start: None,
                     response_expression_span_end: None,
-                    response_type_file: None,
-                    response_type_position: None,
-                    response_type_string: None,
                     primary_type_symbol: Some("Models.User".to_string()),
                     type_import_source: Some("./models".to_string()),
                 },
@@ -1555,11 +1453,10 @@ mod tests {
                 target: "/users".to_string(),
                 method: Some("GET".to_string()),
                 pattern_matched: "fetch(".to_string(),
-                span_start: None,
-                span_end: None,
-                response_type_file: None,
-                response_type_position: None,
-                response_type_string: None,
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_span_start: None,
+                payload_expression_span_end: None,
                 primary_type_symbol: Some("LocalType".to_string()),
                 type_import_source: None,
             }],
@@ -1649,13 +1546,12 @@ mod tests {
                         path: "/".to_string(),
                         handler_name: "listUsers".to_string(),
                         pattern_matched: ".get(".to_string(),
-                        span_start: None,
-                        span_end: None,
+                        call_expression_span_start: None,
+                        call_expression_span_end: None,
+                        payload_expression_span_start: None,
+                        payload_expression_span_end: None,
                         response_expression_span_start: None,
                         response_expression_span_end: None,
-                        response_type_file: None,
-                        response_type_position: None,
-                        response_type_string: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1667,13 +1563,12 @@ mod tests {
                         path: "/".to_string(),
                         handler_name: "createUser".to_string(),
                         pattern_matched: ".post(".to_string(),
-                        span_start: None,
-                        span_end: None,
+                        call_expression_span_start: None,
+                        call_expression_span_end: None,
+                        payload_expression_span_start: None,
+                        payload_expression_span_end: None,
                         response_expression_span_start: None,
                         response_expression_span_end: None,
-                        response_type_file: None,
-                        response_type_position: None,
-                        response_type_string: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1694,27 +1589,6 @@ mod tests {
             .keys()
             .any(|k| k.starts_with("__import_map__::"));
         assert!(has_import_map, "Should have import mapping node");
-    }
-
-    #[test]
-    fn test_derive_body_type() {
-        assert_eq!(
-            FileOrchestrator::derive_body_type("Response<{ id: string }>"),
-            "{ id: string }"
-        );
-        assert_eq!(
-            FileOrchestrator::derive_body_type("Promise<User[]>"),
-            "User[]"
-        );
-        assert_eq!(
-            FileOrchestrator::derive_body_type("Promise<Response<User>>"),
-            "User"
-        );
-        assert_eq!(
-            FileOrchestrator::derive_body_type("Result<User, Error>"),
-            "Result<User, Error>"
-        );
-        assert_eq!(FileOrchestrator::derive_body_type("User"), "User");
     }
 
     #[test]
