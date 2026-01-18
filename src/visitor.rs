@@ -1,7 +1,10 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -117,7 +120,7 @@ pub struct Call {
     pub common_type_name: Option<String>, // Common interface name for type comparison
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymbolKind {
     Named,
     Default,
@@ -204,6 +207,32 @@ impl Visit for ImportSymbolExtractor {
                 }
             }
         }
+    }
+}
+
+/// Extracts locally-declared type symbols for validation.
+#[derive(Debug, Default)]
+pub struct TypeSymbolExtractor {
+    pub type_symbols: HashSet<String>,
+}
+
+impl TypeSymbolExtractor {
+    pub fn new() -> Self {
+        Self {
+            type_symbols: HashSet::new(),
+        }
+    }
+}
+
+impl Visit for TypeSymbolExtractor {
+    fn visit_ts_type_alias_decl(&mut self, alias: &TsTypeAliasDecl) {
+        self.type_symbols.insert(alias.id.sym.to_string());
+        alias.visit_children_with(self);
+    }
+
+    fn visit_ts_interface_decl(&mut self, interface: &TsInterfaceDecl) {
+        self.type_symbols.insert(interface.id.sym.to_string());
+        interface.visit_children_with(self);
     }
 }
 

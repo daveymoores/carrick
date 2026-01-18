@@ -38,7 +38,7 @@ use crate::{
         is_http_method, normalize_manifest_method, parse_file_location,
     },
     url_normalizer::UrlNormalizer,
-    visitor::ImportSymbolExtractor,
+    visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -79,6 +79,22 @@ pub struct ProcessingStats {
 
 type EndpointLookup = HashMap<(String, u32), Vec<(String, String)>>;
 type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
+
+#[derive(Debug, Default)]
+struct SymbolTable {
+    local_types: HashSet<String>,
+    imported_symbols: HashMap<String, ImportedSymbol>,
+}
+
+impl SymbolTable {
+    fn import_map(&self) -> HashMap<String, String> {
+        let mut import_map = HashMap::new();
+        for (local_name, symbol) in &self.imported_symbols {
+            import_map.insert(local_name.clone(), symbol.source.clone());
+        }
+        import_map
+    }
+}
 
 /// Orchestrates file-centric analysis using the FileAnalyzerAgent.
 ///
@@ -186,7 +202,8 @@ impl FileOrchestrator {
                 .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
                 .collect();
 
-            let import_map = Self::extract_import_map(file_path, &cm, &handler);
+            let symbol_table = Self::extract_symbol_table(file_path, &cm, &handler);
+            let import_map = symbol_table.import_map();
 
             // STEP 4: Call Gemini with Full File + Patterns + Candidate Targets
             match self
@@ -207,7 +224,7 @@ impl FileOrchestrator {
 
                     let mut adjusted = result;
                     Self::apply_candidate_map(&mut adjusted, &candidate_map);
-                    Self::reconcile_type_import_sources(&mut adjusted, &import_map);
+                    Self::validate_type_hints(&mut adjusted, &symbol_table);
                     Self::normalize_unusable_types(&mut adjusted);
 
                     stats.total_mounts += adjusted.mounts.len();
@@ -554,67 +571,71 @@ impl FileOrchestrator {
         (explicit_requests, infer_requests, inline_aliases)
     }
 
-    fn extract_import_map(
+    fn extract_symbol_table(
         file_path: &Path,
         cm: &Lrc<SourceMap>,
         handler: &Handler,
-    ) -> HashMap<String, String> {
-        let mut import_map = HashMap::new();
+    ) -> SymbolTable {
         let Some(module) = parse_file(file_path, cm, handler) else {
-            return import_map;
+            return SymbolTable::default();
         };
 
         let mut import_extractor = ImportSymbolExtractor::new();
         module.visit_with(&mut import_extractor);
 
-        for (local_name, symbol) in import_extractor.imported_symbols {
-            import_map.insert(local_name, symbol.source);
-        }
+        let mut type_extractor = TypeSymbolExtractor::new();
+        module.visit_with(&mut type_extractor);
 
-        import_map
+        SymbolTable {
+            local_types: type_extractor.type_symbols,
+            imported_symbols: import_extractor.imported_symbols,
+        }
     }
 
-    fn reconcile_type_import_sources(
-        result: &mut FileAnalysisResult,
-        import_map: &HashMap<String, String>,
-    ) {
-        let import_sources: HashSet<String> = import_map.values().cloned().collect();
+    fn validate_type_hints(result: &mut FileAnalysisResult, symbol_table: &SymbolTable) {
+        let validate = |primary: &mut Option<String>, source: &mut Option<String>| {
+            let Some(symbol) = primary.as_ref() else {
+                *source = None;
+                return;
+            };
 
-        let reconcile = |primary: &mut Option<String>, source: &mut Option<String>| {
-            if let Some(symbol) = primary.as_ref() {
-                if let Some(actual_source) = import_map.get(symbol) {
-                    *source = Some(actual_source.clone());
+            let (root, has_member) = symbol
+                .split_once('.')
+                .map(|(root, _)| (root, true))
+                .unwrap_or((symbol.as_str(), false));
+
+            if symbol_table.local_types.contains(root) {
+                if source.is_none() && !has_member {
+                    return;
+                }
+            } else if let Some(imported) = symbol_table.imported_symbols.get(root) {
+                let source_matches = source
+                    .as_deref()
+                    .map(|value| value == imported.source.as_str())
+                    .unwrap_or(false);
+                let namespace_ok = if imported.kind == SymbolKind::Namespace {
+                    has_member
+                } else {
+                    !has_member
+                };
+                if source_matches && namespace_ok {
                     return;
                 }
             }
 
-            let Some(value) = source.as_ref() else {
-                return;
-            };
-
-            if value.starts_with('.') || value.starts_with('/') {
-                return;
-            }
-
-            if import_sources.contains(value) {
-                return;
-            }
-
+            *primary = None;
             *source = None;
-            if primary.is_some() {
-                *primary = None;
-            }
         };
 
         for endpoint in &mut result.endpoints {
-            reconcile(
+            validate(
                 &mut endpoint.primary_type_symbol,
                 &mut endpoint.type_import_source,
             );
         }
 
         for data_call in &mut result.data_calls {
-            reconcile(
+            validate(
                 &mut data_call.primary_type_symbol,
                 &mut data_call.type_import_source,
             );
@@ -1487,27 +1508,47 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_type_import_sources_uses_import_map() {
+    fn test_validate_type_hints_rejects_invalid_symbols() {
         let mut result = FileAnalysisResult {
             mounts: vec![],
-            endpoints: vec![EndpointResult {
-                candidate_id: "span:590-650".to_string(),
-                line_number: 10,
-                owner_node: "app".to_string(),
-                method: "GET".to_string(),
-                path: "/users".to_string(),
-                handler_name: "handler".to_string(),
-                pattern_matched: "app.get".to_string(),
-                span_start: None,
-                span_end: None,
-                response_expression_span_start: None,
-                response_expression_span_end: None,
-                response_type_file: None,
-                response_type_position: None,
-                response_type_string: Some("Response<User[]>".to_string()),
-                primary_type_symbol: Some("Response".to_string()),
-                type_import_source: Some("react".to_string()),
-            }],
+            endpoints: vec![
+                EndpointResult {
+                    candidate_id: "span:590-650".to_string(),
+                    line_number: 10,
+                    owner_node: "app".to_string(),
+                    method: "GET".to_string(),
+                    path: "/users".to_string(),
+                    handler_name: "handler".to_string(),
+                    pattern_matched: "app.get".to_string(),
+                    span_start: None,
+                    span_end: None,
+                    response_expression_span_start: None,
+                    response_expression_span_end: None,
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: Some("Response<User[]>".to_string()),
+                    primary_type_symbol: Some("User".to_string()),
+                    type_import_source: Some("react".to_string()),
+                },
+                EndpointResult {
+                    candidate_id: "span:700-740".to_string(),
+                    line_number: 12,
+                    owner_node: "app".to_string(),
+                    method: "GET".to_string(),
+                    path: "/models".to_string(),
+                    handler_name: "handler".to_string(),
+                    pattern_matched: "app.get".to_string(),
+                    span_start: None,
+                    span_end: None,
+                    response_expression_span_start: None,
+                    response_expression_span_end: None,
+                    response_type_file: None,
+                    response_type_position: None,
+                    response_type_string: None,
+                    primary_type_symbol: Some("Models.User".to_string()),
+                    type_import_source: Some("./models".to_string()),
+                },
+            ],
             data_calls: vec![DataCallResult {
                 candidate_id: "span:660-700".to_string(),
                 line_number: 12,
@@ -1519,25 +1560,55 @@ mod tests {
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
-                primary_type_symbol: Some("User".to_string()),
-                type_import_source: Some("react".to_string()),
+                primary_type_symbol: Some("LocalType".to_string()),
+                type_import_source: None,
             }],
         };
 
-        let mut import_map = HashMap::new();
-        import_map.insert("Response".to_string(), "express".to_string());
-        import_map.insert("User".to_string(), "./repo-a_types".to_string());
+        let mut imported_symbols = HashMap::new();
+        imported_symbols.insert(
+            "User".to_string(),
+            ImportedSymbol {
+                local_name: "User".to_string(),
+                imported_name: "User".to_string(),
+                source: "./repo-a_types".to_string(),
+                kind: SymbolKind::Named,
+            },
+        );
+        imported_symbols.insert(
+            "Models".to_string(),
+            ImportedSymbol {
+                local_name: "Models".to_string(),
+                imported_name: "Models".to_string(),
+                source: "./models".to_string(),
+                kind: SymbolKind::Namespace,
+            },
+        );
 
-        FileOrchestrator::reconcile_type_import_sources(&mut result, &import_map);
+        let symbol_table = SymbolTable {
+            local_types: HashSet::from(["LocalType".to_string()]),
+            imported_symbols,
+        };
 
-        let endpoint = &result.endpoints[0];
-        assert_eq!(endpoint.type_import_source, Some("express".to_string()));
+        FileOrchestrator::validate_type_hints(&mut result, &symbol_table);
+
+        let invalid_endpoint = &result.endpoints[0];
+        assert!(invalid_endpoint.primary_type_symbol.is_none());
+        assert!(invalid_endpoint.type_import_source.is_none());
+
+        let namespace_endpoint = &result.endpoints[1];
+        assert_eq!(
+            namespace_endpoint.primary_type_symbol.as_deref(),
+            Some("Models.User")
+        );
+        assert_eq!(
+            namespace_endpoint.type_import_source.as_deref(),
+            Some("./models")
+        );
 
         let data_call = &result.data_calls[0];
-        assert_eq!(
-            data_call.type_import_source,
-            Some("./repo-a_types".to_string())
-        );
+        assert_eq!(data_call.primary_type_symbol.as_deref(), Some("LocalType"));
+        assert!(data_call.type_import_source.is_none());
     }
 
     #[test]
