@@ -4,6 +4,7 @@ use crate::{
     mount_graph::MountGraph,
     multi_agent_orchestrator::MultiAgentAnalysisResult,
     packages::Packages,
+    services::type_sidecar::InferKind,
     visitor::{FunctionDefinition, Mount, OwnerType},
 };
 use async_trait::async_trait;
@@ -40,6 +41,25 @@ pub enum ManifestTypeState {
     Unknown,
 }
 
+/// Evidence metadata for how a manifest entry was derived.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TypeEvidence {
+    /// Source file path where the type was found
+    pub file_path: String,
+    /// Start byte offset in the source file
+    pub span_start: Option<u32>,
+    /// End byte offset in the source file
+    pub span_end: Option<u32>,
+    /// Line number in the source file
+    pub line_number: u32,
+    /// Kind of inference performed for this type
+    pub infer_kind: InferKind,
+    /// Whether the type was explicitly annotated
+    pub is_explicit: bool,
+    /// Current state of the type extraction
+    pub type_state: ManifestTypeState,
+}
+
 /// Entry in the type manifest mapping endpoints to their type information
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TypeManifestEntry {
@@ -61,6 +81,8 @@ pub struct TypeManifestEntry {
     pub is_explicit: bool,
     /// Current state of the type extraction
     pub type_state: ManifestTypeState,
+    /// Evidence metadata for this entry
+    pub evidence: TypeEvidence,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

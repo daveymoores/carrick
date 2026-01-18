@@ -40,6 +40,14 @@ pub struct EndpointResult {
     pub path: String,
     pub handler_name: String,
     pub pattern_matched: String,
+    /// Start byte offset of the endpoint definition call expression
+    pub span_start: Option<u32>,
+    /// End byte offset of the endpoint definition call expression
+    pub span_end: Option<u32>,
+    /// Start byte offset of the response emission expression (if detected)
+    pub response_expression_span_start: Option<u32>,
+    /// End byte offset of the response emission expression (if detected)
+    pub response_expression_span_end: Option<u32>,
     /// File path containing the response type definition
     pub response_type_file: Option<String>,
     /// Start position (character index) of the response type in the file
@@ -59,6 +67,10 @@ pub struct DataCallResult {
     pub target: String,
     pub method: Option<String>,
     pub pattern_matched: String,
+    /// Start byte offset of the data call expression
+    pub span_start: Option<u32>,
+    /// End byte offset of the data call expression
+    pub span_end: Option<u32>,
     /// File path containing the response type definition
     pub response_type_file: Option<String>,
     /// Start position (character index) of the response type in the file
@@ -442,6 +454,7 @@ Your extraction must be useful for a graph builder. You must resolve variable na
 * Do not nest details. Every finding must be a top-level item in its respective list.
 * Strings should be exact literals from the code.
 * Line numbers are 1-based.
+* If candidate context includes span_start/span_end, echo them for the matching endpoint/data_call.
 * For HTTP methods, use uppercase: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, ALL.
 
 ### 3. IMPORT TRACKING
@@ -607,11 +620,14 @@ For each endpoint, include: line_number, owner_node, method, path, handler_name,
   - Example: `(req: Request, res: Response<User[]>)` → response_type_string: "Response<User[]>"
   - Example: `(req, res: Response<{{ userId: number; comments: Comment[] }}>)` → response_type_string: "Response<{{ userId: number; comments: Comment[] }}>"
   - Set response_type_file and response_type_position to null (they will be computed separately)
+  - Include span_start/span_end from candidate context when available
+  - If you can detect a response emission expression (res.json(), reply.send(), return ...), include response_expression_span_start/response_expression_span_end
 
 For each data_call, include: line_number, target, method (null if unknown), pattern_matched, response_type_string
   - For fetch/axios calls with typed responses like `await resp.json() as Comment[]`, extract the type assertion
   - For typed fetch wrappers, extract the generic type parameter
   - Set response_type_file and response_type_position to null (they will be computed separately)
+  - Include span_start/span_end from candidate context when available
 
 Return ONLY the JSON object, no explanations."#,
             mount_patterns,
@@ -741,6 +757,10 @@ mod tests {
             path: "/users/:id".to_string(),
             handler_name: "getUserById".to_string(),
             pattern_matched: ".get(".to_string(),
+            span_start: None,
+            span_end: None,
+            response_expression_span_start: None,
+            response_expression_span_end: None,
             response_type_file: Some("test.ts".to_string()),
             response_type_position: Some(100),
             response_type_string: Some("Response<User>".to_string()),
@@ -764,6 +784,8 @@ mod tests {
             target: "https://api.example.com/data".to_string(),
             method: Some("POST".to_string()),
             pattern_matched: "fetch(".to_string(),
+            span_start: None,
+            span_end: None,
             response_type_file: None,
             response_type_position: None,
             response_type_string: Some("Comment[]".to_string()),
@@ -791,6 +813,10 @@ mod tests {
                 path: "/test".to_string(),
                 handler_name: "handler".to_string(),
                 pattern_matched: ".get(".to_string(),
+                span_start: None,
+                span_end: None,
+                response_expression_span_start: None,
+                response_expression_span_end: None,
                 response_type_file: Some("null".to_string()),
                 response_type_position: Some(0),
                 response_type_string: Some("+null".to_string()),
@@ -802,6 +828,8 @@ mod tests {
                 target: "https://example.com".to_string(),
                 method: Some("  POST  ".to_string()),
                 pattern_matched: "fetch(".to_string(),
+                span_start: None,
+                span_end: None,
                 response_type_file: Some("NULL".to_string()),
                 response_type_position: Some(0),
                 response_type_string: Some("null".to_string()),
@@ -847,6 +875,10 @@ mod tests {
                 path: "/health".to_string(),
                 handler_name: "healthCheck".to_string(),
                 pattern_matched: ".get(".to_string(),
+                span_start: None,
+                span_end: None,
+                response_expression_span_start: None,
+                response_expression_span_end: None,
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
@@ -885,6 +917,10 @@ mod tests {
                 path: "/users".to_string(),
                 handler_name: "handler".to_string(),
                 pattern_matched: ".get(".to_string(),
+                span_start: None,
+                span_end: None,
+                response_expression_span_start: None,
+                response_expression_span_end: None,
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,
@@ -896,6 +932,8 @@ mod tests {
                 target: "/users".to_string(),
                 method: Some("GET".to_string()),
                 pattern_matched: "fetch(".to_string(),
+                span_start: None,
+                span_end: None,
                 response_type_file: None,
                 response_type_position: None,
                 response_type_string: None,

@@ -321,6 +321,26 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
                             },
+                            "span_start": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Start byte offset of the endpoint definition call expression"
+                            },
+                            "span_end": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "End byte offset of the endpoint definition call expression"
+                            },
+                            "response_expression_span_start": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Start byte offset of the response emission expression, if detected"
+                            },
+                            "response_expression_span_end": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "End byte offset of the response emission expression, if detected"
+                            },
                             "response_type_file": {
                                 "type": "STRING",
                                 "nullable": true,
@@ -371,6 +391,16 @@ impl AgentSchemas {
                             "pattern_matched": {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
+                            },
+                            "span_start": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Start byte offset of the data call expression"
+                            },
+                            "span_end": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "End byte offset of the data call expression"
                             },
                             "response_type_file": {
                                 "type": "STRING",
@@ -502,6 +532,14 @@ mod tests {
         assert!(schema["properties"]["mounts"].is_object());
         assert!(schema["properties"]["endpoints"].is_object());
         assert!(schema["properties"]["data_calls"].is_object());
+        assert!(schema["properties"]["endpoints"]["items"]["properties"]["span_start"].is_object());
+        assert!(schema["properties"]["endpoints"]["items"]["properties"]["span_end"].is_object());
+        assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_start"].is_object());
+        assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_end"].is_object());
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["span_start"].is_object()
+        );
+        assert!(schema["properties"]["data_calls"]["items"]["properties"]["span_end"].is_object());
         assert!(schema["required"].is_array());
     }
 }

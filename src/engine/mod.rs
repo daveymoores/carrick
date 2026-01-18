@@ -9,7 +9,7 @@ use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
-use crate::services::TypeSidecar;
+use crate::services::{TypeSidecar, type_sidecar::InferKind};
 use crate::type_manifest::{
     build_call_site_id, build_manifest_type_alias_with_call_id, is_http_method,
     normalize_manifest_method, parse_file_location,
@@ -370,6 +370,16 @@ fn add_manifest_pair(
     for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
         let type_alias =
             build_manifest_type_alias_with_call_id(method, path, role, type_kind, call_id);
+        let infer_kind = infer_kind_for_manifest(role, type_kind);
+        let evidence = crate::cloud_storage::TypeEvidence {
+            file_path: file_path.to_string(),
+            span_start: None,
+            span_end: None,
+            line_number,
+            infer_kind,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+        };
         entries.push(TypeManifestEntry {
             method: method.to_string(),
             path: path.to_string(),
@@ -380,7 +390,16 @@ fn add_manifest_pair(
             line_number,
             is_explicit: false,
             type_state: ManifestTypeState::Unknown,
+            evidence,
         });
+    }
+}
+
+fn infer_kind_for_manifest(role: ManifestRole, type_kind: ManifestTypeKind) -> InferKind {
+    match (role, type_kind) {
+        (ManifestRole::Consumer, ManifestTypeKind::Response) => InferKind::CallResult,
+        (_, ManifestTypeKind::Response) => InferKind::ResponseBody,
+        (_, ManifestTypeKind::Request) => InferKind::RequestBody,
     }
 }
 
