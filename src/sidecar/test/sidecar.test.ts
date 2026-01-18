@@ -543,6 +543,38 @@ describe('Type Sidecar Integration Tests', () => {
         assert.ok(!inferred.type_string.includes('RegisterHandle'));
       }
     });
+
+    it('should prefer response.json payload types for fetch calls', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-6',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/fetch-json.ts'),
+            line_number: 2,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-6');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'call_result');
+        assert.ok(inferred.type_string.includes('id'));
+        assert.ok(inferred.type_string.includes('name'));
+        assert.ok(!inferred.type_string.includes('Response'));
+      }
+    });
   });
 
   describe('error handling', () => {

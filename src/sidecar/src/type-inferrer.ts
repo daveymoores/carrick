@@ -265,6 +265,52 @@ export class TypeInferrer {
       return null;
     }
 
+    const explicitType = this.extractExplicitTypeFromAncestor(callExpr);
+    if (explicitType) {
+      return this.createInferredType(
+        request,
+        explicitType,
+        true,
+        this.getNodeLocation(callExpr, sourceFile)
+      );
+    }
+
+    const chainedJsonCall = this.findJsonCallFromAncestor(callExpr);
+    if (chainedJsonCall) {
+      const inferred = this.inferJsonPayloadType(chainedJsonCall);
+      if (inferred) {
+        return this.createInferredType(
+          request,
+          inferred.typeString,
+          inferred.isExplicit,
+          this.getNodeLocation(chainedJsonCall, sourceFile)
+        );
+      }
+    }
+
+    if (this.isFetchCall(callExpr)) {
+      const responseVar = this.getAssignedVariableName(callExpr);
+      const func = this.findContainingFunction(sourceFile, request.line_number);
+      if (responseVar && func) {
+        const jsonCall = this.findJsonCallForIdentifier(
+          func,
+          responseVar,
+          callExpr.getStartLineNumber()
+        );
+        if (jsonCall) {
+          const inferred = this.inferJsonPayloadType(jsonCall);
+          if (inferred) {
+            return this.createInferredType(
+              request,
+              inferred.typeString,
+              inferred.isExplicit,
+              this.getNodeLocation(jsonCall, sourceFile)
+            );
+          }
+        }
+      }
+    }
+
     let returnType = callExpr.getReturnType();
     let typeString = returnType.getText(callExpr);
 
@@ -521,6 +567,156 @@ export class TypeInferrer {
     }
 
     return typeText;
+  }
+
+  private extractExplicitTypeFromAncestor(node: Node): string | null {
+    const varDecl = node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+    if (varDecl) {
+      const typeNode = varDecl.getTypeNode();
+      if (typeNode) {
+        return typeNode.getText();
+      }
+    }
+
+    const asExpr = node.getFirstAncestorByKind(SyntaxKind.AsExpression);
+    if (asExpr) {
+      const typeNode = asExpr.getTypeNode();
+      if (typeNode) {
+        return typeNode.getText();
+      }
+    }
+
+    const typeAssertion = node.getFirstAncestorByKind(
+      SyntaxKind.TypeAssertionExpression
+    );
+    if (typeAssertion && Node.isTypeAssertion(typeAssertion)) {
+      const typeNode = typeAssertion.getTypeNode();
+      if (typeNode) {
+        return typeNode.getText();
+      }
+    }
+
+    return null;
+  }
+
+  private isFetchCall(call: CallExpression): boolean {
+    const expression = call.getExpression();
+    if (Node.isIdentifier(expression)) {
+      return expression.getText() === 'fetch';
+    }
+    if (Node.isPropertyAccessExpression(expression)) {
+      return expression.getName() === 'fetch';
+    }
+    return false;
+  }
+
+  private isDecodeMethod(name: string): boolean {
+    return ['json', 'text', 'blob', 'arrayBuffer', 'formData'].includes(name);
+  }
+
+  private findJsonCallFromAncestor(call: CallExpression): CallExpression | null {
+    let current: Node | undefined = call.getParent();
+    while (current) {
+      if (
+        Node.isPropertyAccessExpression(current) &&
+        this.isDecodeMethod(current.getName())
+      ) {
+        const parent = current.getParent();
+        if (parent && Node.isCallExpression(parent)) {
+          return parent;
+        }
+      }
+      if (
+        Node.isFunctionDeclaration(current) ||
+        Node.isArrowFunction(current) ||
+        Node.isFunctionExpression(current) ||
+        Node.isMethodDeclaration(current)
+      ) {
+        break;
+      }
+      current = current.getParent();
+    }
+
+    return null;
+  }
+
+  private getAssignedVariableName(call: CallExpression): string | null {
+    const varDecl = call.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+    if (!varDecl) {
+      return null;
+    }
+
+    const initializer = varDecl.getInitializer();
+    if (!initializer) {
+      return null;
+    }
+
+    const callNodes = initializer.getDescendantsOfKind(
+      SyntaxKind.CallExpression
+    );
+    if (!callNodes.includes(call)) {
+      return null;
+    }
+
+    const nameNode = varDecl.getNameNode();
+    if (Node.isIdentifier(nameNode)) {
+      return nameNode.getText();
+    }
+
+    return null;
+  }
+
+  private findJsonCallForIdentifier(
+    func: FunctionLike,
+    identifier: string,
+    anchorLine: number
+  ): CallExpression | null {
+    const calls = func.getDescendantsOfKind(SyntaxKind.CallExpression);
+    let bestAfter: { call: CallExpression; delta: number } | null = null;
+    let bestBefore: { call: CallExpression; delta: number } | null = null;
+
+    for (const call of calls) {
+      const expr = call.getExpression();
+      if (!Node.isPropertyAccessExpression(expr)) {
+        continue;
+      }
+      if (!this.isDecodeMethod(expr.getName())) {
+        continue;
+      }
+      const receiver = this.getRootIdentifierName(expr.getExpression());
+      if (receiver !== identifier) {
+        continue;
+      }
+
+      const line = call.getStartLineNumber();
+      const delta = line - anchorLine;
+      if (delta >= 0) {
+        if (!bestAfter || delta < bestAfter.delta) {
+          bestAfter = { call, delta };
+        }
+      } else {
+        const absDelta = Math.abs(delta);
+        if (!bestBefore || absDelta < bestBefore.delta) {
+          bestBefore = { call, delta: absDelta };
+        }
+      }
+    }
+
+    return bestAfter?.call ?? bestBefore?.call ?? null;
+  }
+
+  private inferJsonPayloadType(
+    call: CallExpression
+  ): { typeString: string; isExplicit: boolean } | null {
+    const explicitType = this.extractExplicitTypeFromAncestor(call);
+    if (explicitType) {
+      return { typeString: explicitType, isExplicit: true };
+    }
+
+    const returnType = call.getReturnType();
+    let typeString = returnType.getText(call);
+    typeString = this.unwrapPromise(typeString, returnType);
+    return { typeString, isExplicit: false };
   }
 
   private getRootIdentifierName(node: Node): string | null {
