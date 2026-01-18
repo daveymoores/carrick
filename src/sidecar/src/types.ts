@@ -96,8 +96,12 @@ export interface SymbolRequest {
 export interface InferRequestItem {
   /** Path to the file (relative to repo root) */
   file_path: string;
-  /** Line number (1-based) where inference should occur */
+  /** Line number (1-based) for context and alias generation */
   line_number: number;
+  /** Start byte offset of the target expression */
+  span_start: number;
+  /** End byte offset of the target expression */
+  span_end: number;
   /** The kind of inference to perform */
   infer_kind: InferKind;
   /** Optional alias for the inferred type */

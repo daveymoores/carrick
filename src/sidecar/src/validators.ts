@@ -38,12 +38,24 @@ export const SymbolRequestSchema = z.object({
 // Infer Request Item Schema
 // ============================================================================
 
-export const InferRequestItemSchema = z.object({
-  file_path: z.string().min(1, 'File path cannot be empty'),
-  line_number: z.number().int().positive('Line number must be positive'),
-  infer_kind: InferKindSchema,
-  alias: z.string().optional(),
-});
+export const InferRequestItemSchema = z
+  .object({
+    file_path: z.string().min(1, 'File path cannot be empty'),
+    line_number: z.number().int().positive('Line number must be positive'),
+    span_start: z.number().int().nonnegative('Span start must be non-negative'),
+    span_end: z.number().int().nonnegative('Span end must be non-negative'),
+    infer_kind: InferKindSchema,
+    alias: z.string().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.span_end < value.span_start) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'span_end must be greater than or equal to span_start',
+        path: ['span_end'],
+      });
+    }
+  });
 
 // ============================================================================
 // Action-specific Request Schemas

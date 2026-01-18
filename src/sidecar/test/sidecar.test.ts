@@ -349,6 +349,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
             line_number: 55, // getUser function (line inside the function body)
+            span_start: 1537,
+            span_end: 1541,
             infer_kind: 'function_return',
           },
         ],
@@ -383,6 +385,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
             line_number: 87, // getOrders function body (implicit types)
+            span_start: 1770,
+            span_end: 1776,
             infer_kind: 'response_body',
           },
         ],
@@ -394,6 +398,39 @@ describe('Type Sidecar Integration Tests', () => {
         assert.strictEqual(inferred.infer_kind, 'response_body');
         // For implicit types, is_explicit should be false
         assert.strictEqual(inferred.is_explicit, false);
+      }
+    });
+
+    it('should infer response body type from multiline expressions', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-2a',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/multiline.ts'),
+            line_number: 6,
+            span_start: 121,
+            span_end: 224,
+            infer_kind: 'response_body',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-2a');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'response_body');
+        assert.ok(inferred.type_string.includes('id'));
+        assert.ok(inferred.type_string.includes('meta'));
       }
     });
 
@@ -414,6 +451,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/request-bodies.ts'),
             line_number: 14,
+            span_start: 207,
+            span_end: 215,
             infer_kind: 'request_body',
           },
         ],
@@ -443,6 +482,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/request-bodies.ts'),
             line_number: 20,
+            span_start: 344,
+            span_end: 348,
             infer_kind: 'request_body',
           },
         ],
@@ -471,6 +512,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
             line_number: 55, // Inside getUser function body
+            span_start: 1537,
+            span_end: 1541,
             infer_kind: 'function_return',
             alias: 'GetUserReturn',
           },
@@ -498,6 +541,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
             line_number: 13, // Inside db const declaration (findUser line)
+            span_start: 288,
+            span_end: 290,
             infer_kind: 'variable',
           },
         ],
@@ -526,6 +571,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/call-site.ts'),
             line_number: 21,
+            span_start: 376,
+            span_end: 387,
             infer_kind: 'call_result',
           },
         ],
@@ -561,6 +608,8 @@ describe('Type Sidecar Integration Tests', () => {
           {
             file_path: path.join(FIXTURES_PATH, 'src/fetch-json.ts'),
             line_number: 2,
+            span_start: 60,
+            span_end: 96,
             infer_kind: 'call_result',
           },
         ],
@@ -695,6 +744,8 @@ describe('Validator Unit Tests', () => {
         {
           file_path: 'src/routes.ts',
           line_number: 10,
+          span_start: 10,
+          span_end: 20,
           infer_kind: 'function_return',
         },
       ],
@@ -713,6 +764,8 @@ describe('Validator Unit Tests', () => {
         {
           file_path: 'src/routes.ts',
           line_number: 10,
+          span_start: 10,
+          span_end: 20,
           infer_kind: 'invalid_kind',
         },
       ],

@@ -2,8 +2,8 @@
  * Type Inferrer - Scope-based type inference for implicit types
  *
  * This module extracts types even when developers don't write explicit
- * annotations. It uses scope-based search (not line windows) to handle
- * large handlers with middleware, validation, logging before response.
+ * annotations. It uses span-based node lookup (no line windows) to target
+ * precise expressions provided by the Rust/LLM pipeline.
  *
  * Framework-agnostic patterns detected:
  * - res.json(data) / res.send(data) - Express/Fastify style
@@ -20,10 +20,7 @@ import {
   type ArrowFunction,
   type FunctionExpression,
   type MethodDeclaration,
-  type ParameterDeclaration,
   type CallExpression,
-  type BinaryExpression,
-  type ReturnStatement,
   type Type,
 } from 'ts-morph';
 import type {
@@ -82,13 +79,13 @@ export class TypeInferrer {
           inferredTypes.push(result);
         } else {
           errors.push(
-            `Could not infer type at ${request.file_path}:${request.line_number} (${request.infer_kind})`
+            `Could not infer type at ${request.file_path}:${request.span_start}-${request.span_end} (${request.infer_kind})`
           );
         }
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
         errors.push(
-          `Error inferring type at ${request.file_path}:${request.line_number}: ${error}`
+          `Error inferring type at ${request.file_path}:${request.span_start}-${request.span_end}: ${error}`
         );
       }
     }
@@ -152,15 +149,21 @@ export class TypeInferrer {
   // ===========================================================================
 
   /**
-   * Infer the return type of a function at the given line
+   * Infer the return type of a function containing the target span
    */
   private inferFunctionReturn(
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const func = this.findContainingFunction(sourceFile, request.line_number);
+    const func = this.findContainingFunctionBySpan(
+      sourceFile,
+      request.span_start,
+      request.span_end
+    );
     if (!func) {
-      this.log(`No function found at line ${request.line_number}`);
+      this.log(
+        `No function found for span ${request.span_start}-${request.span_end}`
+      );
       return null;
     }
 
@@ -193,75 +196,52 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const func = this.findContainingFunction(sourceFile, request.line_number);
-    if (!func) {
-      this.log(`No function found at line ${request.line_number}`);
+    const node = this.findNodeAtSpan(
+      sourceFile,
+      request.span_start,
+      request.span_end
+    );
+    if (!node) {
+      this.log(
+        `No response expression found for span ${request.span_start}-${request.span_end}`
+      );
       return null;
     }
 
-    // Collect all response types from the function body
-    const responseTypes: string[] = [];
-
-    // Search for response patterns in the entire function scope
-    const callExpressions = func.getDescendantsOfKind(SyntaxKind.CallExpression);
-    const binaryExpressions = func.getDescendantsOfKind(SyntaxKind.BinaryExpression);
-    const returnStatements = func.getDescendantsOfKind(SyntaxKind.ReturnStatement);
-
-    // Check res.json(), res.send(), Response.json() patterns
-    for (const call of callExpressions) {
-      const responseType = this.extractResponseFromCall(call);
-      if (responseType && !responseTypes.includes(responseType)) {
-        responseTypes.push(responseType);
-      }
-    }
-
-    // Check ctx.body = data patterns (Koa style)
-    for (const binary of binaryExpressions) {
-      const responseType = this.extractResponseFromAssignment(binary);
-      if (responseType && !responseTypes.includes(responseType)) {
-        responseTypes.push(responseType);
-      }
-    }
-
-    // Check return statements for Hono/Web API style
-    for (const ret of returnStatements) {
-      const responseType = this.extractResponseFromReturn(ret);
-      if (responseType && !responseTypes.includes(responseType)) {
-        responseTypes.push(responseType);
-      }
-    }
-
-    if (responseTypes.length === 0) {
+    const payloadNode = this.resolveResponsePayloadNode(node);
+    if (!payloadNode) {
       return null;
     }
 
-    // Create union type if multiple response types
-    const typeString =
-      responseTypes.length === 1
-        ? responseTypes[0]
-        : responseTypes.join(' | ');
+    const payloadType = payloadNode.getType();
+    let typeString = payloadType.getText(payloadNode);
+
+    typeString = this.unwrapPromise(typeString, payloadType);
 
     return this.createInferredType(
       request,
       typeString,
-      false, // Response body inference is always implicit
-      this.getNodeLocation(func, sourceFile)
+      false,
+      this.getNodeLocation(payloadNode, sourceFile)
     );
   }
 
   /**
-   * Infer the return type of a call expression at the given line
+   * Infer the return type of a call expression containing the target span
    */
   private inferCallResult(
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const callExpr = this.findCallExpressionAtLine(
+    const callExpr = this.findCallExpressionAtSpan(
       sourceFile,
-      request.line_number
+      request.span_start,
+      request.span_end
     );
     if (!callExpr) {
-      this.log(`No call expression found at line ${request.line_number}`);
+      this.log(
+        `No call expression found for span ${request.span_start}-${request.span_end}`
+      );
       return null;
     }
 
@@ -290,7 +270,11 @@ export class TypeInferrer {
 
     if (this.isFetchCall(callExpr)) {
       const responseVar = this.getAssignedVariableName(callExpr);
-      const func = this.findContainingFunction(sourceFile, request.line_number);
+      const func = this.findContainingFunctionBySpan(
+        sourceFile,
+        callExpr.getStart(),
+        callExpr.getEnd()
+      );
       if (responseVar && func) {
         const jsonCall = this.findJsonCallForIdentifier(
           func,
@@ -326,13 +310,17 @@ export class TypeInferrer {
   }
 
   /**
-   * Infer the type of a variable at the given line
+   * Infer the type of a variable containing the target span
    */
   private inferVariable(
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const node = this.findNodeAtLine(sourceFile, request.line_number);
+    const node = this.findNodeAtSpan(
+      sourceFile,
+      request.span_start,
+      request.span_end
+    );
     if (!node) return null;
 
     // Find variable declaration
@@ -342,7 +330,9 @@ export class TypeInferrer {
         : node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
 
     if (!varDecl || !Node.isVariableDeclaration(varDecl)) {
-      this.log(`No variable declaration found at line ${request.line_number}`);
+      this.log(
+        `No variable declaration found for span ${request.span_start}-${request.span_end}`
+      );
       return null;
     }
 
@@ -365,13 +355,17 @@ export class TypeInferrer {
   }
 
   /**
-   * Infer the type of an expression at the given line
+   * Infer the type of an expression containing the target span
    */
   private inferExpression(
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const node = this.findNodeAtLine(sourceFile, request.line_number);
+    const node = this.findNodeAtSpan(
+      sourceFile,
+      request.span_start,
+      request.span_end
+    );
     if (!node) return null;
 
     // Get the type of whatever node we found
@@ -396,177 +390,60 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     request: InferRequestItem
   ): InferredType | null {
-    const callExpr = this.findCallExpressionAtLine(
+    const node = this.findNodeAtSpan(
       sourceFile,
-      request.line_number
+      request.span_start,
+      request.span_end
     );
-    if (callExpr) {
-      const payloadType = this.extractRequestPayloadFromCall(callExpr);
-      if (payloadType) {
-        return this.createInferredType(
-          request,
-          payloadType,
-          false,
-          this.getNodeLocation(callExpr, sourceFile)
-        );
-      }
-    }
-
-    const func = this.findContainingFunction(sourceFile, request.line_number);
-    if (!func) {
-      this.log(`No function found at line ${request.line_number}`);
+    if (!node) {
+      this.log(
+        `No request payload found for span ${request.span_start}-${request.span_end}`
+      );
       return null;
     }
 
-    const requestTypes: string[] = [];
-    let firstNode: Node | undefined;
+    const payloadType = node.getType();
+    let typeString = payloadType.getText(node);
 
-    const propertyAccesses = func.getDescendantsOfKind(
-      SyntaxKind.PropertyAccessExpression
-    );
-    for (const access of propertyAccesses) {
-      if (!this.isRequestBodyAccess(access)) {
-        continue;
-      }
-      if (!firstNode) {
-        firstNode = access;
-      }
-      const typeText = access.getType().getText(access);
-      if (typeText && !requestTypes.includes(typeText)) {
-        requestTypes.push(typeText);
-      }
-    }
-
-    if (requestTypes.length === 0) {
-      const paramResult = this.extractRequestBodyFromParams(func);
-      if (paramResult.types.length > 0) {
-        requestTypes.push(...paramResult.types);
-        firstNode = firstNode ?? paramResult.node ?? func;
-      }
-    }
-
-    if (requestTypes.length === 0) {
-      return null;
-    }
-
-    const typeString =
-      requestTypes.length === 1 ? requestTypes[0] : requestTypes.join(' | ');
+    typeString = this.unwrapPromise(typeString, payloadType);
 
     return this.createInferredType(
       request,
       typeString,
       false,
-      this.getNodeLocation(firstNode ?? func, sourceFile)
+      this.getNodeLocation(node, sourceFile)
     );
   }
 
   // ===========================================================================
-  // Response Pattern Extractors
+  // Response Helpers
   // ===========================================================================
 
-  /**
-   * Extract response type from call expressions like res.json(data), res.send(data), Response.json(data)
-   */
-  private extractResponseFromCall(call: CallExpression): string | null {
-    const expression = call.getExpression();
-    let methodName: string | null = null;
-    let receiverName: string | null = null;
-
-    if (Node.isPropertyAccessExpression(expression)) {
-      methodName = expression.getName();
-      receiverName = this.getRootIdentifierName(expression.getExpression());
-    } else if (Node.isIdentifier(expression)) {
-      methodName = expression.getText();
+  private resolveResponsePayloadNode(node: Node): Node | null {
+    if (Node.isExpressionStatement(node)) {
+      return this.resolveResponsePayloadNode(node.getExpression());
     }
 
-    if (!methodName) {
-      return null;
+    if (Node.isReturnStatement(node)) {
+      const expr = node.getExpression();
+      return expr ? this.resolveResponsePayloadNode(expr) : null;
     }
 
-    const methodLower = methodName.toLowerCase();
-    if (methodLower !== 'json' && methodLower !== 'send') {
-      return null;
+    if (Node.isBinaryExpression(node)) {
+      if (node.getOperatorToken().getKind() === SyntaxKind.EqualsToken) {
+        return this.resolveResponsePayloadNode(node.getRight());
+      }
     }
 
-    if (receiverName) {
-      const receiverLower = receiverName.toLowerCase();
-      const allowedReceivers = new Set([
-        'res',
-        'response',
-        'reply',
-        'ctx',
-        'context',
-        'c',
-      ]);
-      if (!allowedReceivers.has(receiverLower)) {
+    if (Node.isCallExpression(node)) {
+      const args = node.getArguments();
+      if (args.length === 0) {
         return null;
       }
-    } else {
-      return null;
+      return args[0];
     }
 
-    // Get the first argument's type
-    const args = call.getArguments();
-    if (args.length === 0) return null;
-
-    const argType = args[0].getType();
-    return argType.getText(args[0]);
-  }
-
-  /**
-   * Extract response type from assignments like ctx.body = data
-   */
-  private extractResponseFromAssignment(binary: BinaryExpression): string | null {
-    // Only handle assignment expressions
-    if (binary.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) {
-      return null;
-    }
-
-    const left = binary.getLeft().getText();
-
-    // Match ctx.body pattern (Koa style)
-    if (!/\b(?:ctx|context)\.body\b/.test(left)) {
-      return null;
-    }
-
-    const right = binary.getRight();
-    const rightType = right.getType();
-    return rightType.getText(right);
-  }
-
-  /**
-   * Extract response type from return statements
-   */
-  private extractResponseFromReturn(ret: ReturnStatement): string | null {
-    const expr = ret.getExpression();
-    if (!expr) return null;
-
-    // Check for Response.json() or new Response() patterns
-    const exprText = expr.getText();
-    if (/Response\.json\(/.test(exprText) || /new Response\(/.test(exprText)) {
-      // Try to get the argument type
-      const callExpr = expr.getKind() === SyntaxKind.CallExpression
-        ? (expr as CallExpression)
-        : expr.getFirstDescendantByKind(SyntaxKind.CallExpression);
-
-      if (callExpr) {
-        const args = callExpr.getArguments();
-        if (args.length > 0) {
-          return args[0].getType().getText(args[0]);
-        }
-      }
-    }
-
-    // For direct return of data (common in Hono/modern frameworks)
-    const exprType = expr.getType();
-    const typeText = exprType.getText(expr);
-
-    // Skip void/undefined returns
-    if (typeText === 'void' || typeText === 'undefined') {
-      return null;
-    }
-
-    return typeText;
+    return node;
   }
 
   private extractExplicitTypeFromAncestor(node: Node): string | null {
@@ -736,143 +613,18 @@ export class TypeInferrer {
   }
 
   // ===========================================================================
-  // Request Pattern Extractors
-  // ===========================================================================
-
-  private extractRequestPayloadFromCall(call: CallExpression): string | null {
-    const expression = call.getExpression();
-    const args = call.getArguments();
-
-    if (Node.isIdentifier(expression)) {
-      const name = expression.getText();
-      if (name === 'fetch') {
-        return this.extractBodyFromFetchArgs(args);
-      }
-    }
-
-    if (Node.isPropertyAccessExpression(expression)) {
-      const name = expression.getName();
-
-      if (name === 'fetch') {
-        return this.extractBodyFromFetchArgs(args);
-      }
-
-      if (['post', 'put', 'patch', 'delete'].includes(name)) {
-        if (args.length >= 2) {
-          return args[1].getType().getText(args[1]);
-        }
-      }
-
-      if (name === 'request' && args.length >= 1) {
-        return this.extractBodyFromConfigArg(args[0]);
-      }
-    }
-
-    return null;
-  }
-
-  private extractBodyFromFetchArgs(args: Node[]): string | null {
-    if (args.length < 2) {
-      return null;
-    }
-
-    return this.extractBodyFromConfigArg(args[1]);
-  }
-
-  private extractBodyFromConfigArg(configArg: Node): string | null {
-    if (!Node.isObjectLiteralExpression(configArg)) {
-      return null;
-    }
-
-    const bodyProp =
-      configArg.getProperty('body') ?? configArg.getProperty('data');
-    if (!bodyProp) {
-      return null;
-    }
-
-    if (Node.isPropertyAssignment(bodyProp)) {
-      const initializer = bodyProp.getInitializer();
-      if (!initializer) {
-        return null;
-      }
-      return initializer.getType().getText(initializer);
-    }
-
-    if (Node.isShorthandPropertyAssignment(bodyProp)) {
-      const nameNode = bodyProp.getNameNode();
-      return nameNode.getType().getText(nameNode);
-    }
-
-    return null;
-  }
-
-  private extractRequestBodyFromParams(
-    func: FunctionLike
-  ): { types: string[]; node?: Node } {
-    const types: string[] = [];
-    let node: Node | undefined;
-
-    for (const param of func.getParameters()) {
-      const bodyType = this.getBodyTypeFromParam(param);
-      if (bodyType && !types.includes(bodyType)) {
-        types.push(bodyType);
-        node = node ?? param;
-      }
-    }
-
-    return { types, node };
-  }
-
-  private getBodyTypeFromParam(param: ParameterDeclaration): string | null {
-    const paramType = param.getType();
-
-    const directBody = paramType.getProperty('body');
-    if (directBody) {
-      const bodyType = directBody.getTypeAtLocation(param);
-      return bodyType.getText(param);
-    }
-
-    const requestProp = paramType.getProperty('request');
-    if (requestProp) {
-      const requestType = requestProp.getTypeAtLocation(param);
-      const nestedBody = requestType.getProperty('body');
-      if (nestedBody) {
-        const bodyType = nestedBody.getTypeAtLocation(param);
-        return bodyType.getText(param);
-      }
-    }
-
-    return null;
-  }
-
-  private isRequestBodyAccess(access: Node): boolean {
-    if (!Node.isPropertyAccessExpression(access)) {
-      return false;
-    }
-
-    if (access.getName() !== 'body') {
-      return false;
-    }
-
-    const expressionText = access.getExpression().getText();
-    return (
-      /^(req|request)$/.test(expressionText) ||
-      /^(ctx|context)\.(request|req)$/.test(expressionText)
-    );
-  }
-
-  // ===========================================================================
-  // Scope-Based Search Utilities
+  // Span-Based Search Utilities
   // ===========================================================================
 
   /**
-   * Find the innermost function containing the target line
+   * Find the innermost function containing the target span
    *
    * CRITICAL: This ensures we search the right scope even for nested functions
    */
-  private findContainingFunction(
+  private findContainingFunctionBySpan(
     sourceFile: SourceFile,
-    targetLine: number
+    spanStart: number,
+    spanEnd: number
   ): FunctionLike | null {
     const functions: FunctionLike[] = [];
 
@@ -882,11 +634,11 @@ export class TypeInferrer {
     functions.push(...sourceFile.getDescendantsOfKind(SyntaxKind.FunctionExpression));
     functions.push(...sourceFile.getDescendantsOfKind(SyntaxKind.MethodDeclaration));
 
-    // Find all functions that contain the target line
+    // Find all functions that contain the target span
     const containing = functions.filter((func) => {
-      const startLine = func.getStartLineNumber();
-      const endLine = func.getEndLineNumber();
-      return targetLine >= startLine && targetLine <= endLine;
+      const start = func.getStart();
+      const end = func.getEnd();
+      return spanStart >= start && spanEnd <= end;
     });
 
     if (containing.length === 0) {
@@ -895,46 +647,64 @@ export class TypeInferrer {
 
     // Return the innermost (smallest range) function
     return containing.reduce((innermost, current) => {
-      const innermostRange =
-        innermost.getEndLineNumber() - innermost.getStartLineNumber();
-      const currentRange =
-        current.getEndLineNumber() - current.getStartLineNumber();
+      const innermostRange = innermost.getEnd() - innermost.getStart();
+      const currentRange = current.getEnd() - current.getStart();
       return currentRange < innermostRange ? current : innermost;
     });
   }
 
   /**
-   * Find the most relevant node at the given line
+   * Find the most specific node that contains the target span
    */
-  private findNodeAtLine(sourceFile: SourceFile, line: number): Node | null {
-    // Find all nodes on this line
+  private findNodeAtSpan(
+    sourceFile: SourceFile,
+    spanStart: number,
+    spanEnd: number
+  ): Node | null {
     const allNodes = sourceFile.getDescendants();
-    const nodesOnLine = allNodes.filter(
-      (n) => n.getStartLineNumber() === line
-    );
+    const containing = allNodes.filter((node) => {
+      if (node.getKind() === SyntaxKind.SyntaxList) {
+        return false;
+      }
+      const start = node.getStart();
+      const end = node.getEnd();
+      return spanStart >= start && spanEnd <= end;
+    });
 
-    if (nodesOnLine.length === 0) {
+    if (containing.length === 0) {
       return null;
     }
 
-    // Return the first meaningful node on this line
-    return nodesOnLine[0];
+    return containing.reduce((best, current) => {
+      const bestRange = best.getEnd() - best.getStart();
+      const currentRange = current.getEnd() - current.getStart();
+      if (currentRange !== bestRange) {
+        return currentRange < bestRange ? current : best;
+      }
+      const bestDelta = Math.abs(spanStart - best.getStart());
+      const currentDelta = Math.abs(spanStart - current.getStart());
+      if (currentDelta !== bestDelta) {
+        return currentDelta < bestDelta ? current : best;
+      }
+      return best;
+    });
   }
 
   /**
-   * Find the most specific call expression that covers a given line.
+   * Find the most specific call expression that contains the target span.
    */
-  private findCallExpressionAtLine(
+  private findCallExpressionAtSpan(
     sourceFile: SourceFile,
-    line: number
+    spanStart: number,
+    spanEnd: number
   ): CallExpression | null {
     const callExpressions = sourceFile.getDescendantsOfKind(
       SyntaxKind.CallExpression
     );
     const candidates = callExpressions.filter((call) => {
-      const start = call.getStartLineNumber();
-      const end = call.getEndLineNumber();
-      return line >= start && line <= end;
+      const start = call.getStart();
+      const end = call.getEnd();
+      return spanStart >= start && spanEnd <= end;
     });
 
     if (candidates.length === 0) {
@@ -942,15 +712,13 @@ export class TypeInferrer {
     }
 
     return candidates.reduce((best, current) => {
-      const bestRange =
-        best.getEndLineNumber() - best.getStartLineNumber();
-      const currentRange =
-        current.getEndLineNumber() - current.getStartLineNumber();
+      const bestRange = best.getEnd() - best.getStart();
+      const currentRange = current.getEnd() - current.getStart();
       if (currentRange !== bestRange) {
         return currentRange < bestRange ? current : best;
       }
-      const bestDelta = Math.abs(line - best.getStartLineNumber());
-      const currentDelta = Math.abs(line - current.getStartLineNumber());
+      const bestDelta = Math.abs(spanStart - best.getStart());
+      const currentDelta = Math.abs(spanStart - current.getStart());
       if (currentDelta !== bestDelta) {
         return currentDelta < bestDelta ? current : best;
       }
