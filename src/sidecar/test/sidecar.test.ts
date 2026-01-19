@@ -624,6 +624,71 @@ describe('Type Sidecar Integration Tests', () => {
         assert.ok(!inferred.type_string.includes('Response'));
       }
     });
+
+    it('should follow call results through destructuring', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-7',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/def-use.ts'),
+            line_number: 18,
+            span_start: 311,
+            span_end: 327,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-7');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'call_result');
+        assert.ok(inferred.type_string.includes('UserData'));
+        assert.ok(!inferred.type_string.includes('UserResponse'));
+        assert.ok(!inferred.type_string.includes('Promise'));
+      }
+    });
+
+    it('should infer call results for chained expressions', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-8',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/def-use.ts'),
+            line_number: 23,
+            span_start: 408,
+            span_end: 444,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-8');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'call_result');
+        assert.ok(inferred.type_string.includes('UserData'));
+        assert.ok(!inferred.type_string.includes('Promise'));
+      }
+    });
   });
 
   describe('error handling', () => {

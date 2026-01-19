@@ -245,67 +245,33 @@ export class TypeInferrer {
       return null;
     }
 
-    const explicitType = this.extractExplicitTypeFromAncestor(callExpr);
+    const func = this.findContainingFunctionBySpan(
+      sourceFile,
+      callExpr.getStart(),
+      callExpr.getEnd()
+    );
+    const terminalNode = this.resolveCallResultTerminalNode(callExpr, func);
+
+    const explicitType = this.extractExplicitTypeFromAncestor(terminalNode);
     if (explicitType) {
       return this.createInferredType(
         request,
         explicitType,
         true,
-        this.getNodeLocation(callExpr, sourceFile)
+        this.getNodeLocation(terminalNode, sourceFile)
       );
     }
 
-    const chainedJsonCall = this.findJsonCallFromAncestor(callExpr);
-    if (chainedJsonCall) {
-      const inferred = this.inferJsonPayloadType(chainedJsonCall);
-      if (inferred) {
-        return this.createInferredType(
-          request,
-          inferred.typeString,
-          inferred.isExplicit,
-          this.getNodeLocation(chainedJsonCall, sourceFile)
-        );
-      }
-    }
+    const returnType = terminalNode.getType();
+    let typeString = returnType.getText(terminalNode);
 
-    if (this.isFetchCall(callExpr)) {
-      const responseVar = this.getAssignedVariableName(callExpr);
-      const func = this.findContainingFunctionBySpan(
-        sourceFile,
-        callExpr.getStart(),
-        callExpr.getEnd()
-      );
-      if (responseVar && func) {
-        const jsonCall = this.findJsonCallForIdentifier(
-          func,
-          responseVar,
-          callExpr.getStartLineNumber()
-        );
-        if (jsonCall) {
-          const inferred = this.inferJsonPayloadType(jsonCall);
-          if (inferred) {
-            return this.createInferredType(
-              request,
-              inferred.typeString,
-              inferred.isExplicit,
-              this.getNodeLocation(jsonCall, sourceFile)
-            );
-          }
-        }
-      }
-    }
-
-    let returnType = callExpr.getReturnType();
-    let typeString = returnType.getText(callExpr);
-
-    // Unwrap Promise<T>
     typeString = this.unwrapPromise(typeString, returnType);
 
     return this.createInferredType(
       request,
       typeString,
       false,
-      this.getNodeLocation(callExpr, sourceFile)
+      this.getNodeLocation(terminalNode, sourceFile)
     );
   }
 
@@ -446,6 +412,222 @@ export class TypeInferrer {
     return node;
   }
 
+  // ===========================================================================
+  // Call Result Def-Use
+  // ===========================================================================
+
+  private resolveCallResultTerminalNode(
+    callExpr: CallExpression,
+    func: FunctionLike | null
+  ): Node {
+    const returnStmt = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
+    if (returnStmt) {
+      return returnStmt.getExpression() ?? callExpr;
+    }
+
+    if (!func) {
+      return callExpr;
+    }
+
+    const binding = this.extractBindingFromCall(callExpr);
+    if (!binding || binding.names.length === 0) {
+      return callExpr;
+    }
+
+    let currentNames = new Set(binding.names);
+    let lastNode: Node = binding.node ?? callExpr;
+    const startPos = callExpr.getStart();
+
+    const candidates = this.collectDefUseNodes(func, startPos);
+    for (const node of candidates) {
+      if (Node.isReturnStatement(node)) {
+        const expr = node.getExpression();
+        if (expr && this.expressionUsesNames(expr, currentNames)) {
+          return expr;
+        }
+        continue;
+      }
+
+      if (Node.isVariableDeclaration(node)) {
+        const initializer = node.getInitializer();
+        if (!initializer) {
+          continue;
+        }
+        if (!this.expressionUsesNames(initializer, currentNames)) {
+          continue;
+        }
+        const names = this.extractBindingNames(node.getNameNode());
+        if (names.length > 0) {
+          currentNames = new Set(names);
+          lastNode = this.getPrimaryBindingNode(node.getNameNode()) ?? node;
+        }
+        continue;
+      }
+
+      if (Node.isBinaryExpression(node)) {
+        if (node.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) {
+          continue;
+        }
+        const right = node.getRight();
+        if (!this.expressionUsesNames(right, currentNames)) {
+          continue;
+        }
+        const names = this.extractBindingNames(node.getLeft());
+        if (names.length > 0) {
+          currentNames = new Set(names);
+          lastNode = this.getPrimaryBindingNode(node.getLeft()) ?? node;
+        }
+      }
+    }
+
+    return lastNode;
+  }
+
+  private extractBindingFromCall(
+    callExpr: CallExpression
+  ): { names: string[]; node?: Node } | null {
+    const varDecl = callExpr.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+    if (varDecl) {
+      const initializer = varDecl.getInitializer();
+      if (
+        initializer &&
+        callExpr.getStart() >= initializer.getStart() &&
+        callExpr.getEnd() <= initializer.getEnd()
+      ) {
+        const names = this.extractBindingNames(varDecl.getNameNode());
+        const node = this.getPrimaryBindingNode(varDecl.getNameNode()) ?? varDecl;
+        return { names, node };
+      }
+    }
+
+    const assignment = callExpr.getFirstAncestorByKind(SyntaxKind.BinaryExpression);
+    if (
+      assignment &&
+      assignment.getOperatorToken().getKind() === SyntaxKind.EqualsToken
+    ) {
+      const right = assignment.getRight();
+      if (
+        callExpr.getStart() >= right.getStart() &&
+        callExpr.getEnd() <= right.getEnd()
+      ) {
+        const names = this.extractBindingNames(assignment.getLeft());
+        const node =
+          this.getPrimaryBindingNode(assignment.getLeft()) ?? assignment.getLeft();
+        return { names, node };
+      }
+    }
+
+    return null;
+  }
+
+  private extractBindingNames(node: Node): string[] {
+    if (Node.isIdentifier(node)) {
+      return [node.getText()];
+    }
+
+    if (Node.isObjectBindingPattern(node) || Node.isArrayBindingPattern(node)) {
+      const names: string[] = [];
+      for (const element of node.getElements()) {
+        if (!Node.isBindingElement(element)) {
+          continue;
+        }
+        const elementName = element.getNameNode();
+        names.push(...this.extractBindingNames(elementName));
+      }
+      return names;
+    }
+
+    return [];
+  }
+
+  private getPrimaryBindingNode(node: Node): Node | null {
+    if (Node.isIdentifier(node)) {
+      return node;
+    }
+
+    if (Node.isObjectBindingPattern(node) || Node.isArrayBindingPattern(node)) {
+      for (const element of node.getElements()) {
+        if (!Node.isBindingElement(element)) {
+          continue;
+        }
+        const elementName = element.getNameNode();
+        const found = this.getPrimaryBindingNode(elementName);
+        if (found) {
+          return found;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private collectDefUseNodes(func: FunctionLike, startPos: number): Node[] {
+    const candidates: Node[] = [];
+    candidates.push(...func.getDescendantsOfKind(SyntaxKind.VariableDeclaration));
+    candidates.push(...func.getDescendantsOfKind(SyntaxKind.BinaryExpression));
+    candidates.push(...func.getDescendantsOfKind(SyntaxKind.ReturnStatement));
+
+    return candidates
+      .filter((node) => {
+        if (!this.isInFunctionScope(node, func)) {
+          return false;
+        }
+        return node.getStart() > startPos;
+      })
+      .sort((a, b) => a.getStart() - b.getStart());
+  }
+
+  private expressionUsesNames(node: Node, names: Set<string>): boolean {
+    const identifiers = node.getDescendantsOfKind(SyntaxKind.Identifier);
+    return identifiers.some((identifier) =>
+      this.isIdentifierUsage(identifier, names)
+    );
+  }
+
+  private isIdentifierUsage(node: Node, names: Set<string>): boolean {
+    if (!Node.isIdentifier(node)) {
+      return false;
+    }
+
+    const text = node.getText();
+    if (!names.has(text)) {
+      return false;
+    }
+
+    const parent = node.getParent();
+    if (Node.isVariableDeclaration(parent) && parent.getNameNode() === node) {
+      return false;
+    }
+    if (Node.isParameterDeclaration(parent)) {
+      return false;
+    }
+    if (Node.isFunctionDeclaration(parent) && parent.getNameNode() === node) {
+      return false;
+    }
+    if (Node.isPropertyAccessExpression(parent) && parent.getNameNode() === node) {
+      return false;
+    }
+    if (Node.isPropertyAssignment(parent) && parent.getNameNode() === node) {
+      return false;
+    }
+    if (Node.isBindingElement(parent) && parent.getNameNode() === node) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private isInFunctionScope(node: Node, func: FunctionLike): boolean {
+    const ancestor = node.getFirstAncestor((candidate) =>
+      Node.isFunctionDeclaration(candidate) ||
+      Node.isArrowFunction(candidate) ||
+      Node.isFunctionExpression(candidate) ||
+      Node.isMethodDeclaration(candidate)
+    );
+
+    return ancestor === func;
+  }
+
   private extractExplicitTypeFromAncestor(node: Node): string | null {
     const varDecl = node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
     if (varDecl) {
@@ -471,142 +653,6 @@ export class TypeInferrer {
       if (typeNode) {
         return typeNode.getText();
       }
-    }
-
-    return null;
-  }
-
-  private isFetchCall(call: CallExpression): boolean {
-    const expression = call.getExpression();
-    if (Node.isIdentifier(expression)) {
-      return expression.getText() === 'fetch';
-    }
-    if (Node.isPropertyAccessExpression(expression)) {
-      return expression.getName() === 'fetch';
-    }
-    return false;
-  }
-
-  private isDecodeMethod(name: string): boolean {
-    return ['json', 'text', 'blob', 'arrayBuffer', 'formData'].includes(name);
-  }
-
-  private findJsonCallFromAncestor(call: CallExpression): CallExpression | null {
-    let current: Node | undefined = call.getParent();
-    while (current) {
-      if (
-        Node.isPropertyAccessExpression(current) &&
-        this.isDecodeMethod(current.getName())
-      ) {
-        const parent = current.getParent();
-        if (parent && Node.isCallExpression(parent)) {
-          return parent;
-        }
-      }
-      if (
-        Node.isFunctionDeclaration(current) ||
-        Node.isArrowFunction(current) ||
-        Node.isFunctionExpression(current) ||
-        Node.isMethodDeclaration(current)
-      ) {
-        break;
-      }
-      current = current.getParent();
-    }
-
-    return null;
-  }
-
-  private getAssignedVariableName(call: CallExpression): string | null {
-    const varDecl = call.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
-    if (!varDecl) {
-      return null;
-    }
-
-    const initializer = varDecl.getInitializer();
-    if (!initializer) {
-      return null;
-    }
-
-    const callNodes = initializer.getDescendantsOfKind(
-      SyntaxKind.CallExpression
-    );
-    if (!callNodes.includes(call)) {
-      return null;
-    }
-
-    const nameNode = varDecl.getNameNode();
-    if (Node.isIdentifier(nameNode)) {
-      return nameNode.getText();
-    }
-
-    return null;
-  }
-
-  private findJsonCallForIdentifier(
-    func: FunctionLike,
-    identifier: string,
-    anchorLine: number
-  ): CallExpression | null {
-    const calls = func.getDescendantsOfKind(SyntaxKind.CallExpression);
-    let bestAfter: { call: CallExpression; delta: number } | null = null;
-    let bestBefore: { call: CallExpression; delta: number } | null = null;
-
-    for (const call of calls) {
-      const expr = call.getExpression();
-      if (!Node.isPropertyAccessExpression(expr)) {
-        continue;
-      }
-      if (!this.isDecodeMethod(expr.getName())) {
-        continue;
-      }
-      const receiver = this.getRootIdentifierName(expr.getExpression());
-      if (receiver !== identifier) {
-        continue;
-      }
-
-      const line = call.getStartLineNumber();
-      const delta = line - anchorLine;
-      if (delta >= 0) {
-        if (!bestAfter || delta < bestAfter.delta) {
-          bestAfter = { call, delta };
-        }
-      } else {
-        const absDelta = Math.abs(delta);
-        if (!bestBefore || absDelta < bestBefore.delta) {
-          bestBefore = { call, delta: absDelta };
-        }
-      }
-    }
-
-    return bestAfter?.call ?? bestBefore?.call ?? null;
-  }
-
-  private inferJsonPayloadType(
-    call: CallExpression
-  ): { typeString: string; isExplicit: boolean } | null {
-    const explicitType = this.extractExplicitTypeFromAncestor(call);
-    if (explicitType) {
-      return { typeString: explicitType, isExplicit: true };
-    }
-
-    const returnType = call.getReturnType();
-    let typeString = returnType.getText(call);
-    typeString = this.unwrapPromise(typeString, returnType);
-    return { typeString, isExplicit: false };
-  }
-
-  private getRootIdentifierName(node: Node): string | null {
-    if (Node.isIdentifier(node)) {
-      return node.getText();
-    }
-
-    if (Node.isPropertyAccessExpression(node)) {
-      return this.getRootIdentifierName(node.getExpression());
-    }
-
-    if (Node.isCallExpression(node)) {
-      return this.getRootIdentifierName(node.getExpression());
     }
 
     return null;
