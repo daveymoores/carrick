@@ -124,17 +124,14 @@ describe('ManifestMatcher', () => {
         repo_name: 'test-repo',
         commit_hash: 'abc123',
         entries: [
-          {
-            method: 'GET',
-            path: '/api/users',
-            type_alias: 'GetUsersResponse',
-            role: 'producer',
-            type_kind: 'response',
-            file_path: 'src/routes.ts',
-            line_number: 10,
-            is_explicit: true,
-            type_state: 'explicit',
-          },
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'GetUsersResponse',
+            'producer',
+            'src/routes.ts',
+            10
+          ),
         ],
       };
 
@@ -534,6 +531,8 @@ describe('createManifestEntry', () => {
     const entry = createManifestEntry('get', '/api/users', 'Type', 'producer', 'file.ts', 10);
 
     assert.strictEqual(entry.method, 'GET');
+    assert.strictEqual(entry.evidence.file_path, 'file.ts');
+    assert.strictEqual(entry.evidence.line_number, 10);
   });
 
   it('should preserve original path', () => {

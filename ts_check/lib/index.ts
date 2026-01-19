@@ -12,6 +12,7 @@ export {
   TypeCompatibilityChecker,
   TypeCheckResult,
   TypeMismatch,
+  UnknownTypePair,
 } from "./type-checker";
 export {
   ManifestMatcher,
@@ -20,6 +21,8 @@ export {
   ManifestRole,
   ManifestTypeKind,
   ManifestTypeState,
+  TypeEvidence,
+  InferKind,
   MatchResult,
   OrphanedEntry,
   normalizePath,

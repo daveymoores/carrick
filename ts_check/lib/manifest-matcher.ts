@@ -31,6 +31,24 @@ export interface TypeManifest {
 export type ManifestRole = 'producer' | 'consumer';
 export type ManifestTypeKind = 'request' | 'response';
 export type ManifestTypeState = 'explicit' | 'implicit' | 'unknown';
+export type InferKind = string;
+
+export interface TypeEvidence {
+  /** Source file path where the type was found */
+  file_path: string;
+  /** Start byte offset in the source file (nullable when unavailable) */
+  span_start: number | null;
+  /** End byte offset in the source file (nullable when unavailable) */
+  span_end: number | null;
+  /** Line number in the source file */
+  line_number: number;
+  /** Kind of inference performed for this type */
+  infer_kind: InferKind;
+  /** Whether the type was explicitly annotated */
+  is_explicit: boolean;
+  /** Current state of the type extraction */
+  type_state: ManifestTypeState;
+}
 
 export interface ManifestEntry {
   /** HTTP method (GET, POST, PUT, DELETE, etc.) */
@@ -51,6 +69,8 @@ export interface ManifestEntry {
   is_explicit: boolean;
   /** Current state of the type extraction */
   type_state: ManifestTypeState;
+  /** Evidence metadata for how this entry was derived */
+  evidence: TypeEvidence;
 }
 
 /**
@@ -215,6 +235,10 @@ export class ManifestMatcher {
       throw new Error('Manifest missing required field: entries (must be an array)');
     }
 
+    for (const entry of manifest.entries) {
+      this.validateEntry(entry);
+    }
+
     return manifest;
   }
 
@@ -248,6 +272,36 @@ export class ManifestMatcher {
     }
     if (!entry.type_state || !['explicit', 'implicit', 'unknown'].includes(entry.type_state)) {
       throw new Error('ManifestEntry missing or invalid field: type_state (must be "explicit", "implicit", or "unknown")');
+    }
+    if (!entry.evidence) {
+      throw new Error('ManifestEntry missing required field: evidence');
+    }
+    if (!entry.evidence.file_path) {
+      throw new Error('ManifestEntry evidence missing required field: file_path');
+    }
+    if (typeof entry.evidence.line_number !== 'number') {
+      throw new Error('ManifestEntry evidence missing required field: line_number (must be a number)');
+    }
+    if (!entry.evidence.infer_kind) {
+      throw new Error('ManifestEntry evidence missing required field: infer_kind');
+    }
+    if (typeof entry.evidence.is_explicit !== 'boolean') {
+      throw new Error('ManifestEntry evidence missing required field: is_explicit (must be a boolean)');
+    }
+    if (!entry.evidence.type_state || !['explicit', 'implicit', 'unknown'].includes(entry.evidence.type_state)) {
+      throw new Error('ManifestEntry evidence missing or invalid field: type_state (must be "explicit", "implicit", or "unknown")');
+    }
+    if (
+      entry.evidence.span_start !== null &&
+      typeof entry.evidence.span_start !== 'number'
+    ) {
+      throw new Error('ManifestEntry evidence missing or invalid field: span_start (must be a number or null)');
+    }
+    if (
+      entry.evidence.span_end !== null &&
+      typeof entry.evidence.span_end !== 'number'
+    ) {
+      throw new Error('ManifestEntry evidence missing or invalid field: span_end (must be a number or null)');
     }
   }
 
@@ -524,8 +578,26 @@ export function createManifestEntry(
   lineNumber: number,
   typeKind: ManifestTypeKind = 'response',
   isExplicit: boolean = true,
-  typeState: ManifestTypeState = isExplicit ? 'explicit' : 'implicit'
+  typeState: ManifestTypeState = isExplicit ? 'explicit' : 'implicit',
+  evidenceOverrides: Partial<TypeEvidence> = {}
 ): ManifestEntry {
+  const inferKind =
+    role === 'consumer' && typeKind === 'response'
+      ? 'call_result'
+      : typeKind === 'request'
+        ? 'request_body'
+        : 'response_body';
+  const evidence: TypeEvidence = {
+    file_path: filePath,
+    span_start: null,
+    span_end: null,
+    line_number: lineNumber,
+    infer_kind: inferKind,
+    is_explicit: isExplicit,
+    type_state: typeState,
+    ...evidenceOverrides,
+  };
+
   return {
     method: normalizeMethod(method),
     path: entryPath,
@@ -536,6 +608,7 @@ export function createManifestEntry(
     line_number: lineNumber,
     is_explicit: isExplicit,
     type_state: typeState,
+    evidence,
   };
 }
 

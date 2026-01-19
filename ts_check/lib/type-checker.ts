@@ -18,6 +18,7 @@ import {
   TypeManifest,
   ManifestEntry,
   MatchResult,
+  TypeEvidence,
 } from "./manifest-matcher";
 
 // ============================================================================
@@ -36,6 +37,19 @@ export interface TypeMismatch {
   errorDetails: string;
   producerLocation?: string;
   consumerLocation?: string;
+  producerEvidence?: TypeEvidence;
+  consumerEvidence?: TypeEvidence;
+}
+
+export interface UnknownTypePair {
+  endpoint: string;
+  reason: string;
+  producerTypeAlias: string;
+  consumerTypeAlias: string;
+  producerLocation?: string;
+  consumerLocation?: string;
+  producerEvidence?: TypeEvidence;
+  consumerEvidence?: TypeEvidence;
 }
 
 /**
@@ -49,6 +63,7 @@ export interface TypeCheckResult {
   mismatches: TypeMismatch[];
   orphanedProducers: string[];
   orphanedConsumers: string[];
+  unknownPairs: UnknownTypePair[];
   /** Match details from manifest matching */
   matchDetails?: MatchResult[];
 }
@@ -141,12 +156,40 @@ export class TypeCompatibilityChecker {
         (o) =>
           `${o.entry.method} ${o.entry.path} (${o.entry.type_kind}, ${o.entry.type_alias})`
       ),
+      unknownPairs: [],
       matchDetails: matches,
     };
 
     // For each match, compare the types
     for (const match of matches) {
       const endpoint = `${match.method} ${match.path} (${match.type_kind})`;
+      const producerUnknown =
+        match.producer.type_state === "unknown" ||
+        match.producer.evidence?.type_state === "unknown";
+      const consumerUnknown =
+        match.consumer.type_state === "unknown" ||
+        match.consumer.evidence?.type_state === "unknown";
+
+      if (producerUnknown || consumerUnknown) {
+        const reasonParts = [];
+        if (producerUnknown) {
+          reasonParts.push("producer type_state=unknown");
+        }
+        if (consumerUnknown) {
+          reasonParts.push("consumer type_state=unknown");
+        }
+        result.unknownPairs.push({
+          endpoint,
+          reason: reasonParts.join(", "),
+          producerTypeAlias: match.producer.type_alias,
+          consumerTypeAlias: match.consumer.type_alias,
+          producerLocation: this.formatEntryLocation(match.producer),
+          consumerLocation: this.formatEntryLocation(match.consumer),
+          producerEvidence: match.producer.evidence,
+          consumerEvidence: match.consumer.evidence,
+        });
+        continue;
+      }
 
       try {
         const mismatch = await this.compareTypes(
@@ -174,8 +217,10 @@ export class TypeCompatibilityChecker {
           consumerType: "UNKNOWN",
           isAssignable: false,
           errorDetails: `Failed to compare types: ${error instanceof Error ? error.message : String(error)}`,
-          producerLocation: `${match.producer.file_path}:${match.producer.line_number}`,
-          consumerLocation: `${match.consumer.file_path}:${match.consumer.line_number}`,
+          producerLocation: this.formatEntryLocation(match.producer),
+          consumerLocation: this.formatEntryLocation(match.consumer),
+          producerEvidence: match.producer.evidence,
+          consumerEvidence: match.consumer.evidence,
         });
         result.incompatiblePairs++;
       }
@@ -216,8 +261,10 @@ export class TypeCompatibilityChecker {
         consumerType: consumer.type_alias,
         isAssignable: false,
         errorDetails: `Producer type '${producer.type_alias}' not found in project`,
-        producerLocation: `${producer.file_path}:${producer.line_number}`,
-        consumerLocation: `${consumer.file_path}:${consumer.line_number}`,
+        producerLocation: this.formatEntryLocation(producer),
+        consumerLocation: this.formatEntryLocation(consumer),
+        producerEvidence: producer.evidence,
+        consumerEvidence: consumer.evidence,
       };
     }
 
@@ -229,8 +276,10 @@ export class TypeCompatibilityChecker {
         consumerType: consumer.type_alias,
         isAssignable: false,
         errorDetails: `Consumer type '${consumer.type_alias}' not found in project`,
-        producerLocation: `${producer.file_path}:${producer.line_number}`,
-        consumerLocation: `${consumer.file_path}:${consumer.line_number}`,
+        producerLocation: this.formatEntryLocation(producer),
+        consumerLocation: this.formatEntryLocation(consumer),
+        producerEvidence: producer.evidence,
+        consumerEvidence: consumer.evidence,
       };
     }
 
@@ -251,8 +300,10 @@ export class TypeCompatibilityChecker {
         consumerType: consumerType.getText(),
         isAssignable: false,
         errorDetails: diagnosticMessage || "Types are not compatible",
-        producerLocation: `${producer.file_path}:${producer.line_number}`,
-        consumerLocation: `${consumer.file_path}:${consumer.line_number}`,
+        producerLocation: this.formatEntryLocation(producer),
+        consumerLocation: this.formatEntryLocation(consumer),
+        producerEvidence: producer.evidence,
+        consumerEvidence: consumer.evidence,
       };
     }
 
@@ -333,6 +384,15 @@ export class TypeCompatibilityChecker {
     }
 
     return null;
+  }
+
+  private formatEntryLocation(entry: ManifestEntry): string {
+    const filePath = entry.evidence?.file_path || entry.file_path;
+    const lineNumber =
+      typeof entry.evidence?.line_number === "number"
+        ? entry.evidence.line_number
+        : entry.line_number;
+    return `${filePath}:${lineNumber}`;
   }
 
   /**

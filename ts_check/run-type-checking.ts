@@ -106,29 +106,103 @@ Example:
 }
 
 function logResults(typeCheckResult: {
-  mismatches: Array<{ endpoint: string; errorDetails: string }>;
+  mismatches: Array<{
+    endpoint: string;
+    errorDetails: string;
+    producerEvidence?: {
+      file_path: string;
+      line_number: number;
+      span_start: number | null;
+      span_end: number | null;
+      infer_kind: string;
+      is_explicit: boolean;
+      type_state: string;
+    };
+    consumerEvidence?: {
+      file_path: string;
+      line_number: number;
+      span_start: number | null;
+      span_end: number | null;
+      infer_kind: string;
+      is_explicit: boolean;
+      type_state: string;
+    };
+  }>;
+  unknownPairs: Array<{
+    endpoint: string;
+    reason: string;
+    producerEvidence?: {
+      file_path: string;
+      line_number: number;
+      span_start: number | null;
+      span_end: number | null;
+      infer_kind: string;
+      is_explicit: boolean;
+      type_state: string;
+    };
+    consumerEvidence?: {
+      file_path: string;
+      line_number: number;
+      span_start: number | null;
+      span_end: number | null;
+      infer_kind: string;
+      is_explicit: boolean;
+      type_state: string;
+    };
+  }>;
   compatiblePairs: number;
   incompatiblePairs: number;
   orphanedProducers: string[];
   orphanedConsumers: string[];
 }): void {
+  const formatEvidence = (evidence?: {
+    file_path: string;
+    line_number: number;
+    span_start: number | null;
+    span_end: number | null;
+    infer_kind: string;
+    is_explicit: boolean;
+    type_state: string;
+  }): string => {
+    if (!evidence) {
+      return "evidence unavailable";
+    }
+    const spanInfo =
+      evidence.span_start !== null && evidence.span_end !== null
+        ? `span ${evidence.span_start}-${evidence.span_end}`
+        : "span n/a";
+    const explicitInfo = evidence.is_explicit ? "explicit" : "implicit";
+    return `${evidence.file_path}:${evidence.line_number} (${spanInfo}, ${evidence.infer_kind}, ${evidence.type_state}, ${explicitInfo})`;
+  };
+
   // Log summary
-  if (typeCheckResult.mismatches.length === 0) {
+  if (
+    typeCheckResult.mismatches.length === 0 &&
+    typeCheckResult.unknownPairs.length === 0
+  ) {
     console.log("\n✅ All types are compatible!");
   } else {
     console.log(
-      `\n❌ Found ${typeCheckResult.mismatches.length} type compatibility issues:`
+      `\n❌ Found ${typeCheckResult.mismatches.length} incompatible matches and ${typeCheckResult.unknownPairs.length} unknown types:`
     );
     typeCheckResult.mismatches.forEach((mismatch) => {
       console.log(
         `  - ${mismatch.endpoint}: ${cleanupPaths(mismatch.errorDetails)}`
       );
+      console.log(`    producer evidence: ${formatEvidence(mismatch.producerEvidence)}`);
+      console.log(`    consumer evidence: ${formatEvidence(mismatch.consumerEvidence)}`);
+    });
+    typeCheckResult.unknownPairs.forEach((unknown) => {
+      console.log(`  - ${unknown.endpoint}: ${unknown.reason}`);
+      console.log(`    producer evidence: ${formatEvidence(unknown.producerEvidence)}`);
+      console.log(`    consumer evidence: ${formatEvidence(unknown.consumerEvidence)}`);
     });
   }
 
   console.log(`\nType checking summary:`);
   console.log(`  Compatible pairs: ${typeCheckResult.compatiblePairs}`);
   console.log(`  Incompatible pairs: ${typeCheckResult.incompatiblePairs}`);
+  console.log(`  Unknown type pairs: ${typeCheckResult.unknownPairs.length}`);
   console.log(
     `  Orphaned producers: ${typeCheckResult.orphanedProducers.length}`
   );
@@ -216,10 +290,23 @@ async function main() {
         isCompatible: mismatch.isAssignable,
         producerLocation: mismatch.producerLocation,
         consumerLocation: mismatch.consumerLocation,
+        producerEvidence: mismatch.producerEvidence,
+        consumerEvidence: mismatch.consumerEvidence,
+      })),
+      unknownPairs: typeCheckResult.unknownPairs.map((unknown) => ({
+        endpoint: unknown.endpoint,
+        reason: unknown.reason,
+        producerTypeAlias: unknown.producerTypeAlias,
+        consumerTypeAlias: unknown.consumerTypeAlias,
+        producerLocation: unknown.producerLocation,
+        consumerLocation: unknown.consumerLocation,
+        producerEvidence: unknown.producerEvidence,
+        consumerEvidence: unknown.consumerEvidence,
       })),
       compatibleCount: typeCheckResult.compatiblePairs,
       totalChecked:
         typeCheckResult.compatiblePairs + typeCheckResult.incompatiblePairs,
+      unknownCount: typeCheckResult.unknownPairs.length,
       matchDetails: typeCheckResult.matchDetails?.length || 0,
     };
 
@@ -248,8 +335,10 @@ async function main() {
     const typeCheckOutputPath = "ts_check/output/type-check-results.json";
     const errorResult = {
       mismatches: [],
+      unknownPairs: [],
       compatibleCount: 0,
       totalChecked: 0,
+      unknownCount: 0,
       error: (error as Error).message,
     };
     fs.writeFileSync(typeCheckOutputPath, JSON.stringify(errorResult, null, 2));
