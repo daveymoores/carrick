@@ -158,7 +158,7 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   try {
     log(`Inferring ${request.requests.length} type(s)`);
 
-    const result = typeInferrer.infer(request.requests);
+    const result = typeInferrer.infer(request.requests, request.wrappers);
 
     return {
       request_id: request.request_id,

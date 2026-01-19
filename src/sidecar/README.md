@@ -54,7 +54,7 @@ let sidecar = TypeSidecar::spawn(&sidecar_path)?;
 sidecar.wait_for_init(&repo_root, None)?;
 
 // Resolve types
-let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests)?;
+let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, &[])?;
 ```
 
 ### Standalone Testing

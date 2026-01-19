@@ -28,6 +28,7 @@ use crate::{
     config::Config,
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
+    packages::Packages,
     parser::parse_file,
     services::type_sidecar::{
         InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult, TypeSidecar,
@@ -39,6 +40,7 @@ use crate::{
     },
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
+    wrapper_registry::wrapper_rules_for_packages,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -718,6 +720,7 @@ impl FileOrchestrator {
     /// * `sidecar` - The TypeSidecar instance for type resolution
     /// * `file_results` - Analysis results keyed by file path
     /// * `repo_path` - Path to the repository root (used to convert relative paths to absolute)
+    /// * `packages` - Dependency metadata used for wrapper rule selection
     /// * `mount_graph` - Resolved mount graph for canonical method/path aliases
     /// * `config` - Config used for URL normalization
     pub fn resolve_types_with_sidecar(
@@ -725,6 +728,7 @@ impl FileOrchestrator {
         sidecar: &TypeSidecar,
         file_results: &HashMap<String, FileAnalysisResult>,
         repo_path: &str,
+        packages: &Packages,
         mount_graph: &MountGraph,
         config: &Config,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
@@ -737,8 +741,10 @@ impl FileOrchestrator {
             infer.len()
         );
 
+        let wrappers = wrapper_rules_for_packages(packages);
+
         let result = sidecar
-            .resolve_all_types(&explicit, &infer)
+            .resolve_all_types(&explicit, &infer, &wrappers)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
         let result = self.append_inline_aliases(result, inline_aliases);

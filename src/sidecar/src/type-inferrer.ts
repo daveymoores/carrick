@@ -21,6 +21,8 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
+  type PropertyAccessExpression,
+  type TypeReferenceNode,
   type Type,
 } from 'ts-morph';
 import type {
@@ -29,6 +31,7 @@ import type {
   InferredType,
   InferKind,
   SourceLocation,
+  WrapperRule,
 } from './types.js';
 
 /**
@@ -68,13 +71,13 @@ export class TypeInferrer {
    * @param requests - Array of inference requests
    * @returns InferResult with inferred types or errors
    */
-  infer(requests: InferRequestItem[]): InferResult {
+  infer(requests: InferRequestItem[], wrappers: WrapperRule[] = []): InferResult {
     const inferredTypes: InferredType[] = [];
     const errors: string[] = [];
 
     for (const request of requests) {
       try {
-        const result = this.inferSingle(request);
+        const result = this.inferSingle(request, wrappers);
         if (result) {
           inferredTypes.push(result);
         } else {
@@ -100,7 +103,10 @@ export class TypeInferrer {
   /**
    * Infer a single type based on the request
    */
-  private inferSingle(request: InferRequestItem): InferredType | null {
+  private inferSingle(
+    request: InferRequestItem,
+    wrappers: WrapperRule[]
+  ): InferredType | null {
     const sourceFile = this.getSourceFile(request.file_path);
     if (!sourceFile) {
       this.logError(`Source file not found: ${request.file_path}`);
@@ -113,7 +119,7 @@ export class TypeInferrer {
       case 'response_body':
         return this.inferResponseBody(sourceFile, request);
       case 'call_result':
-        return this.inferCallResult(sourceFile, request);
+        return this.inferCallResult(sourceFile, request, wrappers);
       case 'variable':
         return this.inferVariable(sourceFile, request);
       case 'expression':
@@ -231,7 +237,8 @@ export class TypeInferrer {
    */
   private inferCallResult(
     sourceFile: SourceFile,
-    request: InferRequestItem
+    request: InferRequestItem,
+    wrappers: WrapperRule[]
   ): InferredType | null {
     const callExpr = this.findCallExpressionAtSpan(
       sourceFile,
@@ -252,25 +259,36 @@ export class TypeInferrer {
     );
     const terminalNode = this.resolveCallResultTerminalNode(callExpr, func);
 
-    const explicitType = this.extractExplicitTypeFromAncestor(terminalNode);
-    if (explicitType) {
+    const returnType = terminalNode.getType();
+    let typeString = returnType.getText(terminalNode);
+    let isExplicit = false;
+
+    typeString = this.unwrapPromise(typeString, returnType);
+
+    const wrapperResolution = this.resolveWrapperType(
+      terminalNode,
+      returnType,
+      wrappers
+    );
+    if (wrapperResolution) {
       return this.createInferredType(
         request,
-        explicitType,
-        true,
+        wrapperResolution.typeString,
+        wrapperResolution.isExplicit,
         this.getNodeLocation(terminalNode, sourceFile)
       );
     }
 
-    const returnType = terminalNode.getType();
-    let typeString = returnType.getText(terminalNode);
-
-    typeString = this.unwrapPromise(typeString, returnType);
+    const explicitType = this.extractExplicitTypeFromAncestor(terminalNode);
+    if (explicitType) {
+      typeString = explicitType;
+      isExplicit = true;
+    }
 
     return this.createInferredType(
       request,
       typeString,
-      false,
+      isExplicit,
       this.getNodeLocation(terminalNode, sourceFile)
     );
   }
@@ -626,6 +644,200 @@ export class TypeInferrer {
     );
 
     return ancestor === func;
+  }
+
+  // ===========================================================================
+  // Wrapper Unwrapping
+  // ===========================================================================
+
+  private resolveWrapperType(
+    node: Node,
+    type: Type,
+    wrappers: WrapperRule[]
+  ): { typeString: string; isExplicit: boolean } | null {
+    if (wrappers.length === 0) {
+      return null;
+    }
+
+    for (const wrapper of wrappers) {
+      if (wrapper.unwrap.kind === 'property') {
+        const propertyAccess = this.getPropertyAccessNode(node);
+        if (propertyAccess) {
+          const baseExpr = propertyAccess.getExpression();
+          const baseType = baseExpr.getType();
+          if (this.matchesWrapperType(baseType, baseExpr, wrapper)) {
+            if (propertyAccess.getName() === wrapper.unwrap.property) {
+              const propertyType = propertyAccess.getType();
+              let typeString = propertyType.getText(propertyAccess);
+              typeString = this.unwrapPromise(typeString, propertyType);
+              return { typeString, isExplicit: false };
+            }
+            return { typeString: 'unknown', isExplicit: false };
+          }
+        }
+
+        if (this.matchesWrapperType(type, node, wrapper)) {
+          return { typeString: 'unknown', isExplicit: false };
+        }
+
+        continue;
+      }
+
+      if (wrapper.unwrap.kind === 'generic_param') {
+        if (!this.matchesWrapperType(type, node, wrapper)) {
+          continue;
+        }
+
+        const explicitArg = this.findExplicitWrapperTypeArgument(node, wrapper);
+        if (!explicitArg) {
+          return { typeString: 'unknown', isExplicit: false };
+        }
+
+        return { typeString: explicitArg.typeString, isExplicit: true };
+      }
+    }
+
+    return null;
+  }
+
+  private findExplicitWrapperTypeArgument(
+    node: Node,
+    wrapper: WrapperRule
+  ): { typeString: string } | null {
+    const index = wrapper.unwrap.index;
+    if (index === undefined) {
+      return null;
+    }
+
+    const callExpr = this.getCallExpressionFromNode(node);
+    if (callExpr) {
+      const typeArgs = callExpr.getTypeArguments();
+      if (typeArgs.length > index) {
+        return { typeString: typeArgs[index].getText() };
+      }
+    }
+
+    const typeRef = this.findWrapperTypeReference(node, wrapper.type_name);
+    if (typeRef) {
+      const typeArgs = typeRef.getTypeArguments();
+      if (typeArgs.length > index) {
+        return { typeString: typeArgs[index].getText() };
+      }
+    }
+
+    return null;
+  }
+
+  private getPropertyAccessNode(
+    node: Node
+  ): PropertyAccessExpression | null {
+    const unwrapped = this.unwrapExpressionNode(node);
+    if (Node.isPropertyAccessExpression(unwrapped)) {
+      return unwrapped;
+    }
+    return null;
+  }
+
+  private getCallExpressionFromNode(node: Node): CallExpression | null {
+    const unwrapped = this.unwrapExpressionNode(node);
+    if (Node.isCallExpression(unwrapped)) {
+      return unwrapped;
+    }
+    return null;
+  }
+
+  private findWrapperTypeReference(
+    node: Node,
+    typeName: string
+  ): TypeReferenceNode | null {
+    for (const ancestor of node.getAncestors()) {
+      if (!Node.isTypeReference(ancestor)) {
+        continue;
+      }
+      const nameText = ancestor.getTypeName().getText();
+      if (nameText === typeName || nameText.endsWith(`.${typeName}`)) {
+        return ancestor;
+      }
+    }
+
+    return null;
+  }
+
+  private unwrapExpressionNode(node: Node): Node {
+    let current = node;
+    while (true) {
+      if (Node.isAwaitExpression(current)) {
+        current = current.getExpression();
+        continue;
+      }
+      if (Node.isParenthesizedExpression(current)) {
+        current = current.getExpression();
+        continue;
+      }
+      if (Node.isAsExpression(current)) {
+        current = current.getExpression();
+        continue;
+      }
+      if (Node.isTypeAssertion(current)) {
+        current = current.getExpression();
+        continue;
+      }
+      break;
+    }
+
+    return current;
+  }
+
+  private matchesWrapperType(type: Type, node: Node, wrapper: WrapperRule): boolean {
+    const symbol = type.getSymbol() ?? type.getAliasSymbol();
+    if (!symbol || symbol.getName() !== wrapper.type_name) {
+      return false;
+    }
+
+    if (
+      symbol
+        .getDeclarations()
+        .some((decl) => this.declarationFromPackage(decl, wrapper.package))
+    ) {
+      return true;
+    }
+
+    const aliasedSymbol = symbol.getAliasedSymbol();
+    if (
+      aliasedSymbol &&
+      aliasedSymbol
+        .getDeclarations()
+        .some((decl) => this.declarationFromPackage(decl, wrapper.package))
+    ) {
+      return true;
+    }
+
+    return this.sourceFileImportsWrapper(node.getSourceFile(), wrapper);
+  }
+
+  private sourceFileImportsWrapper(
+    sourceFile: SourceFile,
+    wrapper: WrapperRule
+  ): boolean {
+    for (const decl of sourceFile.getImportDeclarations()) {
+      if (decl.getModuleSpecifierValue() !== wrapper.package) {
+        continue;
+      }
+      if (decl.getDefaultImport()?.getText() === wrapper.type_name) {
+        return true;
+      }
+      if (decl.getNamedImports().some((named) => named.getName() === wrapper.type_name)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private declarationFromPackage(node: Node, packageName: string): boolean {
+    const filePath = node.getSourceFile().getFilePath();
+    const normalized = filePath.replace(/\\/g, '/');
+    return normalized.includes(`/node_modules/${packageName}/`);
   }
 
   private extractExplicitTypeFromAncestor(node: Node): string | null {

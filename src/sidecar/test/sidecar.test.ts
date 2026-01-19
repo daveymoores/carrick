@@ -689,6 +689,125 @@ describe('Type Sidecar Integration Tests', () => {
         assert.ok(!inferred.type_string.includes('Promise'));
       }
     });
+
+    it('should unwrap wrapper types when access is verified', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-9',
+        wrappers: [
+          {
+            package: 'wrapper-lib',
+            type_name: 'ApiResponse',
+            unwrap: { kind: 'property', property: 'data' },
+          },
+        ],
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/wrapper-usage.ts'),
+            line_number: 15,
+            span_start: 266,
+            span_end: 284,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-9');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'call_result');
+        assert.ok(inferred.type_string.includes('UserData'));
+        assert.ok(inferred.type_string !== 'unknown');
+      }
+    });
+
+    it('should return unknown when wrapper access is not verified', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-10',
+        wrappers: [
+          {
+            package: 'wrapper-lib',
+            type_name: 'ApiResponse',
+            unwrap: { kind: 'property', property: 'data' },
+          },
+        ],
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/wrapper-usage.ts'),
+            line_number: 20,
+            span_start: 371,
+            span_end: 389,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-10');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'call_result');
+        assert.strictEqual(inferred.type_string, 'unknown');
+      }
+    });
+
+    it('should ignore wrapper rules for local types', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-11',
+        wrappers: [
+          {
+            package: 'wrapper-lib',
+            type_name: 'ApiResponse',
+            unwrap: { kind: 'property', property: 'data' },
+          },
+        ],
+        requests: [
+          {
+            file_path: path.join(
+              FIXTURES_PATH,
+              'src/wrapper-false-positive.ts'
+            ),
+            line_number: 8,
+            span_start: 197,
+            span_end: 215,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-11');
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'call_result');
+        assert.ok(inferred.type_string.includes('ApiResponse'));
+        assert.ok(inferred.type_string !== 'unknown');
+      }
+    });
   });
 
   describe('error handling', () => {

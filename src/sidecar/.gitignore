@@ -1,5 +1,8 @@
 # Dependencies
 node_modules/
+!test/fixtures/sample-repo/node_modules/
+!test/fixtures/sample-repo/node_modules/wrapper-lib/
+!test/fixtures/sample-repo/node_modules/wrapper-lib/index.d.ts
 
 # Build output
 dist/

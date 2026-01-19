@@ -19,6 +19,24 @@ export type InferKind =
   | 'request_body';     // Find request body (req.body/ctx.request.body or call payloads)
 
 // ============================================================================
+// Wrapper Registry Types
+// ============================================================================
+
+export type WrapperUnwrapKind = 'property' | 'generic_param';
+
+export interface WrapperUnwrapRule {
+  kind: WrapperUnwrapKind;
+  property?: string;
+  index?: number;
+}
+
+export interface WrapperRule {
+  package: string;
+  type_name: string;
+  unwrap: WrapperUnwrapRule;
+}
+
+// ============================================================================
 // Request Types
 // ============================================================================
 
@@ -52,6 +70,7 @@ export interface BundleRequest extends BaseRequest {
 export interface InferRequest extends BaseRequest {
   action: 'infer';
   requests: InferRequestItem[];
+  wrappers?: WrapperRule[];
 }
 
 /**

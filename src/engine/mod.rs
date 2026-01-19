@@ -476,6 +476,7 @@ async fn analyze_current_repo(
                     sidecar,
                     &analysis_result.file_results,
                     repo_path,
+                    &packages,
                     &analysis_result.mount_graph,
                     &config,
                 ) {

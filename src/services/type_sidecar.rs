@@ -60,6 +60,34 @@ pub enum InferKind {
     RequestBody,
 }
 
+/// Wrapper unwrap strategy
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WrapperUnwrapKind {
+    /// Unwrap via property access (e.g., resp.data)
+    Property,
+    /// Unwrap via explicit generic parameter
+    GenericParam,
+}
+
+/// Rule for unwrapping a wrapper type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WrapperUnwrapRule {
+    pub kind: WrapperUnwrapKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+}
+
+/// Wrapper rule keyed by package and type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WrapperRule {
+    pub package: String,
+    pub type_name: String,
+    pub unwrap: WrapperUnwrapRule,
+}
+
 /// Request for a specific symbol to be bundled
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolRequest {
@@ -115,6 +143,8 @@ enum SidecarRequest {
     Infer {
         request_id: String,
         requests: Vec<InferRequestItem>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wrappers: Option<Vec<WrapperRule>>,
     },
     #[serde(rename = "health")]
     Health { request_id: String },
@@ -473,12 +503,14 @@ impl TypeSidecar {
     ///
     /// # Arguments
     /// * `requests` - Inference requests
+    /// * `wrappers` - Optional wrapper rules for deterministic unwrapping
     ///
     /// # Returns
     /// The sidecar response with inferred types.
     pub fn infer_types(
         &self,
         requests: &[InferRequestItem],
+        wrappers: &[WrapperRule],
     ) -> Result<SidecarResponse, SidecarError> {
         self.ensure_ready()?;
 
@@ -495,9 +527,16 @@ impl TypeSidecar {
             });
         }
 
+        let wrapper_rules = if wrappers.is_empty() {
+            None
+        } else {
+            Some(wrappers.to_vec())
+        };
+
         let request = SidecarRequest::Infer {
             request_id: self.next_request_id(),
             requests: requests.to_vec(),
+            wrappers: wrapper_rules,
         };
 
         self.send_request(&request)?;
@@ -509,6 +548,7 @@ impl TypeSidecar {
     /// # Arguments
     /// * `explicit` - Symbols for explicit type bundling
     /// * `infer` - Requests for type inference
+    /// * `wrappers` - Optional wrapper rules for deterministic unwrapping
     ///
     /// # Returns
     /// Combined result with both explicit and inferred types.
@@ -516,6 +556,7 @@ impl TypeSidecar {
         &self,
         explicit: &[SymbolRequest],
         infer: &[InferRequestItem],
+        wrappers: &[WrapperRule],
     ) -> Result<TypeResolutionResult, SidecarError> {
         self.ensure_ready()?;
 
@@ -544,7 +585,7 @@ impl TypeSidecar {
 
         // Infer implicit types
         if !infer.is_empty() {
-            let infer_response = self.infer_types(infer)?;
+            let infer_response = self.infer_types(infer, wrappers)?;
             if let Some(inferred) = infer_response.inferred_types {
                 result.inferred_types = inferred;
             }
