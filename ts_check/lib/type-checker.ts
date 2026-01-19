@@ -169,13 +169,25 @@ export class TypeCompatibilityChecker {
       const consumerUnknown =
         match.consumer.type_state === "unknown" ||
         match.consumer.evidence?.type_state === "unknown";
+      const producerTypeInfo = producerUnknown
+        ? this.resolveTypeInfo(project, match.producer.type_alias)
+        : undefined;
+      const consumerTypeInfo = consumerUnknown
+        ? this.resolveTypeInfo(project, match.consumer.type_alias)
+        : undefined;
+      const producerIsUnknown =
+        producerUnknown &&
+        (!producerTypeInfo?.type || producerTypeInfo.isPlaceholderUnknown);
+      const consumerIsUnknown =
+        consumerUnknown &&
+        (!consumerTypeInfo?.type || consumerTypeInfo.isPlaceholderUnknown);
 
-      if (producerUnknown || consumerUnknown) {
+      if (producerIsUnknown || consumerIsUnknown) {
         const reasonParts = [];
-        if (producerUnknown) {
+        if (producerIsUnknown) {
           reasonParts.push("producer type_state=unknown");
         }
-        if (consumerUnknown) {
+        if (consumerIsUnknown) {
           reasonParts.push("consumer type_state=unknown");
         }
         result.unknownPairs.push({
@@ -196,7 +208,9 @@ export class TypeCompatibilityChecker {
           project,
           endpoint,
           match.producer,
-          match.consumer
+          match.consumer,
+          producerTypeInfo?.type,
+          consumerTypeInfo?.type
         );
 
         if (mismatch) {
@@ -247,11 +261,17 @@ export class TypeCompatibilityChecker {
     project: Project,
     endpoint: string,
     producer: ManifestEntry,
-    consumer: ManifestEntry
+    consumer: ManifestEntry,
+    resolvedProducerType?: Type | null,
+    resolvedConsumerType?: Type | null
   ): Promise<TypeMismatch | null> {
     // Try to find the type aliases in the project
-    const producerType = this.findTypeInProject(project, producer.type_alias);
-    const consumerType = this.findTypeInProject(project, consumer.type_alias);
+    const producerType =
+      resolvedProducerType ??
+      this.findTypeInProject(project, producer.type_alias);
+    const consumerType =
+      resolvedConsumerType ??
+      this.findTypeInProject(project, consumer.type_alias);
 
     if (!producerType) {
       return {
@@ -384,6 +404,30 @@ export class TypeCompatibilityChecker {
     }
 
     return null;
+  }
+
+  private resolveTypeInfo(
+    project: Project,
+    typeName: string
+  ): { type: Type | null; isPlaceholderUnknown: boolean } {
+    for (const sourceFile of project.getSourceFiles()) {
+      const typeAlias = sourceFile.getTypeAlias(typeName);
+      if (typeAlias) {
+        const typeNode = typeAlias.getTypeNode();
+        const typeText = typeNode?.getText().trim();
+        const isPlaceholderUnknown =
+          typeNode?.getKind() === SyntaxKind.UnknownKeyword ||
+          typeText === "unknown";
+        return { type: typeAlias.getType(), isPlaceholderUnknown };
+      }
+
+      const iface = sourceFile.getInterface(typeName);
+      if (iface) {
+        return { type: iface.getType(), isPlaceholderUnknown: false };
+      }
+    }
+
+    return { type: null, isPlaceholderUnknown: false };
   }
 
   private formatEntryLocation(entry: ManifestEntry): string {

@@ -276,6 +276,70 @@ describe('TypeCompatibilityChecker', () => {
       assert.strictEqual(result.unknownPairs[0].consumerEvidence?.file_path, 'api.ts');
     });
 
+    it('should compare types when type_state is unknown but aliases resolve', async () => {
+      const typesProject = new Project({
+        compilerOptions: {
+          strict: true,
+          skipLibCheck: true,
+        },
+      });
+
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type UsersResponse = { id: number };
+        export type UsersData = { id: number };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'producer-api',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersResponse',
+            'producer',
+            'routes.ts',
+            10,
+            'response',
+            false,
+            'unknown'
+          ),
+        ],
+      };
+
+      const consumers: TypeManifest = {
+        repo_name: 'consumer-app',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/api/users',
+            'UsersData',
+            'consumer',
+            'api.ts',
+            5,
+            'response',
+            false,
+            'unknown'
+          ),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.compatiblePairs, 1);
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+    });
+
     it('should match with path parameter normalization', async () => {
       const producers: TypeManifest = {
         repo_name: 'producer-api',
