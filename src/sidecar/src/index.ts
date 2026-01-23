@@ -3,7 +3,7 @@
  *
  * This module implements a message loop that:
  * 1. Listens on stdin for JSON requests
- * 2. Processes each request (init, bundle, infer, health, shutdown)
+ * 2. Processes each request (init, bundle, emit_surface, infer, build_workspace, check_compatibility, health, shutdown)
  * 3. Writes JSON responses to stdout
  *
  * IMPORTANT:
@@ -15,14 +15,18 @@
 import * as readline from 'node:readline';
 import { parseRequest } from './validators.js';
 import { ProjectLoader } from './project-loader.js';
-import { TypeBundler } from './bundler.js';
+import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
+import { MonorepoBuilder } from './monorepo-builder.js';
 import type {
   SidecarRequest,
   SidecarResponse,
   InitResponse,
   BundleResponse,
+  EmitSurfaceResponse,
   InferResponse,
+  BuildWorkspaceResponse,
+  CheckCompatibilityResponse,
   HealthResponse,
   ShutdownResponse,
   ErrorResponse,
@@ -34,7 +38,9 @@ import type {
 
 let projectLoader: ProjectLoader | null = null;
 let typeBundler: TypeBundler | null = null;
+let surfaceEmitter: SurfaceEmitter | null = null;
 let typeInferrer: TypeInferrer | null = null;
+let monorepoBuilder: MonorepoBuilder | null = null;
 let initTimeMs: number | null = null;
 
 // ===========================================================================
@@ -53,6 +59,8 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
     projectLoader = new ProjectLoader({
       repoRoot: request.repo_root,
       tsconfigPath: request.tsconfig_path,
+      tsconfigSnapshot: request.tsconfig_snapshot,
+      pinnedDependencies: request.pinned_dependencies,
     });
 
     const result = projectLoader.load();
@@ -66,13 +74,24 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
       };
     }
 
-    // Initialize bundler and inferrer
+    // Initialize bundler, surface emitter, and inferrer
     const project = projectLoader.getProject();
+    const repoRoot = projectLoader.getRepoRoot();
+
     typeBundler = new TypeBundler({
       project,
-      repoRoot: projectLoader.getRepoRoot(),
+      repoRoot,
     });
+
+    surfaceEmitter = new SurfaceEmitter({
+      project,
+      repoRoot,
+    });
+
     typeInferrer = new TypeInferrer({ project });
+
+    // Initialize monorepo builder (doesn't need project)
+    monorepoBuilder = new MonorepoBuilder();
 
     initTimeMs = result.initTimeMs || Math.round(performance.now() - startTime);
 
@@ -97,7 +116,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
 }
 
 /**
- * Handle the 'bundle' action - bundle explicit types
+ * Handle the 'bundle' action - bundle explicit types (legacy)
  */
 function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleResponse {
   if (!projectLoader?.isInitialized() || !typeBundler) {
@@ -144,6 +163,54 @@ function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleRes
 }
 
 /**
+ * Handle the 'emit_surface' action - emit a surface .d.ts with rewritten specifiers
+ */
+function handleEmitSurface(request: SidecarRequest & { action: 'emit_surface' }): EmitSurfaceResponse {
+  if (!projectLoader?.isInitialized() || !surfaceEmitter) {
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: ['Sidecar not initialized. Call init first.'],
+    };
+  }
+
+  try {
+    log(`Emitting surface for repo '${request.repo_name}' with ${request.payloads.length} payload(s)`);
+
+    const result = surfaceEmitter.emit(
+      request.repo_name,
+      request.payloads,
+      request.output_path
+    );
+
+    if (!result.success) {
+      return {
+        request_id: request.request_id,
+        status: 'error',
+        errors: result.errors,
+      };
+    }
+
+    return {
+      request_id: request.request_id,
+      status: 'success',
+      output_path: result.output_path,
+      surface_content: result.surface_content,
+      manifest: result.manifest,
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Surface emission failed: ${error}`);
+
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    };
+  }
+}
+
+/**
  * Handle the 'infer' action - infer implicit types
  */
 function handleInfer(request: SidecarRequest & { action: 'infer' }): InferResponse {
@@ -158,7 +225,11 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   try {
     log(`Inferring ${request.requests.length} type(s)`);
 
-    const result = typeInferrer.infer(request.requests, request.wrappers);
+    const result = typeInferrer.infer(
+      request.requests,
+      request.wrappers || [],
+      request.extraction_config
+    );
 
     return {
       request_id: request.request_id,
@@ -169,6 +240,89 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     logError(`Inference failed: ${error}`);
+
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    };
+  }
+}
+
+/**
+ * Handle the 'build_workspace' action - build synthetic monorepo workspace
+ */
+function handleBuildWorkspace(request: SidecarRequest & { action: 'build_workspace' }): BuildWorkspaceResponse {
+  // MonorepoBuilder doesn't require project initialization
+  if (!monorepoBuilder) {
+    monorepoBuilder = new MonorepoBuilder();
+  }
+
+  try {
+    log(`Building synthetic workspace with ${request.repos.length} repo(s)`);
+
+    const result = monorepoBuilder.build(request.repos, request.workspace_root);
+
+    if (!result.success) {
+      return {
+        request_id: request.request_id,
+        status: 'error',
+        errors: result.errors,
+      };
+    }
+
+    return {
+      request_id: request.request_id,
+      status: 'success',
+      workspace_path: result.workspace_path,
+      stub_packages: result.stub_packages,
+      checker_path: result.checker_path,
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Workspace build failed: ${error}`);
+
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    };
+  }
+}
+
+/**
+ * Handle the 'check_compatibility' action - run type compatibility checks
+ */
+function handleCheckCompatibility(request: SidecarRequest & { action: 'check_compatibility' }): CheckCompatibilityResponse {
+  if (!monorepoBuilder) {
+    monorepoBuilder = new MonorepoBuilder();
+  }
+
+  try {
+    log(`Running compatibility checks: ${request.checks.length} check(s)`);
+
+    const result = monorepoBuilder.checkCompatibility(
+      request.workspace_root,
+      request.checks
+    );
+
+    if (!result.success) {
+      return {
+        request_id: request.request_id,
+        status: 'error',
+        errors: result.errors,
+      };
+    }
+
+    return {
+      request_id: request.request_id,
+      status: 'success',
+      results: result.results,
+      diagnostics: result.diagnostics,
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Compatibility check failed: ${error}`);
 
     return {
       request_id: request.request_id,
@@ -222,8 +376,14 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleInit(request);
     case 'bundle':
       return handleBundle(request);
+    case 'emit_surface':
+      return handleEmitSurface(request);
     case 'infer':
       return handleInfer(request);
+    case 'build_workspace':
+      return handleBuildWorkspace(request);
+    case 'check_compatibility':
+      return handleCheckCompatibility(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

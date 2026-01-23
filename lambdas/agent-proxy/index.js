@@ -1,11 +1,7 @@
-const Anthropic = require("@anthropic-ai/sdk");
+const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai");
 
-// Initialize Anthropic client
-const client = new Anthropic({
-  apiKey: process.env.AGENT_API_KEY,
-});
-
-// VALID_API_KEYS will be checked in handler
+// Initialize Google Generative AI client
+const genAI = new GoogleGenerativeAI(process.env.AGENT_API_KEY);
 
 // Simple daily usage tracking
 let dailyUsage = {
@@ -97,53 +93,53 @@ function validateRequest(body) {
   return { valid: true };
 }
 
-// Convert Carrick message format to Anthropic format
-// Supports cache_control for prompt caching
+// Convert Carrick message format to Gemini format
 function convertMessages(messages) {
-  const convertedMessages = [];
-  let systemMessage = null;
+  const contents = [];
+  let systemInstruction = null;
 
   for (const msg of messages) {
     if (typeof msg === "string") {
-      convertedMessages.push({
+      contents.push({
         role: "user",
-        content: msg,
+        parts: [{ text: msg }],
       });
     } else if (msg.role === "system") {
-      // Anthropic uses a separate system parameter
-      // Check if content has cache_control (array of content blocks)
+      // Gemini uses systemInstruction parameter
       if (Array.isArray(msg.content)) {
-        systemMessage = msg.content;
+        // Handle content blocks format
+        systemInstruction = msg.content.map((c) => c.text || c).join("\n");
       } else {
-        systemMessage = msg.content;
+        systemInstruction = msg.content;
       }
     } else {
-      // Map roles - Anthropic uses "assistant" not "model"
-      const role = msg.role === "model" ? "assistant" : msg.role;
+      // Map roles - Gemini uses "model" not "assistant"
+      const role = msg.role === "assistant" ? "model" : msg.role;
 
-      // Check if content is an array of content blocks (for cache_control support)
+      // Handle content
+      let text = "";
       if (Array.isArray(msg.content)) {
-        convertedMessages.push({
-          role: role,
-          content: msg.content,
-        });
+        // Handle content blocks format
+        text = msg.content.map((c) => c.text || c).join("\n");
       } else {
-        convertedMessages.push({
-          role: role,
-          content: msg.content || msg.text || "",
-        });
+        text = msg.content || msg.text || "";
       }
+
+      contents.push({
+        role: role,
+        parts: [{ text: text }],
+      });
     }
   }
 
-  return { messages: convertedMessages, system: systemMessage };
+  return { contents, systemInstruction };
 }
 
-// Convert Carrick schema format to Anthropic JSON schema format
-function convertSchemaToAnthropic(schema) {
+// Convert Carrick schema format to Gemini JSON schema format
+function convertSchemaToGemini(schema) {
   if (!schema) return null;
 
-  // Recursively convert type strings to lowercase as Anthropic expects
+  // Recursively convert schema to Gemini format
   function normalizeSchema(obj) {
     if (Array.isArray(obj)) {
       return obj.map(normalizeSchema);
@@ -155,20 +151,23 @@ function convertSchemaToAnthropic(schema) {
 
     const normalized = { ...obj };
 
-    // Convert TYPE constants (ARRAY, OBJECT, STRING, etc.) to lowercase
+    // Convert type strings to Gemini SchemaType format
     if (normalized.type && typeof normalized.type === "string") {
-      normalized.type = normalized.type.toLowerCase();
-    }
-
-    // Claude requires additionalProperties: false for all object types
-    if (normalized.type === "object" && normalized.properties) {
-      normalized.additionalProperties = false;
-    }
-
-    // Claude doesn't support minimum/maximum for number types
-    if (normalized.type === "number" || normalized.type === "integer") {
-      delete normalized.minimum;
-      delete normalized.maximum;
+      const typeMap = {
+        string: SchemaType.STRING,
+        number: SchemaType.NUMBER,
+        integer: SchemaType.INTEGER,
+        boolean: SchemaType.BOOLEAN,
+        array: SchemaType.ARRAY,
+        object: SchemaType.OBJECT,
+        STRING: SchemaType.STRING,
+        NUMBER: SchemaType.NUMBER,
+        INTEGER: SchemaType.INTEGER,
+        BOOLEAN: SchemaType.BOOLEAN,
+        ARRAY: SchemaType.ARRAY,
+        OBJECT: SchemaType.OBJECT,
+      };
+      normalized.type = typeMap[normalized.type] || normalized.type;
     }
 
     // Recursively normalize nested objects
@@ -313,82 +312,78 @@ exports.handler = async (event) => {
       };
     }
 
-    // Use Claude Haiku 4.5 model
-    const model = "claude-haiku-4-5";
+    // Use Gemini 2.5 Flash model
+    const modelName = "gemini-2.5-flash-preview-05-20";
 
-    // Convert messages to Anthropic format
-    const { messages: agentMessages, system: systemMessage } = convertMessages(
+    // Convert messages to Gemini format
+    const { contents, systemInstruction } = convertMessages(
       requestBody.messages
     );
 
-    // Prepare API call parameters
-    const apiParams = {
-      model: model,
-      max_tokens: 4096,
-      messages: agentMessages,
-    };
+    // Prepare model configuration
+    const modelConfig = {};
 
-    // Add system message if present
-    if (systemMessage) {
-      apiParams.system = systemMessage;
-    }
-
-    // Add temperature if specified (must be a valid number, not null)
-    if (requestBody.options?.temperature != null) {
-      apiParams.temperature = requestBody.options.temperature;
+    // Add system instruction if present
+    if (systemInstruction) {
+      modelConfig.systemInstruction = systemInstruction;
     }
 
     // Add structured output schema if provided
     if (requestBody.response_schema) {
-      const normalizedSchema = convertSchemaToAnthropic(
+      const normalizedSchema = convertSchemaToGemini(
         requestBody.response_schema
       );
-      apiParams.output_format = {
-        type: "json_schema",
-        schema: normalizedSchema,
+      modelConfig.generationConfig = {
+        responseMimeType: "application/json",
+        responseSchema: normalizedSchema,
       };
     }
 
-    // Check if any messages have cache_control for logging
-    const hasCacheControl = agentMessages.some(
-      (m) => Array.isArray(m.content) && m.content.some((c) => c.cache_control)
-    ) || (Array.isArray(systemMessage) && systemMessage.some((c) => c.cache_control));
+    // Get the model
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+      ...modelConfig,
+    });
 
-    console.log("Calling Agent API:", {
-      model,
-      messageCount: agentMessages.length,
+    // Prepare generation config
+    const generationConfig = {
+      maxOutputTokens: 8192,
+      ...(modelConfig.generationConfig || {}),
+    };
+
+    // Add temperature if specified
+    if (requestBody.options?.temperature != null) {
+      generationConfig.temperature = requestBody.options.temperature;
+    }
+
+    console.log("Calling Gemini API:", {
+      model: modelName,
+      messageCount: contents.length,
       dailyRemaining: limitCheck.remaining,
       httpMethod: httpMethod,
       hasSchema: !!requestBody.response_schema,
-      hasSystem: !!systemMessage,
-      hasCacheControl: hasCacheControl,
+      hasSystem: !!systemInstruction,
     });
 
-    // Make the Agent API call using Anthropic SDK with structured outputs
-    const response = await client.beta.messages.create({
-      ...apiParams,
-      betas: ["structured-outputs-2025-11-13"],
+    // Make the Gemini API call
+    const result = await model.generateContent({
+      contents: contents,
+      generationConfig: generationConfig,
     });
 
-    // Extract text from response
-    const text = response.content[0].text;
+    const response = result.response;
+    const text = response.text();
 
     const endTime = Date.now();
     const duration = endTime - startTime;
 
-    // Log cache statistics if available
-    const cacheStats = response.usage?.cache_creation_input_tokens !== undefined
-      ? {
-        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-        cache_read_input_tokens: response.usage.cache_read_input_tokens,
-      }
-      : null;
+    // Get usage metadata if available
+    const usageMetadata = response.usageMetadata;
 
-    console.log("Agent API success:", {
+    console.log("Gemini API success:", {
       duration: `${duration}ms`,
       responseLength: text.length,
-      tokensUsed: response.usage || "unknown",
-      cacheStats: cacheStats,
+      tokensUsed: usageMetadata || "unknown",
     });
 
     // Return successful response
@@ -403,7 +398,13 @@ exports.handler = async (event) => {
       body: JSON.stringify({
         success: true,
         text: text,
-        usage: response.usage,
+        usage: usageMetadata
+          ? {
+            promptTokens: usageMetadata.promptTokenCount,
+            candidatesTokens: usageMetadata.candidatesTokenCount,
+            totalTokens: usageMetadata.totalTokenCount,
+          }
+          : null,
         responseTime: duration,
       }),
     };
@@ -411,7 +412,7 @@ exports.handler = async (event) => {
     const endTime = Date.now();
     const duration = endTime - startTime;
 
-    console.error("Agent API error:", {
+    console.error("Gemini API error:", {
       error: error.message,
       errorName: error.name,
       errorCode: error.code,
@@ -420,7 +421,7 @@ exports.handler = async (event) => {
       duration: `${duration}ms`,
     });
 
-    // Handle specific Agent API errors
+    // Handle specific Gemini API errors
     let statusCode = 500;
     let errorMessage = "Internal server error";
     let debugInfo = error.message;
@@ -428,15 +429,22 @@ exports.handler = async (event) => {
     if (error.message?.includes("quota") || error.message?.includes("limit")) {
       statusCode = 429;
       errorMessage = "API quota exceeded. Please try again later.";
-    } else if (error.message?.includes("API key") || error.message?.includes("authentication")) {
+    } else if (
+      error.message?.includes("API key") ||
+      error.message?.includes("authentication")
+    ) {
       statusCode = 401;
       errorMessage = "API authentication failed";
     } else if (
       error.message?.includes("content") ||
-      error.message?.includes("safety")
+      error.message?.includes("safety") ||
+      error.message?.includes("blocked")
     ) {
       statusCode = 400;
       errorMessage = "Content was blocked by safety filters";
+    } else if (error.message?.includes("not found") || error.status === 404) {
+      statusCode = 503;
+      errorMessage = "Model not available. Please try again later.";
     }
 
     return {

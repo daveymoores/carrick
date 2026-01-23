@@ -9,7 +9,10 @@ use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
-use crate::services::{TypeSidecar, type_sidecar::InferKind};
+use crate::services::{
+    TypeSidecar,
+    type_sidecar::{InferKind, TypeResolutionResult},
+};
 use crate::type_manifest::{
     build_call_site_id, build_manifest_type_alias_with_call_id, is_http_method,
     normalize_manifest_method, parse_file_location,
@@ -17,7 +20,7 @@ use crate::type_manifest::{
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -403,6 +406,94 @@ fn infer_kind_for_manifest(role: ManifestRole, type_kind: ManifestTypeKind) -> I
     }
 }
 
+/// Enrich manifest entries with type resolution results.
+///
+/// This function updates the `type_state` and `is_explicit` fields of manifest entries
+/// based on the results from the TypeSidecar. Types that were successfully resolved
+/// (either explicitly or through inference) will have their state updated from `Unknown`
+/// to `Explicit` or `Implicit`.
+fn enrich_manifest_with_type_resolution(
+    manifest: &mut [TypeManifestEntry],
+    type_resolution: &TypeResolutionResult,
+    bundled_dts: Option<&str>,
+) {
+    // Build a lookup of resolved type aliases
+    // Key: type_alias, Value: (type_string, is_explicit)
+    let mut resolved_types: HashMap<String, (String, bool)> = HashMap::new();
+
+    // Add explicit types from the manifest
+    for entry in &type_resolution.explicit_manifest {
+        resolved_types.insert(entry.alias.clone(), (entry.type_string.clone(), true));
+    }
+
+    // Add inferred types
+    for inferred in &type_resolution.inferred_types {
+        // Don't overwrite explicit types with inferred ones
+        if !resolved_types.contains_key(&inferred.alias) {
+            resolved_types.insert(
+                inferred.alias.clone(),
+                (inferred.type_string.clone(), inferred.is_explicit),
+            );
+        }
+    }
+
+    // Also check the bundled .d.ts content for defined types
+    // This catches types that were successfully bundled but not in the manifest
+    let dts_defined_aliases: HashSet<String> = if let Some(dts) = bundled_dts {
+        manifest
+            .iter()
+            .filter(|e| dts_defines_alias(dts, &e.type_alias))
+            .map(|e| e.type_alias.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    // Update manifest entries
+    for entry in manifest.iter_mut() {
+        if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
+            // Check if the type is actually resolved (not "unknown")
+            let is_unknown_type = type_string.trim() == "unknown"
+                || type_string.trim() == "any"
+                || type_string.is_empty();
+
+            if !is_unknown_type {
+                entry.is_explicit = *is_explicit;
+                entry.type_state = if *is_explicit {
+                    ManifestTypeState::Explicit
+                } else {
+                    ManifestTypeState::Implicit
+                };
+                entry.evidence.is_explicit = *is_explicit;
+                entry.evidence.type_state = entry.type_state;
+            }
+        } else if dts_defined_aliases.contains(&entry.type_alias) {
+            // Type is defined in the .d.ts but wasn't in our resolution results
+            // This can happen for inline aliases or other edge cases
+            entry.type_state = ManifestTypeState::Implicit;
+            entry.evidence.type_state = ManifestTypeState::Implicit;
+        }
+    }
+
+    // Log enrichment stats
+    let explicit_count = manifest
+        .iter()
+        .filter(|e| e.type_state == ManifestTypeState::Explicit)
+        .count();
+    let implicit_count = manifest
+        .iter()
+        .filter(|e| e.type_state == ManifestTypeState::Implicit)
+        .count();
+    let unknown_count = manifest
+        .iter()
+        .filter(|e| e.type_state == ManifestTypeState::Unknown)
+        .count();
+    eprintln!(
+        "[Manifest Enrichment] {} explicit, {} implicit, {} unknown",
+        explicit_count, implicit_count, unknown_count
+    );
+}
+
 #[derive(Serialize)]
 struct TypeManifestFile {
     repo_name: String,
@@ -490,6 +581,15 @@ async fn analyze_current_repo(
 
                         // Phase 2.5: Populate CloudRepoData with bundled types
                         cloud_data.bundled_types = type_resolution.dts_content.clone();
+
+                        // Phase 2.6: Enrich manifest entries with type resolution results
+                        if let Some(ref mut manifest) = cloud_data.type_manifest {
+                            enrich_manifest_with_type_resolution(
+                                manifest,
+                                &type_resolution,
+                                type_resolution.dts_content.as_deref(),
+                            );
+                        }
 
                         // Log any failures for debugging
                         for failure in &type_resolution.symbol_failures {

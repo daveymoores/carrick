@@ -19,7 +19,140 @@ export type InferKind =
   | 'request_body';     // Find request body (req.body/ctx.request.body or call payloads)
 
 // ============================================================================
-// Wrapper Registry Types
+// Extraction Config Types (Agent-Informed Payload Unwrapping)
+// ============================================================================
+
+/**
+ * A rule for unwrapping machinery/wrapper types to extract payload types.
+ *
+ * The unwrapping logic follows these priorities:
+ * 1. Exact wrapperSymbols match wins immediately
+ * 2. machineryIndicators only trigger unwrap if originModuleGlobs also match
+ * 3. Payload extraction: prefer generic args, then property paths
+ */
+export interface ExtractionRule {
+  /**
+   * Exact wrapper type/symbol names to unwrap.
+   * Examples: ["Response", "AxiosResponse", "Promise", "Observable"]
+   */
+  wrapperSymbols?: string[];
+
+  /**
+   * Method/property indicators that suggest a wrapper type.
+   * Examples: ["status", "json", "send", "header", "cookie"]
+   * Note: Only used in conjunction with originModuleGlobs to avoid false positives.
+   */
+  machineryIndicators?: string[];
+
+  /**
+   * Glob patterns for module origins. Only unwrap if the symbol's declarations
+   * come from modules matching these patterns.
+   * Examples: ["express", "express/*", "@types/express/*", "axios", "axios/*"]
+   */
+  originModuleGlobs?: string[];
+
+  /**
+   * Index of the generic type argument containing the payload.
+   * Defaults to 0 (first type arg).
+   * Examples:
+   *   - Response<T> → index 0
+   *   - Map<K, V> → index 1 for values
+   */
+  payloadGenericIndex?: number;
+
+  /**
+   * Property path to extract payload when generics aren't available.
+   * Examples: ["data"] for AxiosResponse.data, ["body"] for Response.body
+   */
+  payloadPropertyPath?: string[];
+
+  /**
+   * Whether to recursively unwrap nested wrappers.
+   * Example: Promise<Response<T>> → unwrap both layers to get T
+   */
+  unwrapRecursively?: boolean;
+
+  /**
+   * Maximum unwrap depth when unwrapRecursively is true.
+   * Defaults to 4 to prevent infinite loops.
+   */
+  maxDepth?: number;
+}
+
+/**
+ * Configuration for extracting payload types from machinery wrappers.
+ * Provided by the main Carrick process based on agent analysis.
+ */
+export interface ExtractionConfig {
+  rules: ExtractionRule[];
+}
+
+// ============================================================================
+// Pinned Dependency Snapshot Types
+// ============================================================================
+
+/**
+ * A map of package names to exact pinned versions.
+ * Used to ensure deterministic typechecking across CI runs.
+ */
+export interface PinnedDependencySnapshot {
+  [packageName: string]: string;
+}
+
+// ============================================================================
+// Tsconfig Snapshot Types
+// ============================================================================
+
+/**
+ * A normalized/closed tsconfig object where all `extends` chains have been resolved.
+ * Contains only the compiler options needed for surface checking.
+ */
+export interface TsconfigSnapshot {
+  compilerOptions: {
+    module?: string;
+    moduleResolution?: string;
+    target?: string;
+    lib?: string[];
+    types?: string[];
+    typeRoots?: string[];
+    jsx?: string;
+    strict?: boolean;
+    esModuleInterop?: boolean;
+    skipLibCheck?: boolean;
+    declaration?: boolean;
+    declarationMap?: boolean;
+    paths?: Record<string, string[]>;
+    baseUrl?: string;
+    [key: string]: unknown;
+  };
+}
+
+// ============================================================================
+// Repo Metadata Types
+// ============================================================================
+
+/**
+ * Metadata for a single repository in the synthetic monorepo.
+ */
+export interface RepoMetadata {
+  /** Unique name for this repo (used in @carrick/{repoName}/...) */
+  repoName: string;
+
+  /** Pinned dependency versions for this repo */
+  dependencies: PinnedDependencySnapshot;
+
+  /** Closed tsconfig snapshot for this repo */
+  tsconfig: TsconfigSnapshot;
+
+  /** Extraction config for unwrapping machinery types */
+  extractionConfig?: ExtractionConfig;
+
+  /** The emitted surface .d.ts content (after Task 2) */
+  surfaceContent?: string;
+}
+
+// ============================================================================
+// Legacy Wrapper Registry Types (kept for backwards compat during migration)
 // ============================================================================
 
 export type WrapperUnwrapKind = 'property' | 'generic_param';
@@ -54,14 +187,45 @@ export interface InitRequest extends BaseRequest {
   action: 'init';
   repo_root: string;
   tsconfig_path?: string;
+  /** Optional tsconfig snapshot (closed/merged) - preferred over tsconfig_path */
+  tsconfig_snapshot?: TsconfigSnapshot;
+  /** Optional pinned dependencies for this repo */
+  pinned_dependencies?: PinnedDependencySnapshot;
 }
 
 /**
  * Request to bundle explicit types from source files
+ * @deprecated Use emit_surface instead for the new architecture
  */
 export interface BundleRequest extends BaseRequest {
   action: 'bundle';
   symbols: SymbolRequest[];
+}
+
+/**
+ * Request to emit a surface .d.ts file with rewritten module specifiers
+ */
+export interface EmitSurfaceRequest extends BaseRequest {
+  action: 'emit_surface';
+  /** The repo name for specifier rewriting (@carrick/{repoName}/...) */
+  repo_name: string;
+  /** Payload types to include in the surface */
+  payloads: PayloadDefinition[];
+  /** Output path for the surface .d.ts file */
+  output_path: string;
+}
+
+/**
+ * Definition of a payload type to emit
+ */
+export interface PayloadDefinition {
+  /** Alias/name for this payload in the surface */
+  alias: string;
+  /** The type string (already unwrapped from machinery) */
+  type_string: string;
+  /** Optional source information */
+  source_file?: string;
+  source_location?: SourceLocation;
 }
 
 /**
@@ -71,6 +235,45 @@ export interface InferRequest extends BaseRequest {
   action: 'infer';
   requests: InferRequestItem[];
   wrappers?: WrapperRule[];
+  /** New extraction config (preferred over wrappers) */
+  extraction_config?: ExtractionConfig;
+}
+
+/**
+ * Request to build the synthetic monorepo workspace
+ */
+export interface BuildWorkspaceRequest extends BaseRequest {
+  action: 'build_workspace';
+  repos: RepoMetadata[];
+  /** Root directory for the workspace (defaults to .carrick/workspace) */
+  workspace_root?: string;
+}
+
+/**
+ * Request to run type compatibility checks
+ */
+export interface CheckCompatibilityRequest extends BaseRequest {
+  action: 'check_compatibility';
+  /** Path to the workspace root */
+  workspace_root: string;
+  /** Pairs of types to check for compatibility */
+  checks: CompatibilityCheck[];
+}
+
+/**
+ * A single compatibility check between two types
+ */
+export interface CompatibilityCheck {
+  /** Source repo name */
+  source_repo: string;
+  /** Source payload alias */
+  source_alias: string;
+  /** Target repo name */
+  target_repo: string;
+  /** Target payload alias */
+  target_alias: string;
+  /** Direction: 'source_extends_target' or 'target_extends_source' or 'bidirectional' */
+  direction: 'source_extends_target' | 'target_extends_source' | 'bidirectional';
 }
 
 /**
@@ -93,7 +296,10 @@ export interface ShutdownRequest extends BaseRequest {
 export type SidecarRequest =
   | InitRequest
   | BundleRequest
+  | EmitSurfaceRequest
   | InferRequest
+  | BuildWorkspaceRequest
+  | CheckCompatibilityRequest
   | HealthRequest
   | ShutdownRequest;
 
@@ -155,6 +361,7 @@ export interface InitResponse extends BaseResponse {
 
 /**
  * Response for bundle action
+ * @deprecated Use EmitSurfaceResponse instead
  */
 export interface BundleResponse extends BaseResponse {
   /** The bundled .d.ts content */
@@ -168,6 +375,29 @@ export interface BundleResponse extends BaseResponse {
 }
 
 /**
+ * Response for emit_surface action
+ */
+export interface EmitSurfaceResponse extends BaseResponse {
+  /** Path to the emitted surface file */
+  output_path?: string;
+  /** The emitted .d.ts content */
+  surface_content?: string;
+  /** Manifest of emitted payloads */
+  manifest?: SurfaceManifestEntry[];
+  /** Errors during emission */
+  errors?: string[];
+}
+
+/**
+ * Entry in the surface manifest
+ */
+export interface SurfaceManifestEntry {
+  alias: string;
+  type_string: string;
+  rewritten_imports: string[];
+}
+
+/**
  * Response for infer action
  */
 export interface InferResponse extends BaseResponse {
@@ -175,6 +405,45 @@ export interface InferResponse extends BaseResponse {
   inferred_types?: InferredType[];
   /** General errors */
   errors?: string[];
+}
+
+/**
+ * Response for build_workspace action
+ */
+export interface BuildWorkspaceResponse extends BaseResponse {
+  /** Path to the created workspace */
+  workspace_path?: string;
+  /** Paths to generated stub packages */
+  stub_packages?: string[];
+  /** Path to the checker package */
+  checker_path?: string;
+  /** Errors during workspace creation */
+  errors?: string[];
+}
+
+/**
+ * Response for check_compatibility action
+ */
+export interface CheckCompatibilityResponse extends BaseResponse {
+  /** Results of each compatibility check */
+  results?: CompatibilityResult[];
+  /** TypeScript compiler diagnostics */
+  diagnostics?: string[];
+  /** Errors during checking */
+  errors?: string[];
+}
+
+/**
+ * Result of a single compatibility check
+ */
+export interface CompatibilityResult {
+  source_repo: string;
+  source_alias: string;
+  target_repo: string;
+  target_alias: string;
+  compatible: boolean;
+  /** Diagnostic message if not compatible */
+  diagnostic?: string;
 }
 
 /**
@@ -206,7 +475,10 @@ export interface ErrorResponse extends BaseResponse {
 export type SidecarResponse =
   | InitResponse
   | BundleResponse
+  | EmitSurfaceResponse
   | InferResponse
+  | BuildWorkspaceResponse
+  | CheckCompatibilityResponse
   | HealthResponse
   | ShutdownResponse
   | ErrorResponse;
@@ -241,6 +513,8 @@ export interface InferredType {
   source_location: SourceLocation;
   /** The kind of inference that was performed */
   infer_kind: InferKind;
+  /** The unwrapped/extracted payload type (if different from type_string) */
+  payload_type_string?: string;
 }
 
 /**
@@ -277,6 +551,7 @@ export interface SymbolFailure {
 
 /**
  * Internal result from the bundler
+ * @deprecated Use SurfaceEmitResult instead
  */
 export interface BundleResult {
   /** Whether bundling was successful */
@@ -292,6 +567,22 @@ export interface BundleResult {
 }
 
 /**
+ * Internal result from surface emission
+ */
+export interface SurfaceEmitResult {
+  /** Whether emission was successful */
+  success: boolean;
+  /** The emitted .d.ts content */
+  surface_content?: string;
+  /** Output path where content was written */
+  output_path?: string;
+  /** Manifest of emitted payloads */
+  manifest?: SurfaceManifestEntry[];
+  /** General error messages */
+  errors?: string[];
+}
+
+/**
  * Internal result from the type inferrer
  */
 export interface InferResult {
@@ -300,5 +591,35 @@ export interface InferResult {
   /** Successfully inferred types */
   inferred_types?: InferredType[];
   /** General error messages */
+  errors?: string[];
+}
+
+/**
+ * Result from building the synthetic workspace
+ */
+export interface WorkspaceBuildResult {
+  /** Whether build was successful */
+  success: boolean;
+  /** Path to the workspace root */
+  workspace_path?: string;
+  /** Paths to stub packages */
+  stub_packages?: string[];
+  /** Path to the checker package */
+  checker_path?: string;
+  /** Error messages */
+  errors?: string[];
+}
+
+/**
+ * Result from running compatibility checks
+ */
+export interface CompatibilityCheckResult {
+  /** Whether checks ran successfully (not whether types are compatible) */
+  success: boolean;
+  /** Individual check results */
+  results?: CompatibilityResult[];
+  /** TypeScript diagnostics */
+  diagnostics?: string[];
+  /** Error messages */
   errors?: string[];
 }

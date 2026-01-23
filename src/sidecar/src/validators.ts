@@ -25,7 +25,66 @@ export const InferKindSchema = z.enum([
 ]);
 
 // ============================================================================
-// Wrapper Registry Schemas
+// Extraction Config Schemas (New)
+// ============================================================================
+
+const ExtractionRuleSchema = z.object({
+  wrapperSymbols: z.array(z.string()).optional(),
+  machineryIndicators: z.array(z.string()).optional(),
+  originModuleGlobs: z.array(z.string()).optional(),
+  payloadGenericIndex: z.number().int().nonnegative().optional(),
+  payloadPropertyPath: z.array(z.string()).optional(),
+  unwrapRecursively: z.boolean().optional(),
+  maxDepth: z.number().int().positive().optional(),
+});
+
+const ExtractionConfigSchema = z.object({
+  rules: z.array(ExtractionRuleSchema),
+});
+
+// ============================================================================
+// Tsconfig Snapshot Schema
+// ============================================================================
+
+const TsconfigSnapshotSchema = z.object({
+  compilerOptions: z.object({
+    module: z.string().optional(),
+    moduleResolution: z.string().optional(),
+    target: z.string().optional(),
+    lib: z.array(z.string()).optional(),
+    types: z.array(z.string()).optional(),
+    typeRoots: z.array(z.string()).optional(),
+    jsx: z.string().optional(),
+    strict: z.boolean().optional(),
+    esModuleInterop: z.boolean().optional(),
+    skipLibCheck: z.boolean().optional(),
+    declaration: z.boolean().optional(),
+    declarationMap: z.boolean().optional(),
+    paths: z.record(z.array(z.string())).optional(),
+    baseUrl: z.string().optional(),
+  }).passthrough(),
+});
+
+// ============================================================================
+// Pinned Dependency Snapshot Schema
+// ============================================================================
+
+const PinnedDependencySnapshotSchema = z.record(z.string());
+
+// ============================================================================
+// Repo Metadata Schema
+// ============================================================================
+
+const RepoMetadataSchema = z.object({
+  repoName: z.string().min(1, 'Repo name cannot be empty'),
+  dependencies: PinnedDependencySnapshotSchema,
+  tsconfig: TsconfigSnapshotSchema,
+  extractionConfig: ExtractionConfigSchema.optional(),
+  surfaceContent: z.string().optional(),
+});
+
+// ============================================================================
+// Wrapper Registry Schemas (Legacy)
 // ============================================================================
 
 const WrapperUnwrapKindSchema = z.enum(['property', 'generic_param']);
@@ -93,6 +152,37 @@ export const InferRequestItemSchema = z
   });
 
 // ============================================================================
+// Payload Definition Schema (New)
+// ============================================================================
+
+const SourceLocationSchema = z.object({
+  file_path: z.string(),
+  start_line: z.number(),
+  end_line: z.number(),
+  start_column: z.number().optional(),
+  end_column: z.number().optional(),
+});
+
+const PayloadDefinitionSchema = z.object({
+  alias: z.string().min(1, 'Alias cannot be empty'),
+  type_string: z.string().min(1, 'Type string cannot be empty'),
+  source_file: z.string().optional(),
+  source_location: SourceLocationSchema.optional(),
+});
+
+// ============================================================================
+// Compatibility Check Schema (New)
+// ============================================================================
+
+const CompatibilityCheckSchema = z.object({
+  source_repo: z.string().min(1, 'Source repo cannot be empty'),
+  source_alias: z.string().min(1, 'Source alias cannot be empty'),
+  target_repo: z.string().min(1, 'Target repo cannot be empty'),
+  target_alias: z.string().min(1, 'Target alias cannot be empty'),
+  direction: z.enum(['source_extends_target', 'target_extends_source', 'bidirectional']),
+});
+
+// ============================================================================
 // Action-specific Request Schemas
 // ============================================================================
 
@@ -104,6 +194,8 @@ export const InitRequestSchema = BaseRequestSchema.extend({
   action: z.literal('init'),
   repo_root: z.string().min(1, 'Repo root cannot be empty'),
   tsconfig_path: z.string().optional(),
+  tsconfig_snapshot: TsconfigSnapshotSchema.optional(),
+  pinned_dependencies: PinnedDependencySnapshotSchema.optional(),
 });
 
 export const BundleRequestSchema = BaseRequestSchema.extend({
@@ -111,10 +203,30 @@ export const BundleRequestSchema = BaseRequestSchema.extend({
   symbols: z.array(SymbolRequestSchema).min(1, 'At least one symbol is required'),
 });
 
+export const EmitSurfaceRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('emit_surface'),
+  repo_name: z.string().min(1, 'Repo name cannot be empty'),
+  payloads: z.array(PayloadDefinitionSchema).min(1, 'At least one payload is required'),
+  output_path: z.string().min(1, 'Output path cannot be empty'),
+});
+
 export const InferRequestSchema = BaseRequestSchema.extend({
   action: z.literal('infer'),
   requests: z.array(InferRequestItemSchema).min(1, 'At least one infer request is required'),
   wrappers: z.array(WrapperRuleSchema).optional(),
+  extraction_config: ExtractionConfigSchema.optional(),
+});
+
+export const BuildWorkspaceRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('build_workspace'),
+  repos: z.array(RepoMetadataSchema).min(1, 'At least one repo is required'),
+  workspace_root: z.string().optional(),
+});
+
+export const CheckCompatibilityRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('check_compatibility'),
+  workspace_root: z.string().min(1, 'Workspace root cannot be empty'),
+  checks: z.array(CompatibilityCheckSchema).min(1, 'At least one check is required'),
 });
 
 export const HealthRequestSchema = BaseRequestSchema.extend({
@@ -135,7 +247,10 @@ export const ShutdownRequestSchema = BaseRequestSchema.extend({
 export const SidecarRequestSchema = z.discriminatedUnion('action', [
   InitRequestSchema,
   BundleRequestSchema,
+  EmitSurfaceRequestSchema,
   InferRequestSchema,
+  BuildWorkspaceRequestSchema,
+  CheckCompatibilityRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
 ]);
@@ -200,7 +315,10 @@ export function parseRequestOrThrow(json: unknown): SidecarRequest {
 
 export type ValidatedInitRequest = z.infer<typeof InitRequestSchema>;
 export type ValidatedBundleRequest = z.infer<typeof BundleRequestSchema>;
+export type ValidatedEmitSurfaceRequest = z.infer<typeof EmitSurfaceRequestSchema>;
 export type ValidatedInferRequest = z.infer<typeof InferRequestSchema>;
+export type ValidatedBuildWorkspaceRequest = z.infer<typeof BuildWorkspaceRequestSchema>;
+export type ValidatedCheckCompatibilityRequest = z.infer<typeof CheckCompatibilityRequestSchema>;
 export type ValidatedHealthRequest = z.infer<typeof HealthRequestSchema>;
 export type ValidatedShutdownRequest = z.infer<typeof ShutdownRequestSchema>;
 export type ValidatedSidecarRequest = z.infer<typeof SidecarRequestSchema>;
