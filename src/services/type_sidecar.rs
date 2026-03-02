@@ -690,7 +690,18 @@ impl TypeSidecar {
             return false;
         }
         let base = trimmed.rsplit('.').next().unwrap_or(trimmed);
-        base == "Response"
+        matches!(
+            base,
+            // Express
+            "Response" | "Request" | "NextFunction" |
+            "Express" | "Application" | "Router" |
+            // Fastify
+            "Context" | "FastifyInstance" | "FastifyReply" | "FastifyRequest" |
+            // Koa
+            "Koa" | "ParameterizedContext" |
+            // Node.js HTTP core
+            "IncomingMessage" | "ServerResponse"
+        )
     }
 
     fn ensure_ready(&self) -> Result<(), SidecarError> {

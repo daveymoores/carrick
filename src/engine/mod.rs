@@ -370,7 +370,14 @@ fn add_manifest_pair(
     line_number: u32,
     call_id: Option<&str>,
 ) {
+    // Producers for GET/HEAD/OPTIONS never have request bodies
+    let skip_request =
+        role == ManifestRole::Producer && matches!(method, "GET" | "HEAD" | "OPTIONS");
+
     for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
+        if skip_request && type_kind == ManifestTypeKind::Request {
+            continue;
+        }
         let type_alias =
             build_manifest_type_alias_with_call_id(method, path, role, type_kind, call_id);
         let infer_kind = infer_kind_for_manifest(role, type_kind);

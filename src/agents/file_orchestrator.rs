@@ -19,9 +19,7 @@
 use crate::{
     agent_service::AgentService,
     agents::{
-        file_analyzer_agent::{
-            DataCallResult, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
-        },
+        file_analyzer_agent::{FileAnalysisResult, FileAnalyzerAgent},
         framework_guidance_agent::FrameworkGuidance,
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
@@ -129,7 +127,7 @@ impl FileOrchestrator {
     /// # Arguments
     /// * `files` - List of file paths to analyze
     /// * `guidance` - Framework-specific patterns for detection
-    /// * `_framework_detection` - Framework detection results (for future use)
+    /// * `framework_detection` - Framework detection results (used for type scrubbing)
     ///
     /// # Returns
     /// A `FileCentricAnalysisResult` containing per-file results and aggregated graph.
@@ -137,7 +135,7 @@ impl FileOrchestrator {
         &self,
         files: &[PathBuf],
         guidance: &FrameworkGuidance,
-        _framework_detection: &DetectionResult,
+        framework_detection: &DetectionResult,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         println!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         println!("Processing {} files with SWC gatekeeper", files.len());
@@ -227,7 +225,7 @@ impl FileOrchestrator {
                     let mut adjusted = result;
                     Self::apply_candidate_map(&mut adjusted, &candidate_map);
                     Self::validate_type_hints(&mut adjusted, &symbol_table);
-                    Self::normalize_unusable_types(&mut adjusted);
+                    Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
@@ -429,15 +427,26 @@ impl FileOrchestrator {
                     push_explicit(
                         symbol.clone(),
                         Self::resolve_import_path(&file_path_absolute, import_source),
-                        None,
+                        Some(response_alias.clone()),
                     );
                 } else if endpoint.primary_type_symbol.is_some()
                     && endpoint.type_import_source.is_none()
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = endpoint.primary_type_symbol {
-                        push_explicit(symbol.clone(), file_path_absolute.clone(), None);
+                        push_explicit(
+                            symbol.clone(),
+                            file_path_absolute.clone(),
+                            Some(response_alias.clone()),
+                        );
                     }
+                } else if endpoint.type_import_source.is_some()
+                    && endpoint.primary_type_symbol.is_none()
+                {
+                    eprintln!(
+                        "[FileOrchestrator] Endpoint at {}:{} has import source {:?} but no symbol; relying on inference",
+                        file_path, line_number, endpoint.type_import_source
+                    );
                 }
 
                 let response_inferred = push_infer(
@@ -447,6 +456,13 @@ impl FileOrchestrator {
                     response_alias.clone(),
                     endpoint.response_expression_span_start,
                     endpoint.response_expression_span_end,
+                ) || push_infer(
+                    &file_path_absolute,
+                    line_number,
+                    InferKind::ResponseBody,
+                    response_alias.clone(),
+                    endpoint.call_expression_span_start,
+                    endpoint.call_expression_span_end,
                 );
                 if !response_inferred {
                     if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
@@ -455,13 +471,20 @@ impl FileOrchestrator {
                 }
 
                 if should_infer_request_body(&method) {
-                    push_infer(
+                    let _ = push_infer(
                         &file_path_absolute,
                         line_number,
                         InferKind::RequestBody,
                         request_alias.clone(),
                         endpoint.payload_expression_span_start,
                         endpoint.payload_expression_span_end,
+                    ) || push_infer(
+                        &file_path_absolute,
+                        line_number,
+                        InferKind::RequestBody,
+                        request_alias.clone(),
+                        endpoint.call_expression_span_start,
+                        endpoint.call_expression_span_end,
                     );
                 }
             }
@@ -536,15 +559,26 @@ impl FileOrchestrator {
                     push_explicit(
                         symbol.clone(),
                         Self::resolve_import_path(&file_path_absolute, import_source),
-                        None,
+                        Some(response_alias.clone()),
                     );
                 } else if data_call.primary_type_symbol.is_some()
                     && data_call.type_import_source.is_none()
                 {
                     // Type symbol exists but no import - it might be in the same file
                     if let Some(ref symbol) = data_call.primary_type_symbol {
-                        push_explicit(symbol.clone(), file_path_absolute.clone(), None);
+                        push_explicit(
+                            symbol.clone(),
+                            file_path_absolute.clone(),
+                            Some(response_alias.clone()),
+                        );
                     }
+                } else if data_call.type_import_source.is_some()
+                    && data_call.primary_type_symbol.is_none()
+                {
+                    eprintln!(
+                        "[FileOrchestrator] Data call at {}:{} has import source {:?} but no symbol; relying on inference",
+                        file_path, line_number, data_call.type_import_source
+                    );
                 }
 
                 let call_inferred = push_infer(
@@ -656,29 +690,39 @@ impl FileOrchestrator {
     }
 
     /// Normalize unusable type hints from the LLM so we can force inference instead of padding unknowns.
-    fn normalize_unusable_types(result: &mut FileAnalysisResult) {
-        let scrub_endpoint = |endpoint: &mut EndpointResult| {
-            // Drop framework imports to force inference later.
-            let bad_source = matches!(endpoint.type_import_source.as_deref(), Some("express"));
-            if bad_source {
-                endpoint.type_import_source = None;
-                endpoint.primary_type_symbol = None;
+    ///
+    /// Checks BOTH `type_import_source` AND `primary_type_symbol` against all detected frameworks.
+    /// This prevents the LLM from using framework namespace types (e.g., `express`, `fastify`)
+    /// as payload types, which would resolve to the framework's root namespace instead of actual data.
+    fn normalize_unusable_types(result: &mut FileAnalysisResult, frameworks: &[String]) {
+        let scrub = |primary: &mut Option<String>, source: &mut Option<String>| {
+            // Check type_import_source against ALL detected frameworks
+            if let Some(src) = source.as_deref() {
+                if frameworks.iter().any(|f| f == src) {
+                    *primary = None;
+                    *source = None;
+                    return;
+                }
             }
-        };
-
-        let scrub_data_call = |call: &mut DataCallResult| {
-            let bad_source = matches!(call.type_import_source.as_deref(), Some("express"));
-            if bad_source {
-                call.type_import_source = None;
-                call.primary_type_symbol = None;
+            // Check primary_type_symbol: if it matches a framework package name
+            // (the default import), it's a framework namespace, not a payload type
+            if let Some(sym) = primary.as_deref() {
+                let sym_lower = sym.to_lowercase();
+                if frameworks.iter().any(|f| f.to_lowercase() == sym_lower) {
+                    *primary = None;
+                    *source = None;
+                }
             }
         };
 
         for endpoint in &mut result.endpoints {
-            scrub_endpoint(endpoint);
+            scrub(
+                &mut endpoint.primary_type_symbol,
+                &mut endpoint.type_import_source,
+            );
         }
         for call in &mut result.data_calls {
-            scrub_data_call(call);
+            scrub(&mut call.primary_type_symbol, &mut call.type_import_source);
         }
     }
 
@@ -686,6 +730,7 @@ impl FileOrchestrator {
         result: &mut FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
     ) {
+        // Endpoints: keep filter_map (endpoints without candidates are unreliable)
         result.endpoints = result
             .endpoints
             .drain(..)
@@ -698,17 +743,29 @@ impl FileOrchestrator {
             })
             .collect();
 
+        // Data calls: preserve even without candidate match (inline aliases still work)
+        let mut dropped_count = 0;
         result.data_calls = result
             .data_calls
             .drain(..)
-            .filter_map(|mut data_call| {
-                let candidate = candidate_map.get(&data_call.candidate_id)?;
-                data_call.line_number = candidate.line_number as i32;
-                data_call.call_expression_span_start = Some(candidate.span_start);
-                data_call.call_expression_span_end = Some(candidate.span_end);
-                Some(data_call)
+            .map(|mut data_call| {
+                if let Some(candidate) = candidate_map.get(&data_call.candidate_id) {
+                    data_call.line_number = candidate.line_number as i32;
+                    data_call.call_expression_span_start = Some(candidate.span_start);
+                    data_call.call_expression_span_end = Some(candidate.span_end);
+                } else {
+                    dropped_count += 1;
+                }
+                data_call
             })
             .collect();
+
+        if dropped_count > 0 {
+            eprintln!(
+                "[FileOrchestrator] {} data call(s) had no matching SWC candidate (spans unavailable)",
+                dropped_count
+            );
+        }
     }
 
     /// Resolve types using the TypeSidecar.
