@@ -363,6 +363,12 @@ impl UrlNormalizer {
             result = result[..fragment_idx].to_string();
         }
 
+        // Strip any surrounding quotes or backticks (template literal artifacts)
+        result = result
+            .trim_start_matches(['`', '"', '\''])
+            .trim_end_matches(['`', '"', '\''])
+            .to_string();
+
         // Ensure path starts with /
         if !result.starts_with('/') {
             result = format!("/{}", result);
@@ -726,6 +732,25 @@ mod tests {
         let result = normalizer.normalize("ENV_VAR:API_URL:/users/${userId}");
 
         assert_eq!(result.path, "/users/:userId");
+        assert!(result.is_internal);
+    }
+
+    #[test]
+    fn test_normalize_template_literal_strips_trailing_backtick() {
+        let config = Config {
+            service_name: None,
+            internal_domains: HashSet::new(),
+            external_domains: HashSet::new(),
+            internal_env_vars: ["ORDER_SERVICE_URL"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            external_env_vars: HashSet::new(),
+        };
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("`${process.env.ORDER_SERVICE_URL}/api/orders/101`");
+        assert_eq!(result.path, "/api/orders/101");
         assert!(result.is_internal);
     }
 
