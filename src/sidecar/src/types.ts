@@ -323,10 +323,14 @@ export interface InferRequestItem {
   file_path: string;
   /** Line number (1-based) for context and alias generation */
   line_number: number;
-  /** Start byte offset of the target expression */
-  span_start: number;
-  /** End byte offset of the target expression */
-  span_end: number;
+  /** Start byte offset of the target expression (from SWC spans) */
+  span_start?: number;
+  /** End byte offset of the target expression (from SWC spans) */
+  span_end?: number;
+  /** Verbatim expression text to locate in source (from Gemini) */
+  expression_text?: string;
+  /** Line number where the expression starts (from Gemini) */
+  expression_line?: number;
   /** The kind of inference to perform */
   infer_kind: InferKind;
   /** Optional alias for the inferred type */

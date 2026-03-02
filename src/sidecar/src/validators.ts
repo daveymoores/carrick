@@ -136,17 +136,32 @@ export const InferRequestItemSchema = z
   .object({
     file_path: z.string().min(1, 'File path cannot be empty'),
     line_number: z.number().int().positive('Line number must be positive'),
-    span_start: z.number().int().nonnegative('Span start must be non-negative'),
-    span_end: z.number().int().nonnegative('Span end must be non-negative'),
+    span_start: z.number().int().nonnegative('Span start must be non-negative').optional(),
+    span_end: z.number().int().nonnegative('Span end must be non-negative').optional(),
+    expression_text: z.string().optional(),
+    expression_line: z.number().int().positive('Expression line must be positive').optional(),
     infer_kind: InferKindSchema,
     alias: z.string().optional(),
   })
   .superRefine((value, ctx) => {
-    if (value.span_end < value.span_start) {
+    if (
+      value.span_start !== undefined &&
+      value.span_end !== undefined &&
+      value.span_end < value.span_start
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'span_end must be greater than or equal to span_start',
         path: ['span_end'],
+      });
+    }
+    const hasSpan = value.span_start !== undefined && value.span_end !== undefined;
+    const hasText = value.expression_text !== undefined;
+    if (!hasSpan && !hasText) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'At least one of (span_start + span_end) or expression_text must be provided',
+        path: [],
       });
     }
   });

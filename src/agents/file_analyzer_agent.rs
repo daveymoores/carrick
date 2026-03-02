@@ -41,18 +41,18 @@ pub struct EndpointResult {
     pub path: String,
     pub handler_name: String,
     pub pattern_matched: String,
-    /// Start byte offset of the endpoint definition call expression
+    /// Start byte offset of the endpoint definition call expression (from SWC)
     pub call_expression_span_start: Option<u32>,
-    /// End byte offset of the endpoint definition call expression
+    /// End byte offset of the endpoint definition call expression (from SWC)
     pub call_expression_span_end: Option<u32>,
-    /// Start byte offset of the request payload expression (if detected)
-    pub payload_expression_span_start: Option<u32>,
-    /// End byte offset of the request payload expression (if detected)
-    pub payload_expression_span_end: Option<u32>,
-    /// Start byte offset of the response emission expression (if detected)
-    pub response_expression_span_start: Option<u32>,
-    /// End byte offset of the response emission expression (if detected)
-    pub response_expression_span_end: Option<u32>,
+    /// Verbatim code text of the request payload expression (from Gemini)
+    pub payload_expression_text: Option<String>,
+    /// Line number where the payload expression starts (from Gemini)
+    pub payload_expression_line: Option<i32>,
+    /// Verbatim code text of the response emission expression (from Gemini)
+    pub response_expression_text: Option<String>,
+    /// Line number where the response expression starts (from Gemini)
+    pub response_expression_line: Option<i32>,
     /// The primary type symbol name without wrappers (e.g., "User" from "Response<User[]>")
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
@@ -67,14 +67,14 @@ pub struct DataCallResult {
     pub target: String,
     pub method: Option<String>,
     pub pattern_matched: String,
-    /// Start byte offset of the data call expression
+    /// Start byte offset of the data call expression (from SWC)
     pub call_expression_span_start: Option<u32>,
-    /// End byte offset of the data call expression
+    /// End byte offset of the data call expression (from SWC)
     pub call_expression_span_end: Option<u32>,
-    /// Start byte offset of the request payload expression (if detected)
-    pub payload_expression_span_start: Option<u32>,
-    /// End byte offset of the request payload expression (if detected)
-    pub payload_expression_span_end: Option<u32>,
+    /// Verbatim code text of the request payload expression (from Gemini)
+    pub payload_expression_text: Option<String>,
+    /// Line number where the payload expression starts (from Gemini)
+    pub payload_expression_line: Option<i32>,
     /// The primary type symbol name without wrappers (e.g., "User" from "Promise<User>")
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
@@ -438,20 +438,25 @@ When a variable is used in a mount and that variable was imported, include the i
 * **response.json()/.text():** Treat these as data_calls only when they are part of an actual downstream HTTP consumer. Use the provided call-chain context (upstream call, path/method literal, enclosing function) to decide; avoid framework/client-specific heuristics.
 
 ### 5. TYPE LOCATION EXTRACTION (CRITICAL FOR TYPE CHECKING)
-For endpoints and data calls, emit spans that tell the compiler where to infer types.
+For endpoints and data calls, emit **expression text + line number** to tell the compiler where to infer types.
+The source code is displayed with line-number prefixes (e.g., "  42| res.json(users)"). Read the number directly.
 
 #### A. Response Body Expressions
 Identify the expression that sends/returns the response body (res.json(...), reply.send(...), return ...).
-Emit response_expression_span_start/response_expression_span_end when detected.
+* Emit `response_expression_text` as the verbatim code text (e.g., `res.json(users)`)
+* Emit `response_expression_line` as the line number where this expression starts
+* CRITICAL: Copy the expression EXACTLY as it appears in the source code. Do not paraphrase or modify it.
 
 #### B. Request Payload Expressions
 Identify the expression representing request payloads:
 * Endpoints: req.body / ctx.request.body or payload forwarded into downstream calls.
 * Data calls: the payload argument passed to fetch/axios/etc.
-Emit payload_expression_span_start/payload_expression_span_end when detected.
+* Emit `payload_expression_text` as the verbatim code text (e.g., `req.body`)
+* Emit `payload_expression_line` as the line number where this expression starts
 
 #### C. Call Result Expressions (Consumers)
 For data calls, emit call_expression_span_start/call_expression_span_end for the call expression whose result is consumed.
+These byte offsets come from the candidate context JSON - echo them as-is.
 
 #### D. Explicit Type Symbols (optional)
 If you see explicit TypeScript type annotations, extract:
@@ -528,6 +533,17 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
             )
         };
 
+        // Add line-number prefixes to file content so Gemini can read line numbers directly
+        let mut numbered_content =
+            String::with_capacity(file_content.len() + file_content.lines().count() * 7);
+        for (i, line) in file_content.lines().enumerate() {
+            use std::fmt::Write;
+            if i > 0 {
+                numbered_content.push('\n');
+            }
+            let _ = write!(numbered_content, "{:4}| {}", i + 1, line);
+        }
+
         format!(
             r#"### ACTIVE PATTERNS (Derived from Framework Guidance)
 {{
@@ -555,6 +571,7 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
 {}
 
 ### FILE CONTENT (Path: {})
+Lines are prefixed with line numbers. Use these numbers for *_expression_line fields.
 ```
 {}
 ```
@@ -567,19 +584,22 @@ Analyze this file and return a JSON object with:
 For each mount, include: line_number, parent_node, child_node, mount_path, import_source (null if local), pattern_matched
 
 For each endpoint, include: candidate_id, line_number, owner_node, method, path, handler_name, pattern_matched,
-call_expression_span_start/call_expression_span_end, payload_expression_span_start/payload_expression_span_end,
-response_expression_span_start/response_expression_span_end, primary_type_symbol, type_import_source
+call_expression_span_start/call_expression_span_end, response_expression_text, response_expression_line,
+payload_expression_text, payload_expression_line, primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
   - Use candidate context spans for call_expression_span_* when available
-  - If you can detect a request payload expression, include payload_expression_span_start/End
-  - If you can detect a response emission expression (res.json(), reply.send(), return ...), include response_expression_span_start/End
+  - For response_expression_text: copy the EXACT expression text that sends the response (e.g., "res.json(users)")
+  - For response_expression_line: read the line number from the prefix in the source code
+  - For payload_expression_text: copy the EXACT expression for the request payload (e.g., "req.body")
+  - For payload_expression_line: read the line number from the prefix
 
 For each data_call, include: candidate_id, line_number, target, method (null if unknown), pattern_matched,
-call_expression_span_start/call_expression_span_end, payload_expression_span_start/payload_expression_span_end,
+call_expression_span_start/call_expression_span_end, payload_expression_text, payload_expression_line,
 primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
   - Use candidate context spans for call_expression_span_* when available
-  - If you can detect a payload argument, include payload_expression_span_start/End
+  - For payload_expression_text: copy the EXACT payload argument text if detected
+  - For payload_expression_line: read the line number from the prefix
 
 Return ONLY the JSON object, no explanations."#,
             mount_patterns,
@@ -590,7 +610,7 @@ Return ONLY the JSON object, no explanations."#,
             imports_section,
             guidance.triage_hints,
             file_path,
-            file_content
+            numbered_content
         )
     }
 
@@ -712,10 +732,10 @@ mod tests {
             pattern_matched: ".get(".to_string(),
             call_expression_span_start: None,
             call_expression_span_end: None,
-            payload_expression_span_start: None,
-            payload_expression_span_end: None,
-            response_expression_span_start: None,
-            response_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
             primary_type_symbol: Some("User".to_string()),
             type_import_source: Some("./types/user".to_string()),
         };
@@ -739,8 +759,8 @@ mod tests {
             pattern_matched: "fetch(".to_string(),
             call_expression_span_start: None,
             call_expression_span_end: None,
-            payload_expression_span_start: None,
-            payload_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
             primary_type_symbol: Some("Comment".to_string()),
             type_import_source: None,
         };
@@ -768,10 +788,10 @@ mod tests {
                 pattern_matched: ".get(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
-                payload_expression_span_start: None,
-                payload_expression_span_end: None,
-                response_expression_span_start: None,
-                response_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                response_expression_text: None,
+                response_expression_line: None,
                 primary_type_symbol: Some("-".to_string()),
                 type_import_source: Some(".repo-a_types.ts".to_string()),
             }],
@@ -783,8 +803,8 @@ mod tests {
                 pattern_matched: "fetch(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
-                payload_expression_span_start: None,
-                payload_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
                 primary_type_symbol: Some("NULL".to_string()),
                 type_import_source: Some("bad import (oops)".to_string()),
             }],
@@ -824,10 +844,10 @@ mod tests {
                 pattern_matched: ".get(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
-                payload_expression_span_start: None,
-                payload_expression_span_end: None,
-                response_expression_span_start: None,
-                response_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                response_expression_text: None,
+                response_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],
@@ -866,10 +886,10 @@ mod tests {
                 pattern_matched: ".get(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
-                payload_expression_span_start: None,
-                payload_expression_span_end: None,
-                response_expression_span_start: None,
-                response_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                response_expression_text: None,
+                response_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],
@@ -881,8 +901,8 @@ mod tests {
                 pattern_matched: "fetch(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
-                payload_expression_span_start: None,
-                payload_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],

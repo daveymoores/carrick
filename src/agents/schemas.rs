@@ -305,25 +305,25 @@ impl AgentSchemas {
                                 "nullable": true,
                                 "description": "End byte offset of the endpoint definition call expression"
                             },
-                            "payload_expression_span_start": {
-                                "type": "INTEGER",
+                            "payload_expression_text": {
+                                "type": "STRING",
                                 "nullable": true,
-                                "description": "Start byte offset of the request payload expression, if detected"
+                                "description": "Verbatim code text of the request payload expression (e.g., 'req.body'), copied EXACTLY as it appears in the source code"
                             },
-                            "payload_expression_span_end": {
+                            "payload_expression_line": {
                                 "type": "INTEGER",
                                 "nullable": true,
-                                "description": "End byte offset of the request payload expression, if detected"
+                                "description": "Line number where the payload expression starts (read from the line-number prefix in the source code)"
                             },
-                            "response_expression_span_start": {
-                                "type": "INTEGER",
+                            "response_expression_text": {
+                                "type": "STRING",
                                 "nullable": true,
-                                "description": "Start byte offset of the response emission expression, if detected"
+                                "description": "Verbatim code text of the response emission expression (e.g., 'res.json(users)'), copied EXACTLY as it appears in the source code"
                             },
-                            "response_expression_span_end": {
+                            "response_expression_line": {
                                 "type": "INTEGER",
                                 "nullable": true,
-                                "description": "End byte offset of the response emission expression, if detected"
+                                "description": "Line number where the response expression starts (read from the line-number prefix in the source code)"
                             },
                             "primary_type_symbol": {
                                 "type": "STRING",
@@ -375,15 +375,15 @@ impl AgentSchemas {
                                 "nullable": true,
                                 "description": "End byte offset of the data call expression"
                             },
-                            "payload_expression_span_start": {
-                                "type": "INTEGER",
+                            "payload_expression_text": {
+                                "type": "STRING",
                                 "nullable": true,
-                                "description": "Start byte offset of the request payload expression, if detected"
+                                "description": "Verbatim code text of the request payload expression (e.g., '{ name, email }'), copied EXACTLY as it appears in the source code"
                             },
-                            "payload_expression_span_end": {
+                            "payload_expression_line": {
                                 "type": "INTEGER",
                                 "nullable": true,
-                                "description": "End byte offset of the request payload expression, if detected"
+                                "description": "Line number where the payload expression starts (read from the line-number prefix in the source code)"
                             },
                             "primary_type_symbol": {
                                 "type": "STRING",
@@ -512,15 +512,21 @@ mod tests {
                 .is_object()
         );
         assert!(
-            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_span_start"]
+            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_text"]
                 .is_object()
         );
         assert!(
-            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_span_end"]
+            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_line"]
                 .is_object()
         );
-        assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_start"].is_object());
-        assert!(schema["properties"]["endpoints"]["items"]["properties"]["response_expression_span_end"].is_object());
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["response_expression_text"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["response_expression_line"]
+                .is_object()
+        );
         assert!(
             schema["properties"]["data_calls"]["items"]["properties"]["candidate_id"].is_object()
         );
@@ -533,11 +539,11 @@ mod tests {
                 .is_object()
         );
         assert!(
-            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_span_start"]
+            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_text"]
                 .is_object()
         );
         assert!(
-            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_span_end"]
+            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_line"]
                 .is_object()
         );
         assert!(schema["required"].is_array());

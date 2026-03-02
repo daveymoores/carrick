@@ -766,10 +766,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "pattern_matched": ".get(",
                 "call_expression_span_start": span_start,
                 "call_expression_span_end": span_end,
-                "payload_expression_span_start": null,
-                "payload_expression_span_end": null,
-                "response_expression_span_start": null,
-                "response_expression_span_end": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
                 "primary_type_symbol": null,
                 "type_import_source": null
             }));
@@ -796,10 +796,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "pattern_matched": ".post(",
                 "call_expression_span_start": span_start,
                 "call_expression_span_end": span_end,
-                "payload_expression_span_start": null,
-                "payload_expression_span_end": null,
-                "response_expression_span_start": null,
-                "response_expression_span_end": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
                 "primary_type_symbol": null,
                 "type_import_source": null
             }));
@@ -827,10 +827,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "pattern_matched": ".delete(",
                 "call_expression_span_start": span_start,
                 "call_expression_span_end": span_end,
-                "payload_expression_span_start": null,
-                "payload_expression_span_end": null,
-                "response_expression_span_start": null,
-                "response_expression_span_end": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
                 "primary_type_symbol": null,
                 "type_import_source": null
             }));
@@ -858,10 +858,10 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "pattern_matched": ".put(",
                 "call_expression_span_start": span_start,
                 "call_expression_span_end": span_end,
-                "payload_expression_span_start": null,
-                "payload_expression_span_end": null,
-                "response_expression_span_start": null,
-                "response_expression_span_end": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
                 "primary_type_symbol": null,
                 "type_import_source": null
             }));
@@ -885,8 +885,8 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "pattern_matched": "fetch(",
                 "call_expression_span_start": span_start,
                 "call_expression_span_end": span_end,
-                "payload_expression_span_start": null,
-                "payload_expression_span_end": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
                 "primary_type_symbol": null,
                 "type_import_source": null
             }));
@@ -916,8 +916,8 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "pattern_matched": "axios.",
                 "call_expression_span_start": span_start,
                 "call_expression_span_end": span_end,
-                "payload_expression_span_start": null,
-                "payload_expression_span_end": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
                 "primary_type_symbol": null,
                 "type_import_source": null
             }));

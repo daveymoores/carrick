@@ -103,18 +103,20 @@ export class TypeInferrer {
 
     for (const request of requests) {
       try {
+        const loc = this.formatRequestLocation(request);
         const result = this.inferSingle(request, wrappers, extractionConfig);
         if (result) {
           inferredTypes.push(result);
         } else {
           errors.push(
-            `Could not infer type at ${request.file_path}:${request.span_start}-${request.span_end} (${request.infer_kind})`
+            `Could not infer type at ${request.file_path}:${loc} (${request.infer_kind})`
           );
         }
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
+        const loc = this.formatRequestLocation(request);
         errors.push(
-          `Error inferring type at ${request.file_path}:${request.span_start}-${request.span_end}: ${error}`
+          `Error inferring type at ${request.file_path}:${loc}: ${error}`
         );
       }
     }
@@ -187,14 +189,10 @@ export class TypeInferrer {
     wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const func = this.findContainingFunctionBySpan(
-      sourceFile,
-      request.span_start,
-      request.span_end
-    );
+    const func = this.resolveContainingFunction(sourceFile, request);
 
     if (!func) {
-      this.log(`No function found at span ${request.span_start}-${request.span_end}`);
+      this.log(`No function found for request at ${request.file_path}:${request.line_number}`);
       return null;
     }
 
@@ -231,14 +229,10 @@ export class TypeInferrer {
     wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const node = this.findNodeAtSpan(
-      sourceFile,
-      request.span_start,
-      request.span_end
-    );
+    const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
-      this.log(`No node found at span ${request.span_start}-${request.span_end}`);
+      this.log(`No node found for request at ${request.file_path}:${request.line_number}`);
       return null;
     }
 
@@ -276,21 +270,14 @@ export class TypeInferrer {
     wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const callExpr = this.findCallExpressionAtSpan(
-      sourceFile,
-      request.span_start,
-      request.span_end
-    );
+    const callExpr = this.resolveTargetCallExpression(sourceFile, request);
 
     if (!callExpr) {
       return this.inferExpression(sourceFile, request, wrappers, extractionConfig);
     }
 
-    const func = this.findContainingFunctionBySpan(
-      sourceFile,
-      request.span_start,
-      request.span_end
-    );
+    // Walk up from the already-found call expression instead of re-searching
+    const func = this.findContainingFunctionForNode(callExpr);
     const terminalNode = this.resolveCallResultTerminalNode(callExpr, func);
     const returnType = terminalNode.getType();
     let typeString = returnType.getText(terminalNode);
@@ -343,11 +330,7 @@ export class TypeInferrer {
     wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const node = this.findNodeAtSpan(
-      sourceFile,
-      request.span_start,
-      request.span_end
-    );
+    const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
       return null;
@@ -394,11 +377,7 @@ export class TypeInferrer {
     wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const node = this.findNodeAtSpan(
-      sourceFile,
-      request.span_start,
-      request.span_end
-    );
+    const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
       return null;
@@ -430,11 +409,7 @@ export class TypeInferrer {
     wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const node = this.findNodeAtSpan(
-      sourceFile,
-      request.span_start,
-      request.span_end
-    );
+    const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
       return null;
@@ -1294,6 +1269,219 @@ export class TypeInferrer {
 
   // ===========================================================================
   // Node Finding
+  // ===========================================================================
+
+  // ===========================================================================
+  // Text-Based Node Resolution (Gemini expression text + line)
+  // ===========================================================================
+
+  /**
+   * Resolve the target node using the best available locator:
+   * 1. If span_start + span_end present → findNodeAtSpan (SWC byte offsets)
+   * 2. If expression_text present → findNodeByText (Gemini text + line)
+   * 3. Otherwise → undefined
+   */
+  private resolveTargetNode(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): Node | undefined {
+    if (request.span_start !== undefined && request.span_end !== undefined) {
+      return this.findNodeAtSpan(sourceFile, request.span_start, request.span_end);
+    }
+    if (request.expression_text) {
+      return this.findNodeByText(sourceFile, request.expression_text, request.expression_line);
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolve to a CallExpression using the best available locator.
+   */
+  private resolveTargetCallExpression(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): CallExpression | undefined {
+    if (request.span_start !== undefined && request.span_end !== undefined) {
+      return this.findCallExpressionAtSpan(sourceFile, request.span_start, request.span_end);
+    }
+    if (request.expression_text) {
+      return this.findCallExpressionByText(sourceFile, request.expression_text, request.expression_line);
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolve to a containing function using the best available locator.
+   */
+  private resolveContainingFunction(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): FunctionLike | undefined {
+    if (request.span_start !== undefined && request.span_end !== undefined) {
+      return this.findContainingFunctionBySpan(sourceFile, request.span_start, request.span_end);
+    }
+    if (request.expression_text) {
+      const node = this.findNodeByText(sourceFile, request.expression_text, request.expression_line);
+      if (!node) return undefined;
+      return this.findContainingFunctionForNode(node);
+    }
+    return undefined;
+  }
+
+  /**
+   * Walk up from a node to find its innermost containing function.
+   */
+  private findContainingFunctionForNode(node: Node): FunctionLike | undefined {
+    return node.getFirstAncestor(
+      (n): n is FunctionLike =>
+        Node.isFunctionDeclaration(n) ||
+        Node.isArrowFunction(n) ||
+        Node.isFunctionExpression(n) ||
+        Node.isMethodDeclaration(n)
+    );
+  }
+
+  /**
+   * Find a node by matching expression text near a target line.
+   *
+   * Strategy:
+   * 1. Get all descendant nodes within [lineNumber - searchRadius, lineNumber + searchRadius]
+   * 2. Normalize whitespace for comparison
+   * 3. Try exact match first (after normalization), prefer closest to target line
+   * 4. Fall back to substring match (LLM text in node text, or vice versa)
+   * 5. Return smallest matching node closest to target line
+   */
+  private findNodeByText(
+    sourceFile: SourceFile,
+    expressionText: string,
+    lineNumber?: number,
+    searchRadius: number = 5
+  ): Node | undefined {
+    const allNodes = sourceFile.getDescendants().filter((node) => {
+      if (Node.isSourceFile(node)) return false;
+      if (node.getKind() === SyntaxKind.SyntaxList) return false;
+      return true;
+    });
+    return this.matchByText(allNodes, expressionText, lineNumber, searchRadius);
+  }
+
+  /**
+   * Find a CallExpression by matching expression text near a target line.
+   */
+  private findCallExpressionByText(
+    sourceFile: SourceFile,
+    expressionText: string,
+    lineNumber?: number,
+    searchRadius: number = 5
+  ): CallExpression | undefined {
+    const callExpressions = sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression);
+    return this.matchByText(callExpressions, expressionText, lineNumber, searchRadius) as
+      | CallExpression
+      | undefined;
+  }
+
+  /**
+   * Shared text-matching logic for node resolution.
+   * Normalizes whitespace once per candidate, then tries exact match,
+   * then substring match (preferring containing matches).
+   */
+  private matchByText<T extends Node>(
+    nodes: T[],
+    expressionText: string,
+    lineNumber?: number,
+    searchRadius: number = 5
+  ): T | undefined {
+    const normalizedTarget = this.normalizeWhitespace(expressionText);
+    if (!normalizedTarget) return undefined;
+
+    // Filter to nodes within the search window and pre-compute normalized text
+    const candidates = (
+      lineNumber
+        ? nodes.filter((node) => {
+            const nodeLine = node.getStartLineNumber();
+            return nodeLine >= lineNumber - searchRadius && nodeLine <= lineNumber + searchRadius;
+          })
+        : nodes
+    ).map((node) => ({ node, text: this.normalizeWhitespace(node.getText()) }));
+
+    if (candidates.length === 0) return undefined;
+
+    // Try exact match (normalized whitespace)
+    const exactMatches = candidates.filter((c) => c.text === normalizedTarget);
+    if (exactMatches.length > 0) {
+      return this.pickBestMatch(exactMatches.map((c) => c.node), lineNumber) as T;
+    }
+
+    // Fall back to substring match
+    // For the reverse direction (target contains node text), require a minimum node text
+    // length to avoid matching tiny identifiers like "res" or "body" too broadly
+    const MIN_REVERSE_MATCH_LEN = 8;
+    const substringMatches = candidates.filter(
+      (c) =>
+        c.text.includes(normalizedTarget) ||
+        (c.text.length >= MIN_REVERSE_MATCH_LEN && normalizedTarget.includes(c.text))
+    );
+
+    if (substringMatches.length > 0) {
+      // Prefer nodes where the LLM text is contained in the node text
+      const containingMatches = substringMatches.filter((c) =>
+        c.text.includes(normalizedTarget)
+      );
+
+      if (containingMatches.length > 0) {
+        return this.pickBestMatch(containingMatches.map((c) => c.node), lineNumber) as T;
+      }
+
+      return this.pickBestMatch(substringMatches.map((c) => c.node), lineNumber) as T;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Pick the best match from a set of candidate nodes:
+   * smallest range, then closest to target line.
+   */
+  private pickBestMatch(nodes: Node[], targetLine?: number): Node {
+    return nodes.reduce((best, current) => {
+      const bestRange = best.getEnd() - best.getStart();
+      const currentRange = current.getEnd() - current.getStart();
+
+      // Prefer smaller nodes
+      if (currentRange !== bestRange) {
+        return currentRange < bestRange ? current : best;
+      }
+
+      // Tie-break by proximity to target line
+      if (targetLine !== undefined) {
+        const bestDist = Math.abs(best.getStartLineNumber() - targetLine);
+        const currentDist = Math.abs(current.getStartLineNumber() - targetLine);
+        return currentDist < bestDist ? current : best;
+      }
+
+      return best;
+    });
+  }
+
+  /**
+   * Normalize whitespace for text comparison:
+   * collapse runs of whitespace into single spaces, trim.
+   */
+  private normalizeWhitespace(text: string): string {
+    return text.replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * Format a human-readable location string for error messages.
+   */
+  private formatRequestLocation(request: InferRequestItem): string {
+    return request.expression_text
+      ? `text="${request.expression_text}" line=${request.expression_line ?? '?'}`
+      : `${request.span_start}-${request.span_end}`;
+  }
+
+  // ===========================================================================
+  // Span-Based Node Lookup (SWC byte offsets)
   // ===========================================================================
 
   private findContainingFunctionBySpan(

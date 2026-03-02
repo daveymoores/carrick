@@ -107,12 +107,18 @@ pub struct InferRequestItem {
     pub file_path: String,
     /// Line number (1-based) where inference should occur
     pub line_number: u32,
-    /// Start byte offset of the target expression
+    /// Start byte offset of the target expression (from SWC spans)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_start: Option<u32>,
-    /// End byte offset of the target expression
+    /// End byte offset of the target expression (from SWC spans)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_end: Option<u32>,
+    /// Verbatim expression text to locate in source (from Gemini)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression_text: Option<String>,
+    /// Line number where the expression starts (from Gemini)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression_line: Option<u32>,
     /// The kind of inference to perform
     pub infer_kind: InferKind,
     /// Optional alias for the inferred type
@@ -910,6 +916,8 @@ mod tests {
             line_number: 42,
             span_start: Some(128),
             span_end: Some(196),
+            expression_text: None,
+            expression_line: None,
             infer_kind: InferKind::ResponseBody,
             alias: None,
         };

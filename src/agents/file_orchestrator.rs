@@ -328,24 +328,67 @@ impl FileOrchestrator {
                     });
                 }
             };
+        /// Locator for type inference: either SWC byte-offset spans or Gemini expression text + line
+        enum InferLocator<'a> {
+            Span {
+                span_start: Option<u32>,
+                span_end: Option<u32>,
+            },
+            Text {
+                expression_text: Option<&'a str>,
+                expression_line: Option<i32>,
+            },
+        }
+
         let mut push_infer = |file_path: &str,
                               line_number: u32,
                               infer_kind: InferKind,
                               alias: String,
-                              span_start: Option<u32>,
-                              span_end: Option<u32>| {
-            let (Some(start), Some(end)) = (span_start, span_end) else {
-                return false;
-            };
-            infer_requests.push(InferRequestItem {
-                file_path: file_path.to_string(),
-                line_number,
-                infer_kind,
-                span_start: Some(start),
-                span_end: Some(end),
-                alias: Some(alias),
-            });
-            true
+                              locator: InferLocator<'_>| {
+            match locator {
+                InferLocator::Span {
+                    span_start,
+                    span_end,
+                } => {
+                    let (Some(start), Some(end)) = (span_start, span_end) else {
+                        return false;
+                    };
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path.to_string(),
+                        line_number,
+                        infer_kind,
+                        span_start: Some(start),
+                        span_end: Some(end),
+                        expression_text: None,
+                        expression_line: None,
+                        alias: Some(alias),
+                    });
+                    true
+                }
+                InferLocator::Text {
+                    expression_text,
+                    expression_line,
+                } => {
+                    let Some(text) = expression_text else {
+                        return false;
+                    };
+                    if text.is_empty() {
+                        return false;
+                    }
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path.to_string(),
+                        line_number,
+                        infer_kind,
+                        span_start: None,
+                        span_end: None,
+                        expression_text: Some(text.to_string()),
+                        expression_line: expression_line
+                            .map(|l| if l > 0 { l as u32 } else { line_number }),
+                        alias: Some(alias),
+                    });
+                    true
+                }
+            }
         };
 
         for endpoint in mount_graph.get_resolved_endpoints() {
@@ -457,15 +500,19 @@ impl FileOrchestrator {
                     line_number,
                     InferKind::ResponseBody,
                     response_alias.clone(),
-                    endpoint.response_expression_span_start,
-                    endpoint.response_expression_span_end,
+                    InferLocator::Text {
+                        expression_text: endpoint.response_expression_text.as_deref(),
+                        expression_line: endpoint.response_expression_line,
+                    },
                 ) || push_infer(
                     &file_path_absolute,
                     line_number,
                     InferKind::ResponseBody,
                     response_alias.clone(),
-                    endpoint.call_expression_span_start,
-                    endpoint.call_expression_span_end,
+                    InferLocator::Span {
+                        span_start: endpoint.call_expression_span_start,
+                        span_end: endpoint.call_expression_span_end,
+                    },
                 );
                 if !response_inferred {
                     if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
@@ -479,15 +526,19 @@ impl FileOrchestrator {
                         line_number,
                         InferKind::RequestBody,
                         request_alias.clone(),
-                        endpoint.payload_expression_span_start,
-                        endpoint.payload_expression_span_end,
+                        InferLocator::Text {
+                            expression_text: endpoint.payload_expression_text.as_deref(),
+                            expression_line: endpoint.payload_expression_line,
+                        },
                     ) || push_infer(
                         &file_path_absolute,
                         line_number,
                         InferKind::RequestBody,
                         request_alias.clone(),
-                        endpoint.call_expression_span_start,
-                        endpoint.call_expression_span_end,
+                        InferLocator::Span {
+                            span_start: endpoint.call_expression_span_start,
+                            span_end: endpoint.call_expression_span_end,
+                        },
                     );
                 }
             }
@@ -589,8 +640,10 @@ impl FileOrchestrator {
                     line_number,
                     InferKind::CallResult,
                     response_alias.clone(),
-                    data_call.call_expression_span_start,
-                    data_call.call_expression_span_end,
+                    InferLocator::Span {
+                        span_start: data_call.call_expression_span_start,
+                        span_end: data_call.call_expression_span_end,
+                    },
                 );
                 if !call_inferred {
                     if let Some(symbol) = data_call.primary_type_symbol.as_ref() {
@@ -604,8 +657,10 @@ impl FileOrchestrator {
                         line_number,
                         InferKind::RequestBody,
                         request_alias.clone(),
-                        data_call.payload_expression_span_start,
-                        data_call.payload_expression_span_end,
+                        InferLocator::Text {
+                            expression_text: data_call.payload_expression_text.as_deref(),
+                            expression_line: data_call.payload_expression_line,
+                        },
                     );
                 }
             }
@@ -1261,10 +1316,10 @@ mod tests {
                     pattern_matched: ".get(".to_string(),
                     call_expression_span_start: None,
                     call_expression_span_end: None,
-                    payload_expression_span_start: None,
-                    payload_expression_span_end: None,
-                    response_expression_span_start: None,
-                    response_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -1312,8 +1367,8 @@ mod tests {
                     pattern_matched: "fetch(".to_string(),
                     call_expression_span_start: None,
                     call_expression_span_end: None,
-                    payload_expression_span_start: None,
-                    payload_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -1350,8 +1405,8 @@ mod tests {
                         pattern_matched: "resp.json()".to_string(),
                         call_expression_span_start: None,
                         call_expression_span_end: None,
-                        payload_expression_span_start: None,
-                        payload_expression_span_end: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1363,8 +1418,8 @@ mod tests {
                         pattern_matched: "fetch(".to_string(),
                         call_expression_span_start: Some(350),
                         call_expression_span_end: Some(400),
-                        payload_expression_span_start: None,
-                        payload_expression_span_end: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1399,8 +1454,8 @@ mod tests {
                     pattern_matched: "resp.json()".to_string(),
                     call_expression_span_start: None,
                     call_expression_span_end: None,
-                    payload_expression_span_start: None,
-                    payload_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -1437,8 +1492,8 @@ mod tests {
                         pattern_matched: "fetch(".to_string(),
                         call_expression_span_start: Some(470),
                         call_expression_span_end: Some(520),
-                        payload_expression_span_start: None,
-                        payload_expression_span_end: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1450,8 +1505,8 @@ mod tests {
                         pattern_matched: "fetch(".to_string(),
                         call_expression_span_start: Some(530),
                         call_expression_span_end: Some(580),
-                        payload_expression_span_start: None,
-                        payload_expression_span_end: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1488,10 +1543,10 @@ mod tests {
                     pattern_matched: "app.get".to_string(),
                     call_expression_span_start: None,
                     call_expression_span_end: None,
-                    payload_expression_span_start: None,
-                    payload_expression_span_end: None,
-                    response_expression_span_start: None,
-                    response_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
                     primary_type_symbol: Some("User".to_string()),
                     type_import_source: Some("react".to_string()),
                 },
@@ -1505,10 +1560,10 @@ mod tests {
                     pattern_matched: "app.get".to_string(),
                     call_expression_span_start: None,
                     call_expression_span_end: None,
-                    payload_expression_span_start: None,
-                    payload_expression_span_end: None,
-                    response_expression_span_start: None,
-                    response_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
                     primary_type_symbol: Some("Models.User".to_string()),
                     type_import_source: Some("./models".to_string()),
                 },
@@ -1521,8 +1576,8 @@ mod tests {
                 pattern_matched: "fetch(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
-                payload_expression_span_start: None,
-                payload_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
                 primary_type_symbol: Some("LocalType".to_string()),
                 type_import_source: None,
             }],
@@ -1614,10 +1669,10 @@ mod tests {
                         pattern_matched: ".get(".to_string(),
                         call_expression_span_start: None,
                         call_expression_span_end: None,
-                        payload_expression_span_start: None,
-                        payload_expression_span_end: None,
-                        response_expression_span_start: None,
-                        response_expression_span_end: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
+                        response_expression_text: None,
+                        response_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -1631,10 +1686,10 @@ mod tests {
                         pattern_matched: ".post(".to_string(),
                         call_expression_span_start: None,
                         call_expression_span_end: None,
-                        payload_expression_span_start: None,
-                        payload_expression_span_end: None,
-                        response_expression_span_start: None,
-                        response_expression_span_end: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
+                        response_expression_text: None,
+                        response_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
