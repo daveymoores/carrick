@@ -321,7 +321,13 @@ fn build_type_manifest_entries(
 
     for endpoint in mount_graph.get_resolved_endpoints() {
         let method = normalize_manifest_method(&endpoint.method);
+        if !is_http_method(&method) {
+            continue;
+        }
         let path = endpoint.full_path.clone();
+        if !path.starts_with('/') {
+            continue;
+        }
         let (file_path, line_number) = parse_file_location(&endpoint.file_location);
 
         add_manifest_pair(
@@ -445,11 +451,16 @@ fn enrich_manifest_with_type_resolution(
     }
 
     // Also check the bundled .d.ts content for defined types
-    // This catches types that were successfully bundled but not in the manifest
+    // This catches types that were successfully bundled but not in the manifest.
+    // Exclude aliases defined as `= unknown` — those are placeholders for failed
+    // inferences and should not be promoted to Implicit.
     let dts_defined_aliases: HashSet<String> = if let Some(dts) = bundled_dts {
         manifest
             .iter()
-            .filter(|e| dts_defines_alias(dts, &e.type_alias))
+            .filter(|e| {
+                dts_defines_alias(dts, &e.type_alias)
+                    && !dts_alias_is_trivially_unknown(dts, &e.type_alias)
+            })
             .map(|e| e.type_alias.clone())
             .collect()
     } else {
@@ -795,6 +806,17 @@ fn append_missing_aliases(content: String, manifest: Option<&Vec<TypeManifestEnt
 fn dts_defines_alias(content: &str, alias: &str) -> bool {
     let escaped = regex::escape(alias);
     let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.is_match(content),
+        Err(_) => false,
+    }
+}
+
+/// Returns true when the .d.ts defines the alias as exactly `= unknown`,
+/// i.e. it's a placeholder for a failed inference, not a real type.
+fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
+    let escaped = regex::escape(alias);
+    let pattern = format!(r"type\s+{}\s*=\s*unknown\s*;", escaped);
     match regex::Regex::new(&pattern) {
         Ok(re) => re.is_match(content),
         Err(_) => false,

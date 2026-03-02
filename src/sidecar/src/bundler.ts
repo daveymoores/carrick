@@ -582,9 +582,14 @@ export class TypeBundler {
     if (iface) {
       const text = iface.getText();
       const typeString = text;
+      const alreadyExported = text.trimStart().startsWith('export');
       const definition = alias !== symbolName
-        ? text.replace(`interface ${symbolName}`, `export interface ${alias}`)
-        : `export ${text}`;
+        ? (alreadyExported
+            ? text.replace(`interface ${symbolName}`, `interface ${alias}`)
+            : text.replace(`interface ${symbolName}`, `export interface ${alias}`))
+        : alreadyExported
+          ? text
+          : `export ${text}`;
       return { definition, typeString };
     }
 
@@ -593,9 +598,14 @@ export class TypeBundler {
     if (typeAlias) {
       const text = typeAlias.getText();
       const typeString = typeAlias.getType().getText();
+      const alreadyExported = text.trimStart().startsWith('export');
       const definition = alias !== symbolName
-        ? text.replace(`type ${symbolName}`, `export type ${alias}`)
-        : `export ${text}`;
+        ? (alreadyExported
+            ? text.replace(`type ${symbolName}`, `type ${alias}`)
+            : text.replace(`type ${symbolName}`, `export type ${alias}`))
+        : alreadyExported
+          ? text
+          : `export ${text}`;
       return { definition, typeString };
     }
 
@@ -604,9 +614,14 @@ export class TypeBundler {
     if (classDecl) {
       const text = classDecl.getText();
       const typeString = text;
+      const alreadyExported = text.trimStart().startsWith('export');
       const definition = alias !== symbolName
-        ? text.replace(`class ${symbolName}`, `export declare class ${alias}`)
-        : `export declare ${text}`;
+        ? (alreadyExported
+            ? text.replace(`class ${symbolName}`, `declare class ${alias}`)
+            : text.replace(`class ${symbolName}`, `export declare class ${alias}`))
+        : alreadyExported
+          ? text
+          : `export declare ${text}`;
       return { definition, typeString };
     }
 
@@ -615,9 +630,14 @@ export class TypeBundler {
     if (enumDecl) {
       const text = enumDecl.getText();
       const typeString = text;
+      const alreadyExported = text.trimStart().startsWith('export');
       const definition = alias !== symbolName
-        ? text.replace(`enum ${symbolName}`, `export enum ${alias}`)
-        : `export ${text}`;
+        ? (alreadyExported
+            ? text.replace(`enum ${symbolName}`, `enum ${alias}`)
+            : text.replace(`enum ${symbolName}`, `export enum ${alias}`))
+        : alreadyExported
+          ? text
+          : `export ${text}`;
       return { definition, typeString };
     }
 
@@ -635,9 +655,14 @@ export class TypeBundler {
     if (funcDecl) {
       const text = funcDecl.getText();
       const typeString = text;
+      const alreadyExported = text.trimStart().startsWith('export');
       const definition = alias !== symbolName
-        ? text.replace(`function ${symbolName}`, `export declare function ${alias}`)
-        : `export declare ${text}`;
+        ? (alreadyExported
+            ? text.replace(`function ${symbolName}`, `declare function ${alias}`)
+            : text.replace(`function ${symbolName}`, `export declare function ${alias}`))
+        : alreadyExported
+          ? text
+          : `export declare ${text}`;
       return { definition, typeString };
     }
 

@@ -15,8 +15,7 @@
   "author": "Carrick Team",
   "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.0",
-    "@google/generative-ai": "^0.21.0"
+    "@google/generative-ai": "^0.24.1"
   },
   "devDependencies": {
     "aws-lambda-test-utils": "^1.3.0"

@@ -12,6 +12,19 @@ let dailyUsage = {
 // Simple configuration - just protect against huge bills
 const DAILY_LIMIT = 2000;
 
+function normalizeThinkingLevel(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["minimal", "low", "medium", "high"].includes(normalized)) {
+    return normalized;
+  }
+
+  return null;
+}
+
 // Helper function to get client identifier
 function getClientId(event) {
   // Use IP address as primary identifier
@@ -189,6 +202,38 @@ function convertSchemaToGemini(schema) {
   return normalizeSchema(schema);
 }
 
+// Retry wrapper for Gemini API calls with exponential backoff
+async function callGeminiWithRetry(model, contents, generationConfig, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await model.generateContent({
+        contents: contents,
+        generationConfig: generationConfig,
+      });
+    } catch (error) {
+      console.log(`Gemini API attempt ${attempt}/${maxRetries} failed:`, {
+        message: error.message,
+        status: error.status,
+        code: error.code,
+        details: error.errorDetails || error.details,
+      });
+
+      const isRetryable =
+        error.message?.includes("overloaded") ||
+        error.message?.includes("503") ||
+        error.message?.includes("RESOURCE_EXHAUSTED");
+
+      if (isRetryable && attempt < maxRetries) {
+        const waitTime = Math.pow(2, attempt) * 1000; // 2s, 4s
+        console.log(`Retrying in ${waitTime}ms...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 // Main Lambda handler
 exports.handler = async (event) => {
   const startTime = Date.now();
@@ -312,13 +357,34 @@ exports.handler = async (event) => {
       };
     }
 
-    // Use Gemini 2.5 Flash model
-    const modelName = "gemini-2.5-flash-preview-05-20";
+    // Use Gemini 3 Flash preview model
+    const modelName = "gemini-3-flash-preview";
 
     // Convert messages to Gemini format
     const { contents, systemInstruction } = convertMessages(
       requestBody.messages
     );
+
+    // Log prompt metrics for monitoring
+    const totalPromptSize = (systemInstruction?.length || 0) +
+      contents.reduce((sum, c) => sum + (c.parts?.[0]?.text?.length || 0), 0);
+
+    // Get schema info for logging
+    const schemaInfo = requestBody.response_schema ? {
+      topLevelType: requestBody.response_schema.type,
+      propertyCount: requestBody.response_schema.properties
+        ? Object.keys(requestBody.response_schema.properties).length
+        : 0,
+      schemaSize: JSON.stringify(requestBody.response_schema).length,
+    } : null;
+
+    console.log("Prompt metrics:", {
+      totalKB: Math.round(totalPromptSize / 1024),
+      systemInstructionKB: Math.round((systemInstruction?.length || 0) / 1024),
+      messageCount: contents.length,
+      hasSchema: !!requestBody.response_schema,
+      schemaInfo,
+    });
 
     // Prepare model configuration
     const modelConfig = {};
@@ -351,6 +417,15 @@ exports.handler = async (event) => {
       ...(modelConfig.generationConfig || {}),
     };
 
+    const requestedThinkingLevel = normalizeThinkingLevel(
+      requestBody.options?.thinkingLevel ?? requestBody.options?.reasoningEffort,
+    );
+
+    // Gemini 3 models support thinkingLevel
+    generationConfig.thinkingConfig = {
+      thinkingLevel: requestedThinkingLevel || "minimal",
+    };
+
     // Add temperature if specified
     if (requestBody.options?.temperature != null) {
       generationConfig.temperature = requestBody.options.temperature;
@@ -363,13 +438,11 @@ exports.handler = async (event) => {
       httpMethod: httpMethod,
       hasSchema: !!requestBody.response_schema,
       hasSystem: !!systemInstruction,
+      thinkingLevel: generationConfig.thinkingConfig.thinkingLevel,
     });
 
-    // Make the Gemini API call
-    const result = await model.generateContent({
-      contents: contents,
-      generationConfig: generationConfig,
-    });
+    // Make the Gemini API call with retry logic
+    const result = await callGeminiWithRetry(model, contents, generationConfig);
 
     const response = result.response;
     const text = response.text();
@@ -442,6 +515,13 @@ exports.handler = async (event) => {
     ) {
       statusCode = 400;
       errorMessage = "Content was blocked by safety filters";
+    } else if (
+      error.message?.includes("overloaded") ||
+      error.message?.includes("503") ||
+      error.message?.includes("RESOURCE_EXHAUSTED")
+    ) {
+      statusCode = 503;
+      errorMessage = "Model is overloaded. Retries exhausted.";
     } else if (error.message?.includes("not found") || error.status === 404) {
       statusCode = 503;
       errorMessage = "Model not available. Please try again later.";

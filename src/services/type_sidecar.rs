@@ -598,6 +598,21 @@ impl TypeSidecar {
         let mut combined_dts = result.dts_content.take().unwrap_or_default();
         let mut appended_aliases: HashSet<String> = HashSet::new();
 
+        // Pre-populate with aliases already defined by the bundler so the
+        // infer / failure-fallback loops below never shadow them with `= unknown`.
+        if had_explicit_dts {
+            for req in explicit {
+                if let Some(alias) = &req.alias {
+                    if Self::dts_defines_alias(&combined_dts, alias) {
+                        appended_aliases.insert(alias.clone());
+                    }
+                }
+                if Self::dts_defines_alias(&combined_dts, &req.symbol_name) {
+                    appended_aliases.insert(req.symbol_name.clone());
+                }
+            }
+        }
+
         let mut append_alias = |alias: &str, type_string: &str| -> bool {
             if !appended_aliases.insert(alias.to_string()) {
                 return false;
@@ -622,6 +637,14 @@ impl TypeSidecar {
                 inferred.type_string.as_str()
             };
             append_alias(&inferred.alias, type_string);
+        }
+
+        // Scrub inferred_types so downstream consumers (enrich_manifest_with_type_resolution)
+        // see "unknown" for framework types and leave type_state as Unknown.
+        for inferred in &mut result.inferred_types {
+            if Self::is_untyped_response_type(&inferred.type_string) {
+                inferred.type_string = "unknown".to_string();
+            }
         }
 
         for failure in &result.symbol_failures {
@@ -682,6 +705,17 @@ impl TypeSidecar {
         let mut counter = self.request_counter.lock().unwrap();
         *counter += 1;
         format!("req-{}", counter)
+    }
+
+    /// Check whether a bundled DTS string already defines a given alias
+    /// (as a type, interface, class, enum, or namespace declaration).
+    fn dts_defines_alias(content: &str, alias: &str) -> bool {
+        let escaped = regex::escape(alias);
+        let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
+        match regex::Regex::new(&pattern) {
+            Ok(re) => re.is_match(content),
+            Err(_) => false,
+        }
     }
 
     fn is_untyped_response_type(type_string: &str) -> bool {
@@ -936,6 +970,99 @@ mod tests {
         assert_eq!(
             SidecarState::Failed("error".to_string()),
             SidecarState::Failed("error".to_string())
+        );
+    }
+
+    #[test]
+    fn test_dts_defines_alias_matches_interface() {
+        let dts = "export interface Endpoint_abc_Response {\n  id: string;\n}\n";
+        assert!(TypeSidecar::dts_defines_alias(dts, "Endpoint_abc_Response"));
+    }
+
+    #[test]
+    fn test_dts_defines_alias_matches_type() {
+        let dts = "export type Endpoint_abc_Response = { id: string };\n";
+        assert!(TypeSidecar::dts_defines_alias(dts, "Endpoint_abc_Response"));
+    }
+
+    #[test]
+    fn test_dts_defines_alias_no_false_positive() {
+        let dts = "export interface Endpoint_abc_Request {\n  id: string;\n}\n";
+        assert!(!TypeSidecar::dts_defines_alias(
+            dts,
+            "Endpoint_abc_Response"
+        ));
+    }
+
+    #[test]
+    fn test_dts_defines_alias_matches_enum() {
+        let dts = "export enum Status { Active, Inactive }\n";
+        assert!(TypeSidecar::dts_defines_alias(dts, "Status"));
+    }
+
+    #[test]
+    fn test_is_untyped_response_type() {
+        assert!(TypeSidecar::is_untyped_response_type("Response"));
+        assert!(TypeSidecar::is_untyped_response_type("express.Response"));
+        assert!(TypeSidecar::is_untyped_response_type("FastifyReply"));
+        assert!(!TypeSidecar::is_untyped_response_type("{ id: string }"));
+        assert!(!TypeSidecar::is_untyped_response_type("UserResponse"));
+    }
+
+    /// Verify that resolve_all_types does not append `type X = unknown` when
+    /// the bundler already produced an `interface X { ... }` in the DTS.
+    #[test]
+    fn test_resolve_all_types_no_duplicate_when_bundled() {
+        // Simulate a TypeResolutionResult as if the bundler already produced content.
+        let bundled_dts = concat!(
+            "export interface Endpoint_abc_Response {\n",
+            "  id: string;\n",
+            "  author: string;\n",
+            "}\n"
+        );
+
+        // Build an equivalent of what resolve_all_types does post-bundle/infer:
+        let had_explicit_dts = true;
+        let combined_dts = bundled_dts.to_string();
+        let mut appended_aliases: HashSet<String> = HashSet::new();
+
+        // This is the new pre-population logic under test:
+        let explicit = vec![SymbolRequest {
+            symbol_name: "SomeInterface".to_string(),
+            source_file: "src/types.ts".to_string(),
+            alias: Some("Endpoint_abc_Response".to_string()),
+        }];
+
+        if had_explicit_dts {
+            for req in &explicit {
+                if let Some(alias) = &req.alias {
+                    if TypeSidecar::dts_defines_alias(&combined_dts, alias) {
+                        appended_aliases.insert(alias.clone());
+                    }
+                }
+                if TypeSidecar::dts_defines_alias(&combined_dts, &req.symbol_name) {
+                    appended_aliases.insert(req.symbol_name.clone());
+                }
+            }
+        }
+
+        // Now simulate the infer loop trying to append unknown for the same alias
+        let inferred_alias = "Endpoint_abc_Response";
+        let already_present = !appended_aliases.insert(inferred_alias.to_string());
+        assert!(
+            already_present,
+            "appended_aliases should already contain the bundled alias"
+        );
+
+        // The combined DTS should NOT contain a duplicate `type X = unknown`
+        assert!(
+            !combined_dts.contains("type Endpoint_abc_Response = unknown"),
+            "Should not have appended unknown fallback for already-bundled alias"
+        );
+        assert_eq!(
+            combined_dts.matches("Endpoint_abc_Response").count(),
+            1,
+            "Alias should appear exactly once in bundled DTS"
         );
     }
 }

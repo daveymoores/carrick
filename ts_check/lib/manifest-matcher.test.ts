@@ -18,6 +18,7 @@ import {
   TypeManifest,
   ManifestEntry,
   normalizePath,
+  pathsMatch,
   normalizeMethod,
   createManifestEntry,
   mergeManifests,
@@ -82,6 +83,34 @@ describe('normalizePath', () => {
       normalizePath('/api/users/:id/posts/{postId}'),
       '/api/users/:param/posts/:param'
     );
+  });
+});
+
+describe('pathsMatch', () => {
+  it('should match numeric segments against params', () => {
+    assert.ok(pathsMatch('/api/orders/:id', '/api/orders/101'));
+  });
+
+  it('should match non-numeric segments against params (UUIDs, slugs)', () => {
+    assert.ok(pathsMatch('/api/orders/:id', '/api/orders/abc-123'));
+    assert.ok(pathsMatch('/api/orders/:id', '/api/orders/550e8400-e29b-41d4'));
+  });
+
+  it('should match different param names', () => {
+    assert.ok(pathsMatch('/users/:id', '/users/:userId'));
+    assert.ok(pathsMatch('/users/:id/comments', '/users/:userId/comments'));
+  });
+
+  it('should not match different segment counts', () => {
+    assert.ok(!pathsMatch('/api/orders', '/api/orders/101'));
+  });
+
+  it('should not match different literal segments', () => {
+    assert.ok(!pathsMatch('/api/users', '/api/orders'));
+  });
+
+  it('should handle template literal remnants', () => {
+    assert.ok(pathsMatch('/membership/:param', '/membership/gold'));
   });
 });
 
@@ -270,6 +299,22 @@ describe('ManifestMatcher', () => {
 
       const producers = matcher.findProducersForEndpoint(manifest, 'GET', '/api/users/123');
       assert.strictEqual(producers.length, 1);
+    });
+
+    it('should match non-numeric path segments (UUIDs, slugs) to params', () => {
+      const manifest: TypeManifest = {
+        repo_name: 'api-service',
+        commit_hash: 'abc123',
+        entries: [
+          createManifestEntry('GET', '/api/users/:id', 'GetUserResponse', 'producer', 'routes.ts', 10),
+        ],
+      };
+
+      const uuidProducers = matcher.findProducersForEndpoint(manifest, 'GET', '/api/users/550e8400-e29b-41d4');
+      assert.strictEqual(uuidProducers.length, 1);
+
+      const slugProducers = matcher.findProducersForEndpoint(manifest, 'GET', '/api/users/abc-123');
+      assert.strictEqual(slugProducers.length, 1);
     });
 
     it('should return empty array for no matches', () => {

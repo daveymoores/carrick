@@ -407,6 +407,9 @@ impl FileOrchestrator {
                             .cloned()
                     })
                     .unwrap_or_else(|| (method_fallback.clone(), endpoint.path.clone()));
+                if !is_http_method(&method) || !path.starts_with('/') {
+                    continue;
+                }
                 let response_alias = build_manifest_type_alias(
                     &method,
                     &path,

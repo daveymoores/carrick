@@ -138,14 +138,43 @@ export function normalizePath(inputPath: string): string {
   normalized = normalized.replace(/\{([^}]+)\}/g, ':$1');
   normalized = normalized.replace(/\[([^\]]+)\]/g, ':$1');
 
-  // Normalize numeric path segments to :param
-  normalized = normalized.replace(/\/\d+(?=\/|$)/g, '/:param');
+  // Convert ${expr} template literal remnants to :param
+  normalized = normalized.replace(/\$\{[^}]+\}/g, ':param');
 
-  // Normalize path parameters to a generic placeholder for matching
-  // This allows :id, :userId, :user_id, :order.userId to all match
+  // Normalize all path parameter names to :param for deduplication
   normalized = normalized.replace(/:[^/]+/g, ':param');
 
   return normalized;
+}
+
+/**
+ * Check if two paths match using route-aware segment comparison.
+ *
+ * Treats any segment starting with ':' as a wildcard that matches any
+ * other segment. This mirrors the semantics of routing libraries like
+ * Express (path-to-regexp) and matchit.
+ *
+ * Examples:
+ *   pathsMatch('/api/orders/:id', '/api/orders/101')       → true
+ *   pathsMatch('/users/:id', '/users/:userId')              → true
+ *   pathsMatch('/api/orders/:id', '/api/orders/abc-123')    → true
+ *   pathsMatch('/api/users', '/api/orders')                 → false
+ */
+export function pathsMatch(path1: string, path2: string): boolean {
+  const norm1 = normalizePath(path1);
+  const norm2 = normalizePath(path2);
+
+  // Fast path: exact normalized match
+  if (norm1 === norm2) return true;
+
+  const segs1 = norm1.split('/');
+  const segs2 = norm2.split('/');
+
+  if (segs1.length !== segs2.length) return false;
+
+  return segs1.every(
+    (seg, i) => seg === segs2[i] || seg.startsWith(':') || segs2[i].startsWith(':')
+  );
 }
 
 /**
@@ -320,16 +349,14 @@ export class ManifestMatcher {
     typeKind?: ManifestTypeKind
   ): ManifestEntry[] {
     const normalizedMethod = normalizeMethod(method);
-    const normalizedPath = normalizePath(inputPath);
 
     return manifest.entries.filter((entry) => {
       if (entry.role !== 'producer') return false;
       if (typeKind && entry.type_kind !== typeKind) return false;
 
       const entryMethod = normalizeMethod(entry.method);
-      const entryPath = normalizePath(entry.path);
 
-      return entryMethod === normalizedMethod && entryPath === normalizedPath;
+      return entryMethod === normalizedMethod && pathsMatch(entry.path, inputPath);
     });
   }
 
@@ -348,16 +375,14 @@ export class ManifestMatcher {
     typeKind?: ManifestTypeKind
   ): ManifestEntry[] {
     const normalizedMethod = normalizeMethod(method);
-    const normalizedPath = normalizePath(inputPath);
 
     return manifest.entries.filter((entry) => {
       if (entry.role !== 'consumer') return false;
       if (typeKind && entry.type_kind !== typeKind) return false;
 
       const entryMethod = normalizeMethod(entry.method);
-      const entryPath = normalizePath(entry.path);
 
-      return entryMethod === normalizedMethod && entryPath === normalizedPath;
+      return entryMethod === normalizedMethod && pathsMatch(entry.path, inputPath);
     });
   }
 
@@ -429,11 +454,10 @@ export class ManifestMatcher {
       for (let pi = 0; pi < producerEntries.length; pi++) {
         const producer = producerEntries[pi];
         const producerMethod = normalizeMethod(producer.method);
-        const producerPath = normalizePath(producer.path);
 
         if (
           consumerMethod === producerMethod &&
-          consumerPath === producerPath &&
+          pathsMatch(consumer.path, producer.path) &&
           consumer.type_kind === producer.type_kind
         ) {
           matches.push({
@@ -488,25 +512,16 @@ export class ManifestMatcher {
    * - Version compatibility
    */
   private calculateMatchScore(producer: ManifestEntry, consumer: ManifestEntry): number {
-    const producerMethod = normalizeMethod(producer.method);
-    const consumerMethod = normalizeMethod(consumer.method);
-    const producerPath = normalizePath(producer.path);
-    const consumerPath = normalizePath(consumer.path);
+    const norm1 = normalizePath(producer.path);
+    const norm2 = normalizePath(consumer.path);
 
-    // Exact normalized match
-    if (producerMethod === consumerMethod && producerPath === consumerPath) {
-      // Check if original paths are identical (higher confidence)
-      if (
-        producer.method.toUpperCase() === consumer.method.toUpperCase() &&
-        producer.path === consumer.path
-      ) {
-        return 1.0;
-      }
-      // Normalized match (slightly lower confidence due to normalization)
-      return 0.95;
+    // Exact normalized match (both parameterized or both identical)
+    if (norm1 === norm2) {
+      return producer.path === consumer.path ? 1.0 : 0.95;
     }
 
-    return 0;
+    // Segment-level match (concrete value matched against parameter)
+    return 0.9;
   }
 
   /**
