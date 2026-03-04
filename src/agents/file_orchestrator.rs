@@ -1131,12 +1131,17 @@ impl FileOrchestrator {
         // Fourth pass: add endpoints with resolved owners
         for (file_path, result) in file_results {
             for endpoint in &result.endpoints {
+                let method = endpoint.method.trim().to_uppercase();
+                if !is_http_method(&method) {
+                    continue; // Skip non-HTTP methods (e.g., "use", empty)
+                }
+
                 // Try to resolve the owner using import information
                 let resolved_owner =
                     self.resolve_endpoint_owner(&graph, &endpoint.owner_node, file_path);
 
                 graph.endpoints.push(ResolvedEndpoint {
-                    method: endpoint.method.clone(),
+                    method,
                     path: endpoint.path.clone(),
                     full_path: endpoint.path.clone(), // Will be resolved later
                     handler: Some(endpoint.handler_name.clone()),

@@ -1252,9 +1252,47 @@ impl Analyzer {
         Ok(())
     }
 
+    fn build_display_name_map(&self) -> HashMap<String, String> {
+        use std::fs;
+        use std::path::Path;
+
+        let mut map = HashMap::new();
+        let output_dir = Path::new("ts_check/output");
+
+        for manifest_path in &[
+            output_dir.join("producer-manifest.json"),
+            output_dir.join("consumer-manifest.json"),
+        ] {
+            let Ok(contents) = fs::read_to_string(manifest_path) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            let Some(entries) = parsed.get("entries").and_then(|e| e.as_array()) else {
+                continue;
+            };
+            for entry in entries {
+                if let (Some(alias), Some(method), Some(path), Some(type_kind)) = (
+                    entry.get("type_alias").and_then(|v| v.as_str()),
+                    entry.get("method").and_then(|v| v.as_str()),
+                    entry.get("path").and_then(|v| v.as_str()),
+                    entry.get("type_kind").and_then(|v| v.as_str()),
+                ) {
+                    let display = crate::type_manifest::build_display_name(method, path, type_kind);
+                    map.insert(alias.to_string(), display);
+                }
+            }
+        }
+
+        map
+    }
+
     fn get_type_mismatches(&self) -> Vec<String> {
         match self.check_type_compatibility() {
             Ok(result) => {
+                let display_names = self.build_display_name_map();
+
                 if let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) {
                     mismatches.iter()
                         .filter_map(|mismatch| {
@@ -1265,9 +1303,9 @@ impl Analyzer {
                                 mismatch.get("error").and_then(|e| e.as_str()),
                             ) {
                                 // Clean up import paths for better readability
-                                let clean_producer = self.clean_type_string(producer);
-                                let clean_consumer = self.clean_type_string(consumer);
-                                let clean_error = self.clean_error_message(error);
+                                let clean_producer = self.clean_type_string(producer, &display_names);
+                                let clean_consumer = self.clean_type_string(consumer, &display_names);
+                                let clean_error = self.clean_error_message(error, &display_names);
 
                                 Some(format!(
                                     "Type mismatch on {}: Producer ({}) incompatible with Consumer ({}) - {}",
@@ -1289,15 +1327,19 @@ impl Analyzer {
         }
     }
 
-    fn clean_type_string(&self, type_str: &str) -> String {
+    fn clean_type_string(&self, type_str: &str, display_names: &HashMap<String, String>) -> String {
         use regex::Regex;
 
         // Remove absolute paths from import statements, keeping only the relative part
         let import_regex = Regex::new(r#"import\("([^"]+)"\)\.(\w+)"#).unwrap();
         let mut cleaned = import_regex
             .replace_all(type_str, |caps: &regex::Captures| {
-                let path = &caps[1];
                 let type_name = &caps[2];
+                // Replace hash-based type aliases with display names
+                if let Some(display) = display_names.get(type_name) {
+                    return display.clone();
+                }
+                let path = &caps[1];
                 // Extract just the filename without path for readability
                 if let Some(filename) = path.split('/').last() {
                     format!("{}.{}", filename, type_name)
@@ -1307,6 +1349,13 @@ impl Analyzer {
             })
             .to_string();
 
+        // Also replace standalone hash-based type aliases (not inside import())
+        for (alias, display) in display_names {
+            if cleaned.contains(alias.as_str()) {
+                cleaned = cleaned.replace(alias.as_str(), display);
+            }
+        }
+
         // Simplify Array<T> to T[]
         let array_regex = Regex::new(r"Array<([^>]+)>").unwrap();
         cleaned = array_regex.replace_all(&cleaned, "$1[]").to_string();
@@ -1314,8 +1363,8 @@ impl Analyzer {
         cleaned
     }
 
-    fn clean_error_message(&self, error: &str) -> String {
-        error
+    fn clean_error_message(&self, error: &str, display_names: &HashMap<String, String>) -> String {
+        let mut cleaned = error
             .replace("Type '", "")
             .replace(
                 "' is missing the following properties from type '",
@@ -1323,7 +1372,16 @@ impl Analyzer {
             )
             .replace("': ", ": ")
             .replace("' is not assignable to type '", " not assignable to ")
-            .replace("'.", "")
+            .replace("'.", "");
+
+        // Replace hash-based type aliases in error messages
+        for (alias, display) in display_names {
+            if cleaned.contains(alias.as_str()) {
+                cleaned = cleaned.replace(alias.as_str(), display);
+            }
+        }
+
+        cleaned
     }
 
     /// Extract repository prefix from endpoint owner information

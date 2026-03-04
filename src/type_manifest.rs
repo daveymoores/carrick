@@ -16,6 +16,19 @@ pub fn is_http_method(method: &str) -> bool {
     )
 }
 
+pub fn build_display_name(method: &str, path: &str, type_kind: &str) -> String {
+    let kind = if type_kind.is_empty() {
+        type_kind.to_string()
+    } else {
+        let mut chars = type_kind.chars();
+        match chars.next() {
+            Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str().to_lowercase()),
+            None => String::new(),
+        }
+    };
+    format!("{} {} → {}", method, path, kind)
+}
+
 pub fn build_manifest_type_alias(
     method: &str,
     path: &str,
@@ -133,5 +146,21 @@ mod tests {
         assert!(is_http_method("delete"));
         assert!(!is_http_method("unknown"));
         assert!(!is_http_method(".json()"));
+    }
+
+    #[test]
+    fn test_build_display_name() {
+        assert_eq!(
+            build_display_name("GET", "/users/:param", "response"),
+            "GET /users/:param → Response"
+        );
+        assert_eq!(
+            build_display_name("POST", "/api/orders", "request"),
+            "POST /api/orders → Request"
+        );
+        assert_eq!(
+            build_display_name("DELETE", "/items/:id", "Response"),
+            "DELETE /items/:id → Response"
+        );
     }
 }
