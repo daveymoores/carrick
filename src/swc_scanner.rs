@@ -142,6 +142,10 @@ impl SwcScanner {
     }
 
     /// Scan file content directly (useful for testing or when content is already loaded).
+    ///
+    /// Creates a fresh SourceMap for each call to ensure per-file byte offsets.
+    /// Previously, reusing `self.source_map` caused cumulative offset accumulation
+    /// when scanning multiple files, breaking span-based type inference in the sidecar.
     pub fn scan_content(&self, file_path: &Path, content: &str) -> ScanResult {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
         use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
@@ -158,7 +162,12 @@ impl SwcScanner {
             (Syntax::Es(Default::default()), false)
         };
 
-        let source_file = self.source_map.new_source_file(
+        // Create a fresh SourceMap for each file to ensure per-file byte offsets.
+        // SWC's SourceMap maintains cumulative offsets across new_source_file() calls,
+        // so reusing a single map across files would shift all spans by the total size
+        // of previously scanned files.
+        let file_source_map: Lrc<SourceMap> = Default::default();
+        let source_file = file_source_map.new_source_file(
             Lrc::new(FileName::Real(file_path.to_path_buf())),
             content.to_string(),
         );
@@ -189,7 +198,7 @@ impl SwcScanner {
             module.visit_mut_with(&mut pass);
         });
 
-        let mut visitor = CandidateVisitor::new(self.source_map.clone());
+        let mut visitor = CandidateVisitor::new(file_source_map);
         module.visit_with(&mut visitor);
 
         let should_analyze = !visitor.candidates.is_empty();
@@ -693,6 +702,54 @@ createRouter()
             .collect();
         assert!(methods.contains(&&"get".to_string()));
         assert!(methods.contains(&&"post".to_string()));
+    }
+
+    #[test]
+    fn test_scan_content_per_file_offsets_no_accumulation() {
+        // Regression test: verify that scanning multiple files with the same SwcScanner
+        // produces per-file byte offsets (not cumulative offsets).
+        let scanner = SwcScanner::new();
+
+        let file_a_content = "fetch('/api/a');";
+        let file_b_content = "fetch('/api/b');";
+
+        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content);
+        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content);
+
+        assert!(
+            !result_a.candidates.is_empty(),
+            "file a should have candidates"
+        );
+        assert!(
+            !result_b.candidates.is_empty(),
+            "file b should have candidates"
+        );
+
+        let span_a = (
+            result_a.candidates[0].span_start,
+            result_a.candidates[0].span_end,
+        );
+        let span_b = (
+            result_b.candidates[0].span_start,
+            result_b.candidates[0].span_end,
+        );
+
+        // Both files have the same content structure, so spans should be identical
+        // (both start at offset 0-based within their own file).
+        assert_eq!(
+            span_a, span_b,
+            "Spans should be identical for identically-structured files (per-file offsets). \
+             Got a={:?}, b={:?}. If b is offset, SourceMap accumulation bug is present.",
+            span_a, span_b
+        );
+
+        // Spans should be within the file size
+        assert!(
+            (span_b.1 as usize) <= file_b_content.len() + 1,
+            "span_end {} should not exceed file size {}",
+            span_b.1,
+            file_b_content.len()
+        );
     }
 
     #[test]

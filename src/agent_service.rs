@@ -755,7 +755,7 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_endpoint_call {
             let owner = extract_owner_from_line(line, "get");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
-            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
                 "candidate_id": candidate_id,
                 "line_number": line_number,
@@ -764,8 +764,6 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".get(",
-                "call_expression_span_start": span_start,
-                "call_expression_span_end": span_end,
                 "payload_expression_text": null,
                 "payload_expression_line": null,
                 "response_expression_text": null,
@@ -785,7 +783,7 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_post_call {
             let owner = extract_owner_from_line(line, "post");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
-            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
                 "candidate_id": candidate_id,
                 "line_number": line_number,
@@ -794,8 +792,6 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".post(",
-                "call_expression_span_start": span_start,
-                "call_expression_span_end": span_end,
                 "payload_expression_text": null,
                 "payload_expression_line": null,
                 "response_expression_text": null,
@@ -816,7 +812,7 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_delete_call {
             let owner = extract_owner_from_line(line, "delete");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
-            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
                 "candidate_id": candidate_id,
                 "line_number": line_number,
@@ -825,8 +821,6 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".delete(",
-                "call_expression_span_start": span_start,
-                "call_expression_span_end": span_end,
                 "payload_expression_text": null,
                 "payload_expression_line": null,
                 "response_expression_text": null,
@@ -847,7 +841,7 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         if is_put_call {
             let owner = extract_owner_from_line(line, "put");
             let path = extract_path_from_line(line).unwrap_or("/".to_string());
-            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
             endpoints.push(serde_json::json!({
                 "candidate_id": candidate_id,
                 "line_number": line_number,
@@ -856,8 +850,6 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
                 "path": path,
                 "handler_name": "anonymous",
                 "pattern_matched": ".put(",
-                "call_expression_span_start": span_start,
-                "call_expression_span_end": span_end,
                 "payload_expression_text": null,
                 "payload_expression_line": null,
                 "response_expression_text": null,
@@ -876,15 +868,15 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
             } else {
                 "GET"
             };
-            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
             data_calls.push(serde_json::json!({
                 "candidate_id": candidate_id,
                 "line_number": line_number,
                 "target": target,
                 "method": method,
                 "pattern_matched": "fetch(",
-                "call_expression_span_start": span_start,
-                "call_expression_span_end": span_end,
+                "call_expression_text": null,
+                "call_expression_line": null,
                 "payload_expression_text": null,
                 "payload_expression_line": null,
                 "primary_type_symbol": null,
@@ -907,15 +899,15 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
             } else {
                 "GET"
             };
-            let (candidate_id, span_start, span_end) = resolve_candidate(line_number, line);
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
             data_calls.push(serde_json::json!({
                 "candidate_id": candidate_id,
                 "line_number": line_number,
                 "target": "https://api.example.com",
                 "method": method,
                 "pattern_matched": "axios.",
-                "call_expression_span_start": span_start,
-                "call_expression_span_end": span_end,
+                "call_expression_text": null,
+                "call_expression_line": null,
                 "payload_expression_text": null,
                 "payload_expression_line": null,
                 "primary_type_symbol": null,

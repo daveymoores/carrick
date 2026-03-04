@@ -295,16 +295,6 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
                             },
-                            "call_expression_span_start": {
-                                "type": "INTEGER",
-                                "nullable": true,
-                                "description": "Start byte offset of the endpoint definition call expression"
-                            },
-                            "call_expression_span_end": {
-                                "type": "INTEGER",
-                                "nullable": true,
-                                "description": "End byte offset of the endpoint definition call expression"
-                            },
                             "payload_expression_text": {
                                 "type": "STRING",
                                 "nullable": true,
@@ -365,15 +355,15 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
                             },
-                            "call_expression_span_start": {
-                                "type": "INTEGER",
+                            "call_expression_text": {
+                                "type": "STRING",
                                 "nullable": true,
-                                "description": "Start byte offset of the data call expression"
+                                "description": "Verbatim code text of the fetch/axios/HTTP call expression (e.g., 'fetch(\"/api/users\")'), copied EXACTLY as it appears in the source code"
                             },
-                            "call_expression_span_end": {
+                            "call_expression_line": {
                                 "type": "INTEGER",
                                 "nullable": true,
-                                "description": "End byte offset of the data call expression"
+                                "description": "Line number where the call expression starts (read from the line-number prefix in the source code)"
                             },
                             "payload_expression_text": {
                                 "type": "STRING",
@@ -504,14 +494,6 @@ mod tests {
             schema["properties"]["endpoints"]["items"]["properties"]["candidate_id"].is_object()
         );
         assert!(
-            schema["properties"]["endpoints"]["items"]["properties"]["call_expression_span_start"]
-                .is_object()
-        );
-        assert!(
-            schema["properties"]["endpoints"]["items"]["properties"]["call_expression_span_end"]
-                .is_object()
-        );
-        assert!(
             schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_text"]
                 .is_object()
         );
@@ -531,11 +513,11 @@ mod tests {
             schema["properties"]["data_calls"]["items"]["properties"]["candidate_id"].is_object()
         );
         assert!(
-            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_span_start"]
+            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_text"]
                 .is_object()
         );
         assert!(
-            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_span_end"]
+            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_line"]
                 .is_object()
         );
         assert!(

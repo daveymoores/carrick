@@ -41,9 +41,11 @@ pub struct EndpointResult {
     pub path: String,
     pub handler_name: String,
     pub pattern_matched: String,
-    /// Start byte offset of the endpoint definition call expression (from SWC)
+    /// Start byte offset of the endpoint definition call expression (from SWC via apply_candidate_map)
+    #[serde(default)]
     pub call_expression_span_start: Option<u32>,
-    /// End byte offset of the endpoint definition call expression (from SWC)
+    /// End byte offset of the endpoint definition call expression (from SWC via apply_candidate_map)
+    #[serde(default)]
     pub call_expression_span_end: Option<u32>,
     /// Verbatim code text of the request payload expression (from Gemini)
     pub payload_expression_text: Option<String>,
@@ -67,10 +69,18 @@ pub struct DataCallResult {
     pub target: String,
     pub method: Option<String>,
     pub pattern_matched: String,
-    /// Start byte offset of the data call expression (from SWC)
+    /// Start byte offset of the data call expression (from SWC via apply_candidate_map)
+    #[serde(default)]
     pub call_expression_span_start: Option<u32>,
-    /// End byte offset of the data call expression (from SWC)
+    /// End byte offset of the data call expression (from SWC via apply_candidate_map)
+    #[serde(default)]
     pub call_expression_span_end: Option<u32>,
+    /// Verbatim code text of the call expression itself (from Gemini)
+    #[serde(default)]
+    pub call_expression_text: Option<String>,
+    /// Line number where the call expression starts (from Gemini)
+    #[serde(default)]
+    pub call_expression_line: Option<i32>,
     /// Verbatim code text of the request payload expression (from Gemini)
     pub payload_expression_text: Option<String>,
     /// Line number where the payload expression starts (from Gemini)
@@ -419,7 +429,6 @@ Your extraction must be useful for a graph builder. You must resolve variable na
 * Do not nest details. Every finding must be a top-level item in its respective list.
 * Strings should be exact literals from the code.
 * Line numbers are 1-based.
-* If candidate context includes span_start/span_end, use them for call_expression_span_start/end.
 * Always include the candidate_id from the candidate context for each endpoint/data_call.
 * For HTTP methods, use uppercase: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, ALL.
 
@@ -441,22 +450,28 @@ When a variable is used in a mount and that variable was imported, include the i
 For endpoints and data calls, emit **expression text + line number** to tell the compiler where to infer types.
 The source code is displayed with line-number prefixes (e.g., "  42| res.json(users)"). Read the number directly.
 
-#### A. Response Body Expressions
+#### A. Response Body Expressions (MANDATORY for endpoints)
 Identify the expression that sends/returns the response body (res.json(...), reply.send(...), return ...).
+* You MUST emit `response_expression_text` and `response_expression_line` for EVERY endpoint that sends a response.
 * Emit `response_expression_text` as the verbatim code text (e.g., `res.json(users)`)
 * Emit `response_expression_line` as the line number where this expression starts
 * CRITICAL: Copy the expression EXACTLY as it appears in the source code. Do not paraphrase or modify it.
+* If unsure about the exact expression, emit your best match — an approximate match is far better than null.
 
-#### B. Request Payload Expressions
+#### B. Request Payload Expressions (MANDATORY when present)
 Identify the expression representing request payloads:
 * Endpoints: req.body / ctx.request.body or payload forwarded into downstream calls.
 * Data calls: the payload argument passed to fetch/axios/etc.
+* You MUST emit `payload_expression_text` and `payload_expression_line` for EVERY endpoint/data_call that receives a payload.
 * Emit `payload_expression_text` as the verbatim code text (e.g., `req.body`)
 * Emit `payload_expression_line` as the line number where this expression starts
+* If unsure about the exact expression, emit your best match — an approximate match is far better than null.
 
-#### C. Call Result Expressions (Consumers)
-For data calls, emit call_expression_span_start/call_expression_span_end for the call expression whose result is consumed.
-These byte offsets come from the candidate context JSON - echo them as-is.
+#### C. Call Expression Text (MANDATORY for data calls)
+For data calls, emit `call_expression_text` and `call_expression_line` for the HTTP call expression itself.
+* Emit `call_expression_text` as the verbatim code text of the fetch/axios call (e.g., `fetch("/api/users")`)
+* Emit `call_expression_line` as the line number where the call expression starts
+* This tells the compiler where to find the call expression for return-type inference.
 
 #### D. Explicit Type Symbols (optional)
 If you see explicit TypeScript type annotations, extract:
@@ -584,20 +599,20 @@ Analyze this file and return a JSON object with:
 For each mount, include: line_number, parent_node, child_node, mount_path, import_source (null if local), pattern_matched
 
 For each endpoint, include: candidate_id, line_number, owner_node, method, path, handler_name, pattern_matched,
-call_expression_span_start/call_expression_span_end, response_expression_text, response_expression_line,
-payload_expression_text, payload_expression_line, primary_type_symbol, type_import_source
+response_expression_text, response_expression_line, payload_expression_text, payload_expression_line,
+primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
-  - Use candidate context spans for call_expression_span_* when available
-  - For response_expression_text: copy the EXACT expression text that sends the response (e.g., "res.json(users)")
-  - For response_expression_line: read the line number from the prefix in the source code
+  - MUST emit response_expression_text: copy the EXACT expression text that sends the response (e.g., "res.json(users)")
+  - MUST emit response_expression_line: read the line number from the prefix in the source code
   - For payload_expression_text: copy the EXACT expression for the request payload (e.g., "req.body")
   - For payload_expression_line: read the line number from the prefix
 
 For each data_call, include: candidate_id, line_number, target, method (null if unknown), pattern_matched,
-call_expression_span_start/call_expression_span_end, payload_expression_text, payload_expression_line,
+call_expression_text, call_expression_line, payload_expression_text, payload_expression_line,
 primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
-  - Use candidate context spans for call_expression_span_* when available
+  - MUST emit call_expression_text: copy the EXACT text of the fetch/axios/HTTP call (e.g., 'fetch("/api/users")')
+  - MUST emit call_expression_line: read the line number from the prefix
   - For payload_expression_text: copy the EXACT payload argument text if detected
   - For payload_expression_line: read the line number from the prefix
 
@@ -759,6 +774,8 @@ mod tests {
             pattern_matched: "fetch(".to_string(),
             call_expression_span_start: None,
             call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
             payload_expression_text: None,
             payload_expression_line: None,
             primary_type_symbol: Some("Comment".to_string()),
@@ -803,6 +820,8 @@ mod tests {
                 pattern_matched: "fetch(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
+                call_expression_text: None,
+                call_expression_line: None,
                 payload_expression_text: None,
                 payload_expression_line: None,
                 primary_type_symbol: Some("NULL".to_string()),
@@ -901,6 +920,8 @@ mod tests {
                 pattern_matched: "fetch(".to_string(),
                 call_expression_span_start: None,
                 call_expression_span_end: None,
+                call_expression_text: None,
+                call_expression_line: None,
                 payload_expression_text: None,
                 payload_expression_line: None,
                 primary_type_symbol: None,
