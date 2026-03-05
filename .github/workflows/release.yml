@@ -2,42 +2,65 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  release:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: rust
+
+  publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
 
       - name: Build binary
         env:
           CARRICK_API_ENDPOINT: ${{ secrets.CARRICK_API_ENDPOINT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
         run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build
 
       - name: Create release archive
         run: |
           mkdir -p release
           cp target/x86_64-unknown-linux-gnu/release/carrick release/
           cp -r ts_check release/
+          cp -r src/sidecar/dist release/sidecar
+          cp src/sidecar/package.json release/sidecar/
+          cp src/sidecar/package-lock.json release/sidecar/
           cd release
-          tar -czf carrick-action-linux.tar.gz carrick ts_check
+          tar -czf carrick-action-linux.tar.gz carrick ts_check sidecar
 
-      - name: Create release
+      - name: Upload release artifact
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
           files: release/carrick-action-linux.tar.gz
           make_latest: true
         env:
