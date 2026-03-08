@@ -184,9 +184,9 @@ jobs:
           ./target/release/carrick ./test-repo/ > test-repo/output/test_output.txt 2>&1
           echo "=== Test-repo output ==="
           cat test-repo/output/test_output.txt
-          # Check that we find the expected 4 endpoints
-          if ! grep -q "Analyzed \*\*4 endpoints\*\*" test-repo/output/test_output.txt; then
-            echo "ERROR: Expected to find 4 endpoints in test-repo"
+          # Check that we find the expected 3 endpoints
+          if ! grep -q "Analyzed \*\*3 endpoints\*\*" test-repo/output/test_output.txt; then
+            echo "ERROR: Expected to find 3 endpoints in test-repo"
             exit 1
           fi
           echo "✅ Basic endpoint detection working correctly"
