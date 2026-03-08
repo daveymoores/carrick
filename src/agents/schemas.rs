@@ -17,6 +17,7 @@ impl AgentType {
 /// Agent-format schemas for structured output from each agent
 pub struct AgentSchemas;
 
+#[allow(dead_code)]
 impl AgentSchemas {
     /// Schema for TriageAgent output - array of TriageResult
     pub fn triage_schema() -> Value {
@@ -82,21 +83,6 @@ impl AgentSchemas {
                     "reasoning": {
                         "type": "STRING",
                         "description": "Brief explanation of the extraction"
-                    },
-                    "response_type_file": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "File path containing the response type definition"
-                    },
-                    "response_type_position": {
-                        "type": "NUMBER",
-                        "nullable": true,
-                        "description": "Start position (index) of the response type definition in the file"
-                    },
-                    "response_type_string": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "The type string itself (e.g. 'User[]', 'Response<Order>')"
                     }
                 },
                 "required": ["method", "path", "handler", "node_name", "location", "confidence", "reasoning"]
@@ -138,21 +124,6 @@ impl AgentSchemas {
                     "reasoning": {
                         "type": "STRING",
                         "description": "Brief explanation of the extraction"
-                    },
-                    "expected_type_file": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "File path containing the expected response type definition"
-                    },
-                    "expected_type_position": {
-                        "type": "NUMBER",
-                        "nullable": true,
-                        "description": "Start position (index) of the expected response type definition in the file"
-                    },
-                    "expected_type_string": {
-                        "type": "STRING",
-                        "nullable": true,
-                        "description": "The type string expected (e.g. 'User[]')"
                     }
                 },
                 "required": ["library", "url", "method", "location", "confidence", "reasoning"]
@@ -249,6 +220,180 @@ impl AgentSchemas {
         })
     }
 
+    /// Schema for file-centric analysis output - flat structure with mounts, endpoints, and data_calls
+    /// Used by FileAnalyzerAgent for one-shot file analysis with Gemini 3.0 Flash
+    #[allow(dead_code)]
+    pub fn file_analysis_schema() -> Value {
+        json!({
+            "type": "OBJECT",
+            "properties": {
+                "mounts": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "line_number": {
+                                "type": "INTEGER",
+                                "description": "Line number in the source file"
+                            },
+                            "parent_node": {
+                                "type": "STRING",
+                                "description": "Name of variable accepting the mount (e.g., app, router)"
+                            },
+                            "child_node": {
+                                "type": "STRING",
+                                "description": "Name of variable being mounted (e.g., apiRouter, userRoutes)"
+                            },
+                            "mount_path": {
+                                "type": "STRING",
+                                "description": "The string literal path prefix (e.g., /api, /users)"
+                            },
+                            "import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "File path if child_node is imported (e.g., './routes/users'), otherwise null for local definitions"
+                            },
+                            "pattern_matched": {
+                                "type": "STRING",
+                                "description": "The specific pattern that triggered this result (e.g., .use(, .register()"
+                            }
+                        },
+                        "required": ["line_number", "parent_node", "child_node", "mount_path", "pattern_matched"]
+                    }
+                },
+                "endpoints": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "candidate_id": {
+                                "type": "STRING",
+                                "description": "Stable identifier for the AST call site candidate"
+                            },
+                            "line_number": {
+                                "type": "INTEGER",
+                                "description": "Line number in the source file"
+                            },
+                            "owner_node": {
+                                "type": "STRING",
+                                "description": "Variable the endpoint is attached to (e.g., app, router, fastify)"
+                            },
+                            "method": {
+                                "type": "STRING",
+                                "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "ALL"],
+                                "description": "HTTP method"
+                            },
+                            "path": {
+                                "type": "STRING",
+                                "description": "Route path (e.g., /users, /users/:id)"
+                            },
+                            "handler_name": {
+                                "type": "STRING",
+                                "description": "Function name or 'anonymous' for inline handlers"
+                            },
+                            "pattern_matched": {
+                                "type": "STRING",
+                                "description": "The specific pattern that triggered this result"
+                            },
+                            "payload_expression_text": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Verbatim code text of the request payload expression (e.g., 'req.body'), copied EXACTLY as it appears in the source code"
+                            },
+                            "payload_expression_line": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Line number where the payload expression starts (read from the line-number prefix in the source code)"
+                            },
+                            "response_expression_text": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Verbatim code text of the response emission expression (e.g., 'res.json(users)'), copied EXACTLY as it appears in the source code"
+                            },
+                            "response_expression_line": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Line number where the response expression starts (read from the line-number prefix in the source code)"
+                            },
+                            "primary_type_symbol": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The primary type symbol name without wrappers (e.g., 'User' from 'Response<User[]>'). Extract just the identifier, not the full type."
+                            },
+                            "type_import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
+                            }
+                        },
+                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched"]
+                    }
+                },
+                "data_calls": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "candidate_id": {
+                                "type": "STRING",
+                                "description": "Stable identifier for the AST call site candidate"
+                            },
+                            "line_number": {
+                                "type": "INTEGER",
+                                "description": "Line number in the source file"
+                            },
+                            "target": {
+                                "type": "STRING",
+                                "description": "The URL or resource being accessed"
+                            },
+                            "method": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "HTTP method if detectable (GET, POST, etc.)"
+                            },
+                            "pattern_matched": {
+                                "type": "STRING",
+                                "description": "The specific pattern that triggered this result"
+                            },
+                            "call_expression_text": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Verbatim code text of the fetch/axios/HTTP call expression (e.g., 'fetch(\"/api/users\")'), copied EXACTLY as it appears in the source code"
+                            },
+                            "call_expression_line": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Line number where the call expression starts (read from the line-number prefix in the source code)"
+                            },
+                            "payload_expression_text": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Verbatim code text of the request payload expression (e.g., '{ name, email }'), copied EXACTLY as it appears in the source code"
+                            },
+                            "payload_expression_line": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Line number where the payload expression starts (read from the line-number prefix in the source code)"
+                            },
+                            "primary_type_symbol": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The primary type symbol name without wrappers (e.g., 'User' from 'Promise<User>'). Extract just the identifier, not the full type."
+                            },
+                            "type_import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
+                            }
+                        },
+                        "required": ["candidate_id", "line_number", "target", "pattern_matched"]
+                    }
+                }
+            },
+            "required": ["mounts", "endpoints", "data_calls"]
+        })
+    }
+
     /// Schema for MountAgent output - array of MountRelationship
     pub fn mount_schema() -> Value {
         json!({
@@ -336,5 +481,53 @@ mod tests {
         assert!(schema["items"]["properties"]["location"].is_object());
         assert!(schema["items"]["properties"]["classification"]["enum"].is_array());
         assert!(schema["items"]["required"].is_array());
+    }
+
+    #[test]
+    fn test_file_analysis_schema_structure() {
+        let schema = AgentSchemas::file_analysis_schema();
+        assert_eq!(schema["type"], "OBJECT");
+        assert!(schema["properties"]["mounts"].is_object());
+        assert!(schema["properties"]["endpoints"].is_object());
+        assert!(schema["properties"]["data_calls"].is_object());
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["candidate_id"].is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_text"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["payload_expression_line"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["response_expression_text"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["endpoints"]["items"]["properties"]["response_expression_line"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["candidate_id"].is_object()
+        );
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_text"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["call_expression_line"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_text"]
+                .is_object()
+        );
+        assert!(
+            schema["properties"]["data_calls"]["items"]["properties"]["payload_expression_line"]
+                .is_object()
+        );
+        assert!(schema["required"].is_array());
     }
 }

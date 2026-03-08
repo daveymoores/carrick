@@ -6,7 +6,6 @@
 //! 3. Consumer aliases match producer aliases when paths are semantically equivalent
 
 use carrick::{
-    agents::consumer_agent::DataFetchingCall,
     analyzer::Analyzer,
     call_site_extractor::{CallSite, CallSiteExtractor},
 };
@@ -188,45 +187,6 @@ async function fetchUser(userId: string) {
         url.contains(":userId") || url.contains(":param"),
         "URL should have :param style path parameters. Got: {}",
         url
-    );
-}
-
-/// Test that when enrichment receives a correlated fetch with normalized URL,
-/// it should be used even if LLM provided a different URL
-#[test]
-fn test_enrichment_prefers_swc_url_over_llm_url() {
-    // Simulate what happens in enrich_data_fetching_calls_with_type_info
-
-    // LLM returns a DataFetchingCall with malformed URL (template literal syntax)
-    let mut call = DataFetchingCall {
-        library: "fetch".to_string(),
-        url: Some("/users/${userId}/comments".to_string()), // Bad URL from LLM
-        method: Some("GET".to_string()),
-        location: "test.ts:10:5".to_string(),
-        confidence: 0.95,
-        reasoning: "fetch call".to_string(),
-        expected_type_file: None,
-        expected_type_position: None,
-        expected_type_string: None,
-    };
-
-    // SWC extractor provides properly normalized URL
-    let swc_url = Some("/users/:userId/comments".to_string());
-
-    // The fix should override the LLM URL with the SWC URL
-    // For now, document what the current behavior is
-    if call.url.is_some() && swc_url.is_some() {
-        // Currently, if call.url is Some, the SWC URL is NOT used (bug)
-        // After fix, the SWC URL should always be preferred
-
-        // Simulate the fix: always use SWC URL if available
-        call.url = swc_url.clone();
-    }
-
-    assert_eq!(
-        call.url.as_ref().unwrap(),
-        "/users/:userId/comments",
-        "Should use SWC-extracted normalized URL"
     );
 }
 

@@ -528,22 +528,23 @@ fn parse_structured_type_error(issue: &str) -> (String, String, String, String) 
 }
 
 fn extract_method_path(issue: &str) -> (String, String) {
-    // Extract method and path from issues like "Missing endpoint: No endpoint defined for GET /api/users"
-    // or "Orphaned endpoint: No call matching endpoint GET /api/users"
-    if let Some(for_pos) = issue.find(" for ") {
-        let method_path = &issue[for_pos + 5..];
-        let parts: Vec<&str> = method_path.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            return (parts[0].to_string(), parts[1].to_string());
+    // Handle "Orphaned endpoint: METHOD PATH in FILE"
+    if let Some(rest) = issue.strip_prefix("Orphaned endpoint: ") {
+        let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+        if parts.len() >= 2 {
+            let method = parts[0];
+            let path = parts[1];
+            return (method.to_string(), path.to_string());
         }
     }
 
-    // Handle orphaned endpoint format: "Orphaned endpoint: No call matching endpoint GET /api/users"
-    if let Some(endpoint_pos) = issue.find("endpoint ") {
-        let method_path = &issue[endpoint_pos + 9..];
-        let parts: Vec<&str> = method_path.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            return (parts[0].to_string(), parts[1].to_string());
+    // Handle "Missing endpoint for METHOD PATH (normalized: ...)"
+    if let Some(for_pos) = issue.find(" for ") {
+        let method_path = &issue[for_pos + 5..];
+        let parts: Vec<&str> = method_path.splitn(3, ' ').collect();
+        if parts.len() >= 2 {
+            let path = parts[1].split(" (").next().unwrap_or(parts[1]);
+            return (parts[0].to_string(), path.to_string());
         }
     }
 
@@ -812,5 +813,30 @@ mod tests {
         assert_eq!(method, "DELETE");
         assert_eq!(env_var, "ORDER_SERVICE");
         assert_eq!(path, "/orders/123/items");
+    }
+
+    #[test]
+    fn test_extract_method_path_orphaned_endpoint() {
+        let issue = "Orphaned endpoint: GET /api/users in src/routes.ts:42";
+        let (method, path) = extract_method_path(issue);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/api/users");
+    }
+
+    #[test]
+    fn test_extract_method_path_missing_endpoint() {
+        let issue = "Missing endpoint for POST /api/orders (normalized: /api/orders) (called from src/client.ts)";
+        let (method, path) = extract_method_path(issue);
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/api/orders");
+    }
+
+    #[test]
+    fn test_extract_method_path_no_unknown() {
+        // Previously this would return UNKNOWN/UNKNOWN
+        let issue = "Orphaned endpoint: DELETE /items/:id in src/items.ts:10";
+        let (method, path) = extract_method_path(issue);
+        assert_eq!(method, "DELETE");
+        assert_eq!(path, "/items/:id");
     }
 }

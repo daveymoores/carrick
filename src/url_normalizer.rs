@@ -363,6 +363,12 @@ impl UrlNormalizer {
             result = result[..fragment_idx].to_string();
         }
 
+        // Strip any surrounding quotes or backticks (template literal artifacts)
+        result = result
+            .trim_start_matches(['`', '"', '\''])
+            .trim_end_matches(['`', '"', '\''])
+            .to_string();
+
         // Ensure path starts with /
         if !result.starts_with('/') {
             result = format!("/{}", result);
@@ -386,6 +392,35 @@ impl UrlNormalizer {
     /// This is a convenience method that returns just the normalized path string.
     pub fn extract_path(&self, url: &str) -> String {
         self.normalize(url).path
+    }
+
+    /// Heuristic check for URL-like inputs to avoid matching variable names as paths.
+    pub fn is_probable_url(&self, url: &str) -> bool {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if trimmed.starts_with("ENV_VAR:") {
+            return true;
+        }
+
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("//")
+        {
+            return true;
+        }
+
+        if trimmed.contains("process.env.") || trimmed.contains("${") {
+            return true;
+        }
+
+        if trimmed.starts_with('/') || trimmed.contains('/') {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -590,6 +625,22 @@ mod tests {
     }
 
     #[test]
+    fn test_is_probable_url() {
+        let normalizer = UrlNormalizer::default_permissive();
+
+        assert!(normalizer.is_probable_url("/users/123"));
+        assert!(normalizer.is_probable_url("https://example.com/api/users"));
+        assert!(normalizer.is_probable_url("ENV_VAR:API_URL:/users"));
+        assert!(normalizer.is_probable_url("process.env.API_URL + \"/users\""));
+        assert!(normalizer.is_probable_url("${API_URL}/users/${userId}"));
+        assert!(normalizer.is_probable_url("api/users"));
+
+        assert!(!normalizer.is_probable_url("ordersResp"));
+        assert!(!normalizer.is_probable_url("resp.json()"));
+        assert!(!normalizer.is_probable_url(""));
+    }
+
+    #[test]
     fn test_is_external_via_normalize() {
         let config = create_test_config();
         let normalizer = UrlNormalizer::new(&config);
@@ -681,6 +732,25 @@ mod tests {
         let result = normalizer.normalize("ENV_VAR:API_URL:/users/${userId}");
 
         assert_eq!(result.path, "/users/:userId");
+        assert!(result.is_internal);
+    }
+
+    #[test]
+    fn test_normalize_template_literal_strips_trailing_backtick() {
+        let config = Config {
+            service_name: None,
+            internal_domains: HashSet::new(),
+            external_domains: HashSet::new(),
+            internal_env_vars: ["ORDER_SERVICE_URL"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            external_env_vars: HashSet::new(),
+        };
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("`${process.env.ORDER_SERVICE_URL}/api/orders/101`");
+        assert_eq!(result.path, "/api/orders/101");
         assert!(result.is_internal);
     }
 

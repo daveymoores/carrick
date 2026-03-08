@@ -1,5 +1,4 @@
 use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError};
-use crate::utils::get_repository_name;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -192,28 +191,6 @@ impl AwsStorage {
         Ok(())
     }
 
-    async fn download_from_s3(&self, s3_url: &str) -> Result<String, StorageError> {
-        #[derive(Serialize)]
-        struct DownloadRequest {
-            action: String,
-            #[serde(rename = "s3Url")]
-            s3_url: String,
-        }
-
-        #[derive(Deserialize)]
-        struct DownloadResponse {
-            content: String,
-        }
-
-        let request = DownloadRequest {
-            action: "download-file".to_string(),
-            s3_url: s3_url.to_string(),
-        };
-
-        let response: DownloadResponse = self.call_lambda_generic(&request).await?;
-        Ok(response.content)
-    }
-
     fn extract_org_and_repo(&self, repo_name: &str) -> (String, String) {
         if let Some((org, repo)) = repo_name.split_once('/') {
             (org.to_string(), repo.to_string())
@@ -233,7 +210,7 @@ impl AwsStorage {
             repo: data.repo_name.clone(), // Use repo name as-is
             org: org.to_string(),         // Use passed org
             hash: data.commit_hash.clone(),
-            filename: "types.ts".to_string(),
+            filename: "types.d.ts".to_string(),
             cloud_repo_data: Some(data.clone()),
             s3_url: Some(s3_url.to_string()),
         };
@@ -247,9 +224,6 @@ impl AwsStorage {
 
 #[async_trait]
 impl CloudStorage for AwsStorage {
-    async fn download_type_file_content(&self, s3_url: &str) -> Result<String, StorageError> {
-        self.download_from_s3(s3_url).await
-    }
     async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError> {
         let repo = &data.repo_name;
 
@@ -259,7 +233,7 @@ impl CloudStorage for AwsStorage {
             repo: repo.clone(),
             org: org.to_string(),
             hash: data.commit_hash.clone(),
-            filename: "types.ts".to_string(),
+            filename: "types.d.ts".to_string(),
             cloud_repo_data: None,
             s3_url: None,
         };
@@ -268,16 +242,9 @@ impl CloudStorage for AwsStorage {
 
         // Step 2: Upload type file if needed
         if let Some(upload_url) = lambda_response.upload_url {
-            if let Some(ts_file_path) = find_generated_typescript_file(&data.repo_name) {
-                let type_file_content = std::fs::read_to_string(&ts_file_path).map_err(|e| {
-                    StorageError::SerializationError(format!(
-                        "Failed to read TypeScript file: {}",
-                        e
-                    ))
-                })?;
-
-                println!("Uploading type file to S3...");
-                self.upload_to_s3(&upload_url, &type_file_content).await?;
+            if let Some(bundled_types) = data.bundled_types.as_ref() {
+                println!("Uploading bundled types to S3...");
+                self.upload_to_s3(&upload_url, bundled_types).await?;
 
                 // Step 3: Complete the upload by storing metadata
                 let complete_request = LambdaRequest {
@@ -285,7 +252,7 @@ impl CloudStorage for AwsStorage {
                     repo: repo.clone(),
                     org: org.to_string(),
                     hash: data.commit_hash.clone(),
-                    filename: "types.ts".to_string(),
+                    filename: "types.d.ts".to_string(),
                     cloud_repo_data: Some(data.clone()),
                     s3_url: Some(lambda_response.s3_url),
                 };
@@ -293,6 +260,13 @@ impl CloudStorage for AwsStorage {
                 let _complete_response: serde_json::Value =
                     self.call_lambda(&complete_request).await?;
                 println!("Successfully completed upload and stored metadata");
+            } else {
+                println!(
+                    "No bundled types available for {}; storing metadata only",
+                    repo
+                );
+                self.store_repo_metadata(data, &lambda_response.s3_url, org)
+                    .await?;
             }
         } else {
             println!("Type file already exists, just updating metadata");
@@ -367,6 +341,8 @@ impl CloudStorage for AwsStorage {
                     last_updated: chrono::Utc::now(),
                     commit_hash: adjacent.hash,
                     mount_graph: None,
+                    bundled_types: None,
+                    type_manifest: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);
@@ -396,24 +372,5 @@ impl CloudStorage for AwsStorage {
             }
             Err(e) => Err(e),
         }
-    }
-}
-
-// Helper function
-fn find_generated_typescript_file(repo_name: &str) -> Option<String> {
-    use std::path::Path;
-
-    // Use the shared repository name extraction logic
-    let actual_repo_name = get_repository_name(repo_name);
-
-    let expected_filename = format!("{}_types.ts", actual_repo_name);
-    let expected_path = Path::new(".")
-        .join("ts_check/output")
-        .join(&expected_filename);
-
-    if expected_path.exists() {
-        Some(expected_path.to_string_lossy().to_string())
-    } else {
-        None
     }
 }

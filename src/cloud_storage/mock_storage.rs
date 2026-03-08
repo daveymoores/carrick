@@ -29,14 +29,6 @@ impl MockStorage {
 
 #[async_trait]
 impl CloudStorage for MockStorage {
-    async fn download_type_file_content(&self, s3_url: &str) -> Result<String, StorageError> {
-        println!("MOCK: Downloading type file from S3 URL: {}", s3_url);
-        // Return some mock TypeScript content
-        Ok(format!(
-            "// Mock TypeScript content for {}\nexport interface MockType {{ id: string; }}",
-            s3_url
-        ))
-    }
     async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError> {
         println!(
             "MOCK: Uploading repo data for org: {}, repo: {}",
@@ -97,6 +89,8 @@ impl CloudStorage for MockStorage {
                     last_updated: Utc::now(),
                     commit_hash: "abc123".to_string(),
                     mount_graph: None,
+                    bundled_types: None,
+                    type_manifest: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -113,6 +107,8 @@ impl CloudStorage for MockStorage {
                     last_updated: Utc::now(),
                     commit_hash: "def456".to_string(),
                     mount_graph: None,
+                    bundled_types: None,
+                    type_manifest: None,
                 },
             ];
             result.extend(mock_repos);

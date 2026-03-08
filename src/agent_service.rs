@@ -1,6 +1,7 @@
 use crate::visitor::{Call, Json, TypeReference};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,10 +24,18 @@ impl AgentService {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(20);
+        let use_system_proxy = env::var("CARRICK_USE_SYSTEM_PROXY").is_ok();
+        let mut client_builder = Client::builder();
+        if !use_system_proxy {
+            client_builder = client_builder.no_proxy();
+        }
+        let client = client_builder
+            .build()
+            .expect("Failed to build agent HTTP client");
 
         Self {
             api_key,
-            client: Client::new(),
+            client,
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
         }
     }
@@ -531,6 +540,13 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
                 "[]".to_string()
             } else if schema_val.get("type").and_then(|t| t.as_str()) == Some("OBJECT") {
                 if let Some(props) = schema_val.get("properties") {
+                    // Check for file_analysis_schema - has mounts, endpoints, data_calls arrays
+                    if props.get("mounts").is_some()
+                        && props.get("endpoints").is_some()
+                        && props.get("data_calls").is_some()
+                    {
+                        return generate_mock_file_analysis_response(prompt);
+                    }
                     // Check for framework guidance schema - has mount_patterns, endpoint_patterns, etc.
                     if props.get("mount_patterns").is_some()
                         && props.get("endpoint_patterns").is_some()
@@ -577,15 +593,400 @@ fn generate_mock_framework_guidance_response(_prompt: &str) -> String {
 }
 
 /// Generate mock pattern list response for FrameworkGuidanceAgent pattern fetching
-/// Returns empty parallel arrays matching the flattened pattern_list_schema
+/// Returns basic patterns for common frameworks to enable testing
 fn generate_mock_pattern_list_response() -> String {
-    r#"{"patterns":[],"descriptions":[],"frameworks":[]}"#.to_string()
+    r#"{"patterns":["app.get('/path', handler)","app.post('/path', handler)","router.get('/path', handler)","app.use('/path', router)","fetch(url)","axios.get(url)"],"descriptions":["GET endpoint","POST endpoint","Router GET endpoint","Mount router","Fetch call","Axios GET"],"frameworks":["express","express","express","express","fetch","axios"]}"#.to_string()
 }
 
 /// Generate mock general guidance response for FrameworkGuidanceAgent
 /// Returns empty triage hints and parsing notes
 fn generate_mock_general_guidance_response() -> String {
     r#"{"triage_hints":"Mock mode - no triage hints","parsing_notes":"Mock mode - no parsing notes"}"#.to_string()
+}
+
+/// Generate mock file analysis response for FileAnalyzerAgent
+/// Parses the file content from the prompt and extracts mock findings
+fn generate_mock_file_analysis_response(prompt: &str) -> String {
+    // Extract file path from prompt (format: "Path: path/to/file.ts")
+    let file_path = prompt
+        .lines()
+        .find(|line| line.contains("Path:"))
+        .and_then(|line| line.split("Path:").nth(1))
+        .map(|s| s.trim().trim_end_matches(')'))
+        .unwrap_or("unknown.ts");
+
+    let mut candidate_by_line: HashMap<i32, (String, Option<u32>, Option<u32>)> = HashMap::new();
+    let mut candidate_snippets: Vec<(String, Option<u32>, Option<u32>, String)> = Vec::new();
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(candidate_id) = value.get("candidate_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(line_number) = value.get("line_number").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let span_start = value
+            .get("span_start")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let span_end = value
+            .get("span_end")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        if let Some(code_snippet) = value.get("code_snippet").and_then(|v| v.as_str()) {
+            candidate_snippets.push((
+                candidate_id.to_string(),
+                span_start,
+                span_end,
+                code_snippet.to_string(),
+            ));
+        }
+        candidate_by_line.insert(
+            line_number as i32,
+            (candidate_id.to_string(), span_start, span_end),
+        );
+    }
+
+    // Look for common patterns in the file content to generate mock results
+    let mut mounts = Vec::new();
+    let mut endpoints = Vec::new();
+    let mut data_calls = Vec::new();
+
+    // Find where the actual FILE CONTENT section starts (after "### FILE CONTENT")
+    // This avoids detecting patterns from the framework guidance examples
+    let file_content_start = prompt
+        .find("### FILE CONTENT")
+        .or_else(|| prompt.find("FILE CONTENT"))
+        .unwrap_or(0);
+
+    let content_section = &prompt[file_content_start..];
+    let content_to_analyze = if let Some(fence_start) = content_section.find("```") {
+        let after_fence = &content_section[fence_start + 3..];
+        if let Some(fence_end) = after_fence.find("```") {
+            &after_fence[..fence_end]
+        } else {
+            after_fence
+        }
+    } else {
+        content_section
+    };
+
+    let resolve_candidate = |line_number: i32, line_text: &str| {
+        if let Some(entry) = candidate_by_line.get(&line_number) {
+            return entry.clone();
+        }
+        let trimmed_line = line_text.trim();
+        if !trimmed_line.is_empty() {
+            if let Some(entry) = candidate_snippets.iter().find(|(_, _, _, snippet)| {
+                snippet.contains(trimmed_line) || trimmed_line.contains(snippet)
+            }) {
+                return (entry.0.clone(), entry.1, entry.2);
+            }
+        }
+        (format!("line:{}", line_number), None, None)
+    };
+
+    // Simple pattern matching on prompt content for mock generation
+    // Only look at lines that are likely actual code (not comments, not in strings)
+    for (line_num, line) in content_to_analyze.lines().enumerate() {
+        let line_number = (line_num + 1) as i32;
+        let trimmed = line.trim();
+
+        // Skip comments and empty lines
+        if trimmed.starts_with("//") || trimmed.starts_with("*") || trimmed.is_empty() {
+            continue;
+        }
+
+        // Skip lines that are clearly not endpoint definitions
+        // (e.g., interface definitions, type annotations, etc.)
+        if trimmed.starts_with("interface")
+            || trimmed.starts_with("type ")
+            || trimmed.starts_with("export type")
+        {
+            continue;
+        }
+
+        // Detect .use() mounts - must have a path string argument
+        if (line.contains("app.use(")
+            || line.contains("Router.use(")
+            || line.contains("router.use(")
+            || line.contains("apiRouter.use("))
+            && (line.contains("\"/") || line.contains("'/"))
+        {
+            // Extract parent node name
+            let parent = if line.contains("app.use") {
+                "app"
+            } else if line.contains("apiRouter.use") {
+                "apiRouter"
+            } else if line.contains("v1Router.use") {
+                "v1Router"
+            } else {
+                "router"
+            };
+
+            // Try to extract the mount path
+            let mount_path = extract_path_from_line(line).unwrap_or("/".to_string());
+
+            mounts.push(serde_json::json!({
+                "line_number": line_number,
+                "parent_node": parent,
+                "child_node": "childRouter",
+                "mount_path": mount_path,
+                "import_source": null,
+                "pattern_matched": ".use("
+            }));
+        }
+
+        // Detect endpoint patterns - must be on app/router object and have a path string
+        // More specific patterns to avoid false positives
+        let is_endpoint_call = (line.contains("app.get(")
+            || line.contains("router.get(")
+            || line.contains("v1Router.get(")
+            || line.contains("apiRouter.get(")
+            || line.contains("adminRouter.get("))
+            && (line.contains("\"/") || line.contains("'/"));
+
+        if is_endpoint_call {
+            let owner = extract_owner_from_line(line, "get");
+            let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
+            endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
+                "line_number": line_number,
+                "owner_node": owner,
+                "method": "GET",
+                "path": path,
+                "handler_name": "anonymous",
+                "pattern_matched": ".get(",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
+            }));
+        }
+
+        let is_post_call = (line.contains("app.post(")
+            || line.contains("router.post(")
+            || line.contains("v1Router.post(")
+            || line.contains("apiRouter.post(")
+            || line.contains("adminRouter.post("))
+            && (line.contains("\"/") || line.contains("'/"));
+
+        if is_post_call {
+            let owner = extract_owner_from_line(line, "post");
+            let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
+            endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
+                "line_number": line_number,
+                "owner_node": owner,
+                "method": "POST",
+                "path": path,
+                "handler_name": "anonymous",
+                "pattern_matched": ".post(",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
+            }));
+        }
+
+        // Detect DELETE endpoints
+        let is_delete_call = (line.contains("app.delete(")
+            || line.contains("router.delete(")
+            || line.contains("v1Router.delete(")
+            || line.contains("apiRouter.delete(")
+            || line.contains("adminRouter.delete("))
+            && (line.contains("\"/") || line.contains("'/"));
+
+        if is_delete_call {
+            let owner = extract_owner_from_line(line, "delete");
+            let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
+            endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
+                "line_number": line_number,
+                "owner_node": owner,
+                "method": "DELETE",
+                "path": path,
+                "handler_name": "anonymous",
+                "pattern_matched": ".delete(",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
+            }));
+        }
+
+        // Detect PUT endpoints
+        let is_put_call = (line.contains("app.put(")
+            || line.contains("router.put(")
+            || line.contains("v1Router.put(")
+            || line.contains("apiRouter.put(")
+            || line.contains("adminRouter.put("))
+            && (line.contains("\"/") || line.contains("'/"));
+
+        if is_put_call {
+            let owner = extract_owner_from_line(line, "put");
+            let path = extract_path_from_line(line).unwrap_or("/".to_string());
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
+            endpoints.push(serde_json::json!({
+                "candidate_id": candidate_id,
+                "line_number": line_number,
+                "owner_node": owner,
+                "method": "PUT",
+                "path": path,
+                "handler_name": "anonymous",
+                "pattern_matched": ".put(",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
+            }));
+        }
+
+        // Detect fetch calls - but not response.json() or similar
+        if line.contains("fetch(") && !line.contains("response") && !line.contains("res.") {
+            let target =
+                extract_url_from_line(line).unwrap_or("https://api.example.com".to_string());
+            let method = if line.contains("method:") && line.contains("POST") {
+                "POST"
+            } else {
+                "GET"
+            };
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
+            data_calls.push(serde_json::json!({
+                "candidate_id": candidate_id,
+                "line_number": line_number,
+                "target": target,
+                "method": method,
+                "pattern_matched": "fetch(",
+                "call_expression_text": null,
+                "call_expression_line": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
+            }));
+        }
+
+        // Detect axios calls
+        if line.contains("axios.get")
+            || line.contains("axios.post")
+            || line.contains("axios.put")
+            || line.contains("axios.delete")
+        {
+            let method = if line.contains("axios.post") {
+                "POST"
+            } else if line.contains("axios.put") {
+                "PUT"
+            } else if line.contains("axios.delete") {
+                "DELETE"
+            } else {
+                "GET"
+            };
+            let (candidate_id, _span_start, _span_end) = resolve_candidate(line_number, line);
+            data_calls.push(serde_json::json!({
+                "candidate_id": candidate_id,
+                "line_number": line_number,
+                "target": "https://api.example.com",
+                "method": method,
+                "pattern_matched": "axios.",
+                "call_expression_text": null,
+                "call_expression_line": null,
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
+            }));
+        }
+    }
+
+    // Log mock generation for debugging
+    eprintln!(
+        "Mock file analysis for {}: {} mounts, {} endpoints, {} data_calls",
+        file_path,
+        mounts.len(),
+        endpoints.len(),
+        data_calls.len()
+    );
+
+    serde_json::json!({
+        "mounts": mounts,
+        "endpoints": endpoints,
+        "data_calls": data_calls
+    })
+    .to_string()
+}
+
+/// Helper to extract path from a line like: app.get("/users", handler)
+fn extract_path_from_line(line: &str) -> Option<String> {
+    // Try double quotes first
+    if let Some(start) = line.find("\"") {
+        if let Some(end) = line[start + 1..].find("\"") {
+            let path = &line[start + 1..start + 1 + end];
+            if path.starts_with('/') {
+                return Some(path.to_string());
+            }
+        }
+    }
+    // Try single quotes
+    if let Some(start) = line.find("'") {
+        if let Some(end) = line[start + 1..].find("'") {
+            let path = &line[start + 1..start + 1 + end];
+            if path.starts_with('/') {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Helper to extract owner from a line like: router.get("/path", ...)
+fn extract_owner_from_line(line: &str, method: &str) -> String {
+    let pattern = format!(".{}(", method);
+    if let Some(idx) = line.find(&pattern) {
+        let before = &line[..idx];
+        // Get the last word before the dot
+        let words: Vec<&str> = before.split_whitespace().collect();
+        if let Some(last) = words.last() {
+            // Clean up any remaining characters
+            let cleaned = last.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            if !cleaned.is_empty() {
+                return cleaned.to_string();
+            }
+        }
+    }
+    "router".to_string()
+}
+
+/// Helper to extract URL from fetch call
+fn extract_url_from_line(line: &str) -> Option<String> {
+    // Handle template literals and string literals
+    if let Some(path) = extract_path_from_line(line) {
+        return Some(path);
+    }
+    // Handle backtick template literals
+    if let Some(start) = line.find('`') {
+        if let Some(end) = line[start + 1..].find('`') {
+            return Some(line[start + 1..start + 1 + end].to_string());
+        }
+    }
+    None
 }
 
 /// Generate mock triage responses by extracting locations from prompt

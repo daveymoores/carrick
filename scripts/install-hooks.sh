@@ -35,13 +35,15 @@ cat > "$HOOKS_DIR/pre-commit" << 'EOF'
 # Runs formatting checks, linter, and tests before allowing a commit
 #
 
-set -e  # Exit on error
+set -euo pipefail  # Exit on error and fail pipelines
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 echo "🪢 Carrick Pre-Commit Hook"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Check if CARRICK_API_ENDPOINT is set
-if [ -z "$CARRICK_API_ENDPOINT" ]; then
+if [ -z "${CARRICK_API_ENDPOINT:-}" ]; then
     echo "⚠️  CARRICK_API_ENDPOINT not set, using default for testing"
     export CARRICK_API_ENDPOINT="https://test.example.com"
 fi
@@ -86,9 +88,9 @@ fi
 rm -f /tmp/carrick-clippy-output.txt
 echo "✅ Clippy checks passed!"
 
-# Run tests
+# Run Rust tests
 echo ""
-echo "Running test suite..."
+echo "Running Rust test suite..."
 echo ""
 
 if cargo test --quiet 2>&1 | tee /tmp/carrick-test-output.txt; then
@@ -97,14 +99,13 @@ if cargo test --quiet 2>&1 | tee /tmp/carrick-test-output.txt; then
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "✅ All tests passed!"
+    echo "✅ Rust tests passed!"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
     # Clean up
     rm -f /tmp/carrick-test-output.txt
 
-    exit 0
 else
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -118,8 +119,49 @@ else
     # Clean up
     rm -f /tmp/carrick-test-output.txt
 
+fi
+
+# Run ts_check tests
+echo ""
+echo "Running ts_check test suite..."
+echo ""
+
+if [ ! -d "$REPO_ROOT/ts_check" ]; then
+    echo "⚠️  ts_check directory not found, skipping."
+    exit 0
+fi
+
+if [ ! -d "$REPO_ROOT/ts_check/node_modules" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ ts_check/node_modules not found! Commit blocked."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Run '(cd ts_check && npm install)' to install dependencies."
+    echo "To bypass this hook (not recommended): git commit --no-verify"
+    echo ""
     exit 1
 fi
+
+if ! (cd "$REPO_ROOT/ts_check" && npm test); then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ ts_check tests failed! Commit blocked."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Fix the failing ts_check tests and try again."
+    echo "To bypass this hook (not recommended): git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ All tests passed!"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+exit 0
 EOF
 
 # Make hook executable

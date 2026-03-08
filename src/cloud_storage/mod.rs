@@ -4,6 +4,7 @@ use crate::{
     mount_graph::MountGraph,
     multi_agent_orchestrator::MultiAgentAnalysisResult,
     packages::Packages,
+    services::type_sidecar::InferKind,
     visitor::{FunctionDefinition, Mount, OwnerType},
 };
 use async_trait::async_trait;
@@ -17,6 +18,72 @@ mod mock_storage;
 pub use mock_storage::MockStorage;
 mod aws_storage;
 pub use aws_storage::AwsStorage;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestRole {
+    Producer,
+    Consumer,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestTypeKind {
+    Request,
+    Response,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestTypeState {
+    Explicit,
+    Implicit,
+    Unknown,
+}
+
+/// Evidence metadata for how a manifest entry was derived.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TypeEvidence {
+    /// Source file path where the type was found
+    pub file_path: String,
+    /// Start byte offset in the source file
+    pub span_start: Option<u32>,
+    /// End byte offset in the source file
+    pub span_end: Option<u32>,
+    /// Line number in the source file
+    pub line_number: u32,
+    /// Kind of inference performed for this type
+    pub infer_kind: InferKind,
+    /// Whether the type was explicitly annotated
+    pub is_explicit: bool,
+    /// Current state of the type extraction
+    pub type_state: ManifestTypeState,
+}
+
+/// Entry in the type manifest mapping endpoints to their type information
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TypeManifestEntry {
+    /// HTTP method (GET, POST, PUT, DELETE, etc.)
+    pub method: String,
+    /// API path (e.g., /api/users/:id)
+    pub path: String,
+    /// Whether this is a producer or consumer
+    pub role: ManifestRole,
+    /// Whether this entry represents request or response
+    pub type_kind: ManifestTypeKind,
+    /// The type alias used in the bundled .d.ts file
+    pub type_alias: String,
+    /// Source file path where the type was found
+    pub file_path: String,
+    /// Line number in the source file
+    pub line_number: u32,
+    /// Whether the type was explicitly annotated
+    pub is_explicit: bool,
+    /// Current state of the type extraction
+    pub type_state: ManifestTypeState,
+    /// Evidence metadata for this entry
+    pub evidence: TypeEvidence,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
@@ -36,6 +103,12 @@ pub struct CloudRepoData {
     pub commit_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
+    /// Bundled TypeScript type definitions (.d.ts content)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundled_types: Option<String>,
+    /// Type manifest mapping endpoints/calls to their type aliases
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_manifest: Option<Vec<TypeManifestEntry>>,
 }
 
 impl CloudRepoData {
@@ -129,6 +202,8 @@ impl CloudRepoData {
             last_updated: Utc::now(),
             commit_hash: get_current_commit_hash(),
             mount_graph: Some(mount_graph.clone()), // Store mount graph for cross-repo analysis
+            bundled_types: None,
+            type_manifest: None,
         }
     }
 }
@@ -171,7 +246,6 @@ pub trait CloudStorage {
         content: &str,
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
-    async fn download_type_file_content(&self, s3_url: &str) -> Result<String, StorageError>;
 }
 
 pub fn get_current_commit_hash() -> String {

@@ -1,3 +1,4 @@
+// Active type checking exports (used by sidecar architecture)
 export {
   TypeInfo,
   CompositeAliasInfo,
@@ -8,22 +9,28 @@ export {
 export { parseArguments, ParsedArguments } from "./argument-parser";
 export { ProjectManager, isLocalType } from "./project-utils";
 export {
-  findTypeReferenceAtPosition,
-  findTypeDeclarationByPosition,
-  getModuleSpecifierFromNodeModulesPath,
-} from "./type-resolver";
-export { ImportHandler } from "./import-handler";
-export { TypeProcessor } from "./type-processor";
-export { DeclarationCollector } from "./declaration-collector";
-export { DependencyManager } from "./dependency-manager";
-export { OutputGenerator } from "./output-generator";
-export { TypeExtractor } from "./type-extractor";
-export { 
-  TypeCompatibilityChecker, 
-  TypeCheckResult, 
-  TypeMismatch, 
-  ParsedTypeName 
+  TypeCompatibilityChecker,
+  TypeCheckResult,
+  TypeMismatch,
+  UnknownTypePair,
 } from "./type-checker";
+export {
+  ManifestMatcher,
+  TypeManifest,
+  ManifestEntry,
+  ManifestRole,
+  ManifestTypeKind,
+  ManifestTypeState,
+  TypeEvidence,
+  InferKind,
+  MatchResult,
+  OrphanedEntry,
+  normalizePath,
+  normalizeMethod,
+  createManifestEntry,
+  mergeManifests,
+  defaultMatcher,
+} from "./manifest-matcher";
 export {
   MAX_PROPERTY_DEPTH,
   MAX_PROPERTIES_LIMIT,

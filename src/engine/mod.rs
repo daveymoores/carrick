@@ -1,17 +1,31 @@
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
-use crate::cloud_storage::{CloudRepoData, CloudStorage};
+use crate::cloud_storage::{
+    CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
+    TypeManifestEntry,
+};
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
 use crate::parser::parse_file;
+use crate::services::{
+    TypeSidecar,
+    type_sidecar::{InferKind, TypeResolutionResult},
+};
+use crate::type_manifest::{
+    build_call_site_id, build_manifest_type_alias_with_call_id, is_http_method,
+    normalize_manifest_method, parse_file_location,
+};
+use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use serde::Serialize;
 use swc_common::{
     SourceMap,
     errors::{ColorConfig, Handler},
@@ -58,9 +72,19 @@ fn should_upload_data() -> bool {
     true
 }
 
+#[allow(dead_code)]
 pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_analysis_engine_with_sidecar(storage, repo_path, None).await
+}
+
+/// Run analysis engine with optional sidecar for type extraction
+pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
+    storage: T,
+    repo_path: &str,
+    sidecar: Option<&TypeSidecar>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // TODO we have no way of finding unique org names, so I think this will need to be a token
     let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
@@ -78,9 +102,26 @@ pub async fn run_analysis_engine<T: CloudStorage>(
         .map_err(|e| format!("Failed to connect to AWS services: {}", e))?;
     println!("AWS connectivity verified");
 
-    // 1. Analyze current repo only
-    let current_repo_data = analyze_current_repo(repo_path).await?;
+    // 1. Analyze current repo only (with optional sidecar for type resolution)
+    let current_repo_data = analyze_current_repo(repo_path, sidecar).await?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
+
+    // Log sidecar type resolution results if available
+    if current_repo_data.bundled_types.is_some() {
+        println!(
+            "Type resolution: {} bundled types, {} manifest entries",
+            current_repo_data
+                .bundled_types
+                .as_ref()
+                .map(|s| s.lines().count())
+                .unwrap_or(0),
+            current_repo_data
+                .type_manifest
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        );
+    }
 
     // 2. Conditionally upload current repo data to cloud storage
     if should_upload {
@@ -95,7 +136,7 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     }
 
     // 3. Download data from all repos
-    let (mut all_repo_data, repo_s3_urls) = storage // Updated to destructure tuple
+    let (mut all_repo_data, _repo_s3_urls) = storage // Updated to destructure tuple
         .download_all_repo_data(&carrick_org)
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
@@ -111,8 +152,7 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     );
 
     // 4. Reconstruct analyzer with combined data (including current repo)
-    let analyzer =
-        build_cross_repo_analyzer(all_repo_data, current_repo_data, repo_s3_urls, &storage).await?;
+    let analyzer = build_cross_repo_analyzer(all_repo_data, current_repo_data).await?;
     println!("Reconstructed analyzer with cross-repo data");
 
     // 5. Run analysis
@@ -272,8 +312,216 @@ fn load_config_and_packages(
     Ok((config, packages))
 }
 
+fn build_type_manifest_entries(
+    mount_graph: &MountGraph,
+    config: &Config,
+) -> Vec<TypeManifestEntry> {
+    let normalizer = UrlNormalizer::new(config);
+    let mut entries = Vec::new();
+
+    for endpoint in mount_graph.get_resolved_endpoints() {
+        let method = normalize_manifest_method(&endpoint.method);
+        if !is_http_method(&method) {
+            continue;
+        }
+        let path = endpoint.full_path.clone();
+        if !path.starts_with('/') {
+            continue;
+        }
+        let (file_path, line_number) = parse_file_location(&endpoint.file_location);
+
+        add_manifest_pair(
+            &mut entries,
+            &method,
+            &path,
+            ManifestRole::Producer,
+            &file_path,
+            line_number,
+            None,
+        );
+    }
+
+    for call in mount_graph.get_data_calls() {
+        if !normalizer.is_probable_url(&call.target_url) {
+            continue;
+        }
+        let (file_path, line_number) = parse_file_location(&call.file_location);
+        let method = normalize_manifest_method(&call.method);
+        if !is_http_method(&method) {
+            continue;
+        }
+        let path = normalizer.extract_path(&call.target_url);
+        let call_id = build_call_site_id(&file_path, line_number, &method, &path);
+
+        add_manifest_pair(
+            &mut entries,
+            &method,
+            &path,
+            ManifestRole::Consumer,
+            &file_path,
+            line_number,
+            Some(&call_id),
+        );
+    }
+
+    entries
+}
+
+fn add_manifest_pair(
+    entries: &mut Vec<TypeManifestEntry>,
+    method: &str,
+    path: &str,
+    role: ManifestRole,
+    file_path: &str,
+    line_number: u32,
+    call_id: Option<&str>,
+) {
+    // Producers for GET/HEAD/OPTIONS never have request bodies
+    let skip_request =
+        role == ManifestRole::Producer && matches!(method, "GET" | "HEAD" | "OPTIONS");
+
+    for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
+        if skip_request && type_kind == ManifestTypeKind::Request {
+            continue;
+        }
+        let type_alias =
+            build_manifest_type_alias_with_call_id(method, path, role, type_kind, call_id);
+        let infer_kind = infer_kind_for_manifest(role, type_kind);
+        let evidence = crate::cloud_storage::TypeEvidence {
+            file_path: file_path.to_string(),
+            span_start: None,
+            span_end: None,
+            line_number,
+            infer_kind,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+        };
+        entries.push(TypeManifestEntry {
+            method: method.to_string(),
+            path: path.to_string(),
+            role,
+            type_kind,
+            type_alias,
+            file_path: file_path.to_string(),
+            line_number,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+            evidence,
+        });
+    }
+}
+
+fn infer_kind_for_manifest(role: ManifestRole, type_kind: ManifestTypeKind) -> InferKind {
+    match (role, type_kind) {
+        (ManifestRole::Consumer, ManifestTypeKind::Response) => InferKind::CallResult,
+        (_, ManifestTypeKind::Response) => InferKind::ResponseBody,
+        (_, ManifestTypeKind::Request) => InferKind::RequestBody,
+    }
+}
+
+/// Enrich manifest entries with type resolution results.
+///
+/// This function updates the `type_state` and `is_explicit` fields of manifest entries
+/// based on the results from the TypeSidecar. Types that were successfully resolved
+/// (either explicitly or through inference) will have their state updated from `Unknown`
+/// to `Explicit` or `Implicit`.
+fn enrich_manifest_with_type_resolution(
+    manifest: &mut [TypeManifestEntry],
+    type_resolution: &TypeResolutionResult,
+    bundled_dts: Option<&str>,
+) {
+    // Build a lookup of resolved type aliases
+    // Key: type_alias, Value: (type_string, is_explicit)
+    let mut resolved_types: HashMap<String, (String, bool)> = HashMap::new();
+
+    // Add explicit types from the manifest
+    for entry in &type_resolution.explicit_manifest {
+        resolved_types.insert(entry.alias.clone(), (entry.type_string.clone(), true));
+    }
+
+    // Add inferred types
+    for inferred in &type_resolution.inferred_types {
+        // Don't overwrite explicit types with inferred ones
+        if !resolved_types.contains_key(&inferred.alias) {
+            resolved_types.insert(
+                inferred.alias.clone(),
+                (inferred.type_string.clone(), inferred.is_explicit),
+            );
+        }
+    }
+
+    // Also check the bundled .d.ts content for defined types
+    // This catches types that were successfully bundled but not in the manifest.
+    // Exclude aliases defined as `= unknown` — those are placeholders for failed
+    // inferences and should not be promoted to Implicit.
+    let dts_defined_aliases: HashSet<String> = if let Some(dts) = bundled_dts {
+        manifest
+            .iter()
+            .filter(|e| {
+                dts_defines_alias(dts, &e.type_alias)
+                    && !dts_alias_is_trivially_unknown(dts, &e.type_alias)
+            })
+            .map(|e| e.type_alias.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    // Update manifest entries
+    for entry in manifest.iter_mut() {
+        if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
+            // Check if the type is actually resolved (not "unknown")
+            let is_unknown_type = type_string.trim() == "unknown"
+                || type_string.trim() == "any"
+                || type_string.is_empty();
+
+            if !is_unknown_type {
+                entry.is_explicit = *is_explicit;
+                entry.type_state = if *is_explicit {
+                    ManifestTypeState::Explicit
+                } else {
+                    ManifestTypeState::Implicit
+                };
+                entry.evidence.is_explicit = *is_explicit;
+                entry.evidence.type_state = entry.type_state;
+            }
+        } else if dts_defined_aliases.contains(&entry.type_alias) {
+            // Type is defined in the .d.ts but wasn't in our resolution results
+            // This can happen for inline aliases or other edge cases
+            entry.type_state = ManifestTypeState::Implicit;
+            entry.evidence.type_state = ManifestTypeState::Implicit;
+        }
+    }
+
+    // Log enrichment stats
+    let explicit_count = manifest
+        .iter()
+        .filter(|e| e.type_state == ManifestTypeState::Explicit)
+        .count();
+    let implicit_count = manifest
+        .iter()
+        .filter(|e| e.type_state == ManifestTypeState::Implicit)
+        .count();
+    let unknown_count = manifest
+        .iter()
+        .filter(|e| e.type_state == ManifestTypeState::Unknown)
+        .count();
+    eprintln!(
+        "[Manifest Enrichment] {} explicit, {} implicit, {} unknown",
+        explicit_count, implicit_count, unknown_count
+    );
+}
+
+#[derive(Serialize)]
+struct TypeManifestFile {
+    repo_name: String,
+    commit_hash: String,
+    entries: Vec<TypeManifestEntry>,
+}
+
 async fn analyze_current_repo(
     repo_path: &str,
+    sidecar: Option<&TypeSidecar>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     println!(
         "---> Running multi-agent framework-agnostic analysis on: {}",
@@ -304,12 +552,8 @@ async fn analyze_current_repo(
         .run_complete_analysis(files, &packages, &all_imported_symbols)
         .await?;
 
-    // 5. Extract types from agent analysis results
-    let agent_type_infos =
-        orchestrator.extract_types_from_analysis(&analysis_result.analysis_results);
-
-    // 6. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
-    let cloud_data = CloudRepoData::from_multi_agent_results(
+    // 5. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
+    let mut cloud_data = CloudRepoData::from_multi_agent_results(
         repo_name.clone(),
         &analysis_result,
         serde_json::to_string(&config).ok(),
@@ -318,144 +562,85 @@ async fn analyze_current_repo(
         function_definitions.clone(),
     );
 
-    // 7. Create a minimal Analyzer for type extraction
-    let mut analyzer = Analyzer::new(config.clone(), cm.clone());
-    analyzer.endpoints = cloud_data.endpoints.clone();
-    analyzer.calls = cloud_data.calls.clone();
-    analyzer.mounts = cloud_data.mounts.clone();
-    analyzer.function_definitions = function_definitions;
-    analyzer.build_endpoint_router();
+    let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, &config);
+    if !manifest_entries.is_empty() {
+        cloud_data.type_manifest = Some(manifest_entries);
+    }
 
-    // 7a. Resolve types for endpoints using SWC AST (accurate position extraction)
-    analyzer.resolve_types_for_endpoints(cm);
+    // 6. Resolve types using sidecar if available (Phase 2.4)
+    if let Some(sidecar) = sidecar {
+        println!("\n=== Sidecar Type Resolution (Phase 2.4) ===");
 
-    // 8. Extract types for current repo (critical for cross-repo type checking)
-    extract_types_for_current_repo(&analyzer, repo_path, &packages, agent_type_infos)?;
+        // Wait for sidecar to be ready (it should be by now, but ensure it)
+        match sidecar.wait_ready(Duration::from_secs(10)) {
+            Ok(()) => {
+                // Create FileOrchestrator to use its type resolution method
+                let api_key = env::var("CARRICK_API_KEY").unwrap_or_default();
+                let agent_service = crate::agent_service::AgentService::new(api_key);
+                let file_orchestrator =
+                    crate::agents::file_orchestrator::FileOrchestrator::new(agent_service);
+
+                // Resolve types using sidecar
+                match file_orchestrator.resolve_types_with_sidecar(
+                    sidecar,
+                    &analysis_result.file_results,
+                    repo_path,
+                    &packages,
+                    &analysis_result.mount_graph,
+                    &config,
+                ) {
+                    Ok(type_resolution) => {
+                        println!(
+                            "Type resolution successful: {} explicit, {} inferred, {} failures",
+                            type_resolution.explicit_manifest.len(),
+                            type_resolution.inferred_types.len(),
+                            type_resolution.symbol_failures.len()
+                        );
+
+                        // Phase 2.5: Populate CloudRepoData with bundled types
+                        cloud_data.bundled_types = type_resolution.dts_content.clone();
+
+                        // Phase 2.6: Enrich manifest entries with type resolution results
+                        if let Some(ref mut manifest) = cloud_data.type_manifest {
+                            enrich_manifest_with_type_resolution(
+                                manifest,
+                                &type_resolution,
+                                type_resolution.dts_content.as_deref(),
+                            );
+                        }
+
+                        // Log any failures for debugging
+                        for failure in &type_resolution.symbol_failures {
+                            eprintln!(
+                                "[Sidecar] Failed to resolve symbol '{}' from '{}': {}",
+                                failure.symbol_name, failure.source_file, failure.reason
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Sidecar] Type resolution failed: {}", e);
+                        eprintln!("[Sidecar] Continuing without bundled types");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[Sidecar] Sidecar not ready: {}", e);
+                eprintln!("[Sidecar] Skipping type resolution");
+            }
+        }
+    }
+
+    if let Some(bundled_types) = cloud_data.bundled_types.take() {
+        let updated = append_missing_aliases(bundled_types, cloud_data.type_manifest.as_ref());
+        cloud_data.bundled_types = Some(updated);
+    }
 
     Ok(cloud_data)
 }
 
-/// Extract types for current repo - restored from the old system
-fn extract_types_for_current_repo(
-    analyzer: &Analyzer,
-    repo_path: &str,
-    packages: &Packages,
-    agent_type_infos: Vec<serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::collections::HashMap;
-    let mut repo_type_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    let repo_paths = vec![repo_path.to_string()];
-
-    println!("=== TYPE EXTRACTION DIAGNOSTIC START ===");
-    println!("Repository path: {}", repo_path);
-    println!("Agent type_infos count: {}", agent_type_infos.len());
-
-    // Log agent type infos for debugging
-    for (i, type_info) in agent_type_infos.iter().enumerate() {
-        println!(
-            "  Agent type_info[{}]: filePath={}, alias={}, typeString={}",
-            i,
-            type_info["filePath"].as_str().unwrap_or("NONE"),
-            type_info["alias"].as_str().unwrap_or("NONE"),
-            type_info["compositeTypeString"].as_str().unwrap_or("NONE")
-        );
-    }
-
-    // Count endpoints and calls with type info (for diagnostics)
-    let endpoints_with_types = analyzer
-        .endpoints
-        .iter()
-        .filter(|e| e.request_type.is_some() || e.response_type.is_some())
-        .count();
-    let calls_with_types = analyzer
-        .calls
-        .iter()
-        .filter(|c| c.request_type.is_some() || c.response_type.is_some())
-        .count();
-
-    println!(
-        "Analyzer endpoints: {} total, {} with type info",
-        analyzer.endpoints.len(),
-        endpoints_with_types
-    );
-    println!(
-        "Analyzer calls: {} total, {} with type info",
-        analyzer.calls.len(),
-        calls_with_types
-    );
-    println!("Analyzer fetch_calls: {}", analyzer.fetch_calls().len());
-
-    // Group type information by repository using endpoint file path
-    // This ensures types are keyed by repo name (e.g., "repo-a") not owner (e.g., "app")
-    for endpoint in &analyzer.endpoints {
-        let repo_prefix =
-            analyzer.extract_repo_prefix_from_file_path(&endpoint.file_path, &repo_paths);
-        analyzer.process_api_detail_types(endpoint, repo_prefix, &mut repo_type_map);
-    }
-
-    // Group type information by repository using call file information
-    // NOTE: Same issue - type info is None from the adapter layer
-    for call in &analyzer.calls {
-        let repo_prefix = analyzer.extract_repo_prefix_from_file_path(&call.file_path, &repo_paths);
-        analyzer.process_api_detail_types(call, repo_prefix, &mut repo_type_map);
-    }
-
-    // Collect type information from Gemini-extracted fetch_calls (legacy path)
-    let gemini_type_infos = analyzer.collect_type_infos_from_calls(analyzer.fetch_calls());
-    println!(
-        "Gemini type_infos from fetch_calls: {}",
-        gemini_type_infos.len()
-    );
-
-    // Combine Gemini async types AND Agent types
-    // This is the primary source of type info in the multi-agent architecture
-    for type_info in gemini_type_infos
-        .into_iter()
-        .chain(agent_type_infos.into_iter())
-    {
-        let file_path = type_info["filePath"].as_str().unwrap_or("");
-        let repo_prefix =
-            analyzer.extract_repo_prefix_from_file_path(&PathBuf::from(file_path), &repo_paths);
-        repo_type_map
-            .entry(repo_prefix)
-            .or_default()
-            .push(type_info);
-    }
-
-    // Extract types for current repository
-    let repo_name = get_repository_name(repo_path);
-    let type_infos = repo_type_map.get(&repo_name).cloned().unwrap_or_default();
-
-    println!(
-        "Repo type map keys: {:?}",
-        repo_type_map.keys().collect::<Vec<_>>()
-    );
-    println!("Looking for repo_name: '{}'", repo_name);
-    println!("Final type_infos count for this repo: {}", type_infos.len());
-    println!("=== TYPE EXTRACTION DIAGNOSTIC END ===");
-
-    if !type_infos.is_empty() {
-        println!(
-            "Processing {} types from repository: {}",
-            type_infos.len(),
-            repo_path
-        );
-        analyzer.extract_types_for_repo(repo_path, type_infos.clone(), packages);
-    } else {
-        println!(
-            "WARNING: No types to extract for repository: {} - type file will not be generated",
-            repo_path
-        );
-    }
-
-    Ok(())
-}
-
-async fn build_cross_repo_analyzer<T: CloudStorage>(
+async fn build_cross_repo_analyzer(
     mut all_repo_data: Vec<CloudRepoData>,
     current_repo_data: CloudRepoData,
-    repo_s3_urls: HashMap<String, String>,
-    storage: &T,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
     // Add current repo data to the mix
     all_repo_data.push(current_repo_data);
@@ -481,8 +666,7 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     }
 
     // 5. Recreate type files from S3 and run type checking
-    recreate_type_files_and_check(&all_repo_data, &repo_s3_urls, storage, &combined_packages)
-        .await?;
+    recreate_type_files_and_check(&all_repo_data, &combined_packages)?;
 
     // 6. Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
@@ -492,35 +676,10 @@ async fn build_cross_repo_analyzer<T: CloudStorage>(
     Ok(analyzer)
 }
 
-async fn recreate_type_files_and_check<T: CloudStorage>(
+fn recreate_type_files_and_check(
     all_repo_data: &[CloudRepoData],
-    repo_s3_urls: &HashMap<String, String>, // Map repo_name -> s3_url
-    storage: &T,
     packages: &Packages,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Before cleaning output directory, copy current repo type file to temp
-    let current_repo = all_repo_data.last().unwrap().repo_name.replace("/", "_");
-    let generated_type_file = format!("ts_check/output/{}_types.ts", current_repo);
-    let temp_dir = std::path::Path::new("ts_check/temp");
-    if !temp_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(temp_dir) {
-            println!("Warning: Failed to create temp directory: {}", e);
-        }
-    }
-    let temp_type_file = temp_dir.join(format!("{}_types.ts", current_repo));
-    if std::fs::copy(&generated_type_file, &temp_type_file).is_ok() {
-        println!(
-            "Backed up type file before cleaning: {}",
-            temp_type_file.display()
-        );
-    } else {
-        println!(
-            "Warning: Could not backup type file before cleaning: {}",
-            generated_type_file
-        );
-    }
-
-    // Clean output directory
     let output_dir = std::path::Path::new("ts_check/output");
     if output_dir.exists() {
         println!("Cleaning output directory: ts_check/output");
@@ -529,83 +688,139 @@ async fn recreate_type_files_and_check<T: CloudStorage>(
         }
     }
 
-    // Create clean output directory
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         println!("Warning: Failed to create output directory: {}", e);
     } else {
         println!("Created clean output directory: ts_check/output");
     }
 
-    // Debug: Print the full repo_s3_urls map before download
-    println!("repo_s3_urls map before download: {:?}", repo_s3_urls);
-
-    // Download type files for each repository
     for repo_data in all_repo_data {
-        println!(
-            "Attempting to download type file for repo: {}",
-            repo_data.repo_name
-        );
-        // Use local type file for current repo, download from S3 for others
-        if repo_data.repo_name == all_repo_data.last().unwrap().repo_name {
-            // Assume last in all_repo_data is current repo (matches how current_repo_data is appended)
+        if let Some(bundled_types) = &repo_data.bundled_types {
             let safe_repo_name = repo_data.repo_name.replace("/", "_");
-            let file_name = format!("{}_types.ts", safe_repo_name);
+            let file_name = format!("{}_types.d.ts", safe_repo_name);
             let file_path = output_dir.join(&file_name);
-            // Move the backed up type file from temp into output directory
-            let temp_type_file = format!("ts_check/temp/{}_types.ts", safe_repo_name);
-            match std::fs::copy(&temp_type_file, &file_path) {
-                Ok(_) => println!(
-                    "Moved type file from temp for current repo: {}",
-                    file_path.display()
-                ),
-                Err(e) => println!(
-                    "Warning: Failed to move type file from temp {}: {}",
-                    temp_type_file, e
-                ),
-            }
-            // Clean up temp directory after moving the file
-            if let Err(e) = std::fs::remove_dir_all("ts_check/temp") {
-                println!("Warning: Failed to clean temp directory: {}", e);
-            }
-        } else if let Some(s3_url) = repo_s3_urls.get(&repo_data.repo_name) {
-            println!(
-                "Downloading type file for repository: {}",
-                repo_data.repo_name
-            );
+            let content =
+                append_missing_aliases(bundled_types.clone(), repo_data.type_manifest.as_ref());
 
-            match storage.download_type_file_content(s3_url).await {
-                Ok(type_content) => {
-                    // Create a safe filename from repo name
-                    let safe_repo_name = repo_data.repo_name.replace("/", "_");
-                    let file_name = format!("{}_types.ts", safe_repo_name);
-                    let file_path = output_dir.join(&file_name);
-
-                    if let Err(e) = std::fs::write(&file_path, type_content) {
-                        println!("Warning: Failed to write type file {}: {}", file_name, e);
-                    } else {
-                        println!("Created type file: {}", file_path.display());
-                    }
-                }
-                Err(e) => {
-                    println!(
-                        "Warning: Failed to download type file for repo {}: {}",
-                        repo_data.repo_name, e
-                    );
-                }
+            if let Err(e) = std::fs::write(&file_path, content) {
+                println!("Warning: Failed to write type file {}: {}", file_name, e);
+            } else {
+                println!("Created bundled type file: {}", file_path.display());
             }
         } else {
-            println!("No S3 URL found for repository: {}", repo_data.repo_name);
             println!(
-                "repo_s3_urls keys: {:?}",
-                repo_s3_urls.keys().collect::<Vec<_>>()
+                "No bundled types available for repo: {}",
+                repo_data.repo_name
             );
         }
     }
 
-    // Recreate package.json and tsconfig.json after downloading type files
+    write_manifest_files(all_repo_data, output_dir)?;
+
+    // Recreate package.json and tsconfig.json after writing type files
     recreate_package_and_tsconfig(output_dir, packages)?;
 
     Ok(())
+}
+
+fn write_manifest_files(
+    all_repo_data: &[CloudRepoData],
+    output_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut producer_entries = Vec::new();
+    let mut consumer_entries = Vec::new();
+
+    for repo_data in all_repo_data {
+        if let Some(entries) = &repo_data.type_manifest {
+            for entry in entries {
+                match entry.role {
+                    ManifestRole::Producer => producer_entries.push(entry.clone()),
+                    ManifestRole::Consumer => consumer_entries.push(entry.clone()),
+                }
+            }
+        }
+    }
+
+    let producer_manifest = TypeManifestFile {
+        repo_name: "cross-repo-producers".to_string(),
+        commit_hash: "mixed".to_string(),
+        entries: producer_entries,
+    };
+    let consumer_manifest = TypeManifestFile {
+        repo_name: "cross-repo-consumers".to_string(),
+        commit_hash: "mixed".to_string(),
+        entries: consumer_entries,
+    };
+
+    let producer_path = output_dir.join("producer-manifest.json");
+    let consumer_path = output_dir.join("consumer-manifest.json");
+
+    std::fs::write(
+        &producer_path,
+        serde_json::to_string_pretty(&producer_manifest)?,
+    )?;
+    std::fs::write(
+        &consumer_path,
+        serde_json::to_string_pretty(&consumer_manifest)?,
+    )?;
+
+    println!(
+        "Wrote manifest files: {} ({} entries), {} ({} entries)",
+        producer_path.display(),
+        producer_manifest.entries.len(),
+        consumer_path.display(),
+        consumer_manifest.entries.len()
+    );
+
+    Ok(())
+}
+
+fn append_missing_aliases(content: String, manifest: Option<&Vec<TypeManifestEntry>>) -> String {
+    let Some(entries) = manifest else {
+        return content;
+    };
+
+    let mut updated = content;
+    let mut seen = std::collections::HashSet::new();
+
+    for entry in entries {
+        if !seen.insert(entry.type_alias.clone()) {
+            continue;
+        }
+
+        if dts_defines_alias(&updated, &entry.type_alias) {
+            continue;
+        }
+
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("export type ");
+        updated.push_str(&entry.type_alias);
+        updated.push_str(" = unknown;\n");
+    }
+
+    updated
+}
+
+fn dts_defines_alias(content: &str, alias: &str) -> bool {
+    let escaped = regex::escape(alias);
+    let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.is_match(content),
+        Err(_) => false,
+    }
+}
+
+/// Returns true when the .d.ts defines the alias as exactly `= unknown`,
+/// i.e. it's a placeholder for a failed inference, not a real type.
+fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
+    let escaped = regex::escape(alias);
+    let pattern = format!(r"type\s+{}\s*=\s*unknown\s*;", escaped);
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.is_match(content),
+        Err(_) => false,
+    }
 }
 
 /// Recreate package.json and tsconfig.json in the output directory
@@ -643,35 +858,42 @@ fn recreate_package_and_tsconfig(
     )?;
     println!("Recreated package.json at {}", package_json_path.display());
 
-    // Clean any existing node_modules and package-lock.json to avoid conflicts
-    let node_modules_path = output_dir.join("node_modules");
-    let package_lock_path = output_dir.join("package-lock.json");
+    let skip_npm_install = std::env::var("CARRICK_SKIP_NPM_INSTALL").is_ok()
+        || std::env::var("CARRICK_MOCK_ALL").is_ok();
 
-    if node_modules_path.exists() {
-        println!("Removing existing node_modules directory...");
-        std::fs::remove_dir_all(&node_modules_path).ok();
-    }
-
-    if package_lock_path.exists() {
-        println!("Removing existing package-lock.json...");
-        std::fs::remove_file(&package_lock_path).ok();
-    }
-
-    // Install dependencies
-    use std::process::Command;
-    println!("Installing dependencies...");
-
-    let install_output = Command::new("npm")
-        .arg("install")
-        .current_dir(output_dir)
-        .output()
-        .map_err(|e| format!("Failed to run npm install: {}", e))?;
-
-    if !install_output.status.success() {
-        let stderr = String::from_utf8_lossy(&install_output.stderr);
-        eprintln!("Warning: npm install failed: {}", stderr);
+    if skip_npm_install {
+        println!("Skipping npm install (mock mode or CARRICK_SKIP_NPM_INSTALL set)");
     } else {
-        println!("Dependencies installed successfully");
+        // Clean any existing node_modules and package-lock.json to avoid conflicts
+        let node_modules_path = output_dir.join("node_modules");
+        let package_lock_path = output_dir.join("package-lock.json");
+
+        if node_modules_path.exists() {
+            println!("Removing existing node_modules directory...");
+            std::fs::remove_dir_all(&node_modules_path).ok();
+        }
+
+        if package_lock_path.exists() {
+            println!("Removing existing package-lock.json...");
+            std::fs::remove_file(&package_lock_path).ok();
+        }
+
+        // Install dependencies
+        use std::process::Command;
+        println!("Installing dependencies...");
+
+        let install_output = Command::new("npm")
+            .arg("install")
+            .current_dir(output_dir)
+            .output()
+            .map_err(|e| format!("Failed to run npm install: {}", e))?;
+
+        if !install_output.status.success() {
+            let stderr = String::from_utf8_lossy(&install_output.stderr);
+            eprintln!("Warning: npm install failed: {}", stderr);
+        } else {
+            println!("Dependencies installed successfully");
+        }
     }
 
     // Create tsconfig.json with dynamic path mappings based on actual type files
@@ -742,6 +964,8 @@ mod tests {
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
             mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -773,6 +997,8 @@ mod tests {
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
             mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
         }];
 
         // Test Config merging
@@ -839,6 +1065,8 @@ mod tests {
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
             mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues

@@ -17,6 +17,9 @@ target/
 #.idea/
 
 **/*/node_modules
+!src/sidecar/test/fixtures/sample-repo/node_modules/
+!src/sidecar/test/fixtures/sample-repo/node_modules/wrapper-lib/
+!src/sidecar/test/fixtures/sample-repo/node_modules/wrapper-lib/index.d.ts
 **/ts_check/output
 
 # Lambda build artifacts
@@ -28,6 +31,9 @@ lambdas/*.zip
 
 # Crash logs
 crash.log
+
+# macOS Finder metadata
+.DS_Store
 
 # Terraform CLI working directory
 .terraform/

@@ -1,6 +1,5 @@
 pub mod builder;
 
-use serde_json::Value;
 use swc_common::{FileName, SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::TsTypeAnn;
 
@@ -11,7 +10,7 @@ use crate::{
     mount_graph::MountGraph,
     packages::Packages,
     url_normalizer::UrlNormalizer,
-    utils::{get_repository_name, join_prefix_and_path},
+    utils::join_prefix_and_path,
     visitor::{Call, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
 };
 use std::collections::HashSet;
@@ -138,10 +137,6 @@ impl Analyzer {
     /// Set the mount graph for framework-agnostic analysis
     pub fn set_mount_graph(&mut self, mount_graph: MountGraph) {
         self.mount_graph = Some(mount_graph);
-    }
-
-    pub fn fetch_calls(&self) -> &Vec<Call> {
-        &self.fetch_calls
     }
 
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
@@ -1069,125 +1064,6 @@ impl Analyzer {
         self.endpoint_router = Some(router);
     }
 
-    pub fn extract_types_for_repo(
-        &self,
-        repo_path: &str,
-        type_infos: Vec<Value>,
-        packages: &Packages,
-    ) {
-        use std::process::Command;
-
-        // Skip if no types to extract
-        if type_infos.is_empty() {
-            return;
-        }
-
-        // Prepare JSON input with type information
-        let json_input = serde_json::to_string(&type_infos).unwrap();
-        let repo_suffix = get_repository_name(repo_path);
-        let output_path = format!("ts_check/output/{}_types.ts", repo_suffix);
-
-        // Ensure the `ts_check/output` directory exists
-        std::fs::create_dir_all("ts_check/output").expect("Failed to create output directory");
-
-        let dependencies = packages.get_dependencies();
-        // Serialize dependencies as JSON
-        let dependencies_json = serde_json::to_string(dependencies).unwrap();
-
-        // Determine tsconfig path based on repo
-        use std::path::Path;
-        let tsconfig_path = Path::new(repo_path).join("tsconfig.json");
-
-        // Use repo's tsconfig if it exists, otherwise create a default one in output directory
-        let ts_config = if tsconfig_path.exists() {
-            tsconfig_path
-        } else {
-            println!("No tsconfig.json found in repo, creating default one in ts_check/output");
-
-            // Ensure the output directory exists
-            let output_dir = Path::new("ts_check/output");
-            if !output_dir.exists() {
-                std::fs::create_dir_all(output_dir).expect("Failed to create output directory");
-            }
-
-            let default_tsconfig_path = Path::new("ts_check/output/tsconfig.json");
-
-            // Create a basic tsconfig.json content
-            let tsconfig_content = create_standard_tsconfig();
-
-            std::fs::write(
-                default_tsconfig_path,
-                serde_json::to_string_pretty(&tsconfig_content).unwrap(),
-            )
-            .expect("Failed to write default tsconfig.json");
-
-            default_tsconfig_path.to_path_buf()
-        };
-
-        println!("Extracting {} types from {}", type_infos.len(), repo_path);
-
-        // Run the extract-type-definitions script with all types at once
-        let script_path = match std::fs::canonicalize("ts_check/extract-type-definitions.ts") {
-            Ok(path) => path,
-            Err(e) => panic!("Script not found: {}", e),
-        };
-
-        let ts_config = match std::fs::canonicalize(&ts_config) {
-            Ok(path) => path,
-            Err(e) => panic!("tsconfig.json not found: {}", e),
-        };
-
-        let output = Command::new("npx")
-            .arg("ts-node")
-            .arg(script_path)
-            .arg(&json_input)
-            .arg(&output_path)
-            .arg(ts_config)
-            .arg(&dependencies_json)
-            .output()
-            .expect("Failed to run type extraction");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        println!("Type extraction output: {}", stdout);
-        if !stderr.is_empty() {
-            eprintln!("Type extraction errors: {}", stderr);
-        }
-    }
-
-    /// Collect type information from Gemini-extracted calls for TypeScript extraction
-    pub fn collect_type_infos_from_calls(&self, calls: &[Call]) -> Vec<serde_json::Value> {
-        println!("collect_type_infos_from_calls is called");
-        let mut type_infos = Vec::new();
-
-        for call in calls {
-            // Collect request type info
-            if let Some(request_type) = &call.request_type {
-                let type_info = serde_json::json!({
-                    "filePath": request_type.file_path.to_string_lossy().to_string(),
-                    "startPosition": request_type.start_position,
-                    "compositeTypeString": request_type.composite_type_string,
-                    "alias": request_type.alias
-                });
-                type_infos.push(type_info);
-            }
-
-            // Collect response type info
-            if let Some(response_type) = &call.response_type {
-                let type_info = serde_json::json!({
-                    "filePath": response_type.file_path.to_string_lossy().to_string(),
-                    "startPosition": response_type.start_position,
-                    "compositeTypeString": response_type.composite_type_string,
-                    "alias": response_type.alias
-                });
-                type_infos.push(type_info);
-            }
-        }
-
-        type_infos
-    }
-
     pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
         use std::fs;
         use std::path::Path;
@@ -1293,21 +1169,22 @@ impl Analyzer {
         fs::create_dir_all(output_dir)
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
-        // Check if there are any type files to check
+        // Check if there are any bundled .d.ts files to check
         let type_files: Vec<_> = fs::read_dir(output_dir)
             .map_err(|e| format!("Failed to read output directory: {}", e))?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
-                entry.path().extension().is_some_and(|ext| ext == "ts")
-                    && entry
-                        .path()
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().ends_with("_types.ts"))
+                entry
+                    .path()
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".d.ts"))
             })
             .collect();
 
         if type_files.is_empty() {
-            println!("⚠️  No type files found in ts_check/output/ - skipping type checking");
+            println!(
+                "⚠️  No bundled .d.ts files found in ts_check/output/ - skipping type checking"
+            );
             println!("   This may happen if:");
             println!("   - Source code lacks explicit TypeScript type annotations");
             println!("   - Type extraction agents couldn't identify response/request types");
@@ -1331,11 +1208,26 @@ impl Analyzer {
         )
         .map_err(|e| format!("Failed to create tsconfig.json: {}", e))?;
 
+        let producer_manifest = output_dir.join("producer-manifest.json");
+        let consumer_manifest = output_dir.join("consumer-manifest.json");
+
+        if !producer_manifest.exists() || !consumer_manifest.exists() {
+            return Err(
+                "Producer/consumer manifest files not found in ts_check/output".to_string(),
+            );
+        }
+
         // Run the type checking script with the minimal tsconfig
         let output = Command::new("npx")
             .arg("ts-node")
             .arg(script_path)
             .arg(tsconfig_path)
+            .arg("--producer")
+            .arg(producer_manifest)
+            .arg("--consumer")
+            .arg(consumer_manifest)
+            .arg("--types-dir")
+            .arg(output_dir)
             .output()
             .map_err(|e| format!("Failed to run type checking: {}", e))?;
 
@@ -1360,9 +1252,47 @@ impl Analyzer {
         Ok(())
     }
 
+    fn build_display_name_map(&self) -> HashMap<String, String> {
+        use std::fs;
+        use std::path::Path;
+
+        let mut map = HashMap::new();
+        let output_dir = Path::new("ts_check/output");
+
+        for manifest_path in &[
+            output_dir.join("producer-manifest.json"),
+            output_dir.join("consumer-manifest.json"),
+        ] {
+            let Ok(contents) = fs::read_to_string(manifest_path) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            let Some(entries) = parsed.get("entries").and_then(|e| e.as_array()) else {
+                continue;
+            };
+            for entry in entries {
+                if let (Some(alias), Some(method), Some(path), Some(type_kind)) = (
+                    entry.get("type_alias").and_then(|v| v.as_str()),
+                    entry.get("method").and_then(|v| v.as_str()),
+                    entry.get("path").and_then(|v| v.as_str()),
+                    entry.get("type_kind").and_then(|v| v.as_str()),
+                ) {
+                    let display = crate::type_manifest::build_display_name(method, path, type_kind);
+                    map.insert(alias.to_string(), display);
+                }
+            }
+        }
+
+        map
+    }
+
     fn get_type_mismatches(&self) -> Vec<String> {
         match self.check_type_compatibility() {
             Ok(result) => {
+                let display_names = self.build_display_name_map();
+
                 if let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) {
                     mismatches.iter()
                         .filter_map(|mismatch| {
@@ -1373,9 +1303,9 @@ impl Analyzer {
                                 mismatch.get("error").and_then(|e| e.as_str()),
                             ) {
                                 // Clean up import paths for better readability
-                                let clean_producer = self.clean_type_string(producer);
-                                let clean_consumer = self.clean_type_string(consumer);
-                                let clean_error = self.clean_error_message(error);
+                                let clean_producer = self.clean_type_string(producer, &display_names);
+                                let clean_consumer = self.clean_type_string(consumer, &display_names);
+                                let clean_error = self.clean_error_message(error, &display_names);
 
                                 Some(format!(
                                     "Type mismatch on {}: Producer ({}) incompatible with Consumer ({}) - {}",
@@ -1397,15 +1327,19 @@ impl Analyzer {
         }
     }
 
-    fn clean_type_string(&self, type_str: &str) -> String {
+    fn clean_type_string(&self, type_str: &str, display_names: &HashMap<String, String>) -> String {
         use regex::Regex;
 
         // Remove absolute paths from import statements, keeping only the relative part
         let import_regex = Regex::new(r#"import\("([^"]+)"\)\.(\w+)"#).unwrap();
         let mut cleaned = import_regex
             .replace_all(type_str, |caps: &regex::Captures| {
-                let path = &caps[1];
                 let type_name = &caps[2];
+                // Replace hash-based type aliases with display names
+                if let Some(display) = display_names.get(type_name) {
+                    return display.clone();
+                }
+                let path = &caps[1];
                 // Extract just the filename without path for readability
                 if let Some(filename) = path.split('/').last() {
                     format!("{}.{}", filename, type_name)
@@ -1415,6 +1349,13 @@ impl Analyzer {
             })
             .to_string();
 
+        // Also replace standalone hash-based type aliases (not inside import())
+        for (alias, display) in display_names {
+            if cleaned.contains(alias.as_str()) {
+                cleaned = cleaned.replace(alias.as_str(), display);
+            }
+        }
+
         // Simplify Array<T> to T[]
         let array_regex = Regex::new(r"Array<([^>]+)>").unwrap();
         cleaned = array_regex.replace_all(&cleaned, "$1[]").to_string();
@@ -1422,8 +1363,8 @@ impl Analyzer {
         cleaned
     }
 
-    fn clean_error_message(&self, error: &str) -> String {
-        error
+    fn clean_error_message(&self, error: &str, display_names: &HashMap<String, String>) -> String {
+        let mut cleaned = error
             .replace("Type '", "")
             .replace(
                 "' is missing the following properties from type '",
@@ -1431,7 +1372,16 @@ impl Analyzer {
             )
             .replace("': ", ": ")
             .replace("' is not assignable to type '", " not assignable to ")
-            .replace("'.", "")
+            .replace("'.", "");
+
+        // Replace hash-based type aliases in error messages
+        for (alias, display) in display_names {
+            if cleaned.contains(alias.as_str()) {
+                cleaned = cleaned.replace(alias.as_str(), display);
+            }
+        }
+
+        cleaned
     }
 
     /// Extract repository prefix from endpoint owner information
@@ -1448,90 +1398,6 @@ impl Analyzer {
             }
         } else {
             "default".to_string()
-        }
-    }
-
-    /// Extract repository prefix from file path by matching against repository paths
-    pub fn extract_repo_prefix_from_file_path(
-        &self,
-        file_path: &Path,
-        repo_paths: &[String],
-    ) -> String {
-        let file_path_str = file_path.to_string_lossy();
-        repo_paths
-            .iter()
-            .find(|repo_path| file_path_str.starts_with(*repo_path))
-            .map(|repo_path| get_repository_name(repo_path))
-            .unwrap_or("default".to_string())
-    }
-
-    /// Add a TypeReference to the repository type map with incremental naming for multiple calls
-    fn add_type_to_repo_map(
-        &self,
-        type_ref: &TypeReference,
-        repo_prefix: String,
-        repo_type_map: &mut HashMap<String, Vec<Value>>,
-    ) {
-        let file_path = type_ref.file_path.to_string_lossy().to_string();
-
-        let canonical_path =
-            std::fs::canonicalize(file_path).expect("Cannot extract full file path");
-        if let Some(path) = canonical_path.to_str() {
-            let base_alias = &type_ref.alias;
-
-            // For consumer types (calls), we need to ensure unique names
-            let final_alias = if base_alias.ends_with("Response") || base_alias.ends_with("Request")
-            {
-                let repo_entries = repo_type_map.entry(repo_prefix.clone()).or_default();
-
-                // Find all existing aliases that match this base pattern
-                let existing_aliases: std::collections::HashSet<String> = repo_entries
-                    .iter()
-                    .filter_map(|entry| entry.get("alias").and_then(|v| v.as_str()))
-                    .map(|s| s.to_string())
-                    .collect();
-
-                // If the base alias already exists, find the next available number
-                if existing_aliases.contains(base_alias) {
-                    let mut counter = 2;
-                    loop {
-                        let candidate = format!("{}{}", base_alias, counter);
-                        if !existing_aliases.contains(&candidate) {
-                            break candidate;
-                        }
-                        counter += 1;
-                    }
-                } else {
-                    base_alias.clone()
-                }
-            } else {
-                base_alias.clone()
-            };
-
-            let entry = serde_json::json!({
-                "filePath": path.to_string(),
-                "startPosition": type_ref.start_position,
-                "compositeTypeString": type_ref.composite_type_string,
-                "alias": final_alias
-            });
-
-            repo_type_map.entry(repo_prefix).or_default().push(entry);
-        }
-    }
-
-    /// Process both request and response types for an ApiEndpointDetails
-    pub fn process_api_detail_types(
-        &self,
-        api_detail: &ApiEndpointDetails,
-        repo_prefix: String,
-        repo_type_map: &mut HashMap<String, Vec<Value>>,
-    ) {
-        if let Some(req_type) = &api_detail.request_type {
-            self.add_type_to_repo_map(req_type, repo_prefix.clone(), repo_type_map);
-        }
-
-        if let Some(resp_type) = &api_detail.response_type {
-            self.add_type_to_repo_map(resp_type, repo_prefix, repo_type_map);
         }
     }
 }

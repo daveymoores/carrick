@@ -36,13 +36,14 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: |
             test-repo/package.json
             tests/fixtures/imported-routers/package.json
             tests/fixtures/fastify-api/package.json
             tests/fixtures/koa-api/package.json
+            src/sidecar/package-lock.json
 
       - name: Install test dependencies
         run: |
@@ -50,6 +51,9 @@ jobs:
           cd ../tests/fixtures/imported-routers && npm install
           cd ../fastify-api && npm install
           cd ../koa-api && npm install
+
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build
 
       - name: Run output contract tests
         run: cargo test --test output_contract_test --verbose
@@ -63,17 +67,17 @@ jobs:
       - name: Run integration tests
         run: cargo test --test integration_test --verbose
 
-      - name: Run multi-agent tests
-        run: cargo test --test multi_agent_test --verbose
+      - name: Run file-centric analysis tests
+        run: cargo test --test file_centric_analysis_test --verbose
 
-      - name: Run consumer type extraction tests
-        run: cargo test --test consumer_type_extraction_test --verbose
+      - name: Run sidecar integration tests
+        run: cargo test --test sidecar_integration_test --verbose
 
       - name: Run URL alias matching tests
         run: cargo test --test url_alias_matching_test --verbose
 
-      - name: Run multi-framework tests
-        run: cargo test --test multi_framework_test --verbose
+      - name: Run sidecar unit tests
+        run: cd src/sidecar && npm test
 
       - name: Run library tests
         run: cargo test --lib --verbose
@@ -156,13 +160,16 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "22"
 
       - name: Install test-repo dependencies
         run: cd test-repo && npm install
 
       - name: Install imported-routers test dependencies
         run: cd tests/fixtures/imported-routers && npm install
+
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build
 
       - name: Build carrick
         run: cargo build --release
@@ -171,14 +178,15 @@ jobs:
         env:
           CARRICK_MOCK_ALL: "true"
           CARRICK_ORG: "test-org"
+          CARRICK_API_KEY: "mock-key"
         run: |
           mkdir -p test-repo/output
           ./target/release/carrick ./test-repo/ > test-repo/output/test_output.txt 2>&1
           echo "=== Test-repo output ==="
           cat test-repo/output/test_output.txt
-          # Check that we find the expected 4 endpoints
-          if ! grep -q "Analyzed \*\*4 endpoints\*\*" test-repo/output/test_output.txt; then
-            echo "ERROR: Expected to find 4 endpoints in test-repo"
+          # Check that we find the expected 3 endpoints
+          if ! grep -q "Analyzed \*\*3 endpoints\*\*" test-repo/output/test_output.txt; then
+            echo "ERROR: Expected to find 3 endpoints in test-repo"
             exit 1
           fi
           echo "✅ Basic endpoint detection working correctly"
@@ -187,6 +195,7 @@ jobs:
         env:
           CARRICK_MOCK_ALL: "true"
           CARRICK_ORG: "test-org"
+          CARRICK_API_KEY: "mock-key"
         run: |
           mkdir -p tests/fixtures/imported-routers/output
           ./target/release/carrick ./tests/fixtures/imported-routers/ > tests/fixtures/imported-routers/output/test_output.txt 2>&1

@@ -37,6 +37,8 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         last_updated: Utc::now(),
         commit_hash: commit_hash.to_string(),
         mount_graph: None,
+        bundled_types: None,
+        type_manifest: None,
     }
 }
 
@@ -194,25 +196,6 @@ async fn test_upload_type_file() {
 
     // Then: it should succeed
     assert!(result.is_ok(), "Type file upload should succeed");
-}
-
-#[tokio::test]
-async fn test_download_type_file_content() {
-    // Given: a MockStorage instance
-    let storage = MockStorage::new();
-
-    // When: we download type file content
-    let result = storage
-        .download_type_file_content("s3://bucket/test-repo/types.ts")
-        .await;
-
-    // Then: it should return mock content
-    assert!(result.is_ok(), "Type file download should succeed");
-    let content = result.unwrap();
-    assert!(
-        content.contains("MockType"),
-        "Should contain mock type definition"
-    );
 }
 
 #[tokio::test]
