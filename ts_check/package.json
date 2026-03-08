@@ -11,6 +11,7 @@
   "license": "ISC",
   "description": "TypeScript type checking utilities for Carrick. Type extraction is now handled by the TypeSidecar (src/sidecar).",
   "dependencies": {
+    "@types/node": "^25.3.5",
     "ts-morph": "^25.0.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
