@@ -44,7 +44,7 @@ export interface LoadResult {
 const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
   target: 99, // ESNext
   module: 99, // ESNext
-  moduleResolution: 100, // NodeNext
+  moduleResolution: 99, // NodeNext
   strict: true,
   esModuleInterop: true,
   skipLibCheck: true,

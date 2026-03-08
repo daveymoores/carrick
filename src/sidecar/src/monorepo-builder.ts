@@ -651,20 +651,25 @@ export {};
     }
 
     // Look for errors related to this specific check
+    const escSrc = check.source_alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escTgt = check.target_alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const checkPattern = new RegExp(
-      `${check.source_alias}.*${check.target_alias}|${check.target_alias}.*${check.source_alias}`,
+      `${escSrc}.*${escTgt}|${escTgt}.*${escSrc}`,
       'i'
     );
 
     const isRelated = checkPattern.test(tscResult.output);
 
+    // If tsc failed but the error doesn't mention our aliases, treat as
+    // incompatible rather than silently reporting compatible (the check
+    // was not actually validated).
     return {
       source_repo: check.source_repo,
       source_alias: check.source_alias,
       target_repo: check.target_repo,
       target_alias: check.target_alias,
-      compatible: !isRelated,
-      diagnostic: isRelated ? tscResult.output : undefined,
+      compatible: false,
+      diagnostic: tscResult.output,
     };
   }
 
