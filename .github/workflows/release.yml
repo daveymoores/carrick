@@ -17,8 +17,6 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
-        with:
-          release-type: rust
 
   publish:
     needs: release-please
@@ -32,10 +30,23 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "18"
+          cache: "npm"
+          cache-dependency-path: src/sidecar/package-lock.json
 
       - name: Build binary
         env:
@@ -48,10 +59,10 @@ jobs:
 
       - name: Create release archive
         run: |
-          mkdir -p release
+          mkdir -p release/sidecar
           cp target/x86_64-unknown-linux-gnu/release/carrick release/
           cp -r ts_check release/
-          cp -r src/sidecar/dist release/sidecar
+          cp -r src/sidecar/dist release/sidecar/dist
           cp src/sidecar/package.json release/sidecar/
           cp src/sidecar/package-lock.json release/sidecar/
           cd release

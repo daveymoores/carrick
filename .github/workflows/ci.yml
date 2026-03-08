@@ -168,6 +168,9 @@ jobs:
       - name: Install imported-routers test dependencies
         run: cd tests/fixtures/imported-routers && npm install
 
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
       - name: Build carrick
         run: cargo build --release
 

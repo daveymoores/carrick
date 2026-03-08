@@ -40,7 +40,7 @@ runs:
 
     - name: Install ts_check dependencies
       shell: bash
-      run: cd ts_check && npm install
+      run: cd ts_check && npm ci
 
     - name: Install sidecar dependencies
       shell: bash

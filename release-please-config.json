@@ -10,6 +10,7 @@
         { "type": "refactor", "section": "Refactoring" },
         { "type": "perf", "section": "Performance" },
         { "type": "docs", "section": "Documentation" },
+        { "type": "ci", "section": "CI/CD" },
         { "type": "chore", "section": "Miscellaneous", "hidden": true }
       ]
     }
