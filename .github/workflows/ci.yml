@@ -36,7 +36,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: |
             test-repo/package.json
@@ -160,7 +160,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "22"
 
       - name: Install test-repo dependencies
         run: cd test-repo && npm install
@@ -178,6 +178,7 @@ jobs:
         env:
           CARRICK_MOCK_ALL: "true"
           CARRICK_ORG: "test-org"
+          CARRICK_API_KEY: "mock-key"
         run: |
           mkdir -p test-repo/output
           ./target/release/carrick ./test-repo/ > test-repo/output/test_output.txt 2>&1
@@ -194,6 +195,7 @@ jobs:
         env:
           CARRICK_MOCK_ALL: "true"
           CARRICK_ORG: "test-org"
+          CARRICK_API_KEY: "mock-key"
         run: |
           mkdir -p tests/fixtures/imported-routers/output
           ./target/release/carrick ./tests/fixtures/imported-routers/ > tests/fixtures/imported-routers/output/test_output.txt 2>&1
