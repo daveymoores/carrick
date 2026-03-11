@@ -1,10 +1,14 @@
+use crate::agent_service::AgentService;
+use crate::agents::file_orchestrator::FileOrchestrator;
+use crate::agents::framework_guidance_agent::{FrameworkGuidance, FrameworkGuidanceAgent};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
-    TypeManifestEntry,
+    TypeManifestEntry, get_current_commit_hash,
 };
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
+use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
@@ -20,10 +24,11 @@ use crate::type_manifest::{
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use swc_common::{
@@ -32,6 +37,9 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_visit::VisitWith;
+
+/// Current cache format version. Increment when FileAnalysisResult schema changes.
+const CACHE_VERSION: u32 = 1;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -86,24 +94,44 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // TODO we have no way of finding unique org names, so I think this will need to be a token
     let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
 
-    // Determine if we should upload based on branch/event type
     let should_upload = should_upload_data();
     println!(
         "Running Carrick in CI mode with org: {} (upload: {})",
         &carrick_org, should_upload
     );
 
+    // 1. Health check
     storage
         .health_check()
         .await
         .map_err(|e| format!("Failed to connect to AWS services: {}", e))?;
     println!("AWS connectivity verified");
 
-    // 1. Analyze current repo only (with optional sidecar for type resolution)
-    let current_repo_data = analyze_current_repo(repo_path, sidecar).await?;
+    // 2. Download all repos (moved earlier for incremental cache lookup)
+    let (mut all_repo_data, _repo_s3_urls) = storage
+        .download_all_repo_data(&carrick_org)
+        .await
+        .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
+
+    // 3. Extract previous data for current repo (if any)
+    let repo_name = get_repository_name(repo_path);
+    let previous_data = all_repo_data
+        .iter()
+        .find(|r| r.repo_name == repo_name)
+        .cloned();
+
+    if previous_data.is_some() {
+        println!(
+            "[incremental] Found previous analysis data for {}",
+            repo_name
+        );
+    }
+
+    // 4. Analyze (incremental if possible)
+    let current_repo_data =
+        analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref()).await?;
     println!("Analyzed current repo: {}", current_repo_data.repo_name);
 
     // Log sidecar type resolution results if available
@@ -123,7 +151,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
         );
     }
 
-    // 2. Conditionally upload current repo data to cloud storage
+    // 5. Conditionally upload current repo data to cloud storage
     if should_upload {
         let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
         storage
@@ -135,12 +163,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
         println!("Skipping upload (PR/branch mode - analyzing only)");
     }
 
-    // 3. Download data from all repos
-    let (mut all_repo_data, _repo_s3_urls) = storage // Updated to destructure tuple
-        .download_all_repo_data(&carrick_org)
-        .await
-        .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
-
+    // 6. Cross-repo analysis (reuse already-downloaded data)
     // Remove current repo from cross-repo data to prevent duplicate processing
     let current_repo_name = &current_repo_data.repo_name;
     all_repo_data.retain(|repo| &repo.repo_name != current_repo_name);
@@ -151,14 +174,10 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
         current_repo_name
     );
 
-    // 4. Reconstruct analyzer with combined data (including current repo)
     let analyzer = build_cross_repo_analyzer(all_repo_data, current_repo_data).await?;
     println!("Reconstructed analyzer with cross-repo data");
 
-    // 5. Run analysis
     let results = analyzer.get_results();
-
-    // 6. Print results
     print_results(results);
 
     Ok(())
@@ -221,7 +240,8 @@ where
     Ok(T::default())
 }
 
-/// Remove AST nodes from CloudRepoData for serialization
+/// Remove AST nodes from CloudRepoData for serialization.
+/// Also enforces payload size limit for Lambda (6MB) — drops file_results if too large.
 fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     fn strip_endpoint_ast(endpoint: &mut ApiEndpointDetails) {
         endpoint.request_type = None;
@@ -230,10 +250,529 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
 
     data.endpoints.iter_mut().for_each(strip_endpoint_ast);
     data.calls.iter_mut().for_each(strip_endpoint_ast);
+
+    // Payload size guard: Lambda function URLs have a 6MB request payload limit.
+    // If serialized data exceeds ~5MB, drop file_results to stay under the limit.
+    const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
+    if let Ok(serialized) = serde_json::to_string(&data) {
+        if serialized.len() > MAX_PAYLOAD_BYTES {
+            println!(
+                "[incremental] WARNING: Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
+                serialized.len() / 1024,
+                MAX_PAYLOAD_BYTES / 1024
+            );
+            data.file_results = None;
+            data.cached_detection = None;
+            data.cached_guidance = None;
+        }
+    }
+
     data
 }
 
-/// Find the generated TypeScript file for the repo (heuristic: look for ts_check/output/*.ts)
+/// Get files changed between a base commit and HEAD.
+/// Returns relative paths matching the file discovery format.
+fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-only", base_commit, "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!(
+            "[incremental] git diff failed (shallow clone?): {}",
+            stderr.trim()
+        );
+        println!("[incremental] Set fetch-depth: 0 in your workflow for incremental mode.");
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let changed: Vec<String> = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let ext = Path::new(line)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            matches!(ext, "ts" | "tsx" | "js" | "jsx")
+        })
+        .map(|line| line.to_string())
+        .collect();
+
+    Some(changed)
+}
+
+/// Hash file content for cache invalidation (package.json).
+fn hash_file_content(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Normalize file_results keys to be relative to repo root.
+/// This ensures cache key consistency between runs.
+fn normalize_file_results_keys(
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
+) -> HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult> {
+    let repo_prefix = if repo_path.ends_with('/') {
+        repo_path.to_string()
+    } else {
+        format!("{}/", repo_path)
+    };
+
+    file_results
+        .iter()
+        .map(|(key, value)| {
+            let normalized_key = key
+                .strip_prefix(&repo_prefix)
+                .or_else(|| key.strip_prefix("./"))
+                .unwrap_or(key)
+                .to_string();
+            (normalized_key, value.clone())
+        })
+        .collect()
+}
+
+/// Strip diagnostic-only fields from file_results before caching.
+/// These fields are not needed by build_mount_graph() or collect_type_requests().
+fn strip_diagnostic_fields(
+    file_results: &mut HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    for result in file_results.values_mut() {
+        for endpoint in &mut result.endpoints {
+            endpoint.candidate_id = String::new();
+            endpoint.pattern_matched = String::new();
+            endpoint.payload_expression_text = None;
+            endpoint.response_expression_text = None;
+        }
+        for data_call in &mut result.data_calls {
+            data_call.candidate_id = String::new();
+            data_call.pattern_matched = String::new();
+            data_call.call_expression_text = None;
+            data_call.payload_expression_text = None;
+        }
+        for mount in &mut result.mounts {
+            mount.pattern_matched = String::new();
+        }
+    }
+}
+
+/// Incremental analysis: reuse cached per-file LLM results for unchanged files.
+async fn analyze_current_repo_incremental(
+    repo_path: &str,
+    sidecar: Option<&TypeSidecar>,
+    previous_data: Option<&CloudRepoData>,
+) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+
+    // Canonicalize repo_path for consistent path normalization between runs
+    let canonical = std::fs::canonicalize(repo_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| repo_path.to_string());
+    let repo_path = canonical.as_str();
+
+    // 1. Discover files and symbols (fast SWC pass, always full)
+    let cm: Lrc<SourceMap> = Default::default();
+    let (files, all_imported_symbols, function_definitions, repo_name) =
+        discover_files_and_symbols(repo_path, cm.clone())?;
+
+    // 2. Load config and packages
+    let (config, packages) = load_config_and_packages(repo_path)?;
+
+    // 3. Check if we can use incremental mode
+    let can_use_incremental = previous_data
+        .and_then(|prev| {
+            // Must have file_results and matching cache_version
+            let has_cache = prev.file_results.is_some();
+            let version_matches = prev.cache_version == Some(CACHE_VERSION);
+            if has_cache && version_matches {
+                Some(prev)
+            } else {
+                if !has_cache {
+                    println!("[incremental] No cached file_results found, running full analysis");
+                }
+                if !version_matches {
+                    println!(
+                        "[incremental] Cache version mismatch (expected {}, got {:?}), running full analysis",
+                        CACHE_VERSION,
+                        prev.cache_version
+                    );
+                }
+                None
+            }
+        });
+
+    if let Some(prev) = can_use_incremental {
+        let prev_commit = &prev.commit_hash;
+        println!(
+            "[incremental] Found previous analysis (commit {})",
+            &prev_commit[..std::cmp::min(7, prev_commit.len())]
+        );
+
+        // Get changed files via git diff
+        if let Some(changed_files) = get_changed_files(repo_path, prev_commit) {
+            let prev_file_results = prev.file_results.as_ref().unwrap();
+            let repo_prefix = format!("{}/", repo_path);
+
+            // Helper to normalize a file path to repo-relative
+            let normalize_path = |f: &PathBuf| -> String {
+                let s = f.to_string_lossy();
+                if let Some(stripped) = s.strip_prefix(&repo_prefix) {
+                    stripped.to_string()
+                } else if let Some(stripped) = s.strip_prefix("./") {
+                    stripped.to_string()
+                } else {
+                    s.to_string()
+                }
+            };
+
+            // Build set of currently discovered file paths (normalized to relative)
+            let current_file_set: HashSet<String> = files.iter().map(&normalize_path).collect();
+
+            // Normalize changed files relative to repo root
+            let changed_set: HashSet<String> = changed_files.into_iter().collect();
+
+            // Partition: which files need fresh analysis?
+            let files_to_analyze: Vec<PathBuf> = files
+                .iter()
+                .filter(|f| {
+                    let relative = normalize_path(f);
+                    changed_set.contains(&relative) || !prev_file_results.contains_key(&relative)
+                })
+                .cloned()
+                .collect();
+
+            let total_files = files.len();
+            let changed_count = files_to_analyze.len();
+            let reused_count = total_files - changed_count;
+
+            println!(
+                "[incremental] Detected {} changed file(s) out of {}",
+                changed_count, total_files
+            );
+            println!(
+                "[incremental] Reusing cached results for {} files",
+                reused_count
+            );
+
+            // Check if package.json changed → need fresh framework detection/guidance
+            let current_pkg_hash = packages
+                .package_jsons
+                .first()
+                .and_then(|_| {
+                    serde_json::to_string(&packages)
+                        .ok()
+                        .map(|s| hash_file_content(&s))
+                })
+                .unwrap_or_default();
+
+            let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
+
+            let api_key = env::var("CARRICK_API_KEY")
+                .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
+
+            // Get framework detection and guidance (cached or fresh)
+            let (detection, guidance) = if !pkg_changed {
+                if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
+                    println!("[incremental] Reusing cached framework detection and guidance");
+                    (det.clone(), guid.clone())
+                } else {
+                    run_framework_detection_and_guidance(&api_key, &packages, &all_imported_symbols)
+                        .await?
+                }
+            } else {
+                println!("[incremental] package.json changed, re-running framework detection");
+                run_framework_detection_and_guidance(&api_key, &packages, &all_imported_symbols)
+                    .await?
+            };
+
+            // Run Gemini file analysis ONLY on changed files
+            if changed_count > 0 {
+                println!(
+                    "[incremental] Running LLM analysis on {} changed file(s)...",
+                    changed_count
+                );
+            }
+
+            let agent_service = AgentService::new(api_key.clone());
+            let file_orchestrator = FileOrchestrator::new(agent_service);
+
+            let new_file_results = if !files_to_analyze.is_empty() {
+                let result = file_orchestrator
+                    .analyze_files(&files_to_analyze, &guidance, &detection)
+                    .await?;
+                result.file_results
+            } else {
+                HashMap::new()
+            };
+
+            // Merge: start with previous, remove deleted files, update changed
+            let mut merged_results: HashMap<
+                String,
+                crate::agents::file_analyzer_agent::FileAnalysisResult,
+            > = HashMap::new();
+
+            // Copy cached results for unchanged files that still exist
+            for (path, result) in prev_file_results {
+                if current_file_set.contains(path) && !changed_set.contains(path) {
+                    merged_results.insert(path.clone(), result.clone());
+                }
+            }
+
+            // Normalize and insert new results
+            let normalized_new = normalize_file_results_keys(&new_file_results, repo_path);
+            for (path, result) in normalized_new {
+                merged_results.insert(path, result);
+            }
+
+            // Rebuild mount graph from full merged results
+            let agent_service_for_graph = AgentService::new(api_key.clone());
+            let graph_orchestrator = FileOrchestrator::new(agent_service_for_graph);
+            let mount_graph = graph_orchestrator.build_mount_graph(&merged_results);
+
+            let elapsed = start.elapsed();
+            println!(
+                "[incremental] Analysis complete in {:.1}s",
+                elapsed.as_secs_f64()
+            );
+
+            // Build CloudRepoData with merged results
+            let mut cloud_data = build_cloud_data_from_mount_graph(
+                &repo_name,
+                &mount_graph,
+                &config,
+                &packages,
+                function_definitions,
+            );
+
+            // Populate cache fields
+            let mut cached_file_results = merged_results.clone();
+            strip_diagnostic_fields(&mut cached_file_results);
+            cloud_data.file_results = Some(cached_file_results);
+            cloud_data.cached_detection = Some(detection);
+            cloud_data.cached_guidance = Some(guidance);
+            cloud_data.package_json_hash = Some(current_pkg_hash);
+            cloud_data.cache_version = Some(CACHE_VERSION);
+
+            // Build type manifest
+            let manifest_entries = build_type_manifest_entries(&mount_graph, &config);
+            if !manifest_entries.is_empty() {
+                cloud_data.type_manifest = Some(manifest_entries);
+            }
+
+            // Type resolution via sidecar
+            resolve_types_if_available(
+                sidecar,
+                &file_orchestrator,
+                &merged_results,
+                repo_path,
+                &packages,
+                &mount_graph,
+                &config,
+                &mut cloud_data,
+            );
+
+            if let Some(bundled_types) = cloud_data.bundled_types.take() {
+                let updated =
+                    append_missing_aliases(bundled_types, cloud_data.type_manifest.as_ref());
+                cloud_data.bundled_types = Some(updated);
+            }
+
+            return Ok(cloud_data);
+        } else {
+            println!("[incremental] git diff failed, falling back to full analysis");
+        }
+    }
+
+    // Fallback: full analysis (analyze_current_repo now populates cache fields)
+    println!("[incremental] Running full analysis...");
+    let cloud_data = analyze_current_repo(repo_path, sidecar).await?;
+
+    let elapsed = start.elapsed();
+    println!(
+        "[incremental] Full analysis complete in {:.1}s",
+        elapsed.as_secs_f64()
+    );
+
+    Ok(cloud_data)
+}
+
+/// Run framework detection and guidance generation.
+async fn run_framework_detection_and_guidance(
+    api_key: &str,
+    packages: &Packages,
+    imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
+) -> Result<(DetectionResult, FrameworkGuidance), Box<dyn std::error::Error>> {
+    let agent_service = AgentService::new(api_key.to_string());
+    let framework_detector = FrameworkDetector::new(agent_service.clone());
+    let detection = framework_detector
+        .detect_frameworks_and_libraries(packages, imported_symbols)
+        .await?;
+
+    let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
+    let guidance = guidance_agent.generate_guidance(&detection).await?;
+
+    Ok((detection, guidance))
+}
+
+/// Build CloudRepoData from a mount graph (used by incremental path).
+fn build_cloud_data_from_mount_graph(
+    repo_name: &str,
+    mount_graph: &MountGraph,
+    config: &Config,
+    packages: &Packages,
+    function_definitions: HashMap<String, FunctionDefinition>,
+) -> CloudRepoData {
+    let config_json = serde_json::to_string(config).ok();
+    let service_name = config_json.as_ref().and_then(|json| {
+        serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|v| {
+                v.get("serviceName")
+                    .and_then(|s| s.as_str())
+                    .map(String::from)
+            })
+    });
+
+    let endpoints: Vec<ApiEndpointDetails> = mount_graph
+        .get_resolved_endpoints()
+        .iter()
+        .map(|endpoint| ApiEndpointDetails {
+            owner: Some(crate::visitor::OwnerType::App(endpoint.owner.clone())),
+            route: endpoint.full_path.clone(),
+            method: endpoint.method.clone(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: endpoint.handler.clone(),
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(&endpoint.file_location),
+        })
+        .collect();
+
+    let calls: Vec<ApiEndpointDetails> = mount_graph
+        .get_data_calls()
+        .iter()
+        .map(|call| ApiEndpointDetails {
+            owner: None,
+            route: call.target_url.clone(),
+            method: call.method.clone(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: Some(call.client.clone()),
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(&call.file_location),
+        })
+        .collect();
+
+    let mounts: Vec<crate::visitor::Mount> = mount_graph
+        .get_mounts()
+        .iter()
+        .map(|mount| crate::visitor::Mount {
+            parent: crate::visitor::OwnerType::App(mount.parent.clone()),
+            child: crate::visitor::OwnerType::Router(mount.child.clone()),
+            prefix: mount.path_prefix.clone(),
+        })
+        .collect();
+
+    println!("Created CloudRepoData from incremental analysis:");
+    println!("  - {} endpoints", endpoints.len());
+    println!("  - {} calls", calls.len());
+    println!("  - {} mounts", mounts.len());
+
+    CloudRepoData {
+        repo_name: repo_name.to_string(),
+        service_name,
+        endpoints,
+        calls,
+        mounts,
+        apps: HashMap::new(),
+        imported_handlers: vec![],
+        function_definitions,
+        config_json,
+        package_json: serde_json::to_string(packages).ok(),
+        packages: Some(packages.clone()),
+        last_updated: chrono::Utc::now(),
+        commit_hash: get_current_commit_hash(),
+        mount_graph: Some(mount_graph.clone()),
+        bundled_types: None,
+        type_manifest: None,
+        file_results: None,
+        cached_detection: None,
+        cached_guidance: None,
+        package_json_hash: None,
+        cache_version: None,
+    }
+}
+
+/// Resolve types via sidecar if available (shared logic for full and incremental paths).
+#[allow(clippy::too_many_arguments)]
+fn resolve_types_if_available(
+    sidecar: Option<&TypeSidecar>,
+    file_orchestrator: &FileOrchestrator,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
+    packages: &Packages,
+    mount_graph: &MountGraph,
+    config: &Config,
+    cloud_data: &mut CloudRepoData,
+) {
+    let Some(sidecar) = sidecar else { return };
+
+    println!("\n=== Sidecar Type Resolution ===");
+    match sidecar.wait_ready(Duration::from_secs(10)) {
+        Ok(()) => {
+            match file_orchestrator.resolve_types_with_sidecar(
+                sidecar,
+                file_results,
+                repo_path,
+                packages,
+                mount_graph,
+                config,
+            ) {
+                Ok(type_resolution) => {
+                    println!(
+                        "Type resolution successful: {} explicit, {} inferred, {} failures",
+                        type_resolution.explicit_manifest.len(),
+                        type_resolution.inferred_types.len(),
+                        type_resolution.symbol_failures.len()
+                    );
+                    cloud_data.bundled_types = type_resolution.dts_content.clone();
+                    if let Some(ref mut manifest) = cloud_data.type_manifest {
+                        enrich_manifest_with_type_resolution(
+                            manifest,
+                            &type_resolution,
+                            type_resolution.dts_content.as_deref(),
+                        );
+                    }
+                    for failure in &type_resolution.symbol_failures {
+                        eprintln!(
+                            "[Sidecar] Failed to resolve symbol '{}' from '{}': {}",
+                            failure.symbol_name, failure.source_file, failure.reason
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Sidecar] Type resolution failed: {}", e);
+                    eprintln!("[Sidecar] Continuing without bundled types");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[Sidecar] Sidecar not ready: {}", e);
+            eprintln!("[Sidecar] Skipping type resolution");
+        }
+    }
+}
+
 /// Discover files and extract symbols for MultiAgentOrchestrator
 fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -523,6 +1062,12 @@ async fn analyze_current_repo(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+    // Canonicalize repo_path for consistent path normalization between runs
+    let canonical = std::fs::canonicalize(repo_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| repo_path.to_string());
+    let repo_path = canonical.as_str();
+
     println!(
         "---> Running multi-agent framework-agnostic analysis on: {}",
         repo_path
@@ -545,7 +1090,7 @@ async fn analyze_current_repo(
     // 3. Get API key and create MultiAgentOrchestrator
     let api_key = env::var("CARRICK_API_KEY")
         .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
-    let orchestrator = MultiAgentOrchestrator::new(api_key, cm.clone());
+    let orchestrator = MultiAgentOrchestrator::new(api_key.clone(), cm.clone());
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
@@ -567,73 +1112,38 @@ async fn analyze_current_repo(
         cloud_data.type_manifest = Some(manifest_entries);
     }
 
-    // 6. Resolve types using sidecar if available (Phase 2.4)
-    if let Some(sidecar) = sidecar {
-        println!("\n=== Sidecar Type Resolution (Phase 2.4) ===");
+    // 6. Resolve types using sidecar if available
+    let agent_service = AgentService::new(api_key);
+    let file_orchestrator = FileOrchestrator::new(agent_service);
 
-        // Wait for sidecar to be ready (it should be by now, but ensure it)
-        match sidecar.wait_ready(Duration::from_secs(10)) {
-            Ok(()) => {
-                // Create FileOrchestrator to use its type resolution method
-                let api_key = env::var("CARRICK_API_KEY").unwrap_or_default();
-                let agent_service = crate::agent_service::AgentService::new(api_key);
-                let file_orchestrator =
-                    crate::agents::file_orchestrator::FileOrchestrator::new(agent_service);
-
-                // Resolve types using sidecar
-                match file_orchestrator.resolve_types_with_sidecar(
-                    sidecar,
-                    &analysis_result.file_results,
-                    repo_path,
-                    &packages,
-                    &analysis_result.mount_graph,
-                    &config,
-                ) {
-                    Ok(type_resolution) => {
-                        println!(
-                            "Type resolution successful: {} explicit, {} inferred, {} failures",
-                            type_resolution.explicit_manifest.len(),
-                            type_resolution.inferred_types.len(),
-                            type_resolution.symbol_failures.len()
-                        );
-
-                        // Phase 2.5: Populate CloudRepoData with bundled types
-                        cloud_data.bundled_types = type_resolution.dts_content.clone();
-
-                        // Phase 2.6: Enrich manifest entries with type resolution results
-                        if let Some(ref mut manifest) = cloud_data.type_manifest {
-                            enrich_manifest_with_type_resolution(
-                                manifest,
-                                &type_resolution,
-                                type_resolution.dts_content.as_deref(),
-                            );
-                        }
-
-                        // Log any failures for debugging
-                        for failure in &type_resolution.symbol_failures {
-                            eprintln!(
-                                "[Sidecar] Failed to resolve symbol '{}' from '{}': {}",
-                                failure.symbol_name, failure.source_file, failure.reason
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[Sidecar] Type resolution failed: {}", e);
-                        eprintln!("[Sidecar] Continuing without bundled types");
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[Sidecar] Sidecar not ready: {}", e);
-                eprintln!("[Sidecar] Skipping type resolution");
-            }
-        }
-    }
+    resolve_types_if_available(
+        sidecar,
+        &file_orchestrator,
+        &analysis_result.file_results,
+        repo_path,
+        &packages,
+        &analysis_result.mount_graph,
+        &config,
+        &mut cloud_data,
+    );
 
     if let Some(bundled_types) = cloud_data.bundled_types.take() {
         let updated = append_missing_aliases(bundled_types, cloud_data.type_manifest.as_ref());
         cloud_data.bundled_types = Some(updated);
     }
+
+    // 7. Populate cache fields for future incremental runs
+    let mut cached_file_results = analysis_result.file_results.clone();
+    let normalized = normalize_file_results_keys(&cached_file_results, repo_path);
+    cached_file_results = normalized;
+    strip_diagnostic_fields(&mut cached_file_results);
+    cloud_data.file_results = Some(cached_file_results);
+    cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
+    cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
+    cloud_data.cache_version = Some(CACHE_VERSION);
+    cloud_data.package_json_hash = serde_json::to_string(&packages)
+        .ok()
+        .map(|s| hash_file_content(&s));
 
     Ok(cloud_data)
 }
@@ -966,6 +1476,11 @@ mod tests {
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            package_json_hash: None,
+            cache_version: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -999,6 +1514,11 @@ mod tests {
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            package_json_hash: None,
+            cache_version: None,
         }];
 
         // Test Config merging
@@ -1067,6 +1587,11 @@ mod tests {
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            package_json_hash: None,
+            cache_version: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -1081,5 +1606,558 @@ mod tests {
         let analyzer = result.unwrap();
         assert_eq!(analyzer.endpoints.len(), 1);
         assert_eq!(analyzer.calls.len(), 1);
+    }
+
+    // === Incremental analysis tests ===
+
+    use crate::agents::file_analyzer_agent::{
+        DataCallResult, EndpointResult, FileAnalysisResult, MountResult,
+    };
+
+    fn make_file_result(endpoints: Vec<&str>, data_calls: Vec<&str>) -> FileAnalysisResult {
+        FileAnalysisResult {
+            mounts: vec![],
+            endpoints: endpoints
+                .into_iter()
+                .map(|path| EndpointResult {
+                    candidate_id: "cand_123".to_string(),
+                    line_number: 10,
+                    owner_node: "app".to_string(),
+                    method: "GET".to_string(),
+                    path: path.to_string(),
+                    handler_name: "handler".to_string(),
+                    pattern_matched: "app.get(...)".to_string(),
+                    call_expression_span_start: Some(100),
+                    call_expression_span_end: Some(200),
+                    payload_expression_text: Some("req.body".to_string()),
+                    payload_expression_line: Some(11),
+                    response_expression_text: Some("res.json(data)".to_string()),
+                    response_expression_line: Some(12),
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                })
+                .collect(),
+            data_calls: data_calls
+                .into_iter()
+                .map(|target| DataCallResult {
+                    candidate_id: "cand_456".to_string(),
+                    line_number: 20,
+                    target: target.to_string(),
+                    method: Some("GET".to_string()),
+                    pattern_matched: "fetch(...)".to_string(),
+                    call_expression_span_start: Some(300),
+                    call_expression_span_end: Some(400),
+                    call_expression_text: Some("fetch('/api')".to_string()),
+                    call_expression_line: Some(21),
+                    payload_expression_text: Some("body".to_string()),
+                    payload_expression_line: Some(22),
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_hash_file_content_deterministic() {
+        let hash1 = hash_file_content("hello world");
+        let hash2 = hash_file_content("hello world");
+        assert_eq!(hash1, hash2);
+
+        let hash3 = hash_file_content("different content");
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_normalize_file_results_keys_absolute_path() {
+        let mut results = HashMap::new();
+        results.insert(
+            "/home/user/repo/src/app.ts".to_string(),
+            make_file_result(vec!["/api/users"], vec![]),
+        );
+        results.insert(
+            "/home/user/repo/src/routes.ts".to_string(),
+            make_file_result(vec!["/api/posts"], vec![]),
+        );
+
+        let normalized = normalize_file_results_keys(&results, "/home/user/repo");
+
+        assert!(normalized.contains_key("src/app.ts"));
+        assert!(normalized.contains_key("src/routes.ts"));
+        assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn test_normalize_file_results_keys_dot_prefix() {
+        let mut results = HashMap::new();
+        results.insert(
+            "./src/app.ts".to_string(),
+            make_file_result(vec!["/api/users"], vec![]),
+        );
+
+        let normalized = normalize_file_results_keys(&results, ".");
+
+        assert!(normalized.contains_key("src/app.ts"));
+    }
+
+    #[test]
+    fn test_normalize_file_results_keys_already_relative() {
+        let mut results = HashMap::new();
+        results.insert(
+            "src/app.ts".to_string(),
+            make_file_result(vec!["/api/users"], vec![]),
+        );
+
+        let normalized = normalize_file_results_keys(&results, "/some/other/path");
+
+        // Key doesn't match prefix, should be kept as-is
+        assert!(normalized.contains_key("src/app.ts"));
+    }
+
+    #[test]
+    fn test_strip_diagnostic_fields() {
+        let mut results = HashMap::new();
+        results.insert(
+            "src/app.ts".to_string(),
+            make_file_result(vec!["/api/users"], vec!["/api/posts"]),
+        );
+
+        // Add a mount with pattern_matched
+        results
+            .get_mut("src/app.ts")
+            .unwrap()
+            .mounts
+            .push(MountResult {
+                line_number: 5,
+                parent_node: "app".to_string(),
+                child_node: "router".to_string(),
+                mount_path: "/api".to_string(),
+                import_source: Some("./routes".to_string()),
+                pattern_matched: "app.use('/api', router)".to_string(),
+            });
+
+        strip_diagnostic_fields(&mut results);
+
+        let result = &results["src/app.ts"];
+
+        // Endpoint diagnostic fields should be cleared
+        assert_eq!(result.endpoints[0].candidate_id, "");
+        assert_eq!(result.endpoints[0].pattern_matched, "");
+        assert!(result.endpoints[0].payload_expression_text.is_none());
+        assert!(result.endpoints[0].response_expression_text.is_none());
+        // Non-diagnostic fields should be preserved
+        assert_eq!(result.endpoints[0].path, "/api/users");
+        assert_eq!(result.endpoints[0].method, "GET");
+        assert_eq!(result.endpoints[0].handler_name, "handler");
+        assert_eq!(result.endpoints[0].line_number, 10);
+
+        // Data call diagnostic fields should be cleared
+        assert_eq!(result.data_calls[0].candidate_id, "");
+        assert_eq!(result.data_calls[0].pattern_matched, "");
+        assert!(result.data_calls[0].call_expression_text.is_none());
+        assert!(result.data_calls[0].payload_expression_text.is_none());
+        // Non-diagnostic fields preserved
+        assert_eq!(result.data_calls[0].target, "/api/posts");
+
+        // Mount diagnostic fields should be cleared
+        assert_eq!(result.mounts[0].pattern_matched, "");
+        // Non-diagnostic fields preserved
+        assert_eq!(result.mounts[0].mount_path, "/api");
+        assert_eq!(result.mounts[0].parent_node, "app");
+    }
+
+    #[test]
+    fn test_get_changed_files_with_real_git_repo() {
+        use std::process::Command;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_path = temp_dir.path().to_str().unwrap();
+
+        // Init a git repo
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Create initial commit with a .ts file
+        std::fs::write(temp_dir.path().join("app.ts"), "const x = 1;").unwrap();
+        std::fs::write(temp_dir.path().join("readme.md"), "# Readme").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Get the first commit hash
+        let base_hash = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo_path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Make changes: modify .ts, add new .tsx, modify .md (should be filtered)
+        std::fs::write(temp_dir.path().join("app.ts"), "const x = 2;").unwrap();
+        std::fs::write(
+            temp_dir.path().join("new.tsx"),
+            "export default () => <div/>;",
+        )
+        .unwrap();
+        std::fs::write(temp_dir.path().join("readme.md"), "# Updated").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "changes"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Test get_changed_files
+        let changed = get_changed_files(repo_path, &base_hash);
+        assert!(changed.is_some());
+
+        let changed = changed.unwrap();
+        assert!(changed.contains(&"app.ts".to_string()));
+        assert!(changed.contains(&"new.tsx".to_string()));
+        // .md file should be filtered out
+        assert!(!changed.contains(&"readme.md".to_string()));
+    }
+
+    #[test]
+    fn test_get_changed_files_returns_none_for_invalid_commit() {
+        use std::process::Command;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_path = temp_dir.path().to_str().unwrap();
+
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        std::fs::write(temp_dir.path().join("app.ts"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Non-existent commit hash → should return None (simulates shallow clone)
+        let result = get_changed_files(repo_path, "0000000000000000000000000000000000000000");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_payload_size_guard_drops_file_results_when_too_large() {
+        // Create CloudRepoData with large file_results
+        let mut large_results = HashMap::new();
+        // Create entries large enough to exceed 5MB
+        for i in 0..1000 {
+            let large_string = "x".repeat(5000);
+            large_results.insert(
+                format!("src/file_{}.ts", i),
+                FileAnalysisResult {
+                    mounts: vec![],
+                    endpoints: vec![EndpointResult {
+                        candidate_id: large_string.clone(),
+                        line_number: 1,
+                        owner_node: "app".to_string(),
+                        method: "GET".to_string(),
+                        path: large_string.clone(),
+                        handler_name: large_string.clone(),
+                        pattern_matched: large_string.clone(),
+                        call_expression_span_start: None,
+                        call_expression_span_end: None,
+                        payload_expression_text: Some(large_string.clone()),
+                        payload_expression_line: None,
+                        response_expression_text: Some(large_string),
+                        response_expression_line: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    }],
+                    data_calls: vec![],
+                },
+            );
+        }
+
+        let data = CloudRepoData {
+            repo_name: "test-repo".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: Some(large_results),
+            cached_detection: None,
+            cached_guidance: None,
+            package_json_hash: None,
+            cache_version: Some(CACHE_VERSION),
+        };
+
+        let stripped = strip_ast_nodes(data);
+
+        // file_results should be dropped because payload exceeds 5MB
+        assert!(
+            stripped.file_results.is_none(),
+            "file_results should be dropped when payload exceeds 5MB"
+        );
+    }
+
+    #[test]
+    fn test_payload_size_guard_keeps_small_file_results() {
+        let mut small_results = HashMap::new();
+        small_results.insert(
+            "src/app.ts".to_string(),
+            make_file_result(vec!["/api/users"], vec![]),
+        );
+
+        let data = CloudRepoData {
+            repo_name: "test-repo".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: Some(small_results),
+            cached_detection: None,
+            cached_guidance: None,
+            package_json_hash: None,
+            cache_version: Some(CACHE_VERSION),
+        };
+
+        let stripped = strip_ast_nodes(data);
+
+        // file_results should be preserved (small payload)
+        assert!(
+            stripped.file_results.is_some(),
+            "file_results should be preserved when payload is small"
+        );
+    }
+
+    #[test]
+    fn test_file_results_merge_handles_deletes_and_additions() {
+        // Simulate: previous run had files A, B, C
+        // Current run discovers A, B, D (C deleted, D new)
+        // Git diff says B changed
+        let mut prev_results = HashMap::new();
+        prev_results.insert(
+            "src/a.ts".to_string(),
+            make_file_result(vec!["/api/a"], vec![]),
+        );
+        prev_results.insert(
+            "src/b.ts".to_string(),
+            make_file_result(vec!["/api/b"], vec![]),
+        );
+        prev_results.insert(
+            "src/c.ts".to_string(),
+            make_file_result(vec!["/api/c"], vec![]),
+        );
+
+        // Current file discovery
+        let current_file_set: HashSet<String> = ["src/a.ts", "src/b.ts", "src/d.ts"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let changed_set: HashSet<String> = ["src/b.ts"].iter().map(|s| s.to_string()).collect();
+
+        // New results from analyzing changed + new files
+        let mut new_results = HashMap::new();
+        new_results.insert(
+            "src/b.ts".to_string(),
+            make_file_result(vec!["/api/b_v2"], vec![]),
+        );
+        new_results.insert(
+            "src/d.ts".to_string(),
+            make_file_result(vec!["/api/d"], vec![]),
+        );
+
+        // Merge logic (mirrors analyze_current_repo_incremental)
+        let mut merged: HashMap<String, FileAnalysisResult> = HashMap::new();
+
+        // Copy cached results for unchanged files that still exist
+        for (path, result) in &prev_results {
+            if current_file_set.contains(path) && !changed_set.contains(path) {
+                merged.insert(path.clone(), result.clone());
+            }
+        }
+
+        // Insert new/changed results
+        for (path, result) in new_results {
+            merged.insert(path, result);
+        }
+
+        // Verify merge result
+        assert_eq!(
+            merged.len(),
+            3,
+            "Should have A (cached), B (fresh), D (new)"
+        );
+        assert!(merged.contains_key("src/a.ts"), "A should be cached");
+        assert!(merged.contains_key("src/b.ts"), "B should be fresh");
+        assert!(merged.contains_key("src/d.ts"), "D should be new");
+        assert!(!merged.contains_key("src/c.ts"), "C should be deleted");
+
+        // A should have old data
+        assert_eq!(merged["src/a.ts"].endpoints[0].path, "/api/a");
+        // B should have new data
+        assert_eq!(merged["src/b.ts"].endpoints[0].path, "/api/b_v2");
+        // D should have new data
+        assert_eq!(merged["src/d.ts"].endpoints[0].path, "/api/d");
+    }
+
+    #[test]
+    fn test_file_results_serialization_roundtrip() {
+        // Verify FileAnalysisResult survives JSON serialization (critical for AWS cache)
+        let result = make_file_result(vec!["/api/users", "/api/posts"], vec!["/external/api"]);
+
+        let json = serde_json::to_string(&result).expect("should serialize");
+        let deserialized: FileAnalysisResult =
+            serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(deserialized.endpoints.len(), 2);
+        assert_eq!(deserialized.data_calls.len(), 1);
+        assert_eq!(deserialized.endpoints[0].path, "/api/users");
+        assert_eq!(deserialized.data_calls[0].target, "/external/api");
+    }
+
+    #[test]
+    fn test_cloud_repo_data_with_file_results_roundtrip() {
+        // Verify CloudRepoData with file_results survives JSON roundtrip
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/app.ts".to_string(),
+            make_file_result(vec!["/api/users"], vec![]),
+        );
+
+        let data = CloudRepoData {
+            repo_name: "test-repo".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "abc123".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: Some(file_results),
+            cached_detection: Some(DetectionResult {
+                frameworks: vec!["express".to_string()],
+                data_fetchers: vec!["fetch".to_string()],
+                notes: "test".to_string(),
+            }),
+            cached_guidance: None,
+            package_json_hash: Some("abc123hash".to_string()),
+            cache_version: Some(CACHE_VERSION),
+        };
+
+        let json = serde_json::to_string(&data).expect("should serialize");
+        let deserialized: CloudRepoData = serde_json::from_str(&json).expect("should deserialize");
+
+        assert!(deserialized.file_results.is_some());
+        let fr = deserialized.file_results.unwrap();
+        assert!(fr.contains_key("src/app.ts"));
+        assert_eq!(fr["src/app.ts"].endpoints[0].path, "/api/users");
+
+        assert!(deserialized.cached_detection.is_some());
+        assert_eq!(
+            deserialized.cached_detection.unwrap().frameworks,
+            vec!["express"]
+        );
+        assert_eq!(deserialized.cache_version, Some(CACHE_VERSION));
+        assert_eq!(
+            deserialized.package_json_hash,
+            Some("abc123hash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cloud_repo_data_without_cache_fields_deserializes() {
+        // Old CloudRepoData without cache fields should still deserialize (backwards compat)
+        let json = r#"{
+            "repo_name": "old-repo",
+            "endpoints": [],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "last_updated": "2025-01-01T00:00:00Z",
+            "commit_hash": "old123"
+        }"#;
+
+        let data: CloudRepoData =
+            serde_json::from_str(json).expect("should deserialize old format");
+        assert_eq!(data.repo_name, "old-repo");
+        assert!(data.file_results.is_none());
+        assert!(data.cached_detection.is_none());
+        assert!(data.cached_guidance.is_none());
+        assert!(data.package_json_hash.is_none());
+        assert!(data.cache_version.is_none());
     }
 }

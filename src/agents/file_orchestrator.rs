@@ -1038,7 +1038,10 @@ impl FileOrchestrator {
     ///
     /// This implements the key insight from the refactoring plan:
     /// The `import_source` field from each mount result is the key to cross-file resolution.
-    fn build_mount_graph(&self, file_results: &HashMap<String, FileAnalysisResult>) -> MountGraph {
+    pub fn build_mount_graph(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+    ) -> MountGraph {
         let mut graph = MountGraph::new();
 
         // Track import mappings: import_source -> (file_path, local_name)
