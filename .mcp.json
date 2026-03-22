@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "carrick": {
+      "command": "node",
+      "args": ["./mcp-server/dist/index.js"],
+      "env": {
+        "CARRICK_API_ENDPOINT": "${CARRICK_API_ENDPOINT}",
+        "CARRICK_API_KEY": "${CARRICK_API_KEY}",
+        "CARRICK_ORG": "${CARRICK_ORG}"
+      }
+    }
+  }
+}
