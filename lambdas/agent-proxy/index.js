@@ -358,7 +358,7 @@ exports.handler = async (event) => {
     }
 
     // Use Gemini 3 Flash preview model
-    const modelName = "gemini-3-flash-preview";
+    const modelName = "gemini-3.1-flash-lite-preview";
 
     // Convert messages to Gemini format
     const { contents, systemInstruction } = convertMessages(
@@ -421,10 +421,12 @@ exports.handler = async (event) => {
       requestBody.options?.thinkingLevel ?? requestBody.options?.reasoningEffort,
     );
 
-    // Gemini 3 models support thinkingLevel
-    generationConfig.thinkingConfig = {
-      thinkingLevel: requestedThinkingLevel || "minimal",
-    };
+    // Only enable thinking if explicitly requested by caller
+    if (requestedThinkingLevel) {
+      generationConfig.thinkingConfig = {
+        thinkingLevel: requestedThinkingLevel,
+      };
+    }
 
     // Add temperature if specified
     if (requestBody.options?.temperature != null) {

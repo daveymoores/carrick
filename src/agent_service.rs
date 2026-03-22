@@ -85,7 +85,7 @@ impl AgentService {
                 },
             ],
             options: ProxyOptions {
-                temperature: None,
+                temperature: Some(0.0),
                 max_output_tokens: None,
             },
             response_schema,
