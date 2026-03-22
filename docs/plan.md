@@ -265,3 +265,213 @@ This is a small change to `action.yml` and the formatter output.
 - Read-only — no write operations from the webapp (except snapshot creation from CI)
 - Snapshots are immutable once created
 - No real-time updates (refresh or regenerate snapshot)
+
+---
+
+## Appendix: Actual Data Shapes
+
+This section documents the real data structures output by the Carrick tool, as they exist in the codebase today. The graph API Lambda must transform these into the graph-ready format above.
+
+### Source of truth: `CloudRepoData` (Rust → JSON)
+
+This is what gets serialized and stored in DynamoDB's `cloudRepoData` field per repo. Defined in `src/cloud_storage/mod.rs`:
+
+```jsonc
+{
+  "repo_name": "my-api",
+  "service_name": "user-service",           // Optional — from carrick.json serviceName
+  "endpoints": [                            // Producer endpoints (Vec<ApiEndpointDetails>)
+    {
+      "owner": { "App": "app" },            // OwnerType enum: App(String) | Router(String) | null for calls
+      "route": "/api/users/:id",            // The resolved full path
+      "method": "GET",
+      "params": [],                         // Extracted route params
+      "request_body": null,                 // Optional Json enum (Null | Boolean | Number | String | Array | Object)
+      "response_body": null,                // Optional Json enum
+      "handler_name": "getUser",            // Optional handler function name
+      "request_type": null,                 // Optional TypeReference (see below)
+      "response_type": null,                // Optional TypeReference
+      "file_path": "src/routes/users.ts"
+    }
+  ],
+  "calls": [                                // Consumer API calls (same Vec<ApiEndpointDetails> shape)
+    {
+      "owner": null,                        // Calls have no owner
+      "route": "/api/payments",             // Target URL
+      "method": "GET",
+      "params": [],
+      "request_body": null,
+      "response_body": null,
+      "handler_name": "axios",              // Client library used (fetch, axios, got, etc.)
+      "request_type": null,
+      "response_type": null,
+      "file_path": "src/services/payment.ts"
+    }
+  ],
+  "mounts": [                               // Router mount relationships
+    {
+      "parent": { "App": "app" },
+      "child": { "Router": "userRouter" },
+      "prefix": "/api"
+    }
+  ],
+  "apps": {},                               // HashMap<String, AppContext> — { name: String }
+  "imported_handlers": [                    // Vec<(route, method, handler_name, source)>
+    ["/users", "GET", "getUser", "./controllers/users"]
+  ],
+  "function_definitions": {},               // HashMap<String, FunctionDefinition>
+  "config_json": "{...}",                   // Raw carrick.json content (optional)
+  "package_json": "{...}",                  // Raw package.json content (optional)
+  "packages": {                             // Optional structured package data
+    "package_jsons": [
+      {
+        "name": "my-api",
+        "version": "1.0.0",
+        "dependencies": { "express": "^4.18.0" },
+        "dev_dependencies": { "typescript": "^5.0.0" },
+        "peer_dependencies": {}
+      }
+    ],
+    "source_paths": ["package.json"],
+    "merged_dependencies": {
+      "express": { "name": "express", "version": "^4.18.0", "source_path": "package.json" }
+    }
+  },
+  "last_updated": "2026-03-21T10:30:00Z",  // DateTime<Utc>
+  "commit_hash": "abc123def",
+  "mount_graph": {                          // Optional MountGraph — framework-agnostic analysis
+    "nodes": {
+      "app": {
+        "name": "app",
+        "node_type": "Root",                // Root | Mountable | Unknown
+        "creation_site": "const app = express()",
+        "file_location": "src/index.ts:3"
+      }
+    },
+    "mounts": [
+      {
+        "parent": "app",
+        "child": "userRouter",
+        "path_prefix": "/api",
+        "middleware_stack": ["authMiddleware"]
+      }
+    ],
+    "endpoints": [                          // ResolvedEndpoint — with computed full_path
+      {
+        "method": "GET",
+        "path": "/:id",                     // Local path on the router
+        "full_path": "/api/users/:id",      // Computed full path including mount prefixes
+        "handler": "getUser",
+        "owner": "userRouter",
+        "file_location": "src/routes/users.ts:15",
+        "middleware_chain": ["authMiddleware"],
+        "repo_name": null                   // Optional — for cross-repo matching
+      }
+    ],
+    "data_calls": [                         // DataFetchingCall
+      {
+        "method": "GET",
+        "target_url": "/api/payments",
+        "client": "axios",
+        "file_location": "src/services/payment.ts:42"
+      }
+    ]
+  },
+  "bundled_types": "declare type Endpoint_abc_Response = { id: number; name: string; };",  // Optional .d.ts content
+  "type_manifest": [                        // Optional Vec<TypeManifestEntry>
+    {
+      "method": "GET",
+      "path": "/api/users/:id",
+      "role": "producer",                   // "producer" | "consumer"
+      "type_kind": "response",              // "request" | "response"
+      "type_alias": "Endpoint_abc123_Response",  // Alias in the bundled .d.ts
+      "file_path": "src/routes/users.ts",
+      "line_number": 15,
+      "is_explicit": true,                  // Was the type explicitly annotated?
+      "type_state": "explicit",             // "explicit" | "implicit" | "unknown"
+      "evidence": {
+        "file_path": "src/routes/users.ts",
+        "span_start": 450,                  // Byte offset (optional)
+        "span_end": 520,                    // Byte offset (optional)
+        "line_number": 15,
+        "infer_kind": "FunctionReturn",     // FunctionReturn | Expression | CallResult | Variable | ResponseBody | RequestBody
+        "is_explicit": true,
+        "type_state": "explicit"
+      }
+    }
+  ]
+}
+```
+
+### DynamoDB item shape (what the Lambda reads)
+
+The `get-cross-repo-data` action in `lambdas/check-or-upload/index.js` scans DynamoDB and returns:
+
+```jsonc
+// Response from action: "get-cross-repo-data"
+{
+  "repos": [
+    {
+      "repo": "my-api",                     // Extracted from pk: "repo#org/my-api"
+      "hash": "abc123def",
+      "s3Url": "https://bucket.s3.amazonaws.com/org/my-api/abc123def/output.json",
+      "filename": "output.json",
+      "metadata": { /* CloudRepoData JSON — full shape above */ },
+      "lastUpdated": "2026-03-21T10:30:00Z"
+    }
+  ],
+  "processing_errors": []                   // Only present if errors occurred
+}
+```
+
+**DynamoDB key schema** (table: `CarrickTypeFiles`):
+- **pk** (partition key): `repo#${org}/${repo}` (e.g., `repo#my-org/my-api`)
+- **sk** (sort key): always `types`
+
+### Formatter output (GitHub PR comment)
+
+The tool's final markdown output (`src/formatter/mod.rs`) is wrapped in machine-readable delimiters:
+
+```
+<!-- CARRICK_OUTPUT_START -->
+<!-- CARRICK_ISSUE_COUNT:5 -->
+### 🪢 CARRICK: API Analysis Results
+
+Analyzed **12 endpoints** and **8 API calls** across all repositories.
+
+Found **5 total issues**: **2 critical mismatches**, **1 connectivity issues**,
+**1 dependency conflicts**, and **1 configuration suggestions**.
+
+<details>
+<summary><strong>2 Critical: API Mismatches</strong></summary>
+  - Type compatibility issues (TypeScript compiler errors, request body mismatches)
+  - Grouped by endpoint with producer/consumer type details
+</details>
+
+<details>
+<summary><strong>1 Connectivity Issues</strong></summary>
+  - Missing endpoints (called but not defined) — table of method + path
+  - Orphaned endpoints (defined but never called) — table of method + path
+</details>
+
+<details>
+<summary><strong>1 Dependency Conflicts</strong></summary>
+  - Grouped by severity: Critical (major), Warning (minor), Info (patch)
+  - Table of repo + version + source for each conflict
+</details>
+
+<details>
+<summary><strong>1 Configuration Suggestions</strong></summary>
+  - Env var calls that need classifying in carrick.json
+</details>
+<!-- CARRICK_OUTPUT_END -->
+```
+
+### Key observations for the graph API
+
+1. **`mount_graph` is the richest source** — it has resolved full paths, file locations, middleware chains, and the mount hierarchy. Prefer this over the flat `endpoints`/`calls` arrays when available.
+2. **`type_manifest` + `bundled_types`** together enable type compatibility checks. The manifest maps endpoints to type aliases; the bundled `.d.ts` contains the actual type definitions.
+3. **`calls[].route`** contains the target URL (what the consumer calls). **`endpoints[].route`** contains the served path. URL normalization is needed to match them (e.g., `/api/users/:id` vs `/api/users/${userId}`).
+4. **`calls[].handler_name`** holds the HTTP client name (axios, fetch, got), not a function name.
+5. **`service_name`** comes from `carrick.json` — it's the human-readable service name. Falls back to `repo_name` if absent.
+6. **`owner`** is a tagged enum: `{ "App": "app" }` or `{ "Router": "userRouter" }` — not a plain string.
