@@ -440,7 +440,7 @@ exports.handler = async (event) => {
       httpMethod: httpMethod,
       hasSchema: !!requestBody.response_schema,
       hasSystem: !!systemInstruction,
-      thinkingLevel: generationConfig.thinkingConfig.thinkingLevel,
+      thinkingLevel: generationConfig.thinkingConfig?.thinkingLevel ?? "none",
     });
 
     // Make the Gemini API call with retry logic
