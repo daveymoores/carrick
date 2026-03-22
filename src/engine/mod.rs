@@ -461,14 +461,10 @@ async fn analyze_current_repo_incremental(
             );
 
             // Check if package.json changed → need fresh framework detection/guidance
-            let current_pkg_hash = packages
-                .package_jsons
-                .first()
-                .and_then(|_| {
-                    serde_json::to_string(&packages)
-                        .ok()
-                        .map(|s| hash_file_content(&s))
-                })
+            // Hash raw file content (not serialized struct) for deterministic comparison
+            let current_pkg_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
+                .ok()
+                .map(|content| hash_file_content(&content))
                 .unwrap_or_default();
 
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
@@ -544,6 +540,7 @@ async fn analyze_current_repo_incremental(
             // Build CloudRepoData with merged results
             let mut cloud_data = build_cloud_data_from_mount_graph(
                 &repo_name,
+                repo_path,
                 &mount_graph,
                 &config,
                 &packages,
@@ -623,6 +620,7 @@ async fn run_framework_detection_and_guidance(
 /// Build CloudRepoData from a mount graph (used by incremental path).
 fn build_cloud_data_from_mount_graph(
     repo_name: &str,
+    repo_path: &str,
     mount_graph: &MountGraph,
     config: &Config,
     packages: &Packages,
@@ -701,7 +699,7 @@ fn build_cloud_data_from_mount_graph(
         package_json: serde_json::to_string(packages).ok(),
         packages: Some(packages.clone()),
         last_updated: chrono::Utc::now(),
-        commit_hash: get_current_commit_hash(),
+        commit_hash: get_current_commit_hash(repo_path),
         mount_graph: Some(mount_graph.clone()),
         bundled_types: None,
         type_manifest: None,
@@ -1100,6 +1098,7 @@ async fn analyze_current_repo(
     // 5. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
     let mut cloud_data = CloudRepoData::from_multi_agent_results(
         repo_name.clone(),
+        repo_path,
         &analysis_result,
         serde_json::to_string(&config).ok(),
         serde_json::to_string(&packages).ok(),
@@ -1141,9 +1140,10 @@ async fn analyze_current_repo(
     cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
-    cloud_data.package_json_hash = serde_json::to_string(&packages)
+    // Hash raw file content (not serialized struct) for deterministic comparison
+    cloud_data.package_json_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
         .ok()
-        .map(|s| hash_file_content(&s));
+        .map(|content| hash_file_content(&content));
 
     Ok(cloud_data)
 }

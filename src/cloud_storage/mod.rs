@@ -135,6 +135,7 @@ impl CloudRepoData {
     /// This bypasses the legacy Analyzer adapter layer
     pub fn from_multi_agent_results(
         repo_name: String,
+        repo_path: &str,
         analysis_result: &MultiAgentAnalysisResult,
         config_json: Option<String>,
         package_json: Option<String>,
@@ -219,7 +220,7 @@ impl CloudRepoData {
             package_json,
             packages,
             last_updated: Utc::now(),
-            commit_hash: get_current_commit_hash(),
+            commit_hash: get_current_commit_hash(repo_path),
             mount_graph: Some(mount_graph.clone()), // Store mount graph for cross-repo analysis
             bundled_types: None,
             type_manifest: None,
@@ -272,9 +273,10 @@ pub trait CloudStorage {
     async fn health_check(&self) -> Result<(), StorageError>;
 }
 
-pub fn get_current_commit_hash() -> String {
+pub fn get_current_commit_hash(repo_path: &str) -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
+        .current_dir(repo_path)
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())

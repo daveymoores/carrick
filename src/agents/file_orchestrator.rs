@@ -176,6 +176,8 @@ impl FileOrchestrator {
                 println!("Skipped (no API patterns): {} [0 candidates]", path_str);
                 stats.files_skipped += 1;
                 stats.files_skipped_no_candidates += 1;
+                // Store empty result so incremental cache knows this file was processed
+                file_results.insert(path_str, FileAnalysisResult::default());
                 continue;
             }
 
