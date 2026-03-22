@@ -1,0 +1,20 @@
+{
+  "name": "carrick-graph-api",
+  "version": "1.0.0",
+  "description": "Read-only Lambda that serves graph-ready data from Carrick DynamoDB",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test.js"
+  },
+  "keywords": ["lambda", "graph", "carrick"],
+  "author": "Carrick Team",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "nanoid": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

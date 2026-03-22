@@ -16,6 +16,23 @@ resource "aws_lambda_function" "check_or_upload" {
   }
 }
 
+resource "aws_lambda_function" "graph_api" {
+  function_name    = "carrick-graph-api"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "index.handler"
+  runtime          = "nodejs22.x"
+  filename         = "../lambdas/graph-api.zip"
+  source_code_hash = filebase64sha256("../lambdas/graph-api.zip")
+  timeout          = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE = aws_dynamodb_table.type_metadata.name
+      SNAPSHOT_TABLE = aws_dynamodb_table.type_metadata.name
+    }
+  }
+}
+
 resource "aws_lambda_function" "agent_proxy" {
   function_name    = "carrick-agent-proxy"
   role             = aws_iam_role.lambda_exec.arn
