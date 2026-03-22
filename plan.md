@@ -12,7 +12,7 @@ A polished standalone webapp that visualizes how services connect across reposit
 │                  │       │                       │       │                     │
 │  DynamoDB        │──────▶│  GET /graph/{org}     │──────▶│  Next.js + shadcn/ui│
 │  (CloudRepoData) │       │  (read-only, no auth) │       │  + Cytoscape.js     │
-└──────────────────┘       └──────────────────────┘       │  (Vercel)           │
+└──────────────────┘       └──────────────────────┘       │  (Cloudflare Pages) │
                                                           └─────────────────────┘
 ```
 
@@ -31,20 +31,36 @@ Add a read-only Lambda that queries DynamoDB for all repos in an org and returns
   "id": "abc123",
   "org": "my-org",
   "generatedAt": "2026-03-21T...",
-  "nodes": [
-    { "id": "repo-a", "serviceName": "user-service", "endpointCount": 12, "callCount": 5, "lastUpdated": "..." }
-  ],
-  "edges": [
+  "services": [
     {
-      "source": "repo-b",
-      "target": "repo-a",
-      "connections": [
-        { "method": "GET", "path": "/api/users/:id", "typeStatus": "compatible" | "mismatch" | "unknown" }
+      "id": "repo-a",
+      "repoName": "repo-a",
+      "serviceName": "user-service",
+      "lastUpdated": "...",
+      "commitHash": "abc123",
+      "endpoints": [
+        { "id": "repo-a::GET::/api/users/:id", "method": "GET", "path": "/api/users/:id", "handler": "getUser", "hasTypes": true }
+      ],
+      "calls": [
+        { "id": "repo-a::GET::/api/payments", "method": "GET", "targetUrl": "/api/payments", "client": "axios" }
       ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "repo-b::GET::/api/users",
+      "to": "repo-a::GET::/api/users/:id",
+      "typeStatus": "compatible | mismatch | unknown",
+      "typeDetail": { "requestMatch": true, "responseMatch": false, "producerType": "User", "consumerType": "UserDTO" }
     }
   ]
 }
 ```
+
+The webapp transforms this into Cytoscape compound elements:
+- Each service → parent node
+- Each endpoint/call → child node with `parent: serviceId`
+- Each connection → edge between specific child nodes
 
 **How edges are computed:** For each repo's `calls`, match against every other repo's `endpoints` using the existing URL normalizer logic (or a simplified JS version). If type manifests exist for both sides, report compatibility status.
 
@@ -81,20 +97,36 @@ The snapshot captures the graph at a point in time, so the link is stable and sh
 | **Next.js 15** | Framework — SSR for snapshot pages (good for link previews/SEO), static for app shell |
 | **shadcn/ui** | Beautiful, accessible component library (built on Radix + Tailwind) |
 | **Tailwind CSS 4** | Styling — consistent, professional look |
-| **Cytoscape.js** | Graph visualization — force-directed layouts, pan/zoom, selection |
-| **cytoscape-cose-bilkent** | Better layout algorithm for network graphs |
+| **Cytoscape.js** | Graph visualization — compound nodes, force-directed layouts, pan/zoom, selection |
+| **cytoscape-cose-bilkent** | Better layout algorithm for compound/network graphs |
 | **@tanstack/react-query** | Data fetching with caching |
-| **Deployed to:** | **Vercel** (zero-config for Next.js, free tier works) |
+| **Deployed to:** | **Cloudflare Pages** (fast global CDN, free tier, simple Next.js support via `@cloudflare/next-on-pages`) |
 
-### Graph visualization
+### Graph visualization — Compound Nodes
 
-- **Nodes** = repos/services (rounded cards with service name, endpoint count badge)
-- **Edges** = API connections (colored by status: green=compatible, red=mismatch, gray=unknown, line thickness by connection count)
-- **Layout**: `cose-bilkent` (force-directed, good for network topology)
-- Click a node → slide-out sheet shows its endpoints and calls
-- Click an edge → sheet shows specific API connections and type compatibility details
-- Hover tooltips with quick info
-- Dark mode support via shadcn/ui theme
+Services are rendered as **compound (parent) nodes** containing their individual endpoints as child nodes. Edges connect specific endpoints across services.
+
+```
+┌─────────────────────────┐       ┌─────────────────────────┐
+│  user-service           │       │  order-service           │
+│  ┌───────────────────┐  │       │  ┌───────────────────┐  │
+│  │ GET /api/users/:id │◀─────────│ │ fetch(/api/users)  │  │
+│  └───────────────────┘  │       │  └───────────────────┘  │
+│  ┌───────────────────┐  │       │  ┌───────────────────┐  │
+│  │ POST /api/users    │  │       │  │ GET /api/orders    │  │
+│  └───────────────────┘  │       │  └───────────────────┘  │
+└─────────────────────────┘       └─────────────────────────┘
+```
+
+- **Parent nodes** = services (labeled with service/repo name, styled as containers)
+- **Child nodes** = individual endpoints (producers) and calls (consumers)
+- **Edges** = connect a consumer call in one service to the matching producer endpoint in another service
+- **Edge color** by type compatibility: green=compatible, red=mismatch, gray=unknown
+- **Layout**: `cose-bilkent` — handles compound graphs natively, keeps children inside parents
+- Click a parent node → slide-out sheet with full service details
+- Click a child node → endpoint/call detail with type info
+- Click an edge → type compatibility breakdown
+- Hover tooltips, dark mode via shadcn/ui theme
 
 ### Routes
 
@@ -194,10 +226,12 @@ This is a small change to `action.yml` and the formatter output.
 
 ## Step 4: Deployment
 
-### Webapp (Vercel)
-- Connect the `webapp/` directory to Vercel
+### Webapp (Cloudflare Pages)
+- Connect the `webapp/` directory to Cloudflare Pages
+- Uses `@cloudflare/next-on-pages` for Next.js compatibility
 - Auto-deploys on push to `main`
 - Custom domain: `graph.carrick.dev` (optional)
+- Free tier: unlimited bandwidth, 500 builds/month
 
 ### Lambda + API Gateway (Terraform)
 - Add graph-api Lambda and routes to existing Terraform config
@@ -213,7 +247,7 @@ This is a small change to `action.yml` and the formatter output.
 4. **Detail panels** — shadcn Sheet components for repo/connection details
 5. **Snapshot + sharing** — unique link generation and share UI
 6. **PR integration** — add graph link to formatter output
-7. **Deploy** — Vercel for webapp, Terraform apply for Lambda
+7. **Deploy** — Cloudflare Pages for webapp, Terraform apply for Lambda
 
 ## Why these packages
 
@@ -221,8 +255,8 @@ This is a small change to `action.yml` and the formatter output.
 |--------|-----------|
 | **Next.js** | SSR for snapshot pages (link previews work in Slack/GitHub), great DX |
 | **shadcn/ui** | Beautiful defaults, fully customizable, no heavy runtime |
-| **Cytoscape.js** | Purpose-built for network graphs, 10K+ nodes, great interaction model |
-| **Vercel** | Zero-config Next.js hosting, free tier sufficient, instant deploys |
+| **Cytoscape.js** | Native compound node support, force-directed layouts handle service→endpoint hierarchy, 10K+ node scale |
+| **Cloudflare Pages** | Fast global CDN, generous free tier, simpler than self-hosting, good Next.js support |
 | **@tanstack/react-query** | Handles loading/error/cache states cleanly |
 
 ## Scope boundaries
