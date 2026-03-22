@@ -1,6 +1,6 @@
 import type { GraphResponse, SnapshotCreateResponse } from "@/types/graph";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+const API_BASE = import.meta.env.VITE_API_URL || "";
 
 export async function fetchGraph(org: string): Promise<GraphResponse> {
   const res = await fetch(`${API_BASE}/graph/${encodeURIComponent(org)}`);

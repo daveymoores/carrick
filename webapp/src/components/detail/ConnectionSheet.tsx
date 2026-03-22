@@ -1,5 +1,3 @@
-"use client";
-
 import type { Connection, GraphResponse } from "@/types/graph";
 import { Badge } from "@/components/ui/badge";
 import { getMethodColor } from "@/lib/graph-transform";

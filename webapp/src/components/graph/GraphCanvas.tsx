@@ -1,5 +1,3 @@
-"use client";
-
 import { useEffect, useRef, useCallback } from "react";
 import type { Core, EventObject } from "cytoscape";
 import type { GraphResponse, Service, Connection } from "@/types/graph";

@@ -1,44 +1,25 @@
-"use client";
-
-import { use, useState, useCallback } from "react";
+import { useState, useCallback } from "react";
+import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { fetchSnapshot } from "@/lib/api";
+import { fetchGraph } from "@/lib/api";
 import { GraphCanvas } from "@/components/graph/GraphCanvas";
 import { ServiceSheet } from "@/components/detail/ServiceSheet";
 import { ConnectionSheet } from "@/components/detail/ConnectionSheet";
+import { SharePopover } from "@/components/SharePopover";
 import { StatusBar } from "@/components/StatusBar";
-import { Button } from "@/components/ui/button";
-import { Loader2, Check, Link } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
+import { Loader2 } from "lucide-react";
 import type { Service, Connection } from "@/types/graph";
 
-export default function SnapshotPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export function OrgGraphPage() {
+  const { orgName } = useParams<{ orgName: string }>();
   const [selectedService, setSelectedService] = useState<Service | null>(null);
   const [selectedConnection, setSelectedConnection] =
     useState<Connection | null>(null);
-  const [copied, setCopied] = useState(false);
 
-  // Snapshot needs an org to fetch — we pass a placeholder since the
-  // snapshot endpoint stores the full graph data. The API route extracts org
-  // from the stored snapshot.
-  // For now, use a query param or default. The Lambda stores org inside the snapshot.
   const { data, isLoading, error } = useQuery({
-    queryKey: ["snapshot", id],
-    queryFn: async () => {
-      // Try to fetch the snapshot — the API needs the org in the path.
-      // We'll try a well-known pattern: the snapshot ID is globally unique
-      // so we use a wildcard org approach.
-      const res = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || ""}/graph/_/snapshot/${id}`,
-      );
-      if (!res.ok) throw new Error(`Snapshot not found: ${res.status}`);
-      return res.json();
-    },
+    queryKey: ["graph", orgName],
+    queryFn: () => fetchGraph(orgName!),
+    enabled: !!orgName,
   });
 
   const handleSelectService = useCallback((service: Service) => {
@@ -56,12 +37,6 @@ export default function SnapshotPage({
     setSelectedConnection(null);
   }, []);
 
-  async function handleCopyLink() {
-    await navigator.clipboard.writeText(window.location.href);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  }
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -72,37 +47,22 @@ export default function SnapshotPage({
 
   if (error || !data) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-4 text-zinc-400">
-        <p>Snapshot not found</p>
-        <a href="/" className="text-zinc-500 hover:text-zinc-300 underline text-sm">
-          Go home
-        </a>
+      <div className="min-h-screen flex items-center justify-center text-zinc-400">
+        <p>Failed to load graph for {orgName}</p>
       </div>
     );
   }
 
   return (
     <div className="h-screen flex flex-col">
-      {/* Header */}
       <header className="flex items-center justify-between px-4 py-3 bg-zinc-900 border-b border-zinc-800">
         <div className="flex items-center gap-3">
           <h1 className="text-lg font-semibold text-zinc-50">Carrick Graph</h1>
-          <Badge variant="secondary">Snapshot</Badge>
-          {data.org && (
-            <span className="text-sm text-zinc-400">{data.org}</span>
-          )}
+          <span className="text-sm text-zinc-400">{orgName}</span>
         </div>
-        <Button variant="outline" size="sm" onClick={handleCopyLink}>
-          {copied ? (
-            <Check className="h-4 w-4 mr-1 text-green-500" />
-          ) : (
-            <Link className="h-4 w-4 mr-1" />
-          )}
-          Copy link
-        </Button>
+        <SharePopover org={orgName!} />
       </header>
 
-      {/* Main content */}
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 relative">
           <GraphCanvas

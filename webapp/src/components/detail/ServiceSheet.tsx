@@ -1,5 +1,3 @@
-"use client";
-
 import type { Service } from "@/types/graph";
 import { Badge } from "@/components/ui/badge";
 import { getMethodColor } from "@/lib/graph-transform";

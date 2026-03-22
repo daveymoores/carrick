@@ -1,18 +1,14 @@
-"use client";
-
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 
-export default function Home() {
+export function HomePage() {
   const [org, setOrg] = useState("");
-  const router = useRouter();
+  const navigate = useNavigate();
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (org.trim()) {
-      router.push(`/org/${encodeURIComponent(org.trim())}`);
-    }
+    if (org.trim()) navigate(`/org/${encodeURIComponent(org.trim())}`);
   }
 
   return (

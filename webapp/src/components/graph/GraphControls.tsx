@@ -1,5 +1,3 @@
-"use client";
-
 import { Button } from "@/components/ui/button";
 import { Maximize, ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 
