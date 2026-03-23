@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.3](https://github.com/daveymoores/carrick/compare/carrick-v0.1.2...carrick-v0.1.3) (2026-03-23)
+
+
+### Features
+
+* incremental diff-based analysis with per-file LLM caching ([94b456a](https://github.com/daveymoores/carrick/commit/94b456a6f5930b9b42d1e91dd622d43bc8759565))
+* incremental diff-based analysis with per-file LLM caching ([68281dd](https://github.com/daveymoores/carrick/commit/68281dd1984ddacb4a4431c40b9b0577e1bf7edb))
+
+
+### Bug Fixes
+
+* use repo_path for commit hash and deterministic package.json hashing ([fd792d4](https://github.com/daveymoores/carrick/commit/fd792d466920c440c7228c363ca98aaf4a56772a))
+* use std::env::temp_dir() instead of hardcoded /tmp path ([75a7600](https://github.com/daveymoores/carrick/commit/75a7600847a54916547513bc1166bcc2bd17abf7))
+
 ## [0.1.2](https://github.com/daveymoores/carrick/compare/carrick-v0.1.1...carrick-v0.1.2) (2026-03-23)
 
 
