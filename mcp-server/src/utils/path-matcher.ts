@@ -8,7 +8,7 @@
  * - Lowercase
  * - Strip trailing slash
  * - Convert :param and {param} to a common wildcard
- * - Strip common env-var-like prefixes (e.g. /api/v1 prefix from env)
+ * - Normalize path parameter styles to a common wildcard
  */
 export function normalizePath(path: string): string {
   return (

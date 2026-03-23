@@ -4,16 +4,24 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { ApiClient } from "./api-client.js";
 import { createServer } from "./server.js";
 
+const getRequiredEnv = (name: string): string => {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+};
+
 // Module-level client — persists across warm Lambda invocations so
 // the 5-min in-memory cache survives between requests.
 const client = new ApiClient({
-  apiEndpoint: process.env.CARRICK_API_ENDPOINT || "",
-  apiKey: process.env.CARRICK_API_KEY || "",
-  org: process.env.CARRICK_ORG || "",
+  apiEndpoint: getRequiredEnv("CARRICK_API_ENDPOINT"),
+  apiKey: getRequiredEnv("CARRICK_API_KEY"),
+  org: getRequiredEnv("CARRICK_ORG"),
 });
 
 const VALID_KEYS = new Set(
-  (process.env.VALID_API_KEYS || "").split(",").filter(Boolean),
+  (process.env.VALID_API_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean),
 );
 
 const app = express();

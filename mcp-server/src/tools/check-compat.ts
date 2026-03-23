@@ -1,5 +1,5 @@
 import { ApiClient, matchService } from "../api-client.js";
-import { normalizePath, pathsMatch } from "../utils/path-matcher.js";
+import { pathsMatch } from "../utils/path-matcher.js";
 import { CloudRepoData } from "../types.js";
 
 export interface CheckCompatParams {

@@ -29,7 +29,7 @@ resource "aws_lambda_function" "mcp_server" {
   environment {
     variables = {
       CARRICK_API_ENDPOINT = "https://api.${var.domain_name}"
-      CARRICK_API_KEY      = var.carrick_api_keys
+      CARRICK_API_KEY      = trimspace(split(",", var.carrick_api_keys)[0])
       CARRICK_ORG          = var.carrick_org
       VALID_API_KEYS       = var.carrick_api_keys
     }
