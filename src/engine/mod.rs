@@ -194,13 +194,12 @@ where
 {
     // Special handling for Config to properly merge all configs
     if std::any::type_name::<T>() == std::any::type_name::<crate::config::Config>() {
-        use std::path::PathBuf;
         let mut temp_files = Vec::new();
 
         // Write each config to a temporary file
         for (i, repo_data) in all_repo_data.iter().enumerate() {
             if let Some(json_str) = extractor(repo_data) {
-                let temp_path = PathBuf::from(format!("/tmp/carrick_config_{}.json", i));
+                let temp_path = std::env::temp_dir().join(format!("carrick_config_{}.json", i));
                 if std::fs::write(&temp_path, json_str).is_err() {
                     continue;
                 }
