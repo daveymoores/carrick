@@ -19,6 +19,11 @@ output "aws_api_endpoint" {
 #   description = "DNS record to create at your domain provider"
 # }
 
+output "mcp_endpoint" {
+  value       = "https://api.${var.domain_name}/mcp"
+  description = "MCP Streamable HTTP endpoint for AI agent clients"
+}
+
 output "acm_certificate_validation_options" {
   description = "The DNS validation options for the ACM certificate"
   value       = aws_acm_certificate.api_cert.domain_validation_options

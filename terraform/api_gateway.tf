@@ -31,6 +31,40 @@ resource "aws_lambda_permission" "check_or_upload_api" {
   source_arn    = "${aws_apigatewayv2_api.carrick_api.execution_arn}/*/*"
 }
 
+resource "aws_apigatewayv2_integration" "mcp_server_integration" {
+  api_id                 = aws_apigatewayv2_api.carrick_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.mcp_server.invoke_arn
+  integration_method     = "POST"
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "mcp_post" {
+  api_id    = aws_apigatewayv2_api.carrick_api.id
+  route_key = "POST /mcp"
+  target    = "integrations/${aws_apigatewayv2_integration.mcp_server_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "mcp_get" {
+  api_id    = aws_apigatewayv2_api.carrick_api.id
+  route_key = "GET /mcp"
+  target    = "integrations/${aws_apigatewayv2_integration.mcp_server_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "mcp_delete" {
+  api_id    = aws_apigatewayv2_api.carrick_api.id
+  route_key = "DELETE /mcp"
+  target    = "integrations/${aws_apigatewayv2_integration.mcp_server_integration.id}"
+}
+
+resource "aws_lambda_permission" "mcp_server_api" {
+  statement_id  = "AllowAPIGatewayInvokeMCP"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.mcp_server.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.carrick_api.execution_arn}/*/*"
+}
+
 resource "aws_apigatewayv2_integration" "agent_proxy_integration" {
   api_id                 = aws_apigatewayv2_api.carrick_api.id
   integration_type       = "AWS_PROXY"

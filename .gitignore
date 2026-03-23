@@ -21,6 +21,8 @@ target/
 !src/sidecar/test/fixtures/sample-repo/node_modules/wrapper-lib/
 !src/sidecar/test/fixtures/sample-repo/node_modules/wrapper-lib/index.d.ts
 **/ts_check/output
+mcp-server/dist
+mcp-server/dist-lambda
 
 # Lambda build artifacts
 lambdas/*.zip

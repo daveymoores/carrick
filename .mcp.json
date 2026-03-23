@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "carrick": {
+      "url": "https://api.carrick.tools/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CARRICK_API_KEY}"
+      }
+    }
+  }
+}

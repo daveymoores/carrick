@@ -21,6 +21,17 @@ npm install --production
 zip -r ../agent-proxy.zip . -x "*.git*" "node_modules/.cache/*"
 cd ..
 
+# Build mcp-server function
+echo "Building mcp-server..."
+cd ../mcp-server
+npm install
+npm run build:lambda
+cd ../lambdas
+mkdir -p mcp-server-staging
+cp ../mcp-server/dist-lambda/index.js mcp-server-staging/
+cd mcp-server-staging && zip -r ../mcp-server.zip . && cd ..
+rm -rf mcp-server-staging
+
 echo "Lambda functions built successfully:"
 ls -la *.zip
 

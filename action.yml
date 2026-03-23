@@ -33,8 +33,11 @@ runs:
   steps:
     - name: Download Carrick
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
-        curl -L -o carrick-action.tar.gz https://github.com/daveymoores/carrick/releases/latest/download/carrick-action-linux.tar.gz
+        DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases/latest --jq '.assets[] | select(.name=="carrick-action-linux.tar.gz") | .browser_download_url')
+        curl -L -o carrick-action.tar.gz "$DOWNLOAD_URL"
         tar -xzf carrick-action.tar.gz
         chmod +x carrick
 

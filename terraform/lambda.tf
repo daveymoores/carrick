@@ -16,6 +16,26 @@ resource "aws_lambda_function" "check_or_upload" {
   }
 }
 
+resource "aws_lambda_function" "mcp_server" {
+  function_name    = "carrick-mcp-server"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "index.handler"
+  runtime          = "nodejs22.x"
+  filename         = "../lambdas/mcp-server.zip"
+  source_code_hash = filebase64sha256("../lambdas/mcp-server.zip")
+  timeout          = 30
+  memory_size      = 256
+
+  environment {
+    variables = {
+      CARRICK_API_ENDPOINT = "https://api.${var.domain_name}"
+      CARRICK_API_KEY      = trimspace(split(",", var.carrick_api_keys)[0])
+      CARRICK_ORG          = var.carrick_org
+      VALID_API_KEYS       = var.carrick_api_keys
+    }
+  }
+}
+
 resource "aws_lambda_function" "agent_proxy" {
   function_name    = "carrick-agent-proxy"
   role             = aws_iam_role.lambda_exec.arn
