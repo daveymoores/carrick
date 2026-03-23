@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.2](https://github.com/daveymoores/carrick/compare/carrick-v0.1.1...carrick-v0.1.2) (2026-03-23)
+
+
+### Features
+
+* add MCP server for AI agent access to cross-repo API data ([1be5314](https://github.com/daveymoores/carrick/commit/1be53144c75862439c716973938267b8f05297b9))
+* deploy MCP server as Lambda behind API Gateway ([f5cca06](https://github.com/daveymoores/carrick/commit/f5cca06d23c770201aacf7275ed718cd6f61400c))
+* MCP server with Lambda deployment ([0d93f7e](https://github.com/daveymoores/carrick/commit/0d93f7e1ddcf372af5a3b36739c9c6c501df3aba))
+
+
+### Bug Fixes
+
+* **action:** use GitHub API to resolve release download URL ([e74f22d](https://github.com/daveymoores/carrick/commit/e74f22d9d7250b304bf3416d08da27968c2d7f24))
+* address PR review feedback ([63e19e3](https://github.com/daveymoores/carrick/commit/63e19e3e8784c75cbdee488c411874bb2a619c4e))
+
 ## [0.1.1](https://github.com/daveymoores/carrick/compare/carrick-v0.1.0...carrick-v0.1.1) (2026-03-08)
 
 
