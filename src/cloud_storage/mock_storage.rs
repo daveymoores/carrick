@@ -91,6 +91,11 @@ impl CloudStorage for MockStorage {
                     mount_graph: None,
                     bundled_types: None,
                     type_manifest: None,
+                    file_results: None,
+                    cached_detection: None,
+                    cached_guidance: None,
+                    package_json_hash: None,
+                    cache_version: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -109,6 +114,11 @@ impl CloudStorage for MockStorage {
                     mount_graph: None,
                     bundled_types: None,
                     type_manifest: None,
+                    file_results: None,
+                    cached_detection: None,
+                    cached_guidance: None,
+                    package_json_hash: None,
+                    cache_version: None,
                 },
             ];
             result.extend(mock_repos);

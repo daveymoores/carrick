@@ -1,6 +1,10 @@
 use crate::{
+    agents::{
+        file_analyzer_agent::FileAnalysisResult, framework_guidance_agent::FrameworkGuidance,
+    },
     analyzer::ApiEndpointDetails,
     app_context::AppContext,
+    framework_detector::DetectionResult,
     mount_graph::MountGraph,
     multi_agent_orchestrator::MultiAgentAnalysisResult,
     packages::Packages,
@@ -109,6 +113,21 @@ pub struct CloudRepoData {
     /// Type manifest mapping endpoints/calls to their type aliases
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_manifest: Option<Vec<TypeManifestEntry>>,
+    /// Cached per-file LLM analysis results for incremental re-analysis
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_results: Option<HashMap<String, FileAnalysisResult>>,
+    /// Cached framework detection result
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_detection: Option<DetectionResult>,
+    /// Cached framework guidance result
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_guidance: Option<FrameworkGuidance>,
+    /// Hash of package.json content — if it matches, cached detection/guidance are reusable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_json_hash: Option<String>,
+    /// Cache format version — discard cached data if mismatched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_version: Option<u32>,
 }
 
 impl CloudRepoData {
@@ -116,6 +135,7 @@ impl CloudRepoData {
     /// This bypasses the legacy Analyzer adapter layer
     pub fn from_multi_agent_results(
         repo_name: String,
+        repo_path: &str,
         analysis_result: &MultiAgentAnalysisResult,
         config_json: Option<String>,
         package_json: Option<String>,
@@ -200,10 +220,15 @@ impl CloudRepoData {
             package_json,
             packages,
             last_updated: Utc::now(),
-            commit_hash: get_current_commit_hash(),
+            commit_hash: get_current_commit_hash(repo_path),
             mount_graph: Some(mount_graph.clone()), // Store mount graph for cross-repo analysis
             bundled_types: None,
             type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            package_json_hash: None,
+            cache_version: None,
         }
     }
 }
@@ -248,9 +273,10 @@ pub trait CloudStorage {
     async fn health_check(&self) -> Result<(), StorageError>;
 }
 
-pub fn get_current_commit_hash() -> String {
+pub fn get_current_commit_hash(repo_path: &str) -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
+        .current_dir(repo_path)
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())

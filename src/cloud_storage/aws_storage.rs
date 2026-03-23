@@ -284,7 +284,7 @@ impl CloudStorage for AwsStorage {
         content: &str,
     ) -> Result<(), StorageError> {
         let (org, repo) = self.extract_org_and_repo(repo_name);
-        let commit_hash = crate::cloud_storage::get_current_commit_hash();
+        let commit_hash = crate::cloud_storage::get_current_commit_hash(".");
 
         let request = LambdaRequest {
             action: "check-or-upload".to_string(),
@@ -343,6 +343,11 @@ impl CloudStorage for AwsStorage {
                     mount_graph: None,
                     bundled_types: None,
                     type_manifest: None,
+                    file_results: None,
+                    cached_detection: None,
+                    cached_guidance: None,
+                    package_json_hash: None,
+                    cache_version: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);
