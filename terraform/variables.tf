@@ -27,3 +27,8 @@ variable "agent_api_key" {
   type        = string
   sensitive   = true
 }
+
+variable "carrick_org" {
+  description = "Default org name for the MCP server"
+  type        = string
+}

@@ -6,15 +6,20 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "build:lambda": "node esbuild.config.mjs",
     "start": "node dist/index.js",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist dist-lambda"
   },
   "dependencies": {
+    "@codegenie/serverless-express": "^4.15.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.21.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^20.0.0",
+    "esbuild": "^0.24.0",
     "typescript": "^5.8.0"
   },
   "engines": {
