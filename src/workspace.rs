@@ -1,11 +1,10 @@
+use crate::packages::PackageJson;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct WorkspacePackage {
-    /// Package name from package.json "name" field
     pub name: String,
-    /// Absolute path to the package directory
     pub path: PathBuf,
 }
 
@@ -21,7 +20,7 @@ struct RootPackageJson {
     workspaces: WorkspacesField,
 }
 
-/// package.json "workspaces" can be an array of globs or an object with a "packages" array
+/// package.json "workspaces" can be an array of globs or an object with a "packages" array.
 #[derive(Deserialize, Default)]
 #[serde(untagged)]
 enum WorkspacesField {
@@ -42,11 +41,6 @@ impl WorkspacesField {
             WorkspacesField::None => &[],
         }
     }
-}
-
-#[derive(Deserialize)]
-struct PackageJsonName {
-    name: Option<String>,
 }
 
 /// Detect whether the given repo path is a monorepo with workspace packages.
@@ -114,13 +108,12 @@ pub fn detect_workspace(repo_path: &str) -> WorkspaceInfo {
                 continue;
             }
 
-            // Read the package name
             let pkg_content = match std::fs::read_to_string(&pkg_json_path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
 
-            let pkg: PackageJsonName = match serde_json::from_str(&pkg_content) {
+            let pkg: PackageJson = match serde_json::from_str(&pkg_content) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -140,22 +133,10 @@ pub fn detect_workspace(repo_path: &str) -> WorkspaceInfo {
         }
     }
 
-    // Sort by name for deterministic ordering
     packages.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let is_monorepo = !packages.is_empty();
-    if is_monorepo {
-        println!(
-            "[workspace] Detected monorepo with {} packages:",
-            packages.len()
-        );
-        for pkg in &packages {
-            println!("  - {} ({})", pkg.name, pkg.path.display());
-        }
-    }
-
     WorkspaceInfo {
-        is_monorepo,
+        is_monorepo: !packages.is_empty(),
         packages,
     }
 }

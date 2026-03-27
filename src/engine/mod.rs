@@ -49,6 +49,8 @@ type FileDiscoveryResult = Result<
         HashMap<String, crate::visitor::ImportedSymbol>,
         HashMap<String, FunctionDefinition>,
         String,
+        Option<PathBuf>, // config file path
+        Option<PathBuf>, // package.json path
     ),
     Box<dyn std::error::Error>,
 >;
@@ -116,12 +118,18 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
 
-    // 3. Detect monorepo workspace
     let repo_name = get_repository_name(repo_path);
     let workspace = detect_workspace(repo_path);
 
     if workspace.is_monorepo {
-        // === Monorepo mode: analyze each package independently ===
+        println!(
+            "[workspace] Detected monorepo with {} packages:",
+            workspace.packages.len()
+        );
+        for pkg in &workspace.packages {
+            println!("  - {} ({})", pkg.name, pkg.path.display());
+        }
+
         let mut all_package_data: Vec<CloudRepoData> = Vec::new();
 
         for package in &workspace.packages {
@@ -153,8 +161,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
             )
             .await?;
 
-            // Set composite repo_name and package_name
-            package_data.repo_name = composite_name.clone();
+            package_data.repo_name = composite_name;
             package_data.package_name = Some(package.name.clone());
 
             println!(
@@ -182,7 +189,6 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
             println!("Skipping upload (PR/branch mode - analyzing only)");
         }
 
-        // Cross-repo analysis: remove all current monorepo package entries
         let composite_prefix = format!("{}::", repo_name);
         all_repo_data.retain(|repo| {
             !repo.repo_name.starts_with(&composite_prefix) && repo.repo_name != repo_name
@@ -193,9 +199,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
             all_repo_data.len()
         );
 
-        // Build cross-repo analyzer with all package data + external repos
         if !all_package_data.is_empty() {
-            // Split: first package is "current", rest go into the pool
             let first_package = all_package_data.remove(0);
             all_repo_data.extend(all_package_data);
 
@@ -208,7 +212,6 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
             println!("No packages to analyze in monorepo");
         }
     } else {
-        // === Single-repo mode: existing behavior unchanged ===
         let previous_data = all_repo_data
             .iter()
             .find(|r| r.repo_name == repo_name)
@@ -394,6 +397,45 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
     Some(changed)
 }
 
+/// Filter git diff paths for a monorepo package.
+/// Git diff returns paths relative to the repo root (e.g., "apps/event-api/src/app.ts"),
+/// but file discovery normalizes to package-relative paths (e.g., "src/app.ts").
+/// This function strips the package prefix so the paths match.
+fn filter_changed_files_for_package(
+    changed_files: Vec<String>,
+    repo_path: &str,
+    repo_root: Option<&str>,
+) -> HashSet<String> {
+    let Some(root) = repo_root else {
+        return changed_files.into_iter().collect();
+    };
+
+    let canon_root = std::fs::canonicalize(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| root.to_string());
+
+    let package_prefix = repo_path
+        .strip_prefix(&format!("{}/", canon_root))
+        .or_else(|| repo_path.strip_prefix(&canon_root))
+        .unwrap_or("");
+
+    if package_prefix.is_empty() {
+        eprintln!(
+            "[incremental] WARNING: Could not compute package prefix (repo_path={}, root={}), \
+             falling back to full diff",
+            repo_path, canon_root
+        );
+        return changed_files.into_iter().collect();
+    }
+
+    let prefix_with_slash = format!("{}/", package_prefix);
+
+    changed_files
+        .into_iter()
+        .filter_map(|f| f.strip_prefix(&prefix_with_slash).map(|s| s.to_string()))
+        .collect()
+}
+
 /// Hash file content for cache invalidation (package.json).
 fn hash_file_content(content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -467,13 +509,11 @@ async fn analyze_current_repo_incremental(
         .unwrap_or_else(|_| repo_path.to_string());
     let repo_path = canonical.as_str();
 
-    // 1. Discover files and symbols (fast SWC pass, always full)
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_imported_symbols, function_definitions, repo_name) =
+    let (files, all_imported_symbols, function_definitions, repo_name, config_file, package_json) =
         discover_files_and_symbols(repo_path, cm.clone())?;
 
-    // 2. Load config and packages
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    let (config, packages) = load_config_and_packages(config_file, package_json)?;
 
     // 3. Check if we can use incremental mode
     let can_use_incremental = previous_data
@@ -505,14 +545,11 @@ async fn analyze_current_repo_incremental(
             &prev_commit[..std::cmp::min(7, prev_commit.len())]
         );
 
-        // Get changed files via git diff
-        // For monorepo packages, run git from the repo root and filter by package prefix
         let git_dir = repo_root.unwrap_or(repo_path);
         if let Some(changed_files) = get_changed_files(git_dir, prev_commit) {
             let prev_file_results = prev.file_results.as_ref().unwrap();
             let repo_prefix = format!("{}/", repo_path);
 
-            // Helper to normalize a file path to repo-relative
             let normalize_path = |f: &PathBuf| -> String {
                 let s = f.to_string_lossy();
                 if let Some(stripped) = s.strip_prefix(&repo_prefix) {
@@ -524,35 +561,10 @@ async fn analyze_current_repo_incremental(
                 }
             };
 
-            // Build set of currently discovered file paths (normalized to relative)
             let current_file_set: HashSet<String> = files.iter().map(&normalize_path).collect();
 
-            // For monorepo packages, git diff returns paths relative to repo root
-            // (e.g., "apps/event-api/src/app.ts"), but our file normalization yields
-            // paths relative to the package dir (e.g., "src/app.ts").
-            // Compute the package prefix to filter and strip changed files.
-            let changed_set: HashSet<String> = if let Some(root) = repo_root {
-                let canon_root = std::fs::canonicalize(root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| root.to_string());
-                let package_prefix = repo_path
-                    .strip_prefix(&format!("{}/", canon_root))
-                    .or_else(|| repo_path.strip_prefix(&canon_root))
-                    .unwrap_or("");
-
-                let prefix_with_slash = if package_prefix.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", package_prefix)
-                };
-
-                changed_files
-                    .into_iter()
-                    .filter_map(|f| f.strip_prefix(&prefix_with_slash).map(|s| s.to_string()))
-                    .collect()
-            } else {
-                changed_files.into_iter().collect()
-            };
+            let changed_set: HashSet<String> =
+                filter_changed_files_for_package(changed_files, repo_path, repo_root);
 
             // Partition: which files need fresh analysis?
             let files_to_analyze: Vec<PathBuf> = files
@@ -889,14 +901,15 @@ fn resolve_types_if_available(
     }
 }
 
-/// Discover files and extract symbols for MultiAgentOrchestrator
+/// Discover files and extract symbols for MultiAgentOrchestrator.
+/// Returns source files, symbols, function defs, repo name, and config/package.json paths
+/// from a single directory traversal.
 fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
-    // Find files in current repo only
     let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (files, _, _) = find_files(repo_path, &ignore_patterns);
+    let (files, config_file, package_json) = find_files(repo_path, &ignore_patterns);
 
     println!(
         "Found {} files to analyze in directory {}",
@@ -904,18 +917,15 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
         repo_path
     );
 
-    // Extract imported symbols and function definitions by parsing files
     let mut all_imported_symbols = HashMap::new();
     let mut all_function_definitions = HashMap::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
-            // Extract import symbols
             let mut import_extractor = ImportSymbolExtractor::new();
             module.visit_with(&mut import_extractor);
             all_imported_symbols.extend(import_extractor.imported_symbols);
 
-            // Extract function definitions with type annotations
             let mut func_extractor = FunctionDefinitionExtractor::new(file_path.clone());
             module.visit_with(&mut func_extractor);
             all_function_definitions.extend(func_extractor.function_definitions);
@@ -934,16 +944,16 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
         all_imported_symbols,
         all_function_definitions,
         repo_name,
+        config_file,
+        package_json,
     ))
 }
 
-/// Extract config and package loading logic
+/// Load config and packages from pre-discovered file paths (avoids redundant directory traversal).
 fn load_config_and_packages(
-    repo_path: &str,
+    config_file_path: Option<PathBuf>,
+    package_json_path: Option<PathBuf>,
 ) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
-    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
-
     let config = if let Some(config_path) = config_file_path {
         println!("Found carrick.json file: {}", config_path.display());
         Config::new(vec![config_path]).unwrap_or_else(|e| {
@@ -1189,9 +1199,8 @@ async fn analyze_current_repo(
         repo_path
     );
 
-    // 1. Create shared SourceMap and discover files and symbols
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_imported_symbols, function_definitions, repo_name) =
+    let (files, all_imported_symbols, function_definitions, repo_name, config_file, package_json) =
         discover_files_and_symbols(repo_path, cm.clone())?;
     println!(
         "Extracted repository name: '{}' from {} files ({} function definitions)",
@@ -1200,8 +1209,7 @@ async fn analyze_current_repo(
         function_definitions.len()
     );
 
-    // 2. Load config and packages using existing logic
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    let (config, packages) = load_config_and_packages(config_file, package_json)?;
 
     // 3. Get API key and create MultiAgentOrchestrator
     let api_key = env::var("CARRICK_API_KEY")
