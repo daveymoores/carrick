@@ -47,37 +47,97 @@ export function extractTypeDefinition(
   bundledTypes: string,
   typeAlias: string,
 ): string | null {
-  // Try "export type Alias = ..." pattern
-  const typePattern = new RegExp(
-    `(?:export\\s+)?type\\s+${escapeRegex(typeAlias)}\\s*=\\s*([\\s\\S]*?);(?:\\s*(?:export|type|interface|$))`,
-    "m",
+  // Find the start of the declaration
+  const declPattern = new RegExp(
+    `(?:export\\s+)?(?:type|interface)\\s+${escapeRegex(typeAlias)}\\b`,
   );
-  const typeMatch = bundledTypes.match(typePattern);
-  if (typeMatch) {
-    return `type ${typeAlias} = ${typeMatch[1].trim()};`;
+  const declMatch = declPattern.exec(bundledTypes);
+  if (!declMatch) return null;
+
+  const startIdx = declMatch.index;
+  const afterDecl = bundledTypes.slice(declMatch.index + declMatch[0].length);
+
+  // Determine if this is a type alias or interface
+  const isInterface = /interface/.test(declMatch[0]);
+
+  if (isInterface) {
+    // Find opening brace, then brace-count to find the matching close
+    const braceStart = afterDecl.indexOf("{");
+    if (braceStart === -1) return null;
+
+    const body = extractBraceBlock(afterDecl, braceStart);
+    if (body === null) return null;
+    return `interface ${typeAlias} ${body}`;
   }
 
-  // Try "export interface Alias { ... }" pattern
-  const interfacePattern = new RegExp(
-    `(?:export\\s+)?interface\\s+${escapeRegex(typeAlias)}\\s*\\{([\\s\\S]*?)\\}`,
-    "m",
-  );
-  const interfaceMatch = bundledTypes.match(interfacePattern);
-  if (interfaceMatch) {
-    return `interface ${typeAlias} {${interfaceMatch[1]}}`;
+  // Type alias: find the "=" then extract the value
+  const eqIdx = afterDecl.indexOf("=");
+  if (eqIdx === -1) return null;
+
+  const afterEq = afterDecl.slice(eqIdx + 1).trimStart();
+
+  // If the type value starts with "{", use brace counting
+  if (afterEq.startsWith("{")) {
+    const body = extractBraceBlock(afterEq, 0);
+    if (body === null) return null;
+    return `type ${typeAlias} = ${body};`;
   }
 
-  // Fallback: grab anything from "type/interface Alias" to the next top-level declaration
-  const fallbackPattern = new RegExp(
-    `(?:export\\s+)?(?:type|interface)\\s+${escapeRegex(typeAlias)}[\\s\\S]*?(?=(?:export\\s+)?(?:type|interface)\\s+\\w|$)`,
-    "m",
-  );
-  const fallbackMatch = bundledTypes.match(fallbackPattern);
-  if (fallbackMatch) {
-    return fallbackMatch[0].trim();
+  // Simple type alias (no braces): take everything up to the next ";"
+  // at the top level (not inside angle brackets or parens)
+  const end = findTopLevelSemicolon(afterEq);
+  if (end === -1) {
+    // Fallback: take up to next top-level declaration or end of string
+    const fallbackEnd = bundledTypes.slice(startIdx).search(
+      /\n(?:export\s+)?(?:type|interface)\s+\w/,
+    );
+    const chunk = fallbackEnd === -1
+      ? bundledTypes.slice(startIdx)
+      : bundledTypes.slice(startIdx, startIdx + fallbackEnd);
+    return chunk.trim() || null;
   }
+  return `type ${typeAlias} = ${afterEq.slice(0, end).trim()};`;
+}
 
+/**
+ * Extract a brace-delimited block starting at the given index,
+ * counting nested braces to find the matching close.
+ */
+function extractBraceBlock(source: string, openIndex: number): string | null {
+  let depth = 0;
+  for (let i = openIndex; i < source.length; i++) {
+    if (source[i] === "{") depth++;
+    else if (source[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        return source.slice(openIndex, i + 1);
+      }
+    }
+  }
   return null;
+}
+
+/**
+ * Find the index of the first semicolon that is not nested inside
+ * braces, angle brackets, or parentheses.
+ */
+function findTopLevelSemicolon(source: string): number {
+  let braces = 0;
+  let angles = 0;
+  let parens = 0;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "{") braces++;
+    else if (ch === "}") braces--;
+    else if (ch === "<") angles++;
+    else if (ch === ">") angles--;
+    else if (ch === "(") parens++;
+    else if (ch === ")") parens--;
+    else if (ch === ";" && braces === 0 && angles === 0 && parens === 0) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 /**

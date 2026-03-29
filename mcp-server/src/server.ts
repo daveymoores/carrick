@@ -19,14 +19,14 @@ export function createServer(client: ApiClient): McpServer {
 
   server.tool(
     "list_services",
-    "List all services in the org with endpoint counts, call counts, and type availability",
+    "List all services in the organization with endpoint counts, API call counts, and whether TypeScript types are available. Use this first to discover what services exist before drilling into specific endpoints or types.",
     {},
     async () => listServices(client),
   );
 
   server.tool(
     "get_api_endpoints",
-    "Get the API endpoints exposed by a service. Returns method, path, handler, owner, and file location.",
+    "Get the API endpoints exposed by a single service. Returns method, path, handler, owner, and file location for each endpoint. Use this to explore what routes a service exposes before checking types or compatibility.",
     {
       service: z.string().describe("Service name to look up (fuzzy match by repo name, service name, or trailing segment)"),
       method: z.string().optional().describe("Filter by HTTP method (GET, POST, etc.)"),
@@ -37,7 +37,7 @@ export function createServer(client: ApiClient): McpServer {
 
   server.tool(
     "get_endpoint_types",
-    "Get the request/response TypeScript type definitions for a specific API endpoint. This is the highest-value tool — returns extracted .d.ts types.",
+    "Get the TypeScript request/response type definitions for a specific API endpoint. Returns extracted .d.ts types including whether they were explicitly annotated or inferred. Use get_api_endpoints first to find the exact method and path.",
     {
       service: z.string().describe("Service name"),
       method: z.string().describe("HTTP method (GET, POST, PUT, DELETE)"),
@@ -48,7 +48,7 @@ export function createServer(client: ApiClient): McpServer {
 
   server.tool(
     "check_compatibility",
-    "Check if a consumer's API calls are compatible with a producer's endpoints. Finds missing endpoints and unused endpoints.",
+    "Check if a specific consumer service's API calls are compatible with a specific producer service's endpoints. Compares one consumer-producer pair — reports missing endpoints (consumer calls something the producer doesn't expose) and unused endpoints. Use list_services first to find service names.",
     {
       consumer_service: z.string().describe("The service making API calls"),
       producer_service: z.string().describe("The service exposing endpoints"),
@@ -60,7 +60,7 @@ export function createServer(client: ApiClient): McpServer {
 
   server.tool(
     "get_service_dependencies",
-    "Get package dependencies for a service, or find version conflicts across all services in the org.",
+    "Get npm package dependencies for a single service, or omit the service parameter to find version conflicts across all services in the organization. Useful for detecting mismatched dependency versions that could cause runtime issues.",
     {
       service: z.string().optional().describe("Service name (omit for org-wide conflict analysis)"),
     },

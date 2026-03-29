@@ -81,8 +81,8 @@ export async function getEndpoints(
 }
 
 function ownerName(owner: { App?: string; Router?: string; Middleware?: string }): string {
-  return (owner as Record<string, string>).App
-    ?? (owner as Record<string, string>).Router
-    ?? (owner as Record<string, string>).Middleware
-    ?? "unknown";
+  if ("App" in owner && owner.App) return owner.App;
+  if ("Router" in owner && owner.Router) return owner.Router;
+  if ("Middleware" in owner && owner.Middleware) return owner.Middleware;
+  return "unknown";
 }
