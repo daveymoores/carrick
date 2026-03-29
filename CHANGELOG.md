@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.4](https://github.com/daveymoores/carrick/compare/carrick-v0.1.3...carrick-v0.1.4) (2026-03-29)
+
+
+### Bug Fixes
+
+* MCP server type safety, bug fixes, and test coverage ([#43](https://github.com/daveymoores/carrick/issues/43)) ([cc80d27](https://github.com/daveymoores/carrick/commit/cc80d27fda58b4946bf38313b84d45dd70e1fa2e))
+* remove broken "Test Published Action" workflow ([a50fd70](https://github.com/daveymoores/carrick/commit/a50fd70f0d768652a47df8bc5d60a037421a4168)), closes [#44](https://github.com/daveymoores/carrick/issues/44)
+* rename job from "Test Published Action" to "Test Action" ([3de4ef7](https://github.com/daveymoores/carrick/commit/3de4ef79c3335e7ccbf754cf187bf8cce7f15ad2))
+* use local action ref and maintain floating v1 tag ([577c872](https://github.com/daveymoores/carrick/commit/577c87295c896b09202932cd084f71ceddf64ab0)), closes [#44](https://github.com/daveymoores/carrick/issues/44)
+
 ## [0.1.3](https://github.com/daveymoores/carrick/compare/carrick-v0.1.2...carrick-v0.1.3) (2026-03-23)
 
 
