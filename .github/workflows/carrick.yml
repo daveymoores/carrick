@@ -20,7 +20,7 @@ jobs:
 
       - name: Run Carrick Analysis on entire repo
         id: carrick-analysis
-        uses: ./
+        uses: daveymoores/carrick@carrick-v0.1.3
         with:
           carrick-org: ${{ secrets.CARRICK_ORG }}
           carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
