@@ -168,6 +168,74 @@ export type NextType = number;`;
     expect(result).toContain("deep");
   });
 
+  it("preserves generic parameters on interfaces", () => {
+    const bundled = `export interface ApiResponse<T> {
+  data: T;
+  status: number;
+}`;
+
+    const result = extractTypeDefinition(bundled, "ApiResponse");
+    expect(result).not.toBeNull();
+    expect(result).toContain("interface ApiResponse<T>");
+    expect(result).toContain("data: T");
+  });
+
+  it("preserves extends clauses on interfaces", () => {
+    const bundled = `export interface AdminUser extends BaseUser {
+  permissions: string[];
+}`;
+
+    const result = extractTypeDefinition(bundled, "AdminUser");
+    expect(result).not.toBeNull();
+    expect(result).toContain("interface AdminUser");
+    expect(result).toContain("extends BaseUser");
+    expect(result).toContain("permissions: string[]");
+  });
+
+  it("preserves generic params and extends together", () => {
+    const bundled = `export interface PaginatedResponse<T> extends BaseResponse {
+  items: T[];
+  total: number;
+}`;
+
+    const result = extractTypeDefinition(bundled, "PaginatedResponse");
+    expect(result).not.toBeNull();
+    expect(result).toContain("<T>");
+    expect(result).toContain("extends BaseResponse");
+    expect(result).toContain("items: T[]");
+  });
+
+  it("handles intersection types with object literals", () => {
+    const bundled = `export type UserWithMeta = { name: string } & { createdAt: Date };
+export type Other = string;`;
+
+    const result = extractTypeDefinition(bundled, "UserWithMeta");
+    expect(result).not.toBeNull();
+    expect(result).toContain("name: string");
+    expect(result).toContain("&");
+    expect(result).toContain("createdAt: Date");
+  });
+
+  it("handles union types with object literals", () => {
+    const bundled = `export type Result = { ok: true; data: string } | { ok: false; error: string };
+export type Other = number;`;
+
+    const result = extractTypeDefinition(bundled, "Result");
+    expect(result).not.toBeNull();
+    expect(result).toContain("ok: true");
+    expect(result).toContain("|");
+    expect(result).toContain("error: string");
+  });
+
+  it("handles arrow function types", () => {
+    const bundled = `export type Handler = (req: Request) => Response;
+export type Other = string;`;
+
+    const result = extractTypeDefinition(bundled, "Handler");
+    expect(result).not.toBeNull();
+    expect(result).toContain("(req: Request) => Response");
+  });
+
   it("does not match partial type names", () => {
     const bundled = `export type UserResponse = string;
 export type GetUserResponseData = number;`;

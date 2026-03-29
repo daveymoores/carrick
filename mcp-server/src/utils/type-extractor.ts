@@ -65,9 +65,13 @@ export function extractTypeDefinition(
     const braceStart = afterDecl.indexOf("{");
     if (braceStart === -1) return null;
 
+    // Preserve generic parameters and heritage clauses between the
+    // interface name and the opening brace (e.g. "<T> extends Base ").
+    const header = afterDecl.slice(0, braceStart);
+
     const body = extractBraceBlock(afterDecl, braceStart);
     if (body === null) return null;
-    return `interface ${typeAlias} ${body}`;
+    return `interface ${typeAlias}${header}${body}`;
   }
 
   // Type alias: find the "=" then extract the value
@@ -76,15 +80,8 @@ export function extractTypeDefinition(
 
   const afterEq = afterDecl.slice(eqIdx + 1).trimStart();
 
-  // If the type value starts with "{", use brace counting
-  if (afterEq.startsWith("{")) {
-    const body = extractBraceBlock(afterEq, 0);
-    if (body === null) return null;
-    return `type ${typeAlias} = ${body};`;
-  }
-
-  // Simple type alias (no braces): take everything up to the next ";"
-  // at the top level (not inside angle brackets or parens)
+  // Always use top-level semicolon scanning — this handles simple types,
+  // object types, and compound types like `{ a: string } & Other`.
   const end = findTopLevelSemicolon(afterEq);
   if (end === -1) {
     // Fallback: take up to next top-level declaration or end of string
@@ -130,8 +127,10 @@ function findTopLevelSemicolon(source: string): number {
     if (ch === "{") braces++;
     else if (ch === "}") braces--;
     else if (ch === "<") angles++;
-    else if (ch === ">") angles--;
-    else if (ch === "(") parens++;
+    else if (ch === ">" && source[i - 1] !== "=") {
+      // Only decrement for generic closes, not arrow functions (=>)
+      angles = Math.max(0, angles - 1);
+    } else if (ch === "(") parens++;
     else if (ch === ")") parens--;
     else if (ch === ";" && braces === 0 && angles === 0 && parens === 0) {
       return i;
