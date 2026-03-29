@@ -1,5 +1,5 @@
 import express from "express";
-import serverlessExpress from "@codegenie/serverless-express";
+import { configure as serverlessExpress } from "@codegenie/serverless-express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ApiClient } from "./api-client.js";
 import { createServer } from "./server.js";
