@@ -12,8 +12,8 @@ permissions:
   pull-requests: write
 
 jobs:
-  test-published-action:
-    name: Test Published Action
+  test-action:
+    name: Test Action
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
