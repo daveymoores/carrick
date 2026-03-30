@@ -24,6 +24,7 @@ use crate::type_manifest::{
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
+use crate::workspace::detect_workspace;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -48,6 +49,8 @@ type FileDiscoveryResult = Result<
         HashMap<String, crate::visitor::ImportedSymbol>,
         HashMap<String, FunctionDefinition>,
         String,
+        Option<PathBuf>, // config file path
+        Option<PathBuf>, // package.json path
     ),
     Box<dyn std::error::Error>,
 >;
@@ -115,70 +118,159 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
 
-    // 3. Extract previous data for current repo (if any)
     let repo_name = get_repository_name(repo_path);
-    let previous_data = all_repo_data
-        .iter()
-        .find(|r| r.repo_name == repo_name)
-        .cloned();
+    let workspace = detect_workspace(repo_path);
 
-    if previous_data.is_some() {
+    if workspace.is_monorepo {
         println!(
-            "[incremental] Found previous analysis data for {}",
-            repo_name
+            "[workspace] Detected monorepo with {} packages:",
+            workspace.packages.len()
         );
-    }
+        for pkg in &workspace.packages {
+            println!("  - {} ({})", pkg.name, pkg.path.display());
+        }
 
-    // 4. Analyze (incremental if possible)
-    let current_repo_data =
-        analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref()).await?;
-    println!("Analyzed current repo: {}", current_repo_data.repo_name);
+        let mut all_package_data: Vec<CloudRepoData> = Vec::new();
 
-    // Log sidecar type resolution results if available
-    if current_repo_data.bundled_types.is_some() {
+        for package in &workspace.packages {
+            let composite_name = format!("{}::{}", repo_name, package.name);
+            println!(
+                "\n=== Analyzing package: {} ({}) ===",
+                package.name,
+                package.path.display()
+            );
+
+            let previous_data = all_repo_data
+                .iter()
+                .find(|r| r.repo_name == composite_name)
+                .cloned();
+
+            if previous_data.is_some() {
+                println!(
+                    "[incremental] Found previous analysis data for {}",
+                    composite_name
+                );
+            }
+
+            let package_path = package.path.to_string_lossy().to_string();
+            let mut package_data = analyze_current_repo_incremental(
+                &package_path,
+                sidecar,
+                previous_data.as_ref(),
+                Some(repo_path),
+            )
+            .await?;
+
+            package_data.repo_name = composite_name;
+            package_data.package_name = Some(package.name.clone());
+
+            println!(
+                "Analyzed package {}: {} endpoints, {} calls",
+                package.name,
+                package_data.endpoints.len(),
+                package_data.calls.len()
+            );
+
+            if should_upload {
+                let cloud_data_serialized = strip_ast_nodes(package_data.clone());
+                storage
+                    .upload_repo_data(&carrick_org, &cloud_data_serialized)
+                    .await
+                    .map_err(|e| {
+                        format!("Failed to upload data for package {}: {}", package.name, e)
+                    })?;
+                println!("Uploaded data for package {}", package.name);
+            }
+
+            all_package_data.push(package_data);
+        }
+
+        if !should_upload {
+            println!("Skipping upload (PR/branch mode - analyzing only)");
+        }
+
+        let composite_prefix = format!("{}::", repo_name);
+        all_repo_data.retain(|repo| {
+            !repo.repo_name.starts_with(&composite_prefix) && repo.repo_name != repo_name
+        });
+
         println!(
-            "Type resolution: {} bundled types, {} manifest entries",
-            current_repo_data
-                .bundled_types
-                .as_ref()
-                .map(|s| s.lines().count())
-                .unwrap_or(0),
-            current_repo_data
-                .type_manifest
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0)
+            "\nDownloaded data from {} external repos",
+            all_repo_data.len()
         );
-    }
 
-    // 5. Conditionally upload current repo data to cloud storage
-    if should_upload {
-        let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
-        storage
-            .upload_repo_data(&carrick_org, &cloud_data_serialized)
-            .await
-            .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-        println!("Uploaded current repo data to cloud storage");
+        if !all_package_data.is_empty() {
+            let first_package = all_package_data.remove(0);
+            all_repo_data.extend(all_package_data);
+
+            let analyzer = build_cross_repo_analyzer(all_repo_data, first_package).await?;
+            println!("Reconstructed analyzer with cross-repo data");
+
+            let results = analyzer.get_results();
+            print_results(results);
+        } else {
+            println!("No packages to analyze in monorepo");
+        }
     } else {
-        println!("Skipping upload (PR/branch mode - analyzing only)");
+        let previous_data = all_repo_data
+            .iter()
+            .find(|r| r.repo_name == repo_name)
+            .cloned();
+
+        if previous_data.is_some() {
+            println!(
+                "[incremental] Found previous analysis data for {}",
+                repo_name
+            );
+        }
+
+        let current_repo_data =
+            analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref(), None)
+                .await?;
+        println!("Analyzed current repo: {}", current_repo_data.repo_name);
+
+        if current_repo_data.bundled_types.is_some() {
+            println!(
+                "Type resolution: {} bundled types, {} manifest entries",
+                current_repo_data
+                    .bundled_types
+                    .as_ref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0),
+                current_repo_data
+                    .type_manifest
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+            );
+        }
+
+        if should_upload {
+            let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
+            storage
+                .upload_repo_data(&carrick_org, &cloud_data_serialized)
+                .await
+                .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+            println!("Uploaded current repo data to cloud storage");
+        } else {
+            println!("Skipping upload (PR/branch mode - analyzing only)");
+        }
+
+        let current_repo_name = &current_repo_data.repo_name;
+        all_repo_data.retain(|repo| &repo.repo_name != current_repo_name);
+
+        println!(
+            "Downloaded data from {} repos (excluding current repo: {})",
+            all_repo_data.len(),
+            current_repo_name
+        );
+
+        let analyzer = build_cross_repo_analyzer(all_repo_data, current_repo_data).await?;
+        println!("Reconstructed analyzer with cross-repo data");
+
+        let results = analyzer.get_results();
+        print_results(results);
     }
-
-    // 6. Cross-repo analysis (reuse already-downloaded data)
-    // Remove current repo from cross-repo data to prevent duplicate processing
-    let current_repo_name = &current_repo_data.repo_name;
-    all_repo_data.retain(|repo| &repo.repo_name != current_repo_name);
-
-    println!(
-        "Downloaded data from {} repos (excluding current repo: {})",
-        all_repo_data.len(),
-        current_repo_name
-    );
-
-    let analyzer = build_cross_repo_analyzer(all_repo_data, current_repo_data).await?;
-    println!("Reconstructed analyzer with cross-repo data");
-
-    let results = analyzer.get_results();
-    print_results(results);
 
     Ok(())
 }
@@ -305,6 +397,45 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
     Some(changed)
 }
 
+/// Filter git diff paths for a monorepo package.
+/// Git diff returns paths relative to the repo root (e.g., "apps/event-api/src/app.ts"),
+/// but file discovery normalizes to package-relative paths (e.g., "src/app.ts").
+/// This function strips the package prefix so the paths match.
+fn filter_changed_files_for_package(
+    changed_files: Vec<String>,
+    repo_path: &str,
+    repo_root: Option<&str>,
+) -> HashSet<String> {
+    let Some(root) = repo_root else {
+        return changed_files.into_iter().collect();
+    };
+
+    let canon_root = std::fs::canonicalize(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| root.to_string());
+
+    let package_prefix = repo_path
+        .strip_prefix(&format!("{}/", canon_root))
+        .or_else(|| repo_path.strip_prefix(&canon_root))
+        .unwrap_or("");
+
+    if package_prefix.is_empty() {
+        eprintln!(
+            "[incremental] WARNING: Could not compute package prefix (repo_path={}, root={}), \
+             falling back to full diff",
+            repo_path, canon_root
+        );
+        return changed_files.into_iter().collect();
+    }
+
+    let prefix_with_slash = format!("{}/", package_prefix);
+
+    changed_files
+        .into_iter()
+        .filter_map(|f| f.strip_prefix(&prefix_with_slash).map(|s| s.to_string()))
+        .collect()
+}
+
 /// Hash file content for cache invalidation (package.json).
 fn hash_file_content(content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -362,10 +493,13 @@ fn strip_diagnostic_fields(
 }
 
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
+/// `repo_root` is the git root directory (used for monorepo packages where repo_path
+/// is a subdirectory). When None, repo_path is assumed to be the git root.
 async fn analyze_current_repo_incremental(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
+    repo_root: Option<&str>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -375,13 +509,11 @@ async fn analyze_current_repo_incremental(
         .unwrap_or_else(|_| repo_path.to_string());
     let repo_path = canonical.as_str();
 
-    // 1. Discover files and symbols (fast SWC pass, always full)
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_imported_symbols, function_definitions, repo_name) =
+    let (files, all_imported_symbols, function_definitions, repo_name, config_file, package_json) =
         discover_files_and_symbols(repo_path, cm.clone())?;
 
-    // 2. Load config and packages
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    let (config, packages) = load_config_and_packages(config_file, package_json)?;
 
     // 3. Check if we can use incremental mode
     let can_use_incremental = previous_data
@@ -413,12 +545,11 @@ async fn analyze_current_repo_incremental(
             &prev_commit[..std::cmp::min(7, prev_commit.len())]
         );
 
-        // Get changed files via git diff
-        if let Some(changed_files) = get_changed_files(repo_path, prev_commit) {
+        let git_dir = repo_root.unwrap_or(repo_path);
+        if let Some(changed_files) = get_changed_files(git_dir, prev_commit) {
             let prev_file_results = prev.file_results.as_ref().unwrap();
             let repo_prefix = format!("{}/", repo_path);
 
-            // Helper to normalize a file path to repo-relative
             let normalize_path = |f: &PathBuf| -> String {
                 let s = f.to_string_lossy();
                 if let Some(stripped) = s.strip_prefix(&repo_prefix) {
@@ -430,11 +561,10 @@ async fn analyze_current_repo_incremental(
                 }
             };
 
-            // Build set of currently discovered file paths (normalized to relative)
             let current_file_set: HashSet<String> = files.iter().map(&normalize_path).collect();
 
-            // Normalize changed files relative to repo root
-            let changed_set: HashSet<String> = changed_files.into_iter().collect();
+            let changed_set: HashSet<String> =
+                filter_changed_files_for_package(changed_files, repo_path, repo_root);
 
             // Partition: which files need fresh analysis?
             let files_to_analyze: Vec<PathBuf> = files
@@ -688,6 +818,7 @@ fn build_cloud_data_from_mount_graph(
     CloudRepoData {
         repo_name: repo_name.to_string(),
         service_name,
+        package_name: None,
         endpoints,
         calls,
         mounts,
@@ -770,14 +901,15 @@ fn resolve_types_if_available(
     }
 }
 
-/// Discover files and extract symbols for MultiAgentOrchestrator
+/// Discover files and extract symbols for MultiAgentOrchestrator.
+/// Returns source files, symbols, function defs, repo name, and config/package.json paths
+/// from a single directory traversal.
 fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
-    // Find files in current repo only
     let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (files, _, _) = find_files(repo_path, &ignore_patterns);
+    let (files, config_file, package_json) = find_files(repo_path, &ignore_patterns);
 
     println!(
         "Found {} files to analyze in directory {}",
@@ -785,18 +917,15 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
         repo_path
     );
 
-    // Extract imported symbols and function definitions by parsing files
     let mut all_imported_symbols = HashMap::new();
     let mut all_function_definitions = HashMap::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
-            // Extract import symbols
             let mut import_extractor = ImportSymbolExtractor::new();
             module.visit_with(&mut import_extractor);
             all_imported_symbols.extend(import_extractor.imported_symbols);
 
-            // Extract function definitions with type annotations
             let mut func_extractor = FunctionDefinitionExtractor::new(file_path.clone());
             module.visit_with(&mut func_extractor);
             all_function_definitions.extend(func_extractor.function_definitions);
@@ -815,16 +944,16 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
         all_imported_symbols,
         all_function_definitions,
         repo_name,
+        config_file,
+        package_json,
     ))
 }
 
-/// Extract config and package loading logic
+/// Load config and packages from pre-discovered file paths (avoids redundant directory traversal).
 fn load_config_and_packages(
-    repo_path: &str,
+    config_file_path: Option<PathBuf>,
+    package_json_path: Option<PathBuf>,
 ) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
-    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
-
     let config = if let Some(config_path) = config_file_path {
         println!("Found carrick.json file: {}", config_path.display());
         Config::new(vec![config_path]).unwrap_or_else(|e| {
@@ -1070,9 +1199,8 @@ async fn analyze_current_repo(
         repo_path
     );
 
-    // 1. Create shared SourceMap and discover files and symbols
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_imported_symbols, function_definitions, repo_name) =
+    let (files, all_imported_symbols, function_definitions, repo_name, config_file, package_json) =
         discover_files_and_symbols(repo_path, cm.clone())?;
     println!(
         "Extracted repository name: '{}' from {} files ({} function definitions)",
@@ -1081,8 +1209,7 @@ async fn analyze_current_repo(
         function_definitions.len()
     );
 
-    // 2. Load config and packages using existing logic
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    let (config, packages) = load_config_and_packages(config_file, package_json)?;
 
     // 3. Get API key and create MultiAgentOrchestrator
     let api_key = env::var("CARRICK_API_KEY")
@@ -1461,6 +1588,7 @@ mod tests {
         let test_data = CloudRepoData {
             repo_name: "test-repo".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],
@@ -1499,6 +1627,7 @@ mod tests {
         let test_data = vec![CloudRepoData {
             repo_name: "test-repo".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -1572,6 +1701,7 @@ mod tests {
         let test_data = vec![CloudRepoData {
             repo_name: "test-repo".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],
@@ -1921,6 +2051,7 @@ mod tests {
         let data = CloudRepoData {
             repo_name: "test-repo".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -1962,6 +2093,7 @@ mod tests {
         let data = CloudRepoData {
             repo_name: "test-repo".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -2090,6 +2222,7 @@ mod tests {
         let data = CloudRepoData {
             repo_name: "test-repo".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],

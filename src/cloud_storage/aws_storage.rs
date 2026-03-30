@@ -329,6 +329,7 @@ impl CloudStorage for AwsStorage {
                 let repo_data = CloudRepoData {
                     repo_name: adjacent.repo.clone(),
                     service_name: None,
+                    package_name: None,
                     endpoints: Vec::new(),
                     calls: Vec::new(),
                     mounts: Vec::new(),

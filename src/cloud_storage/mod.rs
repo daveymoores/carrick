@@ -94,6 +94,8 @@ pub struct CloudRepoData {
     pub repo_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>, // Service name from carrick.json for cross-repo resolution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>, // Workspace package name for monorepo support
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub mounts: Vec<Mount>,
@@ -210,6 +212,7 @@ impl CloudRepoData {
         Self {
             repo_name,
             service_name,
+            package_name: None,
             endpoints,
             calls,
             mounts,
