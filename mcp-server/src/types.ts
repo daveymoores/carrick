@@ -100,6 +100,10 @@ export interface TypeManifestEntry {
   is_explicit: boolean;
   type_state: ManifestTypeState;
   evidence: TypeEvidence;
+  /** Original declaration text as written (preserves named types) */
+  resolved_definition?: string;
+  /** Compiler-expanded form with all types fully inlined */
+  expanded_definition?: string;
 }
 
 export interface TypeEvidence {

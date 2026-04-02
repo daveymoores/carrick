@@ -579,6 +579,11 @@ async fn analyze_current_repo_incremental(
                 cloud_data.bundled_types = Some(updated);
             }
 
+            // Resolve per-endpoint definitions via compiler
+            if let Some(sidecar) = sidecar {
+                resolve_per_endpoint_definitions(sidecar, &mut cloud_data);
+            }
+
             return Ok(cloud_data);
         } else {
             println!("[incremental] git diff failed, falling back to full analysis");
@@ -848,6 +853,58 @@ fn load_config_and_packages(
     Ok((config, packages))
 }
 
+/// Resolve per-endpoint type definitions using the sidecar's compiler.
+/// Populates `resolved_definition` and `expanded_definition` on each manifest entry.
+/// Non-fatal: if resolution fails, entries keep their None values and the MCP falls back to regex.
+fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut CloudRepoData) {
+    let Some(ref bundled_types) = cloud_data.bundled_types else {
+        return;
+    };
+    let Some(ref mut manifest) = cloud_data.type_manifest else {
+        return;
+    };
+
+    // Collect unique aliases that have actual types (not Unknown)
+    let aliases: Vec<String> = manifest
+        .iter()
+        .filter(|e| e.type_state != ManifestTypeState::Unknown)
+        .map(|e| e.type_alias.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    if aliases.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "[Sidecar] Resolving {} type definition(s) via compiler...",
+        aliases.len()
+    );
+
+    match sidecar.resolve_definitions(bundled_types, &aliases) {
+        Ok(resolved) => {
+            let lookup: std::collections::HashMap<String, _> = resolved
+                .into_iter()
+                .map(|r| (r.type_alias.clone(), r))
+                .collect();
+            for entry in manifest.iter_mut() {
+                if let Some(r) = lookup.get(&entry.type_alias) {
+                    entry.resolved_definition = Some(r.definition.clone());
+                    entry.expanded_definition = Some(r.expanded.clone());
+                }
+            }
+            eprintln!("[Sidecar] Resolved {} type definition(s)", lookup.len());
+        }
+        Err(e) => {
+            eprintln!("[Sidecar] Per-endpoint definition resolution failed: {}", e);
+            eprintln!(
+                "[Sidecar] Continuing without resolved definitions (MCP will use regex fallback)"
+            );
+        }
+    }
+}
+
 fn build_type_manifest_entries(
     mount_graph: &MountGraph,
     config: &Config,
@@ -943,6 +1000,8 @@ fn add_manifest_pair(
             is_explicit: false,
             type_state: ManifestTypeState::Unknown,
             evidence,
+            resolved_definition: None,
+            expanded_definition: None,
         });
     }
 }
@@ -1128,6 +1187,11 @@ async fn analyze_current_repo(
     if let Some(bundled_types) = cloud_data.bundled_types.take() {
         let updated = append_missing_aliases(bundled_types, cloud_data.type_manifest.as_ref());
         cloud_data.bundled_types = Some(updated);
+    }
+
+    // 6b. Resolve per-endpoint definitions via compiler
+    if let Some(sidecar) = sidecar {
+        resolve_per_endpoint_definitions(sidecar, &mut cloud_data);
     }
 
     // 7. Populate cache fields for future incremental runs

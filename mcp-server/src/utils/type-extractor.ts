@@ -13,6 +13,7 @@ export interface ExtractedType {
   type_alias: string;
   type_kind: "request" | "response";
   definition: string;
+  expanded?: string;
   is_explicit: boolean;
   file_path: string;
   line_number: number;
@@ -153,12 +154,14 @@ export function extractEndpointTypes(
   const results: ExtractedType[] = [];
 
   for (const entry of entries) {
-    const definition = extractTypeDefinition(bundledTypes, entry.type_alias);
+    const definition = entry.resolved_definition
+      ?? extractTypeDefinition(bundledTypes, entry.type_alias);
     if (definition) {
       results.push({
         type_alias: entry.type_alias,
         type_kind: entry.type_kind,
         definition,
+        expanded: entry.expanded_definition,
         is_explicit: entry.is_explicit,
         file_path: entry.file_path,
         line_number: entry.line_number,

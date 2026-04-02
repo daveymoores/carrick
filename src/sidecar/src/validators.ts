@@ -252,6 +252,12 @@ export const ShutdownRequestSchema = BaseRequestSchema.extend({
   action: z.literal('shutdown'),
 });
 
+export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('resolve_definitions'),
+  bundled_dts: z.string().min(1, 'Bundled .d.ts content cannot be empty'),
+  aliases: z.array(z.string().min(1)).min(1, 'At least one alias is required'),
+});
+
 // ============================================================================
 // Discriminated Union Schema
 // ============================================================================
@@ -266,6 +272,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   InferRequestSchema,
   BuildWorkspaceRequestSchema,
   CheckCompatibilityRequestSchema,
+  ResolveDefinitionsRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
 ]);

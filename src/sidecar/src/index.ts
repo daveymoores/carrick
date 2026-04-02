@@ -18,6 +18,7 @@ import { ProjectLoader } from './project-loader.js';
 import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { MonorepoBuilder } from './monorepo-builder.js';
+import { DefinitionResolver } from './definition-resolver.js';
 import type {
   SidecarRequest,
   SidecarResponse,
@@ -27,6 +28,7 @@ import type {
   InferResponse,
   BuildWorkspaceResponse,
   CheckCompatibilityResponse,
+  ResolveDefinitionsResponse,
   HealthResponse,
   ShutdownResponse,
   ErrorResponse,
@@ -41,6 +43,7 @@ let typeBundler: TypeBundler | null = null;
 let surfaceEmitter: SurfaceEmitter | null = null;
 let typeInferrer: TypeInferrer | null = null;
 let monorepoBuilder: MonorepoBuilder | null = null;
+let definitionResolver: DefinitionResolver | null = null;
 let initTimeMs: number | null = null;
 
 // ===========================================================================
@@ -89,6 +92,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
     });
 
     typeInferrer = new TypeInferrer({ project });
+    definitionResolver = new DefinitionResolver({ project });
 
     // Initialize monorepo builder (doesn't need project)
     monorepoBuilder = new MonorepoBuilder();
@@ -333,6 +337,49 @@ function handleCheckCompatibility(request: SidecarRequest & { action: 'check_com
 }
 
 /**
+ * Handle the 'resolve_definitions' action - resolve type aliases from bundled .d.ts
+ */
+function handleResolveDefinitions(
+  request: SidecarRequest & { action: 'resolve_definitions' },
+): ResolveDefinitionsResponse {
+  if (!projectLoader?.isInitialized() || !definitionResolver) {
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: ['Sidecar not initialized. Call init first.'],
+    };
+  }
+
+  try {
+    log(`Resolving ${request.aliases.length} type alias(es)`);
+
+    const results = definitionResolver.resolve(
+      request.bundled_dts,
+      request.aliases,
+    );
+
+    return {
+      request_id: request.request_id,
+      status: 'success',
+      definitions: results.map((r) => ({
+        type_alias: r.type_alias,
+        definition: r.definition,
+        expanded: r.expanded,
+      })),
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Definition resolution failed: ${error}`);
+
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    };
+  }
+}
+
+/**
  * Handle the 'health' action - report initialization status
  */
 function handleHealth(request: SidecarRequest & { action: 'health' }): HealthResponse {
@@ -384,6 +431,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleBuildWorkspace(request);
     case 'check_compatibility':
       return handleCheckCompatibility(request);
+    case 'resolve_definitions':
+      return handleResolveDefinitions(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

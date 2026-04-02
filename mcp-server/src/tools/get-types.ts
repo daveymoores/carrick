@@ -81,7 +81,9 @@ export async function getEndpointTypes(
       source_file: t.file_path,
       source_line: t.line_number,
       definition: t.definition,
+      ...(t.expanded ? { expanded: t.expanded } : {}),
     })),
+    hint: "Use get_type_definition(service, type_alias) to get the full resolved definition of any type, including all transitive dependencies.",
   };
 
   return {
