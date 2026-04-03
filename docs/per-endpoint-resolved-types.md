@@ -12,8 +12,10 @@ The MCP `get_endpoint_types` tool uses regex to extract type definitions from a 
 Pre-resolve types at CI time using the TypeScript compiler (ts-morph), not at query time in the MCP Lambda.
 
 Each `TypeManifestEntry` gains two new fields:
-- `definition` — the original declaration text as written (preserves named types for readability)
-- `expanded` — the compiler-expanded form with all types fully inlined (guaranteed complete)
+- `resolved_definition` — the original declaration text as written (preserves named types for readability)
+- `expanded_definition` — the compiler-expanded form with all types fully inlined (guaranteed complete)
+
+The MCP tools map these to `definition` and `expanded` in their JSON responses.
 
 ### Example
 
@@ -32,7 +34,7 @@ The sidecar already has ts-morph with the full TypeScript project loaded. After 
 ```typescript
 const decl = sourceFile.getTypeAlias(alias) ?? sourceFile.getInterface(alias);
 const definition = decl.getText();
-const expanded = decl.getType().getText(decl, ts.TypeFormatFlags.NoTruncation);
+const expanded = decl.getType().getText(decl, ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias);
 ```
 
 The compiler does all the work. No graph walking, no regex, no manual dependency resolution.
