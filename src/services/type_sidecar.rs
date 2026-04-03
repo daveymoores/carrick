@@ -152,6 +152,12 @@ enum SidecarRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         wrappers: Option<Vec<WrapperRule>>,
     },
+    #[serde(rename = "resolve_definitions")]
+    ResolveDefinitions {
+        request_id: String,
+        bundled_dts: String,
+        aliases: Vec<String>,
+    },
     #[serde(rename = "health")]
     Health { request_id: String },
     #[serde(rename = "shutdown")]
@@ -242,9 +248,22 @@ pub struct SidecarResponse {
     /// Inferred types (for infer)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inferred_types: Option<Vec<InferredType>>,
+    /// Resolved definitions (for resolve_definitions)
+    #[serde(default)]
+    pub definitions: Option<Vec<ResolvedDefinitionResult>>,
     /// Error messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
+}
+
+/// A single resolved type definition from the sidecar
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolvedDefinitionResult {
+    pub type_alias: String,
+    /// Original declaration text as written
+    pub definition: String,
+    /// Compiler-expanded form with all types fully inlined
+    pub expanded: String,
 }
 
 // ============================================================================
@@ -492,6 +511,7 @@ impl TypeSidecar {
                 manifest: Some(vec![]),
                 symbol_failures: None,
                 inferred_types: None,
+                definitions: None,
                 errors: None,
             });
         }
@@ -529,6 +549,7 @@ impl TypeSidecar {
                 manifest: None,
                 symbol_failures: None,
                 inferred_types: Some(vec![]),
+                definitions: None,
                 errors: None,
             });
         }
@@ -547,6 +568,42 @@ impl TypeSidecar {
 
         self.send_request(&request)?;
         self.read_response_with_timeout(Duration::from_secs(60))
+    }
+
+    /// Resolve type definitions from bundled .d.ts content.
+    ///
+    /// For each alias, returns both the original declaration text and the
+    /// compiler-expanded form with all types fully inlined.
+    ///
+    /// # Arguments
+    /// * `bundled_dts` - The bundled .d.ts content
+    /// * `aliases` - Type alias names to resolve
+    pub fn resolve_definitions(
+        &self,
+        bundled_dts: &str,
+        aliases: &[String],
+    ) -> Result<Vec<ResolvedDefinitionResult>, SidecarError> {
+        self.ensure_ready()?;
+
+        if aliases.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let request = SidecarRequest::ResolveDefinitions {
+            request_id: self.next_request_id(),
+            bundled_dts: bundled_dts.to_string(),
+            aliases: aliases.to_vec(),
+        };
+
+        self.send_request(&request)?;
+        let response = self.read_response_with_timeout(Duration::from_secs(30))?;
+
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::ResolutionFailed(errors.join("; ")));
+        }
+
+        Ok(response.definitions.unwrap_or_default())
     }
 
     /// Resolve all types (explicit + inferred) in a single operation.
@@ -855,6 +912,8 @@ pub enum SidecarError {
     SerializationError(String),
     /// Failed to deserialize response
     DeserializationError(String),
+    /// Definition resolution failed
+    ResolutionFailed(String),
 }
 
 impl std::fmt::Display for SidecarError {
@@ -868,6 +927,7 @@ impl std::fmt::Display for SidecarError {
             SidecarError::IoError(e) => write!(f, "I/O error: {}", e),
             SidecarError::SerializationError(e) => write!(f, "Serialization error: {}", e),
             SidecarError::DeserializationError(e) => write!(f, "Deserialization error: {}", e),
+            SidecarError::ResolutionFailed(e) => write!(f, "Definition resolution failed: {}", e),
         }
     }
 }

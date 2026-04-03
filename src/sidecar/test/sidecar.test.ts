@@ -814,6 +814,203 @@ describe('Type Sidecar Integration Tests', () => {
     });
   });
 
+  describe('resolve_definitions action', () => {
+    // First, bundle types to get the .d.ts content, then resolve from it
+    let bundledDts: string;
+
+    before(async () => {
+      // Ensure initialized
+      await client.send({
+        action: 'init',
+        request_id: 'resolve-setup',
+        repo_root: FIXTURES_PATH,
+      });
+
+      // Bundle types to get .d.ts content we can resolve against
+      const bundleResponse = await client.send<{
+        status: string;
+        dts_content?: string;
+      }>({
+        action: 'bundle',
+        request_id: 'resolve-bundle',
+        symbols: [
+          { symbol_name: 'User', source_file: 'src/types.ts' },
+          { symbol_name: 'UserProfile', source_file: 'src/types.ts' },
+          { symbol_name: 'UserSettings', source_file: 'src/types.ts' },
+          { symbol_name: 'UserRole', source_file: 'src/types.ts' },
+          { symbol_name: 'Order', source_file: 'src/models.ts' },
+          { symbol_name: 'OrderStatus', source_file: 'src/models.ts' },
+        ],
+      });
+
+      assert.strictEqual(bundleResponse.status, 'success');
+      assert.ok(bundleResponse.dts_content, 'Should have bundled .d.ts content');
+      bundledDts = bundleResponse.dts_content;
+    });
+
+    it('should resolve a simple interface', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        definitions?: Array<{
+          type_alias: string;
+          definition: string;
+          expanded: string;
+        }>;
+        errors?: string[];
+      }>({
+        action: 'resolve_definitions',
+        request_id: 'resolve-1',
+        bundled_dts: bundledDts,
+        aliases: ['User'],
+      });
+
+      assert.strictEqual(response.request_id, 'resolve-1');
+      assert.strictEqual(response.status, 'success');
+      assert.ok(response.definitions);
+      assert.strictEqual(response.definitions.length, 1);
+
+      const def = response.definitions[0];
+      assert.strictEqual(def.type_alias, 'User');
+      // definition should contain the original interface text
+      assert.ok(def.definition.includes('interface User'), 'definition should have original interface');
+      assert.ok(def.definition.includes('name'), 'definition should include name field');
+      // expanded for interfaces returns the type name (nominal) — that's expected
+      assert.ok(def.expanded, 'expanded should be present');
+    });
+
+    it('should resolve a type alias with union', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        definitions?: Array<{
+          type_alias: string;
+          definition: string;
+          expanded: string;
+        }>;
+      }>({
+        action: 'resolve_definitions',
+        request_id: 'resolve-2',
+        bundled_dts: bundledDts,
+        aliases: ['UserRole'],
+      });
+
+      assert.strictEqual(response.status, 'success');
+      assert.ok(response.definitions);
+      const def = response.definitions[0];
+      assert.strictEqual(def.type_alias, 'UserRole');
+      // The expanded form should preserve the union literals
+      assert.ok(def.expanded.includes('admin'), 'expanded should preserve union member "admin"');
+      assert.ok(def.expanded.includes('user'), 'expanded should preserve union member "user"');
+      assert.ok(def.expanded.includes('guest'), 'expanded should preserve union member "guest"');
+    });
+
+    it('should resolve an interface with transitive dependencies', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        definitions?: Array<{
+          type_alias: string;
+          definition: string;
+          expanded: string;
+        }>;
+      }>({
+        action: 'resolve_definitions',
+        request_id: 'resolve-3',
+        bundled_dts: bundledDts,
+        aliases: ['UserProfile'],
+      });
+
+      assert.strictEqual(response.status, 'success');
+      assert.ok(response.definitions);
+      const def = response.definitions[0];
+      assert.strictEqual(def.type_alias, 'UserProfile');
+      // definition should reference UserSettings by name
+      assert.ok(def.definition.includes('UserSettings'), 'definition should reference UserSettings');
+      // definition should show the extends clause
+      assert.ok(def.definition.includes('extends User'), 'definition should show extends User');
+      // expanded for interfaces returns the nominal name — definition has the full text
+      assert.ok(def.expanded, 'expanded should be present');
+    });
+
+    it('should resolve multiple aliases in one call', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        definitions?: Array<{
+          type_alias: string;
+          definition: string;
+          expanded: string;
+        }>;
+      }>({
+        action: 'resolve_definitions',
+        request_id: 'resolve-4',
+        bundled_dts: bundledDts,
+        aliases: ['User', 'Order', 'OrderStatus'],
+      });
+
+      assert.strictEqual(response.status, 'success');
+      assert.ok(response.definitions);
+      assert.strictEqual(response.definitions.length, 3);
+
+      const names = response.definitions.map((d) => d.type_alias);
+      assert.ok(names.includes('User'));
+      assert.ok(names.includes('Order'));
+      assert.ok(names.includes('OrderStatus'));
+
+      // OrderStatus should have the union preserved
+      const orderStatus = response.definitions.find((d) => d.type_alias === 'OrderStatus')!;
+      assert.ok(orderStatus.expanded.includes('pending'));
+      assert.ok(orderStatus.expanded.includes('shipped'));
+    });
+
+    it('should skip non-existent aliases without failing', async () => {
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        definitions?: Array<{
+          type_alias: string;
+          definition: string;
+          expanded: string;
+        }>;
+      }>({
+        action: 'resolve_definitions',
+        request_id: 'resolve-5',
+        bundled_dts: bundledDts,
+        aliases: ['User', 'NonExistentType'],
+      });
+
+      assert.strictEqual(response.status, 'success');
+      assert.ok(response.definitions);
+      // Should only resolve the one that exists
+      assert.strictEqual(response.definitions.length, 1);
+      assert.strictEqual(response.definitions[0].type_alias, 'User');
+    });
+
+    it('should fail before init', async () => {
+      const freshClient = new SidecarClient();
+      await freshClient.start();
+
+      try {
+        const response = await freshClient.send<{
+          request_id: string;
+          status: string;
+          errors?: string[];
+        }>({
+          action: 'resolve_definitions',
+          request_id: 'resolve-uninit',
+          bundled_dts: 'export type Foo = string;',
+          aliases: ['Foo'],
+        });
+
+        assert.strictEqual(response.status, 'error');
+        assert.ok(response.errors?.some((e) => e.toLowerCase().includes('init')));
+      } finally {
+        await freshClient.stop();
+      }
+    });
+  });
+
   describe('error handling', () => {
     it('should handle invalid JSON gracefully', async () => {
       // This is tricky to test since we can't send invalid JSON through our client
@@ -940,6 +1137,45 @@ describe('Validator Unit Tests', () => {
     });
 
     assert.strictEqual(result.success, true);
+  });
+
+  it('should validate resolve_definitions request', async () => {
+    const { parseRequest } = await import('../src/validators.js');
+
+    const result = parseRequest({
+      action: 'resolve_definitions',
+      request_id: 'test-resolve-1',
+      bundled_dts: 'export type Foo = string;',
+      aliases: ['Foo'],
+    });
+
+    assert.strictEqual(result.success, true);
+  });
+
+  it('should reject resolve_definitions with empty aliases', async () => {
+    const { parseRequest } = await import('../src/validators.js');
+
+    const result = parseRequest({
+      action: 'resolve_definitions',
+      request_id: 'test-resolve-2',
+      bundled_dts: 'export type Foo = string;',
+      aliases: [],
+    });
+
+    assert.strictEqual(result.success, false);
+  });
+
+  it('should reject resolve_definitions with empty bundled_dts', async () => {
+    const { parseRequest } = await import('../src/validators.js');
+
+    const result = parseRequest({
+      action: 'resolve_definitions',
+      request_id: 'test-resolve-3',
+      bundled_dts: '',
+      aliases: ['Foo'],
+    });
+
+    assert.strictEqual(result.success, false);
   });
 
   it('should reject invalid infer_kind', async () => {

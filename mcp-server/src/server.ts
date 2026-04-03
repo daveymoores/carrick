@@ -6,6 +6,7 @@ import { getEndpoints } from "./tools/get-endpoints.js";
 import { getEndpointTypes } from "./tools/get-types.js";
 import { checkCompatibility } from "./tools/check-compat.js";
 import { getServiceDependencies } from "./tools/get-deps.js";
+import { getTypeDefinition } from "./tools/get-type-definition.js";
 import { getServiceCatalog } from "./resources/service-catalog.js";
 import { getServiceTypes } from "./resources/service-types.js";
 
@@ -65,6 +66,16 @@ export function createServer(client: ApiClient): McpServer {
       service: z.string().optional().describe("Service name (omit for org-wide conflict analysis)"),
     },
     async (params) => getServiceDependencies(client, params),
+  );
+
+  server.tool(
+    "get_type_definition",
+    "Get the full resolved TypeScript definition for a named type, including all transitive dependencies. Use this after get_endpoint_types to get complete type definitions.",
+    {
+      service: z.string().describe("Service name"),
+      type_alias: z.string().describe("Type alias name (from get_endpoint_types results)"),
+    },
+    async (params) => getTypeDefinition(client, params),
   );
 
   // --- Resources ---

@@ -7,9 +7,9 @@
     "build": "zip -r ../check-or-upload.zip ."
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.490.0",
-    "@aws-sdk/client-s3": "^3.490.0",
-    "@aws-sdk/lib-dynamodb": "^3.490.0"
+    "@aws-sdk/client-dynamodb": "^3.1022.0",
+    "@aws-sdk/client-s3": "^3.1022.0",
+    "@aws-sdk/lib-dynamodb": "^3.1022.0"
   },
   "engines": {
     "node": ">=22.0.0"

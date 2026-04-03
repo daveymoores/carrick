@@ -291,6 +291,18 @@ export interface ShutdownRequest extends BaseRequest {
 }
 
 /**
+ * Request to resolve type definitions from bundled .d.ts content.
+ * Returns both the original declaration and the compiler-expanded form.
+ */
+export interface ResolveDefinitionsRequest extends BaseRequest {
+  action: 'resolve_definitions';
+  /** The bundled .d.ts content to resolve aliases from */
+  bundled_dts: string;
+  /** Type alias names to resolve */
+  aliases: string[];
+}
+
+/**
  * Union type for all possible sidecar requests
  */
 export type SidecarRequest =
@@ -300,6 +312,7 @@ export type SidecarRequest =
   | InferRequest
   | BuildWorkspaceRequest
   | CheckCompatibilityRequest
+  | ResolveDefinitionsRequest
   | HealthRequest
   | ShutdownRequest;
 
@@ -451,6 +464,27 @@ export interface CompatibilityResult {
 }
 
 /**
+ * Response for resolve_definitions action
+ */
+export interface ResolveDefinitionsResponse extends BaseResponse {
+  /** Successfully resolved definitions */
+  definitions?: ResolvedDefinitionResult[];
+  /** Errors during resolution */
+  errors?: string[];
+}
+
+/**
+ * A single resolved type definition
+ */
+export interface ResolvedDefinitionResult {
+  type_alias: string;
+  /** Original declaration text as written */
+  definition: string;
+  /** Compiler-expanded form with all types fully inlined */
+  expanded: string;
+}
+
+/**
  * Response for health action
  */
 export interface HealthResponse extends BaseResponse {
@@ -483,6 +517,7 @@ export type SidecarResponse =
   | InferResponse
   | BuildWorkspaceResponse
   | CheckCompatibilityResponse
+  | ResolveDefinitionsResponse
   | HealthResponse
   | ShutdownResponse
   | ErrorResponse;

@@ -87,6 +87,14 @@ pub struct TypeManifestEntry {
     pub type_state: ManifestTypeState,
     /// Evidence metadata for this entry
     pub evidence: TypeEvidence,
+    /// Original declaration text as written (preserves named types for readability).
+    /// Generated at CI time by the sidecar's DefinitionResolver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_definition: Option<String>,
+    /// Compiler-expanded form with all types fully inlined.
+    /// Generated at CI time via ts-morph's type.getText() with NoTruncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expanded_definition: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
