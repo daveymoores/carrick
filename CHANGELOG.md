@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/daveymoores/carrick/compare/carrick-v0.1.4...carrick-v0.1.5) (2026-04-03)
+
+
+### Features
+
+* per-endpoint resolved type definitions via compiler ([#51](https://github.com/daveymoores/carrick/issues/51)) ([cd1b8e2](https://github.com/daveymoores/carrick/commit/cd1b8e255fd44fad32146dc8e43b9c42b59e3896))
+
 ## [0.1.4](https://github.com/daveymoores/carrick/compare/carrick-v0.1.3...carrick-v0.1.4) (2026-03-29)
 
 
