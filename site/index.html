@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Carrick &mdash; Your agent already knows your codebase. Now it knows all of them.</title>
+  <meta name="description" content="Carrick is an MCP tool that gives AI agents instant access to business logic, endpoints, and functions across every repo in your org.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+    :root {
+      --bg: #09090b;
+      --surface: #131316;
+      --surface-2: #1c1c21;
+      --border: #27272a;
+      --text: #fafafa;
+      --text-muted: #a1a1aa;
+      --accent: #6d5dfc;
+      --accent-light: #8b7ffd;
+      --accent-glow: rgba(109, 93, 252, 0.15);
+      --green: #22c55e;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ── NAV ── */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      padding: 1rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(9,9,11,0.8);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      font-weight: 800;
+      font-size: 1.25rem;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 2rem;
+      align-items: center;
+      list-style: none;
+    }
+
+    .nav-links a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover { color: var(--text); }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.625rem 1.25rem;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.2s;
+      cursor: pointer;
+      border: none;
+      font-family: var(--font);
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-light);
+      box-shadow: 0 0 24px var(--accent-glow);
+    }
+
+    .btn-secondary {
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--text-muted);
+    }
+
+    /* ── HERO ── */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 8rem 2rem 4rem;
+      position: relative;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -20%;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.375rem 1rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-bottom: 2rem;
+    }
+
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      background: var(--green);
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 900;
+      line-height: 1.05;
+      letter-spacing: -0.04em;
+      max-width: 800px;
+      margin-bottom: 1.5rem;
+    }
+
+    h1 .gradient {
+      background: linear-gradient(135deg, var(--accent-light), #c084fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero-sub {
+      font-size: clamp(1.05rem, 2vw, 1.25rem);
+      color: var(--text-muted);
+      max-width: 560px;
+      margin-bottom: 2.5rem;
+      line-height: 1.7;
+    }
+
+    .hero-cta {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-bottom: 4rem;
+    }
+
+    /* ── VIDEO ── */
+    .video-section {
+      width: 100%;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 0 2rem;
+    }
+
+    .video-wrapper {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow:
+        0 0 0 1px var(--border),
+        0 24px 48px -12px rgba(0,0,0,0.5),
+        0 0 64px var(--accent-glow);
+    }
+
+    .video-wrapper video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .video-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      background: linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%);
+    }
+
+    .play-icon {
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      background: var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 32px var(--accent-glow);
+      transition: transform 0.2s;
+    }
+
+    .play-icon:hover { transform: scale(1.1); }
+
+    .play-icon svg {
+      width: 28px;
+      height: 28px;
+      fill: #fff;
+      margin-left: 4px;
+    }
+
+    .video-placeholder span {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    /* ── PROBLEM / SOLUTION ── */
+    .section {
+      padding: 6rem 2rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    .section-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent-light);
+      margin-bottom: 1rem;
+    }
+
+    .section h2 {
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 1.5rem;
+    }
+
+    .section p.lead {
+      font-size: 1.125rem;
+      color: var(--text-muted);
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    /* ── PAIN POINTS ── */
+    .pain-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .pain-card {
+      padding: 1.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      transition: border-color 0.2s;
+    }
+
+    .pain-card:hover { border-color: var(--accent); }
+
+    .pain-card .icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+    }
+
+    .pain-card h3 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+
+    .pain-card p {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+
+    /* ── HOW IT WORKS ── */
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 2rem;
+      margin-top: 3rem;
+      counter-reset: step;
+    }
+
+    .step {
+      counter-increment: step;
+      padding: 2rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      position: relative;
+    }
+
+    .step::before {
+      content: counter(step);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.875rem;
+      margin-bottom: 1rem;
+    }
+
+    .step h3 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+
+    .step p {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+
+    /* ── CODE BLOCK ── */
+    .code-section {
+      max-width: 700px;
+      margin: 4rem auto 0;
+    }
+
+    .code-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .code-header {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .code-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+
+    .code-dot:nth-child(1) { background: #ef4444; }
+    .code-dot:nth-child(2) { background: #f59e0b; }
+    .code-dot:nth-child(3) { background: #22c55e; }
+
+    .code-body {
+      padding: 1.25rem;
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      line-height: 1.8;
+      overflow-x: auto;
+    }
+
+    .code-body .comment { color: #6b7280; }
+    .code-body .string { color: #a5f3fc; }
+    .code-body .keyword { color: var(--accent-light); }
+    .code-body .fn { color: #fbbf24; }
+
+    /* ── FEATURES ── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .feature {
+      padding: 1.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    .feature h3 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+
+    .feature p {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+
+    /* ── CTA ── */
+    .cta-section {
+      text-align: center;
+      padding: 6rem 2rem 8rem;
+    }
+
+    .cta-section h2 {
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 1rem;
+    }
+
+    .cta-section p {
+      color: var(--text-muted);
+      font-size: 1.1rem;
+      margin-bottom: 2rem;
+    }
+
+    .cta-buttons {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    /* ── FOOTER ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+    }
+
+    /* ── DIVIDER ── */
+    .divider {
+      max-width: 1100px;
+      margin: 0 auto;
+      border: none;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 640px) {
+      nav { padding: 1rem; }
+      .nav-links { display: none; }
+      .hero { padding: 7rem 1.25rem 3rem; }
+      .section { padding: 4rem 1.25rem; }
+      .hero-cta { flex-direction: column; align-items: center; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- NAV -->
+  <nav>
+    <a href="#" class="logo">carrick</a>
+    <ul class="nav-links">
+      <li><a href="#how-it-works">How it works</a></li>
+      <li><a href="#features">Features</a></li>
+      <li><a href="https://github.com/daveymoores/carrick" target="_blank">GitHub</a></li>
+      <li><a href="https://www.carrick.tools/" class="btn btn-primary" target="_blank">Get early access</a></li>
+    </ul>
+  </nav>
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="badge">
+      <span class="badge-dot"></span>
+      Now in private beta
+    </div>
+    <h1>Your agent knows <em>one</em> repo.<br><span class="gradient">Carrick knows all of them.</span></h1>
+    <p class="hero-sub">
+      An MCP server that gives AI agents a map of every endpoint, function, and piece of business logic across your entire microservices architecture. No more guessing. No more grep.
+    </p>
+    <div class="hero-cta">
+      <a href="https://www.carrick.tools/" class="btn btn-primary" target="_blank">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" style="display:inline-block;vertical-align:middle"><path d="M8 1v14M1 8h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        Join the beta
+      </a>
+      <a href="#how-it-works" class="btn btn-secondary">See how it works</a>
+    </div>
+
+    <!-- VIDEO -->
+    <div class="video-section">
+      <div class="video-wrapper">
+        <!-- Replace the placeholder below with: <video src="demo.mp4" controls></video> -->
+        <div class="video-placeholder" id="video-placeholder">
+          <div class="play-icon">
+            <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+          </div>
+          <span>Demo video coming soon</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROBLEM -->
+  <section class="section">
+    <p class="section-label">The problem</p>
+    <h2>Microservices are a black box&mdash;<br>even for your AI agent.</h2>
+    <p class="lead">
+      Your agent is brilliant inside a single repo. But the moment it needs to understand how services talk to each other, it's blind. You're back to manually tracing calls, grepping across repos, and hoping nothing breaks.
+    </p>
+
+    <div class="pain-grid">
+      <div class="pain-card">
+        <div class="icon" style="background: rgba(239,68,68,0.1); color: var(--red);">?</div>
+        <h3>"Which service calls this endpoint?"</h3>
+        <p>Your agent can see the route handler. It can't see the 4 other repos that depend on it. Change the contract and you'll find out in production.</p>
+      </div>
+      <div class="pain-card">
+        <div class="icon" style="background: rgba(245,158,11,0.1); color: var(--amber);">&#x21C4;</div>
+        <h3>"What types does this expect?"</h3>
+        <p>The producer sends <code style="color:var(--accent-light)">User</code>. The consumer expects <code style="color:var(--accent-light)">UserProfile</code>. The mismatch sits quietly in your codebase until something blows up.</p>
+      </div>
+      <div class="pain-card">
+        <div class="icon" style="background: rgba(109,93,252,0.1); color: var(--accent-light);">&#x1F50D;</div>
+        <h3>"Where's the business logic for X?"</h3>
+        <p>It's split across three services, two shared libraries, and a Lambda. Good luck getting any AI to reason about that without a map.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="divider">
+
+  <!-- HOW IT WORKS -->
+  <section class="section" id="how-it-works">
+    <p class="section-label">How it works</p>
+    <h2>One tool. Total cross-repo awareness.</h2>
+    <p class="lead">
+      Carrick scans every repo in your org, builds a live index of producers and consumers, and serves it to your agent via MCP. No schema files to maintain. No manual wiring.
+    </p>
+
+    <div class="steps">
+      <div class="step">
+        <h3>Scan &amp; extract</h3>
+        <p>Carrick uses SWC to parse your Express services at the AST level. Every route, every mounted router, every call site&mdash;mapped automatically.</p>
+      </div>
+      <div class="step">
+        <h3>Resolve types</h3>
+        <p>TypeScript types are resolved recursively across files using ts-morph. Request and response shapes are captured per-endpoint with full fidelity.</p>
+      </div>
+      <div class="step">
+        <h3>Index cross-repo</h3>
+        <p>Endpoint metadata flows into a shared store. Every service sees every other service. Producers and consumers are linked across your entire org.</p>
+      </div>
+      <div class="step">
+        <h3>Serve via MCP</h3>
+        <p>Your AI agent queries the Carrick MCP server and instantly knows what calls what, what types flow where, and what will break if you change something.</p>
+      </div>
+    </div>
+
+    <div class="code-section">
+      <div class="code-block">
+        <div class="code-header">
+          <span class="code-dot"></span>
+          <span class="code-dot"></span>
+          <span class="code-dot"></span>
+        </div>
+        <div class="code-body">
+<span class="comment">// Your agent asks Carrick via MCP:</span>
+<span class="comment">// "What depends on GET /api/users/:id?"</span>
+
+<span class="keyword">Found</span> <span class="string">3 consumers</span> across 3 repos:
+
+  <span class="fn">order-service</span>    &rarr; GET /api/users/:id  <span style="color:var(--green)">&#x2713; types match</span>
+  <span class="fn">billing-service</span>  &rarr; GET /api/users/:id  <span style="color:var(--red)">&#x2717; missing field: role</span>
+  <span class="fn">dashboard-app</span>   &rarr; GET /api/users/:id  <span style="color:var(--green)">&#x2713; types match</span>
+
+<span class="comment">// Your agent now knows billing-service will break</span>
+<span class="comment">// before you even open a PR.</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <hr class="divider">
+
+  <!-- FEATURES -->
+  <section class="section" id="features">
+    <p class="section-label">Features</p>
+    <h2>Everything your agent needs to<br>reason across services.</h2>
+
+    <div class="features-grid">
+      <div class="feature">
+        <h3>MCP-native</h3>
+        <p>Purpose-built as a Model Context Protocol server. Works with Claude, Cursor, Windsurf, and any MCP-compatible agent out of the box.</p>
+      </div>
+      <div class="feature">
+        <h3>AST-level precision</h3>
+        <p>No regex hacks. Carrick parses your code with SWC and ts-morph to extract routes, call sites, and types with compiler-grade accuracy.</p>
+      </div>
+      <div class="feature">
+        <h3>Full type resolution</h3>
+        <p>TypeScript interfaces resolved recursively. When your agent sees an endpoint, it sees the exact shape of every request and response.</p>
+      </div>
+      <div class="feature">
+        <h3>GitHub Action built-in</h3>
+        <p>Runs in CI on every PR. Catches cross-repo contract violations and posts actionable comments before code hits main.</p>
+      </div>
+      <div class="feature">
+        <h3>AI-powered extraction</h3>
+        <p>Complex call patterns&mdash;template literals, env vars, wrapper functions&mdash;are handled by an LLM agent that reads your code like a human would.</p>
+      </div>
+      <div class="feature">
+        <h3>Incremental &amp; fast</h3>
+        <p>Only re-analyzes changed files. Results are cached. Even large monorepo-scale architectures get sub-minute analysis times.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="divider">
+
+  <!-- CTA -->
+  <section class="cta-section">
+    <h2>Stop flying blind across repos.</h2>
+    <p>Give your AI agent the cross-service context it's been missing.</p>
+    <div class="cta-buttons">
+      <a href="https://www.carrick.tools/" class="btn btn-primary" target="_blank">Get early access</a>
+      <a href="https://github.com/daveymoores/carrick" class="btn btn-secondary" target="_blank">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="display:inline-block;vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        View on GitHub
+      </a>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer>
+    <p>&copy; 2026 Carrick. Built for teams who ship across services.</p>
+  </footer>
+
+</body>
+</html>
