@@ -7,6 +7,7 @@ import { getEndpointTypes } from "./tools/get-types.js";
 import { checkCompatibility } from "./tools/check-compat.js";
 import { getServiceDependencies } from "./tools/get-deps.js";
 import { getTypeDefinition } from "./tools/get-type-definition.js";
+import { listFunctionIntents } from "./tools/find-similar.js";
 import { getServiceCatalog } from "./resources/service-catalog.js";
 import { getServiceTypes } from "./resources/service-types.js";
 
@@ -76,6 +77,16 @@ export function createServer(client: ApiClient): McpServer {
       type_alias: z.string().describe("Type alias name (from get_endpoint_types results)"),
     },
     async (params) => getTypeDefinition(client, params),
+  );
+
+  server.tool(
+    "list_function_intents",
+    "List all exported functions with their LLM-generated intent descriptions across org services. Returns a compact list the agent can scan to discover existing implementations. Use gh CLI to browse the actual source code on GitHub.",
+    {
+      service: z.string().optional().describe("Filter to a specific service (omit for all services)"),
+      exclude_service: z.string().optional().describe("Service to exclude from results"),
+    },
+    async (params) => listFunctionIntents(client, params),
   );
 
   // --- Resources ---

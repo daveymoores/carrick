@@ -5,6 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
+use swc_common::SourceMapper;
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -90,6 +91,29 @@ pub struct FunctionDefinition {
     pub file_path: PathBuf,
     pub node_type: FunctionNodeType,
     pub arguments: Vec<FunctionArgument>,
+    /// Raw source text of function body (capped at 2000 chars)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_source: Option<String>,
+    /// Whether the function is exported
+    #[serde(default)]
+    pub is_exported: bool,
+    /// Start line number for navigation
+    #[serde(default)]
+    pub line_number: u32,
+    /// LLM-generated description of what this function intends to do
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// Local functions called by this function (name, file_path, line_number)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<FunctionCallRef>,
+}
+
+/// A reference to a called function, for navigating to its source via GitHub.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FunctionCallRef {
+    pub name: String,
+    pub file_path: String,
+    pub line_number: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -238,18 +262,50 @@ impl Visit for TypeSymbolExtractor {
 
 /// Extractor for function definitions with type annotations.
 /// Used to extract handler functions for type resolution in the multi-agent pipeline.
-#[derive(Debug)]
 pub struct FunctionDefinitionExtractor {
     pub function_definitions: HashMap<String, FunctionDefinition>,
     current_file_path: PathBuf,
+    source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
+    /// Names of functions that are exported (populated by visit_export_decl / visit_named_export)
+    exported_names: HashSet<String>,
 }
 
 impl FunctionDefinitionExtractor {
-    pub fn new(file_path: PathBuf) -> Self {
+    pub fn new(
+        file_path: PathBuf,
+        source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
+    ) -> Self {
         Self {
             function_definitions: HashMap::new(),
             current_file_path: file_path,
+            source_map,
+            exported_names: HashSet::new(),
         }
+    }
+
+    /// Extract source text from a span, capped at 2000 chars
+    fn extract_source(&self, span: swc_common::Span) -> Option<String> {
+        if span.is_dummy() {
+            return None;
+        }
+        let src = self.source_map.span_to_snippet(span).ok()?;
+        if src.len() > 2000 {
+            if let Some((idx, _)) = src.char_indices().nth(2000) {
+                Some(format!("{}...", &src[..idx]))
+            } else {
+                Some(src)
+            }
+        } else {
+            Some(src)
+        }
+    }
+
+    /// Get the line number for a span
+    fn line_number(&self, span: swc_common::Span) -> u32 {
+        if span.is_dummy() {
+            return 0;
+        }
+        self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
     /// Extract function arguments with their type annotations
@@ -301,12 +357,114 @@ impl FunctionDefinitionExtractor {
             })
             .collect()
     }
+
+    /// Mark functions as exported based on collected export names.
+    /// Call this after `module.visit_with()` completes.
+    pub fn finalize_exports(&mut self) {
+        for (name, def) in self.function_definitions.iter_mut() {
+            if self.exported_names.contains(name) {
+                def.is_exported = true;
+            }
+        }
+    }
 }
 
 impl Visit for FunctionDefinitionExtractor {
+    /// Track `export function foo() {}` and `export const bar = ...`
+    fn visit_export_decl(&mut self, export: &ExportDecl) {
+        match &export.decl {
+            Decl::Fn(fn_decl) => {
+                self.exported_names.insert(fn_decl.ident.sym.to_string());
+            }
+            Decl::Var(var_decl) => {
+                for decl in &var_decl.decls {
+                    if let Pat::Ident(ident) = &decl.name {
+                        self.exported_names.insert(ident.id.sym.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Continue visiting so visit_fn_decl / visit_var_declarator fire
+        export.visit_children_with(self);
+    }
+
+    /// Track `export default function foo() {}` and `export default class Foo {}`
+    fn visit_export_default_decl(&mut self, export: &ExportDefaultDecl) {
+        match &export.decl {
+            DefaultDecl::Fn(fn_expr) => {
+                if let Some(ident) = &fn_expr.ident {
+                    let name = ident.sym.to_string();
+                    self.exported_names.insert(name.clone());
+                    // Capture the function since visit_fn_decl won't fire for default exports
+                    let arguments = self.extract_arguments(&fn_expr.function.params);
+                    let body_source = fn_expr
+                        .function
+                        .body
+                        .as_ref()
+                        .and_then(|b| self.extract_source(b.span));
+                    let line_number = self.line_number(fn_expr.function.span);
+                    self.function_definitions.insert(
+                        name.clone(),
+                        FunctionDefinition {
+                            name,
+                            file_path: self.current_file_path.clone(),
+                            node_type: FunctionNodeType::FunctionExpression(Box::new(
+                                fn_expr.clone(),
+                            )),
+                            arguments,
+                            body_source,
+                            is_exported: true,
+                            line_number,
+                            intent: None,
+                            calls: vec![],
+                        },
+                    );
+                }
+            }
+            DefaultDecl::Class(class_expr) => {
+                if let Some(ident) = &class_expr.ident {
+                    self.exported_names.insert(ident.sym.to_string());
+                }
+            }
+            _ => {}
+        }
+        export.visit_children_with(self);
+    }
+
+    /// Track `export default foo` (expression)
+    fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
+        if let Expr::Ident(ident) = &*export.expr {
+            self.exported_names.insert(ident.sym.to_string());
+        }
+        export.visit_children_with(self);
+    }
+
+    /// Track `export { foo, bar }` named exports
+    fn visit_named_export(&mut self, export: &NamedExport) {
+        // Only track re-exports from local scope (no `from` source)
+        if export.src.is_none() {
+            for spec in &export.specifiers {
+                if let ExportSpecifier::Named(named) = spec {
+                    let name = match &named.orig {
+                        ModuleExportName::Ident(ident) => ident.sym.to_string(),
+                        ModuleExportName::Str(s) => s.value.to_string(),
+                    };
+                    self.exported_names.insert(name);
+                }
+            }
+        }
+    }
+
     fn visit_fn_decl(&mut self, fn_decl: &FnDecl) {
         let name = fn_decl.ident.sym.to_string();
         let arguments = self.extract_arguments(&fn_decl.function.params);
+        let body_source = fn_decl
+            .function
+            .body
+            .as_ref()
+            .and_then(|b| self.extract_source(b.span));
+        let line_number = self.line_number(fn_decl.function.span);
 
         self.function_definitions.insert(
             name.clone(),
@@ -315,6 +473,11 @@ impl Visit for FunctionDefinitionExtractor {
                 file_path: self.current_file_path.clone(),
                 node_type: FunctionNodeType::FunctionDeclaration(Box::new(fn_decl.clone())),
                 arguments,
+                body_source,
+                is_exported: false, // Updated in a post-pass
+                line_number,
+                intent: None,
+                calls: vec![],
             },
         );
 
@@ -332,6 +495,8 @@ impl Visit for FunctionDefinitionExtractor {
                 match &**init {
                     Expr::Arrow(arrow) => {
                         let arguments = self.extract_arrow_arguments(&arrow.params);
+                        let body_source = self.extract_source(arrow.span);
+                        let line_number = self.line_number(arrow.span);
                         self.function_definitions.insert(
                             name.clone(),
                             FunctionDefinition {
@@ -339,11 +504,22 @@ impl Visit for FunctionDefinitionExtractor {
                                 file_path: self.current_file_path.clone(),
                                 node_type: FunctionNodeType::ArrowFunction(Box::new(arrow.clone())),
                                 arguments,
+                                body_source,
+                                is_exported: false,
+                                line_number,
+                                intent: None,
+                                calls: vec![],
                             },
                         );
                     }
                     Expr::Fn(fn_expr) => {
                         let arguments = self.extract_arguments(&fn_expr.function.params);
+                        let body_source = fn_expr
+                            .function
+                            .body
+                            .as_ref()
+                            .and_then(|b| self.extract_source(b.span));
+                        let line_number = self.line_number(fn_expr.function.span);
                         self.function_definitions.insert(
                             name.clone(),
                             FunctionDefinition {
@@ -353,6 +529,11 @@ impl Visit for FunctionDefinitionExtractor {
                                     fn_expr.clone(),
                                 )),
                                 arguments,
+                                body_source,
+                                is_exported: false,
+                                line_number,
+                                intent: None,
+                                calls: vec![],
                             },
                         );
                     }
@@ -363,5 +544,364 @@ impl Visit for FunctionDefinitionExtractor {
 
         // Continue visiting child nodes
         var_decl.visit_children_with(self);
+    }
+
+    /// Capture anonymous closures passed as arguments to method calls.
+    /// e.g. `app.get("/users", async (req, res) => { ... })` → name: "GET_users_handler"
+    /// e.g. `emitter.on("data", (chunk) => { ... })` → name: "on_data_handler"
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Some((method_name, first_str_arg)) = extract_call_context(call) {
+            // Look for function/arrow arguments (skip the first string arg)
+            for arg in &call.args {
+                match &*arg.expr {
+                    Expr::Arrow(arrow) => {
+                        let synthetic_name =
+                            derive_handler_name(&method_name, first_str_arg.as_deref());
+                        // Don't overwrite named functions already captured
+                        if !self.function_definitions.contains_key(&synthetic_name) {
+                            let arguments = self.extract_arrow_arguments(&arrow.params);
+                            let body_source = self.extract_source(arrow.span);
+                            let line_number = self.line_number(arrow.span);
+                            self.function_definitions.insert(
+                                synthetic_name.clone(),
+                                FunctionDefinition {
+                                    name: synthetic_name,
+                                    file_path: self.current_file_path.clone(),
+                                    node_type: FunctionNodeType::ArrowFunction(Box::new(
+                                        arrow.clone(),
+                                    )),
+                                    arguments,
+                                    body_source,
+                                    is_exported: false,
+                                    line_number,
+                                    intent: None,
+                                    calls: vec![],
+                                },
+                            );
+                        }
+                    }
+                    Expr::Fn(fn_expr) => {
+                        let synthetic_name =
+                            derive_handler_name(&method_name, first_str_arg.as_deref());
+                        if !self.function_definitions.contains_key(&synthetic_name) {
+                            let arguments = self.extract_arguments(&fn_expr.function.params);
+                            let body_source = fn_expr
+                                .function
+                                .body
+                                .as_ref()
+                                .and_then(|b| self.extract_source(b.span));
+                            let line_number = self.line_number(fn_expr.function.span);
+                            self.function_definitions.insert(
+                                synthetic_name.clone(),
+                                FunctionDefinition {
+                                    name: synthetic_name,
+                                    file_path: self.current_file_path.clone(),
+                                    node_type: FunctionNodeType::FunctionExpression(Box::new(
+                                        fn_expr.clone(),
+                                    )),
+                                    arguments,
+                                    body_source,
+                                    is_exported: false,
+                                    line_number,
+                                    intent: None,
+                                    calls: vec![],
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Continue visiting child nodes
+        call.visit_children_with(self);
+    }
+}
+
+/// Extract the method name and optional first string argument from a call expression.
+/// e.g. `app.get("/users", handler)` → Some(("get", Some("/users")))
+/// e.g. `emitter.on("data", handler)` → Some(("on", Some("data")))
+/// e.g. `doSomething(handler)` → Some(("doSomething", None))
+fn extract_call_context(call: &CallExpr) -> Option<(String, Option<String>)> {
+    let method_name = match &call.callee {
+        Callee::Expr(expr) => match &**expr {
+            Expr::Member(member) => {
+                if let MemberProp::Ident(ident) = &member.prop {
+                    Some(ident.sym.to_string())
+                } else {
+                    None
+                }
+            }
+            Expr::Ident(ident) => Some(ident.sym.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }?;
+
+    // Get the first string argument if present
+    let first_str = call.args.first().and_then(|arg| match &*arg.expr {
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        Expr::Tpl(tpl) => {
+            // Template literal — extract the first quasi
+            tpl.quasis.first().map(|q| q.raw.to_string())
+        }
+        _ => None,
+    });
+
+    // Only capture if there's at least one function argument
+    let has_fn_arg = call
+        .args
+        .iter()
+        .any(|arg| matches!(&*arg.expr, Expr::Arrow(_) | Expr::Fn(_)));
+
+    if has_fn_arg {
+        Some((method_name, first_str))
+    } else {
+        None
+    }
+}
+
+/// Derive a handler name from the method and path/event.
+/// e.g. ("get", Some("/users/:id")) → "get_users_id_handler"
+/// e.g. ("on", Some("data")) → "on_data_handler"
+/// e.g. ("use", None) → "use_handler"
+fn derive_handler_name(method: &str, first_arg: Option<&str>) -> String {
+    let base = match first_arg {
+        Some(arg) => {
+            let cleaned: String = arg
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let trimmed = cleaned.trim_matches('_');
+            if trimmed.is_empty() {
+                method.to_string()
+            } else {
+                format!("{}_{}", method, trimmed)
+            }
+        }
+        None => method.to_string(),
+    };
+    format!("{}_handler", base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_file;
+    use swc_common::{
+        SourceMap,
+        errors::{ColorConfig, Handler},
+        sync::Lrc,
+    };
+
+    fn parse_ts(source: &str) -> (Lrc<SourceMap>, Module) {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+        (cm, module)
+    }
+
+    fn extract(source: &str) -> HashMap<String, FunctionDefinition> {
+        let (cm, module) = parse_ts(source);
+        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from("test.ts"), cm);
+        module.visit_with(&mut extractor);
+        extractor.finalize_exports();
+        extractor.function_definitions
+    }
+
+    #[test]
+    fn captures_body_source_for_function_declaration() {
+        let defs = extract("function greet(name: string) { return `Hello ${name}`; }");
+        let def = defs.get("greet").expect("should find greet");
+        assert!(def.body_source.is_some(), "should have body_source");
+        assert!(
+            def.body_source.as_ref().unwrap().contains("Hello"),
+            "body should contain function text"
+        );
+    }
+
+    #[test]
+    fn captures_body_source_for_arrow_function() {
+        let defs = extract("const add = (a: number, b: number) => { return a + b; };");
+        let def = defs.get("add").expect("should find add");
+        assert!(def.body_source.is_some(), "should have body_source");
+        assert!(
+            def.body_source.as_ref().unwrap().contains("a + b"),
+            "body should contain arrow text"
+        );
+    }
+
+    #[test]
+    fn detects_export_function_declaration() {
+        let defs = extract("export function hello() { return 1; }");
+        let def = defs.get("hello").expect("should find hello");
+        assert!(def.is_exported, "export function should be marked exported");
+    }
+
+    #[test]
+    fn detects_export_default_function() {
+        let defs = extract("export default function main() { return 1; }");
+        let def = defs.get("main").expect("should find main");
+        assert!(
+            def.is_exported,
+            "export default function should be marked exported"
+        );
+    }
+
+    #[test]
+    fn detects_export_default_expression() {
+        let defs = extract("function setup() { return 1; }\nexport default setup;");
+        let def = defs.get("setup").expect("should find setup");
+        assert!(
+            def.is_exported,
+            "export default expr should be marked exported"
+        );
+    }
+
+    #[test]
+    fn detects_export_const_arrow() {
+        let defs = extract("export const foo = () => { return 42; };");
+        let def = defs.get("foo").expect("should find foo");
+        assert!(
+            def.is_exported,
+            "export const arrow should be marked exported"
+        );
+    }
+
+    #[test]
+    fn detects_named_export() {
+        let defs =
+            extract("function bar() { return 1; }\nfunction baz() { return 2; }\nexport { bar };");
+        let bar = defs.get("bar").expect("should find bar");
+        let baz = defs.get("baz").expect("should find baz");
+        assert!(
+            bar.is_exported,
+            "bar should be marked exported via named export"
+        );
+        assert!(!baz.is_exported, "baz should NOT be exported");
+    }
+
+    #[test]
+    fn non_exported_function_is_not_marked() {
+        let defs = extract("function internal() { return 'private'; }");
+        let def = defs.get("internal").expect("should find internal");
+        assert!(
+            !def.is_exported,
+            "non-exported function should not be marked"
+        );
+    }
+
+    #[test]
+    fn captures_line_number() {
+        let defs = extract("function first() { return 1; }");
+        let def = defs.get("first").expect("should find first");
+        assert!(def.line_number > 0, "line_number should be positive");
+    }
+
+    #[test]
+    fn caps_body_source_at_2000_chars() {
+        // Generate a function with a body > 2000 chars
+        let long_body = "x".repeat(2500);
+        let source = format!(
+            "function big() {{ const s = \"{}\"; return s; }}",
+            long_body
+        );
+        let defs = extract(&source);
+        let def = defs.get("big").expect("should find big");
+        let body = def.body_source.as_ref().expect("should have body_source");
+        assert!(
+            body.len() <= 2003, // 2000 + "..."
+            "body_source should be capped (got {} chars)",
+            body.len()
+        );
+        assert!(body.ends_with("..."), "capped body should end with ...");
+    }
+
+    #[test]
+    fn captures_anonymous_arrow_in_method_call() {
+        let defs = extract(
+            r#"
+            const app = { get: (path: string, handler: any) => {} };
+            app.get("/users", (req: any, res: any) => { res.json({ id: 1 }); });
+            "#,
+        );
+        // "/users" → "_users" → trimmed → "users" → "get_users_handler"
+        let handler_keys: Vec<_> = defs.keys().filter(|k| k.contains("handler")).collect();
+        assert!(
+            !handler_keys.is_empty(),
+            "should have captured at least one handler, got keys: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+        let def = defs
+            .get("get_users_handler")
+            .expect("should capture route handler");
+        assert!(def.body_source.is_some());
+        assert!(def.body_source.as_ref().unwrap().contains("res.json"));
+    }
+
+    #[test]
+    fn captures_anonymous_fn_in_method_call() {
+        let defs = extract(
+            r#"
+            const router = { post: (path: string, handler: any) => {} };
+            router.post("/orders", function(req: any, res: any) { res.send("ok"); });
+            "#,
+        );
+        let def = defs
+            .get("post_orders_handler")
+            .expect("should capture route handler");
+        assert!(def.body_source.is_some());
+    }
+
+    #[test]
+    fn anonymous_handler_has_line_number() {
+        let defs = extract(
+            r#"
+            const app = { get: (path: string, handler: any) => {} };
+            app.get("/health", () => { return "ok"; });
+            "#,
+        );
+        let def = defs
+            .get("get_health_handler")
+            .expect("should capture handler");
+        assert!(def.line_number > 0);
+    }
+
+    #[test]
+    fn does_not_capture_non_function_args() {
+        let defs = extract(
+            r#"
+            const app = { get: (path: string) => {} };
+            app.get("/static");
+            "#,
+        );
+        // No function arg → no handler captured
+        assert!(
+            !defs.keys().any(|k| k.contains("handler")),
+            "should not capture calls without function args"
+        );
+    }
+
+    #[test]
+    fn derive_handler_name_works() {
+        assert_eq!(
+            super::derive_handler_name("get", Some("/users/:id")),
+            "get_users__id_handler"
+        );
+        assert_eq!(
+            super::derive_handler_name("on", Some("data")),
+            "on_data_handler"
+        );
+        assert_eq!(super::derive_handler_name("use", None), "use_handler");
     }
 }

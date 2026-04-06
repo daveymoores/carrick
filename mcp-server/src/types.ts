@@ -11,7 +11,7 @@ export interface CloudRepoData {
   mounts: Mount[];
   apps: Record<string, unknown>;
   imported_handlers: [string, string, string, string][];
-  function_definitions: Record<string, unknown>;
+  function_definitions: Record<string, FunctionDefinition>;
   config_json?: string;
   package_json?: string;
   packages?: Packages;
@@ -134,6 +134,28 @@ export interface PackageInfo {
   name: string;
   version: string;
   source_path: string;
+}
+
+export interface FunctionDefinition {
+  name: string;
+  file_path: string;
+  node_type: string;
+  arguments: FunctionArgument[];
+  body_source?: string;
+  is_exported: boolean;
+  line_number: number;
+  intent?: string;
+  calls?: FunctionCallRef[];
+}
+
+export interface FunctionArgument {
+  name: string;
+}
+
+export interface FunctionCallRef {
+  name: string;
+  file_path: string;
+  line_number: number;
 }
 
 /** Shape returned by the Lambda get-cross-repo-data action */

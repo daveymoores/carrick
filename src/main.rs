@@ -11,6 +11,7 @@ mod extractor;
 mod file_finder;
 mod formatter;
 mod framework_detector;
+mod intent_generator;
 mod mount_graph;
 mod multi_agent_orchestrator;
 mod packages;
