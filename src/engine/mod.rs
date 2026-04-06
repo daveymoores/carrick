@@ -186,15 +186,30 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     let results = analyzer.get_results();
     print_results(results);
 
-    // 7. Best-effort log upload
-    if let Some(log_path) = logging::get_log_file_path() {
-        if let Ok(log_content) = std::fs::read_to_string(&log_path) {
-            let repo_name = get_repository_name(repo_path);
-            if let Err(e) = storage
-                .upload_logs(&carrick_org, &repo_name, &log_content)
-                .await
-            {
-                debug!("Failed to upload logs: {:?}", e);
+    // 7. Best-effort log upload (only on main/master, same policy as data upload)
+    if should_upload {
+        if let Some(log_path) = logging::get_log_file_path() {
+            const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+            if let Ok(mut file) = std::fs::File::open(&log_path) {
+                use std::io::{Read, Seek};
+                if let Ok(metadata) = file.metadata() {
+                    let file_len = metadata.len();
+                    let start = file_len.saturating_sub(MAX_LOG_BYTES);
+                    if file.seek(std::io::SeekFrom::Start(start)).is_ok() {
+                        let mut buf = Vec::with_capacity((file_len - start) as usize);
+                        if file.read_to_end(&mut buf).is_ok() {
+                            let log_content = String::from_utf8_lossy(&buf);
+                            let repo_name = get_repository_name(repo_path);
+                            if let Err(e) = storage
+                                .upload_logs(&carrick_org, &repo_name, &log_content)
+                                .await
+                            {
+                                debug!("Failed to upload logs: {:?}", e);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

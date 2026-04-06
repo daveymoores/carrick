@@ -32,7 +32,7 @@ use engine::run_analysis_engine_with_sidecar;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// CLI arguments for the carrick analyzer
 struct CliArgs {
@@ -103,7 +103,7 @@ async fn main() {
     logging::init(args.verbose);
 
     if let Err(e) = run_analysis(args).await {
-        eprintln!("Analysis failed: {}", e);
+        error!("Analysis failed: {}", e);
         std::process::exit(1);
     }
 }
@@ -114,8 +114,10 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // The sidecar is bundled with the tool - auto-discover its location
     // =======================================================================
     let sp = logging::spinner("Initializing sidecar...");
+    let mut sidecar_found = false;
     let sidecar = match discover_sidecar_path() {
         Some(sidecar_path) => {
+            sidecar_found = true;
             debug!("Found sidecar at: {}", sidecar_path.display());
             match spawn_sidecar(&sidecar_path, &args.repo_path) {
                 Ok(sidecar) => {
@@ -151,6 +153,9 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 false
             }
         }
+    } else if sidecar_found {
+        logging::finish_spinner_warn(&sp, "Sidecar failed to start");
+        false
     } else {
         logging::finish_spinner_warn(&sp, "Sidecar not found");
         false

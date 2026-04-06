@@ -11,7 +11,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "log_expiry" {
     status = "Enabled"
 
     filter {
-      prefix = "*/logs/"
+      tag {
+        key   = "log"
+        value = "true"
+      }
     }
 
     expiration {

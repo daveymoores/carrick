@@ -39,16 +39,18 @@ pub fn init(verbose: bool) {
                 .with_target(true)
                 .with_filter(EnvFilter::new("debug"));
 
-            tracing_subscriber::registry()
+            let _ = tracing_subscriber::registry()
                 .with(terminal_layer)
                 .with(file_layer)
-                .init();
+                .try_init();
             return;
         }
     }
 
     // Fallback: terminal only
-    tracing_subscriber::registry().with(terminal_layer).init();
+    let _ = tracing_subscriber::registry()
+        .with(terminal_layer)
+        .try_init();
 }
 
 /// Return the path to today's log file, if it exists.

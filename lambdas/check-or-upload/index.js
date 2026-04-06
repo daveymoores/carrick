@@ -485,7 +485,11 @@ async function handleUploadLogs(payload) {
   try {
     const uploadUrl = await getSignedUrl(
       s3Client,
-      new PutObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key }),
+      new PutObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: s3Key,
+        Tagging: "log=true",
+      }),
       { expiresIn: 60 * 5 },
     );
 
