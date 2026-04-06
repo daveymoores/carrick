@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/daveymoores/carrick/compare/carrick-v0.1.5...carrick-v0.1.6) (2026-04-06)
+
+
+### Features
+
+* function intent discovery via LLM-generated descriptions ([#57](https://github.com/daveymoores/carrick/issues/57)) ([97cd3ff](https://github.com/daveymoores/carrick/commit/97cd3ff18941f4b4b2cf0bc33180fe2226bec2b6))
+
 ## [0.1.5](https://github.com/daveymoores/carrick/compare/carrick-v0.1.4...carrick-v0.1.5) (2026-04-03)
 
 
