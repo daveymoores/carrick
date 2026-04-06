@@ -25,10 +25,10 @@ pub async fn generate_function_intents(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     _imported_symbols: &HashMap<String, ImportedSymbol>,
 ) {
-    // Only process exported functions with body source
+    // Process all named functions with body source
     let eligible: Vec<String> = function_definitions
         .iter()
-        .filter(|(_, def)| def.is_exported && def.body_source.is_some())
+        .filter(|(_, def)| def.body_source.is_some())
         .map(|(name, _)| name.clone())
         .collect();
 
@@ -38,7 +38,7 @@ pub async fn generate_function_intents(
     }
 
     eprintln!(
-        "[intent] Generating intents for {} exported function(s)...",
+        "[intent] Generating intents for {} function(s)...",
         eligible.len()
     );
 

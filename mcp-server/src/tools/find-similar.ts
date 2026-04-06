@@ -36,7 +36,7 @@ export async function listFunctionIntents(
 
     for (const [, def] of Object.entries(repo.function_definitions)) {
       const fn = def as FunctionDefinition;
-      if (!fn.is_exported || !fn.intent) continue;
+      if (!fn.intent) continue;
 
       entries.push({
         service: serviceName,

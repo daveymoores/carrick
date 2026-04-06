@@ -490,6 +490,150 @@ impl Visit for FunctionDefinitionExtractor {
         // Continue visiting child nodes
         var_decl.visit_children_with(self);
     }
+
+    /// Capture anonymous closures passed as arguments to method calls.
+    /// e.g. `app.get("/users", async (req, res) => { ... })` → name: "GET_users_handler"
+    /// e.g. `emitter.on("data", (chunk) => { ... })` → name: "on_data_handler"
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Some((method_name, first_str_arg)) = extract_call_context(call) {
+            // Look for function/arrow arguments (skip the first string arg)
+            for arg in &call.args {
+                match &*arg.expr {
+                    Expr::Arrow(arrow) => {
+                        let synthetic_name =
+                            derive_handler_name(&method_name, first_str_arg.as_deref());
+                        // Don't overwrite named functions already captured
+                        if !self.function_definitions.contains_key(&synthetic_name) {
+                            let arguments = self.extract_arrow_arguments(&arrow.params);
+                            let body_source = self.extract_source(arrow.span);
+                            let line_number = self.line_number(arrow.span);
+                            self.function_definitions.insert(
+                                synthetic_name.clone(),
+                                FunctionDefinition {
+                                    name: synthetic_name,
+                                    file_path: self.current_file_path.clone(),
+                                    node_type: FunctionNodeType::ArrowFunction(Box::new(
+                                        arrow.clone(),
+                                    )),
+                                    arguments,
+                                    body_source,
+                                    is_exported: false,
+                                    line_number,
+                                    intent: None,
+                                    calls: vec![],
+                                },
+                            );
+                        }
+                    }
+                    Expr::Fn(fn_expr) => {
+                        let synthetic_name =
+                            derive_handler_name(&method_name, first_str_arg.as_deref());
+                        if !self.function_definitions.contains_key(&synthetic_name) {
+                            let arguments = self.extract_arguments(&fn_expr.function.params);
+                            let body_source = fn_expr
+                                .function
+                                .body
+                                .as_ref()
+                                .and_then(|b| self.extract_source(b.span));
+                            let line_number = self.line_number(fn_expr.function.span);
+                            self.function_definitions.insert(
+                                synthetic_name.clone(),
+                                FunctionDefinition {
+                                    name: synthetic_name,
+                                    file_path: self.current_file_path.clone(),
+                                    node_type: FunctionNodeType::FunctionExpression(Box::new(
+                                        fn_expr.clone(),
+                                    )),
+                                    arguments,
+                                    body_source,
+                                    is_exported: false,
+                                    line_number,
+                                    intent: None,
+                                    calls: vec![],
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Continue visiting child nodes
+        call.visit_children_with(self);
+    }
+}
+
+/// Extract the method name and optional first string argument from a call expression.
+/// e.g. `app.get("/users", handler)` → Some(("get", Some("/users")))
+/// e.g. `emitter.on("data", handler)` → Some(("on", Some("data")))
+/// e.g. `doSomething(handler)` → Some(("doSomething", None))
+fn extract_call_context(call: &CallExpr) -> Option<(String, Option<String>)> {
+    let method_name = match &call.callee {
+        Callee::Expr(expr) => match &**expr {
+            Expr::Member(member) => {
+                if let MemberProp::Ident(ident) = &member.prop {
+                    Some(ident.sym.to_string())
+                } else {
+                    None
+                }
+            }
+            Expr::Ident(ident) => Some(ident.sym.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }?;
+
+    // Get the first string argument if present
+    let first_str = call.args.first().and_then(|arg| match &*arg.expr {
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        Expr::Tpl(tpl) => {
+            // Template literal — extract the first quasi
+            tpl.quasis.first().map(|q| q.raw.to_string())
+        }
+        _ => None,
+    });
+
+    // Only capture if there's at least one function argument
+    let has_fn_arg = call
+        .args
+        .iter()
+        .any(|arg| matches!(&*arg.expr, Expr::Arrow(_) | Expr::Fn(_)));
+
+    if has_fn_arg {
+        Some((method_name, first_str))
+    } else {
+        None
+    }
+}
+
+/// Derive a handler name from the method and path/event.
+/// e.g. ("get", Some("/users/:id")) → "get_users_id_handler"
+/// e.g. ("on", Some("data")) → "on_data_handler"
+/// e.g. ("use", None) → "use_handler"
+fn derive_handler_name(method: &str, first_arg: Option<&str>) -> String {
+    let base = match first_arg {
+        Some(arg) => {
+            let cleaned: String = arg
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let trimmed = cleaned.trim_matches('_');
+            if trimmed.is_empty() {
+                method.to_string()
+            } else {
+                format!("{}_{}", method, trimmed)
+            }
+        }
+        None => method.to_string(),
+    };
+    format!("{}_handler", base)
 }
 
 #[cfg(test)]
@@ -606,5 +750,83 @@ mod tests {
             body.len()
         );
         assert!(body.ends_with("..."), "capped body should end with ...");
+    }
+
+    #[test]
+    fn captures_anonymous_arrow_in_method_call() {
+        let defs = extract(
+            r#"
+            const app = { get: (path: string, handler: any) => {} };
+            app.get("/users", (req: any, res: any) => { res.json({ id: 1 }); });
+            "#,
+        );
+        // "/users" → "_users" → trimmed → "users" → "get_users_handler"
+        let handler_keys: Vec<_> = defs.keys().filter(|k| k.contains("handler")).collect();
+        assert!(
+            !handler_keys.is_empty(),
+            "should have captured at least one handler, got keys: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+        let def = defs
+            .get("get_users_handler")
+            .expect("should capture route handler");
+        assert!(def.body_source.is_some());
+        assert!(def.body_source.as_ref().unwrap().contains("res.json"));
+    }
+
+    #[test]
+    fn captures_anonymous_fn_in_method_call() {
+        let defs = extract(
+            r#"
+            const router = { post: (path: string, handler: any) => {} };
+            router.post("/orders", function(req: any, res: any) { res.send("ok"); });
+            "#,
+        );
+        let def = defs
+            .get("post_orders_handler")
+            .expect("should capture route handler");
+        assert!(def.body_source.is_some());
+    }
+
+    #[test]
+    fn anonymous_handler_has_line_number() {
+        let defs = extract(
+            r#"
+            const app = { get: (path: string, handler: any) => {} };
+            app.get("/health", () => { return "ok"; });
+            "#,
+        );
+        let def = defs
+            .get("get_health_handler")
+            .expect("should capture handler");
+        assert!(def.line_number > 0);
+    }
+
+    #[test]
+    fn does_not_capture_non_function_args() {
+        let defs = extract(
+            r#"
+            const app = { get: (path: string) => {} };
+            app.get("/static");
+            "#,
+        );
+        // No function arg → no handler captured
+        assert!(
+            !defs.keys().any(|k| k.contains("handler")),
+            "should not capture calls without function args"
+        );
+    }
+
+    #[test]
+    fn derive_handler_name_works() {
+        assert_eq!(
+            super::derive_handler_name("get", Some("/users/:id")),
+            "get_users__id_handler"
+        );
+        assert_eq!(
+            super::derive_handler_name("on", Some("data")),
+            "on_data_handler"
+        );
+        assert_eq!(super::derive_handler_name("use", None), "use_handler");
     }
 }
