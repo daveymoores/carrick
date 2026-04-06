@@ -20,6 +20,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 // ============================================================================
 // Sidecar State
@@ -342,14 +343,14 @@ impl TypeSidecar {
     pub fn spawn(sidecar_path: &Path) -> Result<Self, SidecarError> {
         let spawn_time = Instant::now();
 
-        eprintln!("[type_sidecar] Spawning sidecar from: {:?}", sidecar_path);
+        debug!("[type_sidecar] Spawning sidecar from: {:?}", sidecar_path);
 
         // Spawn the Node.js process
         let mut child = Command::new("node")
             .arg(sidecar_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // Let sidecar logs go to stderr
+            .stderr(Stdio::piped()) // Capture stderr, pipe through tracing
             .spawn()
             .map_err(|e| SidecarError::SpawnFailed(e.to_string()))?;
 
@@ -363,7 +364,19 @@ impl TypeSidecar {
             .take()
             .ok_or_else(|| SidecarError::SpawnFailed("Failed to get stdout".to_string()))?;
 
-        eprintln!(
+        // Pipe sidecar stderr through tracing on a background thread
+        if let Some(stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        debug!("{}", line);
+                    }
+                }
+            });
+        }
+
+        debug!(
             "[type_sidecar] Sidecar spawned in {:?}",
             spawn_time.elapsed()
         );
@@ -397,7 +410,7 @@ impl TypeSidecar {
             *state = SidecarState::Initializing;
         }
 
-        eprintln!("[type_sidecar] Starting init for repo: {}", repo_root_str);
+        debug!("[type_sidecar] Starting init for repo: {}", repo_root_str);
 
         // Send init request
         let request = SidecarRequest::Init {
@@ -450,7 +463,7 @@ impl TypeSidecar {
                         let mut state = self.state.lock().unwrap();
                         if response.status == "ready" {
                             *state = SidecarState::Ready;
-                            eprintln!(
+                            debug!(
                                 "[type_sidecar] Sidecar ready (init_time: {:?}ms, total: {:?})",
                                 response.init_time_ms,
                                 self.spawn_time.elapsed()
@@ -876,7 +889,7 @@ impl TypeSidecar {
 
 impl Drop for TypeSidecar {
     fn drop(&mut self) {
-        eprintln!("[type_sidecar] Shutting down sidecar");
+        debug!("[type_sidecar] Shutting down sidecar");
 
         // Try graceful shutdown first
         let _ = self.shutdown();

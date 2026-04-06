@@ -5,6 +5,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use tracing::debug;
 
 pub struct MockStorage {
     // Group data by org, then store repos
@@ -30,7 +31,7 @@ impl MockStorage {
 #[async_trait]
 impl CloudStorage for MockStorage {
     async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError> {
-        println!(
+        debug!(
             "MOCK: Uploading repo data for org: {}, repo: {}",
             org, data.repo_name
         );
@@ -48,7 +49,7 @@ impl CloudStorage for MockStorage {
         file_name: &str,
         content: &str,
     ) -> Result<(), StorageError> {
-        println!(
+        debug!(
             "MOCK: Uploading type file for repo: {}, file: {}",
             repo_name, file_name
         );
@@ -62,7 +63,7 @@ impl CloudStorage for MockStorage {
         &self,
         org: &str,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
-        println!("MOCK: Downloading all repo data for org: {}", org);
+        debug!("MOCK: Downloading all repo data for org: {}", org);
         let storage = self.data.lock().unwrap();
         let mut result = storage.get(org).cloned().unwrap_or_default();
 
@@ -133,12 +134,22 @@ impl CloudStorage for MockStorage {
             );
         }
 
-        println!("MOCK: Found {} repos for org {}", result.len(), org);
+        debug!("MOCK: Found {} repos for org {}", result.len(), org);
         Ok((result, mock_s3_urls))
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
-        println!("MOCK: Health check passed");
+        debug!("MOCK: Health check passed");
+        Ok(())
+    }
+
+    async fn upload_logs(
+        &self,
+        org: &str,
+        repo: &str,
+        _log_content: &str,
+    ) -> Result<(), StorageError> {
+        debug!("MOCK: Skipping log upload for {}/{}", org, repo);
         Ok(())
     }
 }

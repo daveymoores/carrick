@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
+use tracing::debug;
 
 mod mock_storage;
 pub use mock_storage::MockStorage;
@@ -209,11 +210,13 @@ impl CloudRepoData {
             })
             .collect();
 
-        println!("Created CloudRepoData directly from multi-agent results:");
-        println!("  - {} endpoints", endpoints.len());
-        println!("  - {} calls", calls.len());
-        println!("  - {} mounts", mounts.len());
-        println!("  - {} function definitions", function_definitions.len());
+        debug!(
+            endpoints = endpoints.len(),
+            calls = calls.len(),
+            mounts = mounts.len(),
+            function_definitions = function_definitions.len(),
+            "Created CloudRepoData directly from multi-agent results"
+        );
 
         Self {
             repo_name,
@@ -279,6 +282,12 @@ pub trait CloudStorage {
         content: &str,
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
+    async fn upload_logs(
+        &self,
+        org: &str,
+        repo: &str,
+        log_content: &str,
+    ) -> Result<(), StorageError>;
 }
 
 pub fn get_current_commit_hash(repo_path: &str) -> String {

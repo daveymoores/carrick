@@ -19,6 +19,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::{debug, warn};
 
 /// Result of analyzing a single mount relationship
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,14 +185,14 @@ impl FileAnalyzerAgent {
             import_map,
         );
 
-        println!("=== FILE ANALYZER AGENT (AST-GATED) ===");
-        println!("Analyzing file: {}", file_path);
-        println!(
+        debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
+        debug!("Analyzing file: {}", file_path);
+        debug!(
             "File size: {} chars, {} lines",
             file_content.len(),
             file_content.lines().count()
         );
-        println!("Candidate targets: {}", candidate_hints.len());
+        debug!("Candidate targets: {}", candidate_hints.len());
 
         let schema = AgentSchemas::file_analysis_schema();
         let response = self
@@ -199,9 +200,9 @@ impl FileAnalyzerAgent {
             .analyze_code_with_schema(&user_message, &system_message, Some(schema.clone()))
             .await?;
 
-        println!("=== RAW FILE ANALYSIS RESPONSE ===");
-        println!("{}", response);
-        println!("=== END RAW RESPONSE ===");
+        debug!("=== RAW FILE ANALYSIS RESPONSE ===");
+        debug!("{}", response);
+        debug!("=== END RAW RESPONSE ===");
 
         let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
             format!(
@@ -214,15 +215,15 @@ impl FileAnalyzerAgent {
         let needs_retry = Self::sanitize_result(&mut result);
         let initial_result = result.clone();
         if needs_retry {
-            println!("[FileAnalyzerAgent] Suspicious fields detected in LLM output; retrying once");
+            warn!("[FileAnalyzerAgent] Suspicious fields detected in LLM output; retrying once");
             let response = self
                 .agent_service
                 .analyze_code_with_schema(&user_message, &system_message, Some(schema))
                 .await?;
 
-            println!("=== RAW FILE ANALYSIS RESPONSE ===");
-            println!("{}", response);
-            println!("=== END RAW RESPONSE ===");
+            debug!("=== RAW FILE ANALYSIS RESPONSE ===");
+            debug!("{}", response);
+            debug!("=== END RAW RESPONSE ===");
 
             let mut retry_result: FileAnalysisResult =
                 serde_json::from_str(&response).map_err(|e| {
@@ -235,7 +236,7 @@ impl FileAnalyzerAgent {
             Self::sanitize_result(&mut retry_result);
             let chosen = Self::choose_best_result(initial_result, retry_result);
 
-            println!(
+            debug!(
                 "File analysis complete: {} mounts, {} endpoints, {} data_calls",
                 chosen.mounts.len(),
                 chosen.endpoints.len(),
@@ -245,7 +246,7 @@ impl FileAnalyzerAgent {
             return Ok(chosen);
         }
 
-        println!(
+        debug!(
             "File analysis complete: {} mounts, {} endpoints, {} data_calls",
             result.mounts.len(),
             result.endpoints.len(),
@@ -269,7 +270,7 @@ impl FileAnalyzerAgent {
         if retry_score >= initial_score {
             retry
         } else {
-            println!("[FileAnalyzerAgent] Retry produced fewer findings; keeping original result");
+            warn!("[FileAnalyzerAgent] Retry produced fewer findings; keeping original result");
             initial
         }
     }

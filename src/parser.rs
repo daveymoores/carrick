@@ -5,6 +5,7 @@ use swc_ecma_ast::Module;
 use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_visit::VisitMutWith;
+use tracing::warn;
 
 /// Parse a JavaScript or TypeScript file into an AST
 pub fn parse_file(
@@ -26,7 +27,7 @@ pub fn parse_file(
     let file_content = match fs::read_to_string(file_path) {
         Ok(content) => content,
         Err(e) => {
-            eprintln!("Error reading file {}: {}", file_path.display(), e);
+            warn!("Error reading file {}: {}", file_path.display(), e);
             return None;
         }
     };

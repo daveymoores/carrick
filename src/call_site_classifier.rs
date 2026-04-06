@@ -2,6 +2,7 @@ use crate::{
     agent_service::AgentService, call_site_extractor::CallSite, framework_detector::DetectionResult,
 };
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 /// Classification result for a call site with detailed extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,39 +56,39 @@ impl CallSiteClassifier {
         call_sites: &[CallSite],
         framework_detection: &DetectionResult,
     ) -> Result<Vec<ClassifiedCallSite>, Box<dyn std::error::Error>> {
-        println!("=== CALL SITE CLASSIFICATION DEBUG ===");
-        println!("Number of call sites to classify: {}", call_sites.len());
-        println!("Framework detection: {:?}", framework_detection);
+        debug!("=== CALL SITE CLASSIFICATION DEBUG ===");
+        debug!("Number of call sites to classify: {}", call_sites.len());
+        debug!("Framework detection: {:?}", framework_detection);
 
         // Print each call site for debugging
         for (i, call_site) in call_sites.iter().enumerate() {
-            println!(
+            debug!(
                 "Call site {}: {}.{}()",
                 i + 1,
                 call_site.callee_object,
                 call_site.callee_property
             );
-            println!("  Location: {}", call_site.location);
-            println!("  Args: {} arguments", call_site.args.len());
+            debug!("  Location: {}", call_site.location);
+            debug!("  Args: {} arguments", call_site.args.len());
         }
 
         let prompt = self.build_classification_prompt(call_sites, framework_detection);
         let system_message = self.build_system_message();
 
-        println!("=== PROMPT BEING SENT TO AGENT ===");
-        println!("System message length: {} chars", system_message.len());
-        println!("Prompt length: {} chars", prompt.len());
-        println!("Full prompt:\n{}", prompt);
-        println!("=== END OF PROMPT ===");
+        debug!("=== PROMPT BEING SENT TO AGENT ===");
+        debug!("System message length: {} chars", system_message.len());
+        debug!("Prompt length: {} chars", prompt.len());
+        debug!("Full prompt:\n{}", prompt);
+        debug!("=== END OF PROMPT ===");
 
         let response = self
             .agent_service
             .analyze_code(&prompt, &system_message)
             .await?;
 
-        println!("=== AGENT RESPONSE ===");
-        println!("{}", response);
-        println!("=== END OF RESPONSE ===");
+        debug!("=== AGENT RESPONSE ===");
+        debug!("{}", response);
+        debug!("=== END OF RESPONSE ===");
 
         let classified_sites: Vec<ClassifiedCallSite> = serde_json::from_str(&response)
             .map_err(|e| format!("Failed to parse LLM classification response: {}", e))?;

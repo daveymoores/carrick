@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
+use tracing::{debug, warn};
 
 pub struct AwsStorage {
     lambda_url: String,
@@ -216,7 +217,7 @@ impl AwsStorage {
         };
 
         let _response: StoreMetadataResponse = self.call_lambda(&request).await?;
-        println!("Successfully stored metadata for {}", data.repo_name);
+        debug!("Successfully stored metadata for {}", data.repo_name);
 
         Ok(())
     }
@@ -243,7 +244,7 @@ impl CloudStorage for AwsStorage {
         // Step 2: Upload type file if needed
         if let Some(upload_url) = lambda_response.upload_url {
             if let Some(bundled_types) = data.bundled_types.as_ref() {
-                println!("Uploading bundled types to S3...");
+                debug!("Uploading bundled types to S3...");
                 self.upload_to_s3(&upload_url, bundled_types).await?;
 
                 // Step 3: Complete the upload by storing metadata
@@ -259,9 +260,9 @@ impl CloudStorage for AwsStorage {
 
                 let _complete_response: serde_json::Value =
                     self.call_lambda(&complete_request).await?;
-                println!("Successfully completed upload and stored metadata");
+                debug!("Successfully completed upload and stored metadata");
             } else {
-                println!(
+                debug!(
                     "No bundled types available for {}; storing metadata only",
                     repo
                 );
@@ -269,7 +270,7 @@ impl CloudStorage for AwsStorage {
                     .await?;
             }
         } else {
-            println!("Type file already exists, just updating metadata");
+            debug!("Type file already exists, just updating metadata");
             self.store_repo_metadata(data, &lambda_response.s3_url, org)
                 .await?;
         }
@@ -321,11 +322,11 @@ impl CloudStorage for AwsStorage {
 
         for adjacent in response.repos {
             if let Some(metadata) = adjacent.metadata {
-                println!("Processing repo: {} with full metadata", adjacent.repo);
+                debug!("Processing repo: {} with full metadata", adjacent.repo);
                 repo_s3_urls.insert(metadata.repo_name.clone(), adjacent.s3_url);
                 all_repo_data.push(metadata);
             } else {
-                println!("Warning: No metadata found for repo: {}", adjacent.repo);
+                warn!("No metadata found for repo: {}", adjacent.repo);
                 let repo_data = CloudRepoData {
                     repo_name: adjacent.repo.clone(),
                     service_name: None,
@@ -355,6 +356,41 @@ impl CloudStorage for AwsStorage {
         }
 
         Ok((all_repo_data, repo_s3_urls))
+    }
+
+    async fn upload_logs(
+        &self,
+        org: &str,
+        repo: &str,
+        log_content: &str,
+    ) -> Result<(), StorageError> {
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+
+        #[derive(Serialize)]
+        struct UploadLogsRequest {
+            action: String,
+            org: String,
+            repo: String,
+            timestamp: String,
+        }
+
+        #[derive(Deserialize)]
+        struct UploadLogsResponse {
+            #[serde(rename = "uploadUrl")]
+            upload_url: String,
+        }
+
+        let request = UploadLogsRequest {
+            action: "upload-logs".to_string(),
+            org: org.to_string(),
+            repo: repo.to_string(),
+            timestamp,
+        };
+
+        let resp: UploadLogsResponse = self.call_lambda_generic(&request).await?;
+        self.upload_to_s3(&resp.upload_url, log_content).await?;
+
+        Ok(())
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {

@@ -3,6 +3,23 @@ resource "aws_s3_bucket" "carrick_types" {
   force_destroy = true
 }
 
+resource "aws_s3_bucket_lifecycle_configuration" "log_expiry" {
+  bucket = aws_s3_bucket.carrick_types.id
+
+  rule {
+    id     = "expire-logs"
+    status = "Enabled"
+
+    filter {
+      prefix = "*/logs/"
+    }
+
+    expiration {
+      days = 60
+    }
+  }
+}
+
 resource "aws_s3_bucket_public_access_block" "carrick_types" {
   bucket = aws_s3_bucket.carrick_types.id
   block_public_acls   = true
