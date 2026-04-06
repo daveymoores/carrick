@@ -9,6 +9,7 @@ use crate::cloud_storage::{
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
+use crate::intent_generator::generate_function_intents;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
@@ -801,9 +802,11 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
             module.visit_with(&mut import_extractor);
             all_imported_symbols.extend(import_extractor.imported_symbols);
 
-            // Extract function definitions with type annotations
-            let mut func_extractor = FunctionDefinitionExtractor::new(file_path.clone());
+            // Extract function definitions with type annotations and source text
+            let mut func_extractor =
+                FunctionDefinitionExtractor::new(file_path.clone(), cm.clone());
             module.visit_with(&mut func_extractor);
+            func_extractor.finalize_exports();
             all_function_definitions.extend(func_extractor.function_definitions);
         }
     }
@@ -1152,6 +1155,18 @@ async fn analyze_current_repo(
     let analysis_result = orchestrator
         .run_complete_analysis(files, &packages, &all_imported_symbols)
         .await?;
+
+    // 4b. Generate function intents using LLM
+    let mut function_definitions = function_definitions;
+    {
+        let intent_agent = AgentService::new(api_key.clone());
+        generate_function_intents(
+            &intent_agent,
+            &mut function_definitions,
+            &all_imported_symbols,
+        )
+        .await;
+    }
 
     // 5. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
     let mut cloud_data = CloudRepoData::from_multi_agent_results(
