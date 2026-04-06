@@ -58,6 +58,8 @@ exports.handler = async (event) => {
       return await handleGetCrossRepoData(payload, apiKey);
     case "download-file":
       return await handleDownloadFile(payload, apiKey);
+    case "upload-logs":
+      return await handleUploadLogs(payload);
     default:
       // Default behavior - backward compatibility
       return await handleCheckOrUpload(body);
@@ -466,6 +468,38 @@ async function handleDownloadFile(payload, apiKey) {
       return response(404, { error: "File not found" });
     }
     return response(500, { error: "Failed to download file" });
+  }
+}
+
+async function handleUploadLogs(payload) {
+  const { org, repo, timestamp } = payload;
+
+  if (!org || !repo || !timestamp) {
+    return response(400, {
+      error: "Missing required fields: org, repo, timestamp",
+    });
+  }
+
+  const s3Key = `${org}/${repo}/logs/${timestamp}.log`;
+
+  try {
+    const uploadUrl = await getSignedUrl(
+      s3Client,
+      new PutObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: s3Key,
+        Tagging: "log=true",
+      }),
+      { expiresIn: 60 * 5 },
+    );
+
+    return response(200, {
+      uploadUrl,
+      s3Key,
+    });
+  } catch (err) {
+    console.error("Failed to generate log upload URL:", err);
+    return response(500, { error: "Failed to generate upload URL" });
   }
 }
 

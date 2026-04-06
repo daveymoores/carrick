@@ -1,6 +1,7 @@
 use crate::{agent_service::AgentService, packages::Packages, visitor::ImportedSymbol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::debug;
 
 /// Result of framework and library detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,10 +159,10 @@ impl FrameworkDetector {
             "You are analyzing a Node.js/TypeScript project to detect HTTP frameworks and data-fetching libraries."
         ).await?;
 
-        // Debug: Print the actual LLM response
-        println!("Framework Detection LLM Response:");
-        println!("{}", response);
-        println!("--- End of Response ---");
+        // Debug: log the actual LLM response
+        debug!("Framework Detection LLM Response:");
+        debug!("{}", response);
+        debug!("--- End of Response ---");
 
         // Extract JSON from response using robust method
         let json_str = self.extract_json_from_response(&response)?;

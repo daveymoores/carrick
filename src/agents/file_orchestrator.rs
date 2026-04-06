@@ -48,6 +48,7 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_visit::VisitWith;
+use tracing::{debug, warn};
 
 /// Complete result of file-centric analysis
 #[derive(Debug)]
@@ -137,8 +138,8 @@ impl FileOrchestrator {
         guidance: &FrameworkGuidance,
         framework_detection: &DetectionResult,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
-        println!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
-        println!("Processing {} files with SWC gatekeeper", files.len());
+        debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
+        debug!("Processing {} files with SWC gatekeeper", files.len());
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
@@ -163,7 +164,7 @@ impl FileOrchestrator {
 
             // Skip empty files
             if content.trim().is_empty() {
-                println!("Skipping empty file: {}", path_str);
+                debug!("Skipping empty file: {}", path_str);
                 stats.files_skipped += 1;
                 continue;
             }
@@ -173,7 +174,7 @@ impl FileOrchestrator {
 
             // STEP 2: Check Relevance - if no candidates, SKIP (zero LLM cost)
             if !scan_result.should_analyze {
-                println!("Skipped (no API patterns): {} [0 candidates]", path_str);
+                debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
                 stats.files_skipped += 1;
                 stats.files_skipped_no_candidates += 1;
                 // Store empty result so incremental cache knows this file was processed
@@ -181,7 +182,7 @@ impl FileOrchestrator {
                 continue;
             }
 
-            println!(
+            debug!(
                 "Analyzing: {} [{} candidates detected by SWC]",
                 path_str,
                 scan_result.candidates.len()
@@ -244,16 +245,16 @@ impl FileOrchestrator {
             }
         }
 
-        println!("\n=== FILE PROCESSING COMPLETE ===");
-        println!("  - Files processed (LLM calls): {}", stats.files_processed);
-        println!("  - Files skipped (total): {}", stats.files_skipped);
-        println!(
+        debug!("\n=== FILE PROCESSING COMPLETE ===");
+        debug!("  - Files processed (LLM calls): {}", stats.files_processed);
+        debug!("  - Files skipped (total): {}", stats.files_skipped);
+        debug!(
             "  - Zero-cost skips (no API patterns): {}",
             stats.files_skipped_no_candidates
         );
-        println!("  - Total mounts: {}", stats.total_mounts);
-        println!("  - Total endpoints: {}", stats.total_endpoints);
-        println!("  - Total data calls: {}", stats.total_data_calls);
+        debug!("  - Total mounts: {}", stats.total_mounts);
+        debug!("  - Total endpoints: {}", stats.total_endpoints);
+        debug!("  - Total data calls: {}", stats.total_data_calls);
 
         // STEP 5: Build aggregated mount graph from all file results
         let mount_graph = self.build_mount_graph(&file_results);
@@ -491,7 +492,7 @@ impl FileOrchestrator {
                 } else if endpoint.type_import_source.is_some()
                     && endpoint.primary_type_symbol.is_none()
                 {
-                    eprintln!(
+                    warn!(
                         "[FileOrchestrator] Endpoint at {}:{} has import source {:?} but no symbol; relying on inference",
                         file_path, line_number, endpoint.type_import_source
                     );
@@ -631,7 +632,7 @@ impl FileOrchestrator {
                 } else if data_call.type_import_source.is_some()
                     && data_call.primary_type_symbol.is_none()
                 {
-                    eprintln!(
+                    warn!(
                         "[FileOrchestrator] Data call at {}:{} has import source {:?} but no symbol; relying on inference",
                         file_path, line_number, data_call.type_import_source
                     );
@@ -677,7 +678,7 @@ impl FileOrchestrator {
             }
         }
 
-        eprintln!(
+        debug!(
             "[FileOrchestrator] Collected {} explicit type requests, {} inference requests, {} inline aliases",
             explicit_requests.len(),
             infer_requests.len(),
@@ -830,7 +831,7 @@ impl FileOrchestrator {
             .collect();
 
         if dropped_count > 0 {
-            eprintln!(
+            warn!(
                 "[FileOrchestrator] {} data call(s) had no matching SWC candidate (spans unavailable)",
                 dropped_count
             );
@@ -861,7 +862,7 @@ impl FileOrchestrator {
         let (explicit, infer, inline_aliases) =
             self.collect_type_requests(file_results, repo_path, mount_graph, config);
 
-        eprintln!(
+        debug!(
             "[FileOrchestrator] Resolving types: {} explicit, {} inferred",
             explicit.len(),
             infer.len()
@@ -876,7 +877,7 @@ impl FileOrchestrator {
         let result = self.append_inline_aliases(result, inline_aliases);
 
         // Log results
-        eprintln!(
+        debug!(
             "[FileOrchestrator] Type resolution complete: {} manifest entries, {} inferred types, {} failures",
             result.explicit_manifest.len(),
             result.inferred_types.len(),
@@ -884,7 +885,7 @@ impl FileOrchestrator {
         );
 
         if !result.errors.is_empty() {
-            eprintln!(
+            warn!(
                 "[FileOrchestrator] Type resolution warnings: {:?}",
                 result.errors
             );

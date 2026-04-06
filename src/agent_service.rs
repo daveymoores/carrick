@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
+use tracing::{debug, warn};
 
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
@@ -126,7 +127,7 @@ impl AgentService {
                         // Retry on 429 Too Many Requests with exponential backoff
                         if status == 429 && attempt < max_retries {
                             let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                            eprintln!(
+                            warn!(
                                 "Agent API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
                                 wait_time, attempt, max_retries
                             );
@@ -138,7 +139,7 @@ impl AgentService {
                         // This handles API Gateway timeout issues
                         if status == 503 && attempt < max_retries {
                             let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                            eprintln!(
+                            warn!(
                                 "Agent API returned 503, retrying in {:?} (attempt {}/{})",
                                 wait_time, attempt, max_retries
                             );
@@ -158,7 +159,7 @@ impl AgentService {
                     // Retry network errors with exponential backoff
                     if attempt < max_retries {
                         let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                        eprintln!(
+                        warn!(
                             "Agent proxy call failed: {}, retrying in {:?} (attempt {}/{})",
                             e, wait_time, attempt, max_retries
                         );
@@ -270,7 +271,7 @@ pub async fn extract_calls_from_async_expressions(
 
     // Emergency disable option for Agent API
     if env::var("DISABLE_AGENT").is_ok() {
-        println!("Agent API disabled via DISABLE_AGENT environment variable");
+        debug!("Agent API disabled via DISABLE_AGENT environment variable");
         return Ok(vec![]);
     }
 
@@ -286,14 +287,14 @@ pub async fn extract_calls_from_async_expressions(
 
     const MAX_REASONABLE_SIZE: usize = 200_000; // 200KB - warn above this
     if total_size > MAX_REASONABLE_SIZE {
-        eprintln!(
+        warn!(
             "Warning: Large amount of source code to analyze ({:.1}KB total). This may result in high token usage.",
             total_size as f64 / 1024.0
         );
     }
 
-    println!(
-        "Found {} async expressions, sending to Agent Service with framework context...",
+    debug!(
+        "Found {} async expressions, sending to Agent Service with framework context",
         async_calls.len()
     );
 
@@ -469,7 +470,7 @@ fn parse_agent_response(response: &str, contexts: &[AsyncCallContext]) -> Vec<Ca
         }
     }
 
-    eprintln!("All JSON parsing attempts failed. Response: {}", json_str);
+    warn!("All JSON parsing attempts failed. Response: {}", json_str);
     vec![]
 }
 
@@ -917,7 +918,7 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
     }
 
     // Log mock generation for debugging
-    eprintln!(
+    debug!(
         "Mock file analysis for {}: {} mounts, {} endpoints, {} data_calls",
         file_path,
         mounts.len(),

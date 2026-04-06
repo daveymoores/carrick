@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
+use tracing::{debug, warn};
 
 // Type aliases to reduce complexity
 type RouteFieldMap = HashMap<(String, String), Json>;
@@ -237,7 +238,7 @@ impl Analyzer {
 
         // Skip Gemini call if no async expressions found (safety check)
         if all_async_contexts.is_empty() {
-            println!("No async expressions found, skipping Gemini analysis");
+            debug!("No async expressions found, skipping Gemini analysis");
             return;
         }
 
@@ -251,12 +252,12 @@ impl Analyzer {
         {
             Ok(calls) => calls,
             Err(e) => {
-                eprintln!("Failed to extract calls from async expressions: {}", e);
+                warn!("Failed to extract calls from async expressions: {}", e);
                 vec![]
             }
         };
 
-        println!("Gemini extracted {} HTTP calls", gemini_calls.len());
+        debug!("Gemini extracted {} HTTP calls", gemini_calls.len());
 
         // Process calls as before
         let processed_calls = self.process_fetch_calls(gemini_calls);
@@ -622,8 +623,8 @@ impl Analyzer {
         let loc = cm.lookup_char_pos(type_ref_span.lo);
         let file_start_bytepos = loc.file.start_pos;
         if type_ref_span.lo < file_start_bytepos {
-            eprintln!(
-                "Warning: Span `lo` ({:?}) is before its supposed file's start_pos ({:?}) for file {:?}. This indicates a SourceMap or span issue.",
+            warn!(
+                "Span `lo` ({:?}) is before its supposed file's start_pos ({:?}) for file {:?}. This indicates a SourceMap or span issue.",
                 type_ref_span.lo, file_start_bytepos, loc.file.name
             );
             return None; // Or handle as an error appropriately
@@ -633,7 +634,7 @@ impl Analyzer {
         let actual_span_file_path = match &*loc.file.name {
             FileName::Real(pathbuf) => pathbuf.clone(), // Clone to own PathBuf
             other => {
-                eprintln!(
+                warn!(
                     "Span found in a non-real file: {:?}. Cannot process.",
                     other
                 );
@@ -644,7 +645,7 @@ impl Analyzer {
         let file_content = match std::fs::read_to_string(&actual_span_file_path) {
             Ok(content) => content,
             Err(e) => {
-                eprintln!(
+                warn!(
                     "Failed to read file {:?} for offset calculation: {}. Skipping.",
                     actual_span_file_path, e
                 );
@@ -1052,12 +1053,12 @@ impl Analyzer {
                 .push((endpoint.route.clone(), endpoint.method.clone()));
         }
 
-        println!("Unique endpoint paths: {}", path_to_endpoints.len());
+        debug!("Unique endpoint paths: {}", path_to_endpoints.len());
 
         // Now insert each unique path once, with a collection of route-method pairs
         for (path, route_methods) in path_to_endpoints {
             if let Err(e) = router.insert(&path, route_methods) {
-                println!("Warning: Could not add route to router: {}", e);
+                warn!("Could not add route to router: {}", e);
             }
         }
 
@@ -1182,18 +1183,16 @@ impl Analyzer {
             .collect();
 
         if type_files.is_empty() {
-            println!(
-                "⚠️  No bundled .d.ts files found in ts_check/output/ - skipping type checking"
-            );
-            println!("   This may happen if:");
-            println!("   - Source code lacks explicit TypeScript type annotations");
-            println!("   - Type extraction agents couldn't identify response/request types");
-            println!("   - This is the first run and no cross-repo data exists yet");
-            println!("   Type checking will work when type annotations are present in the source.");
+            debug!("No bundled .d.ts files found in ts_check/output/ - skipping type checking");
+            debug!("   This may happen if:");
+            debug!("   - Source code lacks explicit TypeScript type annotations");
+            debug!("   - Type extraction agents couldn't identify response/request types");
+            debug!("   - This is the first run and no cross-repo data exists yet");
+            debug!("   Type checking will work when type annotations are present in the source.");
             return Ok(());
         }
 
-        println!(
+        debug!(
             "Found {} type file(s) to check: {:?}",
             type_files.len(),
             type_files.iter().map(|f| f.file_name()).collect::<Vec<_>>()
@@ -1234,12 +1233,16 @@ impl Analyzer {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Print the output from the type checking script
+        // Log type checking output at debug level
         if !stdout.trim().is_empty() {
-            print!("{}", stdout);
+            for line in stdout.lines() {
+                debug!("{}", line);
+            }
         }
         if !stderr.trim().is_empty() && !output.status.success() {
-            print!("{}", stderr);
+            for line in stderr.lines() {
+                debug!("{}", line);
+            }
         }
 
         if !output.status.success() {

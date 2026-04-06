@@ -2,6 +2,7 @@ use crate::{
     agent_service::AgentService, agents::schemas::AgentSchemas, framework_detector::DetectionResult,
 };
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 /// A single pattern example for a specific framework
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,18 +90,18 @@ impl FrameworkGuidanceAgent {
         &self,
         framework_detection: &DetectionResult,
     ) -> Result<FrameworkGuidance, Box<dyn std::error::Error>> {
-        println!("=== FRAMEWORK GUIDANCE AGENT DEBUG ===");
-        println!(
+        debug!("=== FRAMEWORK GUIDANCE AGENT DEBUG ===");
+        debug!(
             "Generating guidance for frameworks: {:?}",
             framework_detection.frameworks
         );
-        println!("Data fetchers: {:?}", framework_detection.data_fetchers);
+        debug!("Data fetchers: {:?}", framework_detection.data_fetchers);
 
         let system_message = self.build_system_message();
         let prompt_context = self.build_context_string(framework_detection);
 
         // Execute calls in parallel for speed (flattened schema makes this fast enough)
-        println!("  Fetching all patterns in parallel...");
+        debug!("  Fetching all patterns in parallel...");
         let mount_task = self.fetch_patterns("mount", &prompt_context, &system_message);
         let endpoint_task = self.fetch_patterns("endpoint", &prompt_context, &system_message);
         let middleware_task = self.fetch_patterns("middleware", &prompt_context, &system_message);
@@ -131,14 +132,14 @@ impl FrameworkGuidanceAgent {
             parsing_notes: general_guidance.parsing_notes,
         };
 
-        println!("Generated guidance with:");
-        println!("  - {} mount patterns", guidance.mount_patterns.len());
-        println!("  - {} endpoint patterns", guidance.endpoint_patterns.len());
-        println!(
+        debug!("Generated guidance with:");
+        debug!("  - {} mount patterns", guidance.mount_patterns.len());
+        debug!("  - {} endpoint patterns", guidance.endpoint_patterns.len());
+        debug!(
             "  - {} middleware patterns",
             guidance.middleware_patterns.len()
         );
-        println!(
+        debug!(
             "  - {} data fetching patterns",
             guidance.data_fetching_patterns.len()
         );

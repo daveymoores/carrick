@@ -12,6 +12,7 @@ mod file_finder;
 mod formatter;
 mod framework_detector;
 mod intent_generator;
+mod logging;
 mod mount_graph;
 mod multi_agent_orchestrator;
 mod packages;
@@ -31,17 +32,21 @@ use engine::run_analysis_engine_with_sidecar;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 /// CLI arguments for the carrick analyzer
 struct CliArgs {
     /// Path to the repository to analyze
     repo_path: String,
+    /// Enable verbose (debug-level) terminal output
+    verbose: bool,
 }
 
 impl CliArgs {
     fn parse() -> Self {
         let args: Vec<String> = env::args().skip(1).collect();
         let mut repo_path = ".".to_string();
+        let mut verbose = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -49,6 +54,9 @@ impl CliArgs {
                 "--help" | "-h" => {
                     Self::print_help();
                     std::process::exit(0);
+                }
+                "--verbose" | "-v" => {
+                    verbose = true;
                 }
                 arg if !arg.starts_with('-') => {
                     repo_path = arg.to_string();
@@ -62,7 +70,7 @@ impl CliArgs {
             i += 1;
         }
 
-        Self { repo_path }
+        Self { repo_path, verbose }
     }
 
     fn print_help() {
@@ -77,6 +85,7 @@ ARGUMENTS:
 
 OPTIONS:
     -h, --help     Print this help message
+    -v, --verbose  Enable verbose (debug-level) terminal output
 
 ENVIRONMENT VARIABLES:
     CARRICK_API_KEY         API key for the LLM service (required)
@@ -90,37 +99,39 @@ ENVIRONMENT VARIABLES:
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run_analysis().await {
-        eprintln!("Analysis failed: {}", e);
+    let args = CliArgs::parse();
+    logging::init(args.verbose);
+
+    if let Err(e) = run_analysis(args).await {
+        error!("Analysis failed: {}", e);
         std::process::exit(1);
     }
 }
 
-async fn run_analysis() -> Result<(), Box<dyn std::error::Error>> {
-    let args = CliArgs::parse();
-
+async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // =======================================================================
     // STEP 1: Discover and spawn sidecar (non-blocking)
     // The sidecar is bundled with the tool - auto-discover its location
     // =======================================================================
+    let sp = logging::spinner("Initializing sidecar...");
+    let mut sidecar_found = false;
     let sidecar = match discover_sidecar_path() {
         Some(sidecar_path) => {
-            eprintln!("[main] Found sidecar at: {}", sidecar_path.display());
+            sidecar_found = true;
+            debug!("Found sidecar at: {}", sidecar_path.display());
             match spawn_sidecar(&sidecar_path, &args.repo_path) {
                 Ok(sidecar) => {
-                    eprintln!("[main] Sidecar spawned, initializing in background...");
+                    debug!("Sidecar spawned, initializing in background...");
                     Some(sidecar)
                 }
                 Err(e) => {
-                    eprintln!("[main] Warning: Failed to spawn sidecar: {}", e);
-                    eprintln!("[main] Continuing without sidecar type extraction");
+                    warn!("Failed to spawn sidecar: {}", e);
                     None
                 }
             }
         }
         None => {
-            eprintln!("[main] Sidecar not found, continuing without type extraction");
-            eprintln!("[main] (Run 'npm run build' in src/sidecar to enable type extraction)");
+            debug!("Sidecar not found, continuing without type extraction");
             None
         }
     };
@@ -130,19 +141,23 @@ async fn run_analysis() -> Result<(), Box<dyn std::error::Error>> {
     // The sidecar initializes in parallel, so it should be ready by now
     // =======================================================================
     let sidecar_ready = if let Some(ref sidecar) = sidecar {
-        eprintln!("[main] Waiting for sidecar to be ready...");
+        debug!("Waiting for sidecar to be ready...");
         match sidecar.wait_ready(Duration::from_secs(30)) {
             Ok(()) => {
-                eprintln!("[main] Sidecar is ready for type extraction");
+                logging::finish_spinner(&sp, "Sidecar ready");
                 true
             }
             Err(e) => {
-                eprintln!("[main] Warning: Sidecar failed to initialize: {}", e);
-                eprintln!("[main] Continuing without sidecar type extraction");
+                warn!("Sidecar failed to initialize: {}", e);
+                logging::finish_spinner_warn(&sp, "Sidecar unavailable");
                 false
             }
         }
+    } else if sidecar_found {
+        logging::finish_spinner_warn(&sp, "Sidecar failed to start");
+        false
     } else {
+        logging::finish_spinner_warn(&sp, "Sidecar not found");
         false
     };
 
@@ -161,7 +176,7 @@ async fn run_analysis() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if use_mock {
-        println!("Using MockStorage (CARRICK_MOCK_ALL environment variable detected)");
+        info!("Using MockStorage");
         let storage = MockStorage::new();
         run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref).await
     } else {
@@ -201,7 +216,7 @@ fn discover_sidecar_path() -> Option<PathBuf> {
     for candidate in candidates {
         let full_path = candidate.join(sidecar_entry);
         if full_path.exists() {
-            eprintln!("[main] Checking sidecar candidate: {:?}", full_path);
+            debug!("Checking sidecar candidate: {:?}", full_path);
             return Some(full_path);
         }
     }
@@ -230,18 +245,14 @@ fn spawn_sidecar(
     let absolute_repo_path = if repo_path.is_absolute() {
         repo_path.to_path_buf()
     } else {
-        // Get current working directory and join with relative path
         let cwd = env::current_dir()
             .map_err(|e| format!("Failed to get current working directory: {}", e))?;
-        eprintln!("[main] Current working directory: {:?}", cwd);
-        eprintln!("[main] Repo path (relative): {:?}", repo_path);
+        debug!("Current working directory: {:?}", cwd);
+        debug!("Repo path (relative): {:?}", repo_path);
         cwd.join(repo_path)
     };
 
-    eprintln!(
-        "[main] Repo path (before canonicalize): {:?}",
-        absolute_repo_path
-    );
+    debug!("Repo path (before canonicalize): {:?}", absolute_repo_path);
 
     // Canonicalize to resolve any .. or . segments in the path
     let absolute_repo_path = absolute_repo_path.canonicalize().map_err(|e| {
@@ -253,7 +264,7 @@ fn spawn_sidecar(
         )
     })?;
 
-    eprintln!("[main] Repo path (canonicalized): {:?}", absolute_repo_path);
+    debug!("Repo path (canonicalized): {:?}", absolute_repo_path);
 
     // Spawn the sidecar process
     let sidecar = TypeSidecar::spawn(sidecar_path)?;

@@ -10,6 +10,7 @@ use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::intent_generator::generate_function_intents;
+use crate::logging;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
 use crate::packages::Packages;
@@ -30,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 use serde::Serialize;
 use swc_common::{
@@ -98,19 +100,18 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
 
     let should_upload = should_upload_data();
-    println!(
-        "Running Carrick in CI mode with org: {} (upload: {})",
-        &carrick_org, should_upload
-    );
+    debug!(org = %carrick_org, upload = should_upload, "Running Carrick in CI mode");
 
     // 1. Health check
+    let sp = logging::spinner("Connecting to AWS...");
     storage
         .health_check()
         .await
         .map_err(|e| format!("Failed to connect to AWS services: {}", e))?;
-    println!("AWS connectivity verified");
+    logging::finish_spinner(&sp, "AWS connectivity verified");
 
     // 2. Download all repos (moved earlier for incremental cache lookup)
+    let sp = logging::spinner("Downloading cross-repo data...");
     let (mut all_repo_data, _repo_s3_urls) = storage
         .download_all_repo_data(&carrick_org)
         .await
@@ -124,20 +125,22 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
         .cloned();
 
     if previous_data.is_some() {
-        println!(
-            "[incremental] Found previous analysis data for {}",
-            repo_name
-        );
+        debug!("Found previous analysis data for {}", repo_name);
     }
+    logging::finish_spinner(
+        &sp,
+        &format!("Downloaded data from {} repos", all_repo_data.len()),
+    );
 
     // 4. Analyze (incremental if possible)
+    let sp = logging::spinner("Analyzing repository...");
     let current_repo_data =
         analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref()).await?;
-    println!("Analyzed current repo: {}", current_repo_data.repo_name);
+    logging::finish_spinner(&sp, &format!("Analyzed {}", current_repo_data.repo_name));
 
     // Log sidecar type resolution results if available
     if current_repo_data.bundled_types.is_some() {
-        println!(
+        debug!(
             "Type resolution: {} bundled types, {} manifest entries",
             current_repo_data
                 .bundled_types
@@ -154,14 +157,15 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
 
     // 5. Conditionally upload current repo data to cloud storage
     if should_upload {
+        let sp = logging::spinner("Uploading results...");
         let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
         storage
             .upload_repo_data(&carrick_org, &cloud_data_serialized)
             .await
             .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-        println!("Uploaded current repo data to cloud storage");
+        logging::finish_spinner(&sp, "Uploaded results to cloud storage");
     } else {
-        println!("Skipping upload (PR/branch mode - analyzing only)");
+        debug!("Skipping upload (PR/branch mode)");
     }
 
     // 6. Cross-repo analysis (reuse already-downloaded data)
@@ -169,17 +173,46 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     let current_repo_name = &current_repo_data.repo_name;
     all_repo_data.retain(|repo| &repo.repo_name != current_repo_name);
 
-    println!(
-        "Downloaded data from {} repos (excluding current repo: {})",
+    debug!(
+        "Cross-repo analysis with {} repos (excluding {})",
         all_repo_data.len(),
         current_repo_name
     );
 
+    let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer = build_cross_repo_analyzer(all_repo_data, current_repo_data).await?;
-    println!("Reconstructed analyzer with cross-repo data");
+    logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
     print_results(results);
+
+    // 7. Best-effort log upload (only on main/master, same policy as data upload)
+    if should_upload {
+        if let Some(log_path) = logging::get_log_file_path() {
+            const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+            if let Ok(mut file) = std::fs::File::open(&log_path) {
+                use std::io::{Read, Seek};
+                if let Ok(metadata) = file.metadata() {
+                    let file_len = metadata.len();
+                    let start = file_len.saturating_sub(MAX_LOG_BYTES);
+                    if file.seek(std::io::SeekFrom::Start(start)).is_ok() {
+                        let mut buf = Vec::with_capacity((file_len - start) as usize);
+                        if file.read_to_end(&mut buf).is_ok() {
+                            let log_content = String::from_utf8_lossy(&buf);
+                            let repo_name = get_repository_name(repo_path);
+                            if let Err(e) = storage
+                                .upload_logs(&carrick_org, &repo_name, &log_content)
+                                .await
+                            {
+                                debug!("Failed to upload logs: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -256,8 +289,8 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
     if let Ok(serialized) = serde_json::to_string(&data) {
         if serialized.len() > MAX_PAYLOAD_BYTES {
-            println!(
-                "[incremental] WARNING: Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
+            warn!(
+                "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
                 serialized.len() / 1024,
                 MAX_PAYLOAD_BYTES / 1024
             );
@@ -281,11 +314,8 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        println!(
-            "[incremental] git diff failed (shallow clone?): {}",
-            stderr.trim()
-        );
-        println!("[incremental] Set fetch-depth: 0 in your workflow for incremental mode.");
+        debug!("git diff failed (shallow clone?): {}", stderr.trim());
+        debug!("Set fetch-depth: 0 in your workflow for incremental mode.");
         return None;
     }
 
@@ -385,32 +415,30 @@ async fn analyze_current_repo_incremental(
     let (config, packages) = load_config_and_packages(repo_path)?;
 
     // 3. Check if we can use incremental mode
-    let can_use_incremental = previous_data
-        .and_then(|prev| {
-            // Must have file_results and matching cache_version
-            let has_cache = prev.file_results.is_some();
-            let version_matches = prev.cache_version == Some(CACHE_VERSION);
-            if has_cache && version_matches {
-                Some(prev)
-            } else {
-                if !has_cache {
-                    println!("[incremental] No cached file_results found, running full analysis");
-                }
-                if !version_matches {
-                    println!(
-                        "[incremental] Cache version mismatch (expected {}, got {:?}), running full analysis",
-                        CACHE_VERSION,
-                        prev.cache_version
-                    );
-                }
-                None
+    let can_use_incremental = previous_data.and_then(|prev| {
+        // Must have file_results and matching cache_version
+        let has_cache = prev.file_results.is_some();
+        let version_matches = prev.cache_version == Some(CACHE_VERSION);
+        if has_cache && version_matches {
+            Some(prev)
+        } else {
+            if !has_cache {
+                debug!("No cached file_results found, running full analysis");
             }
-        });
+            if !version_matches {
+                debug!(
+                    "Cache version mismatch (expected {}, got {:?}), running full analysis",
+                    CACHE_VERSION, prev.cache_version
+                );
+            }
+            None
+        }
+    });
 
     if let Some(prev) = can_use_incremental {
         let prev_commit = &prev.commit_hash;
-        println!(
-            "[incremental] Found previous analysis (commit {})",
+        debug!(
+            "Found previous analysis (commit {})",
             &prev_commit[..std::cmp::min(7, prev_commit.len())]
         );
 
@@ -451,13 +479,9 @@ async fn analyze_current_repo_incremental(
             let changed_count = files_to_analyze.len();
             let reused_count = total_files - changed_count;
 
-            println!(
-                "[incremental] Detected {} changed file(s) out of {}",
-                changed_count, total_files
-            );
-            println!(
-                "[incremental] Reusing cached results for {} files",
-                reused_count
+            debug!(
+                "Detected {} changed file(s) out of {}, reusing {} cached",
+                changed_count, total_files, reused_count
             );
 
             // Check if package.json changed → need fresh framework detection/guidance
@@ -475,24 +499,21 @@ async fn analyze_current_repo_incremental(
             // Get framework detection and guidance (cached or fresh)
             let (detection, guidance) = if !pkg_changed {
                 if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
-                    println!("[incremental] Reusing cached framework detection and guidance");
+                    debug!("Reusing cached framework detection and guidance");
                     (det.clone(), guid.clone())
                 } else {
                     run_framework_detection_and_guidance(&api_key, &packages, &all_imported_symbols)
                         .await?
                 }
             } else {
-                println!("[incremental] package.json changed, re-running framework detection");
+                debug!("package.json changed, re-running framework detection");
                 run_framework_detection_and_guidance(&api_key, &packages, &all_imported_symbols)
                     .await?
             };
 
             // Run Gemini file analysis ONLY on changed files
             if changed_count > 0 {
-                println!(
-                    "[incremental] Running LLM analysis on {} changed file(s)...",
-                    changed_count
-                );
+                debug!("Running LLM analysis on {} changed file(s)", changed_count);
             }
 
             let agent_service = AgentService::new(api_key.clone());
@@ -532,8 +553,8 @@ async fn analyze_current_repo_incremental(
             let mount_graph = graph_orchestrator.build_mount_graph(&merged_results);
 
             let elapsed = start.elapsed();
-            println!(
-                "[incremental] Analysis complete in {:.1}s",
+            debug!(
+                "Incremental analysis complete in {:.1}s",
                 elapsed.as_secs_f64()
             );
 
@@ -587,19 +608,16 @@ async fn analyze_current_repo_incremental(
 
             return Ok(cloud_data);
         } else {
-            println!("[incremental] git diff failed, falling back to full analysis");
+            debug!("git diff failed, falling back to full analysis");
         }
     }
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
-    println!("[incremental] Running full analysis...");
+    debug!("Running full analysis...");
     let cloud_data = analyze_current_repo(repo_path, sidecar).await?;
 
     let elapsed = start.elapsed();
-    println!(
-        "[incremental] Full analysis complete in {:.1}s",
-        elapsed.as_secs_f64()
-    );
+    debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
 
     Ok(cloud_data)
 }
@@ -686,10 +704,12 @@ fn build_cloud_data_from_mount_graph(
         })
         .collect();
 
-    println!("Created CloudRepoData from incremental analysis:");
-    println!("  - {} endpoints", endpoints.len());
-    println!("  - {} calls", calls.len());
-    println!("  - {} mounts", mounts.len());
+    debug!(
+        "CloudRepoData from incremental: {} endpoints, {} calls, {} mounts",
+        endpoints.len(),
+        calls.len(),
+        mounts.len()
+    );
 
     CloudRepoData {
         repo_name: repo_name.to_string(),
@@ -730,7 +750,7 @@ fn resolve_types_if_available(
 ) {
     let Some(sidecar) = sidecar else { return };
 
-    println!("\n=== Sidecar Type Resolution ===");
+    debug!("Starting sidecar type resolution");
     match sidecar.wait_ready(Duration::from_secs(10)) {
         Ok(()) => {
             match file_orchestrator.resolve_types_with_sidecar(
@@ -742,8 +762,8 @@ fn resolve_types_if_available(
                 config,
             ) {
                 Ok(type_resolution) => {
-                    println!(
-                        "Type resolution successful: {} explicit, {} inferred, {} failures",
+                    debug!(
+                        "Type resolution: {} explicit, {} inferred, {} failures",
                         type_resolution.explicit_manifest.len(),
                         type_resolution.inferred_types.len(),
                         type_resolution.symbol_failures.len()
@@ -757,21 +777,21 @@ fn resolve_types_if_available(
                         );
                     }
                     for failure in &type_resolution.symbol_failures {
-                        eprintln!(
-                            "[Sidecar] Failed to resolve symbol '{}' from '{}': {}",
+                        debug!(
+                            "Failed to resolve symbol '{}' from '{}': {}",
                             failure.symbol_name, failure.source_file, failure.reason
                         );
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Sidecar] Type resolution failed: {}", e);
-                    eprintln!("[Sidecar] Continuing without bundled types");
+                    warn!("Type resolution failed: {}", e);
+                    debug!("Continuing without bundled types");
                 }
             }
         }
         Err(e) => {
-            eprintln!("[Sidecar] Sidecar not ready: {}", e);
-            eprintln!("[Sidecar] Skipping type resolution");
+            warn!("Sidecar not ready: {}", e);
+            debug!("Skipping type resolution");
         }
     }
 }
@@ -785,11 +805,7 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
     let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
     let (files, _, _) = find_files(repo_path, &ignore_patterns);
 
-    println!(
-        "Found {} files to analyze in directory {}",
-        files.len(),
-        repo_path
-    );
+    debug!("Found {} files to analyze in {}", files.len(), repo_path);
 
     // Extract imported symbols and function definitions by parsing files
     let mut all_imported_symbols = HashMap::new();
@@ -811,7 +827,7 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
         }
     }
 
-    println!(
+    debug!(
         "Extracted {} imported symbols and {} function definitions from {} files",
         all_imported_symbols.len(),
         all_function_definitions.len(),
@@ -834,9 +850,9 @@ fn load_config_and_packages(
     let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
 
     let config = if let Some(config_path) = config_file_path {
-        println!("Found carrick.json file: {}", config_path.display());
+        debug!("Found carrick.json: {}", config_path.display());
         Config::new(vec![config_path]).unwrap_or_else(|e| {
-            eprintln!("Warning: Error parsing config file: {}", e);
+            warn!("Error parsing config file: {}", e);
             Config::default()
         })
     } else {
@@ -844,9 +860,9 @@ fn load_config_and_packages(
     };
 
     let packages = if let Some(package_path) = package_json_path {
-        println!("Found package.json: {}", package_path.display());
+        debug!("Found package.json: {}", package_path.display());
         Packages::new(vec![package_path]).unwrap_or_else(|e| {
-            eprintln!("Warning: Error parsing package.json: {}", e);
+            warn!("Error parsing package.json: {}", e);
             Packages::default()
         })
     } else {
@@ -880,8 +896,8 @@ fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut Clou
         return;
     }
 
-    eprintln!(
-        "[Sidecar] Resolving {} type definition(s) via compiler...",
+    debug!(
+        "Resolving {} type definition(s) via compiler",
         aliases.len()
     );
 
@@ -897,13 +913,11 @@ fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut Clou
                     entry.expanded_definition = Some(r.expanded.clone());
                 }
             }
-            eprintln!("[Sidecar] Resolved {} type definition(s)", lookup.len());
+            debug!("Resolved {} type definition(s)", lookup.len());
         }
         Err(e) => {
-            eprintln!("[Sidecar] Per-endpoint definition resolution failed: {}", e);
-            eprintln!(
-                "[Sidecar] Continuing without resolved definitions (MCP will use regex fallback)"
-            );
+            warn!("Per-endpoint definition resolution failed: {}", e);
+            debug!("Continuing without resolved definitions (MCP will use regex fallback)");
         }
     }
 }
@@ -1104,8 +1118,8 @@ fn enrich_manifest_with_type_resolution(
         .iter()
         .filter(|e| e.type_state == ManifestTypeState::Unknown)
         .count();
-    eprintln!(
-        "[Manifest Enrichment] {} explicit, {} implicit, {} unknown",
+    debug!(
+        "Manifest enrichment: {} explicit, {} implicit, {} unknown",
         explicit_count, implicit_count, unknown_count
     );
 }
@@ -1127,17 +1141,14 @@ async fn analyze_current_repo(
         .unwrap_or_else(|_| repo_path.to_string());
     let repo_path = canonical.as_str();
 
-    println!(
-        "---> Running multi-agent framework-agnostic analysis on: {}",
-        repo_path
-    );
+    debug!("Running multi-agent analysis on: {}", repo_path);
 
     // 1. Create shared SourceMap and discover files and symbols
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
         discover_files_and_symbols(repo_path, cm.clone())?;
-    println!(
-        "Extracted repository name: '{}' from {} files ({} function definitions)",
+    debug!(
+        "Repository '{}': {} files, {} function definitions",
         repo_name,
         files.len(),
         function_definitions.len()
@@ -1258,7 +1269,7 @@ async fn build_cross_repo_analyzer(
 
     // 6. Run final type checking
     if let Err(e) = analyzer.run_final_type_checking() {
-        println!("⚠️  Warning: Type checking failed: {}", e);
+        warn!("Type checking failed: {}", e);
     }
 
     Ok(analyzer)
@@ -1270,16 +1281,16 @@ fn recreate_type_files_and_check(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = std::path::Path::new("ts_check/output");
     if output_dir.exists() {
-        println!("Cleaning output directory: ts_check/output");
+        debug!("Cleaning output directory: ts_check/output");
         if let Err(e) = std::fs::remove_dir_all(output_dir) {
-            println!("Warning: Failed to clean output directory: {}", e);
+            warn!("Failed to clean output directory: {}", e);
         }
     }
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
-        println!("Warning: Failed to create output directory: {}", e);
+        warn!("Failed to create output directory: {}", e);
     } else {
-        println!("Created clean output directory: ts_check/output");
+        debug!("Created clean output directory: ts_check/output");
     }
 
     for repo_data in all_repo_data {
@@ -1291,12 +1302,12 @@ fn recreate_type_files_and_check(
                 append_missing_aliases(bundled_types.clone(), repo_data.type_manifest.as_ref());
 
             if let Err(e) = std::fs::write(&file_path, content) {
-                println!("Warning: Failed to write type file {}: {}", file_name, e);
+                warn!("Failed to write type file {}: {}", file_name, e);
             } else {
-                println!("Created bundled type file: {}", file_path.display());
+                debug!("Created bundled type file: {}", file_path.display());
             }
         } else {
-            println!(
+            debug!(
                 "No bundled types available for repo: {}",
                 repo_data.repo_name
             );
@@ -1352,11 +1363,9 @@ fn write_manifest_files(
         serde_json::to_string_pretty(&consumer_manifest)?,
     )?;
 
-    println!(
-        "Wrote manifest files: {} ({} entries), {} ({} entries)",
-        producer_path.display(),
+    debug!(
+        "Wrote manifest files: {} producers, {} consumers",
         producer_manifest.entries.len(),
-        consumer_path.display(),
         consumer_manifest.entries.len()
     );
 
@@ -1444,31 +1453,31 @@ fn recreate_package_and_tsconfig(
         &package_json_path,
         serde_json::to_string_pretty(&package_json_content)?,
     )?;
-    println!("Recreated package.json at {}", package_json_path.display());
+    debug!("Recreated package.json at {}", package_json_path.display());
 
     let skip_npm_install = std::env::var("CARRICK_SKIP_NPM_INSTALL").is_ok()
         || std::env::var("CARRICK_MOCK_ALL").is_ok();
 
     if skip_npm_install {
-        println!("Skipping npm install (mock mode or CARRICK_SKIP_NPM_INSTALL set)");
+        debug!("Skipping npm install (mock mode or CARRICK_SKIP_NPM_INSTALL set)");
     } else {
         // Clean any existing node_modules and package-lock.json to avoid conflicts
         let node_modules_path = output_dir.join("node_modules");
         let package_lock_path = output_dir.join("package-lock.json");
 
         if node_modules_path.exists() {
-            println!("Removing existing node_modules directory...");
+            debug!("Removing existing node_modules directory");
             std::fs::remove_dir_all(&node_modules_path).ok();
         }
 
         if package_lock_path.exists() {
-            println!("Removing existing package-lock.json...");
+            debug!("Removing existing package-lock.json");
             std::fs::remove_file(&package_lock_path).ok();
         }
 
         // Install dependencies
         use std::process::Command;
-        println!("Installing dependencies...");
+        debug!("Installing dependencies...");
 
         let install_output = Command::new("npm")
             .arg("install")
@@ -1478,9 +1487,9 @@ fn recreate_package_and_tsconfig(
 
         if !install_output.status.success() {
             let stderr = String::from_utf8_lossy(&install_output.stderr);
-            eprintln!("Warning: npm install failed: {}", stderr);
+            warn!("npm install failed: {}", stderr);
         } else {
-            println!("Dependencies installed successfully");
+            debug!("Dependencies installed successfully");
         }
     }
 
@@ -1492,7 +1501,7 @@ fn recreate_package_and_tsconfig(
         &tsconfig_path,
         serde_json::to_string_pretty(&tsconfig_content)?,
     )?;
-    println!("Recreated tsconfig.json at {}", tsconfig_path.display());
+    debug!("Recreated tsconfig.json at {}", tsconfig_path.display());
 
     Ok(())
 }

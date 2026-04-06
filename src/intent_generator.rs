@@ -13,6 +13,7 @@
 use crate::agent_service::AgentService;
 use crate::visitor::{FunctionCallRef, FunctionDefinition, ImportedSymbol};
 use std::collections::{HashMap, HashSet};
+use tracing::{debug, warn};
 
 /// Generate intents for all exported functions that have body source.
 ///
@@ -37,10 +38,7 @@ pub async fn generate_function_intents(
         return;
     }
 
-    eprintln!(
-        "[intent] Generating intents for {} function(s)...",
-        eligible.len()
-    );
+    debug!("Generating intents for {} function(s)", eligible.len());
 
     // Build a local call graph: for each function, which other local functions does it reference?
     let local_fn_names: HashSet<&str> = function_definitions.keys().map(|s| s.as_str()).collect();
@@ -134,7 +132,7 @@ pub async fn generate_function_intents(
                     }
                 }
                 Err(e) => {
-                    eprintln!("[intent] Failed to generate intent for {}: {}", name, e);
+                    warn!("Failed to generate intent for {}: {}", name, e);
                 }
             }
         }
@@ -148,7 +146,7 @@ pub async fn generate_function_intents(
         }
     }
 
-    eprintln!("[intent] Generated {} intent(s)", count);
+    debug!("Generated {} intent(s)", count);
 
     // Strip body_source — source code stays in GitHub, not AWS
     strip_body_source(function_definitions);

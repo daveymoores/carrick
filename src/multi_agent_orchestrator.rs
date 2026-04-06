@@ -26,6 +26,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use swc_common::{SourceMap, sync::Lrc};
+use tracing::debug;
 
 /// Complete analysis result from the multi-agent workflow
 #[derive(Debug)]
@@ -80,29 +81,29 @@ impl MultiAgentOrchestrator {
         packages: &Packages,
         imported_symbols: &HashMap<String, ImportedSymbol>,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
-        println!("Starting AST-Gated File-Centric analysis...");
+        debug!("Starting AST-Gated File-Centric analysis...");
 
         // Stage 0: Framework Detection
-        println!("\n=== Stage 0: Framework Detection ===");
+        debug!("=== Stage 0: Framework Detection ===");
         let framework_detector = FrameworkDetector::new(self.agent_service.clone());
         let framework_detection = framework_detector
             .detect_frameworks_and_libraries(packages, imported_symbols)
             .await?;
 
-        println!("Detected frameworks: {:?}", framework_detection.frameworks);
-        println!(
+        debug!("Detected frameworks: {:?}", framework_detection.frameworks);
+        debug!(
             "Detected data fetchers: {:?}",
             framework_detection.data_fetchers
         );
 
         // Stage 1: Framework Guidance Generation
-        println!("\n=== Stage 1: Framework Guidance Generation ===");
+        debug!("=== Stage 1: Framework Guidance Generation ===");
         let framework_guidance_agent = FrameworkGuidanceAgent::new(self.agent_service.clone());
         let framework_guidance = framework_guidance_agent
             .generate_guidance(&framework_detection)
             .await?;
 
-        println!(
+        debug!(
             "Generated guidance with {} mount patterns, {} endpoint patterns, {} data fetching patterns",
             framework_guidance.mount_patterns.len(),
             framework_guidance.endpoint_patterns.len(),
@@ -110,7 +111,7 @@ impl MultiAgentOrchestrator {
         );
 
         // Stage 2: AST-Gated File-Centric Analysis
-        println!("\n=== Stage 2: AST-Gated File-Centric Analysis ===");
+        debug!("=== Stage 2: AST-Gated File-Centric Analysis ===");
         let file_orchestrator = FileOrchestrator::new(self.agent_service.clone());
         let file_centric_result = file_orchestrator
             .analyze_files(&files, &framework_guidance, &framework_detection)
@@ -119,16 +120,16 @@ impl MultiAgentOrchestrator {
         self.print_analysis_summary(&file_centric_result);
 
         // Stage 3: Mount Graph is already built by FileOrchestrator
-        println!("\n=== Stage 3: Mount Graph Summary ===");
+        debug!("=== Stage 3: Mount Graph Summary ===");
         let mount_graph = &file_centric_result.mount_graph;
-        println!("Built mount graph:");
-        println!("  - {} nodes", mount_graph.get_nodes().len());
-        println!("  - {} mounts", mount_graph.get_mounts().len());
-        println!(
+        debug!("Built mount graph:");
+        debug!("  - {} nodes", mount_graph.get_nodes().len());
+        debug!("  - {} mounts", mount_graph.get_mounts().len());
+        debug!(
             "  - {} endpoints",
             mount_graph.get_resolved_endpoints().len()
         );
-        println!("  - {} data calls", mount_graph.get_data_calls().len());
+        debug!("  - {} data calls", mount_graph.get_data_calls().len());
 
         Ok(MultiAgentAnalysisResult {
             framework_detection,
@@ -140,27 +141,27 @@ impl MultiAgentOrchestrator {
     }
 
     fn print_analysis_summary(&self, result: &FileCentricAnalysisResult) {
-        println!("\n=== ANALYSIS SUMMARY ===");
-        println!("File Processing:");
-        println!(
+        debug!("=== ANALYSIS SUMMARY ===");
+        debug!("File Processing:");
+        debug!(
             "  - Files processed (LLM calls): {}",
             result.stats.files_processed
         );
-        println!("  - Files skipped (total): {}", result.stats.files_skipped);
-        println!(
+        debug!("  - Files skipped (total): {}", result.stats.files_skipped);
+        debug!(
             "  - Zero-cost skips (no API patterns): {}",
             result.stats.files_skipped_no_candidates
         );
 
-        println!("Extracted Items:");
-        println!("  - Total mounts: {}", result.stats.total_mounts);
-        println!("  - Total endpoints: {}", result.stats.total_endpoints);
-        println!("  - Total data calls: {}", result.stats.total_data_calls);
+        debug!("Extracted Items:");
+        debug!("  - Total mounts: {}", result.stats.total_mounts);
+        debug!("  - Total endpoints: {}", result.stats.total_endpoints);
+        debug!("  - Total data calls: {}", result.stats.total_data_calls);
 
         if !result.stats.errors.is_empty() {
-            println!("Errors ({}):", result.stats.errors.len());
+            debug!("Errors ({}):", result.stats.errors.len());
             for error in &result.stats.errors {
-                println!("  - {}", error);
+                debug!("  - {}", error);
             }
         }
     }

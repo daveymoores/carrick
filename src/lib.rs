@@ -12,6 +12,7 @@ pub mod file_finder;
 pub mod formatter;
 pub mod framework_detector;
 pub mod intent_generator;
+pub mod logging;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;
 pub mod packages;
