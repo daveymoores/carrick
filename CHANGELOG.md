@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/daveymoores/carrick/compare/carrick-v0.1.6...carrick-v0.1.7) (2026-04-06)
+
+
+### Features
+
+* structured logging with tracing, spinners, and S3 log upload ([#60](https://github.com/daveymoores/carrick/issues/60)) ([e56363b](https://github.com/daveymoores/carrick/commit/e56363bd68c6e41c5567e594f547dbfc65576c22))
+
 ## [0.1.6](https://github.com/daveymoores/carrick/compare/carrick-v0.1.5...carrick-v0.1.6) (2026-04-06)
 
 
