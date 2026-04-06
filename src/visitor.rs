@@ -290,7 +290,11 @@ impl FunctionDefinitionExtractor {
         }
         let src = self.source_map.span_to_snippet(span).ok()?;
         if src.len() > 2000 {
-            Some(format!("{}...", &src[..2000]))
+            if let Some((idx, _)) = src.char_indices().nth(2000) {
+                Some(format!("{}...", &src[..idx]))
+            } else {
+                Some(src)
+            }
         } else {
             Some(src)
         }
@@ -366,7 +370,7 @@ impl FunctionDefinitionExtractor {
 }
 
 impl Visit for FunctionDefinitionExtractor {
-    /// Track `export function foo() {}` and `export default function() {}`
+    /// Track `export function foo() {}` and `export const bar = ...`
     fn visit_export_decl(&mut self, export: &ExportDecl) {
         match &export.decl {
             Decl::Fn(fn_decl) => {
@@ -382,6 +386,57 @@ impl Visit for FunctionDefinitionExtractor {
             _ => {}
         }
         // Continue visiting so visit_fn_decl / visit_var_declarator fire
+        export.visit_children_with(self);
+    }
+
+    /// Track `export default function foo() {}` and `export default class Foo {}`
+    fn visit_export_default_decl(&mut self, export: &ExportDefaultDecl) {
+        match &export.decl {
+            DefaultDecl::Fn(fn_expr) => {
+                if let Some(ident) = &fn_expr.ident {
+                    let name = ident.sym.to_string();
+                    self.exported_names.insert(name.clone());
+                    // Capture the function since visit_fn_decl won't fire for default exports
+                    let arguments = self.extract_arguments(&fn_expr.function.params);
+                    let body_source = fn_expr
+                        .function
+                        .body
+                        .as_ref()
+                        .and_then(|b| self.extract_source(b.span));
+                    let line_number = self.line_number(fn_expr.function.span);
+                    self.function_definitions.insert(
+                        name.clone(),
+                        FunctionDefinition {
+                            name,
+                            file_path: self.current_file_path.clone(),
+                            node_type: FunctionNodeType::FunctionExpression(Box::new(
+                                fn_expr.clone(),
+                            )),
+                            arguments,
+                            body_source,
+                            is_exported: true,
+                            line_number,
+                            intent: None,
+                            calls: vec![],
+                        },
+                    );
+                }
+            }
+            DefaultDecl::Class(class_expr) => {
+                if let Some(ident) = &class_expr.ident {
+                    self.exported_names.insert(ident.sym.to_string());
+                }
+            }
+            _ => {}
+        }
+        export.visit_children_with(self);
+    }
+
+    /// Track `export default foo` (expression)
+    fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
+        if let Expr::Ident(ident) = &*export.expr {
+            self.exported_names.insert(ident.sym.to_string());
+        }
         export.visit_children_with(self);
     }
 
@@ -691,6 +746,26 @@ mod tests {
         let defs = extract("export function hello() { return 1; }");
         let def = defs.get("hello").expect("should find hello");
         assert!(def.is_exported, "export function should be marked exported");
+    }
+
+    #[test]
+    fn detects_export_default_function() {
+        let defs = extract("export default function main() { return 1; }");
+        let def = defs.get("main").expect("should find main");
+        assert!(
+            def.is_exported,
+            "export default function should be marked exported"
+        );
+    }
+
+    #[test]
+    fn detects_export_default_expression() {
+        let defs = extract("function setup() { return 1; }\nexport default setup;");
+        let def = defs.get("setup").expect("should find setup");
+        assert!(
+            def.is_exported,
+            "export default expr should be marked exported"
+        );
     }
 
     #[test]
