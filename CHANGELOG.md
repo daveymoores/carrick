@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/daveymoores/carrick/compare/carrick-v0.1.7...carrick-v0.1.8) (2026-04-09)
+
+
+### Features
+
+* add --no-cache flag to skip incremental analysis ([#63](https://github.com/daveymoores/carrick/issues/63)) ([f81c53c](https://github.com/daveymoores/carrick/commit/f81c53c63700a274216d0d77aa7f492601929230))
+
 ## [0.1.7](https://github.com/daveymoores/carrick/compare/carrick-v0.1.6...carrick-v0.1.7) (2026-04-06)
 
 
