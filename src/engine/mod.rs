@@ -88,7 +88,7 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_analysis_engine_with_sidecar(storage, repo_path, None).await
+    run_analysis_engine_with_sidecar(storage, repo_path, None, false).await
 }
 
 /// Run analysis engine with optional sidecar for type extraction
@@ -96,6 +96,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     storage: T,
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
+    no_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
 
@@ -119,14 +120,19 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
 
     // 3. Extract previous data for current repo (if any)
     let repo_name = get_repository_name(repo_path);
-    let previous_data = all_repo_data
-        .iter()
-        .find(|r| r.repo_name == repo_name)
-        .cloned();
-
-    if previous_data.is_some() {
-        debug!("Found previous analysis data for {}", repo_name);
-    }
+    let previous_data = if no_cache {
+        debug!("--no-cache: skipping incremental cache");
+        None
+    } else {
+        let data = all_repo_data
+            .iter()
+            .find(|r| r.repo_name == repo_name)
+            .cloned();
+        if data.is_some() {
+            debug!("Found previous analysis data for {}", repo_name);
+        }
+        data
+    };
     logging::finish_spinner(
         &sp,
         &format!("Downloaded data from {} repos", all_repo_data.len()),
