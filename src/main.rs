@@ -40,13 +40,20 @@ struct CliArgs {
     repo_path: String,
     /// Enable verbose (debug-level) terminal output
     verbose: bool,
+    /// Skip incremental cache and run a full analysis
+    no_cache: bool,
 }
 
 impl CliArgs {
     fn parse() -> Self {
         let args: Vec<String> = env::args().skip(1).collect();
+        Self::parse_from(&args)
+    }
+
+    fn parse_from(args: &[String]) -> Self {
         let mut repo_path = ".".to_string();
         let mut verbose = false;
+        let mut no_cache = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -57,6 +64,9 @@ impl CliArgs {
                 }
                 "--verbose" | "-v" => {
                     verbose = true;
+                }
+                "--no-cache" => {
+                    no_cache = true;
                 }
                 arg if !arg.starts_with('-') => {
                     repo_path = arg.to_string();
@@ -70,7 +80,11 @@ impl CliArgs {
             i += 1;
         }
 
-        Self { repo_path, verbose }
+        Self {
+            repo_path,
+            verbose,
+            no_cache,
+        }
     }
 
     fn print_help() {
@@ -86,6 +100,7 @@ ARGUMENTS:
 OPTIONS:
     -h, --help     Print this help message
     -v, --verbose  Enable verbose (debug-level) terminal output
+    --no-cache     Skip incremental cache and run a full analysis
 
 ENVIRONMENT VARIABLES:
     CARRICK_API_KEY         API key for the LLM service (required)
@@ -178,10 +193,10 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     if use_mock {
         info!("Using MockStorage");
         let storage = MockStorage::new();
-        run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref).await
+        run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await
     } else {
         let storage = AwsStorage::new()?;
-        run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref).await
+        run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await
     }
 
     // Sidecar will be automatically shut down when it goes out of scope (Drop impl)
@@ -272,4 +287,61 @@ fn spawn_sidecar(
     sidecar.start_init(&absolute_repo_path, None);
 
     Ok(sidecar)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(input: &[&str]) -> Vec<String> {
+        input.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_defaults() {
+        let cli = CliArgs::parse_from(&args(&[]));
+        assert_eq!(cli.repo_path, ".");
+        assert!(!cli.verbose);
+        assert!(!cli.no_cache);
+    }
+
+    #[test]
+    fn test_repo_path() {
+        let cli = CliArgs::parse_from(&args(&["/some/path"]));
+        assert_eq!(cli.repo_path, "/some/path");
+    }
+
+    #[test]
+    fn test_verbose_short() {
+        let cli = CliArgs::parse_from(&args(&["-v"]));
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn test_verbose_long() {
+        let cli = CliArgs::parse_from(&args(&["--verbose"]));
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn test_no_cache() {
+        let cli = CliArgs::parse_from(&args(&["--no-cache"]));
+        assert!(cli.no_cache);
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn test_no_cache_with_repo_path() {
+        let cli = CliArgs::parse_from(&args(&["--no-cache", "/my/repo"]));
+        assert!(cli.no_cache);
+        assert_eq!(cli.repo_path, "/my/repo");
+    }
+
+    #[test]
+    fn test_all_flags() {
+        let cli = CliArgs::parse_from(&args(&["-v", "--no-cache", "/my/repo"]));
+        assert!(cli.verbose);
+        assert!(cli.no_cache);
+        assert_eq!(cli.repo_path, "/my/repo");
+    }
 }
