@@ -34,3 +34,18 @@ export function pathsMatch(a: string, b: string): boolean {
 export function pathContains(path: string, substring: string): boolean {
   return path.toLowerCase().includes(substring.toLowerCase());
 }
+
+/**
+ * Extract named parameters from a path. Handles both `:id` and `{id}` styles.
+ * Returns a record mapping parameter names to "string" (their inferred type).
+ */
+export function extractPathParams(path: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const match of path.matchAll(/:([a-zA-Z_][a-zA-Z0-9_]*)/g)) {
+    params[match[1]] = "string";
+  }
+  for (const match of path.matchAll(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g)) {
+    params[match[1]] = "string";
+  }
+  return params;
+}

@@ -100,6 +100,9 @@ pub struct FunctionDefinition {
     /// Start line number for navigation
     #[serde(default)]
     pub line_number: u32,
+    /// End line number for source extraction
+    #[serde(default)]
+    pub end_line_number: u32,
     /// LLM-generated description of what this function intends to do
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
@@ -300,12 +303,20 @@ impl FunctionDefinitionExtractor {
         }
     }
 
-    /// Get the line number for a span
+    /// Get the start line number for a span
     fn line_number(&self, span: swc_common::Span) -> u32 {
         if span.is_dummy() {
             return 0;
         }
         self.source_map.lookup_char_pos(span.lo).line as u32
+    }
+
+    /// Get the end line number for a span
+    fn end_line_number(&self, span: swc_common::Span) -> u32 {
+        if span.is_dummy() {
+            return 0;
+        }
+        self.source_map.lookup_char_pos(span.hi).line as u32
     }
 
     /// Extract function arguments with their type annotations
@@ -404,6 +415,7 @@ impl Visit for FunctionDefinitionExtractor {
                         .as_ref()
                         .and_then(|b| self.extract_source(b.span));
                     let line_number = self.line_number(fn_expr.function.span);
+                    let end_line_number = self.end_line_number(fn_expr.function.span);
                     self.function_definitions.insert(
                         name.clone(),
                         FunctionDefinition {
@@ -416,6 +428,7 @@ impl Visit for FunctionDefinitionExtractor {
                             body_source,
                             is_exported: true,
                             line_number,
+                            end_line_number,
                             intent: None,
                             calls: vec![],
                         },
@@ -465,6 +478,7 @@ impl Visit for FunctionDefinitionExtractor {
             .as_ref()
             .and_then(|b| self.extract_source(b.span));
         let line_number = self.line_number(fn_decl.function.span);
+        let end_line_number = self.end_line_number(fn_decl.function.span);
 
         self.function_definitions.insert(
             name.clone(),
@@ -476,6 +490,7 @@ impl Visit for FunctionDefinitionExtractor {
                 body_source,
                 is_exported: false, // Updated in a post-pass
                 line_number,
+                end_line_number,
                 intent: None,
                 calls: vec![],
             },
@@ -497,6 +512,7 @@ impl Visit for FunctionDefinitionExtractor {
                         let arguments = self.extract_arrow_arguments(&arrow.params);
                         let body_source = self.extract_source(arrow.span);
                         let line_number = self.line_number(arrow.span);
+                        let end_line_number = self.end_line_number(arrow.span);
                         self.function_definitions.insert(
                             name.clone(),
                             FunctionDefinition {
@@ -507,6 +523,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 body_source,
                                 is_exported: false,
                                 line_number,
+                                end_line_number,
                                 intent: None,
                                 calls: vec![],
                             },
@@ -520,6 +537,7 @@ impl Visit for FunctionDefinitionExtractor {
                             .as_ref()
                             .and_then(|b| self.extract_source(b.span));
                         let line_number = self.line_number(fn_expr.function.span);
+                        let end_line_number = self.end_line_number(fn_expr.function.span);
                         self.function_definitions.insert(
                             name.clone(),
                             FunctionDefinition {
@@ -532,6 +550,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 body_source,
                                 is_exported: false,
                                 line_number,
+                                end_line_number,
                                 intent: None,
                                 calls: vec![],
                             },
@@ -562,6 +581,7 @@ impl Visit for FunctionDefinitionExtractor {
                             let arguments = self.extract_arrow_arguments(&arrow.params);
                             let body_source = self.extract_source(arrow.span);
                             let line_number = self.line_number(arrow.span);
+                            let end_line_number = self.end_line_number(arrow.span);
                             self.function_definitions.insert(
                                 synthetic_name.clone(),
                                 FunctionDefinition {
@@ -574,6 +594,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     body_source,
                                     is_exported: false,
                                     line_number,
+                                    end_line_number,
                                     intent: None,
                                     calls: vec![],
                                 },
@@ -591,6 +612,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 .as_ref()
                                 .and_then(|b| self.extract_source(b.span));
                             let line_number = self.line_number(fn_expr.function.span);
+                            let end_line_number = self.end_line_number(fn_expr.function.span);
                             self.function_definitions.insert(
                                 synthetic_name.clone(),
                                 FunctionDefinition {
@@ -603,6 +625,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     body_source,
                                     is_exported: false,
                                     line_number,
+                                    end_line_number,
                                     intent: None,
                                     calls: vec![],
                                 },
@@ -806,6 +829,31 @@ mod tests {
         let defs = extract("function first() { return 1; }");
         let def = defs.get("first").expect("should find first");
         assert!(def.line_number > 0, "line_number should be positive");
+    }
+
+    #[test]
+    fn captures_end_line_number() {
+        let defs = extract("function multi() {\n  const a = 1;\n  return a;\n}");
+        let def = defs.get("multi").expect("should find multi");
+        assert!(def.line_number > 0, "start line should be positive");
+        assert!(
+            def.end_line_number >= def.line_number,
+            "end_line_number ({}) should be >= line_number ({})",
+            def.end_line_number,
+            def.line_number
+        );
+    }
+
+    #[test]
+    fn captures_end_line_number_for_arrow() {
+        let defs = extract("const handler = (x: number) => {\n  return x * 2;\n};");
+        let def = defs.get("handler").expect("should find handler");
+        assert!(
+            def.end_line_number >= def.line_number,
+            "arrow end_line ({}) should be >= start ({})",
+            def.end_line_number,
+            def.line_number
+        );
     }
 
     #[test]

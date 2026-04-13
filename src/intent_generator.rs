@@ -324,6 +324,7 @@ mod tests {
                 body_source: Some("return 1;".to_string()),
                 is_exported: true,
                 line_number: 1,
+                end_line_number: 1,
                 intent: Some("returns one".to_string()),
                 calls: vec![],
             },

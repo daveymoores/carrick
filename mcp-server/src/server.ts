@@ -8,6 +8,7 @@ import { checkCompatibility } from "./tools/check-compat.js";
 import { getServiceDependencies } from "./tools/get-deps.js";
 import { getTypeDefinition } from "./tools/get-type-definition.js";
 import { listFunctionIntents } from "./tools/find-similar.js";
+import { getFunctionSource } from "./tools/get-function-source.js";
 import { getServiceCatalog } from "./resources/service-catalog.js";
 import { getServiceTypes } from "./resources/service-types.js";
 
@@ -87,6 +88,20 @@ export function createServer(client: ApiClient): McpServer {
       exclude_service: z.string().optional().describe("Service to exclude from results"),
     },
     async (params) => listFunctionIntents(client, params),
+  );
+
+  server.tool(
+    "get_function_source",
+    "Get structured metadata and GitHub fetch coordinates for a specific function. Returns route, resolved request/response types, external API calls, internal calls, and intent. Use detail='signature' for metadata only, or detail='full' (default) to also get line-precise GitHub coordinates for fetching just the function source. Use list_function_intents first to find function names.",
+    {
+      service: z.string().describe("Service name (fuzzy match)"),
+      function_name: z.string().describe("Function name from list_function_intents"),
+      detail: z
+        .enum(["signature", "full"])
+        .default("full")
+        .describe("'signature' for metadata only, 'full' adds GitHub source coordinates"),
+    },
+    async (params) => getFunctionSource(client, params),
   );
 
   // --- Resources ---

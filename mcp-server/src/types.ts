@@ -144,6 +144,7 @@ export interface FunctionDefinition {
   body_source?: string;
   is_exported: boolean;
   line_number: number;
+  end_line_number: number;
   intent?: string;
   calls?: FunctionCallRef[];
 }
