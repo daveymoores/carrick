@@ -6,6 +6,51 @@ How close is Carrick to framework-agnostic REST support across Express, Koa, Fas
 
 ---
 
+## 0. Hand-off orientation
+
+**If you're picking this up cold, start here.**
+
+**Current state.** This document is audit + plan only; no code changes have shipped from it. The published Carrick works on Express; everything else has the gaps catalogued below. The NestJS decorator gap is verified by a throwaway test (§2.3 notes the result); other gaps are code-inspection-level confidence unless explicitly marked "verified."
+
+**How to read this doc:**
+- **§1–§6** are the audit. Findings, gap list, reference material.
+- **§7** is the ship list. Tactical sequence for unblocking OSS teardown posts.
+- **§9** is direction of travel. Explains *why* the §7 steps look the way they do — read this before implementing §7, or you'll pick the wrong approach.
+- **§10** is CI / fixture infrastructure. Build alongside §7 Step 2 at the earliest.
+
+**If you're implementing, do §7 in order.** Step-level acceptance criteria:
+
+- **Step 1** (Koa `ctx.body` + Hapi `h.response` response detection) — done when the `koa-api` and `hapi-*` fixtures produce correct response types end-to-end. Implement as the **payload-expression schema change in §9 Move 1**, not by extending `['json', 'send', 'end', 'write']` at `type-inferrer.ts:469`. If you're reaching for the whitelist, you've picked the wrong fix.
+- **Step 2** (wire orphan fixtures into real tests) — done when a Rust test exercises the pipeline against `tests/fixtures/fastify-api/` and `tests/fixtures/koa-api/` and asserts endpoint counts and types. Settle §10.3 (CI shape) before writing the harness so Step 2 and §10 don't conflict.
+- **Step 3** (NestJS decorator support) — done when a NestJS controller fixture produces non-zero candidates and correct endpoints. **Ask the user before committing to an implementation direction**: §9 Move 2 proposes widening the scanner unconditionally; alternate approaches (decorator-specific visitor, config-driven AST emission) exist and have different cost/complexity trade-offs.
+- **Step 4** (GraphQL detection banner) — done when a repo using `graphql-request` / `@apollo/client` / similar triggers the §4.3 banner in the report. Orthogonal to the other steps.
+- **Step 5** — grab bag. Move 1 subsumes most of it; do last.
+
+**Verify before acting on these claims:**
+- §2.8 says `src/extractor.rs:163, 260, 301` hardcodes `"res"` / `"req"` and "may be dead code." Confirm whether that module is reachable in the live pipeline (`engine/mod.rs` or `multi_agent_orchestrator.rs`) before either deleting it or extending it. If dead, just delete.
+- §2.6 describes a `.tsx` import-resolution edge case. Low frequency — don't fix unless a real repo hits it.
+- §6 OSS repo recommendations were verified on 2026-04-17 against live `package.json` files. Re-check before targeting a teardown post; framework choices drift.
+
+**Check with the user before:**
+- Widening the SWC scanner's emission surface (§9 Move 2). This affects LLM cost per scan and isn't a pure bugfix.
+- Adding any framework-specific string or name list anywhere in Rust or TypeScript source. The plan's whole direction is to move these out of source, not add more.
+- Introducing infrastructure outside this repo (rules repo, external caches, community-contribution systems). Not MVP scope — see the conversation leading to §9.1.
+
+**Safe to act on without asking:**
+- Schema additions to `FileAnalyzerAgent` output (§9 Move 1, Move 3).
+- Passing `ImportSymbolExtractor` output into `FileAnalyzerAgent`'s per-file prompt (§9.3 Move 3) — pure prompt enrichment.
+- New fixtures under `tests/framework-fixtures/` per §10.
+- Edits to this document when findings change.
+
+**Load-bearing files to know:**
+- `src/swc_scanner.rs` — the candidate gate (§2.3)
+- `src/agents/file_analyzer_agent.rs` — the per-file LLM call; schema lives here
+- `src/agents/framework_guidance_agent.rs` — the per-scan framework rule generator
+- `src/sidecar/src/type-inferrer.ts` — response/request body type inference (§2.2)
+- `src/services/type_sidecar.rs` — Rust side of the sidecar; hardcoded type list at lines 797–815 (§2.1)
+
+---
+
 ## 1. Summary Table
 
 Ratings: **tested** = real test exercises the path · **code-present-untested** = the code would likely handle it but no test/fixture validates · **gap** = a concrete code/prompt change is required.
