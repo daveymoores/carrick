@@ -22,7 +22,7 @@ How close is Carrick to framework-agnostic REST support across Express, Koa, Fas
 
 - **Step 1** (Koa `ctx.body` + Hapi `h.response` response detection) — done when the `koa-api` and `hapi-*` fixtures produce correct response types end-to-end. Implement as the **payload-expression schema change in §9 Move 1**, not by extending `['json', 'send', 'end', 'write']` at `type-inferrer.ts:469`. If you're reaching for the whitelist, you've picked the wrong fix.
 - **Step 2** (wire orphan fixtures into real tests) — done when a Rust test exercises the pipeline against `tests/fixtures/fastify-api/` and `tests/fixtures/koa-api/` and asserts endpoint counts and types. Settle §10.3 (CI shape) before writing the harness so Step 2 and §10 don't conflict.
-- **Step 3** (NestJS decorator support) — done when a NestJS controller fixture produces non-zero candidates and correct endpoints. **Ask the user before committing to an implementation direction**: §9 Move 2 proposes widening the scanner unconditionally; alternate approaches (decorator-specific visitor, config-driven AST emission) exist and have different cost/complexity trade-offs.
+- **Step 3** (NestJS decorator support) — done when a NestJS controller fixture produces non-zero candidates and correct endpoints. **Implement as §9 Move 2: widen the SWC scanner to emit candidates for all call expressions and decorator calls, then let the LLM filter.** The cost trade-off (more LLM tokens per scan) is accepted for MVP; do not hesitate over it. Do not add framework-specific branches to the scanner.
 - **Step 4** (GraphQL detection banner) — done when a repo using `graphql-request` / `@apollo/client` / similar triggers the §4.3 banner in the report. Orthogonal to the other steps.
 - **Step 5** — grab bag. Move 1 subsumes most of it; do last.
 
@@ -31,16 +31,27 @@ How close is Carrick to framework-agnostic REST support across Express, Koa, Fas
 - §2.6 describes a `.tsx` import-resolution edge case. Low frequency — don't fix unless a real repo hits it.
 - §6 OSS repo recommendations were verified on 2026-04-17 against live `package.json` files. Re-check before targeting a teardown post; framework choices drift.
 
-**Check with the user before:**
-- Widening the SWC scanner's emission surface (§9 Move 2). This affects LLM cost per scan and isn't a pure bugfix.
-- Adding any framework-specific string or name list anywhere in Rust or TypeScript source. The plan's whole direction is to move these out of source, not add more.
-- Introducing infrastructure outside this repo (rules repo, external caches, community-contribution systems). Not MVP scope — see the conversation leading to §9.1.
+**Defaults already decided — do not re-litigate:**
+- **Widen the SWC scanner** (§9 Move 2) when NestJS support lands. The LLM-cost trade-off is accepted.
+- **Never add framework-specific strings or name lists** to Rust or TypeScript source. If a fix seems to require one, the fix is wrong; re-read §9.
+- **No external infrastructure** (rules repos, rule caches outside this repo, community-contribution systems). MVP scope is "ship from this repo only."
+- **Hand-off posture**: execute the plan. When the plan has an opinion, follow it without pausing. When you discover a claim in this doc is wrong, correct the doc in the same PR and continue.
 
-**Safe to act on without asking:**
+**Act without asking:**
 - Schema additions to `FileAnalyzerAgent` output (§9 Move 1, Move 3).
 - Passing `ImportSymbolExtractor` output into `FileAnalyzerAgent`'s per-file prompt (§9.3 Move 3) — pure prompt enrichment.
 - New fixtures under `tests/framework-fixtures/` per §10.
+- Deleting `src/extractor.rs` (or parts of it) if §2.8's "possibly dead code" turns out to be confirmed dead. Just do the verification first.
 - Edits to this document when findings change.
+- Any change that replaces a framework-specific heuristic in source with LLM-generated guidance or prompt enrichment.
+
+**Escalate (open a PR comment or draft PR and wait) only for:**
+- Destructive git operations on shared history (force-push to `main`, deleting branches, rewriting published commits).
+- Changes that require external credentials, accounts, or infrastructure provisioning.
+- Public API or CLI surface changes to Carrick (new flags, breaking output format changes, changes to `action.yml`).
+- A finding that invalidates the plan's core premise (e.g., the `FrameworkGuidanceAgent` pipeline doesn't actually work the way §9.1 describes).
+
+**If you discover a required decision the plan doesn't cover:** pick the most MVP-ish option, document the choice in this doc in a new subsection, and continue. Don't block.
 
 **Load-bearing files to know:**
 - `src/swc_scanner.rs` — the candidate gate (§2.3)
