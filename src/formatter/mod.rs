@@ -45,6 +45,8 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
         categorized_issues.configuration.len()
     ));
 
+    output.push_str(&format_graphql_banner(&result.detected_graphql_libraries));
+
     // Critical Issues Section
     if !categorized_issues.critical.is_empty() {
         output.push_str(&format_critical_section(&categorized_issues.critical));
@@ -83,9 +85,30 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
 fn format_no_issues(result: &ApiAnalysisResult) -> String {
     format!(
-        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n<!-- CARRICK_OUTPUT_END -->\n",
+        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n{}<!-- CARRICK_OUTPUT_END -->\n",
         result.endpoints.len(),
-        result.calls.len()
+        result.calls.len(),
+        format_graphql_banner(&result.detected_graphql_libraries),
+    )
+}
+
+/// Render a banner noting that GraphQL usage was detected but is out of scope
+/// for v1 (REST-only). See .thoughts/framework-coverage.md §4.3.
+fn format_graphql_banner(graphql_libraries: &[String]) -> String {
+    if graphql_libraries.is_empty() {
+        return String::new();
+    }
+    let mut libs: Vec<&String> = graphql_libraries.iter().collect();
+    libs.sort();
+    libs.dedup();
+    let lib_list = libs
+        .iter()
+        .map(|s| format!("`{}`", s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "> ℹ️ **GraphQL detected** ({}). Carrick v1 analyzes REST contracts only — GraphQL schema drift and resolver typing are not yet supported. REST endpoints in this repo were analyzed normally.\n\n",
+        lib_list,
     )
 }
 
@@ -704,6 +727,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            detected_graphql_libraries: vec![],
         };
 
         let output = format_analysis_results(result);
@@ -736,6 +760,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            detected_graphql_libraries: vec![],
         };
 
         let output = format_analysis_results(result);
@@ -746,6 +771,49 @@ mod tests {
         assert!(output.contains("UserResponse"));
         assert!(output.contains("User[]"));
         assert!(output.contains("Property 'role' is missing"));
+    }
+
+    #[test]
+    fn test_graphql_banner_renders_when_libraries_detected() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            detected_graphql_libraries: vec!["graphql-request".to_string(), "@apollo/client".to_string()],
+        };
+        let output = format_analysis_results(result);
+        assert!(output.contains("GraphQL detected"));
+        assert!(output.contains("graphql-request"));
+        assert!(output.contains("@apollo/client"));
+        assert!(output.contains("REST contracts only"));
+    }
+
+    #[test]
+    fn test_graphql_banner_absent_when_no_libraries() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            detected_graphql_libraries: vec![],
+        };
+        let output = format_analysis_results(result);
+        assert!(!output.contains("GraphQL detected"));
     }
 
     #[test]
@@ -763,6 +831,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            detected_graphql_libraries: vec![],
         };
 
         let output = format_analysis_results(result);

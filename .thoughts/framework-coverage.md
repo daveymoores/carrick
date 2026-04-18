@@ -10,16 +10,16 @@ How close is Carrick to framework-agnostic REST support across Express, Koa, Fas
 
 **If you're picking this up cold, start here.**
 
-**Current state.** §7 Step 1 (Move 1) has shipped in-branch:
-- The response-method whitelist `['json', 'send', 'end', 'write']` at `type-inferrer.ts:469,486` is gone.
-- `inferResponseBody` now resolves the node at the given locator and reads its type directly; if the resolved node is a CallExpression (legacy span-based callers) it falls through to `arguments[0]` without any method-name check. No framework-specific names live in the sidecar.
-- The LLM prompt (`file_analyzer_agent.rs`) and schema description (`schemas.rs`) now instruct the model to emit the **payload subexpression** (e.g., `users`) — not the surrounding call (`res.json(users)`) — across Express / Koa `ctx.body = x` / Hapi `h.response(x)` / Fastify-NestJS-Hono bare return / `c.json(x)`.
-- A Hapi fixture has been added at `tests/fixtures/hapi-api/`.
-- Sidecar unit tests in `src/sidecar/test/sidecar.test.ts` exercise the text-locator path for each idiom against `src/framework-handlers.ts`.
+**Current state.** §7 Steps 1–5 have shipped in-branch. The LLM-dependent end-to-end verification (running `carrick scan .` against each fixture with a real `CARRICK_API_KEY`) still hasn't been run in this sandbox — that's CI-harness work per §10.3, not cargo-test work.
 
-End-to-end acceptance (running the real LLM pipeline against `koa-api/` and `hapi-api/` fixtures) has not been executed in this sandbox — that's the remaining Step 1 verification. The published Carrick still reflects Express-only coverage until §7 Step 2 wires the fixtures into CI. Steps 2–5 are untouched.
+Shipped:
+- **Step 1 (Move 1)**: response-method whitelist removed from `type-inferrer.ts`; `inferResponseBody` resolves the LLM-emitted payload subexpression directly. Prompt + schema updated. Hapi fixture added. Sidecar unit tests cover Express / Koa / Hapi / bare-return idioms.
+- **Step 2**: `tests/framework_coverage_test.rs` exercises the SWC scanner against `koa-api/`, `fastify-api/`, `hapi-api/`, and `nestjs-api/` fixtures — asserts method/object/mount candidate shapes per framework. Full LLM-dependent end-to-end remains a CI harness concern (see §10).
+- **Step 3 (Move 2)**: `CandidateVisitor::visit_decorator` added to `src/swc_scanner.rs` and decorators enabled in both `swc_scanner.rs` and `src/parser.rs` TsSyntax. `@Controller` / `@Get` / `@Post` classes now produce candidates. `is_untyped_response_type` (`type_sidecar.rs`) widened for NestJS / Hapi / Hono types. `FileAnalyzerAgent` prompt teaches decorator semantics (enclosing class method = handler, class-level `@Controller('prefix')` = path prefix). NestJS fixture added at `tests/fixtures/nestjs-api/`.
+- **Step 4**: GraphQL banner threaded through `ApiAnalysisResult.detected_graphql_libraries` → `formatter::format_graphql_banner`. Populated from detected `data_fetchers` via `filter_graphql_libraries`. Banner says "REST contracts only" and lists the detected libs.
+- **Step 5**: `file_orchestrator::resolve_import_path` now tries `.ts` → `.tsx` → `.js` → `.jsx` → `./index.{ts,tsx,js,jsx}` in order. `framework_detector.rs` prompt examples include Hono + ky + @apollo/client + urql. Hono method list polish is subsumed by Move 1.
 
-The NestJS decorator gap is verified by a throwaway test (§2.3 notes the result); other gaps are code-inspection-level confidence unless explicitly marked "verified."
+The NestJS decorator gap — originally verified as "test-verified: zero candidates" in §2.3 — is now **verified-fixed**: `tests/framework_coverage_test.rs::nestjs_controller_fixture_emits_decorator_candidates` asserts non-zero candidates. Other gaps are code-inspection-level confidence unless explicitly marked "verified."
 
 **How to read this doc:**
 - **§1–§6** are the audit. Findings, gap list, reference material.
@@ -30,10 +30,10 @@ The NestJS decorator gap is verified by a throwaway test (§2.3 notes the result
 **If you're implementing, do §7 in order.** Step-level acceptance criteria:
 
 - **Step 1** (Koa `ctx.body` + Hapi `h.response` response detection) — ~~done when the `koa-api` and `hapi-*` fixtures produce correct response types end-to-end. Implement as the **payload-expression schema change in §9 Move 1**, not by extending `['json', 'send', 'end', 'write']` at `type-inferrer.ts:469`. If you're reaching for the whitelist, you've picked the wrong fix.~~ **SHIPPED (code).** Move 1 is in: whitelist removed, prompt/schema teach the LLM to emit the payload subexpression, Hapi fixture added. End-to-end verification against `koa-api/` and `hapi-api/` still pending — run it as part of Step 2 once fixtures are wired into CI.
-- **Step 2** (wire orphan fixtures into real tests) — done when a Rust test exercises the pipeline against `tests/fixtures/fastify-api/` and `tests/fixtures/koa-api/` and asserts endpoint counts and types. Settle §10.3 (CI shape) before writing the harness so Step 2 and §10 don't conflict.
-- **Step 3** (NestJS decorator support) — done when a NestJS controller fixture produces non-zero candidates and correct endpoints. **Implement as §9 Move 2: widen the SWC scanner to emit candidates for all call expressions and decorator calls, then let the LLM filter.** The cost trade-off (more LLM tokens per scan) is accepted for MVP; do not hesitate over it. Do not add framework-specific branches to the scanner.
-- **Step 4** (GraphQL detection banner) — done when a repo using `graphql-request` / `@apollo/client` / similar triggers the §4.3 banner in the report. Orthogonal to the other steps.
-- **Step 5** — grab bag. Move 1 subsumes most of it; do last.
+- **Step 2** (wire orphan fixtures into real tests) — ~~done when a Rust test exercises the pipeline against `tests/fixtures/fastify-api/` and `tests/fixtures/koa-api/` and asserts endpoint counts and types.~~ **SHIPPED (scanner layer).** `tests/framework_coverage_test.rs` covers the deterministic candidate shape for all four framework fixtures. The LLM-dependent "endpoint counts and types" acceptance still needs the §10 CI harness (published binary + `CARRICK_API_KEY`); tracking that as part of §10.
+- **Step 3** (NestJS decorator support) — ~~done when a NestJS controller fixture produces non-zero candidates and correct endpoints.~~ **SHIPPED.** `visit_decorator` added to `CandidateVisitor`; decorators enabled in `swc_scanner.rs` + `parser.rs`; `FileAnalyzerAgent` prompt teaches decorator semantics. Non-zero candidates verified by `nestjs_controller_fixture_emits_decorator_candidates`.
+- **Step 4** (GraphQL detection banner) — ~~done when a repo using `graphql-request` / `@apollo/client` / similar triggers the §4.3 banner in the report.~~ **SHIPPED.** `filter_graphql_libraries` extracts GraphQL libs from detected `data_fetchers`; formatter emits a banner listing them and stating "REST contracts only" for v1. Verified by `formatter::tests::test_graphql_banner_renders_when_libraries_detected`.
+- **Step 5** — ~~grab bag. Move 1 subsumes most of it; do last.~~ **SHIPPED.** Import resolution tries `.ts` / `.tsx` / `.js` / `.jsx` / `./index.*` in order; Hono added to framework_detector prompt examples; NestJS/Hapi/Hono types added to `is_untyped_response_type`.
 
 **Verify before acting on these claims:**
 - §2.8 says `src/extractor.rs:163, 260, 301` hardcodes `"res"` / `"req"` and "may be dead code." Confirm whether that module is reachable in the live pipeline (`engine/mod.rs` or `multi_agent_orchestrator.rs`) before either deleting it or extending it. If dead, just delete.
@@ -135,9 +135,9 @@ These lists are reasonable for call-expression-based frameworks. But the visitor
 1. `call.callee` is `Expr::Member(member)` (i.e., `obj.method(...)`), OR
 2. The callee is a bare `Ident` named literally `fetch` (`swc_scanner.rs:315-322`)
 
-**Critical gap — CONFIRMED by test**: NestJS decorator calls like `@Get('/users')` appear in the AST as `Decorator { expr: CallExpr { callee: Ident("Get"), args: [...] } }`. The visitor's `visit_call_expr` does fire on the inner `CallExpr`, but the callee is `Expr::Ident("Get")`, not `Expr::Member`. The member-call branch doesn't match, and the global-fetch branch only matches the literal `"fetch"`. **Result: zero candidates emitted → NestJS files are short-circuited out of the pipeline at `src/swc_scanner.rs:136 (should_analyze = false)`.**
+**Critical gap (HISTORICAL — now fixed)**: NestJS decorator calls like `@Get('/users')` appear in the AST as `Decorator { expr: CallExpr { callee: Ident("Get"), args: [...] } }`. The visitor's `visit_call_expr` does fire on the inner `CallExpr`, but the callee is `Expr::Ident("Get")`, not `Expr::Member`. Previously, the member-call branch didn't match and the global-fetch branch only matched `"fetch"`. Result: zero candidates → `should_analyze = false` → file skipped.
 
-Verified with a throwaway test (`SwcScanner::scan_content` on a classic `@Controller('users')` / `@Get() / @Get(':id') / @Post()` controller): `should_analyze = false`, `candidates.len() = 0`. Not speculation.
+**Status (Step 3 shipped)**: `visit_decorator` now fires on every `Decorator` node and emits a candidate for its inner call expression. `TsSyntax { decorators: true }` had to be added alongside — without that flag, SWC silently drops decorator syntax during parsing, so `visit_decorator` never fired even when implemented. Verified by `tests/framework_coverage_test.rs::nestjs_controller_fixture_emits_decorator_candidates` and the unit test `swc_scanner::tests::test_detects_decorator_calls_for_nestjs_style`.
 
 Also missed: Hapi's `server.route({...})` DOES emit a candidate (both `server` and `route` are in the lists), but the first-arg snippet is an `ObjectLit`, not a string — the LLM must extract method/path from inside the object.
 
@@ -407,26 +407,44 @@ Implemented as §9 Move 1 (payload-expression schema change), per the hand-off g
 
 **Unlocks**: Koa teardown (Strapi). Hapi teardown (synthetic fixture).
 
-### Step 2 — Wire the orphan fixtures into real tests
-**Effort**: ~1 day. `tests/fixtures/fastify-api/server.ts` and `tests/fixtures/koa-api/server.ts` exist but no Rust test references them. Add a `tests/framework_coverage_test.rs` that scans each fixture end-to-end and asserts the expected endpoint count, paths, and that response types resolve (or resolve to `unknown` in the framework-type case).
+### Step 2 — Wire the orphan fixtures into real tests — **SHIPPED (scanner layer)**
 
-**Unlocks**: Fastify and Koa are no longer "code-present-untested". Creates regression guardrails before OSS teardowns go public.
+`tests/framework_coverage_test.rs` exercises the SWC candidate scanner against four fixtures:
+- `tests/fixtures/koa-api/server.ts` — asserts `.get` / `.post` endpoint candidates + `.use` mount + global `fetch`
+- `tests/fixtures/fastify-api/server.ts` — asserts `.get` / `.post` / `.register` candidates
+- `tests/fixtures/hapi-api/server.ts` — asserts ≥3 `.route(...)` candidates + `.register` mount + global `fetch`
+- `tests/fixtures/nestjs-api/users.controller.ts` — asserts decorator candidates (`@Controller`, `@Get`, `@Post`)
 
-### Step 3 — NestJS decorator support
-**Effort**: ~1 week. Add `visit_decorator` to `CandidateVisitor` in `src/swc_scanner.rs` that emits candidates for decorator calls matching `Get|Post|Put|Patch|Delete|Options|Head|All`. Teach the `FileAnalyzerAgent` prompt that decorator patterns mean "the enclosing class method is the handler" and "the enclosing `@Controller('prefix')` provides the path prefix". Add NestJS-specific types to `is_untyped_response_type`.
+**Remaining**: LLM-dependent "endpoint counts AND types" requires the §10 CI harness (published binary + response caching). Until then, the deterministic scanner assertions are the regression net.
+
+**Unlocks**: Fastify / Koa / Hapi / NestJS are no longer scanner-untested. Creates regression guardrails before OSS teardowns go public.
+
+### Step 3 — NestJS decorator support — **SHIPPED (Move 2)**
+
+Implemented as §9 Move 2 per the hand-off guidance: the scanner was widened generically, no framework-specific name list added.
+- `src/swc_scanner.rs` — `CandidateVisitor::visit_decorator` emits a candidate for any decorator call expression. `TsSyntax { decorators: true }` added so SWC actually parses decorator nodes (previously silently dropped).
+- `src/parser.rs` — same TsSyntax flag so the main parse path matches the scanner's.
+- `src/agents/file_analyzer_agent.rs` — §4 special-case added to the prompt explaining decorator semantics: handler = enclosing class method, owner = enclosing class, path = `@Controller('prefix')` + decorator arg.
+- `src/services/type_sidecar.rs` — `is_untyped_response_type` widened for NestJS (`ExecutionContext`, `ArgumentsHost`, `CallHandler`, `HttpException`) plus Hapi and Hono types while we were in there.
+- `tests/fixtures/nestjs-api/` — new controller fixture.
+- `tests/framework_coverage_test.rs::nestjs_controller_fixture_emits_decorator_candidates` — verifies non-zero decorator candidates.
 
 **Unlocks**: Twenty teardown. Novu teardown. Without this, ~30% of the serious Node backend OSS surface is invisible to Carrick.
 
-### Step 4 — GraphQL "detected but out-of-scope" banner
-**Effort**: ~2 days. Detect GraphQL libs in `framework_detector.rs` output, add a banner to the report formatter (`src/formatter/`). List the candidate sites without type analysis. Wire to the growth playbook's GraphQL-is-next pitch.
+### Step 4 — GraphQL "detected but out-of-scope" banner — **SHIPPED**
+
+- `src/analyzer/mod.rs` — `filter_graphql_libraries` extracts GraphQL libs from the LLM-detected `data_fetchers` list (matches `graphql`, `graphql-request`, `graphql-tag`, `relay-runtime`, `@apollo/*`, `@urql/*`, `urql`). New `ApiAnalysisResult.detected_graphql_libraries` field carries the result through to the formatter.
+- `src/formatter/mod.rs` — `format_graphql_banner` emits a "REST contracts only" banner above the body of both the issues report and the "no issues" report.
+- Per-call-site listing (§4.3's grep-for-GraphQL-operation suggestion) is **not** implemented for MVP — the banner + library names are sufficient to signal scope and seed the "GraphQL coming" pitch.
 
 **Unlocks**: Clean story for PayloadCMS / Strapi / Twenty teardowns (all mix REST + GraphQL).
 
-### Step 5 — Lower-priority polish
-- Hono: add `'text'`, `'html'`, `'body'` to the response-method whitelist.
-- Import resolution (`file_orchestrator.rs:983-988`): try `.ts` → `.tsx` → `./index.ts` → `./index.tsx` in order.
-- Widen NestJS/Hapi/Hono types in `is_untyped_response_type`.
-- Add Hono to the `framework_detector.rs` example list at line 194.
+### Step 5 — Lower-priority polish — **SHIPPED**
+
+- ~~Hono: add `'text'`, `'html'`, `'body'` to the response-method whitelist.~~ Subsumed by Move 1 — no whitelist exists to extend.
+- `file_orchestrator::resolve_import_path` (formerly `:983-988`, now the earlier `resolve_import_path` fn) tries `.ts` → `.tsx` → `.js` → `.jsx` → `./index.{ts,tsx,js,jsx}` in order, falling back to `.ts` only when nothing on disk matches.
+- NestJS / Hapi / Hono types added to `is_untyped_response_type` (done as part of Step 3, since it's the same patch).
+- `framework_detector.rs` prompt examples now include Hono (routing), plus ky / `@apollo/client` / urql (data fetchers).
 
 > **Framing**: Steps 1–3 are the first moves toward the target architecture in §9 (rules-driven pipeline). Step 1 eliminates one heuristic outright. Steps 2–3 move two more heuristics out of Rust source and into LLM-generated rule data. Keep that direction of travel in mind — every fix in this workstream should either delete framework-specific code or replace it with consumption of LLM-generated rules, never add new hardcoded names.
 

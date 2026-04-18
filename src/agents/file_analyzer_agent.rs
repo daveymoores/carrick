@@ -450,6 +450,13 @@ When a variable is used in a mount and that variable was imported, include the i
 * **Re-exports:** Track the original source, not intermediate re-exports.
 * **Dynamic imports:** Record import_source as the string literal if available, otherwise null.
 * **response.json()/.text():** Treat these as data_calls only when they are part of an actual downstream HTTP consumer. Use the provided call-chain context (upstream call, path/method literal, enclosing function) to decide; avoid framework/client-specific heuristics.
+* **Decorator-based routing (class methods):** Some candidates are decorator calls on class methods (e.g., an `@Get(':id')` above `findOne(...)`). Use the Import Table to decide if the decorator identifier is a routing decorator from a known framework (e.g., `@nestjs/common`). When it is:
+  * The **handler_name** is the name of the enclosing class method (the method the decorator is attached to), NOT the decorator itself.
+  * The **owner_node** is the enclosing class name (e.g., `UsersController`).
+  * The **path** comes from two places: (a) the decorator's own argument, if any (`@Get(':id')` → `:id`, `@Post()` → empty), and (b) the class-level decorator if present (e.g., `@Controller('users')` above the class → prefix `users`). Concatenate the two with a single `/` (no double slashes, no trailing slash), then ensure the result starts with `/`.
+  * The **method** comes from the decorator identifier (`Get` → GET, `Post` → POST, etc.).
+  * Do NOT emit a candidate for the `@Controller(...)` decorator itself — it only contributes a prefix.
+  * Only classify decorators as endpoints when the Import Table resolves their identifier to a routing framework module. If the decorator comes from elsewhere, ignore it.
 
 ### 5. TYPE LOCATION EXTRACTION (CRITICAL FOR TYPE CHECKING)
 For endpoints and data calls, emit **expression text + line number** to tell the compiler where to infer types.

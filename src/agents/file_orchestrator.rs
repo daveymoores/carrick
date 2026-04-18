@@ -977,24 +977,53 @@ impl FileOrchestrator {
 
         // Join with the import source and normalize
         let resolved = current_dir.join(import_source);
-
-        // Add .ts extension if not present
         let resolved_str = resolved.to_string_lossy().to_string();
-        let with_extension = if !resolved_str.ends_with(".ts")
-            && !resolved_str.ends_with(".tsx")
-            && !resolved_str.ends_with(".js")
-            && !resolved_str.ends_with(".jsx")
-        {
-            format!("{}.ts", resolved_str)
-        } else {
-            resolved_str
-        };
 
-        // Canonicalize to resolve .. and . components
-        Path::new(&with_extension)
+        // If the import already has a source extension, don't guess.
+        let already_has_ext = resolved_str.ends_with(".ts")
+            || resolved_str.ends_with(".tsx")
+            || resolved_str.ends_with(".js")
+            || resolved_str.ends_with(".jsx");
+
+        if already_has_ext {
+            return Path::new(&resolved_str)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or(resolved_str);
+        }
+
+        // Try candidate extensions/index-files in order and return the first
+        // one that exists. This handles `.tsx` route handlers in Next.js-shaped
+        // monorepos and `import './routes'` pointing at `./routes/index.ts`.
+        // See .thoughts/framework-coverage.md §2.6 / §5.2.
+        let candidates = [
+            format!("{}.ts", resolved_str),
+            format!("{}.tsx", resolved_str),
+            format!("{}.js", resolved_str),
+            format!("{}.jsx", resolved_str),
+            format!("{}/index.ts", resolved_str),
+            format!("{}/index.tsx", resolved_str),
+            format!("{}/index.js", resolved_str),
+            format!("{}/index.jsx", resolved_str),
+        ];
+
+        for candidate in &candidates {
+            if Path::new(candidate).exists() {
+                return Path::new(candidate)
+                    .canonicalize()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| candidate.clone());
+            }
+        }
+
+        // Nothing on disk matched — fall back to the original `.ts` default so
+        // downstream code still has a plausible path (mount linking will just
+        // silently drop the edge, as before).
+        let fallback = format!("{}.ts", resolved_str);
+        Path::new(&fallback)
             .canonicalize()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or(with_extension)
+            .unwrap_or(fallback)
     }
 
     fn dts_defines_alias(content: &str, alias: &str) -> bool {

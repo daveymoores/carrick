@@ -89,6 +89,33 @@ pub struct ApiAnalysisResult {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub issues: ApiIssues,
+    /// GraphQL libraries detected across all scanned repos (subset of
+    /// `detected_data_fetchers`). Populated so the formatter can show a
+    /// "REST-only for v1" banner; Carrick doesn't analyze GraphQL schemas.
+    pub detected_graphql_libraries: Vec<String>,
+}
+
+/// Return the subset of `data_fetchers` that are GraphQL libraries.
+/// Comparison is case-insensitive to handle package-name casing variations.
+pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
+    // Known GraphQL client/server libraries per framework-coverage.md §4.3.
+    // Match against the lowercased package name — substring or equality.
+    data_fetchers
+        .iter()
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower == "graphql"
+                || lower == "graphql-request"
+                || lower == "graphql-tag"
+                || lower == "relay-runtime"
+                || lower.starts_with("@apollo/")
+                || lower.starts_with("@urql/")
+                || lower == "urql"
+                || lower == "apollo-client"
+                || lower == "apollo-server"
+        })
+        .cloned()
+        .collect()
 }
 
 pub struct Analyzer {
@@ -1140,6 +1167,8 @@ impl Analyzer {
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 
+        let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
+
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
             calls: self.calls.clone(),
@@ -1151,6 +1180,7 @@ impl Analyzer {
                 type_mismatches,
                 dependency_conflicts,
             },
+            detected_graphql_libraries,
         }
     }
 
@@ -1408,6 +1438,39 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_filter_graphql_libraries() {
+        let data_fetchers = vec![
+            "axios".to_string(),
+            "graphql-request".to_string(),
+            "@apollo/client".to_string(),
+            "urql".to_string(),
+            "got".to_string(),
+            "node-fetch".to_string(),
+            "@urql/core".to_string(),
+            "relay-runtime".to_string(),
+        ];
+        let mut found = filter_graphql_libraries(&data_fetchers);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "@apollo/client".to_string(),
+                "@urql/core".to_string(),
+                "graphql-request".to_string(),
+                "relay-runtime".to_string(),
+                "urql".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_graphql_libraries_empty_when_rest_only() {
+        let data_fetchers = vec!["axios".to_string(), "fetch".to_string(), "got".to_string()];
+        let found = filter_graphql_libraries(&data_fetchers);
+        assert!(found.is_empty());
+    }
 
     #[test]
     fn test_sanitize_route_colon_params() {
