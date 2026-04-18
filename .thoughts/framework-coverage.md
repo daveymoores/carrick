@@ -10,7 +10,16 @@ How close is Carrick to framework-agnostic REST support across Express, Koa, Fas
 
 **If you're picking this up cold, start here.**
 
-**Current state.** This document is audit + plan only; no code changes have shipped from it. The published Carrick works on Express; everything else has the gaps catalogued below. The NestJS decorator gap is verified by a throwaway test (§2.3 notes the result); other gaps are code-inspection-level confidence unless explicitly marked "verified."
+**Current state.** §7 Step 1 (Move 1) has shipped in-branch:
+- The response-method whitelist `['json', 'send', 'end', 'write']` at `type-inferrer.ts:469,486` is gone.
+- `inferResponseBody` now resolves the node at the given locator and reads its type directly; if the resolved node is a CallExpression (legacy span-based callers) it falls through to `arguments[0]` without any method-name check. No framework-specific names live in the sidecar.
+- The LLM prompt (`file_analyzer_agent.rs`) and schema description (`schemas.rs`) now instruct the model to emit the **payload subexpression** (e.g., `users`) — not the surrounding call (`res.json(users)`) — across Express / Koa `ctx.body = x` / Hapi `h.response(x)` / Fastify-NestJS-Hono bare return / `c.json(x)`.
+- A Hapi fixture has been added at `tests/fixtures/hapi-api/`.
+- Sidecar unit tests in `src/sidecar/test/sidecar.test.ts` exercise the text-locator path for each idiom against `src/framework-handlers.ts`.
+
+End-to-end acceptance (running the real LLM pipeline against `koa-api/` and `hapi-api/` fixtures) has not been executed in this sandbox — that's the remaining Step 1 verification. The published Carrick still reflects Express-only coverage until §7 Step 2 wires the fixtures into CI. Steps 2–5 are untouched.
+
+The NestJS decorator gap is verified by a throwaway test (§2.3 notes the result); other gaps are code-inspection-level confidence unless explicitly marked "verified."
 
 **How to read this doc:**
 - **§1–§6** are the audit. Findings, gap list, reference material.
@@ -20,7 +29,7 @@ How close is Carrick to framework-agnostic REST support across Express, Koa, Fas
 
 **If you're implementing, do §7 in order.** Step-level acceptance criteria:
 
-- **Step 1** (Koa `ctx.body` + Hapi `h.response` response detection) — done when the `koa-api` and `hapi-*` fixtures produce correct response types end-to-end. Implement as the **payload-expression schema change in §9 Move 1**, not by extending `['json', 'send', 'end', 'write']` at `type-inferrer.ts:469`. If you're reaching for the whitelist, you've picked the wrong fix.
+- **Step 1** (Koa `ctx.body` + Hapi `h.response` response detection) — ~~done when the `koa-api` and `hapi-*` fixtures produce correct response types end-to-end. Implement as the **payload-expression schema change in §9 Move 1**, not by extending `['json', 'send', 'end', 'write']` at `type-inferrer.ts:469`. If you're reaching for the whitelist, you've picked the wrong fix.~~ **SHIPPED (code).** Move 1 is in: whitelist removed, prompt/schema teach the LLM to emit the payload subexpression, Hapi fixture added. End-to-end verification against `koa-api/` and `hapi-api/` still pending — run it as part of Step 2 once fixtures are wired into CI.
 - **Step 2** (wire orphan fixtures into real tests) — done when a Rust test exercises the pipeline against `tests/fixtures/fastify-api/` and `tests/fixtures/koa-api/` and asserts endpoint counts and types. Settle §10.3 (CI shape) before writing the harness so Step 2 and §10 don't conflict.
 - **Step 3** (NestJS decorator support) — done when a NestJS controller fixture produces non-zero candidates and correct endpoints. **Implement as §9 Move 2: widen the SWC scanner to emit candidates for all call expressions and decorator calls, then let the LLM filter.** The cost trade-off (more LLM tokens per scan) is accepted for MVP; do not hesitate over it. Do not add framework-specific branches to the scanner.
 - **Step 4** (GraphQL detection banner) — done when a repo using `graphql-request` / `@apollo/client` / similar triggers the §4.3 banner in the report. Orthogonal to the other steps.
@@ -100,18 +109,21 @@ matches!(base,
 ```
 **Missing**: Hono (`Hono`, `Context` is already there but ambiguous), Hapi (`ResponseToolkit`, `ResponseObject`, `Request`), NestJS (`ExecutionContext`, framework-side `Response`). When a handler's return-type resolves to one of these, the inferrer should treat it as "no real payload type" and emit `unknown`; otherwise the raw framework type leaks into the bundled `.d.ts`.
 
-### 2.2 `src/sidecar/src/type-inferrer.ts:469, 486` — response-body method whitelist
+### 2.2 ~~`src/sidecar/src/type-inferrer.ts:469, 486` — response-body method whitelist~~ **REMOVED (Move 1)**
 
-```ts
-if (['json', 'send', 'end', 'write'].includes(methodName)) {
-```
-Hardcoded method names for "this is a response emission". Covers:
-- Express: `res.json(x)` ✓, `res.send(x)` ✓, `res.end(x)` ✓
-- Fastify: `reply.send(x)` ✓ (but Fastify idiomatic is `return x` — falls through to `inferFunctionReturn`)
-- Hono: `c.json(x)` ✓ (but `c.text(x)`, `c.html(x)`, `c.body(x)` are **missing**)
-- Koa: **broken** — `ctx.body = x` is an *assignment expression*, not a method call; the whole `resolveResponsePayloadNode` path at `type-inferrer.ts:445-498` only looks for `CallExpression` children
-- Hapi: **broken** — `h.response(x)` uses method name `response`, which isn't in the list; bare `return x` works via `inferFunctionReturn` fallback
-- NestJS: mostly `return x` — works via fallback; but `@Res() res.status(200).json(x)` (Express-underneath escape hatch) uses `.json()` so it works
+The whitelist `['json', 'send', 'end', 'write']` has been deleted along with the `resolveResponsePayloadNode` helper. `inferResponseBody` now:
+1. Resolves the target node from the provided locator (span or payload-expression text).
+2. Treats that node as the payload — reads its type directly.
+3. If the resolved node happens to be a `CallExpression` (legacy span-based callers that point at the whole `res.json(users)` call), falls through to `arguments[0]` with no method-name check.
+4. If nothing resolves, falls back to `inferFunctionReturn` on the containing function — covers payload-less handlers (redirects, 204s).
+
+For this to produce correct types, the LLM must emit the **payload subexpression** as `response_expression_text`, not the whole call. The prompt in `file_analyzer_agent.rs` and the schema description in `schemas.rs` have been updated accordingly. Historical per-framework notes:
+- Express `res.json(x)` → LLM emits `x`.
+- Fastify `reply.send(x)` / idiomatic bare `return x` → LLM emits `x`.
+- Hono `c.json/c.text/c.html/c.body(x)` → LLM emits `x` (all four work uniformly; no method list needed).
+- Koa `ctx.body = x` → LLM emits `x` (the RHS); the assignment shape is irrelevant to the sidecar.
+- Hapi `h.response(x)` / bare `return x` → LLM emits `x`.
+- NestJS `return x` / `@Res() res.status(...).json(x)` → LLM emits `x`.
 
 ### 2.3 `src/swc_scanner.rs:220-312` — AST candidate gatekeeper
 
@@ -382,8 +394,16 @@ Carrick's REST surface analyzes cleanly; GraphQL gets flagged. These are fine te
 
 Close gaps in this order. Each step unblocks a specific growth-playbook dependency.
 
-### Step 1 — Koa `ctx.body` + Hapi `h.response` response detection
-**Effort**: ~1–2 days. Add `'response'` to the response-body method whitelist in `src/sidecar/src/type-inferrer.ts:469, 486`. Add an `AssignmentExpression` branch to `resolveResponsePayloadNode` that detects `ctx.body = x` / `this.body = x`. Update the `FileAnalyzerAgent` system prompt at `src/agents/file_analyzer_agent.rs:458-460` to explicitly mention `ctx.body = ...` and `h.response(...)` as response-emission patterns.
+### Step 1 — Koa `ctx.body` + Hapi `h.response` response detection — **SHIPPED (code)**
+
+Implemented as §9 Move 1 (payload-expression schema change), per the hand-off guidance. Concretely:
+- `src/sidecar/src/type-inferrer.ts` — removed `resolveResponsePayloadNode` + the `['json','send','end','write']` whitelist; `inferResponseBody` now takes the resolved node's type directly, with a `CallExpression → arguments[0]` fallback for legacy span callers and `inferFunctionReturn` for payload-less handlers.
+- `src/agents/file_analyzer_agent.rs` — system prompt §5.A and user-message instructions rewritten to tell the LLM to emit the payload subexpression (e.g., `users`), covering `res.json(x)` / `ctx.body = x` / `h.response(x)` / bare `return x` / `reply.send(x)` / `c.json(x)`.
+- `src/agents/schemas.rs` — `response_expression_text` description rewritten to match.
+- `tests/fixtures/hapi-api/` — new Hapi fixture mirroring the Koa/Fastify shape.
+- `src/sidecar/test/sidecar.test.ts` — new text-locator tests per framework idiom against `src/framework-handlers.ts`.
+
+**Remaining for Step 1**: end-to-end verification against `koa-api/` and `hapi-api/` fixtures through the real LLM — fold into Step 2's fixture harness.
 
 **Unlocks**: Koa teardown (Strapi). Hapi teardown (synthetic fixture).
 

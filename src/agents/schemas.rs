@@ -308,12 +308,12 @@ impl AgentSchemas {
                             "response_expression_text": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "Verbatim code text of the response emission expression (e.g., 'res.json(users)'), copied EXACTLY as it appears in the source code"
+                                "description": "Verbatim code text of the response PAYLOAD SUBEXPRESSION — the value whose type is the response body. Emit the inner value, not the surrounding call: e.g. 'users' from 'res.json(users)', 'ctx.body = users', 'h.response(users)', 'return users', 'reply.send(users)', or 'c.json(users)'. Null for payload-less handlers (redirects, 204s)."
                             },
                             "response_expression_line": {
                                 "type": "INTEGER",
                                 "nullable": true,
-                                "description": "Line number where the response expression starts (read from the line-number prefix in the source code)"
+                                "description": "Line number where the payload subexpression starts (read from the line-number prefix in the source code)"
                             },
                             "primary_type_symbol": {
                                 "type": "STRING",

@@ -52,9 +52,13 @@ pub struct EndpointResult {
     pub payload_expression_text: Option<String>,
     /// Line number where the payload expression starts (from Gemini)
     pub payload_expression_line: Option<i32>,
-    /// Verbatim code text of the response emission expression (from Gemini)
+    /// Verbatim code text of the response payload subexpression (from Gemini).
+    /// This is the value whose type we want — e.g., `users` in `res.json(users)`,
+    /// `ctx.body = users`, `h.response(users)`, `return users`, `reply.send(users)`,
+    /// `c.json(users)`. Framework-agnostic; set to null for payload-less handlers
+    /// (redirects, 204s, streaming).
     pub response_expression_text: Option<String>,
-    /// Line number where the response expression starts (from Gemini)
+    /// Line number where the payload expression starts (from Gemini)
     pub response_expression_line: Option<i32>,
     /// The primary type symbol name without wrappers (e.g., "User" from "Response<User[]>")
     pub primary_type_symbol: Option<String>,
@@ -451,12 +455,23 @@ When a variable is used in a mount and that variable was imported, include the i
 For endpoints and data calls, emit **expression text + line number** to tell the compiler where to infer types.
 The source code is displayed with line-number prefixes (e.g., "  42| res.json(users)"). Read the number directly.
 
-#### A. Response Body Expressions (MANDATORY for endpoints)
-Identify the expression that sends/returns the response body (res.json(...), reply.send(...), return ...).
-* You MUST emit `response_expression_text` and `response_expression_line` for EVERY endpoint that sends a response.
-* Emit `response_expression_text` as the verbatim code text (e.g., `res.json(users)`)
-* Emit `response_expression_line` as the line number where this expression starts
-* CRITICAL: Copy the expression EXACTLY as it appears in the source code. Do not paraphrase or modify it.
+#### A. Response Payload Subexpression (MANDATORY for endpoints with a payload)
+Identify the **payload subexpression** — the single value whose type is the response body. Emit that subexpression directly, NOT the surrounding call or assignment.
+
+Patterns and what to emit (the framework idiom is irrelevant; always emit the inner value):
+* `res.json(users)` / `res.send(users)` / `reply.send(users)` → emit `users`
+* `ctx.body = users` (Koa assignment) → emit `users`
+* `h.response(users)` (Hapi) → emit `users`
+* `return users` (Fastify/NestJS/Hono/bare return) → emit `users`
+* `c.json(users)` / `c.text(s)` / `c.html(s)` / `c.body(b)` (Hono) → emit the inner value
+* `return new Response(JSON.stringify(data))` → emit `data`
+* Chained forms like `res.status(200).json(users)` → emit `users`
+
+Rules:
+* You MUST emit `response_expression_text` and `response_expression_line` for every endpoint that returns a payload.
+* Copy the subexpression EXACTLY as it appears in the source — verbatim identifier, object literal, template literal, etc.
+* For object literals, template literals, or composed expressions, emit the whole literal (e.g., `{ status: 'ok' }`, `` `hello ${name}` ``).
+* If the handler is payload-less (redirect, 204, `res.end()` with no args, streaming only, `ctx.body = null`), emit `null` for both text and line. Do NOT invent a payload.
 * If unsure about the exact expression, emit your best match — an approximate match is far better than null.
 
 #### B. Request Payload Expressions (MANDATORY when present)
@@ -603,8 +618,8 @@ For each endpoint, include: candidate_id, line_number, owner_node, method, path,
 response_expression_text, response_expression_line, payload_expression_text, payload_expression_line,
 primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
-  - MUST emit response_expression_text: copy the EXACT expression text that sends the response (e.g., "res.json(users)")
-  - MUST emit response_expression_line: read the line number from the prefix in the source code
+  - MUST emit response_expression_text: copy the EXACT payload subexpression (e.g., "users" from res.json(users), ctx.body = users, h.response(users), or return users). Emit null for payload-less handlers.
+  - MUST emit response_expression_line: read the line number from the prefix in the source code (line where the payload subexpression appears)
   - For payload_expression_text: copy the EXACT expression for the request payload (e.g., "req.body")
   - For payload_expression_line: read the line number from the prefix
 
