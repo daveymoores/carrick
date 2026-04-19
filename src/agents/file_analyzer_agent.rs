@@ -16,6 +16,7 @@
 use crate::{
     agent_service::AgentService,
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
+    visitor::{ImportedSymbol, SymbolKind},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -172,7 +173,7 @@ impl FileAnalyzerAgent {
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
         candidate_contexts: &[String],
-        import_map: &HashMap<String, String>,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -186,7 +187,7 @@ impl FileAnalyzerAgent {
             guidance,
             candidate_hints,
             candidate_contexts,
-            import_map,
+            imported_symbols,
         );
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
@@ -529,7 +530,7 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
         candidate_contexts: &[String],
-        import_map: &HashMap<String, String>,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
@@ -554,22 +555,7 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
             )
         };
 
-        // Deterministic import map formatting
-        let mut imports: Vec<_> = import_map.iter().collect();
-        imports.sort_by(|a, b| a.0.cmp(b.0));
-        let imports_section = if imports.is_empty() {
-            "No imports detected by AST; treat all symbols as local unless resolved in code."
-                .to_string()
-        } else {
-            let lines: Vec<String> = imports
-                .iter()
-                .map(|(local, source)| format!(r#"  - "{}" -> "{}""#, local, source))
-                .collect();
-            format!(
-                "Resolved import table (AST-derived):\n{}\nUse this table for symbol grounding; do NOT invent sources.",
-                lines.join("\n")
-            )
-        };
+        let imports_section = Self::format_import_table(imported_symbols);
 
         // Add line-number prefixes to file content so Gemini can read line numbers directly
         let mut numbered_content =
@@ -672,6 +658,74 @@ Return ONLY the JSON object, no explanations."#,
             })
             .collect::<Vec<_>>()
             .join(",\n")
+    }
+
+    /// Format the AST-derived imports grouped by source module with kind
+    /// annotations. This is Move 3 (§9.3) in framework-coverage.md: richer
+    /// per-file grounding so the LLM reads symbols against real imports
+    /// rather than a pattern list.
+    ///
+    /// Format:
+    /// ```text
+    /// Imports resolved from the AST (grouped by source):
+    ///   - From '@nestjs/common': Get, Post, Controller [named]
+    ///   - From 'koa': Koa [default]
+    ///   - From 'express': express [namespace]
+    ///   - From './user.service': UserService [named]
+    /// ```
+    fn format_import_table(imported_symbols: &HashMap<String, ImportedSymbol>) -> String {
+        if imported_symbols.is_empty() {
+            return "No imports detected by AST; treat all symbols as local unless resolved in code.".to_string();
+        }
+
+        // Group by (source, kind). Named imports can batch per source;
+        // default/namespace are one-per-source in practice but we handle it
+        // uniformly for deterministic output.
+        use std::collections::BTreeMap;
+        let mut groups: BTreeMap<(String, &'static str), Vec<(String, String)>> = BTreeMap::new();
+        for symbol in imported_symbols.values() {
+            let kind_label = match symbol.kind {
+                SymbolKind::Named => "named",
+                SymbolKind::Default => "default",
+                SymbolKind::Namespace => "namespace",
+            };
+            groups
+                .entry((symbol.source.clone(), kind_label))
+                .or_default()
+                .push((symbol.local_name.clone(), symbol.imported_name.clone()));
+        }
+
+        // Stable per-group ordering by local name.
+        for entries in groups.values_mut() {
+            entries.sort();
+        }
+
+        let lines: Vec<String> = groups
+            .iter()
+            .map(|((source, kind_label), entries)| {
+                let pretty: Vec<String> = entries
+                    .iter()
+                    .map(|(local, imported)| {
+                        if local == imported {
+                            local.clone()
+                        } else {
+                            // `import { Foo as Bar }` → Bar (as Foo)
+                            format!("{local} (as {imported})")
+                        }
+                    })
+                    .collect();
+                format!(
+                    "  - From '{source}': {names} [{kind_label}]",
+                    names = pretty.join(", "),
+                )
+            })
+            .collect();
+
+        format!(
+            "Imports resolved from the AST (grouped by source):\n{}\n\n\
+             Use this table to interpret candidates. An identifier used in this file that appears above is the imported symbol from that module; an identifier NOT listed is either local to this file or globally available. Do NOT invent sources.",
+            lines.join("\n"),
+        )
     }
 }
 
@@ -1014,6 +1068,33 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
         assert!(message.contains("express"));
     }
 
+    fn named(local: &str, source: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            local_name: local.to_string(),
+            imported_name: local.to_string(),
+            source: source.to_string(),
+            kind: SymbolKind::Named,
+        }
+    }
+
+    fn default_import(local: &str, source: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            local_name: local.to_string(),
+            imported_name: local.to_string(),
+            source: source.to_string(),
+            kind: SymbolKind::Default,
+        }
+    }
+
+    fn namespace_import(local: &str, source: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            local_name: local.to_string(),
+            imported_name: local.to_string(),
+            source: source.to_string(),
+            kind: SymbolKind::Namespace,
+        }
+    }
+
     #[test]
     fn test_build_user_message_includes_import_table_and_candidates() {
         let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
@@ -1026,9 +1107,9 @@ const data = await fetch('/api/users').then(resp => resp.json());
         let candidates = vec!["- Line 3: fetch(...) - `fetch('/api/users')`".to_string()];
         let candidate_contexts: Vec<String> =
             vec![r#"{"line":3,"callee":"fetch","path":"/api/users","fn":"getData"}"#.to_string()];
-        let mut import_map = HashMap::new();
-        import_map.insert("User".to_string(), "./types".to_string());
-        import_map.insert("useUsers".to_string(), "../hooks".to_string());
+        let mut imported = HashMap::new();
+        imported.insert("User".to_string(), named("User", "./types"));
+        imported.insert("useUsers".to_string(), named("useUsers", "../hooks"));
 
         let message = agent.build_user_message_with_candidates(
             "test.ts",
@@ -1036,15 +1117,73 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &guidance,
             &candidates,
             &candidate_contexts,
-            &import_map,
+            &imported,
         );
 
         assert!(message.contains("IMPORT TABLE"));
-        assert!(message.contains(r#""User" -> "./types""#));
+        // Grouped-by-source format: "From './types': User [named]".
+        assert!(
+            message.contains("From './types': User [named]"),
+            "expected grouped import line, got: {message}"
+        );
         assert!(message.contains("CANDIDATE TARGETS"));
         assert!(message.contains("Line 3"));
         assert!(message.contains("CANDIDATE CONTEXT"));
         assert!(message.contains("/api/users"));
+    }
+
+    #[test]
+    fn test_format_import_table_groups_by_source_and_kind() {
+        // Named imports from the same module batch together (NestJS style).
+        let mut imports = HashMap::new();
+        imports.insert("Get".to_string(), named("Get", "@nestjs/common"));
+        imports.insert("Post".to_string(), named("Post", "@nestjs/common"));
+        imports.insert("Controller".to_string(), named("Controller", "@nestjs/common"));
+        imports.insert("Koa".to_string(), default_import("Koa", "koa"));
+        imports.insert("express".to_string(), namespace_import("express", "express"));
+
+        let out = FileAnalyzerAgent::format_import_table(&imports);
+        // @nestjs/common should list all three named imports on one line, sorted.
+        assert!(
+            out.contains("From '@nestjs/common': Controller, Get, Post [named]"),
+            "named imports should group & sort: {out}"
+        );
+        // Default & namespace annotated explicitly.
+        assert!(
+            out.contains("From 'koa': Koa [default]"),
+            "default import annotation: {out}"
+        );
+        assert!(
+            out.contains("From 'express': express [namespace]"),
+            "namespace import annotation: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_import_table_aliased_named_import() {
+        // `import { Foo as Bar } from 'mod'` — show both.
+        let mut imports = HashMap::new();
+        imports.insert(
+            "Bar".to_string(),
+            ImportedSymbol {
+                local_name: "Bar".to_string(),
+                imported_name: "Foo".to_string(),
+                source: "mod".to_string(),
+                kind: SymbolKind::Named,
+            },
+        );
+        let out = FileAnalyzerAgent::format_import_table(&imports);
+        assert!(
+            out.contains("From 'mod': Bar (as Foo) [named]"),
+            "aliased import should show `local (as imported)`: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_import_table_empty() {
+        let imports = HashMap::new();
+        let out = FileAnalyzerAgent::format_import_table(&imports);
+        assert!(out.contains("No imports detected"));
     }
 
     #[test]

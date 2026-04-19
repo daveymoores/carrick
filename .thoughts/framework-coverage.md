@@ -18,6 +18,7 @@ Shipped:
 - **Step 3 (Move 2)**: `CandidateVisitor::visit_decorator` added to `src/swc_scanner.rs` and decorators enabled in both `swc_scanner.rs` and `src/parser.rs` TsSyntax. `@Controller` / `@Get` / `@Post` classes now produce candidates. `is_untyped_response_type` (`type_sidecar.rs`) widened for NestJS / Hapi / Hono types. `FileAnalyzerAgent` prompt teaches decorator semantics (enclosing class method = handler, class-level `@Controller('prefix')` = path prefix). NestJS fixture added at `tests/fixtures/nestjs-api/`.
 - **Step 4**: GraphQL banner threaded through `ApiAnalysisResult.detected_graphql_libraries` → `formatter::format_graphql_banner`. Populated from detected `data_fetchers` via `filter_graphql_libraries`. Banner says "REST contracts only" and lists the detected libs.
 - **Step 5**: `file_orchestrator::resolve_import_path` now tries `.ts` → `.tsx` → `.js` → `.jsx` → `./index.{ts,tsx,js,jsx}` in order. `framework_detector.rs` prompt examples include Hono + ky + @apollo/client + urql. Hono method list polish is subsumed by Move 1.
+- **Move 3** (§9.3 direction-of-travel): the full `ImportedSymbol` record (local name, imported name, `kind: Named | Default | Namespace`, source) now reaches the `FileAnalyzerAgent` prompt, grouped by source with kind annotations. Replaces the lossy `local → source` flat map. Grounds the LLM against real imports rather than pattern lists. Covered by three new unit tests.
 
 The NestJS decorator gap — originally verified as "test-verified: zero candidates" in §2.3 — is now **verified-fixed**: `tests/framework_coverage_test.rs::nestjs_controller_fixture_emits_decorator_candidates` asserts non-zero candidates. Other gaps are code-inspection-level confidence unless explicitly marked "verified."
 
@@ -502,17 +503,21 @@ Edge case to handle: payload-less endpoints (redirects, 204s, streaming). LLM em
 
 The cost is more LLM tokens per scan. That's the right trade at MVP scale — LLM cost scales predictably, maintenance burden doesn't.
 
-**Move 3 — use imports that already exist.** `ImportSymbolExtractor` (`visitor.rs:185-235`) tracks local-name → source mapping for every import. This data doesn't currently reach `FileAnalyzerAgent`'s per-file prompt. Pipe it in as structured context:
+**Move 3 — use imports that already exist — SHIPPED.** `ImportSymbolExtractor` (`visitor.rs:185-235`) tracks local-name → source mapping for every import. The flat `local → source` map already reached the prompt as a bare "IMPORT TABLE" section, but the richer `ImportedSymbol` info (`imported_name` and `kind: Named | Default | Namespace`) was discarded. Shipped as of `feat(framework-coverage): ship Move 3`:
+- `FileAnalyzerAgent::analyze_file_with_candidates` now takes `&HashMap<String, ImportedSymbol>` (full record), not the flattened string map.
+- `format_import_table` groups by source with kind annotations so colocated imports colocate in the prompt:
 
 ```
-This file imports:
-  - Get, Post, Body, Controller from '@nestjs/common'
-  - UserService from './user.service'
+Imports resolved from the AST (grouped by source):
+  - From '@nestjs/common': Controller, Get, Post [named]
+  - From 'koa': Koa [default]
+  - From 'express': express [namespace]
+  - From './user.service': UserService [named]
 ```
 
-The LLM now has explicit grounding per file — it knows `@Get()` in this file means the NestJS decorator, not a local function called `Get`. It knows which candidates to treat as framework-native. No rule-keying scheme, no per-file selection algorithm — just richer prompt context from data the AST already produced.
+The LLM now sees that `@Get()` and `@Post()` share an origin (same module, same kind line) and can resolve them as peers. Namespace imports (`import * as express from 'express'`) are annotated so `express.Router()` lookups become unambiguous. `SymbolTable::import_map()` was deleted — no more lossy flattening. Covered by three new unit tests in `file_analyzer_agent::tests::test_format_import_table_*`.
 
-This is the single highest-leverage change: it grounds the LLM against the actual repo, not against a pattern list.
+This is the single highest-leverage change: it grounds the LLM against the actual repo, not against a pattern list. The pre-Move-3 decorator prose in the prompt can now gradually migrate to pure import-grounded heuristics, since the LLM can tell from the import table which decorators are routing decorators vs user-defined.
 
 ### 9.4 Wrapper types — a later move, same shape
 

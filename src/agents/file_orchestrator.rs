@@ -87,16 +87,6 @@ struct SymbolTable {
     imported_symbols: HashMap<String, ImportedSymbol>,
 }
 
-impl SymbolTable {
-    fn import_map(&self) -> HashMap<String, String> {
-        let mut import_map = HashMap::new();
-        for (local_name, symbol) in &self.imported_symbols {
-            import_map.insert(local_name.clone(), symbol.source.clone());
-        }
-        import_map
-    }
-}
-
 /// Orchestrates file-centric analysis using the FileAnalyzerAgent.
 ///
 /// This orchestrator implements the AST-Gated architecture:
@@ -206,9 +196,9 @@ impl FileOrchestrator {
                 .collect();
 
             let symbol_table = Self::extract_symbol_table(file_path, &cm, &handler);
-            let import_map = symbol_table.import_map();
 
-            // STEP 4: Call Gemini with Full File + Patterns + Candidate Targets
+            // STEP 4: Call Gemini with Full File + Patterns + Candidate Targets +
+            // richer AST-derived import table (Move 3, §9.3 of framework-coverage.md).
             match self
                 .file_analyzer
                 .analyze_file_with_candidates(
@@ -217,7 +207,7 @@ impl FileOrchestrator {
                     guidance,
                     &candidate_hints,
                     &candidate_contexts,
-                    &import_map,
+                    &symbol_table.imported_symbols,
                 )
                 .await
             {
