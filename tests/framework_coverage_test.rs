@@ -57,8 +57,14 @@ fn koa_api_fixture_produces_expected_candidates() {
     let methods = methods(&result.candidates);
     // Three endpoint methods on the router plus one on the prefixed apiRouter.
     assert!(methods.contains(&"get".to_string()), "expected router.get");
-    assert!(methods.contains(&"post".to_string()), "expected router.post");
-    assert!(methods.contains(&"use".to_string()), "expected app.use mount");
+    assert!(
+        methods.contains(&"post".to_string()),
+        "expected router.post"
+    );
+    assert!(
+        methods.contains(&"use".to_string()),
+        "expected app.use mount"
+    );
 
     let has_fetch = result
         .candidates

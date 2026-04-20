@@ -449,6 +449,17 @@ Implemented as §9 Move 2 per the hand-off guidance: the scanner was widened gen
 
 > **Framing**: Steps 1–3 are the first moves toward the target architecture in §9 (rules-driven pipeline). Step 1 eliminates one heuristic outright. Steps 2–3 move two more heuristics out of Rust source and into LLM-generated rule data. Keep that direction of travel in mind — every fix in this workstream should either delete framework-specific code or replace it with consumption of LLM-generated rules, never add new hardcoded names.
 
+### Step 6 — End-to-end fixture fixes from the 2026-04-20 run — **IN FLIGHT**
+
+After the first end-to-end fixture runs (Koa / Fastify / Hapi / NestJS against real AWS + real LLM), three concrete gaps surfaced. Details and acceptance criteria live in `.thoughts/framework-coverage-followup.md`. Current state:
+
+- **Fix 3 Layer A (`ts_check/` path discovery)** — **SHIPPED**. `discover_ts_check_path` in `src/main.rs` mirrors `discover_sidecar_path`; `Analyzer.ts_check_dir` threads the resolved path through; all four hardcoded `"ts_check/..."` strings replaced. `carrick <abs-path>` run from an arbitrary cwd now finds the type-checker script. Non-discovery emits an actionable warning instead of a silent skip.
+- **Fix 1 (Koa mount-prefix non-determinism)** — **prompt edit SHIPPED, LLM-verification pending**. `file_analyzer_agent.rs` §1.C "Mount Path Attribution" teaches constructor-carried vs mount-site prefix attribution. Framework-neutral wording.
+- **Fix 2 (Hapi plugin-mount prefix)** — **prompt edits SHIPPED, LLM-verification pending**. `framework_guidance_agent.rs` elicits nested-prefix shapes and requires `description` to name the dotted object-path of the prefix; `file_analyzer_agent.rs` §1.C reads the prefix from that path. No Hapi-specific source.
+- **Fix 3 Layer B (npm packaging)** — not started; multi-week work; requires human sign-off per hand-off guardrails.
+
+LLM-dependent acceptance (10 deterministic koa runs; hapi `/api/v1/status` appearing; no regression on fastify/nestjs) needs real AWS + LLM fixture runs — those have not been executed yet.
+
 ---
 
 ## 8. Honest Summary for the Growth Playbook Dependency

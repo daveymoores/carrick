@@ -430,6 +430,27 @@ Your extraction must be useful for a graph builder. You must resolve variable na
 * **Imports:** If a router/controller is mounted (e.g., `parent.mount('/', child)`), and `child` is imported from `'./auth'`, you MUST record `'./auth'` as the `import_source`. This is the ONLY way we link files.
 * **Inline:** If a variable is defined in this file (e.g., `const api = createRouter()`), track that it is local (import_source = null).
 * **Chaining:** If a pattern is chained (e.g., `createApp().plugin(...)`), the `parent_node` is the root object.
+* **Plugin-closure owner attribution (CRITICAL).** When an endpoint is defined inside the body of a function that is itself passed as a mount child OR assigned as a property on a plugin-like object that becomes a mount child, the endpoint's `owner_node` MUST be the plugin/child identifier from the enclosing mount, NOT the enclosing function's parameter name. The function's parameter is a scoped instance that, despite possibly sharing a name with the outer app/server (e.g., `register: async (server) => { server.route(...) }`), logically belongs to the plugin/child for graph-walking purposes.
+  * Concretely: if you emit a mount `{ parent_node: "app", child_node: "myPlugin", mount_path: "/api" }`, then any endpoint that the LLM finds inside `myPlugin`'s register/setup function body must have `owner_node: "myPlugin"`. Otherwise the mount graph walker cannot apply the prefix and the endpoint's full path silently loses its prefix.
+  * This applies whether the plugin is an object literal with a `register` method, a function passed directly to a registration call, or any equivalent shape. Read the Import Table and the mount you emit: pick owner identifiers so `endpoint.owner_node` matches some mount's `child_node`.
+
+#### C. Mount Path Attribution (CRITICAL — prevents double prefixing AND lost prefixes)
+Downstream, the graph builder computes each endpoint's full URL as `mount_prefix + endpoint.path` by walking the mount chain. A path prefix is a piece of the URL that applies to a whole sub-router. It must land in EXACTLY ONE place — either the endpoint's own `path`, or the mount's `mount_path`. If it lands in both, the full URL is doubled. If it lands in neither, the full URL is missing it.
+
+Before emitting endpoints/mounts for a sub-router/sub-app, locate every prefix that contributes to its endpoints' runtime URLs. A prefix can appear in two places:
+
+1. **Constructor-carried** — the child is built with the prefix baked in (e.g., `new Router({ prefix: '/api/v1' })`, `.basePath('/api')`, or any equivalent construction-time option).
+2. **Mount-site** — the prefix is supplied at the mount call itself (e.g., `app.use('/api', child)`, `app.register(child, { prefix: '/api' })`, or any nested options shape such as `register({ plugin, routes: { prefix: '/api' } })` — see "Read the pattern description" below).
+
+For each case, emit exactly this encoding:
+
+* **Constructor-carried prefix case.** The endpoint's `path` MUST include the constructor-carried prefix concatenated with its own literal suffix. Example: given `new Router({ prefix: '/api/v1' })` and `apiRouter.get('/status', handler)`, emit endpoint `path: "/api/v1/status"` (NOT `"/status"`). Then, when you emit the mount for this child, set `mount_path: ""` (empty string) — the prefix is already inside the endpoint path, and emitting it again on the mount would produce `/api/v1/api/v1/status`.
+* **Mount-site prefix case.** The endpoint's `path` is the literal suffix from the child's `.get(...)` / `.post(...)` / decorator call, with NO prefix. The mount's `mount_path` carries the prefix.
+* **Both cases at once.** If the child has BOTH a constructor-carried prefix AND the mount call adds another one (rare but possible), bake the constructor-carried portion into the endpoint path AND emit the mount-site portion as `mount_path`. The two must not overlap.
+
+**Read the pattern description to locate the prefix in an options object.** Each `mount_pattern` from framework guidance carries a `description` field that names where the prefix lives. When a mount candidate matches a pattern whose description names an object-path (e.g., `"Prefix is at options.prefix (2nd argument)"` or `"Prefix is at options.routes.prefix (2nd argument)"`), read the prefix from that exact dotted path inside the call's argument object literal. Do NOT fall back to a top-level key if the description specifies a nested path — nested-prefix shapes are otherwise silently dropped. If the description says the prefix is constructor-carried, use the constructor-carried encoding above (prefix into endpoint path, `mount_path: ""`).
+
+**Principle:** Read the child's construction site (same file or Import Table) AND the `mount_pattern` description before emitting. Pick the encoding and stick to it. The test is whether `mount_prefix + endpoint.path` equals the runtime URL of the endpoint exactly once.
 
 ### 2. OUTPUT REQUIREMENTS (Flat Schema)
 * Do not nest details. Every finding must be a top-level item in its respective list.
@@ -1138,9 +1159,15 @@ const data = await fetch('/api/users').then(resp => resp.json());
         let mut imports = HashMap::new();
         imports.insert("Get".to_string(), named("Get", "@nestjs/common"));
         imports.insert("Post".to_string(), named("Post", "@nestjs/common"));
-        imports.insert("Controller".to_string(), named("Controller", "@nestjs/common"));
+        imports.insert(
+            "Controller".to_string(),
+            named("Controller", "@nestjs/common"),
+        );
         imports.insert("Koa".to_string(), default_import("Koa", "koa"));
-        imports.insert("express".to_string(), namespace_import("express", "express"));
+        imports.insert(
+            "express".to_string(),
+            namespace_import("express", "express"),
+        );
 
         let out = FileAnalyzerAgent::format_import_table(&imports);
         // @nestjs/common should list all three named imports on one line, sorted.

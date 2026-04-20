@@ -787,7 +787,10 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
-            detected_graphql_libraries: vec!["graphql-request".to_string(), "@apollo/client".to_string()],
+            detected_graphql_libraries: vec![
+                "graphql-request".to_string(),
+                "@apollo/client".to_string(),
+            ],
         };
         let output = format_analysis_results(result);
         assert!(output.contains("GraphQL detected"));

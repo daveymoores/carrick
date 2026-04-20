@@ -155,7 +155,21 @@ impl FrameworkGuidanceAgent {
     ) -> Result<Vec<PatternExample>, Box<dyn std::error::Error>> {
         let category_prompt = match category {
             "mount" => {
-                "MOUNT PATTERNS: How does this framework mount sub-routers or sub-applications? Provide specific syntax."
+                "MOUNT PATTERNS: How does this framework mount sub-routers, sub-applications, or plugins?
+
+Cover every realistic mount shape for each detected framework, including:
+  (a) Top-level path-string mounts (e.g., `parent.use('/api', child)`).
+  (b) Option-object mounts where the path prefix is a top-level key (e.g., `register(child, { prefix: '/api' })`).
+  (c) Option-object mounts where the path prefix is NESTED inside the option object under a non-top-level key (e.g., a `routes: { prefix: '/api' }` shape, or any other wrapper the framework's register/mount function expects). Do NOT skip these — they are the most commonly missed shape.
+  (d) Constructor-carried prefixes, where the child itself is built with a prefix and the mount site adds none (e.g., constructing a sub-router with a prefix option, then mounting it with no additional path).
+
+For EACH pattern you return, the `description` field MUST tell a downstream analyzer exactly how to read the prefix from the call's arguments. Use this shape:
+  - If the prefix is a top-level string argument: `\"Prefix is the 1st string argument.\"`
+  - If the prefix is a top-level key in an options object: `\"Prefix is at options.prefix (2nd argument).\"`
+  - If the prefix is nested inside an options object: name the exact dotted path, e.g. `\"Prefix is at options.routes.prefix (2nd argument).\"`
+  - If the prefix is constructor-carried and the mount site contributes no prefix: `\"Prefix is carried by the child constructor; mount site contributes no prefix.\"`
+
+The downstream file analyzer reads this description verbatim to locate the prefix in the AST. Vague descriptions like \"mounts a plugin with options\" will cause prefix extraction to fail."
             }
             "endpoint" => {
                 "ENDPOINT PATTERNS: How are HTTP endpoints defined? Provide specific syntax for routes/handlers."
@@ -169,9 +183,11 @@ impl FrameworkGuidanceAgent {
             _ => "Provide relevant code patterns.",
         };
 
+        let example_count = if category == "mount" { "3-5" } else { "2-3" };
+
         let prompt = format!(
-            "{}\n\nTASK:\nProvide 2-3 concise examples for: {}\n\nReturn JSON with three parallel arrays: patterns (code), descriptions (what each does), frameworks (which framework).",
-            context, category_prompt
+            "{}\n\nTASK:\nProvide {} concise examples for: {}\n\nReturn JSON with three parallel arrays: patterns (code), descriptions (what each does — for mounts, see the required description format above), frameworks (which framework).",
+            context, example_count, category_prompt
         );
 
         let schema = AgentSchemas::pattern_list_schema();
