@@ -430,9 +430,8 @@ Your extraction must be useful for a graph builder. You must resolve variable na
 * **Imports:** If a router/controller is mounted (e.g., `parent.mount('/', child)`), and `child` is imported from `'./auth'`, you MUST record `'./auth'` as the `import_source`. This is the ONLY way we link files.
 * **Inline:** If a variable is defined in this file (e.g., `const api = createRouter()`), track that it is local (import_source = null).
 * **Chaining:** If a pattern is chained (e.g., `createApp().plugin(...)`), the `parent_node` is the root object.
-* **Plugin-closure owner attribution (CRITICAL).** When an endpoint is defined inside the body of a function that is itself passed as a mount child OR assigned as a property on a plugin-like object that becomes a mount child, the endpoint's `owner_node` MUST be the plugin/child identifier from the enclosing mount, NOT the enclosing function's parameter name. The function's parameter is a scoped instance that, despite possibly sharing a name with the outer app/server (e.g., `register: async (server) => { server.route(...) }`), logically belongs to the plugin/child for graph-walking purposes.
-  * Concretely: if you emit a mount `{ parent_node: "app", child_node: "myPlugin", mount_path: "/api" }`, then any endpoint that the LLM finds inside `myPlugin`'s register/setup function body must have `owner_node: "myPlugin"`. Otherwise the mount graph walker cannot apply the prefix and the endpoint's full path silently loses its prefix.
-  * This applies whether the plugin is an object literal with a `register` method, a function passed directly to a registration call, or any equivalent shape. Read the Import Table and the mount you emit: pick owner identifiers so `endpoint.owner_node` matches some mount's `child_node`.
+* **Owner–child consistency when a mount actually exists.** The mount graph walker applies a mount's prefix to an endpoint only when the endpoint's `owner_node` matches some mount's `child_node`. WHEN you emit a mount — meaning the source code contains an explicit mount call (e.g., `app.use(child)`, `server.register(plugin)`, `parent.route('/', child)`, or equivalent for the detected framework) — the endpoints introduced by that mount must have `owner_node` equal to the mount's `child_node`, not the name of a callback parameter or the inner framework instance. Framework-specific closure shapes (which parameter names shadow outer identifiers, which plugin shapes carry routes) are described in FRAMEWORK-SPECIFIC PARSING NOTES below.
+* **Do NOT invent mounts.** Some frameworks (notably decorator-based ones) contribute a prefix without any explicit mount call — e.g., NestJS `@Controller('users')` on a class. In those cases, do not emit a mount at all; apply §4's decorator encoding (concatenate the class-decorator prefix into each endpoint's `path`). Emitting a synthetic mount alongside the decorator-prefixed endpoint path will produce doubled URLs.
 
 #### C. Mount Path Attribution (CRITICAL — prevents double prefixing AND lost prefixes)
 Downstream, the graph builder computes each endpoint's full URL as `mount_prefix + endpoint.path` by walking the mount chain. A path prefix is a piece of the URL that applies to a whole sub-router. It must land in EXACTLY ONE place — either the endpoint's own `path`, or the mount's `mount_path`. If it lands in both, the full URL is doubled. If it lands in neither, the full URL is missing it.
@@ -615,6 +614,10 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
 ### FRAMEWORK-SPECIFIC HINTS
 {}
 
+### FRAMEWORK-SPECIFIC PARSING NOTES
+These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
+{}
+
 ### FILE CONTENT (Path: {})
 Lines are prefixed with line numbers. Use these numbers for *_expression_line fields.
 ```
@@ -654,6 +657,7 @@ Return ONLY the JSON object, no explanations."#,
             candidate_contexts_section,
             imports_section,
             guidance.triage_hints,
+            guidance.parsing_notes,
             file_path,
             numbered_content
         )

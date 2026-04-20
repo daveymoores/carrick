@@ -20,7 +20,7 @@ Same fixture, same binary, two different outputs for Koa — classic LLM non-det
 
 ## Fix 1 — Koa mount-prefix non-determinism
 
-**Status (2026-04-20):** ~~prompt edit shipped~~. `src/agents/file_analyzer_agent.rs` §1.C "Mount Path Attribution" adds framework-neutral rules teaching the LLM to attribute a prefix to exactly one of {child constructor, mount site} based on where the prefix literal actually appears. Acceptance criterion ("10 consecutive scans of koa-api all produce `/api/v1/status`") is LLM-dependent and has **not yet been run** — needs real AWS + LLM fixture runs once the human confirms scope.
+**Status (2026-04-20):** ~~prompt edit shipped and verified~~. `src/agents/file_analyzer_agent.rs` §1.C "Mount Path Attribution" adds framework-neutral rules teaching the LLM to attribute a prefix to exactly one of {child constructor, mount site}. Verified on real AWS + LLM: 15/15 koa-api runs deterministically produce `/api/v1/status` (no doubling, no dropping). Post-ship refactor: §1.C wording unchanged after a brief simplification experiment regressed to 9/10 — reverted to the original prescriptive wording.
 
 ### Problem
 `tests/fixtures/koa-api/server.ts` constructs a sub-router with a constructor-level prefix:
@@ -57,11 +57,12 @@ Even with the prompt fix, LLM non-determinism is a category that won't disappear
 
 ## Fix 2 — Hapi plugin-mount prefix extraction
 
-**Status (2026-04-20):** ~~prompt edits shipped~~ in both agents.
+**Status (2026-04-20):** ~~prompt edits shipped and end-to-end verified~~ in both agents.
 - `src/agents/framework_guidance_agent.rs`: the MOUNT PATTERNS prompt now explicitly enumerates the four mount shapes (top-level path-string, top-level option-object key, nested option-object key, constructor-carried) and requires the `description` field to carry an extraction rule naming the dotted object-path where the prefix lives (e.g., `"Prefix is at options.routes.prefix (2nd argument)."`). Example count raised to 3–5 for mounts.
 - `src/agents/file_analyzer_agent.rs` §1.C: the consumer-side rule now instructs the LLM to read the prefix from the dotted object-path given in the matching `mount_pattern.description`, rather than falling back to a top-level key.
+- **Post-ship refactor (same day):** the initial fix added a plugin-closure owner-attribution rule inline in the file-analyzer system prompt. After the human flagged this as "framework-specific knowledge leaking into source," the rule was refactored out: `framework_guidance_agent.rs::fetch_general_guidance` now demands per-framework parsing notes covering owner attribution in closures, prefix location, decorator routing, and chaining quirks; `parsing_notes` is threaded into the file analyzer's user message as FRAMEWORK-SPECIFIC PARSING NOTES; the static §1.B rule is now a framework-neutral guard ("owner–child consistency when a mount actually exists; do not invent mounts"). End-to-end verified: 10/10 koa + 3/3 hapi + fastify + nestjs fixtures all produce correct paths.
 
-No Hapi-specific strings landed in source. Acceptance criterion ("hapi-api fixture produces `/api/v1/status`") is LLM-dependent and **not yet verified** — needs a real AWS + LLM run.
+No Hapi-specific strings in source. LLM-dependent acceptance is **verified**.
 
 ### Problem
 ```ts
