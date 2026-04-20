@@ -185,6 +185,49 @@ Recommended shape:
 
 ---
 
+## Fix 4 — Sidecar payload-less handler fallback (from Copilot PR 67 review, 2026-04-20)
+
+### Problem
+
+`src/sidecar/src/type-inferrer.ts::inferResponseBody` is designed to fall back to `inferFunctionReturn` when the LLM emits `null` for `response_expression_text` (payload-less handlers: redirects, 204s, streaming). Two real gaps Copilot flagged:
+
+1. **"No locator at all" case is unhandled.** `inferFunctionReturn` locates the containing function via `span_start/span_end` or `expression_text`. If the caller truly provides only `file_path` + `line_number`, neither resolution path fires and the fallback returns null silently. Fix: add a line-number-spanning function lookup (find the smallest `FunctionLike` whose span covers `request.line_number`), OR require the orchestrator to always emit an anchor (e.g., the `return`-statement line) even when the return value is null.
+
+2. **Function-identifier locator is not unwrapped.** When the LLM emits the enclosing function's identifier (e.g., `bareReturnHandler`) as the locator, the sidecar resolves it and emits `typeof bareReturnHandler` rather than the function's *return* type. Fix: detect when the resolved node is a `FunctionLike` / function-typed identifier and unwrap to `.getReturnType()` before returning.
+
+### Status
+
+- Copilot test no-op bug (`|| response` tautology in `sidecar.test.ts`) — **fixed**. Assertion now requires `inferred_types` non-empty, `infer_kind === 'response_body'`, `type_string` non-empty.
+- Underlying behaviour gaps (1) and (2) — **not fixed**. The current four fixtures all have payloads, so neither path is exercised in the fixture harness. Will surface when (a) a 204/redirect fixture is added, or (b) a real repo with payload-less handlers is scanned.
+
+### Acceptance (when addressed)
+
+- A new sidecar test sends a request with only `file_path` + `line_number` (no spans, no expression) pointing inside a function body; `inferred_types` is non-empty.
+- A new sidecar test sends a function-identifier locator and asserts the inferred type is the function's return type, not `typeof fn`.
+- No regression on the four existing payload tests.
+
+### Scope guardrail
+
+Fix in the sidecar. Don't push this into the Rust pipeline or LLM prompts — it's a TypeScript AST concern, not a framework-coverage concern.
+
+---
+
+## Fix 5 — GitHub Action Node.js setup (from Copilot PR 67 review, 2026-04-20)
+
+### Problem
+
+The sidecar's `engines.node` was bumped to `>=22` in commit `18029f2`. CI workflows (`ci.yml`, `release.yml`) were updated to install Node 22, but `action.yml` — the composite Action consumed by external repos — was never updated to set up Node itself; it relied on the runner's ambient Node. Downstream users whose runners default to Node 20 would see `npm ci` engine-mismatch warnings (or failures under `engine-strict=true`).
+
+### Status
+
+**Fixed.** `action.yml` now starts with an `actions/setup-node@v4` step pinned to `node-version: "22"`.
+
+### Scope guardrail
+
+If the sidecar's engine requirement changes again, keep `action.yml` and `ci.yml` / `release.yml` in sync.
+
+---
+
 ## Sequencing suggestion
 
 1. **Fix 3 Layer A** — smallest, fixes a real silent-failure in every non-CI run.

@@ -539,20 +539,26 @@ describe('Type Sidecar Integration Tests', () => {
       }
     });
 
-    it('should fall back to function return when no payload locator resolves (redirect / 204)', async () => {
-      // When the LLM emits null for response_expression_text (payload-less handler),
-      // the orchestrator passes no locator; the sidecar should fall back to
-      // inferFunctionReturn rather than erroring.
+    it('should return a response_body inference when the locator resolves to a function identifier', async () => {
+      // Canary for the "payload-less handler" path. The LLM sometimes emits a
+      // function identifier (e.g., `bareReturnHandler`) as the locator; the
+      // sidecar must resolve it and emit a non-empty response_body inference
+      // rather than crashing or silently dropping the request.
+      //
+      // Known limitations (tracked separately from Copilot's 2026-04-20 review):
+      //   - The sidecar currently returns `typeof bareReturnHandler` rather than
+      //     unwrapping to the function's return type. That's a follow-up.
+      //   - The "no locator at all" case (only file_path + line_number) is NOT
+      //     exercised here; `inferFunctionReturn` needs an anchor to find the
+      //     containing function.
       const response = await client.send<{
-        inferred_types?: Array<unknown>;
+        inferred_types?: Array<{ type_string: string; infer_kind: string }>;
       }>({
         action: 'infer',
         request_id: 'infer-payload-fallback',
         requests: [
           {
             file_path: path.join(FIXTURES_PATH, 'src/framework-handlers.ts'),
-            // Anchor the request to a line inside bareReturnHandler so the
-            // function-lookup fallback has a starting point.
             line_number: 42,
             expression_text: 'bareReturnHandler',
             expression_line: 42,
@@ -561,12 +567,15 @@ describe('Type Sidecar Integration Tests', () => {
         ],
       });
 
-      // The key invariant: the pipeline handles a missing payload gracefully.
-      // We don't assert on the exact type string — inferFunctionReturn will
-      // return Promise<User> here; for a real redirect/204 it'd be void.
       assert.ok(
-        (response.inferred_types && response.inferred_types.length > 0) || response,
-        'should not crash on missing payload locator'
+        response.inferred_types && response.inferred_types.length > 0,
+        `expected inferred_types to be non-empty, got ${JSON.stringify(response)}`
+      );
+      const inferred = response.inferred_types![0];
+      assert.strictEqual(inferred.infer_kind, 'response_body');
+      assert.ok(
+        inferred.type_string && inferred.type_string.length > 0,
+        `expected non-empty type_string, got ${JSON.stringify(inferred)}`
       );
     });
 
