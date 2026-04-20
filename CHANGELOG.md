@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/daveymoores/carrick/compare/carrick-v0.1.9...carrick-v0.1.10) (2026-04-20)
+
+
+### Bug Fixes
+
+* **deps:** clear security audit findings ([#68](https://github.com/daveymoores/carrick/issues/68)) ([37a3d24](https://github.com/daveymoores/carrick/commit/37a3d24b89f9a6fe4e50f2a014a18d812f5928cb))
+
 ## [0.1.9](https://github.com/daveymoores/carrick/compare/carrick-v0.1.8...carrick-v0.1.9) (2026-04-20)
 
 
