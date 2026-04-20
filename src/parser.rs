@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, errors::Handler, sync::Lrc};
 use swc_ecma_ast::Module;
-use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
+use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_visit::VisitMutWith;
 use tracing::warn;
@@ -13,10 +13,26 @@ pub fn parse_file(
     source_map: &Lrc<SourceMap>,
     handler: &Handler,
 ) -> Option<Module> {
-    // Determine syntax based on file extension
+    // Determine syntax based on file extension. Enable decorators so NestJS
+    // `@Controller` / `@Get()` parse into Decorator AST nodes rather than
+    // being treated as a syntax error and silently dropped.
     let (syntax, is_typescript) = if let Some(ext) = file_path.extension() {
         match ext.to_string_lossy().as_ref() {
-            "ts" | "tsx" => (Syntax::Typescript(Default::default()), true),
+            "ts" => (
+                Syntax::Typescript(TsSyntax {
+                    decorators: true,
+                    ..Default::default()
+                }),
+                true,
+            ),
+            "tsx" => (
+                Syntax::Typescript(TsSyntax {
+                    tsx: true,
+                    decorators: true,
+                    ..Default::default()
+                }),
+                true,
+            ),
             _ => (Syntax::Es(Default::default()), false),
         }
     } else {

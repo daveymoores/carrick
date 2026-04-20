@@ -191,8 +191,8 @@ Input:
 2. List of import statements found in source files.
 
 Task:
-- Identify all frameworks/libraries used for HTTP routing, e.g., express, koa, fastify, hapi, nestjs.
-- Identify all libraries used for data fetching or HTTP clients, e.g., axios, node-fetch, got, superagent, graphql-request.
+- Identify all frameworks/libraries used for HTTP routing, e.g., express, koa, fastify, hapi, nestjs, hono.
+- Identify all libraries used for data fetching or HTTP clients, e.g., axios, node-fetch, got, superagent, ky, graphql-request, @apollo/client, urql.
 - Return a JSON object with:
 
 {{

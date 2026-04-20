@@ -190,16 +190,69 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let ts_check_dir = discover_ts_check_path();
+    if ts_check_dir.is_none() {
+        warn!(
+            "ts_check/ not found adjacent to the carrick binary. Expected \
+             layouts: <exe_dir>/ts_check, <exe_dir>/../ts_check, or <exe_dir>/../lib/ts_check. \
+             Type checking will be skipped — install may be incomplete."
+        );
+    }
+
     if use_mock {
         info!("Using MockStorage");
         let storage = MockStorage::new();
-        run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await
+        run_analysis_engine_with_sidecar(
+            storage,
+            &args.repo_path,
+            sidecar_ref,
+            args.no_cache,
+            ts_check_dir.as_deref(),
+        )
+        .await
     } else {
         let storage = AwsStorage::new()?;
-        run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await
+        run_analysis_engine_with_sidecar(
+            storage,
+            &args.repo_path,
+            sidecar_ref,
+            args.no_cache,
+            ts_check_dir.as_deref(),
+        )
+        .await
     }
 
     // Sidecar will be automatically shut down when it goes out of scope (Drop impl)
+}
+
+/// Discover the ts_check directory by checking known locations.
+/// Mirrors `discover_sidecar_path` — must resolve regardless of CWD so the
+/// type-checker script runs from any install shape (packaged binary, cargo
+/// run, GitHub Action tarball).
+fn discover_ts_check_path() -> Option<PathBuf> {
+    let marker = "run-type-checking.ts";
+
+    let mut candidates: Vec<PathBuf> = vec![
+        get_executable_relative_path("ts_check"),
+        get_executable_relative_path("../ts_check"),
+        get_executable_relative_path("../lib/ts_check"),
+    ];
+
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+        candidates.push(PathBuf::from(manifest_dir).join("ts_check"));
+    }
+
+    candidates.extend([PathBuf::from("ts_check"), PathBuf::from("./ts_check")]);
+
+    for candidate in candidates {
+        let marker_path = candidate.join(marker);
+        if marker_path.exists() {
+            debug!("Found ts_check at: {:?}", candidate);
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 /// Discover the sidecar path by checking known locations

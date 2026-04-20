@@ -809,6 +809,12 @@ impl TypeSidecar {
             "Context" | "FastifyInstance" | "FastifyReply" | "FastifyRequest" |
             // Koa
             "Koa" | "ParameterizedContext" |
+            // Hapi
+            "ResponseToolkit" | "ResponseObject" | "Lifecycle" |
+            // NestJS
+            "ExecutionContext" | "ArgumentsHost" | "CallHandler" | "HttpException" |
+            // Hono
+            "Hono" | "HonoRequest" |
             // Node.js HTTP core
             "IncomingMessage" | "ServerResponse"
         )

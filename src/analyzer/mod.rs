@@ -89,6 +89,33 @@ pub struct ApiAnalysisResult {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub issues: ApiIssues,
+    /// GraphQL libraries detected across all scanned repos (subset of
+    /// `detected_data_fetchers`). Populated so the formatter can show a
+    /// "REST-only for v1" banner; Carrick doesn't analyze GraphQL schemas.
+    pub detected_graphql_libraries: Vec<String>,
+}
+
+/// Return the subset of `data_fetchers` that are GraphQL libraries.
+/// Comparison is case-insensitive to handle package-name casing variations.
+pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
+    // Known GraphQL client/server libraries per framework-coverage.md §4.3.
+    // Match against the lowercased package name — substring or equality.
+    data_fetchers
+        .iter()
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower == "graphql"
+                || lower == "graphql-request"
+                || lower == "graphql-tag"
+                || lower == "relay-runtime"
+                || lower.starts_with("@apollo/")
+                || lower.starts_with("@urql/")
+                || lower == "urql"
+                || lower == "apollo-client"
+                || lower == "apollo-server"
+        })
+        .cloned()
+        .collect()
 }
 
 pub struct Analyzer {
@@ -107,6 +134,7 @@ pub struct Analyzer {
     detected_frameworks: Vec<String>,
     detected_data_fetchers: Vec<String>,
     mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
+    ts_check_dir: Option<PathBuf>,   // Resolved ts_check/ directory; set by the CLI entry point
 }
 
 impl CoreExtractor for Analyzer {
@@ -132,12 +160,24 @@ impl Analyzer {
             detected_frameworks: Vec::new(),
             detected_data_fetchers: Vec::new(),
             mount_graph: None,
+            ts_check_dir: None,
         }
     }
 
     /// Set the mount graph for framework-agnostic analysis
     pub fn set_mount_graph(&mut self, mount_graph: MountGraph) {
         self.mount_graph = Some(mount_graph);
+    }
+
+    /// Set the resolved ts_check/ directory. The CLI entry point discovers this
+    /// via `discover_ts_check_path`; tests and callers that don't need type
+    /// checking can leave it unset.
+    pub fn set_ts_check_dir(&mut self, ts_check_dir: PathBuf) {
+        self.ts_check_dir = Some(ts_check_dir);
+    }
+
+    fn ts_check_output_dir(&self) -> Option<PathBuf> {
+        self.ts_check_dir.as_ref().map(|d| d.join("output"))
     }
 
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
@@ -1067,15 +1107,23 @@ impl Analyzer {
 
     pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
         use std::fs;
-        use std::path::Path;
+
+        let output_dir = self.ts_check_output_dir().ok_or_else(|| {
+            "ts_check/ directory was not discovered. Ensure the carrick install \
+             includes ts_check/ adjacent to the binary."
+                .to_string()
+        })?;
 
         // Ensure the output directory exists
-        if !Path::new("ts_check/output").exists() {
-            return Err("Output directory ts_check/output does not exist".to_string());
+        if !output_dir.exists() {
+            return Err(format!(
+                "Output directory {} does not exist",
+                output_dir.display()
+            ));
         }
 
         // Check for type-check-results.json file created by the integrated type checker
-        let results_file = Path::new("ts_check/output/type-check-results.json");
+        let results_file = output_dir.join("type-check-results.json");
 
         if !results_file.exists() {
             return Err("Type check results file not found. Type checking may have failed during extraction.".to_string());
@@ -1140,6 +1188,8 @@ impl Analyzer {
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 
+        let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
+
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
             calls: self.calls.clone(),
@@ -1151,27 +1201,39 @@ impl Analyzer {
                 type_mismatches,
                 dependency_conflicts,
             },
+            detected_graphql_libraries,
         }
     }
 
     pub fn run_final_type_checking(&self) -> Result<(), String> {
         use std::fs;
-        use std::path::Path;
         use std::process::Command;
 
-        // Check if we have the type checking script
-        let script_path = "ts_check/run-type-checking.ts";
-        if !Path::new(script_path).exists() {
-            return Err("Type checking script not found".to_string());
+        // Resolve the ts_check/ directory (discovered at CLI entry time).
+        let ts_check_dir = self.ts_check_dir.as_ref().ok_or_else(|| {
+            "ts_check/ directory was not discovered. The carrick binary could not \
+             locate ts_check/run-type-checking.ts adjacent to itself. Expected \
+             layouts: <exe_dir>/ts_check, <exe_dir>/../ts_check, or \
+             <exe_dir>/../lib/ts_check. This usually means the install is incomplete."
+                .to_string()
+        })?;
+
+        let script_path = ts_check_dir.join("run-type-checking.ts");
+        if !script_path.exists() {
+            return Err(format!(
+                "Type checking script not found at {}. Expected a complete ts_check/ \
+                 directory adjacent to the carrick binary.",
+                script_path.display()
+            ));
         }
 
         // Create minimal tsconfig.json in output directory
-        let output_dir = Path::new("ts_check/output");
-        fs::create_dir_all(output_dir)
+        let output_dir = ts_check_dir.join("output");
+        fs::create_dir_all(&output_dir)
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
         // Check if there are any bundled .d.ts files to check
-        let type_files: Vec<_> = fs::read_dir(output_dir)
+        let type_files: Vec<_> = fs::read_dir(&output_dir)
             .map_err(|e| format!("Failed to read output directory: {}", e))?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -1183,7 +1245,10 @@ impl Analyzer {
             .collect();
 
         if type_files.is_empty() {
-            debug!("No bundled .d.ts files found in ts_check/output/ - skipping type checking");
+            debug!(
+                "No bundled .d.ts files found in {} - skipping type checking",
+                output_dir.display()
+            );
             debug!("   This may happen if:");
             debug!("   - Source code lacks explicit TypeScript type annotations");
             debug!("   - Type extraction agents couldn't identify response/request types");
@@ -1211,22 +1276,23 @@ impl Analyzer {
         let consumer_manifest = output_dir.join("consumer-manifest.json");
 
         if !producer_manifest.exists() || !consumer_manifest.exists() {
-            return Err(
-                "Producer/consumer manifest files not found in ts_check/output".to_string(),
-            );
+            return Err(format!(
+                "Producer/consumer manifest files not found in {}",
+                output_dir.display()
+            ));
         }
 
         // Run the type checking script with the minimal tsconfig
         let output = Command::new("npx")
             .arg("ts-node")
-            .arg(script_path)
-            .arg(tsconfig_path)
+            .arg(&script_path)
+            .arg(&tsconfig_path)
             .arg("--producer")
-            .arg(producer_manifest)
+            .arg(&producer_manifest)
             .arg("--consumer")
-            .arg(consumer_manifest)
+            .arg(&consumer_manifest)
             .arg("--types-dir")
-            .arg(output_dir)
+            .arg(&output_dir)
             .output()
             .map_err(|e| format!("Failed to run type checking: {}", e))?;
 
@@ -1257,10 +1323,11 @@ impl Analyzer {
 
     fn build_display_name_map(&self) -> HashMap<String, String> {
         use std::fs;
-        use std::path::Path;
 
         let mut map = HashMap::new();
-        let output_dir = Path::new("ts_check/output");
+        let Some(output_dir) = self.ts_check_output_dir() else {
+            return map;
+        };
 
         for manifest_path in &[
             output_dir.join("producer-manifest.json"),
@@ -1408,6 +1475,39 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_filter_graphql_libraries() {
+        let data_fetchers = vec![
+            "axios".to_string(),
+            "graphql-request".to_string(),
+            "@apollo/client".to_string(),
+            "urql".to_string(),
+            "got".to_string(),
+            "node-fetch".to_string(),
+            "@urql/core".to_string(),
+            "relay-runtime".to_string(),
+        ];
+        let mut found = filter_graphql_libraries(&data_fetchers);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "@apollo/client".to_string(),
+                "@urql/core".to_string(),
+                "graphql-request".to_string(),
+                "relay-runtime".to_string(),
+                "urql".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_graphql_libraries_empty_when_rest_only() {
+        let data_fetchers = vec!["axios".to_string(), "fetch".to_string(), "got".to_string()];
+        let found = filter_graphql_libraries(&data_fetchers);
+        assert!(found.is_empty());
+    }
 
     #[test]
     fn test_sanitize_route_colon_params() {

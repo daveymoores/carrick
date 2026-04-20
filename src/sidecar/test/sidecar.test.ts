@@ -434,6 +434,151 @@ describe('Type Sidecar Integration Tests', () => {
       }
     });
 
+    // Move 1: the LLM emits the payload subexpression directly (e.g., `users`),
+    // not the surrounding call (`res.json(users)`). The sidecar resolves the
+    // node by text and returns its type, working identically across
+    // res.json(...), ctx.body = ..., h.response(...), and bare return.
+    it('should resolve response payload via text locator — Express res.json(x)', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{ type_string: string; infer_kind: string }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-payload-express',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/framework-handlers.ts'),
+            line_number: 25,
+            expression_text: 'users',
+            expression_line: 25,
+            infer_kind: 'response_body',
+          },
+        ],
+      });
+
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.strictEqual(inferred.infer_kind, 'response_body');
+        assert.ok(inferred.type_string.includes('User'), `expected User[], got ${inferred.type_string}`);
+      } else {
+        assert.fail('expected inferred_types for Express payload');
+      }
+    });
+
+    it('should resolve response payload via text locator — Koa ctx.body = x', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{ type_string: string; infer_kind: string }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-payload-koa',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/framework-handlers.ts'),
+            line_number: 31,
+            expression_text: 'users',
+            expression_line: 31,
+            infer_kind: 'response_body',
+          },
+        ],
+      });
+
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.ok(inferred.type_string.includes('User'), `expected User[], got ${inferred.type_string}`);
+      } else {
+        assert.fail('expected inferred_types for Koa payload');
+      }
+    });
+
+    it('should resolve response payload via text locator — Hapi h.response(x)', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{ type_string: string; infer_kind: string }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-payload-hapi',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/framework-handlers.ts'),
+            line_number: 37,
+            expression_text: 'order',
+            expression_line: 37,
+            infer_kind: 'response_body',
+          },
+        ],
+      });
+
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.ok(inferred.type_string.includes('Order'), `expected Order, got ${inferred.type_string}`);
+      } else {
+        assert.fail('expected inferred_types for Hapi payload');
+      }
+    });
+
+    it('should resolve response payload via text locator — bare return (Fastify/NestJS/Hono)', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{ type_string: string; infer_kind: string }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-payload-bare-return',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/framework-handlers.ts'),
+            line_number: 43,
+            expression_text: 'user',
+            expression_line: 43,
+            infer_kind: 'response_body',
+          },
+        ],
+      });
+
+      if (response.inferred_types && response.inferred_types.length > 0) {
+        const inferred = response.inferred_types[0];
+        assert.ok(inferred.type_string.includes('User'), `expected User, got ${inferred.type_string}`);
+      } else {
+        assert.fail('expected inferred_types for bare-return payload');
+      }
+    });
+
+    it('should return a response_body inference when the locator resolves to a function identifier', async () => {
+      // Canary for the "payload-less handler" path. The LLM sometimes emits a
+      // function identifier (e.g., `bareReturnHandler`) as the locator; the
+      // sidecar must resolve it and emit a non-empty response_body inference
+      // rather than crashing or silently dropping the request.
+      //
+      // Known limitations (tracked separately from Copilot's 2026-04-20 review):
+      //   - The sidecar currently returns `typeof bareReturnHandler` rather than
+      //     unwrapping to the function's return type. That's a follow-up.
+      //   - The "no locator at all" case (only file_path + line_number) is NOT
+      //     exercised here; `inferFunctionReturn` needs an anchor to find the
+      //     containing function.
+      const response = await client.send<{
+        inferred_types?: Array<{ type_string: string; infer_kind: string }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-payload-fallback',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/framework-handlers.ts'),
+            line_number: 42,
+            expression_text: 'bareReturnHandler',
+            expression_line: 42,
+            infer_kind: 'response_body',
+          },
+        ],
+      });
+
+      assert.ok(
+        response.inferred_types && response.inferred_types.length > 0,
+        `expected inferred_types to be non-empty, got ${JSON.stringify(response)}`
+      );
+      const inferred = response.inferred_types![0];
+      assert.strictEqual(inferred.infer_kind, 'response_body');
+      assert.ok(
+        inferred.type_string && inferred.type_string.length > 0,
+        `expected non-empty type_string, got ${JSON.stringify(inferred)}`
+      );
+    });
+
     it('should infer request body type from handler usage', async () => {
       const response = await client.send<{
         request_id: string;

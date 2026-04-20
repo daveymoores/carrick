@@ -16,6 +16,7 @@
 use crate::{
     agent_service::AgentService,
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
+    visitor::{ImportedSymbol, SymbolKind},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,9 +53,13 @@ pub struct EndpointResult {
     pub payload_expression_text: Option<String>,
     /// Line number where the payload expression starts (from Gemini)
     pub payload_expression_line: Option<i32>,
-    /// Verbatim code text of the response emission expression (from Gemini)
+    /// Verbatim code text of the response payload subexpression (from Gemini).
+    /// This is the value whose type we want — e.g., `users` in `res.json(users)`,
+    /// `ctx.body = users`, `h.response(users)`, `return users`, `reply.send(users)`,
+    /// `c.json(users)`. Framework-agnostic; set to null for payload-less handlers
+    /// (redirects, 204s, streaming).
     pub response_expression_text: Option<String>,
-    /// Line number where the response expression starts (from Gemini)
+    /// Line number where the payload expression starts (from Gemini)
     pub response_expression_line: Option<i32>,
     /// The primary type symbol name without wrappers (e.g., "User" from "Response<User[]>")
     pub primary_type_symbol: Option<String>,
@@ -168,7 +173,7 @@ impl FileAnalyzerAgent {
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
         candidate_contexts: &[String],
-        import_map: &HashMap<String, String>,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -182,7 +187,7 @@ impl FileAnalyzerAgent {
             guidance,
             candidate_hints,
             candidate_contexts,
-            import_map,
+            imported_symbols,
         );
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
@@ -425,6 +430,26 @@ Your extraction must be useful for a graph builder. You must resolve variable na
 * **Imports:** If a router/controller is mounted (e.g., `parent.mount('/', child)`), and `child` is imported from `'./auth'`, you MUST record `'./auth'` as the `import_source`. This is the ONLY way we link files.
 * **Inline:** If a variable is defined in this file (e.g., `const api = createRouter()`), track that it is local (import_source = null).
 * **Chaining:** If a pattern is chained (e.g., `createApp().plugin(...)`), the `parent_node` is the root object.
+* **Owner–child consistency when a mount actually exists.** The mount graph walker applies a mount's prefix to an endpoint only when the endpoint's `owner_node` matches some mount's `child_node`. WHEN you emit a mount — meaning the source code contains an explicit mount call (e.g., `app.use(child)`, `server.register(plugin)`, `parent.route('/', child)`, or equivalent for the detected framework) — the endpoints introduced by that mount must have `owner_node` equal to the mount's `child_node`, not the name of a callback parameter or the inner framework instance. Framework-specific closure shapes (which parameter names shadow outer identifiers, which plugin shapes carry routes) are described in FRAMEWORK-SPECIFIC PARSING NOTES below.
+* **Do NOT invent mounts.** Some frameworks (notably decorator-based ones) contribute a prefix without any explicit mount call — e.g., NestJS `@Controller('users')` on a class. In those cases, do not emit a mount at all; apply §4's decorator encoding (concatenate the class-decorator prefix into each endpoint's `path`). Emitting a synthetic mount alongside the decorator-prefixed endpoint path will produce doubled URLs.
+
+#### C. Mount Path Attribution (CRITICAL — prevents double prefixing AND lost prefixes)
+Downstream, the graph builder computes each endpoint's full URL as `mount_prefix + endpoint.path` by walking the mount chain. A path prefix is a piece of the URL that applies to a whole sub-router. It must land in EXACTLY ONE place — either the endpoint's own `path`, or the mount's `mount_path`. If it lands in both, the full URL is doubled. If it lands in neither, the full URL is missing it.
+
+Before emitting endpoints/mounts for a sub-router/sub-app, locate every prefix that contributes to its endpoints' runtime URLs. A prefix can appear in two places:
+
+1. **Constructor-carried** — the child is built with the prefix baked in (e.g., `new Router({ prefix: '/api/v1' })`, `.basePath('/api')`, or any equivalent construction-time option).
+2. **Mount-site** — the prefix is supplied at the mount call itself (e.g., `app.use('/api', child)`, `app.register(child, { prefix: '/api' })`, or any nested options shape such as `register({ plugin, routes: { prefix: '/api' } })` — see "Read the pattern description" below).
+
+For each case, emit exactly this encoding:
+
+* **Constructor-carried prefix case.** The endpoint's `path` MUST include the constructor-carried prefix concatenated with its own literal suffix. Example: given `new Router({ prefix: '/api/v1' })` and `apiRouter.get('/status', handler)`, emit endpoint `path: "/api/v1/status"` (NOT `"/status"`). Then, when you emit the mount for this child, set `mount_path: ""` (empty string) — the prefix is already inside the endpoint path, and emitting it again on the mount would produce `/api/v1/api/v1/status`.
+* **Mount-site prefix case.** The endpoint's `path` is the literal suffix from the child's `.get(...)` / `.post(...)` / decorator call, with NO prefix. The mount's `mount_path` carries the prefix.
+* **Both cases at once.** If the child has BOTH a constructor-carried prefix AND the mount call adds another one (rare but possible), bake the constructor-carried portion into the endpoint path AND emit the mount-site portion as `mount_path`. The two must not overlap.
+
+**Read the pattern description to locate the prefix in an options object.** Each `mount_pattern` from framework guidance carries a `description` field that names where the prefix lives. When a mount candidate matches a pattern whose description names an object-path (e.g., `"Prefix is at options.prefix (2nd argument)"` or `"Prefix is at options.routes.prefix (2nd argument)"`), read the prefix from that exact dotted path inside the call's argument object literal. Do NOT fall back to a top-level key if the description specifies a nested path — nested-prefix shapes are otherwise silently dropped. If the description says the prefix is constructor-carried, use the constructor-carried encoding above (prefix into endpoint path, `mount_path: ""`).
+
+**Principle:** Read the child's construction site (same file or Import Table) AND the `mount_pattern` description before emitting. Pick the encoding and stick to it. The test is whether `mount_prefix + endpoint.path` equals the runtime URL of the endpoint exactly once.
 
 ### 2. OUTPUT REQUIREMENTS (Flat Schema)
 * Do not nest details. Every finding must be a top-level item in its respective list.
@@ -446,17 +471,35 @@ When a variable is used in a mount and that variable was imported, include the i
 * **Re-exports:** Track the original source, not intermediate re-exports.
 * **Dynamic imports:** Record import_source as the string literal if available, otherwise null.
 * **response.json()/.text():** Treat these as data_calls only when they are part of an actual downstream HTTP consumer. Use the provided call-chain context (upstream call, path/method literal, enclosing function) to decide; avoid framework/client-specific heuristics.
+* **Decorator-based routing (class methods):** Some candidates are decorator calls on class methods (e.g., an `@Get(':id')` above `findOne(...)`). Use the Import Table to decide if the decorator identifier is a routing decorator from a known framework (e.g., `@nestjs/common`). When it is:
+  * The **handler_name** is the name of the enclosing class method (the method the decorator is attached to), NOT the decorator itself.
+  * The **owner_node** is the enclosing class name (e.g., `UsersController`).
+  * The **path** comes from two places: (a) the decorator's own argument, if any (`@Get(':id')` → `:id`, `@Post()` → empty), and (b) the class-level decorator if present (e.g., `@Controller('users')` above the class → prefix `users`). Concatenate the two with a single `/` (no double slashes, no trailing slash), then ensure the result starts with `/`.
+  * The **method** comes from the decorator identifier (`Get` → GET, `Post` → POST, etc.).
+  * Do NOT emit a candidate for the `@Controller(...)` decorator itself — it only contributes a prefix.
+  * Only classify decorators as endpoints when the Import Table resolves their identifier to a routing framework module. If the decorator comes from elsewhere, ignore it.
 
 ### 5. TYPE LOCATION EXTRACTION (CRITICAL FOR TYPE CHECKING)
 For endpoints and data calls, emit **expression text + line number** to tell the compiler where to infer types.
 The source code is displayed with line-number prefixes (e.g., "  42| res.json(users)"). Read the number directly.
 
-#### A. Response Body Expressions (MANDATORY for endpoints)
-Identify the expression that sends/returns the response body (res.json(...), reply.send(...), return ...).
-* You MUST emit `response_expression_text` and `response_expression_line` for EVERY endpoint that sends a response.
-* Emit `response_expression_text` as the verbatim code text (e.g., `res.json(users)`)
-* Emit `response_expression_line` as the line number where this expression starts
-* CRITICAL: Copy the expression EXACTLY as it appears in the source code. Do not paraphrase or modify it.
+#### A. Response Payload Subexpression (MANDATORY for endpoints with a payload)
+Identify the **payload subexpression** — the single value whose type is the response body. Emit that subexpression directly, NOT the surrounding call or assignment.
+
+Patterns and what to emit (the framework idiom is irrelevant; always emit the inner value):
+* `res.json(users)` / `res.send(users)` / `reply.send(users)` → emit `users`
+* `ctx.body = users` (Koa assignment) → emit `users`
+* `h.response(users)` (Hapi) → emit `users`
+* `return users` (Fastify/NestJS/Hono/bare return) → emit `users`
+* `c.json(users)` / `c.text(s)` / `c.html(s)` / `c.body(b)` (Hono) → emit the inner value
+* `return new Response(JSON.stringify(data))` → emit `data`
+* Chained forms like `res.status(200).json(users)` → emit `users`
+
+Rules:
+* You MUST emit `response_expression_text` and `response_expression_line` for every endpoint that returns a payload.
+* Copy the subexpression EXACTLY as it appears in the source — verbatim identifier, object literal, template literal, etc.
+* For object literals, template literals, or composed expressions, emit the whole literal (e.g., `{ status: 'ok' }`, `` `hello ${name}` ``).
+* If the handler is payload-less (redirect, 204, `res.end()` with no args, streaming only, `ctx.body = null`), emit `null` for both text and line. Do NOT invent a payload.
 * If unsure about the exact expression, emit your best match — an approximate match is far better than null.
 
 #### B. Request Payload Expressions (MANDATORY when present)
@@ -507,7 +550,7 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
         guidance: &FrameworkGuidance,
         candidate_hints: &[String],
         candidate_contexts: &[String],
-        import_map: &HashMap<String, String>,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
@@ -532,22 +575,7 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
             )
         };
 
-        // Deterministic import map formatting
-        let mut imports: Vec<_> = import_map.iter().collect();
-        imports.sort_by(|a, b| a.0.cmp(b.0));
-        let imports_section = if imports.is_empty() {
-            "No imports detected by AST; treat all symbols as local unless resolved in code."
-                .to_string()
-        } else {
-            let lines: Vec<String> = imports
-                .iter()
-                .map(|(local, source)| format!(r#"  - "{}" -> "{}""#, local, source))
-                .collect();
-            format!(
-                "Resolved import table (AST-derived):\n{}\nUse this table for symbol grounding; do NOT invent sources.",
-                lines.join("\n")
-            )
-        };
+        let imports_section = Self::format_import_table(imported_symbols);
 
         // Add line-number prefixes to file content so Gemini can read line numbers directly
         let mut numbered_content =
@@ -586,6 +614,10 @@ Do NOT emit full type strings. If no explicit annotation is found, set both to n
 ### FRAMEWORK-SPECIFIC HINTS
 {}
 
+### FRAMEWORK-SPECIFIC PARSING NOTES
+These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
+{}
+
 ### FILE CONTENT (Path: {})
 Lines are prefixed with line numbers. Use these numbers for *_expression_line fields.
 ```
@@ -603,8 +635,8 @@ For each endpoint, include: candidate_id, line_number, owner_node, method, path,
 response_expression_text, response_expression_line, payload_expression_text, payload_expression_line,
 primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
-  - MUST emit response_expression_text: copy the EXACT expression text that sends the response (e.g., "res.json(users)")
-  - MUST emit response_expression_line: read the line number from the prefix in the source code
+  - MUST emit response_expression_text: copy the EXACT payload subexpression (e.g., "users" from res.json(users), ctx.body = users, h.response(users), or return users). Emit null for payload-less handlers.
+  - MUST emit response_expression_line: read the line number from the prefix in the source code (line where the payload subexpression appears)
   - For payload_expression_text: copy the EXACT expression for the request payload (e.g., "req.body")
   - For payload_expression_line: read the line number from the prefix
 
@@ -625,6 +657,7 @@ Return ONLY the JSON object, no explanations."#,
             candidate_contexts_section,
             imports_section,
             guidance.triage_hints,
+            guidance.parsing_notes,
             file_path,
             numbered_content
         )
@@ -650,6 +683,74 @@ Return ONLY the JSON object, no explanations."#,
             })
             .collect::<Vec<_>>()
             .join(",\n")
+    }
+
+    /// Format the AST-derived imports grouped by source module with kind
+    /// annotations. This is Move 3 (§9.3) in framework-coverage.md: richer
+    /// per-file grounding so the LLM reads symbols against real imports
+    /// rather than a pattern list.
+    ///
+    /// Format:
+    /// ```text
+    /// Imports resolved from the AST (grouped by source):
+    ///   - From '@nestjs/common': Get, Post, Controller [named]
+    ///   - From 'koa': Koa [default]
+    ///   - From 'express': express [namespace]
+    ///   - From './user.service': UserService [named]
+    /// ```
+    fn format_import_table(imported_symbols: &HashMap<String, ImportedSymbol>) -> String {
+        if imported_symbols.is_empty() {
+            return "No imports detected by AST; treat all symbols as local unless resolved in code.".to_string();
+        }
+
+        // Group by (source, kind). Named imports can batch per source;
+        // default/namespace are one-per-source in practice but we handle it
+        // uniformly for deterministic output.
+        use std::collections::BTreeMap;
+        let mut groups: BTreeMap<(String, &'static str), Vec<(String, String)>> = BTreeMap::new();
+        for symbol in imported_symbols.values() {
+            let kind_label = match symbol.kind {
+                SymbolKind::Named => "named",
+                SymbolKind::Default => "default",
+                SymbolKind::Namespace => "namespace",
+            };
+            groups
+                .entry((symbol.source.clone(), kind_label))
+                .or_default()
+                .push((symbol.local_name.clone(), symbol.imported_name.clone()));
+        }
+
+        // Stable per-group ordering by local name.
+        for entries in groups.values_mut() {
+            entries.sort();
+        }
+
+        let lines: Vec<String> = groups
+            .iter()
+            .map(|((source, kind_label), entries)| {
+                let pretty: Vec<String> = entries
+                    .iter()
+                    .map(|(local, imported)| {
+                        if local == imported {
+                            local.clone()
+                        } else {
+                            // `import { Foo as Bar }` → Bar (as Foo)
+                            format!("{local} (as {imported})")
+                        }
+                    })
+                    .collect();
+                format!(
+                    "  - From '{source}': {names} [{kind_label}]",
+                    names = pretty.join(", "),
+                )
+            })
+            .collect();
+
+        format!(
+            "Imports resolved from the AST (grouped by source):\n{}\n\n\
+             Use this table to interpret candidates. An identifier used in this file that appears above is the imported symbol from that module; an identifier NOT listed is either local to this file or globally available. Do NOT invent sources.",
+            lines.join("\n"),
+        )
     }
 }
 
@@ -992,6 +1093,33 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
         assert!(message.contains("express"));
     }
 
+    fn named(local: &str, source: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            local_name: local.to_string(),
+            imported_name: local.to_string(),
+            source: source.to_string(),
+            kind: SymbolKind::Named,
+        }
+    }
+
+    fn default_import(local: &str, source: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            local_name: local.to_string(),
+            imported_name: local.to_string(),
+            source: source.to_string(),
+            kind: SymbolKind::Default,
+        }
+    }
+
+    fn namespace_import(local: &str, source: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            local_name: local.to_string(),
+            imported_name: local.to_string(),
+            source: source.to_string(),
+            kind: SymbolKind::Namespace,
+        }
+    }
+
     #[test]
     fn test_build_user_message_includes_import_table_and_candidates() {
         let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
@@ -1004,9 +1132,9 @@ const data = await fetch('/api/users').then(resp => resp.json());
         let candidates = vec!["- Line 3: fetch(...) - `fetch('/api/users')`".to_string()];
         let candidate_contexts: Vec<String> =
             vec![r#"{"line":3,"callee":"fetch","path":"/api/users","fn":"getData"}"#.to_string()];
-        let mut import_map = HashMap::new();
-        import_map.insert("User".to_string(), "./types".to_string());
-        import_map.insert("useUsers".to_string(), "../hooks".to_string());
+        let mut imported = HashMap::new();
+        imported.insert("User".to_string(), named("User", "./types"));
+        imported.insert("useUsers".to_string(), named("useUsers", "../hooks"));
 
         let message = agent.build_user_message_with_candidates(
             "test.ts",
@@ -1014,15 +1142,79 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &guidance,
             &candidates,
             &candidate_contexts,
-            &import_map,
+            &imported,
         );
 
         assert!(message.contains("IMPORT TABLE"));
-        assert!(message.contains(r#""User" -> "./types""#));
+        // Grouped-by-source format: "From './types': User [named]".
+        assert!(
+            message.contains("From './types': User [named]"),
+            "expected grouped import line, got: {message}"
+        );
         assert!(message.contains("CANDIDATE TARGETS"));
         assert!(message.contains("Line 3"));
         assert!(message.contains("CANDIDATE CONTEXT"));
         assert!(message.contains("/api/users"));
+    }
+
+    #[test]
+    fn test_format_import_table_groups_by_source_and_kind() {
+        // Named imports from the same module batch together (NestJS style).
+        let mut imports = HashMap::new();
+        imports.insert("Get".to_string(), named("Get", "@nestjs/common"));
+        imports.insert("Post".to_string(), named("Post", "@nestjs/common"));
+        imports.insert(
+            "Controller".to_string(),
+            named("Controller", "@nestjs/common"),
+        );
+        imports.insert("Koa".to_string(), default_import("Koa", "koa"));
+        imports.insert(
+            "express".to_string(),
+            namespace_import("express", "express"),
+        );
+
+        let out = FileAnalyzerAgent::format_import_table(&imports);
+        // @nestjs/common should list all three named imports on one line, sorted.
+        assert!(
+            out.contains("From '@nestjs/common': Controller, Get, Post [named]"),
+            "named imports should group & sort: {out}"
+        );
+        // Default & namespace annotated explicitly.
+        assert!(
+            out.contains("From 'koa': Koa [default]"),
+            "default import annotation: {out}"
+        );
+        assert!(
+            out.contains("From 'express': express [namespace]"),
+            "namespace import annotation: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_import_table_aliased_named_import() {
+        // `import { Foo as Bar } from 'mod'` — show both.
+        let mut imports = HashMap::new();
+        imports.insert(
+            "Bar".to_string(),
+            ImportedSymbol {
+                local_name: "Bar".to_string(),
+                imported_name: "Foo".to_string(),
+                source: "mod".to_string(),
+                kind: SymbolKind::Named,
+            },
+        );
+        let out = FileAnalyzerAgent::format_import_table(&imports);
+        assert!(
+            out.contains("From 'mod': Bar (as Foo) [named]"),
+            "aliased import should show `local (as imported)`: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_import_table_empty() {
+        let imports = HashMap::new();
+        let out = FileAnalyzerAgent::format_import_table(&imports);
+        assert!(out.contains("No imports detected"));
     }
 
     #[test]

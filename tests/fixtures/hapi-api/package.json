@@ -1,0 +1,8 @@
+{
+  "name": "hapi-api",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@hapi/hapi": "^21.3.0"
+  }
+}

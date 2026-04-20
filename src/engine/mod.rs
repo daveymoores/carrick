@@ -88,7 +88,7 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_analysis_engine_with_sidecar(storage, repo_path, None, false).await
+    run_analysis_engine_with_sidecar(storage, repo_path, None, false, None).await
 }
 
 /// Run analysis engine with optional sidecar for type extraction
@@ -97,6 +97,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     no_cache: bool,
+    ts_check_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
 
@@ -186,7 +187,8 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     );
 
     let sp = logging::spinner("Running cross-repo analysis...");
-    let analyzer = build_cross_repo_analyzer(all_repo_data, current_repo_data).await?;
+    let analyzer =
+        build_cross_repo_analyzer(all_repo_data, current_repo_data, ts_check_dir).await?;
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
@@ -1246,6 +1248,7 @@ async fn analyze_current_repo(
 async fn build_cross_repo_analyzer(
     mut all_repo_data: Vec<CloudRepoData>,
     current_repo_data: CloudRepoData,
+    ts_check_dir: Option<&std::path::Path>,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
     // Add current repo data to the mix
     all_repo_data.push(current_repo_data);
@@ -1271,11 +1274,19 @@ async fn build_cross_repo_analyzer(
     }
 
     // 5. Recreate type files from S3 and run type checking
-    recreate_type_files_and_check(&all_repo_data, &combined_packages)?;
+    if let Some(ts_check_dir) = ts_check_dir {
+        analyzer.set_ts_check_dir(ts_check_dir.to_path_buf());
+        recreate_type_files_and_check(&all_repo_data, &combined_packages, ts_check_dir)?;
 
-    // 6. Run final type checking
-    if let Err(e) = analyzer.run_final_type_checking() {
-        warn!("Type checking failed: {}", e);
+        // 6. Run final type checking
+        if let Err(e) = analyzer.run_final_type_checking() {
+            warn!("Type checking failed: {}", e);
+        }
+    } else {
+        warn!(
+            "Skipping type checking: ts_check/ directory was not found adjacent to the \
+             carrick binary. Expected at <exe_dir>/ts_check or <exe_dir>/../lib/ts_check."
+        );
     }
 
     Ok(analyzer)
@@ -1284,10 +1295,12 @@ async fn build_cross_repo_analyzer(
 fn recreate_type_files_and_check(
     all_repo_data: &[CloudRepoData],
     packages: &Packages,
+    ts_check_dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output_dir = std::path::Path::new("ts_check/output");
+    let output_dir_buf = ts_check_dir.join("output");
+    let output_dir = output_dir_buf.as_path();
     if output_dir.exists() {
-        debug!("Cleaning output directory: ts_check/output");
+        debug!("Cleaning output directory: {}", output_dir.display());
         if let Err(e) = std::fs::remove_dir_all(output_dir) {
             warn!("Failed to clean output directory: {}", e);
         }
@@ -1296,7 +1309,7 @@ fn recreate_type_files_and_check(
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         warn!("Failed to create output directory: {}", e);
     } else {
-        debug!("Created clean output directory: ts_check/output");
+        debug!("Created clean output directory: {}", output_dir.display());
     }
 
     for repo_data in all_repo_data {

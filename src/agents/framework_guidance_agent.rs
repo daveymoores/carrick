@@ -155,7 +155,21 @@ impl FrameworkGuidanceAgent {
     ) -> Result<Vec<PatternExample>, Box<dyn std::error::Error>> {
         let category_prompt = match category {
             "mount" => {
-                "MOUNT PATTERNS: How does this framework mount sub-routers or sub-applications? Provide specific syntax."
+                "MOUNT PATTERNS: How does this framework mount sub-routers, sub-applications, or plugins?
+
+Cover every realistic mount shape for each detected framework, including:
+  (a) Top-level path-string mounts (e.g., `parent.use('/api', child)`).
+  (b) Option-object mounts where the path prefix is a top-level key (e.g., `register(child, { prefix: '/api' })`).
+  (c) Option-object mounts where the path prefix is NESTED inside the option object under a non-top-level key (e.g., a `routes: { prefix: '/api' }` shape, or any other wrapper the framework's register/mount function expects). Do NOT skip these — they are the most commonly missed shape.
+  (d) Constructor-carried prefixes, where the child itself is built with a prefix and the mount site adds none (e.g., constructing a sub-router with a prefix option, then mounting it with no additional path).
+
+For EACH pattern you return, the `description` field MUST tell a downstream analyzer exactly how to read the prefix from the call's arguments. Use this shape:
+  - If the prefix is a top-level string argument: `\"Prefix is the 1st string argument.\"`
+  - If the prefix is a top-level key in an options object: `\"Prefix is at options.prefix (2nd argument).\"`
+  - If the prefix is nested inside an options object: name the exact dotted path, e.g. `\"Prefix is at options.routes.prefix (2nd argument).\"`
+  - If the prefix is constructor-carried and the mount site contributes no prefix: `\"Prefix is carried by the child constructor; mount site contributes no prefix.\"`
+
+The downstream file analyzer reads this description verbatim to locate the prefix in the AST. Vague descriptions like \"mounts a plugin with options\" will cause prefix extraction to fail."
             }
             "endpoint" => {
                 "ENDPOINT PATTERNS: How are HTTP endpoints defined? Provide specific syntax for routes/handlers."
@@ -169,9 +183,11 @@ impl FrameworkGuidanceAgent {
             _ => "Provide relevant code patterns.",
         };
 
+        let example_count = if category == "mount" { "3-5" } else { "2-3" };
+
         let prompt = format!(
-            "{}\n\nTASK:\nProvide 2-3 concise examples for: {}\n\nReturn JSON with three parallel arrays: patterns (code), descriptions (what each does), frameworks (which framework).",
-            context, category_prompt
+            "{}\n\nTASK:\nProvide {} concise examples for: {}\n\nReturn JSON with three parallel arrays: patterns (code), descriptions (what each does — for mounts, see the required description format above), frameworks (which framework).",
+            context, example_count, category_prompt
         );
 
         let schema = AgentSchemas::pattern_list_schema();
@@ -196,7 +212,7 @@ impl FrameworkGuidanceAgent {
         system_message: &str,
     ) -> Result<GeneralGuidanceResponse, Box<dyn std::error::Error>> {
         let prompt = format!(
-            "{}\n\nTASK:\nProvide general guidance:\n1. TRIAGE HINTS: How to distinguish mounts vs middleware vs endpoints\n2. PARSING NOTES: AST/parsing considerations (decorators, chaining, etc.)\n\nReturn ONLY the JSON object.",
+            "{}\n\nTASK:\nProvide general guidance for a downstream static-analysis agent that reads a single source file and extracts endpoints, mounts, and data calls. The agent's correctness depends on your notes.\n\nReturn two fields:\n\n1. TRIAGE HINTS: How to distinguish mounts vs middleware vs endpoints for the detected framework(s).\n\n2. PARSING NOTES: Enumerate the framework-specific AST/parsing semantics the agent needs to extract endpoints correctly. For EACH detected framework, cover at minimum (omit a bullet if it genuinely does not apply):\n\n   (a) Owner attribution inside plugin/sub-app closures. If the framework registers routes inside a callback whose parameter shadows an outer identifier (e.g., `register: async (server) => {{ server.route(...) }}` in Hapi, `app.register(async (instance) => {{ instance.get(...) }})` in Fastify, or similar), state explicitly: the scoped parameter is a child instance; routes defined on it MUST be attributed to the plugin/child variable visible to the registration call, NOT to the parameter name. Name the typical parameter names the framework uses so the downstream agent can recognise the shape.\n\n   (b) Path-prefix location (ties to the MOUNT PATTERNS your mount call returns). State where the prefix lives for each registration idiom: constructor-carried (baked into the child at construction time) vs mount-site (provided in the registration call itself, including nested-options shapes). If constructor-carried, the endpoint's emitted path must include the prefix and the mount's prefix must be empty; if mount-site, vice versa. This is the highest-leverage correctness note — do not skip it.\n\n   (c) Decorator routing, if applicable (class-method decorators, param decorators). Name the routing decorators, the method-name → HTTP-verb mapping, and how class-level decorators contribute a path prefix.\n\n   (d) Method chaining quirks (e.g., `router.route('/x').get(...).post(...)`). State whether the chain's receiver anchors the owner.\n\n   (e) Any other shape the agent cannot infer from pattern examples alone — e.g., how handlers return responses in ways that affect which expression is the payload.\n\nBe concrete. Use the framework's real identifier names. Multi-framework repos: include a short section per framework. Vague notes like \"uses decorators\" will cause silent extraction bugs; notes like \"In NestJS, `@Controller('prefix')` on the class contributes a path prefix concatenated with the method decorator's argument\" are what the agent needs.\n\nReturn ONLY the JSON object.",
             context
         );
 

@@ -21,6 +21,7 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::*;
+use swc_ecma_parser::TsSyntax;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::parser::parse_file;
@@ -152,10 +153,26 @@ impl SwcScanner {
         use swc_ecma_transforms_base::resolver;
         use swc_ecma_visit::VisitMutWith;
 
-        // Determine syntax based on file extension
+        // Determine syntax based on file extension. Decorators must be enabled
+        // so NestJS-style `@Controller('users')` / `@Get(':id')` parse into
+        // `Decorator` nodes that the visitor can traverse.
         let (syntax, is_typescript) = if let Some(ext) = file_path.extension() {
             match ext.to_string_lossy().as_ref() {
-                "ts" | "tsx" => (Syntax::Typescript(Default::default()), true),
+                "ts" => (
+                    Syntax::Typescript(TsSyntax {
+                        decorators: true,
+                        ..Default::default()
+                    }),
+                    true,
+                ),
+                "tsx" => (
+                    Syntax::Typescript(TsSyntax {
+                        tsx: true,
+                        decorators: true,
+                        ..Default::default()
+                    }),
+                    true,
+                ),
                 _ => (Syntax::Es(Default::default()), false),
             }
         } else {
@@ -428,6 +445,38 @@ impl Visit for CandidateVisitor {
         } else {
             node.visit_children_with(self);
         }
+    }
+
+    fn visit_decorator(&mut self, node: &Decorator) {
+        // Emit a candidate for any decorator call expression. This is the
+        // framework-agnostic path for class-method routing (NestJS) — the
+        // scanner stays free of framework names; the LLM classifies the
+        // decorator by its identifier via the Import Table.
+        if let Expr::Call(call) = &*node.expr {
+            if let Callee::Expr(callee_expr) = &call.callee {
+                let callee_name = Self::extract_callee_object(callee_expr);
+                if let Some(name) = callee_name {
+                    let line_number = self.get_line_number(call.span);
+                    let (span_start, span_end) = self.span_range(call.span);
+                    let candidate_id = self.candidate_id(span_start, span_end);
+                    let code_snippet = self.get_code_snippet(call.span);
+                    let path_snippet = self.extract_first_arg_snippet(call);
+
+                    self.candidates.push(CandidateTarget {
+                        candidate_id,
+                        span_start,
+                        span_end,
+                        line_number,
+                        callee_object: name,
+                        callee_property: None,
+                        enclosing_function: self.current_function(),
+                        path_snippet,
+                        code_snippet,
+                    });
+                }
+            }
+        }
+        node.visit_children_with(self);
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
@@ -749,6 +798,55 @@ createRouter()
             "span_end {} should not exceed file size {}",
             span_b.1,
             file_b_content.len()
+        );
+    }
+
+    #[test]
+    fn test_detects_decorator_calls_for_nestjs_style() {
+        // Regression for the gap verified in .thoughts/framework-coverage.md §2.3:
+        // prior to Move 2, decorator calls produced zero candidates because the
+        // visitor only fired on member calls. After widening the scanner, a
+        // @Controller('users') class with @Get/@Post/@Get(':id') methods must
+        // produce non-zero candidates — the LLM decides which are routing
+        // decorators via the Import Table.
+        let content = r#"
+import { Controller, Get, Post } from '@nestjs/common';
+
+@Controller('users')
+export class UsersController {
+  @Get()
+  findAll() { return []; }
+
+  @Get(':id')
+  findOne() { return null; }
+
+  @Post()
+  create() { return { id: 1 }; }
+}
+"#;
+
+        let result = scan_test_content(content);
+        assert!(result.should_analyze, "NestJS controller should analyze");
+
+        // At least four decorator candidates (one Controller + three method decorators).
+        let decorator_candidates: Vec<_> = result
+            .candidates
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.callee_object.as_str(),
+                    "Controller" | "Get" | "Post" | "Put" | "Patch" | "Delete"
+                )
+            })
+            .collect();
+        assert!(
+            decorator_candidates.len() >= 4,
+            "expected >=4 decorator candidates, got {}: {:?}",
+            decorator_candidates.len(),
+            decorator_candidates
+                .iter()
+                .map(|c| &c.callee_object)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -10,10 +10,12 @@
  * - Supports union/intersection composition
  * - Recursive unwrapping with depth limits
  *
- * Framework-agnostic patterns detected:
- * - res.json(data) / res.send(data) - Express/Fastify style
- * - ctx.body = data - Koa style
- * - return data / return Response.json(data) - Hono/Web API style
+ * Framework agnosticism: The LLM emits the payload subexpression directly (e.g.,
+ * the `users` in `res.json(users)`, `ctx.body = users`, `h.response(users)`, or
+ * `return users`). The sidecar resolves that node and reads its type — no
+ * framework-specific method-name lists live here. For payload-less handlers
+ * (redirects, 204s), the LLM emits null and we fall back to the containing
+ * function's return type.
  */
 
 import {
@@ -232,19 +234,28 @@ export class TypeInferrer {
     const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
-      this.log(`No node found for request at ${request.file_path}:${request.line_number}`);
-      return null;
+      // No locator, or locator didn't resolve — likely a payload-less handler
+      // (redirect, 204, streaming). Infer the containing function's return type.
+      this.log(
+        `No payload node found for request at ${request.file_path}:${request.line_number}; falling back to function return`
+      );
+      return this.inferFunctionReturn(sourceFile, request, wrappers, extractionConfig);
     }
 
-    const payloadNode = this.resolveResponsePayloadNode(node);
-    if (!payloadNode) {
-      return this.inferExpression(sourceFile, request, wrappers, extractionConfig);
+    // The resolved node IS the payload subexpression in the MVP schema.
+    // Transitional fallback: if a caller still supplies a bare call expression
+    // (e.g., `res.json(users)`), drill to its first argument. No method-name list.
+    let payloadNode: Node = node;
+    if (Node.isCallExpression(node)) {
+      const args = node.getArguments();
+      if (args.length > 0) {
+        payloadNode = args[0];
+      }
     }
 
     const payloadType = payloadNode.getType();
     let typeString = payloadType.getText(payloadNode);
 
-    // Apply extraction config for unwrapping
     const unwrapResult = this.unwrapTypeWithConfig(
       payloadType,
       payloadNode,
@@ -436,65 +447,6 @@ export class TypeInferrer {
       this.getNodeLocation(node),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
     );
-  }
-
-  // ===========================================================================
-  // Response Payload Resolution
-  // ===========================================================================
-
-  private resolveResponsePayloadNode(node: Node): Node | null {
-    // Try to find a call expression in the node or its descendants
-    let callExpr: CallExpression | undefined;
-
-    const expr = this.unwrapExpressionNode(node);
-
-    if (Node.isCallExpression(expr)) {
-      callExpr = expr;
-    } else if (Node.isExpressionStatement(expr)) {
-      const inner = expr.getExpression();
-      if (Node.isCallExpression(inner)) {
-        callExpr = inner;
-      }
-    }
-
-    // If we didn't find it directly, search descendants
-    if (!callExpr) {
-      const callExprs = node.getDescendantsOfKind(SyntaxKind.CallExpression);
-      if (callExprs.length > 0) {
-        // Find the first call that looks like a response method
-        for (const ce of callExprs) {
-          const propAccess = ce.getExpression();
-          if (Node.isPropertyAccessExpression(propAccess)) {
-            const methodName = propAccess.getName();
-            if (['json', 'send', 'end', 'write'].includes(methodName)) {
-              callExpr = ce;
-              break;
-            }
-          }
-        }
-        // Fallback to first call if no response method found
-        if (!callExpr) {
-          callExpr = callExprs[0];
-        }
-      }
-    }
-
-    if (callExpr) {
-      const propertyAccess = callExpr.getExpression();
-      if (Node.isPropertyAccessExpression(propertyAccess)) {
-        const methodName = propertyAccess.getName();
-        if (['json', 'send', 'end', 'write'].includes(methodName)) {
-          const args = callExpr.getArguments();
-          if (args.length > 0) {
-            return args[0];
-          }
-        }
-      }
-      // For other call expressions, return the call itself
-      return callExpr;
-    }
-
-    return null;
   }
 
   // ===========================================================================
