@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.9](https://github.com/daveymoores/carrick/compare/carrick-v0.1.8...carrick-v0.1.9) (2026-04-20)
+
+
+### Features
+
+* framework coverage for Koa, Fastify, Hapi, NestJS, Hono ([65a060a](https://github.com/daveymoores/carrick/commit/65a060a39eb1796ef539ea914435fbc7e69f0ce5))
+
+
+### Documentation
+
+* add growth playbook ([e7ea644](https://github.com/daveymoores/carrick/commit/e7ea644c1e40ec2e995a6305aef31312d2dd9be2))
+
 ## [0.1.8](https://github.com/daveymoores/carrick/compare/carrick-v0.1.7...carrick-v0.1.8) (2026-04-09)
 
 
