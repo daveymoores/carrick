@@ -234,20 +234,20 @@ impl UrlNormalizer {
         let mut is_external = false;
 
         // Check if starts with a variable that might be a base URL
-        if url.starts_with("${") {
-            if let Some(end) = url.find('}') {
-                let var_name = &url[2..end];
-                // Check if this is a known env var
-                if self.internal_env_vars.contains(var_name) {
-                    is_internal = true;
-                    stripped_host = Some(format!("${{{}}}", var_name));
-                } else if self.external_env_vars.contains(var_name) {
-                    is_external = true;
-                    stripped_host = Some(format!("${{{}}}", var_name));
-                }
-                // Remove the base URL variable
-                result = url[end + 1..].to_string();
+        if url.starts_with("${")
+            && let Some(end) = url.find('}')
+        {
+            let var_name = &url[2..end];
+            // Check if this is a known env var
+            if self.internal_env_vars.contains(var_name) {
+                is_internal = true;
+                stripped_host = Some(format!("${{{}}}", var_name));
+            } else if self.external_env_vars.contains(var_name) {
+                is_external = true;
+                stripped_host = Some(format!("${{{}}}", var_name));
             }
+            // Remove the base URL variable
+            result = url[end + 1..].to_string();
         }
 
         // Convert remaining ${varName} to :varName for path parameter matching

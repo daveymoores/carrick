@@ -479,21 +479,20 @@ fn extract_from_code_block(text: &str) -> &str {
         if let Some(end) = text[start + 7..].find("```") {
             return text[start + 7..start + 7 + end].trim();
         }
-    } else if let Some(start) = text.find("```") {
-        if let Some(end) = text[start + 3..].find("```") {
-            return text[start + 3..start + 3 + end].trim();
-        }
+    } else if let Some(start) = text.find("```")
+        && let Some(end) = text[start + 3..].find("```")
+    {
+        return text[start + 3..start + 3 + end].trim();
     }
     text
 }
 
 fn extract_json_array(text: &str) -> &str {
-    if let Some(start) = text.find('[') {
-        if let Some(end) = text.rfind(']') {
-            if end > start {
-                return &text[start..=end];
-            }
-        }
+    if let Some(start) = text.find('[')
+        && let Some(end) = text.rfind(']')
+        && end > start
+    {
+        return &text[start..=end];
     }
     "[]"
 }
@@ -513,28 +512,28 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
             // Check if schema is for an array
             if schema_val.get("type").and_then(|t| t.as_str()) == Some("ARRAY") {
                 // Check what kind of array based on the items schema
-                if let Some(items) = schema_val.get("items") {
-                    if let Some(props) = items.get("properties") {
-                        // Triage schema - has location, classification, confidence
-                        if props.get("classification").is_some() {
-                            return generate_mock_triage_response(prompt);
-                        }
-                        // Endpoint schema - has method, path, handler, node_name
-                        if props.get("node_name").is_some() && props.get("path").is_some() {
-                            return generate_mock_endpoint_response(prompt);
-                        }
-                        // Consumer schema - has library, url, method
-                        if props.get("library").is_some() {
-                            return generate_mock_consumer_response(prompt);
-                        }
-                        // Mount schema - has parent_node, child_node, mount_path
-                        if props.get("parent_node").is_some() && props.get("child_node").is_some() {
-                            return generate_mock_mount_response(prompt);
-                        }
-                        // Middleware schema - has middleware_type
-                        if props.get("middleware_type").is_some() {
-                            return generate_mock_middleware_response(prompt);
-                        }
+                if let Some(items) = schema_val.get("items")
+                    && let Some(props) = items.get("properties")
+                {
+                    // Triage schema - has location, classification, confidence
+                    if props.get("classification").is_some() {
+                        return generate_mock_triage_response(prompt);
+                    }
+                    // Endpoint schema - has method, path, handler, node_name
+                    if props.get("node_name").is_some() && props.get("path").is_some() {
+                        return generate_mock_endpoint_response(prompt);
+                    }
+                    // Consumer schema - has library, url, method
+                    if props.get("library").is_some() {
+                        return generate_mock_consumer_response(prompt);
+                    }
+                    // Mount schema - has parent_node, child_node, mount_path
+                    if props.get("parent_node").is_some() && props.get("child_node").is_some() {
+                        return generate_mock_mount_response(prompt);
+                    }
+                    // Middleware schema - has middleware_type
+                    if props.get("middleware_type").is_some() {
+                        return generate_mock_middleware_response(prompt);
                     }
                 }
                 // Default array response
@@ -683,12 +682,12 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
             return entry.clone();
         }
         let trimmed_line = line_text.trim();
-        if !trimmed_line.is_empty() {
-            if let Some(entry) = candidate_snippets.iter().find(|(_, _, _, snippet)| {
+        if !trimmed_line.is_empty()
+            && let Some(entry) = candidate_snippets.iter().find(|(_, _, _, snippet)| {
                 snippet.contains(trimmed_line) || trimmed_line.contains(snippet)
-            }) {
-                return (entry.0.clone(), entry.1, entry.2);
-            }
+            })
+        {
+            return (entry.0.clone(), entry.1, entry.2);
         }
         (format!("line:{}", line_number), None, None)
     };
@@ -937,21 +936,21 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
 /// Helper to extract path from a line like: app.get("/users", handler)
 fn extract_path_from_line(line: &str) -> Option<String> {
     // Try double quotes first
-    if let Some(start) = line.find("\"") {
-        if let Some(end) = line[start + 1..].find("\"") {
-            let path = &line[start + 1..start + 1 + end];
-            if path.starts_with('/') {
-                return Some(path.to_string());
-            }
+    if let Some(start) = line.find("\"")
+        && let Some(end) = line[start + 1..].find("\"")
+    {
+        let path = &line[start + 1..start + 1 + end];
+        if path.starts_with('/') {
+            return Some(path.to_string());
         }
     }
     // Try single quotes
-    if let Some(start) = line.find("'") {
-        if let Some(end) = line[start + 1..].find("'") {
-            let path = &line[start + 1..start + 1 + end];
-            if path.starts_with('/') {
-                return Some(path.to_string());
-            }
+    if let Some(start) = line.find("'")
+        && let Some(end) = line[start + 1..].find("'")
+    {
+        let path = &line[start + 1..start + 1 + end];
+        if path.starts_with('/') {
+            return Some(path.to_string());
         }
     }
     None
@@ -982,10 +981,10 @@ fn extract_url_from_line(line: &str) -> Option<String> {
         return Some(path);
     }
     // Handle backtick template literals
-    if let Some(start) = line.find('`') {
-        if let Some(end) = line[start + 1..].find('`') {
-            return Some(line[start + 1..start + 1 + end].to_string());
-        }
+    if let Some(start) = line.find('`')
+        && let Some(end) = line[start + 1..].find('`')
+    {
+        return Some(line[start + 1..start + 1 + end].to_string());
     }
     None
 }
@@ -1476,13 +1475,12 @@ fn extract_call_sites_from_prompt(prompt: &str) -> Vec<serde_json::Value> {
         let abs_start = current_pos + start;
         if let Some(end_offset) = find_matching_bracket(&prompt[abs_start..]) {
             let json_str = &prompt[abs_start..abs_start + end_offset];
-            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
-                if !parsed.is_empty()
-                    && parsed[0].get("callee_object").is_some()
-                    && parsed[0].get("location").is_some()
-                {
-                    return parsed;
-                }
+            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(json_str)
+                && !parsed.is_empty()
+                && parsed[0].get("callee_object").is_some()
+                && parsed[0].get("location").is_some()
+            {
+                return parsed;
             }
         }
         current_pos = abs_start + 1;

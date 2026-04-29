@@ -294,10 +294,10 @@ fn discover_sidecar_path() -> Option<PathBuf> {
 
 /// Get a path relative to the executable location
 fn get_executable_relative_path(relative: &str) -> PathBuf {
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            return exe_dir.join(relative);
-        }
+    if let Ok(exe_path) = env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        return exe_dir.join(relative);
     }
     PathBuf::from(relative)
 }

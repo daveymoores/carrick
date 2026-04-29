@@ -106,12 +106,11 @@ mod tests {
 
     impl Visit for BindingIdCollector {
         fn visit_var_declarator(&mut self, var_decl: &VarDeclarator) {
-            if self.global_var_i.is_none() {
-                if let Pat::Ident(binding) = &var_decl.name {
-                    if binding.id.sym.as_ref() == "i" {
-                        self.global_var_i = Some(binding.id.to_id());
-                    }
-                }
+            if self.global_var_i.is_none()
+                && let Pat::Ident(binding) = &var_decl.name
+                && binding.id.sym.as_ref() == "i"
+            {
+                self.global_var_i = Some(binding.id.to_id());
             }
 
             var_decl.visit_children_with(self);
@@ -120,11 +119,11 @@ mod tests {
         fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
             if self.arrow_param_i.is_none() {
                 for param in &arrow.params {
-                    if let Pat::Ident(binding) = param {
-                        if binding.id.sym.as_ref() == "i" {
-                            self.arrow_param_i = Some(binding.id.to_id());
-                            break;
-                        }
+                    if let Pat::Ident(binding) = param
+                        && binding.id.sym.as_ref() == "i"
+                    {
+                        self.arrow_param_i = Some(binding.id.to_id());
+                        break;
                     }
                 }
             }

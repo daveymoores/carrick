@@ -2,12 +2,6 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, io, path::PathBuf};
 
-#[derive(Debug, Serialize)]
-pub struct PackagesDataForTypeScript {
-    pub name: String,
-    pub dependencies: HashMap<String, String>,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PackageJson {
     pub name: Option<String>,

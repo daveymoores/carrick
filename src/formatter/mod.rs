@@ -397,31 +397,31 @@ fn group_similar_issues(issues: &[String]) -> HashMap<String, Vec<String>> {
 
 fn extract_issue_type(issue: &str) -> String {
     if issue.contains("Request body mismatch") {
-        if let Some(start) = issue.find("for ") {
-            if let Some(end) = issue.find(" ->") {
-                return format!("Request Body Mismatch: `{}`", &issue[start + 4..end]);
-            }
+        if let Some(start) = issue.find("for ")
+            && let Some(end) = issue.find(" ->")
+        {
+            return format!("Request Body Mismatch: `{}`", &issue[start + 4..end]);
         }
         "Request Body Mismatch".to_string()
     } else if issue.contains(": Type '") {
         // Parse any TypeScript compiler error to extract endpoint
         let methods = ["GET ", "POST ", "PUT ", "DELETE ", "PATCH "];
         for method in &methods {
-            if let Some(start) = issue.find(method) {
-                if let Some(end) = issue.find(": Type '") {
-                    let endpoint = &issue[start..end];
-                    return format!("TypeScript Error: `{}`", endpoint);
-                }
+            if let Some(start) = issue.find(method)
+                && let Some(end) = issue.find(": Type '")
+            {
+                let endpoint = &issue[start..end];
+                return format!("TypeScript Error: `{}`", endpoint);
             }
         }
         "TypeScript Error".to_string()
     } else if issue.contains("Type mismatch on ") {
         // Parse structured type mismatch errors
-        if let Some(start) = issue.find("Type mismatch on ") {
-            if let Some(end) = issue.find(": Producer") {
-                let endpoint = &issue[start + 17..end];
-                return format!("Type Compatibility Issue: `{}`", endpoint);
-            }
+        if let Some(start) = issue.find("Type mismatch on ")
+            && let Some(end) = issue.find(": Producer")
+        {
+            let endpoint = &issue[start + 17..end];
+            return format!("Type Compatibility Issue: `{}`", endpoint);
         }
         "Type Compatibility Issue".to_string()
     } else if issue.contains("Type mismatch") {
@@ -479,11 +479,11 @@ fn parse_generic_typescript_error(issue: &str) -> (String, String) {
         let mut found_endpoint = "Unknown".to_string();
 
         for method in &methods {
-            if let Some(start) = issue.find(method) {
-                if let Some(end) = issue.find(": Type '") {
-                    found_endpoint = issue[start..end].to_string();
-                    break;
-                }
+            if let Some(start) = issue.find(method)
+                && let Some(end) = issue.find(": Type '")
+            {
+                found_endpoint = issue[start..end].to_string();
+                break;
             }
         }
         found_endpoint

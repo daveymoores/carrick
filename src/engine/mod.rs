@@ -59,10 +59,10 @@ type FileDiscoveryResult = Result<
 /// Only upload on main/master branch, not on PRs
 fn should_upload_data() -> bool {
     // Check if we're in a pull request
-    if let Ok(event_name) = env::var("GITHUB_EVENT_NAME") {
-        if event_name == "pull_request" {
-            return false;
-        }
+    if let Ok(event_name) = env::var("GITHUB_EVENT_NAME")
+        && event_name == "pull_request"
+    {
+        return false;
     }
 
     // Check if we're on a feature branch (not main/master)
@@ -195,26 +195,24 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     print_results(results);
 
     // 7. Best-effort log upload (only on main/master, same policy as data upload)
-    if should_upload {
-        if let Some(log_path) = logging::get_log_file_path() {
-            const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    if should_upload && let Some(log_path) = logging::get_log_file_path() {
+        const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
-            if let Ok(mut file) = std::fs::File::open(&log_path) {
-                use std::io::{Read, Seek};
-                if let Ok(metadata) = file.metadata() {
-                    let file_len = metadata.len();
-                    let start = file_len.saturating_sub(MAX_LOG_BYTES);
-                    if file.seek(std::io::SeekFrom::Start(start)).is_ok() {
-                        let mut buf = Vec::with_capacity((file_len - start) as usize);
-                        if file.read_to_end(&mut buf).is_ok() {
-                            let log_content = String::from_utf8_lossy(&buf);
-                            let repo_name = get_repository_name(repo_path);
-                            if let Err(e) = storage
-                                .upload_logs(&carrick_org, &repo_name, &log_content)
-                                .await
-                            {
-                                debug!("Failed to upload logs: {:?}", e);
-                            }
+        if let Ok(mut file) = std::fs::File::open(&log_path) {
+            use std::io::{Read, Seek};
+            if let Ok(metadata) = file.metadata() {
+                let file_len = metadata.len();
+                let start = file_len.saturating_sub(MAX_LOG_BYTES);
+                if file.seek(std::io::SeekFrom::Start(start)).is_ok() {
+                    let mut buf = Vec::with_capacity((file_len - start) as usize);
+                    if file.read_to_end(&mut buf).is_ok() {
+                        let log_content = String::from_utf8_lossy(&buf);
+                        let repo_name = get_repository_name(repo_path);
+                        if let Err(e) = storage
+                            .upload_logs(&carrick_org, &repo_name, &log_content)
+                            .await
+                        {
+                            debug!("Failed to upload logs: {:?}", e);
                         }
                     }
                 }
@@ -272,10 +270,10 @@ where
 
     // For non-Config types, use the first found (original behavior)
     for repo_data in all_repo_data {
-        if let Some(json_str) = extractor(repo_data) {
-            if let Ok(data) = serde_json::from_str::<T>(json_str) {
-                return Ok(data);
-            }
+        if let Some(json_str) = extractor(repo_data)
+            && let Ok(data) = serde_json::from_str::<T>(json_str)
+        {
+            return Ok(data);
         }
     }
     Ok(T::default())
@@ -295,17 +293,17 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     // Payload size guard: Lambda function URLs have a 6MB request payload limit.
     // If serialized data exceeds ~5MB, drop file_results to stay under the limit.
     const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
-    if let Ok(serialized) = serde_json::to_string(&data) {
-        if serialized.len() > MAX_PAYLOAD_BYTES {
-            warn!(
-                "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
-                serialized.len() / 1024,
-                MAX_PAYLOAD_BYTES / 1024
-            );
-            data.file_results = None;
-            data.cached_detection = None;
-            data.cached_guidance = None;
-        }
+    if let Ok(serialized) = serde_json::to_string(&data)
+        && serialized.len() > MAX_PAYLOAD_BYTES
+    {
+        warn!(
+            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
+            serialized.len() / 1024,
+            MAX_PAYLOAD_BYTES / 1024
+        );
+        data.file_results = None;
+        data.cached_detection = None;
+        data.cached_guidance = None;
     }
 
     data

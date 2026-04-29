@@ -16,10 +16,10 @@ pub fn join_prefix_and_path(prefix: &str, path: &str) -> String {
 /// Get repository name, checking GITHUB_REPOSITORY environment variable first
 pub fn get_repository_name(repo_path: &str) -> String {
     // Check for GitHub Actions environment variable (format: "owner/repo")
-    if let Ok(github_repo) = env::var("GITHUB_REPOSITORY") {
-        if let Some(repo_name) = github_repo.split('/').last() {
-            return repo_name.to_string();
-        }
+    if let Ok(github_repo) = env::var("GITHUB_REPOSITORY")
+        && let Some(repo_name) = github_repo.split('/').next_back()
+    {
+        return repo_name.to_string();
     }
 
     // Fall back to extracting from path
@@ -30,12 +30,11 @@ pub fn get_repository_name(repo_path: &str) -> String {
         .unwrap_or(".");
 
     // If we got "." (current directory), use the actual directory name
-    if path_name == "." {
-        if let Ok(current_dir) = env::current_dir() {
-            if let Some(dir_name) = current_dir.file_name() {
-                return dir_name.to_string_lossy().to_string();
-            }
-        }
+    if path_name == "."
+        && let Ok(current_dir) = env::current_dir()
+        && let Some(dir_name) = current_dir.file_name()
+    {
+        return dir_name.to_string_lossy().to_string();
     }
 
     path_name.to_string()

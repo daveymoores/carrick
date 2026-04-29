@@ -545,15 +545,15 @@ impl Analyzer {
         }
 
         // Handle ${process.env.VAR} or ${VAR} patterns
-        if let Some(start) = route.find("${") {
-            if let Some(end) = route[start..].find('}') {
-                let inner = &route[start + 2..start + end];
-                // Handle process.env.VAR -> VAR
-                if let Some(last_dot) = inner.rfind('.') {
-                    return inner[last_dot + 1..].to_string();
-                }
-                return inner.to_string();
+        if let Some(start) = route.find("${")
+            && let Some(end) = route[start..].find('}')
+        {
+            let inner = &route[start + 2..start + end];
+            // Handle process.env.VAR -> VAR
+            if let Some(last_dot) = inner.rfind('.') {
+                return inner[last_dot + 1..].to_string();
             }
+            return inner.to_string();
         }
 
         // Handle process.env.VAR patterns (without ${})
@@ -568,14 +568,14 @@ impl Analyzer {
         }
 
         // Handle start-of-string variable (e.g. API_URL + "/path")
-        if let Some(first_char) = route.chars().next() {
-            if first_char.is_uppercase() {
-                let end = route
-                    .find(|c: char| !c.is_alphanumeric() && c != '_')
-                    .unwrap_or(route.len());
-                if end > 0 {
-                    return route[..end].to_string();
-                }
+        if let Some(first_char) = route.chars().next()
+            && first_char.is_uppercase()
+        {
+            let end = route
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(route.len());
+            if end > 0 {
+                return route[..end].to_string();
             }
         }
 
@@ -604,41 +604,41 @@ impl Analyzer {
         }
 
         // Check for ${...} at the START of the route (not in the middle)
-        if route.starts_with("${") {
-            if let Some(end) = route.find('}') {
-                let var_name = &route[2..end];
-                // If it contains a dot (like process.env.X) or is UPPER_CASE, it's an env var
-                if var_name.contains('.')
-                    || var_name
-                        .chars()
-                        .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
-                {
-                    return true;
-                }
+        if route.starts_with("${")
+            && let Some(end) = route.find('}')
+        {
+            let var_name = &route[2..end];
+            // If it contains a dot (like process.env.X) or is UPPER_CASE, it's an env var
+            if var_name.contains('.')
+                || var_name
+                    .chars()
+                    .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+            {
+                return true;
             }
         }
 
         // Check for start-of-string variables (e.g. API_URL + "/path")
         // If it starts with an uppercase letter and is not a path (doesn't start with /),
         // we treat it as a potential environment variable or constant base URL.
-        if let Some(first_char) = route.chars().next() {
-            if first_char.is_uppercase() {
-                // Extract the first identifier
-                let end = route
-                    .find(|c: char| !c.is_alphanumeric() && c != '_')
-                    .unwrap_or(route.len());
+        if let Some(first_char) = route.chars().next()
+            && first_char.is_uppercase()
+        {
+            // Extract the first identifier
+            let end = route
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(route.len());
 
-                // If the identifier is non-empty and looks like a constant (mostly uppercase/digits/underscore)
-                // we treat it as an env var.
-                // We verify it's at least 2 chars to avoid single letters being treated as vars excessively
-                if end >= 2 {
-                    let ident = &route[..end];
-                    if ident
-                        .chars()
-                        .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
-                    {
-                        return true;
-                    }
+            // If the identifier is non-empty and looks like a constant (mostly uppercase/digits/underscore)
+            // we treat it as an env var.
+            // We verify it's at least 2 chars to avoid single letters being treated as vars excessively
+            if end >= 2 {
+                let ident = &route[..end];
+                if ident
+                    .chars()
+                    .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+                {
+                    return true;
                 }
             }
         }
@@ -729,50 +729,45 @@ impl Analyzer {
         });
 
         for endpoint in &self.endpoints {
-            if let Some(handler_name) = &endpoint.handler_name {
-                if let Some(func_def) = self.function_definitions.get(handler_name) {
-                    if func_def.arguments.len() >= 2 {
-                        // Process Request Type (argument 0)
-                        if let Some(req_type_ann_swc) = &func_def.arguments[0].type_ann {
-                            let alias = Self::generate_common_type_alias_name(
-                                &endpoint.route,
-                                &endpoint.method,
-                                true,  // is_request_type
-                                false, // is_consumer = false (endpoints are producers)
-                            );
-                            if let Some(type_ref) = Self::create_type_reference_from_swc(
-                                req_type_ann_swc,
-                                &cm,
-                                &func_def.file_path,
-                                alias,
-                            ) {
-                                request_types_map.insert(
-                                    (endpoint.route.clone(), endpoint.method.clone()),
-                                    type_ref,
-                                );
-                            }
-                        }
+            if let Some(handler_name) = &endpoint.handler_name
+                && let Some(func_def) = self.function_definitions.get(handler_name)
+                && func_def.arguments.len() >= 2
+            {
+                // Process Request Type (argument 0)
+                if let Some(req_type_ann_swc) = &func_def.arguments[0].type_ann {
+                    let alias = Self::generate_common_type_alias_name(
+                        &endpoint.route,
+                        &endpoint.method,
+                        true,  // is_request_type
+                        false, // is_consumer = false (endpoints are producers)
+                    );
+                    if let Some(type_ref) = Self::create_type_reference_from_swc(
+                        req_type_ann_swc,
+                        &cm,
+                        &func_def.file_path,
+                        alias,
+                    ) {
+                        request_types_map
+                            .insert((endpoint.route.clone(), endpoint.method.clone()), type_ref);
+                    }
+                }
 
-                        // Process Response Type (argument 1)
-                        if let Some(res_type_ann_swc) = &func_def.arguments[1].type_ann {
-                            let alias = Self::generate_common_type_alias_name(
-                                &endpoint.route,
-                                &endpoint.method,
-                                false, // is_request_type = false
-                                false, // is_consumer = false (endpoints are producers)
-                            );
-                            if let Some(type_ref) = Self::create_type_reference_from_swc(
-                                res_type_ann_swc,
-                                &cm,
-                                &func_def.file_path,
-                                alias,
-                            ) {
-                                response_types_map.insert(
-                                    (endpoint.route.clone(), endpoint.method.clone()),
-                                    type_ref,
-                                );
-                            }
-                        }
+                // Process Response Type (argument 1)
+                if let Some(res_type_ann_swc) = &func_def.arguments[1].type_ann {
+                    let alias = Self::generate_common_type_alias_name(
+                        &endpoint.route,
+                        &endpoint.method,
+                        false, // is_request_type = false
+                        false, // is_consumer = false (endpoints are producers)
+                    );
+                    if let Some(type_ref) = Self::create_type_reference_from_swc(
+                        res_type_ann_swc,
+                        &cm,
+                        &func_def.file_path,
+                        alias,
+                    ) {
+                        response_types_map
+                            .insert((endpoint.route.clone(), endpoint.method.clone()), type_ref);
                     }
                 }
             }
@@ -1411,7 +1406,7 @@ impl Analyzer {
                 }
                 let path = &caps[1];
                 // Extract just the filename without path for readability
-                if let Some(filename) = path.split('/').last() {
+                if let Some(filename) = path.split('/').next_back() {
                     format!("{}.{}", filename, type_name)
                 } else {
                     format!("{}.{}", path, type_name)

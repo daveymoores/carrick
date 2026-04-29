@@ -30,21 +30,21 @@ pub fn init(verbose: bool) {
     // Try to set up file logging to ~/.carrick/logs/
     let log_dir = dirs::home_dir().map(|h| h.join(".carrick").join("logs"));
 
-    if let Some(ref dir) = log_dir {
-        if std::fs::create_dir_all(dir).is_ok() {
-            let file_appender = rolling::daily(dir, "carrick.log");
-            let file_layer = fmt::layer()
-                .with_writer(file_appender)
-                .with_ansi(false)
-                .with_target(true)
-                .with_filter(EnvFilter::new("debug"));
+    if let Some(ref dir) = log_dir
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let file_appender = rolling::daily(dir, "carrick.log");
+        let file_layer = fmt::layer()
+            .with_writer(file_appender)
+            .with_ansi(false)
+            .with_target(true)
+            .with_filter(EnvFilter::new("debug"));
 
-            let _ = tracing_subscriber::registry()
-                .with(terminal_layer)
-                .with(file_layer)
-                .try_init();
-            return;
-        }
+        let _ = tracing_subscriber::registry()
+            .with(terminal_layer)
+            .with(file_layer)
+            .try_init();
+        return;
     }
 
     // Fallback: terminal only

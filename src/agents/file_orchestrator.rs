@@ -507,10 +507,8 @@ impl FileOrchestrator {
                         span_end: endpoint.call_expression_span_end,
                     },
                 );
-                if !response_inferred {
-                    if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
-                        inline_aliases.push((response_alias.clone(), symbol.clone()));
-                    }
+                if !response_inferred && let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
+                    inline_aliases.push((response_alias.clone(), symbol.clone()));
                 }
 
                 if should_infer_request_body(&method) {
@@ -647,10 +645,8 @@ impl FileOrchestrator {
                         span_end: data_call.call_expression_span_end,
                     },
                 );
-                if !call_inferred {
-                    if let Some(symbol) = data_call.primary_type_symbol.as_ref() {
-                        inline_aliases.push((response_alias.clone(), symbol.clone()));
-                    }
+                if !call_inferred && let Some(symbol) = data_call.primary_type_symbol.as_ref() {
+                    inline_aliases.push((response_alias.clone(), symbol.clone()));
                 }
 
                 if should_infer_request_body(&method) {
@@ -757,12 +753,12 @@ impl FileOrchestrator {
     fn normalize_unusable_types(result: &mut FileAnalysisResult, frameworks: &[String]) {
         let scrub = |primary: &mut Option<String>, source: &mut Option<String>| {
             // Check type_import_source against ALL detected frameworks
-            if let Some(src) = source.as_deref() {
-                if frameworks.iter().any(|f| f == src) {
-                    *primary = None;
-                    *source = None;
-                    return;
-                }
+            if let Some(src) = source.as_deref()
+                && frameworks.iter().any(|f| f == src)
+            {
+                *primary = None;
+                *source = None;
+                return;
             }
             // Check primary_type_symbol: if it matches a framework package name
             // (the default import), it's a framework namespace, not a payload type
