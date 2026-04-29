@@ -330,10 +330,10 @@ impl CandidateVisitor {
 
     /// Check if this is a global fetch call
     fn is_global_fetch(&self, callee: &Callee) -> bool {
-        if let Callee::Expr(expr) = callee {
-            if let Expr::Ident(ident) = &**expr {
-                return ident.sym.as_ref() == "fetch";
-            }
+        if let Callee::Expr(expr) = callee
+            && let Expr::Ident(ident) = &**expr
+        {
+            return ident.sym.as_ref() == "fetch";
         }
         false
     }
@@ -452,28 +452,28 @@ impl Visit for CandidateVisitor {
         // framework-agnostic path for class-method routing (NestJS) — the
         // scanner stays free of framework names; the LLM classifies the
         // decorator by its identifier via the Import Table.
-        if let Expr::Call(call) = &*node.expr {
-            if let Callee::Expr(callee_expr) = &call.callee {
-                let callee_name = Self::extract_callee_object(callee_expr);
-                if let Some(name) = callee_name {
-                    let line_number = self.get_line_number(call.span);
-                    let (span_start, span_end) = self.span_range(call.span);
-                    let candidate_id = self.candidate_id(span_start, span_end);
-                    let code_snippet = self.get_code_snippet(call.span);
-                    let path_snippet = self.extract_first_arg_snippet(call);
+        if let Expr::Call(call) = &*node.expr
+            && let Callee::Expr(callee_expr) = &call.callee
+        {
+            let callee_name = Self::extract_callee_object(callee_expr);
+            if let Some(name) = callee_name {
+                let line_number = self.get_line_number(call.span);
+                let (span_start, span_end) = self.span_range(call.span);
+                let candidate_id = self.candidate_id(span_start, span_end);
+                let code_snippet = self.get_code_snippet(call.span);
+                let path_snippet = self.extract_first_arg_snippet(call);
 
-                    self.candidates.push(CandidateTarget {
-                        candidate_id,
-                        span_start,
-                        span_end,
-                        line_number,
-                        callee_object: name,
-                        callee_property: None,
-                        enclosing_function: self.current_function(),
-                        path_snippet,
-                        code_snippet,
-                    });
-                }
+                self.candidates.push(CandidateTarget {
+                    candidate_id,
+                    span_start,
+                    span_end,
+                    line_number,
+                    callee_object: name,
+                    callee_property: None,
+                    enclosing_function: self.current_function(),
+                    path_snippet,
+                    code_snippet,
+                });
             }
         }
         node.visit_children_with(self);
@@ -502,53 +502,52 @@ impl Visit for CandidateVisitor {
         }
 
         // Check for method calls (obj.method())
-        if let Callee::Expr(callee_expr) = &call.callee {
-            if let Expr::Member(member) = &**callee_expr {
-                // Extract method name
-                let method_name = match &member.prop {
-                    MemberProp::Ident(ident) => Some(ident.sym.to_string()),
-                    MemberProp::Computed(computed) => {
-                        if let Expr::Lit(Lit::Str(s)) = &*computed.expr {
-                            Some(s.value.to_string())
-                        } else {
-                            None
-                        }
+        if let Callee::Expr(callee_expr) = &call.callee
+            && let Expr::Member(member) = &**callee_expr
+        {
+            // Extract method name
+            let method_name = match &member.prop {
+                MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+                MemberProp::Computed(computed) => {
+                    if let Expr::Lit(Lit::Str(s)) = &*computed.expr {
+                        Some(s.value.to_string())
+                    } else {
+                        None
                     }
-                    MemberProp::PrivateName(_) => None,
+                }
+                MemberProp::PrivateName(_) => None,
+            };
+
+            if let Some(method) = method_name {
+                // Extract object name
+                let obj_name = Self::extract_callee_object(&member.obj);
+
+                // Check if this looks like an API call
+                let is_api_call = match &obj_name {
+                    Some(name) => {
+                        self.is_potential_api_object(name) || self.is_potential_api_method(&method)
+                    }
+                    None => self.is_potential_api_method(&method),
                 };
 
-                if let Some(method) = method_name {
-                    // Extract object name
-                    let obj_name = Self::extract_callee_object(&member.obj);
+                if is_api_call {
+                    let line_number = self.get_line_number(call.span);
+                    let (span_start, span_end) = self.span_range(call.span);
+                    let candidate_id = self.candidate_id(span_start, span_end);
+                    let code_snippet = self.get_code_snippet(call.span);
+                    let path_snippet = self.extract_first_arg_snippet(call);
 
-                    // Check if this looks like an API call
-                    let is_api_call = match &obj_name {
-                        Some(name) => {
-                            self.is_potential_api_object(name)
-                                || self.is_potential_api_method(&method)
-                        }
-                        None => self.is_potential_api_method(&method),
-                    };
-
-                    if is_api_call {
-                        let line_number = self.get_line_number(call.span);
-                        let (span_start, span_end) = self.span_range(call.span);
-                        let candidate_id = self.candidate_id(span_start, span_end);
-                        let code_snippet = self.get_code_snippet(call.span);
-                        let path_snippet = self.extract_first_arg_snippet(call);
-
-                        self.candidates.push(CandidateTarget {
-                            candidate_id,
-                            span_start,
-                            span_end,
-                            line_number,
-                            callee_object: obj_name.unwrap_or_else(|| "<chain>".to_string()),
-                            callee_property: Some(method),
-                            enclosing_function: self.current_function(),
-                            path_snippet,
-                            code_snippet,
-                        });
-                    }
+                    self.candidates.push(CandidateTarget {
+                        candidate_id,
+                        span_start,
+                        span_end,
+                        line_number,
+                        callee_object: obj_name.unwrap_or_else(|| "<chain>".to_string()),
+                        callee_property: Some(method),
+                        enclosing_function: self.current_function(),
+                        path_snippet,
+                        code_snippet,
+                    });
                 }
             }
         }

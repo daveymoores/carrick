@@ -436,34 +436,33 @@ impl CallSiteExtractor {
                 };
 
                 // Get type annotation if present
-                if let Pat::Ident(ident) = &param.pat {
-                    if let Some(type_ann) = &ident.type_ann {
-                        let type_string = self
-                            .source_map
-                            .span_to_snippet(type_ann.type_ann.span())
-                            .unwrap_or_else(|_| "unknown".to_string());
+                if let Pat::Ident(ident) = &param.pat
+                    && let Some(type_ann) = &ident.type_ann
+                {
+                    let type_string = self
+                        .source_map
+                        .span_to_snippet(type_ann.type_ann.span())
+                        .unwrap_or_else(|_| "unknown".to_string());
 
-                        // Calculate file-relative UTF-16 offset
-                        let span = type_ann.type_ann.span();
-                        let loc = self.source_map.lookup_char_pos(span.lo);
-                        let file_start = loc.file.start_pos;
-                        let file_relative_byte = (span.lo - file_start).0 as usize;
+                    // Calculate file-relative UTF-16 offset
+                    let span = type_ann.type_ann.span();
+                    let loc = self.source_map.lookup_char_pos(span.lo);
+                    let file_start = loc.file.start_pos;
+                    let file_relative_byte = (span.lo - file_start).0 as usize;
 
-                        // Read file content to convert to UTF-16
-                        let utf16_offset = if let Ok(content) =
-                            std::fs::read_to_string(&self.current_file)
-                        {
+                    // Read file content to convert to UTF-16
+                    let utf16_offset =
+                        if let Ok(content) = std::fs::read_to_string(&self.current_file) {
                             Self::byte_offset_to_utf16_offset(&content, file_relative_byte) as u32
                         } else {
                             file_relative_byte as u32
                         };
 
-                        return Some(HandlerParamType {
-                            param_name: name,
-                            type_string,
-                            utf16_offset,
-                        });
-                    }
+                    return Some(HandlerParamType {
+                        param_name: name,
+                        type_string,
+                        utf16_offset,
+                    });
                 }
                 None
             })
@@ -729,10 +728,10 @@ impl CallSiteExtractor {
 
     fn extract_http_method_from_call(&self, call: &CallExpr) -> Option<String> {
         for arg in &call.args {
-            if let Expr::Object(obj) = &*arg.expr {
-                if let Some(method) = self.extract_http_method_from_object(obj) {
-                    return Some(method);
-                }
+            if let Expr::Object(obj) = &*arg.expr
+                && let Some(method) = self.extract_http_method_from_object(obj)
+            {
+                return Some(method);
             }
         }
 
@@ -776,13 +775,13 @@ impl CallSiteExtractor {
 
         let mut merged: Vec<Span> = Vec::new();
         for span in spans {
-            if let Some(last) = merged.last_mut() {
-                if span.lo <= last.hi {
-                    if span.hi > last.hi {
-                        last.hi = span.hi;
-                    }
-                    continue;
+            if let Some(last) = merged.last_mut()
+                && span.lo <= last.hi
+            {
+                if span.hi > last.hi {
+                    last.hi = span.hi;
                 }
+                continue;
             }
 
             merged.push(span);
@@ -972,10 +971,10 @@ impl Visit for CallSiteExtractor {
                         _ => {}
                     }
 
-                    if let Some(call_expr) = Self::find_call_expr_in_expr(init) {
-                        if let Some(info) = self.build_correlated_call_info(call_expr) {
-                            self.call_result_vars.insert(var_name.clone(), info);
-                        }
+                    if let Some(call_expr) = Self::find_call_expr_in_expr(init)
+                        && let Some(info) = self.build_correlated_call_info(call_expr)
+                    {
+                        self.call_result_vars.insert(var_name.clone(), info);
                     }
 
                     // Extract type annotation and link to call expression if present
@@ -1199,10 +1198,10 @@ mod definition_index_tests {
     impl Visit for IdFinder {
         fn visit_import_decl(&mut self, import: &ImportDecl) {
             for spec in &import.specifiers {
-                if let ImportSpecifier::Named(named) = spec {
-                    if named.local.sym.as_ref() == "r" {
-                        self.import_r = Some(named.local.to_id());
-                    }
+                if let ImportSpecifier::Named(named) = spec
+                    && named.local.sym.as_ref() == "r"
+                {
+                    self.import_r = Some(named.local.to_id());
                 }
             }
 
@@ -1225,11 +1224,11 @@ mod definition_index_tests {
         fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
             if self.arrow_param_r.is_none() {
                 for param in &arrow.params {
-                    if let Pat::Ident(binding) = param {
-                        if binding.id.sym.as_ref() == "r" {
-                            self.arrow_param_r = Some(binding.id.to_id());
-                            break;
-                        }
+                    if let Pat::Ident(binding) = param
+                        && binding.id.sym.as_ref() == "r"
+                    {
+                        self.arrow_param_r = Some(binding.id.to_id());
+                        break;
                     }
                 }
             }

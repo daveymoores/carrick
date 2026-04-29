@@ -362,10 +362,10 @@ impl FileAnalyzerAgent {
             if normalize_import_source(&mut endpoint.type_import_source) {
                 needs_retry = true;
             }
-            if let Some(ref symbol) = endpoint.primary_type_symbol {
-                if !is_valid_identifier(symbol) {
-                    endpoint.primary_type_symbol = None;
-                }
+            if let Some(ref symbol) = endpoint.primary_type_symbol
+                && !is_valid_identifier(symbol)
+            {
+                endpoint.primary_type_symbol = None;
             }
         }
 
@@ -384,10 +384,10 @@ impl FileAnalyzerAgent {
             if normalize_import_source(&mut data_call.type_import_source) {
                 needs_retry = true;
             }
-            if let Some(ref symbol) = data_call.primary_type_symbol {
-                if !is_valid_identifier(symbol) {
-                    data_call.primary_type_symbol = None;
-                }
+            if let Some(ref symbol) = data_call.primary_type_symbol
+                && !is_valid_identifier(symbol)
+            {
+                data_call.primary_type_symbol = None;
             }
         }
 

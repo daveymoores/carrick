@@ -678,10 +678,10 @@ impl TypeSidecar {
         // infer / failure-fallback loops below never shadow them with `= unknown`.
         if had_explicit_dts {
             for req in explicit {
-                if let Some(alias) = &req.alias {
-                    if Self::dts_defines_alias(&combined_dts, alias) {
-                        appended_aliases.insert(alias.clone());
-                    }
+                if let Some(alias) = &req.alias
+                    && Self::dts_defines_alias(&combined_dts, alias)
+                {
+                    appended_aliases.insert(alias.clone());
                 }
                 if Self::dts_defines_alias(&combined_dts, &req.symbol_name) {
                     appended_aliases.insert(req.symbol_name.clone());
@@ -737,10 +737,10 @@ impl TypeSidecar {
 
         if !infer.is_empty() {
             for request in infer {
-                if let Some(alias) = &request.alias {
-                    if !inferred_aliases.contains(alias) {
-                        append_alias(alias, "unknown");
-                    }
+                if let Some(alias) = &request.alias
+                    && !inferred_aliases.contains(alias)
+                {
+                    append_alias(alias, "unknown");
                 }
             }
         }
@@ -1122,10 +1122,10 @@ mod tests {
 
         if had_explicit_dts {
             for req in &explicit {
-                if let Some(alias) = &req.alias {
-                    if TypeSidecar::dts_defines_alias(&combined_dts, alias) {
-                        appended_aliases.insert(alias.clone());
-                    }
+                if let Some(alias) = &req.alias
+                    && TypeSidecar::dts_defines_alias(&combined_dts, alias)
+                {
+                    appended_aliases.insert(alias.clone());
                 }
                 if TypeSidecar::dts_defines_alias(&combined_dts, &req.symbol_name) {
                     appended_aliases.insert(req.symbol_name.clone());

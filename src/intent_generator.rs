@@ -45,15 +45,15 @@ pub async fn generate_function_intents(
     let mut deps: HashMap<String, Vec<String>> = HashMap::new();
 
     for name in &eligible {
-        if let Some(def) = function_definitions.get(name) {
-            if let Some(ref body) = def.body_source {
-                let called: Vec<String> = local_fn_names
-                    .iter()
-                    .filter(|&&fn_name| fn_name != name.as_str() && body.contains(fn_name))
-                    .map(|&s| s.to_string())
-                    .collect();
-                deps.insert(name.clone(), called);
-            }
+        if let Some(def) = function_definitions.get(name)
+            && let Some(ref body) = def.body_source
+        {
+            let called: Vec<String> = local_fn_names
+                .iter()
+                .filter(|&&fn_name| fn_name != name.as_str() && body.contains(fn_name))
+                .map(|&s| s.to_string())
+                .collect();
+            deps.insert(name.clone(), called);
         }
     }
 

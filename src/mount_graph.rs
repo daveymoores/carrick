@@ -156,10 +156,10 @@ impl MountGraph {
     #[allow(dead_code)]
     fn build_mount_edges(&mut self, classified_sites: &[ClassifiedCallSite]) {
         for site in classified_sites {
-            if matches!(site.classification, CallSiteType::RouterMount) {
-                if let Some(mount) = self.extract_mount_relationship(site) {
-                    self.mounts.push(mount);
-                }
+            if matches!(site.classification, CallSiteType::RouterMount)
+                && let Some(mount) = self.extract_mount_relationship(site)
+            {
+                self.mounts.push(mount);
             }
         }
     }
@@ -190,10 +190,10 @@ impl MountGraph {
     #[allow(dead_code)]
     fn collect_endpoints(&mut self, classified_sites: &[ClassifiedCallSite]) {
         for site in classified_sites {
-            if matches!(site.classification, CallSiteType::HttpEndpoint) {
-                if let Some(endpoint) = self.extract_endpoint(site) {
-                    self.endpoints.push(endpoint);
-                }
+            if matches!(site.classification, CallSiteType::HttpEndpoint)
+                && let Some(endpoint) = self.extract_endpoint(site)
+            {
+                self.endpoints.push(endpoint);
             }
         }
     }
@@ -238,10 +238,10 @@ impl MountGraph {
     #[allow(dead_code)]
     fn collect_data_calls(&mut self, classified_sites: &[ClassifiedCallSite]) {
         for site in classified_sites {
-            if matches!(site.classification, CallSiteType::DataFetchingCall) {
-                if let Some(call) = self.extract_data_call(site) {
-                    self.data_calls.push(call);
-                }
+            if matches!(site.classification, CallSiteType::DataFetchingCall)
+                && let Some(call) = self.extract_data_call(site)
+            {
+                self.data_calls.push(call);
             }
         }
     }
@@ -306,10 +306,10 @@ impl MountGraph {
             current_node = &mount.parent;
 
             // Stop if we reach a root node (top-level application)
-            if let Some(node) = self.nodes.get(current_node) {
-                if matches!(node.node_type, NodeType::Root) {
-                    break;
-                }
+            if let Some(node) = self.nodes.get(current_node)
+                && matches!(node.node_type, NodeType::Root)
+            {
+                break;
             }
         }
 

@@ -36,7 +36,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: |
             test-repo/package.json
@@ -160,7 +160,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Install test-repo dependencies
         run: cd test-repo && npm install
@@ -241,9 +241,4 @@ jobs:
         run: cargo install cargo-audit
 
       - name: Run security audit
-        # RUSTSEC-2026-0009: time 0.3.44 DoS via parsing attacker-controlled
-        # date strings. We only use `time` transitively via tracing-appender
-        # for internal timestamp formatting, so the vector does not apply.
-        # Fix requires time >=0.3.47, which forces serde >=1.0.228 and breaks
-        # swc_common 12. Revisit when the swc stack is bumped.
-        run: cargo audit --ignore RUSTSEC-2026-0009
+        run: cargo audit

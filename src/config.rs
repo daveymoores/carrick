@@ -124,12 +124,12 @@ pub fn create_dynamic_tsconfig(output_dir: &std::path::Path) -> Value {
     // Scan for actual type files and create specific mappings
     if let Ok(entries) = std::fs::read_dir(output_dir) {
         for entry in entries.flatten() {
-            if let Some(file_name) = entry.file_name().to_str() {
-                if file_name.ends_with("_types.ts") || file_name.ends_with("_types.d.ts") {
-                    let base_name = file_name.trim_end_matches(".d.ts").trim_end_matches(".ts");
-                    let module_name = base_name.replace("_", "-");
-                    paths.insert(module_name, vec![format!("./{}", base_name)]);
-                }
+            if let Some(file_name) = entry.file_name().to_str()
+                && (file_name.ends_with("_types.ts") || file_name.ends_with("_types.d.ts"))
+            {
+                let base_name = file_name.trim_end_matches(".d.ts").trim_end_matches(".ts");
+                let module_name = base_name.replace("_", "-");
+                paths.insert(module_name, vec![format!("./{}", base_name)]);
             }
         }
     }
