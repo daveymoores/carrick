@@ -82,7 +82,7 @@ Net-new pieces of `carrick-cloud`. This is the work-of-record under Option C.
    - Links to each repo's service map.
    - Single "Request cross-repo access" button → email to you, flag toggled on approval.
 4. **Service map pages** at `carrick.tools/<owner>/<repo>/map`:
-   - Render service graph + endpoint list + drift findings.
+   - Render service graph + endpoint list + drift findings. Visual implementation spec: [`service-map-visualization.md`](./service-map-visualization.md).
    - **Visibility mirrors the GitHub repo.** Captured at upload time from `GITHUB_REPOSITORY` + GitHub API repo metadata, stored with the map, re-verified on each read.
    - Private-repo maps require the viewer to authenticate and pass a GitHub API read-access check (collaborator or org member) on every page load. Cache the check briefly (5 min) to avoid hammering GitHub's API.
    - Public-repo maps are ungated public URLs.
