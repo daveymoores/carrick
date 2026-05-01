@@ -21,7 +21,7 @@ jobs:
           # Patterns that indicate LLM prompt content. These belong in carrick-cloud
           # lambdas, not in the public Rust scanner. The baseline is a ratchet:
           # counts may shrink (Phase 1 migrations) but never grow.
-          PATTERN='You are |Extract ONLY|responseSchema|system_instruction|prompt:[[:space:]]*"|Identify all frameworks|"frameworks":'
+          PATTERN='You are |You describe |You analyze |Extract ONLY|responseSchema|system_instruction|prompt:[[:space:]]*"|Identify all frameworks|"frameworks":'
 
           # Scope: src/ only. Exclude ts_check/output/node_modules/ (downloaded deps).
           grep -rEc "$PATTERN" src/ \
