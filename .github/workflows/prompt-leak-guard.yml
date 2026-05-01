@@ -1,0 +1,77 @@
+name: Prompt Leak Guard
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "src/**"
+      - ".github/prompt-leak-baseline.txt"
+      - ".github/workflows/prompt-leak-guard.yml"
+
+jobs:
+  guard:
+    name: Guard against prompt strings in public Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate current counts
+        id: counts
+        run: |
+          # Patterns that indicate LLM prompt content. These belong in carrick-cloud
+          # lambdas, not in the public Rust scanner. The baseline is a ratchet:
+          # counts may shrink (Phase 1 migrations) but never grow.
+          PATTERN='You are |Extract ONLY|responseSchema|system_instruction|prompt:[[:space:]]*"|Identify all frameworks|"frameworks":'
+
+          # Scope: src/ only. Exclude ts_check/output/node_modules/ (downloaded deps).
+          grep -rEc "$PATTERN" src/ \
+            --exclude-dir=node_modules \
+            --exclude-dir=output \
+            | grep -v ':0$' \
+            | sort > current.txt || true
+
+          echo "Current counts:"
+          cat current.txt
+
+      - name: Compare against baseline
+        run: |
+          BASELINE=.github/prompt-leak-baseline.txt
+          CURRENT=current.txt
+
+          if [ ! -f "$BASELINE" ]; then
+            echo "ERROR: $BASELINE missing. If you are intentionally introducing the guard, commit the baseline file."
+            exit 1
+          fi
+
+          fail=0
+
+          # For each file in current.txt, check it does not exceed baseline.
+          # Files not in baseline are forbidden entirely (count must be 0, but
+          # they cannot appear in current.txt with a non-zero count by definition).
+          while IFS=: read -r file count; do
+            [ -z "$file" ] && continue
+            baseline_line=$(grep "^${file}:" "$BASELINE" || true)
+            if [ -z "$baseline_line" ]; then
+              echo "FAIL: $file has $count prompt-shaped match(es) but is not in the baseline."
+              echo "      Add the prompt to a carrick-cloud lambda instead, or update the baseline if this is intentional."
+              fail=1
+              continue
+            fi
+            baseline_count=$(echo "$baseline_line" | cut -d: -f2)
+            if [ "$count" -gt "$baseline_count" ]; then
+              echo "FAIL: $file has $count match(es), baseline allows $baseline_count."
+              fail=1
+            fi
+          done < "$CURRENT"
+
+          # Also flag if any baselined file *increased* even though it stayed listed.
+          # (Already covered above, but we want a positive "all good" message.)
+          if [ "$fail" -eq 0 ]; then
+            echo ""
+            echo "Prompt leak guard passed. Counts are at or below baseline."
+            echo ""
+            echo "Reminder: when Phase 1 migrations remove prompts, update"
+            echo ".github/prompt-leak-baseline.txt in the same PR to ratchet down."
+          else
+            exit 1
+          fi
