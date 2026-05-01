@@ -92,75 +92,73 @@ impl AgentService {
             response_schema,
         };
 
-        let mut request_builder = self
+        let request_builder = self
             .client
             .post(&proxy_endpoint)
             .json(&proxy_request)
-            .timeout(std::time::Duration::from_secs(60));
+            .timeout(std::time::Duration::from_secs(60))
+            .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
+            .header("Authorization", format!("Bearer {}", self.api_key));
 
-        // Add API key for authentication
-        request_builder =
-            request_builder.header("Authorization", format!("Bearer {}", self.api_key));
-
-        // Retry logic for transient failures with exponential backoff
-        // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s (handles API Gateway 30s timeouts)
+        // Retry logic for transient failures with exponential backoff.
+        // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s. The lambda's structured
+        // error envelope (`error.retriable`) is the source of truth — we
+        // only retry when it says retriable=true (or on bare network
+        // failures, which are by definition transient).
         let max_retries = 7;
         for attempt in 1..=max_retries {
             match request_builder.try_clone().unwrap().send().await {
                 Ok(response) => {
-                    if response.status().is_success() {
-                        match response.json::<ProxyResponse>().await {
-                            Ok(proxy_response) => {
-                                if proxy_response.success {
-                                    return Ok(proxy_response.text);
-                                } else {
-                                    return Err("Agent proxy returned unsuccessful response".into());
-                                }
-                            }
-                            Err(e) => {
-                                return Err(format!("Failed to parse proxy response: {}", e).into());
-                            }
-                        }
-                    } else {
-                        let status = response.status();
+                    let status = response.status();
 
-                        // Retry on 429 Too Many Requests with exponential backoff
-                        if status == 429 && attempt < max_retries {
-                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                            warn!(
-                                "Agent API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
-                                wait_time, attempt, max_retries
-                            );
-                            sleep(wait_time).await;
-                            continue;
+                    let body: AgentResponse = match response.json().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Err(format!(
+                                "Agent proxy returned status {} with unparseable body: {}",
+                                status, e
+                            )
+                            .into());
                         }
+                    };
 
-                        // Retry on 503 Service Unavailable with exponential backoff
-                        // This handles API Gateway timeout issues
-                        if status == 503 && attempt < max_retries {
-                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                            warn!(
-                                "Agent API returned 503, retrying in {:?} (attempt {}/{})",
-                                wait_time, attempt, max_retries
-                            );
-                            sleep(wait_time).await;
-                            continue;
-                        }
-
-                        let error_text = response.text().await.unwrap_or_default();
-                        return Err(format!(
-                            "Agent proxy call failed with status {}: {}",
-                            status, error_text
-                        )
-                        .into());
+                    if status.is_success() && body.success {
+                        return Ok(body.text.unwrap_or_default());
                     }
+
+                    let err = match body.error {
+                        Some(err) => err,
+                        None => {
+                            return Err(format!(
+                                "Agent proxy status {} success={} but no error envelope",
+                                status, body.success
+                            )
+                            .into());
+                        }
+                    };
+
+                    if err.retriable && attempt < max_retries {
+                        let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                        warn!(
+                            "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
+                            err.code, wait_time, attempt, max_retries, err.message
+                        );
+                        sleep(wait_time).await;
+                        continue;
+                    }
+
+                    return Err(format!(
+                        "Agent error '{}' (retriable={}): {}",
+                        err.code, err.retriable, err.message
+                    )
+                    .into());
                 }
                 Err(e) => {
-                    // Retry network errors with exponential backoff
+                    // Bare network failure (no response received) — retriable by definition.
                     if attempt < max_retries {
                         let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
                         warn!(
-                            "Agent proxy call failed: {}, retrying in {:?} (attempt {}/{})",
+                            "Agent proxy network error: {}, retrying in {:?} (attempt {}/{})",
                             e, wait_time, attempt, max_retries
                         );
                         sleep(wait_time).await;
@@ -253,10 +251,24 @@ struct ProxyOptions {
     max_output_tokens: Option<u32>,
 }
 
+/// Lambda response envelope. On success: `success=true, text="..."`.
+/// On failure: `success=false, error=AgentError{...}`. The `retriable`
+/// flag on the error is the source of truth for whether the scanner
+/// should consume an exponential-backoff attempt.
 #[derive(Debug, Deserialize)]
-struct ProxyResponse {
+struct AgentResponse {
     success: bool,
-    text: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    error: Option<AgentError>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AgentError {
+    code: String,
+    message: String,
+    retriable: bool,
 }
 
 pub async fn extract_calls_from_async_expressions(
