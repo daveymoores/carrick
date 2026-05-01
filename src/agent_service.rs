@@ -51,7 +51,10 @@ impl AgentService {
             .await
     }
 
-    /// Generic method for making Agent API calls with optional response schema
+    /// Generic method for making Agent API calls with optional response schema.
+    /// Uses the legacy /agent/chat endpoint where Rust constructs both system
+    /// and user messages. Per-task lambdas (file-analyzer, etc.) use
+    /// `analyze_with_lambda` instead.
     pub async fn analyze_code_with_schema(
         &self,
         prompt: &str,
@@ -69,10 +72,6 @@ impl AgentService {
         if env::var("CARRICK_MOCK_ALL").is_ok() {
             return Ok(generate_mock_response(&response_schema, prompt));
         }
-
-        // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
-        let api_base = env!("CARRICK_API_ENDPOINT");
-        let proxy_endpoint = format!("{}/agent/chat", api_base);
 
         let proxy_request = ProxyRequest {
             messages: vec![
@@ -92,10 +91,55 @@ impl AgentService {
             response_schema,
         };
 
+        self.post_with_retry("/agent/chat", &proxy_request).await
+    }
+
+    /// Per-task lambda call. The lambda owns the system prompt; Rust
+    /// only sends `{ user_message, response_schema }`. `task_path` is
+    /// the API Gateway route, e.g. "/analyze-file".
+    pub async fn analyze_with_lambda(
+        &self,
+        task_path: &str,
+        user_message: &str,
+        response_schema: Option<serde_json::Value>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
+
+        if env::var("CARRICK_MOCK_ALL").is_ok() {
+            return Ok(generate_mock_response(&response_schema, user_message));
+        }
+
+        let request = LambdaRequest {
+            user_message: user_message.to_string(),
+            response_schema,
+        };
+
+        self.post_with_retry(task_path, &request).await
+    }
+
+    /// Shared HTTP + retry implementation for all lambda calls. Sends
+    /// the version header, parses the structured error envelope, and
+    /// only consumes a backoff attempt when the error is marked
+    /// retriable=true (or on bare network failures).
+    async fn post_with_retry<B>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<String, Box<dyn std::error::Error>>
+    where
+        B: Serialize + ?Sized,
+    {
+        let api_base = env!("CARRICK_API_ENDPOINT");
+        let endpoint = format!("{}{}", api_base, path);
+
         let request_builder = self
             .client
-            .post(&proxy_endpoint)
-            .json(&proxy_request)
+            .post(&endpoint)
+            .json(body)
             .timeout(std::time::Duration::from_secs(60))
             .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
             .header("Authorization", format!("Bearer {}", self.api_key));
@@ -233,6 +277,15 @@ pub struct TypeInfo {
 struct ProxyRequest {
     messages: Vec<ProxyMessage>,
     options: ProxyOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_schema: Option<serde_json::Value>,
+}
+
+/// Request body for per-task lambda endpoints (e.g. /analyze-file).
+/// The lambda owns the system prompt; Rust just sends the user payload.
+#[derive(Debug, Serialize)]
+struct LambdaRequest {
+    user_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<serde_json::Value>,
 }
