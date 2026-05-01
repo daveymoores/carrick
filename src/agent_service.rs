@@ -94,14 +94,30 @@ impl AgentService {
         self.post_with_retry("/agent/chat", &proxy_request).await
     }
 
-    /// Per-task lambda call. The lambda owns the system prompt; Rust
-    /// only sends `{ user_message, response_schema }`. `task_path` is
-    /// the API Gateway route, e.g. "/analyze-file".
+    /// Per-task lambda call where the lambda just needs a user_message +
+    /// schema (e.g. file-analyzer). The lambda owns the system prompt.
+    /// `task_path` is the API Gateway route, e.g. "/analyze-file".
     pub async fn analyze_with_lambda(
         &self,
         task_path: &str,
         user_message: &str,
         response_schema: Option<serde_json::Value>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let request = LambdaRequest {
+            user_message: user_message.to_string(),
+            response_schema,
+        };
+        self.post_to_lambda(task_path, &request, user_message).await
+    }
+
+    /// Lower-level per-task lambda call for arbitrary structured payloads
+    /// (e.g. framework-guidance which sends task+category+frameworks).
+    /// `mock_seed` is used in mock mode to pick the right canned response.
+    pub async fn post_to_lambda<B: Serialize + ?Sized>(
+        &self,
+        task_path: &str,
+        body: &B,
+        mock_seed: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let _permit = self
             .semaphore
@@ -110,15 +126,14 @@ impl AgentService {
             .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            return Ok(generate_mock_response(&response_schema, user_message));
+            // Re-derive the schema from the body for mock dispatch (best effort).
+            let schema = serde_json::to_value(body)
+                .ok()
+                .and_then(|v| v.get("response_schema").cloned());
+            return Ok(generate_mock_response(&schema, mock_seed));
         }
 
-        let request = LambdaRequest {
-            user_message: user_message.to_string(),
-            response_schema,
-        };
-
-        self.post_with_retry(task_path, &request).await
+        self.post_with_retry(task_path, body).await
     }
 
     /// Shared HTTP + retry implementation for all lambda calls. Sends
