@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.11](https://github.com/daveymoores/carrick/compare/carrick-v0.1.10...carrick-v0.1.11) (2026-05-01)
+
+
+### Bug Fixes
+
+* **deps:** clear npm Dependabot alerts (lockfile-only) ([#73](https://github.com/daveymoores/carrick/issues/73)) ([35c7656](https://github.com/daveymoores/carrick/commit/35c7656df0a0267e03ec02f921d7252058b39ff7))
+
+
+### Documentation
+
+* add service map visualization implementation brief ([08c1d02](https://github.com/daveymoores/carrick/commit/08c1d02dcbca9e79365b865c7d774a06540af295))
+
 ## [0.1.10](https://github.com/daveymoores/carrick/compare/carrick-v0.1.9...carrick-v0.1.10) (2026-04-20)
 
 
