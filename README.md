@@ -328,10 +328,10 @@ Carrick has comprehensive test coverage with 43 tests covering:
 
 ```bash
 # Run all tests
-CARRICK_API_ENDPOINT=https://test.example.com cargo test
+cargo test
 
 # Run specific test suite
-CARRICK_API_ENDPOINT=https://test.example.com cargo test --test endpoint_matching_test
+cargo test --test endpoint_matching_test
 ```
 
 ### Pre-Commit Hook

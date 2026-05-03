@@ -21,4 +21,4 @@ If you need to touch a Lambda, Terraform, or a prompt, the change goes in `carri
 
 `AGENTS.md` is the canonical repo-guidelines doc — read it for project structure, build commands, testing conventions, and commit style.
 
-The current migration plan (Carrick → carrick-cloud split, Phases 0+1) lives at `/Users/davidjonathanmoores/.claude-personal/plans/can-you-research-the-jiggly-lampson.md`.
+The Carrick → carrick-cloud split landed in 2026-05. Follow-up work (OAuth dashboard, ELv2 relicense + flip public, etc.) is tracked as GitHub issues.

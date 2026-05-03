@@ -73,11 +73,7 @@ impl AgentService {
             .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            // Re-derive the schema from the body for mock dispatch (best effort).
-            let schema = serde_json::to_value(body)
-                .ok()
-                .and_then(|v| v.get("response_schema").cloned());
-            return Ok(generate_mock_response(&schema, mock_seed));
+            return Ok(generate_mock_for_task(task_path, body, mock_seed));
         }
 
         self.post_with_retry(task_path, body).await
@@ -108,18 +104,34 @@ impl AgentService {
 
         // Retry logic for transient failures with exponential backoff.
         // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s. The lambda's structured
-        // error envelope (`error.retriable`) is the source of truth — we
-        // only retry when it says retriable=true (or on bare network
-        // failures, which are by definition transient).
+        // error envelope (`error.retriable`) is the source of truth for
+        // application-level errors. We additionally retry on transient
+        // *gateway* errors (429/502/503/504) where the body may not
+        // even be a parseable JSON envelope (API Gateway timeouts return
+        // non-envelope responses).
         let max_retries = 7;
         for attempt in 1..=max_retries {
             match request_builder.try_clone().unwrap().send().await {
                 Ok(response) => {
                     let status = response.status();
+                    let is_transient_gateway_status =
+                        matches!(status.as_u16(), 429 | 502 | 503 | 504);
 
                     let body: AgentResponse = match response.json().await {
                         Ok(b) => b,
                         Err(e) => {
+                            // Body wasn't a parseable envelope. If the status
+                            // is a known transient gateway code, retry —
+                            // otherwise fail fast (server-side bug).
+                            if is_transient_gateway_status && attempt < max_retries {
+                                let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                                warn!(
+                                    "Gateway status {} with non-envelope body: {}. Retrying in {:?} (attempt {}/{})",
+                                    status, e, wait_time, attempt, max_retries
+                                );
+                                sleep(wait_time).await;
+                                continue;
+                            }
                             return Err(format!(
                                 "Agent proxy returned status {} with unparseable body: {}",
                                 status, e
@@ -402,6 +414,33 @@ fn clean_response(text: &str) -> String {
         .filter(|line| !line.is_empty() && !line.starts_with("//"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Mock-mode dispatch by task path. Some lambdas don't send a
+/// `response_schema` (e.g. /generate-intent ships only `{name, body,
+/// called_intents}`), so falling through to schema-based dispatch
+/// produces the wrong shape. This wrapper handles those tasks
+/// explicitly before delegating to the generic schema-based mock.
+fn generate_mock_for_task<B: Serialize + ?Sized>(
+    task_path: &str,
+    body: &B,
+    mock_seed: &str,
+) -> String {
+    match task_path {
+        "/generate-intent" => "Mock intent: function does something.".to_string(),
+        "/extract-calls" => "[]".to_string(),
+        _ => {
+            // Tasks that send a schema (file-analyzer, framework-guidance)
+            // dispatch by inspecting the schema shape. Tasks that don't but
+            // happen to want the framework-detection-shaped fallback
+            // (framework-detect) also land here — that's fine because the
+            // default response_schema=None branch returns exactly that.
+            let schema = serde_json::to_value(body)
+                .ok()
+                .and_then(|v| v.get("response_schema").cloned());
+            generate_mock_response(&schema, mock_seed)
+        }
+    }
 }
 
 /// Generate mock response based on schema type
