@@ -287,6 +287,25 @@ Add it to `internalEnvVars` if it points to one of your services, or `externalEn
 - Wrong HTTP verbs
 - Missing or deprecated endpoints
 
+## MCP Server
+
+Carrick exposes its cross-repo analysis to AI agents via the Model Context Protocol. Add it to your MCP-aware client (Claude Desktop, Cursor, etc.) over HTTP — no local install:
+
+```bash
+claude mcp add --transport http carrick https://api.carrick.tools/mcp
+```
+
+Tools exposed:
+- `list_services` — every service Carrick has analyzed in your org
+- `get_api_endpoints` — endpoints declared by a given service
+- `get_service_dependencies` — services calling a given producer
+- `get_endpoint_types` — request / response types for a specific endpoint
+- `get_type_definition` — fully resolved TypeScript type, by name, across the org
+- `check_compatibility` — does service A's call to service B match the producer's contract?
+- `list_function_intents` — natural-language descriptions of exported functions
+
+Authentication uses the same Carrick API key as the GitHub Action.
+
 ## Join the Private Beta
 
 We're now inviting developers to join our private beta. Here's how to get started:

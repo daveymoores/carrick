@@ -10,8 +10,10 @@ This is the **public** Rust scanner for Carrick. Companion to the private `carri
 
 ## Boundary
 
-- Public (this repo): Rust scanner, AST/parser, agent orchestrators (thin), MCP server source, `ts_check/`, `src/sidecar/`, GitHub Action.
-- Private (`carrick-cloud`): all Lambdas, Terraform, prompts, wrapper-rule generation, future web dashboard.
+- Public (this repo): Rust scanner, AST/parser, agent orchestrators (thin), `ts_check/`, `src/sidecar/`, GitHub Action.
+- Private (`carrick-cloud`): all Lambdas, MCP server + tools, Terraform, prompts, wrapper-rule generation, future web dashboard.
+
+MCP is exposed exclusively as an HTTP endpoint at `https://api.carrick.tools/mcp`. Users add Carrick to their AI agent via `claude mcp add --transport http carrick https://api.carrick.tools/mcp`. There is no local-stdio install — the MCP tool implementations live in `carrick-cloud/lambdas/mcp-server/`.
 
 If you need to touch a Lambda, Terraform, or a prompt, the change goes in `carrick-cloud`.
 
