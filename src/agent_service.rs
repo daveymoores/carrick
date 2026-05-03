@@ -41,59 +41,6 @@ impl AgentService {
         }
     }
 
-    /// Generic method for making Agent API calls
-    pub async fn analyze_code(
-        &self,
-        prompt: &str,
-        system_message: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        self.analyze_code_with_schema(prompt, system_message, None)
-            .await
-    }
-
-    /// Generic method for making Agent API calls with optional response schema.
-    /// Uses the legacy /agent/chat endpoint where Rust constructs both system
-    /// and user messages. Per-task lambdas (file-analyzer, etc.) use
-    /// `analyze_with_lambda` instead.
-    pub async fn analyze_code_with_schema(
-        &self,
-        prompt: &str,
-        system_message: &str,
-        response_schema: Option<serde_json::Value>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        // Acquire permit to limit concurrency
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
-
-        // Skip API call in mock mode - return schema-appropriate mock data
-        if env::var("CARRICK_MOCK_ALL").is_ok() {
-            return Ok(generate_mock_response(&response_schema, prompt));
-        }
-
-        let proxy_request = ProxyRequest {
-            messages: vec![
-                ProxyMessage {
-                    role: "system".to_string(),
-                    content: system_message.to_string(),
-                },
-                ProxyMessage {
-                    role: "user".to_string(),
-                    content: prompt.to_string(),
-                },
-            ],
-            options: ProxyOptions {
-                temperature: None,
-                max_output_tokens: None,
-            },
-            response_schema,
-        };
-
-        self.post_with_retry("/agent/chat", &proxy_request).await
-    }
-
     /// Per-task lambda call where the lambda just needs a user_message +
     /// schema (e.g. file-analyzer). The lambda owns the system prompt.
     /// `task_path` is the API Gateway route, e.g. "/analyze-file".
@@ -231,35 +178,6 @@ impl AgentService {
 
         Err("Maximum retry attempts exceeded".into())
     }
-
-    /// Specialized method for analyzing async calls with framework context
-    pub async fn analyze_async_calls_with_context(
-        &self,
-        prompt: &str,
-        system_message: &str,
-        frameworks: &[String],
-        data_fetchers: &[String],
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        // Skip API call in mock mode
-        if env::var("CARRICK_MOCK_ALL").is_ok() {
-            return Ok("[]".to_string());
-        }
-
-        // Build enhanced system message with framework context
-        let context_info = if !data_fetchers.is_empty() {
-            format!(
-                "\n\nFRAMEWORK CONTEXT:\n- HTTP Client Libraries: {}\n- HTTP Frameworks: {}\n\nFocus analysis on these specific libraries when extracting HTTP calls.",
-                data_fetchers.join(", "),
-                frameworks.join(", ")
-            )
-        } else {
-            String::new()
-        };
-
-        let enhanced_system_message = format!("{}{}", system_message, context_info);
-
-        self.analyze_code(prompt, &enhanced_system_message).await
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -288,14 +206,6 @@ pub struct TypeInfo {
     pub alias: String,
 }
 
-#[derive(Debug, Serialize)]
-struct ProxyRequest {
-    messages: Vec<ProxyMessage>,
-    options: ProxyOptions,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_schema: Option<serde_json::Value>,
-}
-
 /// Request body for per-task lambda endpoints (e.g. /analyze-file).
 /// The lambda owns the system prompt; Rust just sends the user payload.
 #[derive(Debug, Serialize)]
@@ -303,20 +213,6 @@ struct LambdaRequest {
     user_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProxyMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ProxyOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
 }
 
 /// Lambda response envelope. On success: `success=true, text="..."`.
@@ -374,7 +270,7 @@ pub async fn extract_calls_from_async_expressions(
     }
 
     debug!(
-        "Found {} async expressions, sending to Agent Service with framework context",
+        "Found {} async expressions, sending to /extract-calls lambda with framework context",
         async_calls.len()
     );
 
@@ -383,100 +279,23 @@ pub async fn extract_calls_from_async_expressions(
         .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
     let agent_service = AgentService::new(api_key);
 
-    let prompt = create_extraction_prompt(&async_calls);
-    let system_message = create_extraction_system_message();
+    let payload = serde_json::json!({
+        "async_calls": async_calls,
+        "frameworks": frameworks,
+        "data_fetchers": data_fetchers,
+    });
 
     let response = agent_service
-        .analyze_async_calls_with_context(&prompt, &system_message, frameworks, data_fetchers)
+        .post_to_lambda("/extract-calls", &payload, "extract-calls")
         .await?;
 
     Ok(parse_agent_response(&response, &async_calls))
 }
 
-fn create_extraction_system_message() -> String {
-    r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
-
-CRITICAL REQUIREMENTS:
-1. Extract ONLY HTTP requests (fetch, axios, request libraries) - ignore setTimeout, file I/O, database calls
-2. Return ONLY valid JSON array starting with [ and ending with ]
-3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean), request_type_info (object or null), response_type_info (object or null)
-
-IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handler parameters (such as req: Request<T>, res: Response<T>). These describe incoming HTTP requests to the server, NOT outgoing HTTP calls made by the server.
-When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
-
-TYPE EXTRACTION REQUIREMENTS:
-4. For outgoing HTTP calls (fetch, axios, etc.):
-   a. For the response type, extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
-
-   CRITICAL:
-   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
-   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
-   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
-
-   BAD EXAMPLE:
-     const raw: Foo[] = await resp.json();
-     const filtered: Foo[] = filter(raw);
-     // Only extract Foo[], not both.
-
-   BAD EXAMPLE:
-     const a: Bar[] = await resp.json();
-     const b: Bar[] = a.filter(...);
-     // Only extract Bar[], not both.
-
-   GOOD EXAMPLE:
-     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
-     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
-     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
-   b. For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
-5. NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
-6. Calculate approximate character position where the type appears in the source
-7. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
-
-TYPE INFO OBJECT FORMAT:
-- file_path: The source file path
-- start_position: Approximate character position of type annotation (number)
-- composite_type_string: Full type string (e.g., "Response<User[]>", "CreateUserRequest")
-- alias: Generated alias name (e.g., "GetUsersResponse", "PostUserRequest")
-
-ENVIRONMENT VARIABLE HANDLING:
-- Format: "ENV_VAR:VARIABLE_NAME:path"
-- process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
-- `${process.env.BASE_URL}/api/data` → "ENV_VAR:BASE_URL:/api/data"
-- env.SERVICE_URL + "/health" → "ENV_VAR:SERVICE_URL:/health"
-
-TEMPLATE LITERAL HANDLING:
-- Convert ALL template literals to :id but PRESERVE ALL PATH PARTS: `/api/users/${{userId}}` → "/api/users/:id"
-- Convert ALL template literals to :id: `/users/${{user_id}}` → "/users/:id"
-- Convert ALL template literals to :id: `/orders/${{orderId}}/items/${{itemId}}` → "/orders/:id/items/:id"
-- PRESERVE PATH PREFIXES: `/api/orders/${{orderId}}` → "/api/orders/:id"
-- Remove query parameters from paths: `/orders?userId=${{userId}}` → "/orders"
-
-URL CONSTRUCTION:
-- String concatenation: "/api" + "/users" → "/api/users"
-- Mixed env vars: process.env.API + "/v1" + path → "ENV_VAR:API:/v1" + path
-- Template literals with env vars: `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
-- Complex template literals: `${{BASE_URL}}/api/users/${{id}}` → "ENV_VAR:BASE_URL:/api/users/:id"
-
-NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
-}
-
-fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
-    let mut prompt =
-        String::from("Extract HTTP calls from these async JavaScript/TypeScript functions:\n\n");
-
-    for (i, call) in async_calls.iter().enumerate() {
-        prompt.push_str(&format!(
-            "## Function {} ({}:{})\n```{}\n{}\n```\n\n",
-            i + 1,
-            call.file,
-            call.line,
-            call.kind,
-            call.function_source
-        ));
-    }
-
-    prompt
-}
+// create_extraction_system_message + create_extraction_prompt moved to
+// carrick-cloud/lambdas/extract-calls/ (system_prompt.txt + buildUserMessage).
+// Rust now sends {async_calls, frameworks, data_fetchers} to /extract-calls;
+// the lambda assembles the prompt from those fields.
 
 fn convert_agent_responses_to_calls(
     agent_calls: Vec<AgentCallResponse>,
