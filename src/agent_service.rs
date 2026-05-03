@@ -41,126 +41,142 @@ impl AgentService {
         }
     }
 
-    /// Generic method for making Agent API calls
-    pub async fn analyze_code(
+    /// Per-task lambda call where the lambda just needs a user_message +
+    /// schema (e.g. file-analyzer). The lambda owns the system prompt.
+    /// `task_path` is the API Gateway route, e.g. "/analyze-file".
+    pub async fn analyze_with_lambda(
         &self,
-        prompt: &str,
-        system_message: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        self.analyze_code_with_schema(prompt, system_message, None)
-            .await
-    }
-
-    /// Generic method for making Agent API calls with optional response schema
-    pub async fn analyze_code_with_schema(
-        &self,
-        prompt: &str,
-        system_message: &str,
+        task_path: &str,
+        user_message: &str,
         response_schema: Option<serde_json::Value>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        // Acquire permit to limit concurrency
+        let request = LambdaRequest {
+            user_message: user_message.to_string(),
+            response_schema,
+        };
+        self.post_to_lambda(task_path, &request, user_message).await
+    }
+
+    /// Lower-level per-task lambda call for arbitrary structured payloads
+    /// (e.g. framework-guidance which sends task+category+frameworks).
+    /// `mock_seed` is used in mock mode to pick the right canned response.
+    pub async fn post_to_lambda<B: Serialize + ?Sized>(
+        &self,
+        task_path: &str,
+        body: &B,
+        mock_seed: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let _permit = self
             .semaphore
             .acquire()
             .await
             .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
 
-        // Skip API call in mock mode - return schema-appropriate mock data
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            return Ok(generate_mock_response(&response_schema, prompt));
+            return Ok(generate_mock_for_task(task_path, body, mock_seed));
         }
 
-        // Get proxy endpoint from CARRICK_API_ENDPOINT (compile-time)
+        self.post_with_retry(task_path, body).await
+    }
+
+    /// Shared HTTP + retry implementation for all lambda calls. Sends
+    /// the version header, parses the structured error envelope, and
+    /// only consumes a backoff attempt when the error is marked
+    /// retriable=true (or on bare network failures).
+    async fn post_with_retry<B>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<String, Box<dyn std::error::Error>>
+    where
+        B: Serialize + ?Sized,
+    {
         let api_base = env!("CARRICK_API_ENDPOINT");
-        let proxy_endpoint = format!("{}/agent/chat", api_base);
+        let endpoint = format!("{}{}", api_base, path);
 
-        let proxy_request = ProxyRequest {
-            messages: vec![
-                ProxyMessage {
-                    role: "system".to_string(),
-                    content: system_message.to_string(),
-                },
-                ProxyMessage {
-                    role: "user".to_string(),
-                    content: prompt.to_string(),
-                },
-            ],
-            options: ProxyOptions {
-                temperature: None,
-                max_output_tokens: None,
-            },
-            response_schema,
-        };
-
-        let mut request_builder = self
+        let request_builder = self
             .client
-            .post(&proxy_endpoint)
-            .json(&proxy_request)
-            .timeout(std::time::Duration::from_secs(60));
+            .post(&endpoint)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(60))
+            .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
+            .header("Authorization", format!("Bearer {}", self.api_key));
 
-        // Add API key for authentication
-        request_builder =
-            request_builder.header("Authorization", format!("Bearer {}", self.api_key));
-
-        // Retry logic for transient failures with exponential backoff
-        // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s (handles API Gateway 30s timeouts)
+        // Retry logic for transient failures with exponential backoff.
+        // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s. The lambda's structured
+        // error envelope (`error.retriable`) is the source of truth for
+        // application-level errors. We additionally retry on transient
+        // *gateway* errors (429/502/503/504) where the body may not
+        // even be a parseable JSON envelope (API Gateway timeouts return
+        // non-envelope responses).
         let max_retries = 7;
         for attempt in 1..=max_retries {
             match request_builder.try_clone().unwrap().send().await {
                 Ok(response) => {
-                    if response.status().is_success() {
-                        match response.json::<ProxyResponse>().await {
-                            Ok(proxy_response) => {
-                                if proxy_response.success {
-                                    return Ok(proxy_response.text);
-                                } else {
-                                    return Err("Agent proxy returned unsuccessful response".into());
-                                }
+                    let status = response.status();
+                    let is_transient_gateway_status =
+                        matches!(status.as_u16(), 429 | 502 | 503 | 504);
+
+                    let body: AgentResponse = match response.json().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            // Body wasn't a parseable envelope. If the status
+                            // is a known transient gateway code, retry —
+                            // otherwise fail fast (server-side bug).
+                            if is_transient_gateway_status && attempt < max_retries {
+                                let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                                warn!(
+                                    "Gateway status {} with non-envelope body: {}. Retrying in {:?} (attempt {}/{})",
+                                    status, e, wait_time, attempt, max_retries
+                                );
+                                sleep(wait_time).await;
+                                continue;
                             }
-                            Err(e) => {
-                                return Err(format!("Failed to parse proxy response: {}", e).into());
-                            }
+                            return Err(format!(
+                                "Agent proxy returned status {} with unparseable body: {}",
+                                status, e
+                            )
+                            .into());
                         }
-                    } else {
-                        let status = response.status();
+                    };
 
-                        // Retry on 429 Too Many Requests with exponential backoff
-                        if status == 429 && attempt < max_retries {
-                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                            warn!(
-                                "Agent API 429 Too Many Requests. Retrying in {:?} (attempt {}/{})",
-                                wait_time, attempt, max_retries
-                            );
-                            sleep(wait_time).await;
-                            continue;
-                        }
-
-                        // Retry on 503 Service Unavailable with exponential backoff
-                        // This handles API Gateway timeout issues
-                        if status == 503 && attempt < max_retries {
-                            let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
-                            warn!(
-                                "Agent API returned 503, retrying in {:?} (attempt {}/{})",
-                                wait_time, attempt, max_retries
-                            );
-                            sleep(wait_time).await;
-                            continue;
-                        }
-
-                        let error_text = response.text().await.unwrap_or_default();
-                        return Err(format!(
-                            "Agent proxy call failed with status {}: {}",
-                            status, error_text
-                        )
-                        .into());
+                    if status.is_success() && body.success {
+                        return Ok(body.text.unwrap_or_default());
                     }
+
+                    let err = match body.error {
+                        Some(err) => err,
+                        None => {
+                            return Err(format!(
+                                "Agent proxy status {} success={} but no error envelope",
+                                status, body.success
+                            )
+                            .into());
+                        }
+                    };
+
+                    if err.retriable && attempt < max_retries {
+                        let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                        warn!(
+                            "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
+                            err.code, wait_time, attempt, max_retries, err.message
+                        );
+                        sleep(wait_time).await;
+                        continue;
+                    }
+
+                    return Err(format!(
+                        "Agent error '{}' (retriable={}): {}",
+                        err.code, err.retriable, err.message
+                    )
+                    .into());
                 }
                 Err(e) => {
-                    // Retry network errors with exponential backoff
+                    // Bare network failure (no response received) — retriable by definition.
                     if attempt < max_retries {
                         let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
                         warn!(
-                            "Agent proxy call failed: {}, retrying in {:?} (attempt {}/{})",
+                            "Agent proxy network error: {}, retrying in {:?} (attempt {}/{})",
                             e, wait_time, attempt, max_retries
                         );
                         sleep(wait_time).await;
@@ -173,35 +189,6 @@ impl AgentService {
         }
 
         Err("Maximum retry attempts exceeded".into())
-    }
-
-    /// Specialized method for analyzing async calls with framework context
-    pub async fn analyze_async_calls_with_context(
-        &self,
-        prompt: &str,
-        system_message: &str,
-        frameworks: &[String],
-        data_fetchers: &[String],
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        // Skip API call in mock mode
-        if env::var("CARRICK_MOCK_ALL").is_ok() {
-            return Ok("[]".to_string());
-        }
-
-        // Build enhanced system message with framework context
-        let context_info = if !data_fetchers.is_empty() {
-            format!(
-                "\n\nFRAMEWORK CONTEXT:\n- HTTP Client Libraries: {}\n- HTTP Frameworks: {}\n\nFocus analysis on these specific libraries when extracting HTTP calls.",
-                data_fetchers.join(", "),
-                frameworks.join(", ")
-            )
-        } else {
-            String::new()
-        };
-
-        let enhanced_system_message = format!("{}{}", system_message, context_info);
-
-        self.analyze_code(prompt, &enhanced_system_message).await
     }
 }
 
@@ -231,32 +218,33 @@ pub struct TypeInfo {
     pub alias: String,
 }
 
+/// Request body for per-task lambda endpoints (e.g. /analyze-file).
+/// The lambda owns the system prompt; Rust just sends the user payload.
 #[derive(Debug, Serialize)]
-struct ProxyRequest {
-    messages: Vec<ProxyMessage>,
-    options: ProxyOptions,
+struct LambdaRequest {
+    user_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
-struct ProxyMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ProxyOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
-}
-
+/// Lambda response envelope. On success: `success=true, text="..."`.
+/// On failure: `success=false, error=AgentError{...}`. The `retriable`
+/// flag on the error is the source of truth for whether the scanner
+/// should consume an exponential-backoff attempt.
 #[derive(Debug, Deserialize)]
-struct ProxyResponse {
+struct AgentResponse {
     success: bool,
-    text: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    error: Option<AgentError>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AgentError {
+    code: String,
+    message: String,
+    retriable: bool,
 }
 
 pub async fn extract_calls_from_async_expressions(
@@ -294,7 +282,7 @@ pub async fn extract_calls_from_async_expressions(
     }
 
     debug!(
-        "Found {} async expressions, sending to Agent Service with framework context",
+        "Found {} async expressions, sending to /extract-calls lambda with framework context",
         async_calls.len()
     );
 
@@ -303,100 +291,23 @@ pub async fn extract_calls_from_async_expressions(
         .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
     let agent_service = AgentService::new(api_key);
 
-    let prompt = create_extraction_prompt(&async_calls);
-    let system_message = create_extraction_system_message();
+    let payload = serde_json::json!({
+        "async_calls": async_calls,
+        "frameworks": frameworks,
+        "data_fetchers": data_fetchers,
+    });
 
     let response = agent_service
-        .analyze_async_calls_with_context(&prompt, &system_message, frameworks, data_fetchers)
+        .post_to_lambda("/extract-calls", &payload, "extract-calls")
         .await?;
 
     Ok(parse_agent_response(&response, &async_calls))
 }
 
-fn create_extraction_system_message() -> String {
-    r#"You are an expert at analyzing JavaScript/TypeScript async calls for API route extraction and TypeScript type extraction.
-
-CRITICAL REQUIREMENTS:
-1. Extract ONLY HTTP requests (fetch, axios, request libraries) - ignore setTimeout, file I/O, database calls
-2. Return ONLY valid JSON array starting with [ and ending with ]
-3. Each object must have: route (string), method (string), request_body (object or null), has_response_type (boolean), request_type_info (object or null), response_type_info (object or null)
-
-IMPORTANT: When analyzing Express route handlers, IGNORE the types of the handler parameters (such as req: Request<T>, res: Response<T>). These describe incoming HTTP requests to the server, NOT outgoing HTTP calls made by the server.
-When extracting HTTP calls (fetch, axios, etc.), infer the request and response types from the data passed to the HTTP call and the expected result, NOT from the Express handler signature.
-
-TYPE EXTRACTION REQUIREMENTS:
-4. For outgoing HTTP calls (fetch, axios, etc.):
-   a. For the response type, extract ONLY ONE type per unique HTTP call. Extract the type that is assigned directly to the result of the HTTP call (such as `const data: MyType = await response.json();`). DO NOT extract types from variables that are filtered, mapped, type-checked, or otherwise transformed versions of the raw response. Ignore all intermediate or final variables that are transformations of the original response; focus ONLY on the type as it is received directly from the HTTP call.
-
-   CRITICAL:
-   - If the result of the HTTP call is assigned to multiple variables, extract ONLY the type from the variable that is assigned the result of `await response.json()` (or equivalent), NOT from variables that are filtered, mapped, or type-checked versions of the response.
-   - DO NOT extract multiple types for the same HTTP call, even if the result is assigned to multiple variables.
-   - If multiple assignments are made from the same HTTP call, extract only the first assignment (the one closest to the HTTP call).
-
-   BAD EXAMPLE:
-     const raw: Foo[] = await resp.json();
-     const filtered: Foo[] = filter(raw);
-     // Only extract Foo[], not both.
-
-   BAD EXAMPLE:
-     const a: Bar[] = await resp.json();
-     const b: Bar[] = a.filter(...);
-     // Only extract Bar[], not both.
-
-   GOOD EXAMPLE:
-     const commentsRaw: {{ id: string; order_id: string }}[] = await commentsResp.json();
-     const comments: {{ id: string; order_id: string }}[] = isCommentArray(commentsRaw) ? commentsRaw : [];
-     // Only extract {{ id: string; order_id: string }}[] for this HTTP call.
-   b. For the request type, use the type of the data passed as the request body or parameters in the HTTP call.
-5. NEVER use Express handler parameter types (e.g., req: Request<T>, res: Response<T>) for outgoing HTTP calls—these describe incoming server requests, not outgoing client requests.
-6. Calculate approximate character position where the type appears in the source
-7. Generate meaningful alias names following pattern: MethodRouteRequest/Response (e.g., "GetUsersResponse", "PostUserRequest")
-
-TYPE INFO OBJECT FORMAT:
-- file_path: The source file path
-- start_position: Approximate character position of type annotation (number)
-- composite_type_string: Full type string (e.g., "Response<User[]>", "CreateUserRequest")
-- alias: Generated alias name (e.g., "GetUsersResponse", "PostUserRequest")
-
-ENVIRONMENT VARIABLE HANDLING:
-- Format: "ENV_VAR:VARIABLE_NAME:path"
-- process.env.API_URL + "/users" → "ENV_VAR:API_URL:/users"
-- `${process.env.BASE_URL}/api/data` → "ENV_VAR:BASE_URL:/api/data"
-- env.SERVICE_URL + "/health" → "ENV_VAR:SERVICE_URL:/health"
-
-TEMPLATE LITERAL HANDLING:
-- Convert ALL template literals to :id but PRESERVE ALL PATH PARTS: `/api/users/${{userId}}` → "/api/users/:id"
-- Convert ALL template literals to :id: `/users/${{user_id}}` → "/users/:id"
-- Convert ALL template literals to :id: `/orders/${{orderId}}/items/${{itemId}}` → "/orders/:id/items/:id"
-- PRESERVE PATH PREFIXES: `/api/orders/${{orderId}}` → "/api/orders/:id"
-- Remove query parameters from paths: `/orders?userId=${{userId}}` → "/orders"
-
-URL CONSTRUCTION:
-- String concatenation: "/api" + "/users" → "/api/users"
-- Mixed env vars: process.env.API + "/v1" + path → "ENV_VAR:API:/v1" + path
-- Template literals with env vars: `${{USER_SERVICE_URL}}/api/users` → "ENV_VAR:USER_SERVICE_URL:/api/users"
-- Complex template literals: `${{BASE_URL}}/api/users/${{id}}` → "ENV_VAR:BASE_URL:/api/users/:id"
-
-NO MARKDOWN, NO EXPLANATIONS - ONLY JSON ARRAY."#.to_string()
-}
-
-fn create_extraction_prompt(async_calls: &[AsyncCallContext]) -> String {
-    let mut prompt =
-        String::from("Extract HTTP calls from these async JavaScript/TypeScript functions:\n\n");
-
-    for (i, call) in async_calls.iter().enumerate() {
-        prompt.push_str(&format!(
-            "## Function {} ({}:{})\n```{}\n{}\n```\n\n",
-            i + 1,
-            call.file,
-            call.line,
-            call.kind,
-            call.function_source
-        ));
-    }
-
-    prompt
-}
+// create_extraction_system_message + create_extraction_prompt moved to
+// carrick-cloud/lambdas/extract-calls/ (system_prompt.txt + buildUserMessage).
+// Rust now sends {async_calls, frameworks, data_fetchers} to /extract-calls;
+// the lambda assembles the prompt from those fields.
 
 fn convert_agent_responses_to_calls(
     agent_calls: Vec<AgentCallResponse>,
@@ -503,6 +414,33 @@ fn clean_response(text: &str) -> String {
         .filter(|line| !line.is_empty() && !line.starts_with("//"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Mock-mode dispatch by task path. Some lambdas don't send a
+/// `response_schema` (e.g. /generate-intent ships only `{name, body,
+/// called_intents}`), so falling through to schema-based dispatch
+/// produces the wrong shape. This wrapper handles those tasks
+/// explicitly before delegating to the generic schema-based mock.
+fn generate_mock_for_task<B: Serialize + ?Sized>(
+    task_path: &str,
+    body: &B,
+    mock_seed: &str,
+) -> String {
+    match task_path {
+        "/generate-intent" => "Mock intent: function does something.".to_string(),
+        "/extract-calls" => "[]".to_string(),
+        _ => {
+            // Tasks that send a schema (file-analyzer, framework-guidance)
+            // dispatch by inspecting the schema shape. Tasks that don't but
+            // happen to want the framework-detection-shaped fallback
+            // (framework-detect) also land here — that's fine because the
+            // default response_schema=None branch returns exactly that.
+            let schema = serde_json::to_value(body)
+                .ok()
+                .and_then(|v| v.get("response_schema").cloned());
+            generate_mock_response(&schema, mock_seed)
+        }
+    }
 }
 
 /// Generate mock response based on schema type

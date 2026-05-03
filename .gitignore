@@ -30,6 +30,8 @@ lambdas/*.zip
 # Terraform state files
 *.tfstate
 *.tfstate.backup
+# Exception: bootstrap state is committed (no secrets, see terraform/bootstrap/README.md)
+!terraform/bootstrap/terraform.tfstate
 
 # Crash logs
 crash.log
@@ -43,6 +45,10 @@ crash.log
 # Variable files (with potential secrets)
 *.tfvars
 *.tfvars.json
+
+# Decrypted SOPS files — never commit. Encrypted (.enc.yaml) is fine.
+*.dec.yaml
+secrets.yaml
 
 # Override files (used for local-only config overrides)
 override.tf

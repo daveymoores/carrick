@@ -147,27 +147,31 @@ impl FrameworkDetector {
         import_statements
     }
 
-    /// Use LLM to classify frameworks and data-fetching libraries
+    /// Use the carrick-cloud /framework-detect lambda to classify frameworks
+    /// and data-fetching libraries. The Rust side just sends the structured
+    /// input (package.json summary + imports list); the prompt body lives
+    /// at carrick-cloud/lambdas/framework-detect/index.js.
     async fn classify_with_llm(
         &self,
         input: FrameworkDetectionInput,
     ) -> Result<DetectionResult, Box<dyn std::error::Error>> {
-        let prompt = self.build_classification_prompt(&input);
+        let body = serde_json::json!({
+            "package_json": input.package_json,
+            "imports": input.imports,
+        });
 
-        let response = self.agent_service.analyze_code(
-            &prompt,
-            "You are analyzing a Node.js/TypeScript project to detect HTTP frameworks and data-fetching libraries."
-        ).await?;
+        let response = self
+            .agent_service
+            .post_to_lambda("/framework-detect", &body, "framework-detect")
+            .await?;
 
-        // Debug: log the actual LLM response
         debug!("Framework Detection LLM Response:");
         debug!("{}", response);
         debug!("--- End of Response ---");
 
-        // Extract JSON from response using robust method
+        // Lambda returns Gemini's raw text — same JSON-extraction step.
         let json_str = self.extract_json_from_response(&response)?;
 
-        // Parse the JSON response
         let detection_result: DetectionResult = serde_json::from_str(&json_str).map_err(|e| {
             format!(
                 "Failed to parse LLM response as JSON: {}. Response was: {}",
@@ -176,63 +180,6 @@ impl FrameworkDetector {
         })?;
 
         Ok(detection_result)
-    }
-
-    /// Build the prompt for LLM classification
-    fn build_classification_prompt(&self, input: &FrameworkDetectionInput) -> String {
-        let input_json = serde_json::to_string_pretty(input).unwrap_or_default();
-
-        format!(
-            r#"
-You are analyzing a Node.js / TypeScript project to detect which HTTP frameworks and data-fetching libraries are used.
-
-Input:
-1. `package.json` dependencies and devDependencies.
-2. List of import statements found in source files.
-
-Task:
-- Identify all frameworks/libraries used for HTTP routing, e.g., express, koa, fastify, hapi, nestjs, hono.
-- Identify all libraries used for data fetching or HTTP clients, e.g., axios, node-fetch, got, superagent, ky, graphql-request, @apollo/client, urql.
-- Return a JSON object with:
-
-{{
-  "frameworks": ["express", "koa", ...],      // list of HTTP frameworks detected
-  "data_fetchers": ["axios", "graphql-request", ...],  // list of data-fetching libraries
-  "notes": "<optional comments about version or partial usage>"
-}}
-
-Example Input:
-{{
-  "package_json": {{
-    "dependencies": {{"express": "^4.18.0", "axios": "^1.7.0"}},
-    "devDependencies": {{"typescript": "^5.3.0"}}
-  }},
-  "imports": [
-    "import express from 'express';",
-    "const Router = require('express').Router",
-    "import axios from 'axios';"
-  ]
-}}
-
-Expected Output:
-{{
-  "frameworks": ["express"],
-  "data_fetchers": ["axios"],
-  "notes": "express is a direct dependency and imported in multiple modules; axios is imported in src/api.ts"
-}}
-
-Instructions:
-- Include only libraries that affect routing or data-fetching.
-- If a library is listed in package.json but not imported, you can still include it but note it in `notes`.
-- Output valid JSON only.
-
-Actual Input:
-{}
-
-Respond with valid JSON only:
-"#,
-            input_json
-        )
     }
 
     /// Extract JSON from LLM response that may contain extra text

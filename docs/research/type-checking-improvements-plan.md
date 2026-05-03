@@ -248,10 +248,10 @@ Tests run:
 - `npm run build` (in `src/sidecar`)
 - `npm test` (in `src/sidecar`)
 - `cargo fmt`
-- `CARRICK_API_ENDPOINT=https://test.example.com cargo test wrapper_registry`
+- `cargo test wrapper_registry`
 
 Notes for the next agent:
-- `CARRICK_API_ENDPOINT` is required at build time for `cargo test`.
+- `CARRICK_API_ENDPOINT` is optional now (defaults to `https://api.carrick.tools` via `build.rs`). Override it at build time only if pointing at a non-prod backend.
 - Wrapper rules are optional; if none are sent, behavior matches pre-Stage 6.
 
 ---
