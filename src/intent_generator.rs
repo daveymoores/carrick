@@ -81,13 +81,14 @@ pub async fn generate_function_intents(
     // Topological sort into levels: functions at the same level can run in parallel
     let levels = topological_levels(&eligible, &deps);
 
-    // Generate intents level by level — within each level, calls run in parallel
+    // Generate intents level by level — within each level, calls run in parallel.
+    // Both the system instruction and user-prompt template now live in the
+    // /generate-intent lambda (carrick-cloud/lambdas/generate-intent/index.js).
     let mut intents: HashMap<String, String> = HashMap::new();
-    let system_msg = "You describe what functions do in 1-2 sentences. Be specific about the business logic, not the implementation details. Respond with ONLY the description, no quotes or prefixes.";
 
     for level in &levels {
-        // Build prompts for all functions in this level
-        let tasks: Vec<(String, String)> = level
+        // Build payloads for all functions in this level
+        let tasks: Vec<(String, String, String, Vec<String>)> = level
             .iter()
             .filter_map(|name| {
                 let def = function_definitions.get(name)?;
@@ -107,17 +108,23 @@ pub async fn generate_function_intents(
                     })
                     .unwrap_or_default();
 
-                let prompt = build_intent_prompt(name, body, &called_intents);
-                Some((name.clone(), prompt))
+                Some((name.clone(), name.clone(), body.clone(), called_intents))
             })
             .collect();
 
-        // Run all LLM calls for this level in parallel
+        // Run all lambda calls for this level in parallel
         let futures: Vec<_> = tasks
             .iter()
-            .map(|(name, prompt)| async {
-                let result = agent_service.analyze_code(prompt, system_msg).await;
-                (name.clone(), result)
+            .map(|(key, name, body, called_intents)| async move {
+                let payload = serde_json::json!({
+                    "name": name,
+                    "body": body,
+                    "called_intents": called_intents,
+                });
+                let result = agent_service
+                    .post_to_lambda("/generate-intent", &payload, name)
+                    .await;
+                (key.clone(), result)
             })
             .collect();
 
@@ -223,24 +230,9 @@ fn topological_levels(names: &[String], deps: &HashMap<String, Vec<String>>) -> 
     levels
 }
 
-fn build_intent_prompt(name: &str, body: &str, called_intents: &[String]) -> String {
-    let mut prompt = String::new();
-
-    if !called_intents.is_empty() {
-        prompt.push_str("This function uses the following helper functions:\n");
-        for intent in called_intents {
-            prompt.push_str(intent);
-            prompt.push('\n');
-        }
-        prompt.push('\n');
-    }
-
-    prompt.push_str(&format!(
-        "Function `{}`:\n```\n{}\n```\n\nWhat does this function intend to do?",
-        name, body
-    ));
-    prompt
-}
+// build_intent_prompt was moved to carrick-cloud/lambdas/generate-intent/index.js
+// (buildPrompt). Rust now sends {name, body, called_intents} as a structured
+// payload; the lambda assembles the prompt from those fields.
 
 #[cfg(test)]
 mod tests {
@@ -293,23 +285,9 @@ mod tests {
         assert_eq!(total, 2, "both should still appear");
     }
 
-    #[test]
-    fn build_prompt_without_deps() {
-        let prompt = build_intent_prompt("foo", "return 1 + 2;", &[]);
-        assert!(prompt.contains("Function `foo`"));
-        assert!(prompt.contains("return 1 + 2"));
-        assert!(!prompt.contains("helper functions"));
-    }
-
-    #[test]
-    fn build_prompt_with_deps() {
-        let called = vec!["- validate: Checks email format".to_string()];
-        let prompt =
-            build_intent_prompt("createUser", "validate(email); db.insert(user);", &called);
-        assert!(prompt.contains("helper functions"));
-        assert!(prompt.contains("validate: Checks email format"));
-        assert!(prompt.contains("Function `createUser`"));
-    }
+    // build_prompt_without_deps and build_prompt_with_deps were removed:
+    // prompt construction moved to /generate-intent lambda. Equivalent
+    // behavioural test now lives in carrick-cloud (TBD).
 
     #[test]
     fn strip_body_source_removes_all() {
