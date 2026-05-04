@@ -55,8 +55,10 @@ impl CloudStorage for MockStorage {
         &self,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
         debug!("MOCK: Downloading all repo data");
-        let storage = self.data.lock().unwrap();
-        let mut result = storage.clone();
+        // Drop the lock as soon as we have a clone — concurrent
+        // upload_repo_data calls would otherwise block on us while we
+        // build the synthetic mock repos and S3-URL map below.
+        let mut result = self.data.lock().unwrap().clone();
 
         // Add some mock repos to simulate cross-repo scenario
         if result.len() <= 1 {
