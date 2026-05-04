@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.15](https://github.com/daveymoores/carrick/compare/carrick-v0.1.14...carrick-v0.1.15) (2026-05-04)
+
+
+### Bug Fixes
+
+* **release:** handle release-please component-prefixed tags in v1 guard ([#87](https://github.com/daveymoores/carrick/issues/87)) ([f2a57b1](https://github.com/daveymoores/carrick/commit/f2a57b1cf100772b01051fa136e0ff15cf4890aa))
+
 ## [0.1.14](https://github.com/daveymoores/carrick/compare/carrick-v0.1.13...carrick-v0.1.14) (2026-05-04)
 
 
