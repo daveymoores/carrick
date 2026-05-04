@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/daveymoores/carrick/compare/carrick-v0.1.15...carrick-v0.1.16) (2026-05-04)
+
+
+### Bug Fixes
+
+* **release:** tag v1 from github.sha instead of release tag name ([#89](https://github.com/daveymoores/carrick/issues/89)) ([7fefe17](https://github.com/daveymoores/carrick/commit/7fefe1776d061a83cb3888e02b9fba3bf0ae7734))
+
 ## [0.1.15](https://github.com/daveymoores/carrick/compare/carrick-v0.1.14...carrick-v0.1.15) (2026-05-04)
 
 
