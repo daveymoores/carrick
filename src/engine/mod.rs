@@ -192,8 +192,10 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     let results = analyzer.get_results();
     print_results(results);
 
-    // 7. Best-effort log upload (only on main/master, same policy as data upload)
-    if should_upload && let Some(log_path) = logging::get_log_file_path() {
+    // 7. Best-effort log upload — runs unconditionally (PRs, feature branches, local).
+    // Logs are independent of the data-upload policy: they're a debugging aid that should
+    // be available for every run, especially the failing PR runs we need to diagnose.
+    if let Some(log_path) = logging::get_log_file_path() {
         const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
         if let Ok(mut file) = std::fs::File::open(&log_path) {
@@ -206,8 +208,17 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
                     if file.read_to_end(&mut buf).is_ok() {
                         let log_content = String::from_utf8_lossy(&buf);
                         let repo_name = get_repository_name(repo_path);
-                        if let Err(e) = storage.upload_logs(&repo_name, &log_content).await {
-                            debug!("Failed to upload logs: {:?}", e);
+                        match storage.upload_logs(&repo_name, &log_content).await {
+                            Ok(()) => {
+                                debug!(
+                                    bytes = log_content.len(),
+                                    repo = %repo_name,
+                                    "Uploaded run logs to S3"
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Failed to upload logs: {:?}", e);
+                            }
                         }
                     }
                 }

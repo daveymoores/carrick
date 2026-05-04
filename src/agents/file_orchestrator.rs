@@ -877,6 +877,18 @@ impl FileOrchestrator {
             );
         }
 
+        // Per-symbol failures carry the actual diagnostic detail (which symbol,
+        // which file, why). Surface them individually so an uploaded log shows
+        // *what* failed, not just that something did.
+        for failure in &result.symbol_failures {
+            warn!(
+                symbol = %failure.symbol_name,
+                source_file = %failure.source_file,
+                reason = %failure.reason,
+                "[FileOrchestrator] Symbol failed to resolve"
+            );
+        }
+
         Ok(result)
     }
 

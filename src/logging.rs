@@ -1,5 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
+use tracing::info;
 use tracing_appender::rolling;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -44,6 +45,7 @@ pub fn init(verbose: bool) {
             .with(terminal_layer)
             .with(file_layer)
             .try_init();
+        emit_run_preamble();
         return;
     }
 
@@ -51,6 +53,38 @@ pub fn init(verbose: bool) {
     let _ = tracing_subscriber::registry()
         .with(terminal_layer)
         .try_init();
+    emit_run_preamble();
+}
+
+/// Emit a structured preamble at the start of every run. Goes through `tracing`
+/// so it lands in both the rolling file log (always) and the terminal (info+).
+/// This is the "what was the environment when this ran" record that makes
+/// uploaded logs interpretable after the fact.
+fn emit_run_preamble() {
+    fn env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| "<unset>".to_string())
+    }
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
+    info!(
+        scanner_version = env!("CARGO_PKG_VERSION"),
+        api_endpoint = env!("CARRICK_API_ENDPOINT"),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        ci = %env("CI"),
+        github_event = %env("GITHUB_EVENT_NAME"),
+        github_ref = %env("GITHUB_REF"),
+        github_repo = %env("GITHUB_REPOSITORY"),
+        github_sha = %env("GITHUB_SHA"),
+        github_run_id = %env("GITHUB_RUN_ID"),
+        github_workflow = %env("GITHUB_WORKFLOW"),
+        runner_os = %env("RUNNER_OS"),
+        cwd = %cwd,
+        "Carrick run starting"
+    );
 }
 
 /// Return the path to today's log file, if it exists.
