@@ -16,7 +16,6 @@ pub struct AwsStorage {
 struct LambdaRequest {
     action: String,
     repo: String,
-    org: String,
     hash: String,
     filename: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,7 +72,6 @@ struct CrossRepoResponse {
 #[derive(Serialize)]
 struct GetCrossRepoRequest {
     action: String,
-    org: String,
 }
 
 impl AwsStorage {
@@ -192,24 +190,14 @@ impl AwsStorage {
         Ok(())
     }
 
-    fn extract_org_and_repo(&self, repo_name: &str) -> (String, String) {
-        if let Some((org, repo)) = repo_name.split_once('/') {
-            (org.to_string(), repo.to_string())
-        } else {
-            ("default".to_string(), repo_name.to_string())
-        }
-    }
-
     async fn store_repo_metadata(
         &self,
         data: &CloudRepoData,
         s3_url: &str,
-        org: &str, // Add org parameter
     ) -> Result<(), StorageError> {
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
-            repo: data.repo_name.clone(), // Use repo name as-is
-            org: org.to_string(),         // Use passed org
+            repo: data.repo_name.clone(),
             hash: data.commit_hash.clone(),
             filename: "types.d.ts".to_string(),
             cloud_repo_data: Some(data.clone()),
@@ -225,14 +213,13 @@ impl AwsStorage {
 
 #[async_trait]
 impl CloudStorage for AwsStorage {
-    async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError> {
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
         let repo = &data.repo_name;
 
         // Step 1: Check if we need to upload type file
         let check_request = LambdaRequest {
             action: "check-or-upload".to_string(),
             repo: repo.clone(),
-            org: org.to_string(),
             hash: data.commit_hash.clone(),
             filename: "types.d.ts".to_string(),
             cloud_repo_data: None,
@@ -251,7 +238,6 @@ impl CloudStorage for AwsStorage {
                 let complete_request = LambdaRequest {
                     action: "complete-upload".to_string(),
                     repo: repo.clone(),
-                    org: org.to_string(),
                     hash: data.commit_hash.clone(),
                     filename: "types.d.ts".to_string(),
                     cloud_repo_data: Some(data.clone()),
@@ -266,12 +252,12 @@ impl CloudStorage for AwsStorage {
                     "No bundled types available for {}; storing metadata only",
                     repo
                 );
-                self.store_repo_metadata(data, &lambda_response.s3_url, org)
+                self.store_repo_metadata(data, &lambda_response.s3_url)
                     .await?;
             }
         } else {
             debug!("Type file already exists, just updating metadata");
-            self.store_repo_metadata(data, &lambda_response.s3_url, org)
+            self.store_repo_metadata(data, &lambda_response.s3_url)
                 .await?;
         }
 
@@ -284,13 +270,11 @@ impl CloudStorage for AwsStorage {
         file_name: &str,
         content: &str,
     ) -> Result<(), StorageError> {
-        let (org, repo) = self.extract_org_and_repo(repo_name);
         let commit_hash = crate::cloud_storage::get_current_commit_hash(".");
 
         let request = LambdaRequest {
             action: "check-or-upload".to_string(),
-            repo,
-            org,
+            repo: repo_name.to_string(),
             hash: commit_hash,
             filename: file_name.to_string(),
             cloud_repo_data: None,
@@ -308,11 +292,9 @@ impl CloudStorage for AwsStorage {
 
     async fn download_all_repo_data(
         &self,
-        org: &str,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
         let request = GetCrossRepoRequest {
             action: "get-cross-repo-data".to_string(),
-            org: org.to_string(),
         };
 
         let response: CrossRepoResponse = self.call_lambda_generic(&request).await?;
@@ -358,18 +340,12 @@ impl CloudStorage for AwsStorage {
         Ok((all_repo_data, repo_s3_urls))
     }
 
-    async fn upload_logs(
-        &self,
-        org: &str,
-        repo: &str,
-        log_content: &str,
-    ) -> Result<(), StorageError> {
+    async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError> {
         let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
 
         #[derive(Serialize)]
         struct UploadLogsRequest {
             action: String,
-            org: String,
             repo: String,
             timestamp: String,
         }
@@ -382,7 +358,6 @@ impl CloudStorage for AwsStorage {
 
         let request = UploadLogsRequest {
             action: "upload-logs".to_string(),
-            org: org.to_string(),
             repo: repo.to_string(),
             timestamp,
         };
@@ -397,7 +372,6 @@ impl CloudStorage for AwsStorage {
         let request = LambdaRequest {
             action: "check-or-upload".to_string(),
             repo: "health".to_string(),
-            org: "check".to_string(),
             hash: "health-check".to_string(),
             filename: "health.ts".to_string(),
             cloud_repo_data: None,

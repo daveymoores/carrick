@@ -269,11 +269,10 @@ impl Error for StorageError {}
 
 #[async_trait]
 pub trait CloudStorage {
-    async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError>;
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError>;
     async fn download_all_repo_data(
         &self,
-        org: &str,
-    ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError>; // Updated return type
+    ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError>;
     #[allow(dead_code)]
     async fn upload_type_file(
         &self,
@@ -282,12 +281,7 @@ pub trait CloudStorage {
         content: &str,
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
-    async fn upload_logs(
-        &self,
-        org: &str,
-        repo: &str,
-        log_content: &str,
-    ) -> Result<(), StorageError>;
+    async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError>;
 }
 
 pub fn get_current_commit_hash(repo_path: &str) -> String {

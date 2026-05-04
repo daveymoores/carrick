@@ -200,7 +200,6 @@ jobs:
         id: carrick-analysis
         uses: daveymoores/carrick@v1
         with:
-          carrick-org: your-org-name
           carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
 
       - name: Comment PR with Results
