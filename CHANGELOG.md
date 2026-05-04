@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/daveymoores/carrick/compare/carrick-v0.1.11...carrick-v0.1.12) (2026-05-03)
+
+
+### Features
+
+* split lambdas + LLM prompts to carrick-cloud ([#74](https://github.com/daveymoores/carrick/issues/74)) ([52e1ecb](https://github.com/daveymoores/carrick/commit/52e1ecbd1b571c8925b457ca0f85232a8f176614))
+
 ## [0.1.11](https://github.com/daveymoores/carrick/compare/carrick-v0.1.10...carrick-v0.1.11) (2026-05-01)
 
 
