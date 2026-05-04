@@ -75,9 +75,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update v1 moving tag
-        if: ${{ !contains(needs.release-please.outputs.tag_name, '-') }}
         run: |
-          git tag -f v1 ${{ needs.release-please.outputs.tag_name }}
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG##*v}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Pre-release version ($VERSION) — skipping v1 update"
+            exit 0
+          fi
+          git tag -f v1 "$TAG"
           git push -f origin v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
