@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.14](https://github.com/daveymoores/carrick/compare/carrick-v0.1.13...carrick-v0.1.14) (2026-05-04)
+
+
+### CI/CD
+
+* **release:** force-update [@v1](https://github.com/v1) moving tag on every stable release ([#85](https://github.com/daveymoores/carrick/issues/85)) ([b0fd90b](https://github.com/daveymoores/carrick/commit/b0fd90bafe74642453910cb32ded3c77f02e3d2b))
+
 ## [0.1.13](https://github.com/daveymoores/carrick/compare/carrick-v0.1.12...carrick-v0.1.13) (2026-05-04)
 
 
