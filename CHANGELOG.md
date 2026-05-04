@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.13](https://github.com/daveymoores/carrick/compare/carrick-v0.1.12...carrick-v0.1.13) (2026-05-04)
+
+
+### Features
+
+* drop carrick-org input; cloud derives org from API key ([#83](https://github.com/daveymoores/carrick/issues/83)) ([e133297](https://github.com/daveymoores/carrick/commit/e1332974329dbf34f96a8cd607669469c033fbb2))
+
 ## [0.1.12](https://github.com/daveymoores/carrick/compare/carrick-v0.1.11...carrick-v0.1.12) (2026-05-03)
 
 
