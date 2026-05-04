@@ -23,7 +23,7 @@ cargo run
 cargo run -- /path/to/repo
 
 # Run with mock storage (for testing without AWS)
-CARRICK_MOCK_ALL=1 CARRICK_ORG=test-org cargo run -- test-repo
+CARRICK_MOCK_ALL=1 cargo run -- test-repo
 ```
 
 ### Testing
@@ -115,8 +115,7 @@ Carrick follows a modular architecture with clear separation of concerns:
 
 ## Environment Variables
 
-- `CARRICK_ORG`: Organization name for grouping repositories (required in CI)
-- `CARRICK_API_KEY`: API key for cloud storage access (required in CI)
+- `CARRICK_API_KEY`: API key for cloud storage access (required in CI). The cloud lambda derives the owning organization from this key — there is no client-supplied org.
 - `CARRICK_MOCK_ALL`: Use mock storage instead of AWS (for local testing)
 - `GITHUB_EVENT_NAME`: Determines upload behavior (no upload on pull_request)
 - `GITHUB_REF`: Branch information for determining when to upload data

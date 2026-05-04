@@ -682,7 +682,6 @@ fn test_full_carrick_analysis_with_sidecar() {
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(producer_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
-        .env("CARRICK_ORG", "test-org")
         .env("CARRICK_API_KEY", "mock")
         .env("CARRICK_SIDECAR_TYPE_EXTRACTION", "1")
         .output()

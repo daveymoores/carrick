@@ -22,7 +22,7 @@
 cargo build
 cargo build --release
 cargo run -- /path/to/repo
-CARRICK_MOCK_ALL=1 CARRICK_ORG=test-org cargo run -- test-repo
+CARRICK_MOCK_ALL=1 cargo run -- test-repo
 
 # Tests and checks
 cargo test
@@ -55,5 +55,5 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 - PRs should include a short summary, rationale, test commands run, and links to relevant issues. Include sample Action output when it changes.
 
 ## Configuration & Infrastructure Notes
-- Runtime env vars: `CARRICK_API_KEY` (required when calling the cloud), `CARRICK_ORG` (cache namespace), `CARRICK_MOCK_ALL` (test-only, returns canned responses without hitting the cloud), `CARRICK_API_ENDPOINT` (override the default `https://api.carrick.tools` endpoint at build time; optional).
+- Runtime env vars: `CARRICK_API_KEY` (required when calling the cloud; org is derived server-side from this key), `CARRICK_MOCK_ALL` (test-only, returns canned responses without hitting the cloud), `CARRICK_API_ENDPOINT` (override the default `https://api.carrick.tools` endpoint at build time; optional).
 - Never run Terraform commands in this repository.

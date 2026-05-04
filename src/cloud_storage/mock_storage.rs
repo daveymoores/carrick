@@ -8,8 +8,7 @@ use std::sync::Mutex;
 use tracing::debug;
 
 pub struct MockStorage {
-    // Group data by org, then store repos
-    data: Mutex<HashMap<String, Vec<CloudRepoData>>>,
+    data: Mutex<Vec<CloudRepoData>>,
     type_files: Mutex<HashMap<String, String>>,
 }
 
@@ -22,7 +21,7 @@ impl Default for MockStorage {
 impl MockStorage {
     pub fn new() -> Self {
         Self {
-            data: Mutex::new(HashMap::new()),
+            data: Mutex::new(Vec::new()),
             type_files: Mutex::new(HashMap::new()),
         }
     }
@@ -30,16 +29,9 @@ impl MockStorage {
 
 #[async_trait]
 impl CloudStorage for MockStorage {
-    async fn upload_repo_data(&self, org: &str, data: &CloudRepoData) -> Result<(), StorageError> {
-        debug!(
-            "MOCK: Uploading repo data for org: {}, repo: {}",
-            org, data.repo_name
-        );
-        let mut storage = self.data.lock().unwrap();
-        storage
-            .entry(org.to_string())
-            .or_default()
-            .push(data.clone());
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
+        debug!("MOCK: Uploading repo data for repo: {}", data.repo_name);
+        self.data.lock().unwrap().push(data.clone());
         Ok(())
     }
 
@@ -61,11 +53,12 @@ impl CloudStorage for MockStorage {
 
     async fn download_all_repo_data(
         &self,
-        org: &str,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
-        debug!("MOCK: Downloading all repo data for org: {}", org);
-        let storage = self.data.lock().unwrap();
-        let mut result = storage.get(org).cloned().unwrap_or_default();
+        debug!("MOCK: Downloading all repo data");
+        // Drop the lock as soon as we have a clone — concurrent
+        // upload_repo_data calls would otherwise block on us while we
+        // build the synthetic mock repos and S3-URL map below.
+        let mut result = self.data.lock().unwrap().clone();
 
         // Add some mock repos to simulate cross-repo scenario
         if result.len() <= 1 {
@@ -134,7 +127,7 @@ impl CloudStorage for MockStorage {
             );
         }
 
-        debug!("MOCK: Found {} repos for org {}", result.len(), org);
+        debug!("MOCK: Found {} repos", result.len());
         Ok((result, mock_s3_urls))
     }
 
@@ -143,13 +136,8 @@ impl CloudStorage for MockStorage {
         Ok(())
     }
 
-    async fn upload_logs(
-        &self,
-        org: &str,
-        repo: &str,
-        _log_content: &str,
-    ) -> Result<(), StorageError> {
-        debug!("MOCK: Skipping log upload for {}/{}", org, repo);
+    async fn upload_logs(&self, repo: &str, _log_content: &str) -> Result<(), StorageError> {
+        debug!("MOCK: Skipping log upload for {}", repo);
         Ok(())
     }
 }

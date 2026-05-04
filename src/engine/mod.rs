@@ -99,10 +99,8 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     no_cache: bool,
     ts_check_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let carrick_org = env::var("CARRICK_ORG").map_err(|_| "CARRICK_ORG must be set in CI mode")?;
-
     let should_upload = should_upload_data();
-    debug!(org = %carrick_org, upload = should_upload, "Running Carrick in CI mode");
+    debug!(upload = should_upload, "Running Carrick in CI mode");
 
     // 1. Health check
     let sp = logging::spinner("Connecting to AWS...");
@@ -115,7 +113,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     // 2. Download all repos (moved earlier for incremental cache lookup)
     let sp = logging::spinner("Downloading cross-repo data...");
     let (mut all_repo_data, _repo_s3_urls) = storage
-        .download_all_repo_data(&carrick_org)
+        .download_all_repo_data()
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
 
@@ -167,7 +165,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
         let sp = logging::spinner("Uploading results...");
         let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
         storage
-            .upload_repo_data(&carrick_org, &cloud_data_serialized)
+            .upload_repo_data(&cloud_data_serialized)
             .await
             .map_err(|e| format!("Failed to upload repo data: {}", e))?;
         logging::finish_spinner(&sp, "Uploaded results to cloud storage");
@@ -208,10 +206,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
                     if file.read_to_end(&mut buf).is_ok() {
                         let log_content = String::from_utf8_lossy(&buf);
                         let repo_name = get_repository_name(repo_path);
-                        if let Err(e) = storage
-                            .upload_logs(&carrick_org, &repo_name, &log_content)
-                            .await
-                        {
+                        if let Err(e) = storage.upload_logs(&repo_name, &log_content).await {
                             debug!("Failed to upload logs: {:?}", e);
                         }
                     }

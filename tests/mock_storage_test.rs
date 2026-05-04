@@ -55,13 +55,13 @@ async fn test_upload_and_download_single_repo() {
     // When: we upload repo data
     let repo_data = create_test_repo_data("test-repo", "abc123");
     storage
-        .upload_repo_data("test-org", &repo_data)
+        .upload_repo_data(&repo_data)
         .await
         .expect("Upload should succeed");
 
     // Then: we can download it back
     let (downloaded, _s3_urls) = storage
-        .download_all_repo_data("test-org")
+        .download_all_repo_data()
         .await
         .expect("Download should succeed");
 
@@ -81,31 +81,31 @@ async fn test_upload_and_download_single_repo() {
 }
 
 #[tokio::test]
-async fn test_upload_multiple_repos_same_org() {
+async fn test_upload_multiple_repos() {
     // Given: a MockStorage instance
     let storage = MockStorage::new();
 
-    // When: we upload multiple repos for the same org
+    // When: we upload multiple repos
     let repo1 = create_test_repo_data("repo-1", "hash1");
     let repo2 = create_test_repo_data("repo-2", "hash2");
     let repo3 = create_test_repo_data("repo-3", "hash3");
 
     storage
-        .upload_repo_data("test-org", &repo1)
+        .upload_repo_data(&repo1)
         .await
         .expect("Upload repo1 should succeed");
     storage
-        .upload_repo_data("test-org", &repo2)
+        .upload_repo_data(&repo2)
         .await
         .expect("Upload repo2 should succeed");
     storage
-        .upload_repo_data("test-org", &repo3)
+        .upload_repo_data(&repo3)
         .await
         .expect("Upload repo3 should succeed");
 
     // Then: we can download all of them
     let (downloaded, _s3_urls) = storage
-        .download_all_repo_data("test-org")
+        .download_all_repo_data()
         .await
         .expect("Download should succeed");
 
@@ -125,55 +125,6 @@ async fn test_upload_multiple_repos_same_org() {
     assert!(our_repos.iter().any(|r| r.repo_name == "repo-1"));
     assert!(our_repos.iter().any(|r| r.repo_name == "repo-2"));
     assert!(our_repos.iter().any(|r| r.repo_name == "repo-3"));
-}
-
-#[tokio::test]
-async fn test_repos_isolated_by_org() {
-    // Given: a MockStorage instance
-    let storage = MockStorage::new();
-
-    // When: we upload repos to different orgs
-    let repo_org1 = create_test_repo_data("repo-org1", "hash1");
-    let repo_org2 = create_test_repo_data("repo-org2", "hash2");
-
-    storage
-        .upload_repo_data("org1", &repo_org1)
-        .await
-        .expect("Upload to org1 should succeed");
-    storage
-        .upload_repo_data("org2", &repo_org2)
-        .await
-        .expect("Upload to org2 should succeed");
-
-    // Then: each org only sees its own repos
-    let (org1_data, _) = storage
-        .download_all_repo_data("org1")
-        .await
-        .expect("Download org1 should succeed");
-    let (org2_data, _) = storage
-        .download_all_repo_data("org2")
-        .await
-        .expect("Download org2 should succeed");
-
-    // Org1 should have repo-org1 but not repo-org2
-    assert!(
-        org1_data.iter().any(|r| r.repo_name == "repo-org1"),
-        "Org1 should have its repo"
-    );
-    assert!(
-        !org1_data.iter().any(|r| r.repo_name == "repo-org2"),
-        "Org1 should not have org2's repo"
-    );
-
-    // Org2 should have repo-org2 but not repo-org1
-    assert!(
-        org2_data.iter().any(|r| r.repo_name == "repo-org2"),
-        "Org2 should have its repo"
-    );
-    assert!(
-        !org2_data.iter().any(|r| r.repo_name == "repo-org1"),
-        "Org2 should not have org1's repo"
-    );
 }
 
 #[tokio::test]
@@ -217,7 +168,7 @@ async fn test_concurrent_uploads() {
             let repo =
                 create_test_repo_data(&format!("concurrent-repo-{}", i), &format!("hash{}", i));
             storage_clone
-                .upload_repo_data("concurrent-org", &repo)
+                .upload_repo_data(&repo)
                 .await
                 .expect("Concurrent upload should succeed");
         });
@@ -231,7 +182,7 @@ async fn test_concurrent_uploads() {
 
     // Then: all repos should be present
     let (downloaded, _) = storage
-        .download_all_repo_data("concurrent-org")
+        .download_all_repo_data()
         .await
         .expect("Download should succeed");
 
@@ -248,24 +199,19 @@ async fn test_concurrent_uploads() {
 }
 
 #[tokio::test]
-async fn test_empty_org_returns_empty_or_mock_data() {
-    // Given: a MockStorage instance
+async fn test_empty_storage_returns_mock_data() {
+    // Given: a fresh MockStorage instance with nothing uploaded
     let storage = MockStorage::new();
 
-    // When: we try to download from an org with no data
+    // When: we download cross-repo data
     let (downloaded, _) = storage
-        .download_all_repo_data("non-existent-org")
+        .download_all_repo_data()
         .await
-        .expect("Download should succeed even for empty org");
+        .expect("Download should succeed for empty storage");
 
-    // Then: should return data without crashing
-    // MockStorage returns mock data for testing purposes (2 repos when result.len() <= 1)
-    // We verify the operation succeeds and returns the expected mock data
-    assert_eq!(
-        downloaded.len(),
-        2,
-        "MockStorage should return mock data for non-existent org"
-    );
+    // Then: MockStorage seeds two synthetic repos when fewer than 2
+    // entries exist, so cross-repo analysis has data to work with.
+    assert_eq!(downloaded.len(), 2);
 }
 
 #[tokio::test]
@@ -275,20 +221,20 @@ async fn test_update_existing_repo() {
 
     let repo_v1 = create_test_repo_data("versioned-repo", "hash1");
     storage
-        .upload_repo_data("test-org", &repo_v1)
+        .upload_repo_data(&repo_v1)
         .await
         .expect("Upload v1 should succeed");
 
     // When: we upload the same repo with a different commit hash
     let repo_v2 = create_test_repo_data("versioned-repo", "hash2");
     storage
-        .upload_repo_data("test-org", &repo_v2)
+        .upload_repo_data(&repo_v2)
         .await
         .expect("Upload v2 should succeed");
 
     // Then: both versions exist (MockStorage appends, doesn't replace)
     let (downloaded, _) = storage
-        .download_all_repo_data("test-org")
+        .download_all_repo_data()
         .await
         .expect("Download should succeed");
 
@@ -313,12 +259,12 @@ async fn test_packages_preserved_in_upload_download_cycle() {
 
     // When: we upload and download
     storage
-        .upload_repo_data("test-org", &repo_data)
+        .upload_repo_data(&repo_data)
         .await
         .expect("Upload should succeed");
 
     let (downloaded, _) = storage
-        .download_all_repo_data("test-org")
+        .download_all_repo_data()
         .await
         .expect("Download should succeed");
 
