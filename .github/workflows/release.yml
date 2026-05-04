@@ -82,7 +82,7 @@ jobs:
             echo "Pre-release version ($VERSION) — skipping v1 update"
             exit 0
           fi
-          git tag -f v1 "$TAG"
+          git tag -f v1 ${{ github.sha }}
           git push -f origin v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
