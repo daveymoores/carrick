@@ -73,3 +73,11 @@ jobs:
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update v1 moving tag
+        if: ${{ !contains(needs.release-please.outputs.tag_name, '-') }}
+        run: |
+          git tag -f v1 ${{ needs.release-please.outputs.tag_name }}
+          git push -f origin v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
