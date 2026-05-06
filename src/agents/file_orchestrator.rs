@@ -877,6 +877,39 @@ impl FileOrchestrator {
             );
         }
 
+        // Per-symbol failures carry the actual diagnostic detail (which symbol,
+        // which file, why). Cap warn-level emissions so a TS-loose codebase
+        // with hundreds of unresolvable types doesn't dominate the 5 MB log
+        // tail and evict the actually-novel diagnostic in a failed run.
+        // Spillover stays at debug — visible with --verbose or in the file
+        // log, but doesn't push noise into uploaded artifacts.
+        const SYMBOL_FAILURE_WARN_CAP: usize = 20;
+        let total = result.symbol_failures.len();
+        let cap = SYMBOL_FAILURE_WARN_CAP.min(total);
+        for failure in &result.symbol_failures[..cap] {
+            warn!(
+                symbol = %failure.symbol_name,
+                source_file = %failure.source_file,
+                reason = %failure.reason,
+                "[FileOrchestrator] Symbol failed to resolve"
+            );
+        }
+        if total > cap {
+            warn!(
+                shown = cap,
+                suppressed = total - cap,
+                "[FileOrchestrator] Additional symbol failures (run with --verbose to see all)"
+            );
+            for failure in &result.symbol_failures[cap..] {
+                debug!(
+                    symbol = %failure.symbol_name,
+                    source_file = %failure.source_file,
+                    reason = %failure.reason,
+                    "[FileOrchestrator] Symbol failed to resolve"
+                );
+            }
+        }
+
         Ok(result)
     }
 

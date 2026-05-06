@@ -181,9 +181,14 @@ impl AwsStorage {
             .map_err(|e| StorageError::ConnectionError(format!("S3 upload failed: {}", e)))?;
 
         if !response.status().is_success() {
+            // Always include the response body — S3 returns the actual cause
+            // (AccessDenied, signature mismatch, missing header, etc.) in the
+            // XML error document. A bare status code is rarely actionable.
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(StorageError::ConnectionError(format!(
-                "S3 upload returned error: {}",
-                response.status()
+                "S3 upload returned {}: {}",
+                status, body
             )));
         }
 
