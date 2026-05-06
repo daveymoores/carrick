@@ -996,24 +996,33 @@ impl FileOrchestrator {
         if import_source.starts_with('.') {
             // Relative import — join against the file's own directory.
             let resolved = current_dir.join(import_source);
-            return Self::resolve_with_extension(resolved.to_string_lossy().as_ref())
-                .unwrap_or_else(|| {
-                    // Nothing on disk matched — fall back to the original
-                    // `.ts` default so downstream code still has a plausible
-                    // path (mount linking will just silently drop the edge).
-                    let fallback = format!("{}.ts", resolved.to_string_lossy());
+            let resolved_str = resolved.to_string_lossy().to_string();
+            return Self::canonicalize_or_probe(&resolved_str).unwrap_or_else(|| {
+                // Nothing matched on disk. Preserve pre-2026-05 behaviour so
+                // downstream mount linking still sees a plausible path. If
+                // the import already ends in a TS-family extension, return
+                // the resolved path as-is (avoid `.ts.ts` double-extension);
+                // otherwise append `.ts` as a default.
+                if Self::has_ts_extension(&resolved_str) {
+                    resolved_str
+                } else {
+                    let fallback = format!("{}.ts", resolved_str);
                     Path::new(&fallback)
                         .canonicalize()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or(fallback)
-                });
+                }
+            });
         }
 
-        // Bare specifier — try resolving against tsconfig.json#baseUrl. If
-        // that fails, return the source unchanged (it's likely a real
-        // node_modules package).
+        // Bare specifier — only attempt baseUrl resolution if a tsconfig in
+        // the file's ancestry sets `compilerOptions.baseUrl` *explicitly*.
+        // `tsc` only enables non-relative module resolution against baseUrl
+        // when it's set; defaulting to "." here would shadow real
+        // node_modules packages. Falling through returns the source
+        // unchanged so package imports (`react`, `axios`) still flow through.
         if let Some((tsconfig_dir, base_url)) = Self::find_tsconfig_base_url(current_dir)
-            && let Some(found) = Self::resolve_with_extension(
+            && let Some(found) = Self::canonicalize_or_probe(
                 tsconfig_dir
                     .join(&base_url)
                     .join(import_source)
@@ -1027,21 +1036,34 @@ impl FileOrchestrator {
         import_source.to_string()
     }
 
-    /// Try a path with each common extension and `index.*` form. Returns
-    /// the canonicalized absolute path if any candidate exists, else None.
-    fn resolve_with_extension(base: &str) -> Option<String> {
+    /// Returns true if `path` ends in a TypeScript-family source extension.
+    fn has_ts_extension(path: &str) -> bool {
+        path.ends_with(".ts")
+            || path.ends_with(".tsx")
+            || path.ends_with(".js")
+            || path.ends_with(".jsx")
+    }
+
+    /// Probe a path on disk and return a canonicalized absolute string if
+    /// it (or one of the standard `.ts/.tsx/.js/.jsx`/`index.*` candidates)
+    /// exists. Returns `None` when nothing matches; callers decide on a
+    /// fallback. If the input already has a TS-family extension we only
+    /// probe that exact path — extension-swapping isn't TS resolver
+    /// behaviour and would mask import bugs.
+    fn canonicalize_or_probe(base: &str) -> Option<String> {
         use std::path::Path;
 
-        let already_has_ext = base.ends_with(".ts")
-            || base.ends_with(".tsx")
-            || base.ends_with(".js")
-            || base.ends_with(".jsx");
-
-        if already_has_ext {
-            return Path::new(base)
-                .canonicalize()
-                .ok()
-                .map(|p| p.to_string_lossy().to_string());
+        if Self::has_ts_extension(base) {
+            return if Path::new(base).exists() {
+                Some(
+                    Path::new(base)
+                        .canonicalize()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| base.to_string()),
+                )
+            } else {
+                None
+            };
         }
 
         let candidates = [
@@ -1069,9 +1091,12 @@ impl FileOrchestrator {
     }
 
     /// Walk up from `start_dir` looking for `tsconfig.json`. Return its
-    /// directory and the resolved `compilerOptions.baseUrl` (defaulting to
-    /// `"."`) if found. Path aliases (`compilerOptions.paths`) are out of
-    /// scope here — this only handles the common baseUrl case.
+    /// directory and the resolved `compilerOptions.baseUrl` only if the
+    /// option is *explicitly set* — matches `tsc` behaviour, which only
+    /// enables baseUrl-based non-relative resolution when configured.
+    /// Returns `None` for tsconfigs that omit baseUrl (or for repos with
+    /// no tsconfig at all). Path aliases (`compilerOptions.paths`) and
+    /// `extends` inheritance are out of scope here.
     fn find_tsconfig_base_url(start_dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
         let mut dir = Some(start_dir);
         while let Some(d) = dir {
@@ -1079,14 +1104,12 @@ impl FileOrchestrator {
             if tsconfig.is_file()
                 && let Ok(text) = std::fs::read_to_string(&tsconfig)
                 && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-            {
-                let base_url = json
+                && let Some(base_url) = json
                     .get("compilerOptions")
                     .and_then(|c| c.get("baseUrl"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or(".")
-                    .to_string();
-                return Some((d.to_path_buf(), base_url));
+            {
+                return Some((d.to_path_buf(), base_url.to_string()));
             }
             dir = d.parent();
         }
@@ -1436,6 +1459,66 @@ mod tests {
             FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "react");
 
         assert_eq!(resolved, "react");
+    }
+
+    /// `tsc` only enables baseUrl-based non-relative resolution when the
+    /// option is explicitly set. A tsconfig without `baseUrl` must not
+    /// shadow real package imports — bare specifiers should pass through.
+    #[test]
+    fn test_resolve_import_path_skips_baseurl_when_not_set() {
+        let repo = tempfile::tempdir().unwrap();
+        // tsconfig WITHOUT baseUrl
+        std::fs::write(
+            repo.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        // A file at types/user.ts that *would* resolve if we defaulted
+        // baseUrl to "." — must NOT be picked up here.
+        std::fs::create_dir_all(repo.path().join("types")).unwrap();
+        std::fs::write(
+            repo.path().join("types/user.ts"),
+            "export interface User { id: number }",
+        )
+        .unwrap();
+        let server = repo.path().join("server.ts");
+        std::fs::write(&server, "// stub").unwrap();
+
+        let resolved =
+            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "types/user");
+
+        assert_eq!(
+            resolved, "types/user",
+            "without explicit baseUrl, bare specifiers must pass through unchanged",
+        );
+    }
+
+    /// Pre-fix, a relative import like `./foo.ts` whose target couldn't be
+    /// canonicalized (broken symlink, absent file, permissions) fell through
+    /// to a `.ts.ts` double-extension fallback because the wrapper helper
+    /// returned `None` for already-extension paths and the outer code
+    /// blindly appended `.ts`.
+    #[test]
+    fn test_resolve_import_path_no_double_extension_for_missing_relative() {
+        let repo = tempfile::tempdir().unwrap();
+        let server = repo.path().join("server.ts");
+        std::fs::write(&server, "// stub").unwrap();
+
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "./missing.ts",
+        );
+
+        assert!(
+            !resolved.ends_with(".ts.ts"),
+            "relative import with extension must not get .ts appended on miss; got `{}`",
+            resolved
+        );
+        assert!(
+            resolved.ends_with(".ts"),
+            "should still surface a single-`.ts` path; got `{}`",
+            resolved
+        );
     }
 
     /// Relative imports continue to resolve against the importing file's
