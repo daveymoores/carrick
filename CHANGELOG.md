@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.17](https://github.com/daveymoores/carrick/compare/carrick-v0.1.16...carrick-v0.1.17) (2026-05-06)
+
+
+### Bug Fixes
+
+* **logging:** unblock CI log uploads and improve diagnostics ([#91](https://github.com/daveymoores/carrick/issues/91)) ([35d3900](https://github.com/daveymoores/carrick/commit/35d390002baa72647977abb02d357f534870862f))
+
 ## [0.1.16](https://github.com/daveymoores/carrick/compare/carrick-v0.1.15...carrick-v0.1.16) (2026-05-04)
 
 
