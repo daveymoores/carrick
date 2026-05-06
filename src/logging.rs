@@ -1,19 +1,26 @@
 use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::info;
 use tracing_appender::rolling;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Byte offset into today's log file at which *this run* started writing.
+/// Captured during `init()` and used by `get_run_log_offset()` so log uploads
+/// only ship the current run's content, not the day's accumulated tail (which
+/// could include unrelated repos analyzed earlier on the same machine).
+static RUN_START_OFFSET: OnceLock<u64> = OnceLock::new();
 
 /// Initialize the global tracing subscriber with two layers:
 ///
 /// 1. **Terminal layer** (stderr): Shows `INFO` by default, `DEBUG` with `--verbose`.
 ///    Uses a minimal format without timestamps or targets for a clean look.
 ///
-/// 2. **File layer**: Always writes `DEBUG`-level logs with timestamps to
-///    `~/.carrick/logs/carrick.log` (daily rotation).
-///
-/// The file layer is best-effort — if the log directory can't be created, only
-/// the terminal layer is active.
+/// 2. **File layer** (best effort): when `~/.carrick/logs/` is writable, appends
+///    `DEBUG`-level logs with timestamps to `carrick.log.YYYY-MM-DD` (daily
+///    rotation). If the directory can't be created the file layer is skipped
+///    and only the terminal layer is active — in that case the run preamble
+///    only reaches stderr.
 pub fn init(verbose: bool) {
     let terminal_filter = if verbose {
         EnvFilter::new("debug")
@@ -34,6 +41,10 @@ pub fn init(verbose: bool) {
     if let Some(ref dir) = log_dir
         && std::fs::create_dir_all(dir).is_ok()
     {
+        // Capture the current size of today's log file *before* we write
+        // anything. Anything past this offset belongs to this run.
+        let _ = RUN_START_OFFSET.set(current_log_file_size());
+
         let file_appender = rolling::daily(dir, "carrick.log");
         let file_layer = fmt::layer()
             .with_writer(file_appender)
@@ -56,18 +67,33 @@ pub fn init(verbose: bool) {
     emit_run_preamble();
 }
 
+fn current_log_file_size() -> u64 {
+    get_log_file_path()
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Byte offset into the daily log file at which this run began. `None` if
+/// the file layer wasn't initialized (terminal-only fallback).
+pub fn get_run_log_offset() -> Option<u64> {
+    RUN_START_OFFSET.get().copied()
+}
+
 /// Emit a structured preamble at the start of every run. Goes through `tracing`
-/// so it lands in both the rolling file log (always) and the terminal (info+).
+/// so it lands in the file log (when available) and the terminal (info+).
 /// This is the "what was the environment when this ran" record that makes
 /// uploaded logs interpretable after the fact.
+///
+/// Intentionally omits absolute filesystem paths (e.g. cwd) — this preamble is
+/// uploaded to S3 from local runs as well as CI, and workstation paths often
+/// contain usernames or internal directory names that aren't needed to
+/// identify a run. GitHub repo/sha are sufficient for CI; for local runs the
+/// repository name from the carrick.json + scanner version are enough.
 fn emit_run_preamble() {
     fn env(name: &str) -> String {
         std::env::var(name).unwrap_or_else(|_| "<unset>".to_string())
     }
-
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
 
     info!(
         scanner_version = env!("CARGO_PKG_VERSION"),
@@ -82,7 +108,6 @@ fn emit_run_preamble() {
         github_run_id = %env("GITHUB_RUN_ID"),
         github_workflow = %env("GITHUB_WORKFLOW"),
         runner_os = %env("RUNNER_OS"),
-        cwd = %cwd,
         "Carrick run starting"
     );
 }

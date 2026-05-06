@@ -91,9 +91,27 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     run_analysis_engine_with_sidecar(storage, repo_path, None, false, None).await
 }
 
-/// Run analysis engine with optional sidecar for type extraction
+/// Run analysis engine with optional sidecar for type extraction.
+///
+/// Always attempts log upload before returning, including on the error path —
+/// the failing runs are exactly the ones whose logs we need. The inner
+/// pipeline lives in `run_analysis_engine_inner` so `?`-propagated errors
+/// don't bypass the upload.
 pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     storage: T,
+    repo_path: &str,
+    sidecar: Option<&TypeSidecar>,
+    no_cache: bool,
+    ts_check_dir: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result =
+        run_analysis_engine_inner(&storage, repo_path, sidecar, no_cache, ts_check_dir).await;
+    upload_run_logs(&storage, repo_path).await;
+    result
+}
+
+async fn run_analysis_engine_inner<T: CloudStorage>(
+    storage: &T,
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     no_cache: bool,
@@ -192,41 +210,68 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     let results = analyzer.get_results();
     print_results(results);
 
-    // 7. Best-effort log upload — runs unconditionally (PRs, feature branches, local).
-    // Logs are independent of the data-upload policy: they're a debugging aid that should
-    // be available for every run, especially the failing PR runs we need to diagnose.
-    if let Some(log_path) = logging::get_log_file_path() {
-        const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    Ok(())
+}
 
-        if let Ok(mut file) = std::fs::File::open(&log_path) {
-            use std::io::{Read, Seek};
-            if let Ok(metadata) = file.metadata() {
-                let file_len = metadata.len();
-                let start = file_len.saturating_sub(MAX_LOG_BYTES);
-                if file.seek(std::io::SeekFrom::Start(start)).is_ok() {
-                    let mut buf = Vec::with_capacity((file_len - start) as usize);
-                    if file.read_to_end(&mut buf).is_ok() {
-                        let log_content = String::from_utf8_lossy(&buf);
-                        let repo_name = get_repository_name(repo_path);
-                        match storage.upload_logs(&repo_name, &log_content).await {
-                            Ok(()) => {
-                                debug!(
-                                    bytes = log_content.len(),
-                                    repo = %repo_name,
-                                    "Uploaded run logs to S3"
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Failed to upload logs: {:?}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+/// Best-effort upload of the current run's log tail to S3.
+///
+/// Reads from the byte offset captured at `logging::init` time so the upload
+/// only contains *this run's* output — not the day's accumulated tail, which
+/// on a developer machine could include unrelated repos analyzed earlier.
+/// Capped at 5 MB in case a single run is unusually verbose.
+///
+/// Runs on both success and failure paths — failing runs are exactly the
+/// ones whose logs we need. Errors here are non-fatal: a failed upload is
+/// logged at warn but never propagated.
+async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+    let Some(log_path) = logging::get_log_file_path() else {
+        return;
+    };
+    let Ok(mut file) = std::fs::File::open(&log_path) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+
+    use std::io::{Read, Seek};
+
+    let file_len = metadata.len();
+    // Start from this run's offset, but cap at 5 MB worth from the end so a
+    // pathologically chatty run doesn't ship hundreds of megabytes.
+    let run_start = logging::get_run_log_offset().unwrap_or(0);
+    let cap_start = file_len.saturating_sub(MAX_LOG_BYTES);
+    let start = run_start.max(cap_start);
+
+    if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+        return;
     }
 
-    Ok(())
+    let mut buf = Vec::with_capacity((file_len - start) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return;
+    }
+
+    // Note: `from_utf8_lossy` replaces invalid sequences with U+FFFD (3 bytes
+    // in UTF-8), so the resulting `log_content.len()` may exceed the original
+    // raw byte count when the file contains non-UTF-8 noise. Close enough for
+    // a logged size hint.
+    let log_content = String::from_utf8_lossy(&buf);
+    let repo_name = get_repository_name(repo_path);
+    match storage.upload_logs(&repo_name, &log_content).await {
+        Ok(()) => {
+            debug!(
+                bytes = log_content.len(),
+                repo = %repo_name,
+                "Uploaded run logs to S3"
+            );
+        }
+        Err(e) => {
+            warn!("Failed to upload logs: {}", e);
+        }
+    }
 }
 
 /// Serialize CloudRepoData without AST nodes in ApiEndpointDetails
@@ -788,12 +833,8 @@ fn resolve_types_if_available(
                             type_resolution.dts_content.as_deref(),
                         );
                     }
-                    for failure in &type_resolution.symbol_failures {
-                        debug!(
-                            "Failed to resolve symbol '{}' from '{}': {}",
-                            failure.symbol_name, failure.source_file, failure.reason
-                        );
-                    }
+                    // Per-symbol failures are logged in FileOrchestrator at the
+                    // resolution call site (with capped warn + spillover to debug).
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);

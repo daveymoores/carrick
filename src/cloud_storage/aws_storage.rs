@@ -181,9 +181,14 @@ impl AwsStorage {
             .map_err(|e| StorageError::ConnectionError(format!("S3 upload failed: {}", e)))?;
 
         if !response.status().is_success() {
+            // Always include the response body — S3 returns the actual cause
+            // (AccessDenied, signature mismatch, missing header, etc.) in the
+            // XML error document. A bare status code is rarely actionable.
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(StorageError::ConnectionError(format!(
-                "S3 upload returned error: {}",
-                response.status()
+                "S3 upload returned {}: {}",
+                status, body
             )));
         }
 
@@ -363,24 +368,7 @@ impl CloudStorage for AwsStorage {
         };
 
         let resp: UploadLogsResponse = self.call_lambda_generic(&request).await?;
-
-        let response = self
-            .http_client
-            .put(&resp.upload_url)
-            .header("Content-Type", "text/plain")
-            .body(log_content.to_string())
-            .send()
-            .await
-            .map_err(|e| StorageError::ConnectionError(format!("S3 log upload failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(StorageError::ConnectionError(format!(
-                "S3 log upload returned {}: {}",
-                status, body
-            )));
-        }
+        self.upload_to_s3(&resp.upload_url, log_content).await?;
 
         Ok(())
     }
