@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.19](https://github.com/daveymoores/carrick/compare/carrick-v0.1.18...carrick-v0.1.19) (2026-05-06)
+
+
+### Bug Fixes
+
+* **formatter+resolver:** missing-endpoint prefix + tsconfig baseUrl resolution ([#95](https://github.com/daveymoores/carrick/issues/95)) ([80d18d8](https://github.com/daveymoores/carrick/commit/80d18d81d099d78c47ffff2b2e2cb83a8844aa91))
+
+
+### Documentation
+
+* **readme:** include carrick-sibling-updated dispatch trigger in example workflow ([#96](https://github.com/daveymoores/carrick/issues/96)) ([bde20e5](https://github.com/daveymoores/carrick/commit/bde20e5dea18bce968f9e386cd89c1fb46718d2c))
+
 ## [0.1.18](https://github.com/daveymoores/carrick/compare/carrick-v0.1.17...carrick-v0.1.18) (2026-05-06)
 
 
