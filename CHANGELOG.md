@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.18](https://github.com/daveymoores/carrick/compare/carrick-v0.1.17...carrick-v0.1.18) (2026-05-06)
+
+
+### Features
+
+* **observability:** emit X-Carrick-Run-Id on every cloud call ([#93](https://github.com/daveymoores/carrick/issues/93)) ([6d17ea5](https://github.com/daveymoores/carrick/commit/6d17ea5ea414454220ea2d517387e4ff96adef57))
+
 ## [0.1.17](https://github.com/daveymoores/carrick/compare/carrick-v0.1.16...carrick-v0.1.17) (2026-05-06)
 
 
