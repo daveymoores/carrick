@@ -196,8 +196,13 @@ fn separate_missing_orphaned(issues: &[String]) -> (Vec<&String>, Vec<&String>) 
     let mut missing = Vec::new();
     let mut orphaned = Vec::new();
 
+    // Prefixes must match what `analyzer::mod` emits:
+    //   "Missing endpoint for {METHOD} {PATH} ..." (no colon)
+    //   "Orphaned endpoint: {METHOD} {PATH} ..."   (has colon)
+    // Pre-2026-05 the missing-side check used a colon and silently dropped
+    // every entry. Tests below pin both literals.
     for issue in issues {
-        if issue.starts_with("Missing endpoint:") {
+        if issue.starts_with("Missing endpoint for") {
             missing.push(issue);
         } else if issue.starts_with("Orphaned endpoint:") {
             orphaned.push(issue);
@@ -910,5 +915,47 @@ mod tests {
         let (method, path) = extract_method_path(issue);
         assert_eq!(method, "DELETE");
         assert_eq!(path, "/items/:id");
+    }
+
+    #[test]
+    fn test_separate_missing_orphaned_routes_both_kinds() {
+        // Regression test: pre-fix, the "Missing endpoint for ..." prefix
+        // was checked as "Missing endpoint:" (with colon) which never matched
+        // the analyzer's actual output, so every missing-endpoint entry was
+        // silently filtered out before rendering.
+        let issues = vec![
+            "Missing endpoint for POST /api/orders (normalized: /api/orders) (called from src/client.ts)".to_string(),
+            "Orphaned endpoint: GET /api/users in src/routes.ts:42".to_string(),
+            "Missing endpoint for DELETE /items/:id (normalized: /items/:id) (called from src/items.ts)".to_string(),
+            "Orphaned endpoint: PUT /api/sessions in src/sessions.ts:7".to_string(),
+        ];
+
+        let (missing, orphaned) = separate_missing_orphaned(&issues);
+
+        assert_eq!(
+            missing.len(),
+            2,
+            "both missing-endpoint entries must route to the missing bucket"
+        );
+        assert_eq!(
+            orphaned.len(),
+            2,
+            "both orphaned-endpoint entries must route to the orphaned bucket"
+        );
+        assert!(missing[0].contains("POST /api/orders"));
+        assert!(missing[1].contains("DELETE /items/:id"));
+        assert!(orphaned[0].contains("GET /api/users"));
+        assert!(orphaned[1].contains("PUT /api/sessions"));
+    }
+
+    #[test]
+    fn test_separate_missing_orphaned_ignores_unrelated() {
+        let issues = vec![
+            "Some other diagnostic about types".to_string(),
+            "Missing endpoint for GET /a (normalized: /a) (called from src/x.ts)".to_string(),
+        ];
+        let (missing, orphaned) = separate_missing_orphaned(&issues);
+        assert_eq!(missing.len(), 1);
+        assert!(orphaned.is_empty());
     }
 }
