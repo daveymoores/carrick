@@ -183,6 +183,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  repository_dispatch:
+    types: [carrick-sibling-updated]
 
 permissions:
   contents: read
