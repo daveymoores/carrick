@@ -11,6 +11,18 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::Subs
 /// could include unrelated repos analyzed earlier on the same machine).
 static RUN_START_OFFSET: OnceLock<u64> = OnceLock::new();
 
+/// UUID v4 generated once per scanner invocation. Sent on every cloud
+/// request as `X-Carrick-Run-Id` and logged in the run preamble so the
+/// same key joins customer-side and CloudWatch logs for one scan.
+static RUN_ID: OnceLock<String> = OnceLock::new();
+
+/// Stable identifier for this scanner run. Initializes lazily on first
+/// call to a fresh UUID v4, then returns the same string for the rest
+/// of the process.
+pub fn run_id() -> &'static str {
+    RUN_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 /// Initialize the global tracing subscriber with two layers:
 ///
 /// 1. **Terminal layer** (stderr): Shows `INFO` by default, `DEBUG` with `--verbose`.
@@ -96,6 +108,7 @@ fn emit_run_preamble() {
     }
 
     info!(
+        run_id = run_id(),
         scanner_version = env!("CARGO_PKG_VERSION"),
         api_endpoint = env!("CARRICK_API_ENDPOINT"),
         os = std::env::consts::OS,

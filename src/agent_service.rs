@@ -100,6 +100,7 @@ impl AgentService {
             .json(body)
             .timeout(std::time::Duration::from_secs(60))
             .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-Carrick-Run-Id", crate::logging::run_id())
             .header("Authorization", format!("Bearer {}", self.api_key));
 
         // Retry logic for transient failures with exponential backoff.
