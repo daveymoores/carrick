@@ -47,6 +47,14 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
     output.push_str(&format_graphql_banner(&result.detected_graphql_libraries));
 
+    // Verified-matches section runs first so users see what *worked* before
+    // the failure list — clean runs would otherwise produce no positive
+    // signal, and noisy runs would bury the matches under orphans.
+    if !result.verified_endpoints.is_empty() {
+        output.push_str(&format_verified_section(&result.verified_endpoints));
+        output.push_str("\n<hr>\n\n");
+    }
+
     // Critical Issues Section
     if !categorized_issues.critical.is_empty() {
         output.push_str(&format_critical_section(&categorized_issues.critical));
@@ -84,12 +92,40 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 }
 
 fn format_no_issues(result: &ApiAnalysisResult) -> String {
+    let verified = if result.verified_endpoints.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", format_verified_section(&result.verified_endpoints))
+    };
     format!(
-        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n{}<!-- CARRICK_OUTPUT_END -->\n",
+        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n{}{}<!-- CARRICK_OUTPUT_END -->\n",
         result.endpoints.len(),
         result.calls.len(),
         format_graphql_banner(&result.detected_graphql_libraries),
+        verified,
     )
+}
+
+/// Render a "Verified Endpoints" details block listing every endpoint that
+/// at least one consumer call successfully matched. Surfaced so PR comments
+/// communicate what's *working*, not just what's broken — without it, a
+/// clean cross-repo run produces no positive signal at all.
+fn format_verified_section(verified: &[(String, String)]) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "<details>\n<summary>\n<strong style=\"font-size: 1.1em;\">✅ {} Verified Endpoint{}</strong>\n</summary>\n\n",
+        verified.len(),
+        if verified.len() == 1 { "" } else { "s" }
+    ));
+    output.push_str(
+        "> These endpoints have at least one matching consumer call across the analyzed repos. Types were resolved and compared via the TypeScript compiler pass.\n\n",
+    );
+    output.push_str("| Method | Path |\n| :--- | :--- |\n");
+    for (method, path) in verified {
+        output.push_str(&format!("| `{}` | `{}` |\n", method, path));
+    }
+    output.push_str("</details>");
+    output
 }
 
 /// Render a banner noting that GraphQL usage was detected but is out of scope
@@ -732,6 +768,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
         };
 
@@ -765,6 +802,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
         };
 
@@ -792,6 +830,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            verified_endpoints: vec![],
             detected_graphql_libraries: vec![
                 "graphql-request".to_string(),
                 "@apollo/client".to_string(),
@@ -818,6 +857,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
         };
         let output = format_analysis_results(result);
@@ -839,6 +879,7 @@ mod tests {
             endpoints: vec![],
             calls: vec![],
             issues,
+            verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
         };
 
@@ -847,6 +888,86 @@ mod tests {
         // Check that no issues message is displayed
         assert!(output.contains("No API inconsistencies detected"));
         assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
+    }
+
+    #[test]
+    fn test_verified_section_renders_when_matches_present() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            verified_endpoints: vec![
+                ("GET".to_string(), "/api/users".to_string()),
+                ("POST".to_string(), "/api/orders".to_string()),
+            ],
+            detected_graphql_libraries: vec![],
+        };
+
+        let output = format_analysis_results(result);
+
+        assert!(output.contains("✅ 2 Verified Endpoints"));
+        assert!(output.contains("`GET` | `/api/users`"));
+        assert!(output.contains("`POST` | `/api/orders`"));
+    }
+
+    #[test]
+    fn test_verified_section_singular_label() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
+            detected_graphql_libraries: vec![],
+        };
+
+        let output = format_analysis_results(result);
+
+        assert!(output.contains("✅ 1 Verified Endpoint"));
+        // Must not pluralize on a single match.
+        assert!(!output.contains("✅ 1 Verified Endpoints"));
+    }
+
+    #[test]
+    fn test_verified_section_renders_on_clean_run() {
+        // Even when there are zero issues, a clean run with verified
+        // matches must surface them — that's the whole point of the
+        // section. Pre-fix, `format_no_issues` ignored verified entirely.
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
+            detected_graphql_libraries: vec![],
+        };
+
+        let output = format_analysis_results(result);
+
+        assert!(output.contains("No API inconsistencies detected"));
+        assert!(output.contains("✅ 1 Verified Endpoint"));
     }
 
     #[test]

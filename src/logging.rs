@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
+use std::io::IsTerminal;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::info;
@@ -139,8 +140,27 @@ pub fn get_log_file_path() -> Option<std::path::PathBuf> {
     }
 }
 
+/// True when stderr is attached to a terminal (TTY). False under CI redirects
+/// like `./carrick . > analysis.log 2>&1`, where indicatif renders nothing
+/// and the user sees a long silent gap between stage transitions.
+fn is_tty() -> bool {
+    std::io::stderr().is_terminal()
+}
+
 /// Create a spinner with a message. Call `finish_with_message` when done.
+///
+/// In non-TTY environments (CI, piped output) the animated spinner is
+/// suppressed and a plain `▸ <msg>` line is emitted to stderr so the user
+/// still sees the stage start. `finish_spinner` mirrors with `✓ <msg>`.
 pub fn spinner(msg: &str) -> ProgressBar {
+    if !is_tty() {
+        eprintln!("▸ {}", msg);
+        // Returning a hidden ProgressBar keeps the call sites uniform — no
+        // ticks are drawn and `finish_*` skips its rendering path. The
+        // matching `✓ <msg>` line is still emitted by the same is_tty()
+        // gate inside `finish_spinner`.
+        return ProgressBar::hidden();
+    }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -154,12 +174,20 @@ pub fn spinner(msg: &str) -> ProgressBar {
 
 /// Finish a spinner with a success checkmark.
 pub fn finish_spinner(pb: &ProgressBar, msg: &str) {
+    if !is_tty() {
+        eprintln!("✓ {}", msg);
+        return;
+    }
     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
     pb.finish_with_message(format!("\x1b[32m✓\x1b[0m {}", msg));
 }
 
 /// Finish a spinner with a warning marker.
 pub fn finish_spinner_warn(pb: &ProgressBar, msg: &str) {
+    if !is_tty() {
+        eprintln!("⚠ {}", msg);
+        return;
+    }
     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
     pb.finish_with_message(format!("\x1b[33m⚠\x1b[0m {}", msg));
 }

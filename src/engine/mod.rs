@@ -121,12 +121,12 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     debug!(upload = should_upload, "Running Carrick in CI mode");
 
     // 1. Health check
-    let sp = logging::spinner("Connecting to AWS...");
+    let sp = logging::spinner("Connecting to Carrick Cloud...");
     storage
         .health_check()
         .await
-        .map_err(|e| format!("Failed to connect to AWS services: {}", e))?;
-    logging::finish_spinner(&sp, "AWS connectivity verified");
+        .map_err(|e| format!("Failed to connect to Carrick Cloud: {}", e))?;
+    logging::finish_spinner(&sp, "Connected to Carrick Cloud");
 
     // 2. Download all repos (moved earlier for incremental cache lookup)
     let sp = logging::spinner("Downloading cross-repo data...");
@@ -186,7 +186,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             .upload_repo_data(&cloud_data_serialized)
             .await
             .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-        logging::finish_spinner(&sp, "Uploaded results to cloud storage");
+        logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
     } else {
         debug!("Skipping upload (PR/branch mode)");
     }

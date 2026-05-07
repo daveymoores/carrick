@@ -104,7 +104,7 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
     CARRICK_API_KEY         API key for the LLM service (required)
-    CARRICK_MOCK_ALL        Use mock storage instead of AWS
+    CARRICK_MOCK_ALL        Use mock storage instead of Carrick Cloud
     CARRICK_API_ENDPOINT    API endpoint for the carrick service (build-time)
 "#
         );

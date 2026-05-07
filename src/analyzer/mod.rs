@@ -22,6 +22,9 @@ use tracing::{debug, warn};
 
 // Type aliases to reduce complexity
 type RouteFieldMap = HashMap<(String, String), Json>;
+/// Result of `analyze_matches_with_mount_graph`:
+///   `(call_issues, endpoint_issues, env_var_calls, verified_endpoints)`.
+type MountGraphMatches = (Vec<String>, Vec<String>, Vec<String>, Vec<(String, String)>);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
@@ -89,6 +92,11 @@ pub struct ApiAnalysisResult {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub issues: ApiIssues,
+    /// Endpoints that were successfully matched by at least one consumer
+    /// call, with their method + canonical path. Surfaced so users see
+    /// what *worked* in the PR comment, not just what's broken — clean
+    /// runs otherwise produce no positive signal.
+    pub verified_endpoints: Vec<(String, String)>,
     /// GraphQL libraries detected across all scanned repos (subset of
     /// `detected_data_fetchers`). Populated so the formatter can show a
     /// "REST-only for v1" banner; Carrick doesn't analyze GraphQL schemas.
@@ -871,12 +879,12 @@ impl Analyzer {
         self
     }
 
-    /// Framework-agnostic analysis using mount graph
-    /// Finds orphaned endpoints and missing API calls without pattern matching
-    fn analyze_matches_with_mount_graph(
-        &self,
-        mount_graph: &MountGraph,
-    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+    /// Framework-agnostic analysis using mount graph.
+    /// Returns `(call_issues, endpoint_issues, env_var_calls, verified_endpoints)`
+    /// — the fourth element captures (method, path) of every endpoint that
+    /// at least one consumer call successfully matched, so the formatter can
+    /// surface them as positive signal in the PR comment.
+    fn analyze_matches_with_mount_graph(&self, mount_graph: &MountGraph) -> MountGraphMatches {
         let mut call_issues = Vec::new();
         let mut endpoint_issues = Vec::new();
         let mut env_var_calls = Vec::new();
@@ -988,18 +996,24 @@ impl Analyzer {
             }
         }
 
-        // Find orphaned endpoints (not matched by any call)
+        // Find orphaned endpoints (not matched by any call), and capture
+        // verified matches as (method, path) tuples for the formatter.
+        let mut verified: Vec<(String, String)> = Vec::new();
         for endpoint in mount_graph.get_resolved_endpoints() {
             let key = format!("{}:{}", endpoint.method, endpoint.full_path);
-            if !matched_endpoints.contains(&key) {
+            if matched_endpoints.contains(&key) {
+                verified.push((endpoint.method.clone(), endpoint.full_path.clone()));
+            } else {
                 endpoint_issues.push(format!(
                     "Orphaned endpoint: {} {} in {}",
                     endpoint.method, endpoint.full_path, endpoint.file_location
                 ));
             }
         }
+        verified.sort();
+        verified.dedup();
 
-        (call_issues, endpoint_issues, env_var_calls)
+        (call_issues, endpoint_issues, env_var_calls, verified)
     }
 
     pub fn compute_full_paths_for_endpoint(
@@ -1176,7 +1190,7 @@ impl Analyzer {
         let mount_graph = self.mount_graph.as_ref()
             .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
 
-        let (call_issues, endpoint_issues, env_var_calls) =
+        let (call_issues, endpoint_issues, env_var_calls, verified_endpoints) =
             self.analyze_matches_with_mount_graph(mount_graph);
         // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
         let mismatches = Vec::new();
@@ -1196,6 +1210,7 @@ impl Analyzer {
                 type_mismatches,
                 dependency_conflicts,
             },
+            verified_endpoints,
             detected_graphql_libraries,
         }
     }
@@ -1785,7 +1800,7 @@ mod tests {
         let mount_graph = MountGraph::new(); // Empty graph
 
         // Run analysis
-        let (call_issues, _, env_var_calls) =
+        let (call_issues, _, env_var_calls, _verified) =
             analyzer.analyze_matches_with_mount_graph(&mount_graph);
 
         // Check results
