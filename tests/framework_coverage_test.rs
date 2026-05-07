@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the deterministic first stage of the pipeline — the
 //! SWC candidate scanner — against each orphan fixture named in
-//! `.thoughts/framework-coverage.md` §10.5. They assert the shape of the
+//! `carrick-cloud/docs/internal/framework-coverage.md` §10.5. They assert the shape of the
 //! candidates the scanner produces (method calls, fetch calls, decorator
 //! calls). They do NOT exercise the LLM-dependent path; that's tracked in
 //! the §10.3 harness note and runs behind `CARRICK_API_KEY`.

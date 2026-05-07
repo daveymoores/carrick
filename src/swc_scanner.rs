@@ -802,7 +802,7 @@ createRouter()
 
     #[test]
     fn test_detects_decorator_calls_for_nestjs_style() {
-        // Regression for the gap verified in .thoughts/framework-coverage.md §2.3:
+        // Regression for the gap verified in carrick-cloud/docs/internal/framework-coverage.md §2.3:
         // prior to Move 2, decorator calls produced zero candidates because the
         // visitor only fired on member calls. After widening the scanner, a
         // @Controller('users') class with @Get/@Post/@Get(':id') methods must
