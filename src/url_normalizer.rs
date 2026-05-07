@@ -83,9 +83,14 @@ impl UrlNormalizer {
         // The LLM sometimes returns URL targets verbatim from source — including
         // the JS template-literal backticks or string-literal quotes. Strip
         // those wrapper chars before pattern dispatch so a target like
-        // `${USER_SERVICE_URL}/api/users` (with literal backticks) hits the
-        // template-literal branch via `starts_with("${")` instead of
-        // falling through and producing `:USER_SERVICE_URL/api/users`.
+        // `${USER_SERVICE_URL}/api/users` (with literal backticks) reaches
+        // `normalize_template_literal::starts_with("${")`, which strips the
+        // base URL host. Without the trim the dispatch *does* still hit the
+        // template-literal branch (the URL contains "${"), but the host strip
+        // is skipped and `convert_interpolations_to_params` rewrites every
+        // `${VAR}` to `:VAR`; `clean_path` then prefixes a leading "/", and
+        // the final path becomes `/:USER_SERVICE_URL/api/users` — never
+        // matching a producer's `/api/users`.
         let url = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
 
         // Handle ENV_VAR: pattern first
@@ -545,10 +550,12 @@ mod tests {
     }
 
     /// Regression: the file-analyzer LLM intermittently emits URL targets
-    /// wrapped in JS template-literal backticks (e.g. `${API_URL}/users`),
-    /// copying the source verbatim. Pre-trim, the leading backtick made
-    /// `starts_with("${")` fail, so the host strip was skipped and the URL
-    /// came out as `:API_URL/users` — never matching a producer's `/users`.
+    /// wrapped in JS template-literal backticks (e.g. `` `${API_URL}/users` ``),
+    /// copying the source verbatim. Pre-trim, the leading backtick made the
+    /// inner `starts_with("${")` host-strip check fail, so only the inner
+    /// `${VAR}` → `:VAR` conversion ran; with `clean_path`'s leading-slash
+    /// guarantee the path came out as `/:API_URL/users` — never matching
+    /// a producer's `/users`.
     #[test]
     fn test_normalize_strips_template_literal_backticks() {
         let config = create_test_config();

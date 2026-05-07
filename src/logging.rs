@@ -155,8 +155,10 @@ fn is_tty() -> bool {
 pub fn spinner(msg: &str) -> ProgressBar {
     if !is_tty() {
         eprintln!("▸ {}", msg);
-        // Returning a hidden ProgressBar keeps the call sites uniform; no
-        // ticks are drawn and `finish_*` will be a no-op via the same gate.
+        // Returning a hidden ProgressBar keeps the call sites uniform — no
+        // ticks are drawn and `finish_*` skips its rendering path. The
+        // matching `✓ <msg>` line is still emitted by the same is_tty()
+        // gate inside `finish_spinner`.
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new_spinner();
