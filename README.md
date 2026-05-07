@@ -1,179 +1,40 @@
 ![Carrick Social Image](https://cdn.prod.website-files.com/685162a038275750f4f698e3/686cee204d48f5406664086d_social-image_1.png)
 
-# Carrick 🪢
+# Carrick
 
-A GitHub Action that checks API producers and consumers across repositories to catch mismatches in CI.
+Carrick indexes every TypeScript service in your GitHub org. The index is exposed to AI coding agents (Claude Code, Cursor, Windsurf, Codex) over the Model Context Protocol, so an agent can answer cross-repo questions without grepping the codebase.
 
-Rather than contract testing, Carrick uses SWC to extract routes from Express apps and mounted routers to find producers, then extracts async call code and sends it to an LLM to find consumers. It extracts request/response types from both sides and runs a minimal TypeScript compiler pass to surface mismatches between services.
+> Carrick is TypeScript only. Cross-repo features need at least two services onboarded in the same GitHub org. A single-repo install still gets same-repo validation.
 
-**Looking for beta testers with Express microservices - sign up at [carrick.tools](https://www.carrick.tools/)**
+## What it indexes
 
-## How it works
+For each TypeScript service in your org, Carrick tracks three things:
 
-1. **Extract producers**: Uses SWC to parse Express apps and extract route definitions from mounted routers
-2. **Extract consumers**: Finds async function calls and sends them to Gemini 2.5 Flash for intelligent extraction of HTTP calls
-3. **Type analysis**: Extracts TypeScript types from both producers and consumers
-4. **Cross-repo analysis**: Shares data across repositories via cloud storage (DynamoDB + S3)
-5. **Mismatch detection**: Runs TypeScript compiler with extracted types to find incompatibilities
+- **Exported functions**, each with a one-line LLM-generated description of what it does.
+- **npm dependencies**, per service and aggregated across the org so version conflicts surface immediately.
+- **API endpoints**, with their real TypeScript request and response types extracted from the source.
 
-Catches issues like type mismatches, method conflicts, missing endpoints, and orphaned routes.
+## What it unblocks
 
-## Example
+Connect your AI agent to Carrick's MCP endpoint and ask the kind of questions an agent normally can't answer alone:
 
-**Producer** (Express service):
-```typescript
-app.get("/users/:id", (req, res) => {
-  res.json({ id: 1, name: "Alice" });
-});
-```
+- "Is there already a helper for this somewhere?"
+- "What is the response shape of `GET /users/:id`?"
+- "What other services call this endpoint, and would adding a required field break them?"
 
-**Consumer** (Client service):
-```typescript
-interface User {
-  id: number;
-  name: string;
-  role: string;
-}
+## On pull requests
 
-async function getUser(id: string): Promise<User> {
-  const response = await fetch(`${API_URL}/users/${id}`);
-  return response.json();
-}
-```
+Carrick also runs as a GitHub Action. On the main branch it refreshes the org index. On pull requests it posts a comment summarising drift detected against the rest of the org: producer/consumer type mismatches, mismatched HTTP verbs, missing endpoints, orphaned routes, and dependency-version conflicts.
 
-**Result:**
-```
-Type compatibility issue: GET /users/:id
-Producer: { id: number; name: string; }
-Consumer: User
-Error: Property 'role' is missing in producer type
-```
+## Install
 
-## GitHub Action Output
+Carrick is currently invite-only while we ship a refreshed authentication flow. Once your org is provisioned, the install is three steps.
 
-When Carrick runs in your CI, it produces detailed reports like this (click sections to expand):
+### 1. Sign in with GitHub on the Carrick dashboard.
 
----
+The dashboard issues an API key for the GitHub Action and sets up the org-wide MCP authorisation.
 
-
-<!-- CARRICK_ISSUE_COUNT:24 -->
-### 🪢 CARRICK: API Analysis Results
-
-Analyzed **20 endpoints** and **13 API calls** across all repositories.
-
-Found **24 total issues**: **2 critical mismatches**, **17 connectivity issues**, **2 dependency conflicts**, and **3 configuration suggestions**.
-
-<br>
-
-<details>
-<summary>
-<strong style="font-size: 1.1em;">2 Critical: API Mismatches</strong>
-</summary>
-
-> These issues indicate a direct conflict between the API consumer and producer and should be addressed first.
-
-#### Type Compatibility Issue: `GET /users/:id`
-
-Type compatibility issue detected.
-
-  - **Endpoint:** `GET /users/:id`
-  - **Producer Type:** `{ commentsByUser: repo-a-types.Comment[]; }`
-  - **Consumer Type:** `repo-b-types.User`
-  - **Error:** { commentsByUser: Comment[]; } missing properties from User: id, name, role
-
-#### Method Mismatch
-
-Issue details: Method mismatch: GET ENV_VAR:ORDER_SERVICE_URL:/orders is called but endpoint only supports POST
-</details>
-<hr>
-
-<details>
-<summary>
-<strong style="font-size: 1.1em;">2 Dependency Conflicts</strong>
-</summary>
-
-> These packages have different versions across repositories, which could cause compatibility issues.
-
-### Critical Conflicts (1) - Major Version Differences
-
-> These conflicts involve major version differences that could cause breaking changes.
-
-#### express
-
-| Repository | Version | Source |
-| :--- | :--- | :--- |
-| `user-service` | `4.18.0` | `package.json` |
-| `comment-service` | `3.4.8` | `package.json` |
-
-### Warning Conflicts (1) - Minor Version Differences
-
-> These conflicts involve minor version differences that may cause compatibility issues.
-
-#### @types/node
-
-| Repository | Version | Source |
-| :--- | :--- | :--- |
-| `user-service` | `18.15.0` | `package.json` |
-| `comment-service` | `18.11.9` | `package.json` |
-
-</details>
-<hr>
-
-<details>
-<summary>
-<strong style="font-size: 1.1em;">17 Connectivity Issues</strong>
-</summary>
-
-> These endpoints are either defined but never used (orphaned) or called but never defined (missing). This could be dead code or a misconfigured route.
-
-#### 2 Missing Endpoints
-
-| Method | Path |
-| :--- | :--- |
-| `GET` | `ENV_VAR:ORDER_SERVICE_URL:/route-does-not-exist` |
-| `GET` | `/not-found` |
-
-<br>
-
-#### 15 Orphaned Endpoints
-
-| Method | Path |
-| :--- | :--- |
-| `GET` | `/api/orders` |
-| `GET` | `/api/orders/:id/comments` |
-| `GET` | `/users` |
-| `GET` | `/api/comments` |
-| `GET` | `/posts/:postId` |
-| `GET` | `/events/:eventId/register` |
-| `GET` | `/api/potatoes` |
-| `GET` | `/admin/stats` |
-| `GET` | `/dynamic` |
-| `GET` | `/api/profiles` |
-| `GET` | `/users/:id/profile` |
-| `GET` | `/api/v1/stats` |
-| `POST` | `/api/comments` |
-| `GET` | `/api/comments/:id` |
-| `POST` | `/api/v1/chat` |
-</details>
-<hr>
-
-<details>
-<summary>
-<strong style="font-size: 1.1em;">3 Configuration Suggestions</strong>
-</summary>
-
-> These API calls use environment variables to construct the URL. To enable full analysis, consider adding them to your tool's external API configuration.
-
-  - `GET` using **[COMMENT_SERVICE_URL]** in `/api/comments`
-  - `GET` using **[COMMENT_SERVICE_URL]** in `/comments`
-</details>
-<!-- CARRICK_OUTPUT_END -->
-
----
-
-## Setup
-
-Add to your GitHub workflow (`.github/workflows/carrick.yml`) for each Express service in your microservice architecture:
+### 2. Add the Carrick GitHub Action workflow to each TypeScript service in your org.
 
 ```yaml
 name: Carrick
@@ -183,8 +44,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  repository_dispatch:
-    types: [carrick-sibling-updated]
 
 permissions:
   contents: read
@@ -192,60 +51,60 @@ permissions:
   pull-requests: write
 
 jobs:
-  carrick-analysis:
-    name: Carrick Analysis
+  carrick:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Carrick Analysis
-        id: carrick-analysis
+      - id: carrick
         uses: daveymoores/carrick@v1
         with:
           carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
 
-      - name: Comment PR with Results
-        if: github.event_name == 'pull_request'
+      - if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
-          COMMENT_BODY: ${{ steps.carrick-analysis.outputs.pr-comment }}
+          COMMENT_BODY: ${{ steps.carrick.outputs.pr-comment }}
         with:
           script: |
-            const comment = process.env.COMMENT_BODY;
-
-            if (comment && comment.trim() !== '') {
+            const body = process.env.COMMENT_BODY;
+            if (body && body.trim()) {
               github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: comment
+                body,
               });
-            } else {
-              console.log('No comment content to post');
             }
 ```
 
-### Requirements
-- API key from [carrick.tools](https://carrick.tools)
-- Add `CARRICK_API_KEY` to your repository secrets
-- Replace `your-org-name` with your GitHub organization name
+Add `CARRICK_API_KEY` to the repository's Actions secrets.
 
-### How it works
-Runs analysis on both main branch deployments and pull requests. On main, shares your repository's API metadata with other repositories in your organization for cross-service analysis. On PRs, automatically posts detailed analysis results as comments showing type mismatches, missing endpoints, and orphaned routes across all repositories in your organization.
+### 3. Connect your AI agent to the Carrick MCP server.
 
-## Technical details
+The recommended path is sign-in-with-Carrick. Your agent opens a browser, you click Approve once, and no API key changes hands. A manual key-paste path is available as a fallback.
 
-**Producer extraction**: Uses SWC parser to walk ASTs and extract Express route definitions, including mounted routers and imported handlers.
+```bash
+claude mcp add --transport http carrick https://api.carrick.tools/mcp
+```
 
-**Consumer extraction**: Pattern matching finds basic fetch/axios calls. For complex cases (template literals, dynamic URLs), sends function source to Gemini 2.5 Flash for intelligent extraction.
+## MCP tools
 
-**Type analysis**: Extracts TypeScript interface definitions and runs targeted compiler passes using only the relevant types to check compatibility.
+The MCP endpoint exposes Carrick's index as structured tools your agent can call directly.
 
-**Cross-repository**: Stores extracted data in DynamoDB with type files in S3. Each repository downloads data from others in the same organization for analysis.
+| Tool | Purpose |
+| :--- | :--- |
+| `list_services` | Every service Carrick has indexed in your org |
+| `list_function_intents` | One-line descriptions of exported functions, searchable by service |
+| `get_api_endpoints` | Endpoints declared by a given service |
+| `get_endpoint_types` | Resolved request and response types for a specific endpoint |
+| `get_type_definition` | Fully resolved TypeScript type by name, across the org |
+| `get_service_dependencies` | Services that call a given producer |
+| `check_compatibility` | Whether service A's call to service B matches the producer's contract |
 
 ## Configuration
 
-Create a `carrick.json` in your repository root to help classify your API calls:
+Add a `carrick.json` to each service's repository root to help classify outbound calls.
 
 ```json
 {
@@ -257,101 +116,40 @@ Create a `carrick.json` in your repository root to help classify your API calls:
 }
 ```
 
-### Configuration Options
-
 | Field | Description |
 | :--- | :--- |
-| `serviceName` | Optional. A friendly name for this service (for future cross-repo features) |
-| `internalEnvVars` | Env vars pointing to **internal** services. Routes using these will be validated against known endpoints |
-| `externalEnvVars` | Env vars pointing to **external** APIs (Stripe, GitHub, etc). These calls are ignored |
+| `serviceName` | Friendly name for this service |
+| `internalEnvVars` | Env vars pointing at other services in your org. Calls are validated against the index. |
+| `externalEnvVars` | Env vars pointing at third-party APIs. Calls are ignored. |
 | `internalDomains` | Full URL prefixes for internal services |
-| `externalDomains` | Full URL prefixes for external APIs to ignore |
+| `externalDomains` | Full URL prefixes for third-party APIs to ignore |
 
-### Why Classify Environment Variables?
+When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`, it needs to know whether `ORDER_SERVICE_URL` points internally or externally. Unclassified env vars surface as a configuration suggestion in the PR comment.
 
-When Carrick finds a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`, it needs to know:
+## How it works
 
-1. **Internal service?** → Validate that `/orders` exists as an endpoint in your organization's repos
-2. **External API?** → Ignore it (we can't validate Stripe's API)
+1. SWC parses each TypeScript file into an AST.
+2. A static-analysis pass extracts function exports, mounted Express routers, and pattern-matched HTTP calls.
+3. An LLM agent handles the cases pattern matching can't reach: dynamic URLs, factory functions, framework-specific routing.
+4. A TypeScript sidecar resolves the request and response types against the actual TypeScript compiler.
+5. The org index lives in DynamoDB and S3 and refreshes each time a service's main branch runs.
 
-If an env var isn't classified, you'll see a "Configuration Suggestion" in the output:
-```
-Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars or externalEnvVars in carrick.json
-```
+## License
 
-Add it to `internalEnvVars` if it points to one of your services, or `externalEnvVars` if it's a third-party API.
-
-## What Carrick Catches
-
-- Mismatched types
-- Incorrect package versions
-- Wrong HTTP verbs
-- Missing or deprecated endpoints
-
-## MCP Server
-
-Carrick exposes its cross-repo analysis to AI agents via the Model Context Protocol. Add it to your MCP-aware client (Claude Desktop, Cursor, etc.) over HTTP — no local install:
-
-```bash
-claude mcp add --transport http carrick https://api.carrick.tools/mcp
-```
-
-Tools exposed:
-- `list_services` — every service Carrick has analyzed in your org
-- `get_api_endpoints` — endpoints declared by a given service
-- `get_service_dependencies` — services calling a given producer
-- `get_endpoint_types` — request / response types for a specific endpoint
-- `get_type_definition` — fully resolved TypeScript type, by name, across the org
-- `check_compatibility` — does service A's call to service B match the producer's contract?
-- `list_function_intents` — natural-language descriptions of exported functions
-
-Authentication uses the same Carrick API key as the GitHub Action.
-
-## Join the Private Beta
-
-We're now inviting developers to join our private beta. Here's how to get started:
-
-1. Go to [carrick.tools](https://carrick.tools) and sign up for the beta
-2. We'll send you your personal API key as we onboard new users
-3. Once you have your key, follow the setup guide above to add the Carrick GitHub Action to your workflows
-
-As an early user, your feedback will be invaluable in shaping the future of the product. We're excited to build it with you.
+[Elastic License 2.0](LICENSE.md). Copyright (c) 2026 Far Harbour B.V.
 
 ## Development
 
-### Running Tests
-
-Carrick has comprehensive test coverage with 43 tests covering:
-- Dependency conflict detection
-- API endpoint matching
-- Cloud storage workflows
-- Integration tests
+See [AGENTS.md](AGENTS.md) for build, test, and contribution conventions.
 
 ```bash
-# Run all tests
 cargo test
-
-# Run specific test suite
-cargo test --test endpoint_matching_test
+cargo fmt
+cargo clippy
 ```
 
-### Pre-Commit Hook
-
-Install the pre-commit hook to automatically run tests before each commit:
+Install the optional pre-commit hook to run formatting and tests before each commit:
 
 ```bash
 ./scripts/install-hooks.sh
 ```
-
-This ensures all tests pass before code is committed, preventing broken commits.
-
-### Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Install pre-commit hooks: `./scripts/install-hooks.sh`
-4. Make your changes
-5. Ensure tests pass: `cargo test`
-6. Submit a pull request
-
-All pull requests must pass the full test suite in CI.
