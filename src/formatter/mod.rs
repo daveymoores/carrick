@@ -93,7 +93,7 @@ fn format_no_issues(result: &ApiAnalysisResult) -> String {
 }
 
 /// Render a banner noting that GraphQL usage was detected but is out of scope
-/// for v1 (REST-only). See .thoughts/framework-coverage.md §4.3.
+/// for v1 (REST-only). See carrick-cloud/docs/internal/framework-coverage.md §4.3.
 fn format_graphql_banner(graphql_libraries: &[String]) -> String {
     if graphql_libraries.is_empty() {
         return String::new();

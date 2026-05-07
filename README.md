@@ -345,12 +345,6 @@ Install the pre-commit hook to automatically run tests before each commit:
 
 This ensures all tests pass before code is committed, preventing broken commits.
 
-### Documentation
-
-- **Testing Strategy**: See `.thoughts/research/testing_strategy.md` for comprehensive testing documentation
-- **Architecture**: See `.thoughts/research/cloud_infrastructure.md` for AWS architecture details
-- **Type Checking**: See `.thoughts/research/ts_check.md` for TypeScript type system details
-
 ### Contributing
 
 1. Fork the repository
