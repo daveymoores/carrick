@@ -1,5 +1,5 @@
-name: "Carrick API Analysis"
-description: "Analyze JavaScript/TypeScript APIs for cross-repository inconsistencies"
+name: "Carrick"
+description: "Add a TypeScript service to your Carrick org index, queryable by AI coding agents over MCP."
 
 branding:
   icon: "link"

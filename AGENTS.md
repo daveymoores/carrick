@@ -1,9 +1,10 @@
 # Repository Guidelines
 
 ## Core Goals (Read First)
-- Build a framework- and library-agnostic REST analysis tool for TypeScript services.
-- Validate producer/consumer request/response/body compatibility across disparate repositories.
-- Prioritize correctness in cross-repo matching over framework-specific heuristics.
+- Build a live, type-aware, intent-aware index of TypeScript services across a GitHub org. The index is the product surface; AI coding agents query it over MCP.
+- The Rust scanner in this repo is the index-population component. Per scanned function it extracts structural facts, request/response types, and intent.
+- The GitHub Action wraps the scanner and runs per repo. PR comments showing cross-repo drift are the demoable proof point of the type analysis, not the headline product.
+- Build framework- and library-agnostic REST extraction for TypeScript services. Prioritize correctness in cross-repo matching over framework-specific heuristics.
 - Remove legacy code paths; backwards compatibility is not required and dead code should not be kept.
 
 ## Project Structure & Module Organization
