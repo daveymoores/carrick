@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.20](https://github.com/daveymoores/carrick/compare/carrick-v0.1.19...carrick-v0.1.20) (2026-05-07)
+
+
+### Bug Fixes
+
+* **matcher+ux:** trim wrapper chars, surface verified matches, expose stages in CI ([#100](https://github.com/daveymoores/carrick/issues/100)) ([3d52671](https://github.com/daveymoores/carrick/commit/3d52671541c3af7f57e4cb1fc4a9b0cf5caff87e))
+
 ## [0.1.19](https://github.com/daveymoores/carrick/compare/carrick-v0.1.18...carrick-v0.1.19) (2026-05-06)
 
 
