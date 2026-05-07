@@ -80,6 +80,14 @@ impl UrlNormalizer {
     pub fn normalize(&self, url: &str) -> NormalizedUrl {
         let original = url.to_string();
 
+        // The LLM sometimes returns URL targets verbatim from source — including
+        // the JS template-literal backticks or string-literal quotes. Strip
+        // those wrapper chars before pattern dispatch so a target like
+        // `${USER_SERVICE_URL}/api/users` (with literal backticks) hits the
+        // template-literal branch via `starts_with("${")` instead of
+        // falling through and producing `:USER_SERVICE_URL/api/users`.
+        let url = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
+
         // Handle ENV_VAR: pattern first
         if url.starts_with("ENV_VAR:") {
             return self.normalize_env_var_pattern(url, original);
@@ -534,6 +542,38 @@ mod tests {
 
         assert_eq!(result.path, "/orders/:orderId/items/:itemId");
         assert!(result.is_internal);
+    }
+
+    /// Regression: the file-analyzer LLM intermittently emits URL targets
+    /// wrapped in JS template-literal backticks (e.g. `${API_URL}/users`),
+    /// copying the source verbatim. Pre-trim, the leading backtick made
+    /// `starts_with("${")` fail, so the host strip was skipped and the URL
+    /// came out as `:API_URL/users` — never matching a producer's `/users`.
+    #[test]
+    fn test_normalize_strips_template_literal_backticks() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("`${API_URL}/users/${userId}`");
+
+        assert_eq!(result.path, "/users/:userId");
+        assert!(result.is_internal);
+        assert_eq!(result.stripped_host, Some("${API_URL}".to_string()));
+    }
+
+    /// Same defence applies to single- and double-quoted string literals if
+    /// the LLM ever emits those — the wrapper chars must not affect dispatch.
+    #[test]
+    fn test_normalize_strips_string_literal_quotes() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        let dq = normalizer.normalize("\"ENV_VAR:API_URL:/users\"");
+        assert_eq!(dq.path, "/users");
+        assert!(dq.is_internal);
+
+        let sq = normalizer.normalize("'/users/:id'");
+        assert_eq!(sq.path, "/users/:id");
     }
 
     #[test]
