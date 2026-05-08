@@ -22,7 +22,7 @@ outputs:
     description: "Number of API issues detected"
     value: ${{ steps.analysis.outputs.issues-found }}
   pr-comment:
-    description: "Formatted PR comment with API Analysis Results"
+    description: "Formatted PR comment with cross-repo analysis"
     value: ${{ steps.analysis.outputs.pr-comment }}
 
 runs:
@@ -91,7 +91,7 @@ runs:
         else
           {
             echo "pr-comment<<EOF"
-            echo "### 🪢 CARRICK: API Analysis Results"
+            echo "### 🪢 Carrick: Cross-repo analysis"
             echo ""
             echo "⚠️ No API analysis results found in output."
             echo "EOF"

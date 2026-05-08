@@ -35,7 +35,7 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
     // Header
     output.push_str(&format!(
-        "### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\nFound **{} total issues**: **{} critical mismatches**, **{} connectivity issues**, **{} dependency conflicts**, and **{} configuration suggestions**.\n\n<br>\n\n",
+        "### 🪢 Carrick: Cross-repo analysis\n\nIndexed **{} endpoints** and **{} cross-repo calls** across the org.\n\nFound **{} issues**: **{} mismatches**, **{} connectivity gaps**, **{} dependency conflicts**, and **{} configuration suggestions**.\n\n<br>\n\n",
         result.endpoints.len(),
         result.calls.len(),
         total_issues,
@@ -98,7 +98,7 @@ fn format_no_issues(result: &ApiAnalysisResult) -> String {
         format!("{}\n", format_verified_section(&result.verified_endpoints))
     };
     format!(
-        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 CARRICK: API Analysis Results\n\nAnalyzed **{} endpoints** and **{} API calls** across all repositories.\n\n✅ **No API inconsistencies detected!**\n\n{}{}<!-- CARRICK_OUTPUT_END -->\n",
+        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 Carrick: Cross-repo analysis\n\nIndexed **{} endpoints** and **{} cross-repo calls** across the org.\n\n✅ **All cross-repo calls match the indexed contracts.**\n\n{}{}<!-- CARRICK_OUTPUT_END -->\n",
         result.endpoints.len(),
         result.calls.len(),
         format_graphql_banner(&result.detected_graphql_libraries),
@@ -143,7 +143,7 @@ fn format_graphql_banner(graphql_libraries: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "> ℹ️ **GraphQL detected** ({}). Carrick v1 analyzes REST contracts only — GraphQL schema drift and resolver typing are not yet supported. REST endpoints in this repo were analyzed normally.\n\n",
+        "> ℹ️ **GraphQL detected** ({}). Carrick v1 analyzes REST contracts only. GraphQL schema drift and resolver typing are not yet supported. REST endpoints in this repo were analyzed normally.\n\n",
         lib_list,
     )
 }
@@ -195,11 +195,11 @@ fn format_critical_section(issues: &[String]) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
-        "<details>\n<summary>\n<strong style=\"font-size: 1.1em;\">{} Critical: API Mismatches</strong>\n</summary>\n\n",
+        "<details>\n<summary>\n<strong style=\"font-size: 1.1em;\">{} Critical: Cross-repo Mismatches</strong>\n</summary>\n\n",
         issues.len()
     ));
 
-    output.push_str("> These issues indicate a direct conflict between the API consumer and producer and should be addressed first.\n\n");
+    output.push_str("> Direct conflicts between a consumer call and the producer it points to in the index.\n\n");
 
     // Group similar issues
     let grouped = group_similar_issues(issues);
@@ -256,7 +256,7 @@ fn format_connectivity_section(issues: &[String]) -> String {
         issues.len()
     ));
 
-    output.push_str("> These endpoints are either defined but never used (orphaned) or called but never defined (missing). This could be dead code or a misconfigured route.\n\n");
+    output.push_str("> Orphaned endpoints have no consumer in the indexed services. Missing endpoints have a consumer call but no producer.\n\n");
 
     let (missing, orphaned) = separate_missing_orphaned(issues);
 
@@ -299,11 +299,11 @@ fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
         issues.len()
     ));
 
-    output.push_str("> These API calls use environment variables to construct the URL. Add them to `internalEnvVars` (to validate routes) or `externalEnvVars` (to ignore) in your `carrick.json`.\n\n");
+    output.push_str("> These calls use environment variables to construct the URL. Add them to `internalEnvVars` (to validate routes) or `externalEnvVars` (to ignore) in your `carrick.json`.\n\n");
 
     for issue in issues {
         output.push_str(&format!(
-            "  - `{} {}` using **[{}]** — {} call site{}\n",
+            "  - `{} {}` using **[{}]** ({} call site{})\n",
             issue.method,
             issue.path,
             issue.env_var,
@@ -345,7 +345,7 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
         conflicts.len()
     ));
 
-    output.push_str("> These packages have different versions across repositories, which could cause compatibility issues.\n\n");
+    output.push_str("> Packages with different versions across services in the index.\n\n");
 
     // Critical conflicts (major version differences)
     if !critical.is_empty() {
@@ -353,8 +353,6 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
             "### Critical Conflicts ({}) - Major Version Differences\n\n",
             critical.len()
         ));
-        output.push_str("> These conflicts involve major version differences that could cause breaking changes.\n\n");
-
         for conflict in &critical {
             output.push_str(&format!("#### {}\n\n", conflict.package_name));
             output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
@@ -378,8 +376,6 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
             "### Warning Conflicts ({}) - Minor Version Differences\n\n",
             warning.len()
         ));
-        output.push_str("> These conflicts involve minor version differences that may cause compatibility issues.\n\n");
-
         for conflict in &warning {
             output.push_str(&format!("#### {}\n\n", conflict.package_name));
             output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
@@ -403,8 +399,6 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
             "### Info Conflicts ({}) - Patch Version Differences\n\n",
             info.len()
         ));
-        output.push_str("> These conflicts involve only patch version differences and are typically low risk.\n\n");
-
         for conflict in &info {
             output.push_str(&format!("#### {}\n\n", conflict.package_name));
             output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
@@ -886,7 +880,7 @@ mod tests {
         let output = format_analysis_results(result);
 
         // Check that no issues message is displayed
-        assert!(output.contains("No API inconsistencies detected"));
+        assert!(output.contains("All cross-repo calls match the indexed contracts"));
         assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
     }
 
@@ -966,7 +960,7 @@ mod tests {
 
         let output = format_analysis_results(result);
 
-        assert!(output.contains("No API inconsistencies detected"));
+        assert!(output.contains("All cross-repo calls match the indexed contracts"));
         assert!(output.contains("✅ 1 Verified Endpoint"));
     }
 

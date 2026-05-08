@@ -33,7 +33,7 @@ impl TestOutput {
             .unwrap_or(0);
 
         // Check for successful analysis (presence of CARRICK header)
-        let has_success = stdout.contains("🪢 CARRICK: API Analysis Results");
+        let has_success = stdout.contains("🪢 Carrick: Cross-repo analysis");
 
         Self {
             raw_output,

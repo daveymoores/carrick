@@ -1,6 +1,6 @@
 # Carrick
 
-Carrick is a live, type-aware, intent-aware index of every TypeScript service in your GitHub org, exposed to AI coding agents over the Model Context Protocol.
+Carrick is a live, type-aware, intent-aware cross-repo index of every TypeScript service in your GitHub org, exposed to AI coding agents over the Model Context Protocol.
 
 > Carrick is TypeScript only. Cross-repo features need at least two services indexed in the same GitHub org. A single-service install still gets same-repo validation.
 
@@ -33,11 +33,11 @@ The MCP endpoint lives at `https://api.carrick.tools/mcp`.
 claude mcp add --transport http carrick https://api.carrick.tools/mcp
 ```
 
-The recommended authentication is sign-in-with-Carrick: your agent opens a browser, you click Approve once, and no API key changes hands. A manual key paste is available as a fallback. Carrick is currently invite-only while the new authentication flow is being shipped; once your org is provisioned both paths work.
+The recommended authentication is sign-in-with-Carrick: your agent opens a browser, you click Approve once, and no API key changes hands. A manual key paste is available as a fallback. Carrick is currently invite-only. Once your org is provisioned, both paths work.
 
 ## Populate the index
 
-The index is populated by running the Carrick GitHub Action on each TypeScript repo you want indexed. On the main branch the action refreshes that repo's contribution. On pull requests it can optionally post the drift comment described under [Pull request signal](#pull-request-signal).
+The index is populated by running the Carrick GitHub Action on each TypeScript repo you want indexed. On the main branch the action refreshes that repo's contribution to the index. On pull requests it can optionally post a drift comment.
 
 ```yaml
 name: Carrick
@@ -97,9 +97,9 @@ The MCP endpoint exposes the index as structured tools your agent can call direc
 | `get_service_dependencies` | Services that call a given producer |
 | `check_compatibility` | Whether service A's call to service B matches the producer's contract |
 
-## Pull request signal
+## On pull requests
 
-The same Carrick action that populates the index can comment on pull requests. The comment summarises drift detected against the rest of your org: producer/consumer type mismatches, mismatched HTTP verbs, missing endpoints, orphaned routes, and npm-dependency-version conflicts. The comment is the proof point that the type analysis is rigorous; the MCP index is the durable product surface.
+The Carrick action can also post a comment on pull requests. The comment summarises drift detected against the indexed services: type mismatches between producers and consumers, mismatched HTTP verbs, missing or orphaned routes, and npm-dependency-version conflicts.
 
 ## Configuration
 
