@@ -609,6 +609,20 @@ async fn analyze_current_repo_incremental(
             let graph_orchestrator = FileOrchestrator::new(agent_service_for_graph);
             let mount_graph = graph_orchestrator.build_mount_graph(&merged_results);
 
+            // Generate function intents (also strips body_source before upload).
+            // Run on the same path as the full analysis so incremental scans
+            // populate FunctionDefinition.intent in DDB (issue #110).
+            let mut function_definitions = function_definitions;
+            {
+                let intent_agent = AgentService::new(api_key.clone());
+                generate_function_intents(
+                    &intent_agent,
+                    &mut function_definitions,
+                    &all_imported_symbols,
+                )
+                .await;
+            }
+
             let elapsed = start.elapsed();
             debug!(
                 "Incremental analysis complete in {:.1}s",
