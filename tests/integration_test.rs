@@ -14,12 +14,12 @@ impl TestOutput {
     fn parse(stdout: &str) -> Self {
         let raw_output = stdout.to_string();
 
-        // Extract endpoint count from "Analyzed **X endpoints**" in new formatted output
+        // Extract endpoint count from "Indexed **X endpoints**" in formatted output
         let endpoint_count = stdout
             .lines()
-            .find(|line| line.contains("Analyzed **") && line.contains(" endpoints**"))
+            .find(|line| line.contains("Indexed **") && line.contains(" endpoints**"))
             .and_then(|line| {
-                // Parse "Analyzed **4 endpoints** and **5 API calls**"
+                // Parse "Indexed **4 endpoints** and **5 cross-repo calls**"
                 let parts: Vec<&str> = line.split("**").collect();
                 if parts.len() >= 2 {
                     parts[1]
