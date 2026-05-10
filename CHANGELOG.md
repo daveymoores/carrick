@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.21](https://github.com/daveymoores/carrick/compare/carrick-v0.1.20...carrick-v0.1.21) (2026-05-10)
+
+
+### Bug Fixes
+
+* **intent:** generate intents in incremental path ([#110](https://github.com/daveymoores/carrick/issues/110)) ([#111](https://github.com/daveymoores/carrick/issues/111)) ([c2d5e1c](https://github.com/daveymoores/carrick/commit/c2d5e1c1204a4942f0d23bec5268d507d6c1db8e))
+* **test:** integration parser counts endpoints from new "Indexed" header ([#108](https://github.com/daveymoores/carrick/issues/108)) ([de13909](https://github.com/daveymoores/carrick/commit/de13909c6d06559fc168c4a03f1dc475822da6ba))
+
 ## [0.1.20](https://github.com/daveymoores/carrick/compare/carrick-v0.1.19...carrick-v0.1.20) (2026-05-07)
 
 
