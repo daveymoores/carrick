@@ -574,7 +574,7 @@ async fn analyze_current_repo_incremental(
             }
 
             let agent_service = AgentService::new(api_key.clone());
-            let file_orchestrator = FileOrchestrator::new(agent_service);
+            let file_orchestrator = FileOrchestrator::new(agent_service.clone());
 
             let new_file_results = if !files_to_analyze.is_empty() {
                 let result = file_orchestrator
@@ -605,9 +605,43 @@ async fn analyze_current_repo_incremental(
             }
 
             // Rebuild mount graph from full merged results
-            let agent_service_for_graph = AgentService::new(api_key.clone());
-            let graph_orchestrator = FileOrchestrator::new(agent_service_for_graph);
+            let graph_orchestrator = FileOrchestrator::new(agent_service.clone());
             let mount_graph = graph_orchestrator.build_mount_graph(&merged_results);
+
+            // Generate function intents (also strips body_source before upload).
+            // Run on the same path as the full analysis so incremental scans
+            // populate FunctionDefinition.intent in DDB (issue #110).
+            //
+            // Optimization: copy intents from `prev.function_definitions` for
+            // functions whose source file did not change. The intent generator
+            // skips entries that already have `intent` set, so this avoids
+            // re-calling /generate-intent for code that hasn't moved. Caveat:
+            // if a function in an unchanged file calls a function in a
+            // changed file, the cached intent may be slightly stale relative
+            // to its callee's new behavior — acceptable trade-off; a full
+            // scan or a touch of the caller's file refreshes it.
+            let mut function_definitions = function_definitions;
+            for (name, def) in function_definitions.iter_mut() {
+                if def.intent.is_some() {
+                    continue;
+                }
+                let rel = normalize_path(&def.file_path);
+                if changed_set.contains(&rel) {
+                    continue;
+                }
+                if let Some(prev_def) = prev.function_definitions.get(name)
+                    && prev_def.intent.is_some()
+                    && normalize_path(&prev_def.file_path) == rel
+                {
+                    def.intent = prev_def.intent.clone();
+                }
+            }
+            generate_function_intents(
+                &agent_service,
+                &mut function_definitions,
+                &all_imported_symbols,
+            )
+            .await;
 
             let elapsed = start.elapsed();
             debug!(

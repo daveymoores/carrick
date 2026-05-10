@@ -84,12 +84,25 @@ pub async fn generate_function_intents(
     // Generate intents level by level — within each level, calls run in parallel.
     // Both the system instruction and user-prompt template now live in the
     // /generate-intent lambda (carrick-cloud/lambdas/generate-intent/index.js).
-    let mut intents: HashMap<String, String> = HashMap::new();
+    //
+    // Seed `intents` with any intent already present on a function definition.
+    // The incremental path uses this to carry intents forward for functions
+    // whose source file did not change, avoiding redundant lambda calls.
+    // Seeded entries also feed the `called_intents` prompt context so
+    // dependent functions get composed prompts even when their callees were
+    // cached.
+    let mut intents: HashMap<String, String> = function_definitions
+        .iter()
+        .filter_map(|(name, def)| def.intent.as_ref().map(|i| (name.clone(), i.clone())))
+        .collect();
+    let reused = intents.len();
 
     for level in &levels {
-        // Build payloads for all functions in this level
+        // Build payloads only for functions in this level that don't already
+        // have an intent (skip cache hits — saves lambda calls).
         let tasks: Vec<(String, String, String, Vec<String>)> = level
             .iter()
+            .filter(|name| !intents.contains_key(name.as_str()))
             .filter_map(|name| {
                 let def = function_definitions.get(name)?;
                 let body = def.body_source.as_ref()?;
@@ -145,15 +158,21 @@ pub async fn generate_function_intents(
         }
     }
 
-    // Write intents back to function definitions
-    let count = intents.len();
+    // Write intents back to function definitions. Reused entries already
+    // have the same value on the def — assigning is idempotent.
+    let total = intents.len();
     for (name, intent) in intents {
         if let Some(def) = function_definitions.get_mut(&name) {
             def.intent = Some(intent);
         }
     }
 
-    debug!("Generated {} intent(s)", count);
+    debug!(
+        "Intents: {} total ({} reused from cache, {} freshly generated)",
+        total,
+        reused,
+        total.saturating_sub(reused)
+    );
 
     // Strip body_source — source code stays in GitHub, not AWS
     strip_body_source(function_definitions);
