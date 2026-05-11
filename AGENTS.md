@@ -12,10 +12,12 @@
 - `tests/` holds Rust integration/unit tests; fixtures live in `tests/fixtures/`.
 - `src/sidecar/` is the TypeScript type-extraction sidecar with tests in `src/sidecar/test/`.
 - `ts_check/` contains legacy/experimental TypeScript utilities.
-- `lambdas/` and `terraform/` cover AWS helpers and infrastructure.
 - `scripts/` contains developer tooling (pre-commit hook installer).
 - `docs/research/` stores architecture and research notes.
 - `action.yml` defines the GitHub Action entrypoint.
+- `examples/` contains reference Express services used as e2e fixtures by CI and as user-facing demos.
+
+Lambdas, MCP server, AWS infrastructure, and the web dashboard live in the companion `carrick-cloud` repo, not here.
 
 ## Build, Test, and Development Commands
 ```bash
@@ -23,7 +25,7 @@
 cargo build
 cargo build --release
 cargo run -- /path/to/repo
-CARRICK_MOCK_ALL=1 cargo run -- test-repo
+CARRICK_MOCK_ALL=1 cargo run -- examples/express-single
 
 # Tests and checks
 cargo test
@@ -57,4 +59,4 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 
 ## Configuration & Infrastructure Notes
 - Runtime env vars: `CARRICK_API_KEY` (required when calling the cloud; org is derived server-side from this key), `CARRICK_MOCK_ALL` (test-only, returns canned responses without hitting the cloud), `CARRICK_API_ENDPOINT` (override the default `https://api.carrick.tools` endpoint at build time; optional).
-- Never run Terraform commands in this repository.
+- Terraform, Lambdas, and dashboard code live in `carrick-cloud`. No infrastructure or server-side code belongs in this repo.

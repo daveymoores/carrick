@@ -53,7 +53,7 @@ async fn test_upload_and_download_single_repo() {
     let storage = MockStorage::new();
 
     // When: we upload repo data
-    let repo_data = create_test_repo_data("test-repo", "abc123");
+    let repo_data = create_test_repo_data("express-single", "abc123");
     storage
         .upload_repo_data(&repo_data)
         .await
@@ -67,14 +67,14 @@ async fn test_upload_and_download_single_repo() {
 
     // Verify we got the repo back (plus any mock repos that might be added)
     assert!(
-        downloaded.iter().any(|r| r.repo_name == "test-repo"),
+        downloaded.iter().any(|r| r.repo_name == "express-single"),
         "Should find uploaded repo in downloaded data"
     );
 
     let found_repo = downloaded
         .iter()
-        .find(|r| r.repo_name == "test-repo")
-        .expect("Should find test-repo");
+        .find(|r| r.repo_name == "express-single")
+        .expect("Should find express-single");
 
     assert_eq!(found_repo.commit_hash, "abc123");
     assert!(found_repo.packages.is_some());
@@ -147,7 +147,7 @@ async fn test_upload_type_file() {
     // When: we upload a type file
     let type_content = "export interface User { id: string; name: string; }";
     let result = storage
-        .upload_type_file("test-repo", "types.ts", type_content)
+        .upload_type_file("express-single", "types.ts", type_content)
         .await;
 
     // Then: it should succeed

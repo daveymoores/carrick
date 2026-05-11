@@ -58,3 +58,4 @@ override.tf.json
 
 # Plan output files
 *.tfplan
+examples/*/package-lock.json
