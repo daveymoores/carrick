@@ -5,7 +5,7 @@ This is the **public** Rust scanner for Carrick. Companion to the private `carri
 ## Hard rules
 
 - **Never run `terraform` shell commands.** Not `init`, not `plan`, not `apply`, not `import`, not `state mv`. The user runs these. Editing files in `terraform/` (writing new `.tf` files, modifying existing ones) is fine — only invoking the `terraform` CLI is forbidden. (See also `AGENTS.md` line 60.)
-- **No LLM prompts in this repo.** Per the public/private split, prompt strings live in `carrick-cloud/lambdas/*/`. CI workflow `prompt-leak-guard.yml` enforces this — if a PR adds matches for `You are`, `Extract ONLY`, `responseSchema`, `system_instruction`, `prompt:\s*"`, `Identify all frameworks`, or `"frameworks":` to `src/`, the PR fails.
+- **No LLM system instructions in this repo.** Per the public/private split, system-prompt strings live in `carrick-cloud/lambdas/*/system_prompt.txt`. User-message templates that interpolate scan-time data may live in Rust because they need access to the data structures the scanner produces (e.g. `src/agents/file_analyzer_agent.rs`). CI workflow `prompt-leak-guard.yml` enforces the system-prompt-shape patterns: if a PR adds matches for `You are`, `Extract ONLY`, `responseSchema`, `system_instruction`, `prompt:\s*"`, `Identify all frameworks`, or `"frameworks":` to `src/`, the PR fails.
 - **No backwards compatibility / no users.** When refactoring, ship the new shape and delete the old shape in the same commit. No feature flags, no deprecation cycles, no parallel old/new code paths.
 
 ## Boundary
