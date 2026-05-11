@@ -23,7 +23,7 @@
 cargo build
 cargo build --release
 cargo run -- /path/to/repo
-CARRICK_MOCK_ALL=1 cargo run -- test-repo
+CARRICK_MOCK_ALL=1 cargo run -- examples/express-single
 
 # Tests and checks
 cargo test

@@ -1645,7 +1645,7 @@ mod tests {
         };
 
         let test_data = CloudRepoData {
-            repo_name: "test-repo".to_string(),
+            repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
@@ -1683,7 +1683,7 @@ mod tests {
         use crate::packages::Packages;
 
         let test_data = vec![CloudRepoData {
-            repo_name: "test-repo".to_string(),
+            repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
             calls: vec![],
@@ -1756,7 +1756,7 @@ mod tests {
         };
 
         let test_data = vec![CloudRepoData {
-            repo_name: "test-repo".to_string(),
+            repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
@@ -2105,7 +2105,7 @@ mod tests {
         }
 
         let data = CloudRepoData {
-            repo_name: "test-repo".to_string(),
+            repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
             calls: vec![],
@@ -2146,7 +2146,7 @@ mod tests {
         );
 
         let data = CloudRepoData {
-            repo_name: "test-repo".to_string(),
+            repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
             calls: vec![],
@@ -2274,7 +2274,7 @@ mod tests {
         );
 
         let data = CloudRepoData {
-            repo_name: "test-repo".to_string(),
+            repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
             calls: vec![],

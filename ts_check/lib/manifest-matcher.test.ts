@@ -150,7 +150,7 @@ describe('ManifestMatcher', () => {
   describe('loadManifest', () => {
     it('should load a valid manifest file', () => {
       const manifest: TypeManifest = {
-        repo_name: 'test-repo',
+        repo_name: 'express-single',
         commit_hash: 'abc123',
         entries: [
           createManifestEntry(
@@ -168,7 +168,7 @@ describe('ManifestMatcher', () => {
       fs.writeFileSync(filePath, JSON.stringify(manifest));
 
       const loaded = matcher.loadManifest(filePath);
-      assert.strictEqual(loaded.repo_name, 'test-repo');
+      assert.strictEqual(loaded.repo_name, 'express-single');
       assert.strictEqual(loaded.commit_hash, 'abc123');
       assert.strictEqual(loaded.entries.length, 1);
     });
@@ -237,13 +237,13 @@ describe('ManifestMatcher', () => {
   describe('parseManifest', () => {
     it('should parse valid JSON string', () => {
       const json = JSON.stringify({
-        repo_name: 'test-repo',
+        repo_name: 'express-single',
         commit_hash: 'abc123',
         entries: [],
       });
 
       const manifest = matcher.parseManifest(json);
-      assert.strictEqual(manifest.repo_name, 'test-repo');
+      assert.strictEqual(manifest.repo_name, 'express-single');
     });
   });
 

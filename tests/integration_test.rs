@@ -120,11 +120,16 @@ fn test_imported_router_endpoint_resolution() {
 
 #[test]
 fn test_basic_endpoint_detection() {
-    // Test with the existing test-repo to ensure we don't break existing functionality
-    let test_repo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-repo");
+    // Test with the existing express-single example to ensure we don't break existing functionality
+    let test_repo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("express-single");
 
     if !test_repo_path.exists() {
-        panic!("test-repo directory not found at {:?}", test_repo_path);
+        panic!(
+            "examples/express-single directory not found at {:?}",
+            test_repo_path
+        );
     }
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
@@ -145,7 +150,7 @@ fn test_basic_endpoint_detection() {
 
     assert!(
         output.status.success(),
-        "Carrick command failed on test-repo"
+        "Carrick command failed on express-single"
     );
 
     // Parse the output using our test utilities
@@ -154,14 +159,14 @@ fn test_basic_endpoint_detection() {
     // Check that analysis completed successfully
     assert!(
         test_output.has_success,
-        "Should have successful CARRICK analysis output for test-repo. Output: {}",
+        "Should have successful CARRICK analysis output for express-single. Output: {}",
         stdout
     );
 
-    // test-repo should have 3 endpoints (the 4th uses a variable reference which the mock doesn't detect)
+    // express-single should have 3 endpoints (the 4th uses a variable reference which the mock doesn't detect)
     assert_eq!(
         test_output.endpoint_count, 3,
-        "Expected 3 endpoints in test-repo, but found {}. Output: {}",
+        "Expected 3 endpoints in express-single, but found {}. Output: {}",
         test_output.endpoint_count, stdout
     );
 }
