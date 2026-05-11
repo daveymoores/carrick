@@ -71,8 +71,27 @@ jobs:
         with:
           script: |
             const body = process.env.COMMENT_BODY;
-            if (body && body.trim()) {
-              github.rest.issues.createComment({
+            if (!body || !body.trim()) return;
+            const marker = '<!-- CARRICK_OUTPUT_START -->';
+            const existing = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              }
+            );
+            const previous = existing.find(c => c.body && c.body.includes(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
