@@ -73,7 +73,7 @@ jobs:
             const body = process.env.COMMENT_BODY;
             if (!body || !body.trim()) return;
             const marker = '<!-- CARRICK_OUTPUT_START -->';
-            const existing = await github.paginate(
+            const iterator = github.paginate.iterator(
               github.rest.issues.listComments,
               {
                 issue_number: context.issue.number,
@@ -82,21 +82,35 @@ jobs:
                 per_page: 100,
               }
             );
-            const previous = existing.find(c => c.body && c.body.includes(marker));
+            let previous = null;
+            for await (const { data: page } of iterator) {
+              previous = page.find(c =>
+                c.user && c.user.type === 'Bot' &&
+                c.user.login === 'github-actions[bot]' &&
+                c.body && c.body.includes(marker)
+              );
+              if (previous) break;
+            }
+            const createNew = () => github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
             if (previous) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: previous.id,
-                body,
-              });
+              try {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: previous.id,
+                  body,
+                });
+              } catch (err) {
+                core.warning(`updateComment failed (${err.status}); creating a fresh comment instead.`);
+                await createNew();
+              }
             } else {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body,
-              });
+              await createNew();
             }
 ```
 
