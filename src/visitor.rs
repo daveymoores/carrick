@@ -331,19 +331,19 @@ impl FunctionDefinitionExtractor {
         params
             .iter()
             .map(|param| {
-                let name = match &param.pat {
-                    Pat::Ident(ident) => ident.id.sym.to_string(),
-                    Pat::Rest(rest) => match &*rest.arg {
-                        Pat::Ident(ident) => format!("...{}", ident.id.sym),
-                        _ => "...rest".to_string(),
-                    },
-                    _ => "param".to_string(),
-                };
-
-                // Get type annotation if present
-                let type_ann = match &param.pat {
-                    Pat::Ident(ident) => ident.type_ann.as_ref().map(|t| *t.clone()),
-                    _ => None,
+                let (name, type_ann) = match &param.pat {
+                    Pat::Ident(ident) => (
+                        ident.id.sym.to_string(),
+                        ident.type_ann.as_ref().map(|t| *t.clone()),
+                    ),
+                    Pat::Rest(rest) => {
+                        let rest_name = match &*rest.arg {
+                            Pat::Ident(ident) => format!("...{}", ident.id.sym),
+                            _ => "...rest".to_string(),
+                        };
+                        (rest_name, rest.type_ann.as_ref().map(|t| *t.clone()))
+                    }
+                    _ => ("param".to_string(), None),
                 };
                 let type_string = type_ann.as_ref().and_then(|t| self.type_ann_to_string(t));
 
@@ -990,6 +990,22 @@ mod tests {
         let defs = extract("function bare(x) { return x; }");
         let def = defs.get("bare").expect("should find bare");
         assert!(def.arguments[0].type_string.is_none());
+    }
+
+    #[test]
+    fn captures_rest_argument_type_on_function_declaration() {
+        let defs = extract("function variadic(...args: string[]) { return args; }");
+        let def = defs.get("variadic").expect("should find variadic");
+        assert_eq!(def.arguments[0].name, "...args");
+        assert_eq!(def.arguments[0].type_string.as_deref(), Some("string[]"));
+    }
+
+    #[test]
+    fn captures_rest_argument_type_on_arrow_function() {
+        let defs = extract("const variadic = (...args: number[]) => args;");
+        let def = defs.get("variadic").expect("should find variadic");
+        assert_eq!(def.arguments[0].name, "...args");
+        assert_eq!(def.arguments[0].type_string.as_deref(), Some("number[]"));
     }
 
     #[test]
