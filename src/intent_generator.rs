@@ -323,6 +323,7 @@ mod tests {
                 line_number: 1,
                 intent: Some("returns one".to_string()),
                 calls: vec![],
+                return_type: None,
             },
         );
         strip_body_source(&mut defs);
