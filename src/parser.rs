@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, errors::Handler, sync::Lrc};
 use swc_ecma_ast::Module;
-use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_visit::VisitMutWith;
 use tracing::warn;
@@ -32,6 +32,13 @@ pub fn parse_file(
                     ..Default::default()
                 }),
                 true,
+            ),
+            "jsx" => (
+                Syntax::Es(EsSyntax {
+                    jsx: true,
+                    ..Default::default()
+                }),
+                false,
             ),
             _ => (Syntax::Es(Default::default()), false),
         }

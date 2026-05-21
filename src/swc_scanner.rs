@@ -21,7 +21,7 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::*;
-use swc_ecma_parser::TsSyntax;
+use swc_ecma_parser::{EsSyntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::parser::parse_file;
@@ -172,6 +172,13 @@ impl SwcScanner {
                         ..Default::default()
                     }),
                     true,
+                ),
+                "jsx" => (
+                    Syntax::Es(EsSyntax {
+                        jsx: true,
+                        ..Default::default()
+                    }),
+                    false,
                 ),
                 _ => (Syntax::Es(Default::default()), false),
             }
