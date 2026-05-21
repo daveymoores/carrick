@@ -187,6 +187,51 @@ fn nestjs_controller_fixture_emits_decorator_candidates() {
 }
 
 // ---------------------------------------------------------------------------
+// React — verifies tsx/jsx parsing surfaces client-side fetch candidates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn react_tsx_fixture_captures_fetch_calls() {
+    let file = fixture_path("react-app/src/components/UserList.tsx");
+    let result = scan(&file);
+
+    assert!(
+        result.should_analyze,
+        "react-app/UserList.tsx should produce at least one candidate"
+    );
+
+    assert!(
+        result
+            .candidates
+            .iter()
+            .any(|c| c.callee_object == "fetch" && c.callee_property.is_none()),
+        "expected global fetch() call inside a tsx component"
+    );
+}
+
+#[test]
+fn react_jsx_fixture_captures_fetch_calls() {
+    let file = fixture_path("react-app/src/legacy/LegacyWidget.jsx");
+    let result = scan(&file);
+
+    assert!(
+        result.should_analyze,
+        "react-app/LegacyWidget.jsx should produce at least one candidate"
+    );
+
+    let fetch_count = result
+        .candidates
+        .iter()
+        .filter(|c| c.callee_object == "fetch" && c.callee_property.is_none())
+        .count();
+    assert!(
+        fetch_count >= 2,
+        "expected >=2 fetch() candidates inside a jsx component, got {}",
+        fetch_count
+    );
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end (LLM-dependent) acceptance
 // ---------------------------------------------------------------------------
 //

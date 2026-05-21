@@ -1,0 +1,15 @@
+{
+  "name": "react-app",
+  "version": "1.0.0",
+  "description": "React app fixture exercising tsx/jsx parsing in the scanner",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "typescript": "^5.4.0"
+  }
+}
