@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
-use swc_common::SourceMapper;
+use swc_common::{SourceMapper, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -15,6 +15,11 @@ pub struct FunctionArgument {
     pub name: String,
     #[serde(skip)]
     pub type_ann: Option<TsTypeAnn>, // swc_ecma_ast::TsTypeAnn
+    /// Raw TS source text of the type annotation, e.g. "Request<{id: string}>".
+    /// `None` when the parameter has no annotation. Serialized so the cloud /
+    /// MCP layer can surface function signatures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_string: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -106,6 +111,10 @@ pub struct FunctionDefinition {
     /// Local functions called by this function (name, file_path, line_number)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<FunctionCallRef>,
+    /// Raw TS source text of the return type annotation, e.g. "Promise<User>".
+    /// `None` when the function has no annotated return type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
 }
 
 /// A reference to a called function, for navigating to its source via GitHub.
@@ -308,27 +317,41 @@ impl FunctionDefinitionExtractor {
         self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
+    /// Render a `TsTypeAnn` as raw TS source text (the text between `:` and
+    /// the next token in the source file). Falls back to `None` if the span
+    /// can't be resolved.
+    fn type_ann_to_string(&self, type_ann: &TsTypeAnn) -> Option<String> {
+        self.source_map
+            .span_to_snippet(type_ann.type_ann.span())
+            .ok()
+    }
+
     /// Extract function arguments with their type annotations
     fn extract_arguments(&self, params: &[Param]) -> Vec<FunctionArgument> {
         params
             .iter()
             .map(|param| {
-                let name = match &param.pat {
-                    Pat::Ident(ident) => ident.id.sym.to_string(),
-                    Pat::Rest(rest) => match &*rest.arg {
-                        Pat::Ident(ident) => format!("...{}", ident.id.sym),
-                        _ => "...rest".to_string(),
-                    },
-                    _ => "param".to_string(),
+                let (name, type_ann) = match &param.pat {
+                    Pat::Ident(ident) => (
+                        ident.id.sym.to_string(),
+                        ident.type_ann.as_ref().map(|t| *t.clone()),
+                    ),
+                    Pat::Rest(rest) => {
+                        let rest_name = match &*rest.arg {
+                            Pat::Ident(ident) => format!("...{}", ident.id.sym),
+                            _ => "...rest".to_string(),
+                        };
+                        (rest_name, rest.type_ann.as_ref().map(|t| *t.clone()))
+                    }
+                    _ => ("param".to_string(), None),
                 };
+                let type_string = type_ann.as_ref().and_then(|t| self.type_ann_to_string(t));
 
-                // Get type annotation if present
-                let type_ann = match &param.pat {
-                    Pat::Ident(ident) => ident.type_ann.as_ref().map(|t| *t.clone()),
-                    _ => None,
-                };
-
-                FunctionArgument { name, type_ann }
+                FunctionArgument {
+                    name,
+                    type_ann,
+                    type_string,
+                }
             })
             .collect()
     }
@@ -352,8 +375,13 @@ impl FunctionDefinitionExtractor {
                     }
                     _ => ("param".to_string(), None),
                 };
+                let type_string = type_ann.as_ref().and_then(|t| self.type_ann_to_string(t));
 
-                FunctionArgument { name, type_ann }
+                FunctionArgument {
+                    name,
+                    type_ann,
+                    type_string,
+                }
             })
             .collect()
     }
@@ -404,6 +432,11 @@ impl Visit for FunctionDefinitionExtractor {
                         .as_ref()
                         .and_then(|b| self.extract_source(b.span));
                     let line_number = self.line_number(fn_expr.function.span);
+                    let return_type = fn_expr
+                        .function
+                        .return_type
+                        .as_ref()
+                        .and_then(|t| self.type_ann_to_string(t));
                     self.function_definitions.insert(
                         name.clone(),
                         FunctionDefinition {
@@ -418,6 +451,7 @@ impl Visit for FunctionDefinitionExtractor {
                             line_number,
                             intent: None,
                             calls: vec![],
+                            return_type,
                         },
                     );
                 }
@@ -465,6 +499,11 @@ impl Visit for FunctionDefinitionExtractor {
             .as_ref()
             .and_then(|b| self.extract_source(b.span));
         let line_number = self.line_number(fn_decl.function.span);
+        let return_type = fn_decl
+            .function
+            .return_type
+            .as_ref()
+            .and_then(|t| self.type_ann_to_string(t));
 
         self.function_definitions.insert(
             name.clone(),
@@ -478,6 +517,7 @@ impl Visit for FunctionDefinitionExtractor {
                 line_number,
                 intent: None,
                 calls: vec![],
+                return_type,
             },
         );
 
@@ -497,6 +537,10 @@ impl Visit for FunctionDefinitionExtractor {
                         let arguments = self.extract_arrow_arguments(&arrow.params);
                         let body_source = self.extract_source(arrow.span);
                         let line_number = self.line_number(arrow.span);
+                        let return_type = arrow
+                            .return_type
+                            .as_ref()
+                            .and_then(|t| self.type_ann_to_string(t));
                         self.function_definitions.insert(
                             name.clone(),
                             FunctionDefinition {
@@ -509,6 +553,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 line_number,
                                 intent: None,
                                 calls: vec![],
+                                return_type,
                             },
                         );
                     }
@@ -520,6 +565,11 @@ impl Visit for FunctionDefinitionExtractor {
                             .as_ref()
                             .and_then(|b| self.extract_source(b.span));
                         let line_number = self.line_number(fn_expr.function.span);
+                        let return_type = fn_expr
+                            .function
+                            .return_type
+                            .as_ref()
+                            .and_then(|t| self.type_ann_to_string(t));
                         self.function_definitions.insert(
                             name.clone(),
                             FunctionDefinition {
@@ -534,6 +584,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 line_number,
                                 intent: None,
                                 calls: vec![],
+                                return_type,
                             },
                         );
                     }
@@ -562,6 +613,10 @@ impl Visit for FunctionDefinitionExtractor {
                             let arguments = self.extract_arrow_arguments(&arrow.params);
                             let body_source = self.extract_source(arrow.span);
                             let line_number = self.line_number(arrow.span);
+                            let return_type = arrow
+                                .return_type
+                                .as_ref()
+                                .and_then(|t| self.type_ann_to_string(t));
                             self.function_definitions.insert(
                                 synthetic_name.clone(),
                                 FunctionDefinition {
@@ -576,6 +631,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     line_number,
                                     intent: None,
                                     calls: vec![],
+                                    return_type,
                                 },
                             );
                         }
@@ -591,6 +647,11 @@ impl Visit for FunctionDefinitionExtractor {
                                 .as_ref()
                                 .and_then(|b| self.extract_source(b.span));
                             let line_number = self.line_number(fn_expr.function.span);
+                            let return_type = fn_expr
+                                .function
+                                .return_type
+                                .as_ref()
+                                .and_then(|t| self.type_ann_to_string(t));
                             self.function_definitions.insert(
                                 synthetic_name.clone(),
                                 FunctionDefinition {
@@ -605,6 +666,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     line_number,
                                     intent: None,
                                     calls: vec![],
+                                    return_type,
                                 },
                             );
                         }
@@ -890,6 +952,129 @@ mod tests {
             !defs.keys().any(|k| k.contains("handler")),
             "should not capture calls without function args"
         );
+    }
+
+    #[test]
+    fn captures_argument_type_strings_on_function_declaration() {
+        let defs = extract("function greet(name: string, count: number) { return name; }");
+        let def = defs.get("greet").expect("should find greet");
+        assert_eq!(def.arguments.len(), 2);
+        assert_eq!(def.arguments[0].name, "name");
+        assert_eq!(def.arguments[0].type_string.as_deref(), Some("string"));
+        assert_eq!(def.arguments[1].name, "count");
+        assert_eq!(def.arguments[1].type_string.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn captures_argument_type_strings_on_arrow_function() {
+        let defs = extract("const add = (a: number, b: number) => a + b;");
+        let def = defs.get("add").expect("should find add");
+        assert_eq!(def.arguments[0].type_string.as_deref(), Some("number"));
+        assert_eq!(def.arguments[1].type_string.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn captures_complex_generic_argument_type() {
+        let defs =
+            extract("function handle(req: Request<{ id: string }>, res: Response) { return; }");
+        let def = defs.get("handle").expect("should find handle");
+        assert_eq!(
+            def.arguments[0].type_string.as_deref(),
+            Some("Request<{ id: string }>")
+        );
+        assert_eq!(def.arguments[1].type_string.as_deref(), Some("Response"));
+    }
+
+    #[test]
+    fn argument_without_annotation_has_no_type_string() {
+        let defs = extract("function bare(x) { return x; }");
+        let def = defs.get("bare").expect("should find bare");
+        assert!(def.arguments[0].type_string.is_none());
+    }
+
+    #[test]
+    fn captures_rest_argument_type_on_function_declaration() {
+        let defs = extract("function variadic(...args: string[]) { return args; }");
+        let def = defs.get("variadic").expect("should find variadic");
+        assert_eq!(def.arguments[0].name, "...args");
+        assert_eq!(def.arguments[0].type_string.as_deref(), Some("string[]"));
+    }
+
+    #[test]
+    fn captures_rest_argument_type_on_arrow_function() {
+        let defs = extract("const variadic = (...args: number[]) => args;");
+        let def = defs.get("variadic").expect("should find variadic");
+        assert_eq!(def.arguments[0].name, "...args");
+        assert_eq!(def.arguments[0].type_string.as_deref(), Some("number[]"));
+    }
+
+    #[test]
+    fn captures_return_type_on_function_declaration() {
+        let defs = extract("function greet(name: string): string { return name; }");
+        let def = defs.get("greet").expect("should find greet");
+        assert_eq!(def.return_type.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn captures_return_type_on_arrow_function() {
+        let defs = extract("const add = (a: number, b: number): number => a + b;");
+        let def = defs.get("add").expect("should find add");
+        assert_eq!(def.return_type.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn captures_return_type_on_function_expression() {
+        let defs = extract("const greet = function(name: string): string { return name; };");
+        let def = defs.get("greet").expect("should find greet");
+        assert_eq!(def.return_type.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn captures_promise_return_type() {
+        let defs =
+            extract("async function fetchUser(id: string): Promise<User> { return null as any; }");
+        let def = defs.get("fetchUser").expect("should find fetchUser");
+        assert_eq!(def.return_type.as_deref(), Some("Promise<User>"));
+    }
+
+    #[test]
+    fn no_return_type_when_unannotated() {
+        let defs = extract("function bare() { return 1; }");
+        let def = defs.get("bare").expect("should find bare");
+        assert!(def.return_type.is_none());
+    }
+
+    #[test]
+    fn captures_return_type_on_anonymous_handler() {
+        let defs = extract(
+            r#"
+            const app = { get: (path: string, handler: any) => {} };
+            app.get("/users", (req: Request, res: Response): void => { res.json({}); });
+            "#,
+        );
+        let def = defs
+            .get("get_users_handler")
+            .expect("should capture handler");
+        assert_eq!(def.arguments[0].type_string.as_deref(), Some("Request"));
+        assert_eq!(def.arguments[1].type_string.as_deref(), Some("Response"));
+        assert_eq!(def.return_type.as_deref(), Some("void"));
+    }
+
+    #[test]
+    fn captures_return_type_on_export_default_function() {
+        let defs = extract("export default function main(): number { return 1; }");
+        let def = defs.get("main").expect("should find main");
+        assert_eq!(def.return_type.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn function_definition_serializes_types_to_json() {
+        let defs = extract("function greet(name: string): Promise<string> { return name as any; }");
+        let def = defs.get("greet").expect("should find greet");
+        let json = serde_json::to_value(def).expect("serialize");
+        assert_eq!(json["return_type"], "Promise<string>");
+        assert_eq!(json["arguments"][0]["name"], "name");
+        assert_eq!(json["arguments"][0]["type_string"], "string");
     }
 
     #[test]
