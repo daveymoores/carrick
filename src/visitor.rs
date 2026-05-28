@@ -17,9 +17,14 @@ pub struct FunctionArgument {
     pub type_ann: Option<TsTypeAnn>, // swc_ecma_ast::TsTypeAnn
     /// Raw TS source text of the type annotation, e.g. "Request<{id: string}>".
     /// `None` when the parameter has no annotation. Serialized so the cloud /
-    /// MCP layer can surface function signatures.
+    /// MCP layer can surface function signatures. May be filled by the
+    /// signature pass with a compiler-inferred type when no annotation exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_string: Option<String>,
+    /// `true` when `type_string` came from a source annotation, `false` when
+    /// it was inferred by the sidecar. Serves as a confidence signal to agents.
+    #[serde(default)]
+    pub is_explicit: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -112,9 +117,19 @@ pub struct FunctionDefinition {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<FunctionCallRef>,
     /// Raw TS source text of the return type annotation, e.g. "Promise<User>".
-    /// `None` when the function has no annotated return type.
+    /// `None` when the function has no annotated return type. May be filled by
+    /// the signature pass with a compiler-inferred type when no annotation exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_type: Option<String>,
+    /// `true` when `return_type` came from a source annotation, `false` when
+    /// it was inferred by the sidecar.
+    #[serde(default)]
+    pub return_is_explicit: bool,
+    /// One-line signature hint composed at scan time, e.g.
+    /// "(token: string, opts?: VerifyOpts) => Promise<AuthResult>". `None`
+    /// until the signature pass runs. The MCP layer surfaces this verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// A reference to a called function, for navigating to its source via GitHub.
@@ -350,6 +365,7 @@ impl FunctionDefinitionExtractor {
                 FunctionArgument {
                     name,
                     type_ann,
+                    is_explicit: type_string.is_some(),
                     type_string,
                 }
             })
@@ -380,6 +396,7 @@ impl FunctionDefinitionExtractor {
                 FunctionArgument {
                     name,
                     type_ann,
+                    is_explicit: type_string.is_some(),
                     type_string,
                 }
             })
@@ -451,7 +468,9 @@ impl Visit for FunctionDefinitionExtractor {
                             line_number,
                             intent: None,
                             calls: vec![],
+                            return_is_explicit: return_type.is_some(),
                             return_type,
+                            signature: None,
                         },
                     );
                 }
@@ -517,7 +536,9 @@ impl Visit for FunctionDefinitionExtractor {
                 line_number,
                 intent: None,
                 calls: vec![],
+                return_is_explicit: return_type.is_some(),
                 return_type,
+                signature: None,
             },
         );
 
@@ -553,7 +574,9 @@ impl Visit for FunctionDefinitionExtractor {
                                 line_number,
                                 intent: None,
                                 calls: vec![],
+                                return_is_explicit: return_type.is_some(),
                                 return_type,
+                                signature: None,
                             },
                         );
                     }
@@ -584,7 +607,9 @@ impl Visit for FunctionDefinitionExtractor {
                                 line_number,
                                 intent: None,
                                 calls: vec![],
+                                return_is_explicit: return_type.is_some(),
                                 return_type,
+                                signature: None,
                             },
                         );
                     }
@@ -631,7 +656,9 @@ impl Visit for FunctionDefinitionExtractor {
                                     line_number,
                                     intent: None,
                                     calls: vec![],
+                                    return_is_explicit: return_type.is_some(),
                                     return_type,
+                                    signature: None,
                                 },
                             );
                         }
@@ -666,7 +693,9 @@ impl Visit for FunctionDefinitionExtractor {
                                     line_number,
                                     intent: None,
                                     calls: vec![],
+                                    return_is_explicit: return_type.is_some(),
                                     return_type,
+                                    signature: None,
                                 },
                             );
                         }
@@ -990,6 +1019,46 @@ mod tests {
         let defs = extract("function bare(x) { return x; }");
         let def = defs.get("bare").expect("should find bare");
         assert!(def.arguments[0].type_string.is_none());
+    }
+
+    #[test]
+    fn annotated_argument_is_marked_explicit() {
+        let defs = extract("function greet(name: string) { return name; }");
+        let def = defs.get("greet").expect("should find greet");
+        assert!(
+            def.arguments[0].is_explicit,
+            "annotated param should be explicit"
+        );
+    }
+
+    #[test]
+    fn unannotated_argument_is_not_explicit() {
+        let defs = extract("function bare(x) { return x; }");
+        let def = defs.get("bare").expect("should find bare");
+        assert!(
+            !def.arguments[0].is_explicit,
+            "unannotated param should not be explicit at parse time"
+        );
+    }
+
+    #[test]
+    fn annotated_return_is_marked_explicit() {
+        let defs = extract("function greet(name: string): string { return name; }");
+        let def = defs.get("greet").expect("should find greet");
+        assert!(
+            def.return_is_explicit,
+            "annotated return should be explicit"
+        );
+    }
+
+    #[test]
+    fn unannotated_return_is_not_explicit() {
+        let defs = extract("function bare() { return 1; }");
+        let def = defs.get("bare").expect("should find bare");
+        assert!(
+            !def.return_is_explicit,
+            "unannotated return should not be explicit at parse time"
+        );
     }
 
     #[test]
