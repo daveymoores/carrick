@@ -22,6 +22,8 @@ export const InferKindSchema = z.enum([
   'variable',
   'response_body',
   'request_body',
+  'signature_return',
+  'function_param',
 ]);
 
 // ============================================================================
@@ -142,6 +144,7 @@ export const InferRequestItemSchema = z
     expression_line: z.number().int().positive('Expression line must be positive').optional(),
     infer_kind: InferKindSchema,
     alias: z.string().optional(),
+    param_name: z.string().optional(),
   })
   .superRefine((value, ctx) => {
     if (
