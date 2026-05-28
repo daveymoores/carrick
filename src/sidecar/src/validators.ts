@@ -160,7 +160,11 @@ export const InferRequestItemSchema = z
     }
     const hasSpan = value.span_start !== undefined && value.span_end !== undefined;
     const hasText = value.expression_text !== undefined;
-    if (!hasSpan && !hasText) {
+    // Signature inference (signature_return / function_param) locates the
+    // function by line_number alone, so it does not require a span or text.
+    const lineOnlyOk =
+      value.infer_kind === 'signature_return' || value.infer_kind === 'function_param';
+    if (!hasSpan && !hasText && !lineOnlyOk) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'At least one of (span_start + span_end) or expression_text must be provided',

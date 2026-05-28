@@ -1071,6 +1071,32 @@ describe('Type Sidecar Integration Tests', () => {
       assert.strictEqual(inferred!.is_explicit, false);
       assert.ok(inferred!.type_string.length > 0);
     });
+
+    it('resolves a function by line number alone (no span or text)', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'line-1',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
+            line_number: 169, // doubleIt declaration line — only locator provided
+            infer_kind: 'signature_return',
+          },
+        ],
+      });
+
+      const inferred = response.inferred_types?.[0];
+      assert.ok(inferred, 'should locate doubleIt by line alone');
+      assert.strictEqual(inferred!.infer_kind, 'signature_return');
+      assert.strictEqual(inferred!.is_explicit, false);
+      assert.ok(inferred!.type_string.length > 0);
+    });
   });
 
   describe('resolve_definitions action', () => {

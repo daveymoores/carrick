@@ -1355,7 +1355,47 @@ export class TypeInferrer {
       if (!node) return undefined;
       return this.findContainingFunctionForNode(node);
     }
-    return undefined;
+    // Signature requests carry only the function's start line (FunctionDefinition
+    // has no byte span). Fall back to locating the function by that line.
+    return this.findFunctionByLine(sourceFile, request.line_number);
+  }
+
+  /**
+   * Find the function whose declaration starts at (or within a couple of lines
+   * of) the given line. Used for signature inference, where the only locator is
+   * the function's start line as recorded by the scanner. Ties break toward the
+   * innermost (smallest) function. Returns undefined if nothing is close enough,
+   * to avoid binding to an unrelated function.
+   */
+  private findFunctionByLine(
+    sourceFile: SourceFile,
+    line: number
+  ): FunctionLike | undefined {
+    const LINE_TOLERANCE = 2;
+    const functions = sourceFile.getDescendants().filter(
+      (node): node is FunctionLike =>
+        Node.isFunctionDeclaration(node) ||
+        Node.isArrowFunction(node) ||
+        Node.isFunctionExpression(node) ||
+        Node.isMethodDeclaration(node)
+    );
+
+    let best: FunctionLike | undefined;
+    let bestDelta = Infinity;
+    for (const fn of functions) {
+      const delta = Math.abs(fn.getStartLineNumber() - line);
+      if (delta > LINE_TOLERANCE) continue;
+      const isCloser = delta < bestDelta;
+      const isInnermostTie =
+        delta === bestDelta &&
+        best !== undefined &&
+        fn.getEnd() - fn.getStart() < best.getEnd() - best.getStart();
+      if (isCloser || isInnermostTie) {
+        best = fn;
+        bestDelta = delta;
+      }
+    }
+    return best;
   }
 
   /**
