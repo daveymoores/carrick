@@ -19,6 +19,7 @@ use crate::services::{
     TypeSidecar,
     type_sidecar::{InferKind, TypeResolutionResult},
 };
+use crate::signature_pass::populate_function_signatures;
 use crate::type_manifest::{
     build_call_site_id, build_manifest_type_alias_with_call_id, is_http_method,
     normalize_manifest_method, parse_file_location,
@@ -643,6 +644,9 @@ async fn analyze_current_repo_incremental(
             )
             .await;
 
+            // Compose function signatures, inferring unannotated slots via sidecar.
+            populate_function_signatures(sidecar, &mut function_definitions, repo_path);
+
             let elapsed = start.elapsed();
             debug!(
                 "Incremental analysis complete in {:.1}s",
@@ -1265,6 +1269,9 @@ async fn analyze_current_repo(
         )
         .await;
     }
+
+    // 4c. Compose function signatures, inferring unannotated slots via sidecar.
+    populate_function_signatures(sidecar, &mut function_definitions, repo_path);
 
     // 5. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
     let mut cloud_data = CloudRepoData::from_multi_agent_results(
