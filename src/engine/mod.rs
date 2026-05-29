@@ -551,22 +551,17 @@ async fn analyze_current_repo_incremental(
 
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
 
-            let api_key = env::var("CARRICK_API_KEY")
-                .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
-
             // Get framework detection and guidance (cached or fresh)
             let (detection, guidance) = if !pkg_changed {
                 if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
                     debug!("Reusing cached framework detection and guidance");
                     (det.clone(), guid.clone())
                 } else {
-                    run_framework_detection_and_guidance(&api_key, &packages, &all_imported_symbols)
-                        .await?
+                    run_framework_detection_and_guidance(&packages, &all_imported_symbols).await?
                 }
             } else {
                 debug!("package.json changed, re-running framework detection");
-                run_framework_detection_and_guidance(&api_key, &packages, &all_imported_symbols)
-                    .await?
+                run_framework_detection_and_guidance(&packages, &all_imported_symbols).await?
             };
 
             // Run Gemini file analysis ONLY on changed files
@@ -574,7 +569,7 @@ async fn analyze_current_repo_incremental(
                 debug!("Running LLM analysis on {} changed file(s)", changed_count);
             }
 
-            let agent_service = AgentService::new(api_key.clone());
+            let agent_service = AgentService::new();
             let file_orchestrator = FileOrchestrator::new(agent_service.clone());
 
             let new_file_results = if !files_to_analyze.is_empty() {
@@ -719,11 +714,10 @@ async fn analyze_current_repo_incremental(
 
 /// Run framework detection and guidance generation.
 async fn run_framework_detection_and_guidance(
-    api_key: &str,
     packages: &Packages,
     imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
 ) -> Result<(DetectionResult, FrameworkGuidance), Box<dyn std::error::Error>> {
-    let agent_service = AgentService::new(api_key.to_string());
+    let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
         .detect_frameworks_and_libraries(packages, imported_symbols)
@@ -1248,10 +1242,8 @@ async fn analyze_current_repo(
     // 2. Load config and packages using existing logic
     let (config, packages) = load_config_and_packages(repo_path)?;
 
-    // 3. Get API key and create MultiAgentOrchestrator
-    let api_key = env::var("CARRICK_API_KEY")
-        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
-    let orchestrator = MultiAgentOrchestrator::new(api_key.clone(), cm.clone());
+    // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
+    let orchestrator = MultiAgentOrchestrator::new(cm.clone());
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
@@ -1261,7 +1253,7 @@ async fn analyze_current_repo(
     // 4b. Generate function intents using LLM
     let mut function_definitions = function_definitions;
     {
-        let intent_agent = AgentService::new(api_key.clone());
+        let intent_agent = AgentService::new();
         generate_function_intents(
             &intent_agent,
             &mut function_definitions,
@@ -1290,7 +1282,7 @@ async fn analyze_current_repo(
     }
 
     // 6. Resolve types using sidecar if available
-    let agent_service = AgentService::new(api_key);
+    let agent_service = AgentService::new();
     let file_orchestrator = FileOrchestrator::new(agent_service);
 
     resolve_types_if_available(

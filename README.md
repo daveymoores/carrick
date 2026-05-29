@@ -49,6 +49,7 @@ on:
     branches: [main]
 
 permissions:
+  id-token: write
   contents: read
   issues: write
   pull-requests: write
@@ -61,8 +62,6 @@ jobs:
 
       - id: carrick
         uses: daveymoores/carrick@v1
-        with:
-          carrick-api-key: ${{ secrets.CARRICK_API_KEY }}
 
       - if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -114,7 +113,7 @@ jobs:
             }
 ```
 
-Add `CARRICK_API_KEY` to the repository's Actions secrets. The dashboard issues the key after you sign in with GitHub.
+No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project in the dashboard.
 
 ## MCP tools
 

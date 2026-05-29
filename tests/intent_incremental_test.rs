@@ -110,7 +110,6 @@ async fn incremental_path_populates_intent() {
     // depends on these vars.
     unsafe {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
-        std::env::set_var("CARRICK_API_KEY", "test");
     }
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/koa-api");
@@ -212,7 +211,6 @@ async fn incremental_path_populates_intent() {
 async fn incremental_path_reuses_intents_from_previous_scan() {
     unsafe {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
-        std::env::set_var("CARRICK_API_KEY", "test");
     }
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/koa-api");

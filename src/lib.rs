@@ -15,6 +15,7 @@ pub mod intent_generator;
 pub mod logging;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;
+pub mod oidc;
 pub mod packages;
 pub mod parser;
 pub mod router_context;

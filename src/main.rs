@@ -15,6 +15,7 @@ mod intent_generator;
 mod logging;
 mod mount_graph;
 mod multi_agent_orchestrator;
+mod oidc;
 mod packages;
 mod parser;
 mod router_context;
@@ -104,9 +105,11 @@ OPTIONS:
     --no-cache     Skip incremental cache and run a full analysis
 
 ENVIRONMENT VARIABLES:
-    CARRICK_API_KEY         API key for the LLM service (required)
-    CARRICK_MOCK_ALL        Use mock storage instead of Carrick Cloud
-    CARRICK_API_ENDPOINT    API endpoint for the carrick service (build-time)
+    ACTIONS_ID_TOKEN_REQUEST_URL    GitHub Actions OIDC token endpoint (auto-set
+                                    when the job grants `id-token: write`)
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN  Bearer token for the OIDC endpoint (auto-set)
+    CARRICK_MOCK_ALL                Use mock storage instead of Carrick Cloud
+    CARRICK_API_ENDPOINT            API endpoint for the carrick service (build-time)
 "#
         );
     }

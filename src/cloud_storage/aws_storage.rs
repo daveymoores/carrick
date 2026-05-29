@@ -1,15 +1,14 @@
 use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError};
+use crate::oidc::OidcProvider;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
 use tracing::{debug, warn};
 
 pub struct AwsStorage {
     lambda_url: String,
     http_client: Client,
-    api_key: String,
 }
 
 #[derive(Serialize)]
@@ -79,57 +78,80 @@ impl AwsStorage {
         let api_endpoint = env!("CARRICK_API_ENDPOINT");
         let lambda_url = format!("{}/types/check-or-upload", api_endpoint);
 
-        let api_key = env::var("CARRICK_API_KEY").map_err(|_| {
-            StorageError::ConnectionError(
-                "CARRICK_API_KEY environment variable not set".to_string(),
-            )
-        })?;
+        // Fail fast if OIDC isn't available — the cloud derives repo identity
+        // from the signed OIDC claims, so there is no other way to authenticate.
+        OidcProvider::global().map_err(|e| StorageError::ConnectionError(e.to_string()))?;
 
         Ok(Self {
             lambda_url,
             http_client: Client::new(),
-            api_key,
         })
+    }
+
+    /// POSTs a JSON body to the upload endpoint with the OIDC bearer header,
+    /// returning the raw response body on success. OIDC tokens are short-lived,
+    /// so on a 401 (token likely expired mid-run) we re-mint once and retry.
+    async fn send_lambda<B>(&self, body: &B) -> Result<String, StorageError>
+    where
+        B: serde::Serialize + ?Sized,
+    {
+        let provider =
+            OidcProvider::global().map_err(|e| StorageError::ConnectionError(e.to_string()))?;
+        let mut token = provider
+            .token()
+            .await
+            .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
+
+        let mut reminted = false;
+        loop {
+            let response = self
+                .http_client
+                .post(&self.lambda_url)
+                .header("X-Carrick-OIDC", &token)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| {
+                    StorageError::ConnectionError(format!("Lambda request failed: {}", e))
+                })?;
+
+            let status = response.status();
+            let response_text = response.text().await.map_err(|e| {
+                StorageError::ConnectionError(format!("Failed to read response: {}", e))
+            })?;
+
+            if status.as_u16() == 401 && !reminted {
+                warn!("Upload returned 401; re-minting OIDC token and retrying once");
+                token = provider
+                    .remint()
+                    .await
+                    .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
+                reminted = true;
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(StorageError::ConnectionError(format!(
+                    "Lambda returned error {}: {}",
+                    status, response_text
+                )));
+            }
+
+            return Ok(response_text);
+        }
     }
 
     async fn call_lambda<T>(&self, request: &LambdaRequest) -> Result<T, StorageError>
     where
         T: for<'de> serde::Deserialize<'de>,
     {
-        let response = self
-            .http_client
-            .post(&self.lambda_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| StorageError::ConnectionError(format!("Lambda request failed: {}", e)))?;
-
-        let status = response.status();
-
-        if !response.status().is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(StorageError::ConnectionError(format!(
-                "Lambda returned error {}: {}",
-                status, error_text
-            )));
-        }
-
-        let response_text = response.text().await.map_err(|e| {
-            StorageError::ConnectionError(format!("Failed to read response: {}", e))
-        })?;
-
-        let lambda_response: T = serde_json::from_str(&response_text).map_err(|e| {
+        let response_text = self.send_lambda(request).await?;
+        serde_json::from_str(&response_text).map_err(|e| {
             StorageError::SerializationError(format!(
                 "Failed to parse lambda response for action '{}': {}. Raw response: {}",
                 request.action, e, response_text
             ))
-        })?;
-
-        Ok(lambda_response)
+        })
     }
 
     async fn call_lambda_generic<Req, Resp>(&self, request: &Req) -> Result<Resp, StorageError>
@@ -137,37 +159,10 @@ impl AwsStorage {
         Req: serde::Serialize,
         Resp: for<'de> serde::Deserialize<'de>,
     {
-        let response = self
-            .http_client
-            .post(&self.lambda_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| StorageError::ConnectionError(format!("Lambda request failed: {}", e)))?;
-
-        let status = response.status();
-
-        if !response.status().is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(StorageError::ConnectionError(format!(
-                "Lambda returned error {}: {}",
-                status, error_text
-            )));
-        }
-
-        let response_text = response.text().await.map_err(|e| {
-            StorageError::ConnectionError(format!("Failed to read response: {}", e))
-        })?;
-
-        let lambda_response: Resp = serde_json::from_str(&response_text).map_err(|e| {
+        let response_text = self.send_lambda(request).await?;
+        serde_json::from_str(&response_text).map_err(|e| {
             StorageError::SerializationError(format!("Failed to parse lambda response: {}", e))
-        })?;
-
-        Ok(lambda_response)
+        })
     }
 
     async fn upload_to_s3(&self, upload_url: &str, content: &str) -> Result<(), StorageError> {

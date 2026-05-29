@@ -58,9 +58,9 @@ pub struct MultiAgentOrchestrator {
 }
 
 impl MultiAgentOrchestrator {
-    pub fn new(api_key: String, source_map: Lrc<SourceMap>) -> Self {
+    pub fn new(source_map: Lrc<SourceMap>) -> Self {
         Self {
-            agent_service: AgentService::new(api_key),
+            agent_service: AgentService::new(),
             source_map,
         }
     }

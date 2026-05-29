@@ -5,7 +5,8 @@
 //! the carrick-cloud repo's `docs/internal/framework-coverage.md` §10.5. They assert the shape of the
 //! candidates the scanner produces (method calls, fetch calls, decorator
 //! calls). They do NOT exercise the LLM-dependent path; that's tracked in
-//! the §10.3 harness note and runs behind `CARRICK_API_KEY`.
+//! the §10.3 harness note and runs behind a live cloud connection (GitHub
+//! Actions OIDC auth).
 //!
 //! Acceptance for §7 Step 2 is "a Rust test exercises the pipeline against
 //! `tests/fixtures/fastify-api/` and `tests/fixtures/koa-api/` and asserts
@@ -236,7 +237,7 @@ fn react_jsx_fixture_captures_fetch_calls() {
 // ---------------------------------------------------------------------------
 //
 // The original §7 Step 2 acceptance bullet — "asserts endpoint counts AND types"
-// — requires the full pipeline, which means `CARRICK_API_KEY` and a live
+// — requires the full pipeline, which means a live cloud connection and a
 // Gemini call per file. Per §10.3 and §10.4 that belongs in a CI harness
 // running the published binary with response caching, not in `cargo test`.
 // When that harness lands, it should:
