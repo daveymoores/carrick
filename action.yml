@@ -10,9 +10,6 @@ inputs:
     description: "Path to analyze"
     required: false
     default: "."
-  carrick-api-key:
-    description: "API key"
-    required: true
 
 outputs:
   success:
@@ -55,7 +52,10 @@ runs:
       id: analysis
       shell: bash
       env:
-        CARRICK_API_KEY: ${{ inputs.carrick-api-key }}
+        # Auth is keyless: the scanner mints a GitHub Actions OIDC token from
+        # ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN (present
+        # automatically when the job grants `permissions: id-token: write`) and
+        # sends it as X-Carrick-OIDC. No API key required.
         CI: "true"
       run: |
         set +e

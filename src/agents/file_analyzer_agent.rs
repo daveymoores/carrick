@@ -920,14 +920,14 @@ mod tests {
 
     #[test]
     fn test_format_patterns_empty() {
-        let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
+        let agent = FileAnalyzerAgent::new(AgentService::new());
         let result = agent.format_patterns(&[]);
         assert_eq!(result, "// No patterns provided");
     }
 
     #[test]
     fn test_format_patterns_with_items() {
-        let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
+        let agent = FileAnalyzerAgent::new(AgentService::new());
         let patterns = vec![
             PatternExample {
                 pattern: ".get(".to_string(),
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_build_user_message() {
-        let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
+        let agent = FileAnalyzerAgent::new(AgentService::new());
         let guidance = create_test_guidance();
         let file_content = r#"
 import express from 'express';
@@ -997,7 +997,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
     #[test]
     fn test_build_user_message_includes_import_table_and_candidates() {
-        let agent = FileAnalyzerAgent::new(AgentService::new("mock".to_string()));
+        let agent = FileAnalyzerAgent::new(AgentService::new());
         let guidance = create_test_guidance();
         let file_content = r#"
 import { User } from './types';

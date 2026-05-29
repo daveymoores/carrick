@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn test_build_mount_graph_from_single_file() {
-        let agent_service = AgentService::new("mock".to_string());
+        let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mut file_results = HashMap::new();
@@ -1632,7 +1632,7 @@ mod tests {
 
     #[test]
     fn test_build_mount_graph_with_data_calls() {
-        let agent_service = AgentService::new("mock".to_string());
+        let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mut file_results = HashMap::new();
@@ -1671,7 +1671,7 @@ mod tests {
 
     #[test]
     fn test_collect_type_requests_skips_non_url_data_calls() {
-        let agent_service = AgentService::new("mock".to_string());
+        let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mut file_results = HashMap::new();
@@ -1725,7 +1725,7 @@ mod tests {
 
     #[test]
     fn test_collect_type_requests_skips_non_http_methods() {
-        let agent_service = AgentService::new("mock".to_string());
+        let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mut file_results = HashMap::new();
@@ -1764,7 +1764,7 @@ mod tests {
 
     #[test]
     fn test_collect_type_requests_assigns_call_ids() {
-        let agent_service = AgentService::new("mock".to_string());
+        let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mut file_results = HashMap::new();
@@ -1927,7 +1927,7 @@ mod tests {
 
     #[test]
     fn test_build_mount_graph_cross_file_resolution() {
-        let agent_service = AgentService::new("mock".to_string());
+        let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mut file_results = HashMap::new();
@@ -2010,7 +2010,7 @@ mod tests {
 
     #[test]
     fn test_infer_node_types() {
-        let agent_service = AgentService::new("mock".to_string());
+        let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mut graph = MountGraph::new();

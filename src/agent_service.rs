@@ -1,3 +1,4 @@
+use crate::oidc::OidcProvider;
 use crate::visitor::{Call, Json, TypeReference};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -12,13 +13,13 @@ use tracing::{debug, warn};
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
 pub struct AgentService {
-    api_key: String,
     client: Client,
     semaphore: Arc<Semaphore>,
 }
 
 impl AgentService {
-    pub fn new(api_key: String) -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         // Limit concurrent requests to avoid rate limits
         // Paid tier allows higher limits, but let's be safe with 20 concurrent requests
         let concurrency_limit = env::var("CARRICK_CONCURRENCY_LIMIT")
@@ -35,7 +36,6 @@ impl AgentService {
             .expect("Failed to build agent HTTP client");
 
         Self {
-            api_key,
             client,
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
         }
@@ -94,14 +94,12 @@ impl AgentService {
         let api_base = env!("CARRICK_API_ENDPOINT");
         let endpoint = format!("{}{}", api_base, path);
 
-        let request_builder = self
-            .client
-            .post(&endpoint)
-            .json(body)
-            .timeout(std::time::Duration::from_secs(60))
-            .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
-            .header("X-Carrick-Run-Id", crate::logging::run_id())
-            .header("Authorization", format!("Bearer {}", self.api_key));
+        // Mint the OIDC token once up front; the cloud derives identity from
+        // its signed claims. Tokens are short-lived, so on a 401 we re-mint
+        // once mid-loop (long scans can outlive a token).
+        let provider = OidcProvider::global()?;
+        let mut token = provider.token().await?;
+        let mut reminted = false;
 
         // Retry logic for transient failures with exponential backoff.
         // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s. The lambda's structured
@@ -112,9 +110,29 @@ impl AgentService {
         // non-envelope responses).
         let max_retries = 7;
         for attempt in 1..=max_retries {
-            match request_builder.try_clone().unwrap().send().await {
+            let request_builder = self
+                .client
+                .post(&endpoint)
+                .json(body)
+                .timeout(std::time::Duration::from_secs(60))
+                .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
+                .header("X-Carrick-Run-Id", crate::logging::run_id())
+                .header("X-Carrick-OIDC", &token);
+
+            match request_builder.send().await {
                 Ok(response) => {
                     let status = response.status();
+
+                    // A 401 mid-run almost certainly means the OIDC token
+                    // expired. Re-mint once and retry immediately without
+                    // consuming a backoff sleep.
+                    if status.as_u16() == 401 && !reminted {
+                        warn!("Agent proxy returned 401; re-minting OIDC token and retrying once");
+                        token = provider.remint().await?;
+                        reminted = true;
+                        continue;
+                    }
+
                     let is_transient_gateway_status =
                         matches!(status.as_u16(), 429 | 502 | 503 | 504);
 
@@ -287,10 +305,7 @@ pub async fn extract_calls_from_async_expressions(
         async_calls.len()
     );
 
-    // Get API key and create AgentService
-    let api_key = env::var("CARRICK_API_KEY")
-        .map_err(|_| "CARRICK_API_KEY environment variable must be set")?;
-    let agent_service = AgentService::new(api_key);
+    let agent_service = AgentService::new();
 
     let payload = serde_json::json!({
         "async_calls": async_calls,

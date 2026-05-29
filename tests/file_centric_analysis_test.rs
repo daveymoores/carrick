@@ -233,7 +233,7 @@ fn test_file_analysis_result_serialization() {
 
 #[test]
 fn test_file_analyzer_agent_system_message_framework_agnostic() {
-    let agent_service = AgentService::new("mock".to_string());
+    let agent_service = AgentService::new();
     let analyzer = FileAnalyzerAgent::new(agent_service);
 
     // We can't directly access the system message, but we can verify
@@ -243,7 +243,7 @@ fn test_file_analyzer_agent_system_message_framework_agnostic() {
 
 #[test]
 fn test_file_orchestrator_creation() {
-    let agent_service = AgentService::new("mock".to_string());
+    let agent_service = AgentService::new();
     let _orchestrator = FileOrchestrator::new(agent_service);
     // Orchestrator should be created without errors
 }
@@ -722,7 +722,7 @@ async fn test_file_orchestrator_with_mock_agent() {
     // SAFETY: This test runs in isolation, environment variable modification is safe
     unsafe { std::env::set_var("CARRICK_MOCK_ALL", "1") };
 
-    let agent_service = AgentService::new("mock_key".to_string());
+    let agent_service = AgentService::new();
     let orchestrator = FileOrchestrator::new(agent_service);
     let guidance = create_express_guidance();
     let detection = create_express_detection();
@@ -764,7 +764,7 @@ async fn test_file_orchestrator_handles_empty_files() {
     // SAFETY: This test runs in isolation, environment variable modification is safe
     unsafe { std::env::set_var("CARRICK_MOCK_ALL", "1") };
 
-    let agent_service = AgentService::new("mock_key".to_string());
+    let agent_service = AgentService::new();
     let orchestrator = FileOrchestrator::new(agent_service);
     let guidance = create_express_guidance();
     let detection = create_express_detection();
@@ -796,7 +796,7 @@ async fn test_file_orchestrator_handles_missing_files() {
     // SAFETY: This test runs in isolation, environment variable modification is safe
     unsafe { std::env::set_var("CARRICK_MOCK_ALL", "1") };
 
-    let agent_service = AgentService::new("mock_key".to_string());
+    let agent_service = AgentService::new();
     let orchestrator = FileOrchestrator::new(agent_service);
     let guidance = create_express_guidance();
     let detection = create_express_detection();
