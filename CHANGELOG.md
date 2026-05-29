@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.22](https://github.com/daveymoores/carrick/compare/carrick-v0.1.21...carrick-v0.1.22) (2026-05-29)
+
+
+### Features
+
+* **parser:** enable jsx parsing for .jsx files ([#114](https://github.com/daveymoores/carrick/issues/114)) ([77d1c1d](https://github.com/daveymoores/carrick/commit/77d1c1dbe0919854b02012046ed994ace088315c))
+* **scanner:** ship function argument + return types to MCP ([#113](https://github.com/daveymoores/carrick/issues/113)) ([2bfd4b0](https://github.com/daveymoores/carrick/commit/2bfd4b09d31caf3df75a4f9c978c6adf61afbb3b))
+* typed function signatures (scanner + sidecar) ([#118](https://github.com/daveymoores/carrick/issues/118)) ([46ee76c](https://github.com/daveymoores/carrick/commit/46ee76cbf216e04ae339993b55c68d1e5f756d31))
+
 ## [0.1.21](https://github.com/daveymoores/carrick/compare/carrick-v0.1.20...carrick-v0.1.21) (2026-05-10)
 
 
