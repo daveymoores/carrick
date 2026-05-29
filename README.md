@@ -158,6 +158,20 @@ Add a `carrick.json` to each indexed service to help classify outbound calls.
 
 When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`, it needs to know whether `ORDER_SERVICE_URL` points internally or externally. Unclassified env vars surface as a configuration suggestion in the PR comment.
 
+### Monorepos
+
+If your backend lives in a monorepo (Nx, Turborepo, or npm/Yarn/pnpm workspaces), list each deployable app in the root `carrick.json` so Carrick indexes them as separate services:
+
+```json
+{
+  "projects": ["apps/orders", "apps/billing", "services/*"]
+}
+```
+
+Each entry is a path or simple glob relative to the repo root. Carrick analyzes every matched app independently — its own endpoints, calls, and types — under a composite identity (`<repo>::<app>`), so drift is detected across apps and against your other repos (for example, a separate frontend repo calling one of these services). Each app may also carry its own `carrick.json` for `serviceName` and env-var classification.
+
+With no `projects` field, Carrick analyzes the repo root as a single service. When it detects a monorepo but no `projects` is configured, it surfaces a suggestion in the PR comment.
+
 ## How it works
 
 1. SWC parses each TypeScript file into an AST.
