@@ -160,17 +160,53 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 
 ### Monorepos
 
-If your backend lives in a monorepo (Nx, Turborepo, or npm/Yarn/pnpm workspaces), list each deployable app in the root `carrick.json` so Carrick indexes them as separate services:
+If your backend lives in a monorepo (Nx, Turborepo, or npm/Yarn/pnpm workspaces), add a `projects` field to the **root** `carrick.json` listing each deployable app. Carrick indexes each one as a separate service, so drift is detected across apps and against your other repos (for example, a separate frontend repo calling one of these services).
+
+```
+my-backend-monorepo/
+  carrick.json          # declares the apps
+  turbo.json
+  apps/
+    orders/
+      carrick.json      # this app's identity + call classification
+      package.json
+    billing/
+      carrick.json
+      package.json
+  packages/
+    shared-types/       # a library — not listed; folded into apps that import it
+```
+
+Root `carrick.json` — just declares the apps:
 
 ```json
 {
-  "projects": ["apps/orders", "apps/billing", "services/*"]
+  "projects": ["apps/*"]
 }
 ```
 
-Each entry is a path or simple glob relative to the repo root. Carrick analyzes every matched app independently — its own endpoints, calls, and types — under a composite identity (`<repo>::<app>`), so drift is detected across apps and against your other repos (for example, a separate frontend repo calling one of these services). Each app may also carry its own `carrick.json` for `serviceName` and env-var classification.
+Each entry is a path or a simple one-level glob (`apps/*`, `services/*`) relative to the repo root. Carrick analyzes every matched app independently — its own endpoints, calls, and types — under a composite identity (`<repo>::<app>`). The `<app>` segment is taken from the app's `package.json` `name`, falling back to its directory name. Libraries (e.g. `packages/*`) should **not** be listed: their source is pulled in automatically when resolving the types of any app that imports them.
 
-With no `projects` field, Carrick analyzes the repo root as a single service. When it detects a monorepo but no `projects` is configured, it surfaces a suggestion in the PR comment.
+Each app then carries its own `carrick.json` (same schema as a single repo) for its `serviceName` and call classification:
+
+```json
+{
+  "serviceName": "orders-service",
+  "internalEnvVars": ["BILLING_SERVICE_URL"],
+  "externalDomains": ["https://api.stripe.com"]
+}
+```
+
+Root-level keys other than `projects` act as defaults that every app inherits, so shared settings can live once at the root:
+
+```json
+{
+  "projects": ["apps/*"],
+  "internalDomains": ["https://api.yourcompany.com"]
+}
+```
+
+With no `projects` field, Carrick analyzes the repo root as a single service (unchanged). When it detects a monorepo (an `nx.json`, `turbo.json`, `pnpm-workspace.yaml`, or a `workspaces` field) but no `projects` is configured, it surfaces a suggestion in the PR comment.
 
 ## How it works
 
