@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.23](https://github.com/daveymoores/carrick/compare/carrick-v0.1.22...carrick-v0.1.23) (2026-05-29)
+
+
+### Features
+
+* **action:** keyless uploads via GitHub Actions OIDC ([#119](https://github.com/daveymoores/carrick/issues/119)) ([b166033](https://github.com/daveymoores/carrick/commit/b1660331078df0623223576b41a414d7a76bc230))
+
 ## [0.1.22](https://github.com/daveymoores/carrick/compare/carrick-v0.1.21...carrick-v0.1.22) (2026-05-29)
 
 
