@@ -39,6 +39,22 @@ their app roots in `carrick.json`, and Carrick analyzes each as a separate unit.
 Auto-detection is reduced to a cheap *nudge* (below), not the ingestion path. We
 can add full auto-detection later if demand justifies it.
 
+### Guiding principle: incomplete is fine, silently incorrect is not
+
+The thing that erodes trust in an early-stage tool is not a missing feature — it
+is a **silent false negative**. Config-driven discovery makes ingestion *look*
+complete while the type layer can quietly degrade: if a monorepo endpoint's
+response type imports from a sibling package (e.g. `@repo/shared-types`) that the
+sidecar can't resolve, the type comes back `unknown` and **no mismatch is
+reported**. To the user that reads as "Carrick checked, we're fine" when in fact
+it never checked. That is strictly worse than "monorepos not supported yet".
+
+So the rule for every phase below: **the tool is allowed to say "I couldn't
+resolve this", but never allowed to imply "I checked and it's fine" when it
+didn't.** Unresolved types, skipped apps, and unexpanded globs must surface
+loudly (PR comment + output), not pass silently. This is what lets us ship
+something incomplete without it ever being incorrect.
+
 ## Mechanism 1 — Config-driven app roots (`projects` in `carrick.json`)
 
 Add an optional `projects` field to the root `carrick.json`. It lists the
@@ -168,6 +184,26 @@ graph tool.
   makes it 6; `upload_repo_data` signatures differ — so this is a redo, not a
   rebase): composite-key upload, `package_name` on `CloudRepoData`, git-diff
   subdir path filtering. Iterate over **configured apps**, not every package.
+- **Honesty instrumentation (first-class, not deferred to Phase 3).** Per the
+  guiding principle, Phase 1 must make degraded analysis visible from day one,
+  *before* cross-package type resolution exists:
+  - **Unresolved request/response types.** When an endpoint or call is indexed
+    but its type resolves to `unknown`/missing because the symbol came from
+    outside the app dir (a sibling package), record it as a distinct, reported
+    outcome — e.g. "indexed `GET /orders/:id` on `orders-service`, but could not
+    resolve its response type (imported from `@repo/shared-types`)". This is a
+    *reported gap*, never a silent pass, and must be visually distinct from
+    "checked, compatible". It also becomes the exact signal Phase 3 is gated on
+    (the type-resolution hit rate in the sequencing section).
+  - **Skipped / empty apps.** A `projects` entry that matches a directory with no
+    `package.json`, no detected endpoints, or that fails to analyze must be
+    surfaced ("`apps/legacy` matched but no endpoints were found"), not dropped
+    silently.
+  - **Globs that matched nothing.** A `projects` entry (e.g. `services/*`) that
+    expands to zero directories must warn, so a typo or wrong layout doesn't look
+    like "analyzed, all clean".
+  - Plumb these through `src/formatter/` (PR comment) and the normal output, in
+    the same spirit as the existing unclassified-env-var suggestion.
 
 **Phase 2 — Detection nudge**
 - Shallow root marker check (Mechanism 2); emit a configuration suggestion via
