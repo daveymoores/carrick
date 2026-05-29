@@ -1,8 +1,27 @@
 # Monorepo Support (NX, Turborepo, pnpm/npm/Yarn workspaces)
 
-**Status:** Design / Not yet implemented
+**Status:** Phases 1, 2, 4 implemented; Phase 3 (cross-package type resolution) gated/future
 **Last Updated:** 2026-05
 **Supersedes:** PR #42 (`feat: monorepo workspace support`, branch `feat/monorepo-support`)
+
+## Implementation status
+
+- **Phase 1 (config + per-app loop)** — done. `projects` field on `Config`
+  (`src/config.rs`); `src/workspace.rs` glob expansion; per-app engine loop in
+  `run_analysis_engine_inner` with composite `<repo>::<app>` keys, `package_name`
+  on `CloudRepoData`, and git-diff subdir filtering
+  (`filter_changed_files_for_package`).
+- **Phase 2 (detection nudge)** — done. `workspace::detect_markers` +
+  single-repo-mode suggestion; honesty warnings (empty globs, skipped dirs,
+  empty apps, unsupported patterns) surfaced via a `warnings` channel on
+  `ApiAnalysisResult` and rendered by `src/formatter/`.
+- **Phase 4 (tests)** — done. `tests/monorepo_test.rs` end-to-end + unit tests
+  for expansion/detection/filtering/formatting.
+- **Phase 3 (cross-package type resolution)** — NOT implemented; intentionally
+  gated on measuring the type-resolution hit rate against a real target (see
+  "The hard part" and "De-risked sequencing"). Until then, an app whose types
+  resolve only via a sibling package will surface as a reported gap, not a
+  silent pass.
 
 ## Goal
 
