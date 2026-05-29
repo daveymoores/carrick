@@ -2216,7 +2216,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
-            .args(["commit", "-m", "initial"])
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "initial"])
             .current_dir(repo_path)
             .output()
             .unwrap();
@@ -2248,7 +2248,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
-            .args(["commit", "-m", "changes"])
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "changes"])
             .current_dir(repo_path)
             .output()
             .unwrap();
@@ -2579,5 +2579,44 @@ mod tests {
         assert!(data.cached_guidance.is_none());
         assert!(data.package_json_hash.is_none());
         assert!(data.cache_version.is_none());
+        // Old data lacks package_name; it must default to None, not error.
+        assert!(data.package_name.is_none());
+    }
+
+    #[test]
+    fn filter_changed_files_single_repo_passthrough() {
+        // No repo_root => single-repo mode => paths returned unchanged.
+        let changed = vec!["src/a.ts".to_string(), "src/b.ts".to_string()];
+        let result = filter_changed_files_for_package(changed, "/repo", None);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains("src/a.ts"));
+        assert!(result.contains("src/b.ts"));
+    }
+
+    #[test]
+    fn filter_changed_files_strips_package_prefix() {
+        // Monorepo: git diff paths are root-relative; the app lives at
+        // <root>/apps/orders. Use a real temp dir so canonicalize() works.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let app = root.join("apps/orders");
+        std::fs::create_dir_all(&app).unwrap();
+
+        let root_str = root.to_str().unwrap();
+        let app_str = std::fs::canonicalize(&app)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let changed = vec![
+            "apps/orders/src/handler.ts".to_string(),
+            "apps/billing/src/other.ts".to_string(), // different app, filtered out
+            "README.md".to_string(),                 // not in this app
+        ];
+        let result = filter_changed_files_for_package(changed, &app_str, Some(root_str));
+
+        // Only the orders file survives, stripped to app-relative.
+        assert_eq!(result.len(), 1);
+        assert!(result.contains("src/handler.ts"));
     }
 }

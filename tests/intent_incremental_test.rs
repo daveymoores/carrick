@@ -78,6 +78,10 @@ impl CloudStorage for StubStorage {
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
+        // Disable GPG signing — sandboxed environments may have commit.gpgsign
+        // enabled globally without a working signer.
+        .arg("-c")
+        .arg("commit.gpgsign=false")
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")

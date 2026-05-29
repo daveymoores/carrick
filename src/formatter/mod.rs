@@ -1116,4 +1116,55 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert!(orphaned.is_empty());
     }
+
+    #[test]
+    fn warnings_render_on_clean_run() {
+        // A run with no issues but with warnings must still surface them, so a
+        // misconfigured monorepo isn't misread as a clean bill of health.
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues: ApiIssues {
+                call_issues: vec![],
+                endpoint_issues: vec![],
+                env_var_calls: vec![],
+                mismatches: vec![],
+                type_mismatches: vec![],
+                dependency_conflicts: vec![],
+            },
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            warnings: vec!["`projects` pattern 'apps/*' matched nothing".to_string()],
+        };
+        let output = format_analysis_results(result);
+        assert!(output.contains("Analysis Warning"));
+        assert!(output.contains("apps/*"));
+        // Still reports zero issues (warnings are not issues).
+        assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
+    }
+
+    #[test]
+    fn warnings_render_alongside_issues() {
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues: ApiIssues {
+                call_issues: vec![
+                    "Missing endpoint for GET /a (normalized: /a) (called from src/x.ts)"
+                        .to_string(),
+                ],
+                endpoint_issues: vec![],
+                env_var_calls: vec![],
+                mismatches: vec![],
+                type_mismatches: vec![],
+                dependency_conflicts: vec![],
+            },
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            warnings: vec!["App 'web' was analyzed but no endpoints were found".to_string()],
+        };
+        let output = format_analysis_results(result);
+        assert!(output.contains("Analysis Warning"));
+        assert!(output.contains("App 'web'"));
+    }
 }
