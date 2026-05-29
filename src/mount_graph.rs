@@ -800,6 +800,7 @@ mod tests {
         // Create config with internal domain
         let config = Config {
             service_name: None,
+            projects: vec![],
             internal_domains: ["user-service.internal".to_string()].into_iter().collect(),
             external_domains: ["api.stripe.com".to_string()].into_iter().collect(),
             internal_env_vars: Default::default(),
@@ -1074,6 +1075,7 @@ mod tests {
 
         let config = Config {
             service_name: None,
+            projects: vec![],
             internal_domains: Default::default(),
             external_domains: Default::default(),
             internal_env_vars: ["ORDER_SERVICE_URL".to_string()].into_iter().collect(),
@@ -1116,6 +1118,7 @@ mod tests {
 
         let config = Config {
             service_name: None,
+            projects: vec![],
             internal_domains: Default::default(),
             external_domains: Default::default(),
             internal_env_vars: ["API_URL".to_string()].into_iter().collect(),

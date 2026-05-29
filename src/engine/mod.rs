@@ -136,82 +136,251 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
 
-    // 3. Extract previous data for current repo (if any)
     let repo_name = get_repository_name(repo_path);
-    let previous_data = if no_cache {
-        debug!("--no-cache: skipping incremental cache");
-        None
-    } else {
-        let data = all_repo_data
-            .iter()
-            .find(|r| r.repo_name == repo_name)
-            .cloned();
-        if data.is_some() {
-            debug!("Found previous analysis data for {}", repo_name);
+
+    // 3. Determine whether this is a configured monorepo. The root carrick.json
+    //    `projects` field lists deployable app roots; when present, each app is
+    //    analyzed as its own `<repo>::<app>` unit so the cross-repo engine
+    //    raises cross-app drift just like it does across separate repos.
+    let root_config = read_root_config(repo_path);
+    let mut warnings: Vec<String> = Vec::new();
+
+    let (analyzed_repos, primary_repo_data) = if !root_config.projects.is_empty() {
+        let expansion = crate::workspace::expand_projects(repo_path, &root_config.projects);
+        warnings.extend(expansion.warnings.iter().cloned());
+
+        if expansion.packages.is_empty() {
+            warnings.push(format!(
+                "`projects` was configured ({}) but no apps were found; nothing to analyze. Check the paths/globs in carrick.json.",
+                root_config.projects.join(", ")
+            ));
+            logging::finish_spinner(
+                &sp,
+                &format!("Downloaded data from {} repos", all_repo_data.len()),
+            );
+            (Vec::new(), None)
+        } else {
+            logging::finish_spinner(
+                &sp,
+                &format!(
+                    "Downloaded data from {} repos; analyzing {} monorepo app(s)",
+                    all_repo_data.len(),
+                    expansion.packages.len()
+                ),
+            );
+
+            let mut analyzed: Vec<CloudRepoData> = Vec::new();
+            for package in &expansion.packages {
+                let composite_name = format!("{}::{}", repo_name, package.name);
+                let package_path = package.path.to_string_lossy().to_string();
+
+                let previous_data = if no_cache {
+                    None
+                } else {
+                    all_repo_data
+                        .iter()
+                        .find(|r| r.repo_name == composite_name)
+                        .cloned()
+                };
+
+                let sp = logging::spinner(&format!("Analyzing app {}...", package.name));
+                let mut package_data = analyze_current_repo_incremental(
+                    &package_path,
+                    sidecar,
+                    previous_data.as_ref(),
+                    Some(repo_path),
+                )
+                .await?;
+                package_data.repo_name = composite_name.clone();
+                package_data.package_name = Some(package.name.clone());
+
+                // Honesty: an app with no endpoints and no calls means Carrick
+                // saw nothing analyzable there — surface it rather than letting
+                // an empty unit look like a clean pass.
+                if package_data.endpoints.is_empty() && package_data.calls.is_empty() {
+                    warnings.push(format!(
+                        "App '{}' ({}) was analyzed but no endpoints or cross-repo calls were found.",
+                        package.name,
+                        package.path.display()
+                    ));
+                }
+
+                logging::finish_spinner(
+                    &sp,
+                    &format!(
+                        "Analyzed {} ({} endpoints, {} calls)",
+                        package.name,
+                        package_data.endpoints.len(),
+                        package_data.calls.len()
+                    ),
+                );
+
+                if should_upload {
+                    let cloud_data_serialized = strip_ast_nodes(package_data.clone());
+                    storage
+                        .upload_repo_data(&cloud_data_serialized)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to upload data for app {}: {}", package.name, e)
+                        })?;
+                } else {
+                    debug!("Skipping upload for {} (PR/branch mode)", package.name);
+                }
+
+                analyzed.push(package_data);
+            }
+
+            // Drop any previously-uploaded data for this monorepo's apps from the
+            // cross-repo set so we don't double-count stale copies alongside the
+            // freshly analyzed ones.
+            let composite_prefix = format!("{}::", repo_name);
+            all_repo_data.retain(|r| {
+                !r.repo_name.starts_with(&composite_prefix) && r.repo_name != repo_name
+            });
+
+            // Use the first app as the "current" repo for build_cross_repo_analyzer
+            // (it pushes current into the list and treats all uniformly).
+            let primary = analyzed.remove(0);
+            (analyzed, Some(primary))
         }
-        data
-    };
-    logging::finish_spinner(
-        &sp,
-        &format!("Downloaded data from {} repos", all_repo_data.len()),
-    );
-
-    // 4. Analyze (incremental if possible)
-    let sp = logging::spinner("Analyzing repository...");
-    let current_repo_data =
-        analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref()).await?;
-    logging::finish_spinner(&sp, &format!("Analyzed {}", current_repo_data.repo_name));
-
-    // Log sidecar type resolution results if available
-    if current_repo_data.bundled_types.is_some() {
-        debug!(
-            "Type resolution: {} bundled types, {} manifest entries",
-            current_repo_data
-                .bundled_types
-                .as_ref()
-                .map(|s| s.lines().count())
-                .unwrap_or(0),
-            current_repo_data
-                .type_manifest
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0)
-        );
-    }
-
-    // 5. Conditionally upload current repo data to cloud storage
-    if should_upload {
-        let sp = logging::spinner("Uploading results...");
-        let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
-        storage
-            .upload_repo_data(&cloud_data_serialized)
-            .await
-            .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-        logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
     } else {
-        debug!("Skipping upload (PR/branch mode)");
+        // Single-repo mode (unchanged). Nudge if this looks like a monorepo.
+        let markers = crate::workspace::detect_markers(repo_path);
+        if !markers.is_empty() {
+            let labels: Vec<&str> = markers.iter().map(|m| m.label()).collect();
+            warnings.push(format!(
+                "Detected a {} monorepo, but Carrick is only analyzing the repo root. Add a `projects` list to carrick.json (e.g. `\"projects\": [\"apps/*\"]`) to index each app as a separate service so cross-app and cross-repo drift is detected.",
+                labels.join(" / ")
+            ));
+        }
+
+        let previous_data = if no_cache {
+            debug!("--no-cache: skipping incremental cache");
+            None
+        } else {
+            let data = all_repo_data
+                .iter()
+                .find(|r| r.repo_name == repo_name)
+                .cloned();
+            if data.is_some() {
+                debug!("Found previous analysis data for {}", repo_name);
+            }
+            data
+        };
+        logging::finish_spinner(
+            &sp,
+            &format!("Downloaded data from {} repos", all_repo_data.len()),
+        );
+
+        let sp = logging::spinner("Analyzing repository...");
+        let current_repo_data =
+            analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref(), None)
+                .await?;
+        logging::finish_spinner(&sp, &format!("Analyzed {}", current_repo_data.repo_name));
+
+        if current_repo_data.bundled_types.is_some() {
+            debug!(
+                "Type resolution: {} bundled types, {} manifest entries",
+                current_repo_data
+                    .bundled_types
+                    .as_ref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0),
+                current_repo_data
+                    .type_manifest
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+            );
+        }
+
+        if should_upload {
+            let sp = logging::spinner("Uploading results...");
+            let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
+            storage
+                .upload_repo_data(&cloud_data_serialized)
+                .await
+                .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+            logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
+        } else {
+            debug!("Skipping upload (PR/branch mode)");
+        }
+
+        // Remove current repo from cross-repo data to prevent duplicate processing
+        all_repo_data.retain(|repo| repo.repo_name != current_repo_data.repo_name);
+        (Vec::new(), Some(current_repo_data))
+    };
+
+    if !should_upload && !root_config.projects.is_empty() {
+        debug!("Skipping uploads (PR/branch mode - analyzing only)");
     }
 
-    // 6. Cross-repo analysis (reuse already-downloaded data)
-    // Remove current repo from cross-repo data to prevent duplicate processing
-    let current_repo_name = &current_repo_data.repo_name;
-    all_repo_data.retain(|repo| &repo.repo_name != current_repo_name);
+    // 6. Cross-repo analysis (reuse already-downloaded data).
+    let Some(primary) = primary_repo_data else {
+        // No apps analyzed (e.g. misconfigured monorepo). Still surface warnings.
+        if !warnings.is_empty() {
+            print_warnings_only(&warnings, repo_name.as_str());
+        }
+        return Ok(());
+    };
+
+    // Fold the additional monorepo apps into the cross-repo set.
+    all_repo_data.extend(analyzed_repos);
 
     debug!(
-        "Cross-repo analysis with {} repos (excluding {})",
+        "Cross-repo analysis with {} repos (primary: {})",
         all_repo_data.len(),
-        current_repo_name
+        primary.repo_name
     );
 
     let sp = logging::spinner("Running cross-repo analysis...");
-    let analyzer =
-        build_cross_repo_analyzer(all_repo_data, current_repo_data, ts_check_dir).await?;
+    let mut analyzer = build_cross_repo_analyzer(all_repo_data, primary, ts_check_dir).await?;
+    analyzer.add_warnings(warnings);
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
     print_results(results);
 
     Ok(())
+}
+
+/// Read the root `carrick.json` (if present) to obtain the `projects` field and
+/// other top-level config. Unlike `load_config_and_packages`, this looks only at
+/// `<repo_path>/carrick.json` — the root config is the authoritative source of
+/// the monorepo `projects` list.
+fn read_root_config(repo_path: &str) -> Config {
+    let path = Path::new(repo_path).join("carrick.json");
+    if !path.is_file() {
+        return Config::default();
+    }
+    Config::new(vec![path]).unwrap_or_else(|e| {
+        warn!("Error parsing root carrick.json: {}", e);
+        Config::default()
+    })
+}
+
+/// Emit warnings when there is no analyzer result to attach them to (e.g. a
+/// monorepo whose `projects` matched nothing). Keeps the honesty signal visible
+/// instead of exiting silently.
+fn print_warnings_only(warnings: &[String], repo_name: &str) {
+    use crate::analyzer::{ApiAnalysisResult, ApiIssues};
+    let result = ApiAnalysisResult {
+        endpoints: vec![],
+        calls: vec![],
+        issues: ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        },
+        verified_endpoints: vec![],
+        detected_graphql_libraries: vec![],
+        warnings: warnings.to_vec(),
+    };
+    debug!("No analyzable apps for {}", repo_name);
+    print_results(result);
 }
 
 /// Best-effort upload of the current run's log tail to S3.
@@ -394,6 +563,49 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
     Some(changed)
 }
 
+/// Filter git-diff paths for a monorepo app and strip the package prefix.
+///
+/// Git diff returns paths relative to the git root (e.g. `apps/orders/src/x.ts`),
+/// but file discovery normalizes to app-relative paths (e.g. `src/x.ts`). This
+/// keeps only the diff entries inside the app dir and strips the prefix so the
+/// two sets align. When `repo_root` is `None` (single-repo mode), paths are
+/// already app-relative and returned unchanged.
+fn filter_changed_files_for_package(
+    changed_files: Vec<String>,
+    repo_path: &str,
+    repo_root: Option<&str>,
+) -> HashSet<String> {
+    let Some(root) = repo_root else {
+        return changed_files.into_iter().collect();
+    };
+
+    let canon_root = std::fs::canonicalize(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| root.to_string());
+
+    // repo_path is already canonicalized by the caller. Derive the package
+    // prefix relative to the git root.
+    let package_prefix = repo_path
+        .strip_prefix(&format!("{}/", canon_root))
+        .or_else(|| repo_path.strip_prefix(&canon_root))
+        .unwrap_or("")
+        .trim_start_matches('/');
+
+    if package_prefix.is_empty() {
+        warn!(
+            "Could not compute package prefix (repo_path={}, root={}); using full diff",
+            repo_path, canon_root
+        );
+        return changed_files.into_iter().collect();
+    }
+
+    let prefix_with_slash = format!("{}/", package_prefix);
+    changed_files
+        .into_iter()
+        .filter_map(|f| f.strip_prefix(&prefix_with_slash).map(|s| s.to_string()))
+        .collect()
+}
+
 /// Hash file content for cache invalidation (package.json).
 fn hash_file_content(content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -451,10 +663,14 @@ fn strip_diagnostic_fields(
 }
 
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
+///
+/// `repo_root` is the git root directory, used when `repo_path` is a monorepo
+/// app subdirectory. When `None`, `repo_path` is assumed to be the git root.
 async fn analyze_current_repo_incremental(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
+    repo_root: Option<&str>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -500,8 +716,10 @@ async fn analyze_current_repo_incremental(
             &prev_commit[..std::cmp::min(7, prev_commit.len())]
         );
 
-        // Get changed files via git diff
-        if let Some(changed_files) = get_changed_files(repo_path, prev_commit) {
+        // Get changed files via git diff. Run git at the repo root (the git
+        // working tree), which for a monorepo app is the parent monorepo dir.
+        let git_dir = repo_root.unwrap_or(repo_path);
+        if let Some(changed_files) = get_changed_files(git_dir, prev_commit) {
             let prev_file_results = prev.file_results.as_ref().unwrap();
             let repo_prefix = format!("{}/", repo_path);
 
@@ -520,8 +738,11 @@ async fn analyze_current_repo_incremental(
             // Build set of currently discovered file paths (normalized to relative)
             let current_file_set: HashSet<String> = files.iter().map(&normalize_path).collect();
 
-            // Normalize changed files relative to repo root
-            let changed_set: HashSet<String> = changed_files.into_iter().collect();
+            // Git diff paths are relative to the git root; file discovery paths
+            // are relative to the app dir. For a monorepo app, strip the package
+            // prefix so the two sets align.
+            let changed_set: HashSet<String> =
+                filter_changed_files_for_package(changed_files, repo_path, repo_root);
 
             // Partition: which files need fresh analysis?
             let files_to_analyze: Vec<PathBuf> = files
@@ -809,6 +1030,7 @@ fn build_cloud_data_from_mount_graph(
     CloudRepoData {
         repo_name: repo_name.to_string(),
         service_name,
+        package_name: None,
         endpoints,
         calls,
         mounts,
@@ -1654,6 +1876,7 @@ mod tests {
         let test_data = CloudRepoData {
             repo_name: "express-single".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],
@@ -1692,6 +1915,7 @@ mod tests {
         let test_data = vec![CloudRepoData {
             repo_name: "express-single".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -1765,6 +1989,7 @@ mod tests {
         let test_data = vec![CloudRepoData {
             repo_name: "express-single".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![endpoint.clone()],
             calls: vec![endpoint.clone()],
             mounts: vec![],
@@ -2114,6 +2339,7 @@ mod tests {
         let data = CloudRepoData {
             repo_name: "express-single".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -2155,6 +2381,7 @@ mod tests {
         let data = CloudRepoData {
             repo_name: "express-single".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],
@@ -2283,6 +2510,7 @@ mod tests {
         let data = CloudRepoData {
             repo_name: "express-single".to_string(),
             service_name: None,
+            package_name: None,
             endpoints: vec![],
             calls: vec![],
             mounts: vec![],

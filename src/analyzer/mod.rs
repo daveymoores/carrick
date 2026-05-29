@@ -101,6 +101,11 @@ pub struct ApiAnalysisResult {
     /// `detected_data_fetchers`). Populated so the formatter can show a
     /// "REST-only for v1" banner; Carrick doesn't analyze GraphQL schemas.
     pub detected_graphql_libraries: Vec<String>,
+    /// Non-fatal analysis warnings surfaced to the user (PR comment + stdout).
+    /// Carries the "honesty" signal for monorepos: globs that matched nothing,
+    /// directories skipped because they lack a package.json, etc. — so a
+    /// misconfiguration never looks like "analyzed, all clean".
+    pub warnings: Vec<String>,
 }
 
 /// Return the subset of `data_fetchers` that are GraphQL libraries.
@@ -143,6 +148,7 @@ pub struct Analyzer {
     detected_data_fetchers: Vec<String>,
     mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
     ts_check_dir: Option<PathBuf>,   // Resolved ts_check/ directory; set by the CLI entry point
+    warnings: Vec<String>, // Non-fatal warnings surfaced to the user (monorepo honesty signals)
 }
 
 impl CoreExtractor for Analyzer {
@@ -169,12 +175,19 @@ impl Analyzer {
             detected_data_fetchers: Vec::new(),
             mount_graph: None,
             ts_check_dir: None,
+            warnings: Vec::new(),
         }
     }
 
     /// Set the mount graph for framework-agnostic analysis
     pub fn set_mount_graph(&mut self, mount_graph: MountGraph) {
         self.mount_graph = Some(mount_graph);
+    }
+
+    /// Add non-fatal warnings to surface in the results (PR comment + stdout).
+    /// Used to carry monorepo honesty signals (skipped apps, empty globs, etc.).
+    pub fn add_warnings(&mut self, warnings: impl IntoIterator<Item = String>) {
+        self.warnings.extend(warnings);
     }
 
     /// Set the resolved ts_check/ directory. The CLI entry point discovers this
@@ -1212,6 +1225,7 @@ impl Analyzer {
             },
             verified_endpoints,
             detected_graphql_libraries,
+            warnings: self.warnings.clone(),
         }
     }
 

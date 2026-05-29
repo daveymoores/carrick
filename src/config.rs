@@ -8,6 +8,12 @@ pub struct Config {
     #[serde(default)]
     #[serde(rename = "serviceName")]
     pub service_name: Option<String>,
+    /// Monorepo app roots (paths or simple one-level globs like `apps/*`),
+    /// relative to the repo root. Only meaningful in the root `carrick.json`.
+    /// When present, each matched directory is analyzed as a separate service.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
     #[serde(default)]
     #[serde(rename = "internalEnvVars")]
     pub internal_env_vars: HashSet<String>,
@@ -34,6 +40,11 @@ impl Config {
             // Use first non-None service_name encountered
             if merged_config.service_name.is_none() {
                 merged_config.service_name = config.service_name;
+            }
+
+            // Use first non-empty projects list encountered (root config wins)
+            if merged_config.projects.is_empty() {
+                merged_config.projects = config.projects;
             }
 
             merged_config
@@ -173,12 +184,33 @@ mod tests {
         assert_eq!(config.service_name, Some("order-service".to_string()));
         assert!(config.internal_env_vars.contains("USER_SERVICE_URL"));
         assert!(config.external_env_vars.contains("STRIPE_API"));
+        assert!(config.projects.is_empty());
+    }
+
+    #[test]
+    fn test_config_with_projects() {
+        let json = r#"{
+            "projects": ["apps/*", "services/billing"]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.projects, vec!["apps/*", "services/billing"]);
+        // Absent serviceName / env-var fields default cleanly.
+        assert!(config.service_name.is_none());
+    }
+
+    #[test]
+    fn test_config_without_projects_defaults_empty() {
+        let json = r#"{ "serviceName": "solo" }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.projects.is_empty());
     }
 
     #[test]
     fn test_is_internal_call() {
         let config = Config {
             service_name: None,
+            projects: vec![],
             internal_env_vars: ["USER_SERVICE_URL".to_string()].into_iter().collect(),
             internal_domains: ["https://api.internal.com".to_string()]
                 .into_iter()
@@ -200,6 +232,7 @@ mod tests {
     fn test_is_external_call() {
         let config = Config {
             service_name: None,
+            projects: vec![],
             internal_env_vars: HashSet::new(),
             internal_domains: HashSet::new(),
             external_env_vars: ["STRIPE_API".to_string()].into_iter().collect(),

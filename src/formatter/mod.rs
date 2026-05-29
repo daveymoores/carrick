@@ -47,6 +47,13 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
 
     output.push_str(&format_graphql_banner(&result.detected_graphql_libraries));
 
+    // Surface non-fatal warnings (e.g. monorepo globs that matched nothing)
+    // near the top so a misconfiguration isn't buried under the issue list.
+    if !result.warnings.is_empty() {
+        output.push_str(&format_warnings_section(&result.warnings));
+        output.push_str("\n<hr>\n\n");
+    }
+
     // Verified-matches section runs first so users see what *worked* before
     // the failure list — clean runs would otherwise produce no positive
     // signal, and noisy runs would bury the matches under orphans.
@@ -97,13 +104,41 @@ fn format_no_issues(result: &ApiAnalysisResult) -> String {
     } else {
         format!("{}\n", format_verified_section(&result.verified_endpoints))
     };
+    let warnings = if result.warnings.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", format_warnings_section(&result.warnings))
+    };
     format!(
-        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 Carrick: Cross-repo analysis\n\nIndexed **{} endpoints** and **{} cross-repo calls** across the org.\n\n✅ **All cross-repo calls match the indexed contracts.**\n\n{}{}<!-- CARRICK_OUTPUT_END -->\n",
+        "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 Carrick: Cross-repo analysis\n\nIndexed **{} endpoints** and **{} cross-repo calls** across the org.\n\n✅ **All cross-repo calls match the indexed contracts.**\n\n{}{}{}<!-- CARRICK_OUTPUT_END -->\n",
         result.endpoints.len(),
         result.calls.len(),
         format_graphql_banner(&result.detected_graphql_libraries),
+        warnings,
         verified,
     )
+}
+
+/// Render a warnings block for non-fatal analysis gaps. Surfaced so a
+/// misconfigured monorepo (e.g. a `projects` glob that matched nothing, or a
+/// directory skipped for lacking a package.json) is visible rather than
+/// silently producing an "all clean" result. See the "incomplete is fine,
+/// silently incorrect is not" principle in docs/research/monorepo-support.md.
+fn format_warnings_section(warnings: &[String]) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "<details open>\n<summary>\n<strong style=\"font-size: 1.1em;\">⚠️ {} Analysis Warning{}</strong>\n</summary>\n\n",
+        warnings.len(),
+        if warnings.len() == 1 { "" } else { "s" }
+    ));
+    output.push_str(
+        "> These did not block analysis, but mean Carrick may have skipped code. Resolve them so results aren't misread as a clean bill of health.\n\n",
+    );
+    for warning in warnings {
+        output.push_str(&format!("- {}\n", warning));
+    }
+    output.push_str("</details>");
+    output
 }
 
 /// Render a "Verified Endpoints" details block listing every endpoint that
@@ -764,6 +799,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            warnings: vec![],
         };
 
         let output = format_analysis_results(result);
@@ -798,6 +834,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            warnings: vec![],
         };
 
         let output = format_analysis_results(result);
@@ -829,6 +866,7 @@ mod tests {
                 "graphql-request".to_string(),
                 "@apollo/client".to_string(),
             ],
+            warnings: vec![],
         };
         let output = format_analysis_results(result);
         assert!(output.contains("GraphQL detected"));
@@ -853,6 +891,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            warnings: vec![],
         };
         let output = format_analysis_results(result);
         assert!(!output.contains("GraphQL detected"));
@@ -875,6 +914,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            warnings: vec![],
         };
 
         let output = format_analysis_results(result);
@@ -903,6 +943,7 @@ mod tests {
                 ("POST".to_string(), "/api/orders".to_string()),
             ],
             detected_graphql_libraries: vec![],
+            warnings: vec![],
         };
 
         let output = format_analysis_results(result);
@@ -928,6 +969,7 @@ mod tests {
             issues,
             verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
             detected_graphql_libraries: vec![],
+            warnings: vec![],
         };
 
         let output = format_analysis_results(result);
@@ -956,6 +998,7 @@ mod tests {
             issues,
             verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
             detected_graphql_libraries: vec![],
+            warnings: vec![],
         };
 
         let output = format_analysis_results(result);

@@ -103,6 +103,11 @@ pub struct CloudRepoData {
     pub repo_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>, // Service name from carrick.json for cross-repo resolution
+    /// Workspace package name when this data belongs to one app of a monorepo.
+    /// The cross-repo identity is the composite `repo_name` (`<repo>::<app>`);
+    /// this field preserves the bare app name for display/debugging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub mounts: Vec<Mount>,
@@ -221,6 +226,7 @@ impl CloudRepoData {
         Self {
             repo_name,
             service_name,
+            package_name: None,
             endpoints,
             calls,
             mounts,

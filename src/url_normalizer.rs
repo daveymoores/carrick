@@ -450,6 +450,7 @@ mod tests {
     fn create_test_config() -> Config {
         Config {
             service_name: None,
+            projects: vec![],
             internal_domains: [
                 "user-service.internal",
                 "api.company.com",
@@ -786,6 +787,7 @@ mod tests {
     fn test_normalize_template_literal_strips_trailing_backtick() {
         let config = Config {
             service_name: None,
+            projects: vec![],
             internal_domains: HashSet::new(),
             external_domains: HashSet::new(),
             internal_env_vars: ["ORDER_SERVICE_URL"]

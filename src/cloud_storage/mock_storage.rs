@@ -71,6 +71,7 @@ impl CloudStorage for MockStorage {
                 CloudRepoData {
                     repo_name: "repo-a".to_string(),
                     service_name: None,
+                    package_name: None,
                     endpoints: vec![],
                     calls: vec![],
                     mounts: vec![],
@@ -94,6 +95,7 @@ impl CloudStorage for MockStorage {
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
                     service_name: None,
+                    package_name: None,
                     endpoints: vec![],
                     calls: vec![],
                     mounts: vec![],
