@@ -59,6 +59,10 @@ pub enum InferKind {
     ResponseBody,
     /// Find request body (req.body/ctx.request.body or call payloads)
     RequestBody,
+    /// Function return for the signature hint — NO Promise/wrapper unwrapping
+    SignatureReturn,
+    /// Type of a single named parameter (explicit or contextually inferred)
+    FunctionParam,
 }
 
 /// Wrapper unwrap strategy
@@ -125,6 +129,9 @@ pub struct InferRequestItem {
     /// Optional alias for the inferred type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// Target parameter name for `FunctionParam` inference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param_name: Option<String>,
 }
 
 // ============================================================================
@@ -999,6 +1006,7 @@ mod tests {
             expression_line: None,
             infer_kind: InferKind::ResponseBody,
             alias: None,
+            param_name: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));

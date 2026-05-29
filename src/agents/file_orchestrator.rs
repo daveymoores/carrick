@@ -355,6 +355,7 @@ impl FileOrchestrator {
                         expression_text: None,
                         expression_line: None,
                         alias: Some(alias),
+                        param_name: None,
                     });
                     true
                 }
@@ -378,6 +379,7 @@ impl FileOrchestrator {
                         expression_line: expression_line
                             .map(|l| if l > 0 { l as u32 } else { line_number }),
                         alias: Some(alias),
+                        param_name: None,
                     });
                     true
                 }

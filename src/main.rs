@@ -19,6 +19,7 @@ mod packages;
 mod parser;
 mod router_context;
 mod services;
+mod signature_pass;
 mod swc_scanner;
 mod type_manifest;
 mod url_normalizer;

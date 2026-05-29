@@ -16,7 +16,9 @@ export type InferKind =
   | 'call_result'       // Get return type of a call expression
   | 'variable'          // Get type of a variable declaration
   | 'response_body'     // Find response body (.json()/.send()/ctx.body)
-  | 'request_body';     // Find request body (req.body/ctx.request.body or call payloads)
+  | 'request_body'      // Find request body (req.body/ctx.request.body or call payloads)
+  | 'signature_return'  // Function return for the signature hint — NO Promise/wrapper unwrapping
+  | 'function_param';   // Type of a single named parameter (explicit or contextually inferred)
 
 // ============================================================================
 // Extraction Config Types (Agent-Informed Payload Unwrapping)
@@ -348,6 +350,8 @@ export interface InferRequestItem {
   infer_kind: InferKind;
   /** Optional alias for the inferred type */
   alias?: string;
+  /** Target parameter name for `function_param` inference. */
+  param_name?: string;
 }
 
 // ============================================================================

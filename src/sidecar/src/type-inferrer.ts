@@ -157,6 +157,10 @@ export class TypeInferrer {
         return this.inferExpression(sourceFile, request, wrappers, extractionConfig);
       case 'request_body':
         return this.inferRequestBody(sourceFile, request, wrappers, extractionConfig);
+      case 'signature_return':
+        return this.inferSignatureReturn(sourceFile, request);
+      case 'function_param':
+        return this.inferFunctionParam(sourceFile, request);
       default:
         this.logError(`Unknown infer kind: ${request.infer_kind}`);
         return null;
@@ -222,6 +226,80 @@ export class TypeInferrer {
       isExplicit,
       this.getNodeLocation(func),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
+    );
+  }
+
+  /**
+   * Infer a function's return type for the signature hint. Unlike
+   * `inferFunctionReturn`, this does NOT unwrap Promise or apply wrapper
+   * rules — a function that returns `Promise<AuthResult>` should show exactly
+   * that in its signature. Used by the function-signature collection pass.
+   */
+  private inferSignatureReturn(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): InferredType | null {
+    const func = this.resolveContainingFunction(sourceFile, request);
+
+    if (!func) {
+      this.log(`No function found for request at ${request.file_path}:${request.line_number}`);
+      return null;
+    }
+
+    const isExplicit = func.getReturnTypeNode() !== undefined;
+    const typeString = func.getReturnType().getText(func);
+
+    return this.createInferredType(
+      request,
+      typeString,
+      isExplicit,
+      this.getNodeLocation(func)
+    );
+  }
+
+  /**
+   * Infer the type of a single named parameter. `is_explicit` reflects whether
+   * the parameter carries a source annotation; the type string is the
+   * compiler's view either way (so contextually-typed callback params resolve
+   * even without an annotation). Uses ts-morph's default `getText()` form,
+   * which keeps named types as names and bounds depth via the compiler's own
+   * truncation.
+   */
+  private inferFunctionParam(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): InferredType | null {
+    const func = this.resolveContainingFunction(sourceFile, request);
+
+    if (!func) {
+      this.log(`No function found for request at ${request.file_path}:${request.line_number}`);
+      return null;
+    }
+
+    if (!request.param_name) {
+      this.logError(`function_param request missing param_name at ${request.file_path}:${request.line_number}`);
+      return null;
+    }
+
+    const param = func
+      .getParameters()
+      .find((p) => p.getName() === request.param_name);
+
+    if (!param) {
+      this.log(
+        `Parameter "${request.param_name}" not found at ${request.file_path}:${request.line_number}`
+      );
+      return null;
+    }
+
+    const isExplicit = param.getTypeNode() !== undefined;
+    const typeString = param.getType().getText(param);
+
+    return this.createInferredType(
+      request,
+      typeString,
+      isExplicit,
+      this.getNodeLocation(param)
     );
   }
 
@@ -1277,7 +1355,47 @@ export class TypeInferrer {
       if (!node) return undefined;
       return this.findContainingFunctionForNode(node);
     }
-    return undefined;
+    // Signature requests carry only the function's start line (FunctionDefinition
+    // has no byte span). Fall back to locating the function by that line.
+    return this.findFunctionByLine(sourceFile, request.line_number);
+  }
+
+  /**
+   * Find the function whose declaration starts at (or within a couple of lines
+   * of) the given line. Used for signature inference, where the only locator is
+   * the function's start line as recorded by the scanner. Ties break toward the
+   * innermost (smallest) function. Returns undefined if nothing is close enough,
+   * to avoid binding to an unrelated function.
+   */
+  private findFunctionByLine(
+    sourceFile: SourceFile,
+    line: number
+  ): FunctionLike | undefined {
+    const LINE_TOLERANCE = 2;
+    const functions = sourceFile.getDescendants().filter(
+      (node): node is FunctionLike =>
+        Node.isFunctionDeclaration(node) ||
+        Node.isArrowFunction(node) ||
+        Node.isFunctionExpression(node) ||
+        Node.isMethodDeclaration(node)
+    );
+
+    let best: FunctionLike | undefined;
+    let bestDelta = Infinity;
+    for (const fn of functions) {
+      const delta = Math.abs(fn.getStartLineNumber() - line);
+      if (delta > LINE_TOLERANCE) continue;
+      const isCloser = delta < bestDelta;
+      const isInnermostTie =
+        delta === bestDelta &&
+        best !== undefined &&
+        fn.getEnd() - fn.getStart() < best.getEnd() - best.getStart();
+      if (isCloser || isInnermostTie) {
+        best = fn;
+        bestDelta = delta;
+      }
+    }
+    return best;
   }
 
   /**
@@ -1616,6 +1734,10 @@ export class TypeInferrer {
         return 'Expr';
       case 'request_body':
         return 'Request';
+      case 'signature_return':
+        return 'SigReturn';
+      case 'function_param':
+        return 'Param';
       default:
         return 'Type';
     }

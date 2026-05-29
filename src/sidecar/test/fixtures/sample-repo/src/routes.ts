@@ -157,3 +157,15 @@ export const koaGetUser = async (ctx: KoaContext) => {
   }
   ctx.body = user;
 };
+
+// ===========================================================================
+// SIGNATURE TYPES - For function-signature inference testing
+// ===========================================================================
+
+/**
+ * Function with an UNANNOTATED parameter — exercises contextual/implicit
+ * parameter inference (param has no type node, compiler view is used).
+ */
+export function doubleIt(n) {
+  return n * 2;
+}

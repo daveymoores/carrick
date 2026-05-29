@@ -957,6 +957,146 @@ describe('Type Sidecar Integration Tests', () => {
         assert.ok(inferred.type_string !== 'unknown');
       }
     });
+
+    it('signature_return keeps Promise wrapper and reports explicit', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'sig-1',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
+            line_number: 61,
+            expression_text: 'res.json(user)',
+            expression_line: 61,
+            infer_kind: 'signature_return',
+          },
+        ],
+      });
+
+      const inferred = response.inferred_types?.[0];
+      assert.ok(inferred, 'should infer getUser return');
+      assert.strictEqual(inferred!.infer_kind, 'signature_return');
+      // getUser is annotated `: Promise<void>` — must NOT be unwrapped to void.
+      assert.strictEqual(inferred!.type_string, 'Promise<void>');
+      assert.strictEqual(inferred!.is_explicit, true);
+    });
+
+    it('signature_return infers an unannotated return as implicit', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'sig-2',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
+            line_number: 87,
+            expression_text: "console.log('Fetching orders for user:', userId)",
+            expression_line: 87,
+            infer_kind: 'signature_return',
+          },
+        ],
+      });
+
+      const inferred = response.inferred_types?.[0];
+      assert.ok(inferred, 'should infer getOrders return');
+      assert.strictEqual(inferred!.is_explicit, false);
+      // Inferred return is a Promise (async handler) — wrapper preserved.
+      assert.ok(inferred!.type_string.includes('Promise'));
+    });
+
+    it('function_param reads an annotated parameter as explicit', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'param-1',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
+            line_number: 61,
+            expression_text: 'res.json(user)',
+            expression_line: 61,
+            infer_kind: 'function_param',
+            param_name: 'req',
+          },
+        ],
+      });
+
+      const inferred = response.inferred_types?.[0];
+      assert.ok(inferred, 'should infer getUser req param');
+      assert.strictEqual(inferred!.infer_kind, 'function_param');
+      assert.strictEqual(inferred!.type_string, 'Request');
+      assert.strictEqual(inferred!.is_explicit, true);
+    });
+
+    it('function_param infers an unannotated parameter as implicit', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'param-2',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
+            line_number: 170,
+            expression_text: 'n * 2',
+            expression_line: 170,
+            infer_kind: 'function_param',
+            param_name: 'n',
+          },
+        ],
+      });
+
+      const inferred = response.inferred_types?.[0];
+      assert.ok(inferred, 'should infer doubleIt n param');
+      assert.strictEqual(inferred!.is_explicit, false);
+      assert.ok(inferred!.type_string.length > 0);
+    });
+
+    it('resolves a function by line number alone (no span or text)', async () => {
+      const response = await client.send<{
+        inferred_types?: Array<{
+          type_string: string;
+          is_explicit: boolean;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'line-1',
+        requests: [
+          {
+            file_path: path.join(FIXTURES_PATH, 'src/routes.ts'),
+            line_number: 169, // doubleIt declaration line — only locator provided
+            infer_kind: 'signature_return',
+          },
+        ],
+      });
+
+      const inferred = response.inferred_types?.[0];
+      assert.ok(inferred, 'should locate doubleIt by line alone');
+      assert.strictEqual(inferred!.infer_kind, 'signature_return');
+      assert.strictEqual(inferred!.is_explicit, false);
+      assert.ok(inferred!.type_string.length > 0);
+    });
   });
 
   describe('resolve_definitions action', () => {

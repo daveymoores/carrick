@@ -324,6 +324,8 @@ mod tests {
                 intent: Some("returns one".to_string()),
                 calls: vec![],
                 return_type: None,
+                return_is_explicit: false,
+                signature: None,
             },
         );
         strip_body_source(&mut defs);
