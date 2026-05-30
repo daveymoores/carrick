@@ -340,25 +340,28 @@ impl UrlNormalizer {
 
     /// Check if a host is configured as internal
     fn is_internal_host(&self, host: &str) -> bool {
-        // Strip port if present
-        let host_without_port = host.split(':').next().unwrap_or(host);
-
-        self.internal_domains.iter().any(|domain| {
-            host_without_port == domain
-                || host_without_port.ends_with(&format!(".{}", domain))
-                || domain.contains(host_without_port)
-        })
+        Self::host_matches_domains(host, &self.internal_domains)
     }
 
     /// Check if a host is configured as external
     fn is_external_host(&self, host: &str) -> bool {
-        // Strip port if present
-        let host_without_port = host.split(':').next().unwrap_or(host);
+        Self::host_matches_domains(host, &self.external_domains)
+    }
 
-        self.external_domains.iter().any(|domain| {
-            host_without_port == domain
-                || host_without_port.ends_with(&format!(".{}", domain))
-                || domain.contains(host_without_port)
+    /// True if `host` exactly equals, or is a subdomain of, one of `domains`.
+    ///
+    /// Comparison is case-insensitive because DNS hostnames are. We deliberately do
+    /// NOT do substring matching (the old `domain.contains(host)` clause): it was
+    /// backwards and could flip internal/external classification — e.g. host `company`
+    /// would spuriously match a configured `api.company.com`, and `api.com` would fail
+    /// to match `api.company.com`.
+    fn host_matches_domains(host: &str, domains: &HashSet<String>) -> bool {
+        // Strip port if present, then lowercase.
+        let host_without_port = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+
+        domains.iter().any(|domain| {
+            let domain = domain.to_ascii_lowercase();
+            host_without_port == domain || host_without_port.ends_with(&format!(".{}", domain))
         })
     }
 

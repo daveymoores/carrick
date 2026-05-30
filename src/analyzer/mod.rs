@@ -14,11 +14,20 @@ use crate::{
     visitor::{Call, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
 };
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
 use tracing::{debug, warn};
+
+// Regexes are compiled once and reused across every endpoint/type-string pass.
+static ROUTE_PARAM_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r":([\w]+)").unwrap());
+static IMPORT_PATH_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"import\("([^"]+)"\)\.(\w+)"#).unwrap());
+static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"Array<([^>]+)>").unwrap());
 
 // Type aliases to reduce complexity
 type RouteFieldMap = HashMap<(String, String), Json>;
@@ -1082,9 +1091,8 @@ impl Analyzer {
     }
 
     fn normalize_route_params(&self, route: &str) -> String {
-        // Use a regex to replace all parameter placeholders with a consistent name
-        let param_regex = regex::Regex::new(r":([\w]+)").unwrap();
-        param_regex.replace_all(route, "{param}").to_string()
+        // Replace all parameter placeholders with a consistent name.
+        ROUTE_PARAM_RE.replace_all(route, "{param}").to_string()
     }
 
     pub fn build_endpoint_router(&mut self) {
@@ -1408,11 +1416,8 @@ impl Analyzer {
     }
 
     fn clean_type_string(&self, type_str: &str, display_names: &HashMap<String, String>) -> String {
-        use regex::Regex;
-
         // Remove absolute paths from import statements, keeping only the relative part
-        let import_regex = Regex::new(r#"import\("([^"]+)"\)\.(\w+)"#).unwrap();
-        let mut cleaned = import_regex
+        let mut cleaned = IMPORT_PATH_RE
             .replace_all(type_str, |caps: &regex::Captures| {
                 let type_name = &caps[2];
                 // Replace hash-based type aliases with display names
@@ -1437,8 +1442,7 @@ impl Analyzer {
         }
 
         // Simplify Array<T> to T[]
-        let array_regex = Regex::new(r"Array<([^>]+)>").unwrap();
-        cleaned = array_regex.replace_all(&cleaned, "$1[]").to_string();
+        cleaned = ARRAY_GENERIC_RE.replace_all(&cleaned, "$1[]").to_string();
 
         cleaned
     }

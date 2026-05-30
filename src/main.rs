@@ -18,7 +18,6 @@ mod multi_agent_orchestrator;
 mod oidc;
 mod packages;
 mod parser;
-mod router_context;
 mod services;
 mod signature_pass;
 mod swc_scanner;

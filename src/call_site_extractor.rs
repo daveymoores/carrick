@@ -450,13 +450,10 @@ impl CallSiteExtractor {
                     let file_start = loc.file.start_pos;
                     let file_relative_byte = (span.lo - file_start).0 as usize;
 
-                    // Read file content to convert to UTF-16
+                    // Convert to UTF-16 using the source already held in the SourceMap
+                    // (no per-param disk re-read).
                     let utf16_offset =
-                        if let Ok(content) = std::fs::read_to_string(&self.current_file) {
-                            Self::byte_offset_to_utf16_offset(&content, file_relative_byte) as u32
-                        } else {
-                            file_relative_byte as u32
-                        };
+                        Self::byte_offset_to_utf16_offset(&loc.file.src, file_relative_byte) as u32;
 
                     return Some(HandlerParamType {
                         param_name: name,
@@ -488,14 +485,11 @@ impl CallSiteExtractor {
                         let file_start = loc.file.start_pos;
                         let file_relative_byte = (span.lo - file_start).0 as usize;
 
-                        // Read file content to convert to UTF-16
-                        let utf16_offset = if let Ok(content) =
-                            std::fs::read_to_string(&self.current_file)
-                        {
-                            Self::byte_offset_to_utf16_offset(&content, file_relative_byte) as u32
-                        } else {
-                            file_relative_byte as u32
-                        };
+                        // Convert to UTF-16 using the source already held in the SourceMap
+                        // (no per-param disk re-read).
+                        let utf16_offset =
+                            Self::byte_offset_to_utf16_offset(&loc.file.src, file_relative_byte)
+                                as u32;
 
                         return Some(HandlerParamType {
                             param_name: name,
@@ -626,8 +620,15 @@ impl CallSiteExtractor {
     fn extract_path_from_url(&self, url: &str) -> Option<String> {
         let mut path = if url.starts_with('/') {
             url.to_string()
-        } else if let Some(idx) = url.find("}/") {
-            url[idx + 1..].to_string()
+        } else if url.starts_with("${") {
+            // Leading `${BASE}/...` interpolation: strip the base-URL variable by taking
+            // everything from the first `}/`. Gated on the leading `${` so that a literal
+            // URL containing brace params (e.g. `api/{id}/items`) is NOT truncated to
+            // `/items` — that case falls through to the branches below.
+            match url.find("}/") {
+                Some(idx) => url[idx + 1..].to_string(),
+                None => url.to_string(),
+            }
         } else if url.starts_with("http://") || url.starts_with("https://") {
             if let Some(path_start) = url.find("://").and_then(|i| url[i + 3..].find('/')) {
                 let path_idx = url.find("://").unwrap() + 3 + path_start;
@@ -991,13 +992,11 @@ impl Visit for CallSiteExtractor {
                         let file_start = loc.file.start_pos;
                         let file_relative_byte = (span.lo - file_start).0 as usize;
 
-                        let utf16_offset = if let Ok(content) =
-                            std::fs::read_to_string(&self.current_file)
-                        {
-                            Self::byte_offset_to_utf16_offset(&content, file_relative_byte) as u32
-                        } else {
-                            file_relative_byte as u32
-                        };
+                        // Convert to UTF-16 using the source already held in the SourceMap
+                        // (no per-param disk re-read).
+                        let utf16_offset =
+                            Self::byte_offset_to_utf16_offset(&loc.file.src, file_relative_byte)
+                                as u32;
 
                         let result_type_info = ResultTypeInfo {
                             type_string: type_string.clone(),

@@ -1,19 +1,20 @@
-use crate::visitor::{ImportedSymbol, Json};
+use crate::visitor::Json;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use swc_common::{SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 
+/// Express-style `:param` route parameter pattern. Compiled once.
+static ROUTE_PARAM_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r":(\w+)").unwrap());
+
 pub trait CoreExtractor {
     fn get_source_map(&self) -> &Lrc<SourceMap>;
-    fn resolve_variable(&self, _name: &str) -> Option<&Expr> {
-        None
-    }
 
     fn extract_params_from_route(&self, route: &str) -> Vec<String> {
-        let param_pattern = regex::Regex::new(r":(\w+)").unwrap();
         let mut params = Vec::new();
 
-        for cap in param_pattern.captures_iter(route) {
+        for cap in ROUTE_PARAM_RE.captures_iter(route) {
             params.push(cap[1].to_string());
         }
 
@@ -158,15 +159,28 @@ pub trait CoreExtractor {
         let callee = call.callee.as_expr()?;
         let member = callee.as_member()?;
 
-        if let Some(ident) = member.obj.as_ident()
-            && (ident.sym == "res" || ident.sym == "json")
-        {
-            let arg = call.args.first()?;
-            // Extract the JSON structure from the argument
-            return Some(self.expr_to_json(&arg.expr));
+        // The method being invoked must be a response-sending method. Previously this
+        // matched any call whose receiver was named `res` OR `json`, which mis-fired on
+        // `JSON.stringify(...)`, `json.parse(...)`, or a local `const json = ...`, and
+        // captured non-body calls like `res.cookie(...)` as a response body.
+        let MemberProp::Ident(method) = &member.prop else {
+            return None;
+        };
+        if !matches!(method.sym.as_ref(), "json" | "send" | "jsonp") {
+            return None;
         }
 
-        None
+        // The receiver should be the handler's response object. Matching on the
+        // conventional parameter names keeps this framework-agnostic while avoiding the
+        // false positives above.
+        let obj = member.obj.as_ident()?;
+        if !matches!(obj.sym.as_ref(), "res" | "response" | "reply") {
+            return None;
+        }
+
+        let arg = call.args.first()?;
+        // Extract the JSON structure from the argument
+        Some(self.expr_to_json(&arg.expr))
     }
 
     // Convert an expression to a Json value
@@ -387,188 +401,5 @@ pub trait CoreExtractor {
         }
 
         contexts
-    }
-}
-
-#[allow(dead_code)]
-pub trait RouteExtractor: CoreExtractor {
-    fn get_route_handler_name(&self, expr: &Expr) -> Option<String>;
-    fn resolve_template_string(&self, tpl: &Tpl) -> Option<String>;
-    fn get_imported_symbols(&self) -> &HashMap<String, ImportedSymbol>;
-    fn get_response_fields(&self) -> &HashMap<String, Json>;
-    fn add_imported_handler(
-        &mut self,
-        route: String,
-        method: String,
-        handler: String,
-        source: String,
-    );
-
-    fn extract_string_from_expr(&self, expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::Lit(Lit::Str(str_lit)) => Some(str_lit.value.to_string()),
-            Expr::Tpl(tpl) => self.resolve_template_string(tpl),
-            Expr::Ident(ident) => {
-                // Try to resolve the variable
-                let var_name = ident.sym.to_string();
-                if let Some(resolved_expr) = self.resolve_variable(&var_name) {
-                    return self.extract_string_from_expr(resolved_expr);
-                }
-                None
-            }
-            // Handle other expression types that could resolve to strings
-            // For example, member expressions like config.API_URL
-            Expr::Member(member) => self.extract_string_from_member_expr(member),
-            _ => None,
-        }
-    }
-
-    fn extract_string_from_member_expr(&self, member: &MemberExpr) -> Option<String> {
-        // For simple cases like obj.prop where obj is a variable
-        if let Expr::Ident(obj_ident) = &*member.obj {
-            let obj_name = obj_ident.sym.to_string();
-
-            // Try to resolve the object
-            if let Some(Expr::Object(obj_lit)) = self.resolve_variable(&obj_name) {
-                // If it's an object literal, extract the property
-                if let MemberProp::Ident(prop_ident) = &member.prop {
-                    let prop_name = prop_ident.sym.to_string();
-
-                    // Find the property in the object
-                    for prop in &obj_lit.props {
-                        if let PropOrSpread::Prop(box_prop) = prop
-                            && let Prop::KeyValue(kv) = &**box_prop
-                            && let PropName::Ident(key_ident) = &kv.key
-                            && key_ident.sym == prop_name
-                        {
-                            return self.extract_string_from_expr(&kv.value);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn extract_endpoint(
-        &mut self,
-        call: &CallExpr,
-        method: &str,
-    ) -> Option<(String, Json, Option<Json>, String)> {
-        // Get the route from the first argument
-        let first_arg = call.args.first()?;
-        let route = self.extract_string_from_expr(&first_arg.expr)?;
-
-        let mut response_json = Json::Null;
-        let mut request_json = None;
-        let mut handler_name = String::from("anonymous_handler");
-
-        // Check the second argument (handler)
-        if let Some(second_arg) = call.args.get(1) {
-            if let Some(name) = self.get_route_handler_name(&second_arg.expr) {
-                handler_name = name.clone();
-
-                // Check if this handler is an imported function
-                if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
-                    // Track this imported handler usage
-                    self.add_imported_handler(
-                        route.clone(),
-                        method.to_string(),
-                        handler_name.clone(),
-                        symbol.source.clone(),
-                    );
-
-                    // Look up the response fields for this handler
-                    if let Some(fields) = self.get_response_fields().get(&handler_name) {
-                        response_json = fields.clone();
-                    }
-
-                    // We've handled this case, so we can return early
-                    return Some((route, response_json, request_json, handler_name));
-                }
-            }
-
-            match &*second_arg.expr {
-                // Arrow function handler
-                Expr::Arrow(arrow_expr) => {
-                    handler_name = format!(
-                        "{}_{}_{}",
-                        route.replace('/', "_"),
-                        method.to_lowercase(),
-                        "arrow"
-                    );
-
-                    if let BlockStmtOrExpr::BlockStmt(block) = &*arrow_expr.body {
-                        // Extract request body fields using existing method
-                        request_json = self.extract_req_body_fields(block);
-
-                        // Extract response fields (using existing logic)
-                        for stmt in &block.stmts {
-                            if let Stmt::Expr(expr_stmt) = stmt
-                                && let Expr::Call(call) = &*expr_stmt.expr
-                                && let Some(json) = self.extract_res_json_fields(call)
-                            {
-                                response_json = json;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Regular function handler
-                Expr::Fn(fn_expr) => {
-                    handler_name = if let Some(ident) = &fn_expr.ident {
-                        ident.sym.to_string()
-                    } else {
-                        format!(
-                            "{}_{}_{}",
-                            route.replace('/', "_"),
-                            method.to_lowercase(),
-                            "fn"
-                        )
-                    };
-
-                    if let Some(body) = &fn_expr.function.body {
-                        // Extract request body fields using existing method
-                        request_json = self.extract_req_body_fields(body);
-
-                        // Extract response fields (existing logic)
-                        for stmt in &body.stmts {
-                            if let Stmt::Expr(expr_stmt) = stmt
-                                && let Expr::Call(call) = &*expr_stmt.expr
-                                && let Some(json) = self.extract_res_json_fields(call)
-                            {
-                                response_json = json;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Imported handler
-                Expr::Ident(ident) => {
-                    let handler_name = ident.sym.to_string();
-
-                    // Check if this handler is an imported function
-                    if let Some(symbol) = self.get_imported_symbols().get(&handler_name) {
-                        // Track this imported handler usage
-                        self.add_imported_handler(
-                            route.clone(),
-                            method.to_string(),
-                            handler_name.clone(),
-                            symbol.source.clone(),
-                        );
-
-                        if let Some(fields) = self.get_response_fields().get(&handler_name) {
-                            response_json = fields.clone();
-                        }
-                    }
-                }
-
-                _ => {}
-            }
-        }
-
-        Some((route, response_json, request_json, handler_name))
     }
 }
