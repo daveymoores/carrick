@@ -681,10 +681,9 @@ impl Visit for CandidateVisitor {
         // decorator by its identifier via the Import Table.
         if let Expr::Call(call) = &*node.expr
             && let Callee::Expr(callee_expr) = &call.callee
+            && let Some(name) = Self::extract_callee_object(callee_expr)
         {
-            if let Some(name) = Self::extract_callee_object(callee_expr) {
-                self.push_candidate(call, name, None);
-            }
+            self.push_candidate(call, name, None);
         }
         node.visit_children_with(self);
     }
