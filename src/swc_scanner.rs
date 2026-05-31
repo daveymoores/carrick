@@ -86,6 +86,22 @@ pub struct ScanResult {
     pub should_analyze: bool,
 }
 
+/// A value exported from a module. Used by file-based routing to recover the
+/// HTTP method of an app-router handler (`export async function GET(...)`),
+/// which is structural information the call-site scanner does not capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedHandler {
+    /// The exported binding name (`GET`, `POST`, …), or `"default"` for a
+    /// default export.
+    pub name: String,
+    /// 1-based line number of the export.
+    pub line_number: usize,
+    /// Start byte offset of the exported declaration.
+    pub span_start: u32,
+    /// End byte offset of the exported declaration.
+    pub span_end: u32,
+}
+
 /// Lightweight SWC-based scanner for detecting potential API patterns.
 ///
 /// This scanner looks for method call expressions that match common
@@ -231,6 +247,102 @@ impl SwcScanner {
             candidates: visitor.candidates,
             should_analyze,
         }
+    }
+
+    /// Extract the top-level exported bindings of a module.
+    ///
+    /// This powers file-based routing: an app-router endpoint declares its HTTP
+    /// method as the *name* of an exported handler (`export function GET`), which
+    /// never appears as a call site, so the candidate scanner alone cannot see
+    /// it. Returns one [`ExportedHandler`] per exported binding; `export default`
+    /// is reported with the name `"default"`.
+    pub fn exported_handlers(&self, file_path: &Path, content: &str) -> Vec<ExportedHandler> {
+        use swc_common::{FileName, Spanned};
+        use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
+
+        let syntax = match file_path.extension().and_then(|e| e.to_str()) {
+            Some("ts") => Syntax::Typescript(TsSyntax {
+                decorators: true,
+                ..Default::default()
+            }),
+            Some("tsx") => Syntax::Typescript(TsSyntax {
+                tsx: true,
+                decorators: true,
+                ..Default::default()
+            }),
+            Some("jsx") => Syntax::Es(EsSyntax {
+                jsx: true,
+                ..Default::default()
+            }),
+            _ => Syntax::Es(Default::default()),
+        };
+
+        let sm: Lrc<SourceMap> = Default::default();
+        let source_file = sm.new_source_file(
+            Lrc::new(FileName::Real(file_path.to_path_buf())),
+            content.to_string(),
+        );
+        let lexer = Lexer::new(
+            syntax,
+            Default::default(),
+            StringInput::from(&*source_file),
+            None,
+        );
+        let mut parser = Parser::new_from(lexer);
+        let module = match parser.parse_module() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        let mut push = |name: String, span: swc_common::Span| {
+            out.push(ExportedHandler {
+                name,
+                line_number: sm.lookup_char_pos(span.lo).line,
+                span_start: span.lo.0,
+                span_end: span.hi.0,
+            });
+        };
+
+        for item in &module.body {
+            let ModuleItem::ModuleDecl(decl) = item else {
+                continue;
+            };
+            match decl {
+                // `export function GET() {}`, `export const POST = ...`, `export class X {}`
+                ModuleDecl::ExportDecl(export) => match &export.decl {
+                    Decl::Fn(f) => push(f.ident.sym.to_string(), export.span()),
+                    Decl::Class(c) => push(c.ident.sym.to_string(), export.span()),
+                    Decl::Var(var) => {
+                        for d in &var.decls {
+                            if let Pat::Ident(ident) = &d.name {
+                                push(ident.id.sym.to_string(), export.span());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                // `export { GET, POST as handler }`
+                ModuleDecl::ExportNamed(named) => {
+                    for spec in &named.specifiers {
+                        if let ExportSpecifier::Named(n) = spec {
+                            // Prefer the exported alias if present (`as handler`).
+                            let name = match n.exported.as_ref().unwrap_or(&n.orig) {
+                                ModuleExportName::Ident(id) => id.sym.to_string(),
+                                ModuleExportName::Str(s) => s.value.to_string(),
+                            };
+                            push(name, n.span());
+                        }
+                    }
+                }
+                // `export default function () {}` / `export default expr`
+                ModuleDecl::ExportDefaultDecl(d) => push("default".to_string(), d.span()),
+                ModuleDecl::ExportDefaultExpr(e) => push("default".to_string(), e.span()),
+                _ => {}
+            }
+        }
+
+        out
     }
 }
 
@@ -573,6 +685,55 @@ mod tests {
         let scanner = SwcScanner::new();
         let path = PathBuf::from("test.ts");
         scanner.scan_content(&path, content)
+    }
+
+    fn handler_names(content: &str) -> Vec<String> {
+        let scanner = SwcScanner::new();
+        let mut names: Vec<String> = scanner
+            .exported_handlers(&PathBuf::from("route.ts"), content)
+            .into_iter()
+            .map(|h| h.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn exported_handlers_finds_app_router_methods() {
+        let content = r#"
+export async function GET(req: Request) { return Response.json({}); }
+export function POST() {}
+const helper = 1;
+function notExported() {}
+"#;
+        assert_eq!(handler_names(content), vec!["GET", "POST"]);
+    }
+
+    #[test]
+    fn exported_handlers_finds_const_and_named_and_default() {
+        let content = r#"
+export const PUT = async () => {};
+function handlePatch() {}
+export { handlePatch as PATCH };
+export default function handler() {}
+"#;
+        assert_eq!(handler_names(content), vec!["PATCH", "PUT", "default"]);
+    }
+
+    #[test]
+    fn exported_handlers_empty_when_no_exports() {
+        let content = "const x = 1; function f() {}";
+        assert!(handler_names(content).is_empty());
+    }
+
+    #[test]
+    fn exported_handlers_reports_line_numbers() {
+        let content = "\n\nexport function GET() {}\n";
+        let scanner = SwcScanner::new();
+        let handlers = scanner.exported_handlers(&PathBuf::from("route.ts"), content);
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].name, "GET");
+        assert_eq!(handlers[0].line_number, 3);
     }
 
     #[test]
