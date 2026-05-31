@@ -32,6 +32,7 @@ import {
   type TypeReferenceNode,
   type Type,
   type Symbol as TsSymbol,
+  ts,
 } from 'ts-morph';
 import type {
   InferRequestItem,
@@ -43,6 +44,21 @@ import type {
   ExtractionConfig,
   ExtractionRule,
 } from './types.js';
+
+/**
+ * Print a `Type` to its string form WITHOUT the compiler's default truncation.
+ *
+ * `Type.getText()` truncates large/anonymous object types to ~160 chars and inserts
+ * `...`, which yields a syntactically-invalid or structurally-wrong surface that then
+ * produces false type-drift verdicts downstream. `NoTruncation` disables that; this is
+ * the same flag set `definition-resolver.ts` already uses for expanded definitions.
+ */
+const TYPE_TEXT_FLAGS =
+  ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias;
+
+function typeText(type: Type, enclosingNode?: Node): string {
+  return type.getText(enclosingNode, TYPE_TEXT_FLAGS);
+}
 
 /**
  * Union of all function-like nodes in ts-morph
@@ -205,7 +221,7 @@ export class TypeInferrer {
     const returnTypeNode = func.getReturnTypeNode();
     const isExplicit = returnTypeNode !== undefined;
     let returnType = func.getReturnType();
-    let typeString = returnType.getText(func);
+    let typeString = typeText(returnType, func);
 
     // Apply extraction config or legacy wrappers
     const unwrapResult = this.unwrapTypeWithConfig(
@@ -247,7 +263,7 @@ export class TypeInferrer {
     }
 
     const isExplicit = func.getReturnTypeNode() !== undefined;
-    const typeString = func.getReturnType().getText(func);
+    const typeString = typeText(func.getReturnType(), func);
 
     return this.createInferredType(
       request,
@@ -293,7 +309,7 @@ export class TypeInferrer {
     }
 
     const isExplicit = param.getTypeNode() !== undefined;
-    const typeString = param.getType().getText(param);
+    const typeString = typeText(param.getType(), param);
 
     return this.createInferredType(
       request,
@@ -332,7 +348,7 @@ export class TypeInferrer {
     }
 
     const payloadType = payloadNode.getType();
-    let typeString = payloadType.getText(payloadNode);
+    let typeString = typeText(payloadType, payloadNode);
 
     const unwrapResult = this.unwrapTypeWithConfig(
       payloadType,
@@ -369,7 +385,7 @@ export class TypeInferrer {
     const func = this.findContainingFunctionForNode(callExpr);
     const terminalNode = this.resolveCallResultTerminalNode(callExpr, func);
     const returnType = terminalNode.getType();
-    let typeString = returnType.getText(terminalNode);
+    let typeString = typeText(returnType, terminalNode);
     let isExplicit = false;
 
     // Try extraction config first, then legacy wrappers
@@ -436,7 +452,7 @@ export class TypeInferrer {
     const typeNode = varDecl.getTypeNode();
     const isExplicit = typeNode !== undefined;
     let varType = varDecl.getType();
-    let typeString = varType.getText(varDecl);
+    let typeString = typeText(varType, varDecl);
 
     // Apply extraction config
     const unwrapResult = this.unwrapTypeWithConfig(
@@ -473,7 +489,7 @@ export class TypeInferrer {
     }
 
     const type = node.getType();
-    let typeString = type.getText(node);
+    let typeString = typeText(type, node);
 
     // Apply extraction config
     const unwrapResult = this.unwrapTypeWithConfig(type, node, extractionConfig, wrappers);
@@ -505,7 +521,7 @@ export class TypeInferrer {
     }
 
     const payloadType = node.getType();
-    let typeString = payloadType.getText(node);
+    let typeString = typeText(payloadType, node);
 
     // Apply extraction config
     const unwrapResult = this.unwrapTypeWithConfig(
@@ -742,7 +758,7 @@ export class TypeInferrer {
         }
       }
       return {
-        typeString: type.getText(node),
+        typeString: typeText(type, node),
         isExplicit: false,
         wasUnwrapped: false,
       };
@@ -769,7 +785,7 @@ export class TypeInferrer {
     const maxGlobalDepth = 10; // Safety limit
     if (depth >= maxGlobalDepth) {
       return {
-        typeString: type.getText(node),
+        typeString: typeText(type, node),
         isExplicit: false,
         wasUnwrapped: false,
       };
@@ -820,7 +836,7 @@ export class TypeInferrer {
     }
 
     return {
-      typeString: type.getText(node),
+      typeString: typeText(type, node),
       isExplicit: false,
       wasUnwrapped: false,
     };
@@ -839,7 +855,7 @@ export class TypeInferrer {
     const maxDepth = rule.maxDepth ?? 4;
     if (depth >= maxDepth) {
       return {
-        typeString: type.getText(node),
+        typeString: typeText(type, node),
         isExplicit: false,
         wasUnwrapped: false,
       };
@@ -859,7 +875,7 @@ export class TypeInferrer {
       if (!rule.originModuleGlobs || rule.originModuleGlobs.length === 0) {
         // Skip: machineryIndicators alone are too many false positives
         return {
-          typeString: type.getText(node),
+          typeString: typeText(type, node),
           isExplicit: false,
           wasUnwrapped: false,
         };
@@ -869,7 +885,7 @@ export class TypeInferrer {
       const hasMachineryIndicators = this.typeHasMachineryIndicators(type, rule.machineryIndicators);
       if (!hasMachineryIndicators) {
         return {
-          typeString: type.getText(node),
+          typeString: typeText(type, node),
           isExplicit: false,
           wasUnwrapped: false,
         };
@@ -879,7 +895,7 @@ export class TypeInferrer {
       const originatesFromAllowed = this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs);
       if (!originatesFromAllowed) {
         return {
-          typeString: type.getText(node),
+          typeString: typeText(type, node),
           isExplicit: false,
           wasUnwrapped: false,
         };
@@ -889,7 +905,7 @@ export class TypeInferrer {
     }
 
     return {
-      typeString: type.getText(node),
+      typeString: typeText(type, node),
       isExplicit: false,
       wasUnwrapped: false,
     };
@@ -913,7 +929,7 @@ export class TypeInferrer {
       const payloadArg = typeArgs[genericIndex];
 
       // Check if it's a useful type (not any/unknown/never)
-      const argText = payloadArg.getText(node);
+      const argText = typeText(payloadArg, node);
       if (!this.isUselessType(argText)) {
         // Recursive unwrap if configured
         if (rule.unwrapRecursively) {
@@ -929,7 +945,7 @@ export class TypeInferrer {
       // Try "first useful generic" heuristic
       for (let i = 0; i < typeArgs.length; i++) {
         const argType = typeArgs[i];
-        const text = argType.getText(node);
+        const text = typeText(argType, node);
         if (!this.isUselessType(text)) {
           if (rule.unwrapRecursively) {
             return this.unwrapType(argType, node, config, depth + 1);
@@ -957,7 +973,7 @@ export class TypeInferrer {
       }
 
       if (currentType !== type) {
-        const propText = currentType.getText(node);
+        const propText = typeText(currentType, node);
         if (!this.isUselessType(propText)) {
           if (rule.unwrapRecursively) {
             return this.unwrapType(currentType, node, config, depth + 1);
@@ -973,7 +989,7 @@ export class TypeInferrer {
 
     // Fallback: return type unchanged
     return {
-      typeString: type.getText(node),
+      typeString: typeText(type, node),
       isExplicit: false,
       wasUnwrapped: false,
     };
@@ -1098,7 +1114,7 @@ export class TypeInferrer {
           if (this.matchesWrapperType(baseType, baseExpr, wrapper)) {
             if (propertyAccess.getName() === wrapper.unwrap.property) {
               const propertyType = propertyAccess.getType();
-              let typeString = propertyType.getText(propertyAccess);
+              let typeString = typeText(propertyType, propertyAccess);
               typeString = this.unwrapPromise(typeString, propertyType);
               return { typeString, isExplicit: false };
             }
@@ -1657,7 +1673,7 @@ export class TypeInferrer {
     // Handle nested Promise via type arguments
     const typeArguments = type.getTypeArguments();
     if (typeArguments.length > 0 && typeString.startsWith('Promise<')) {
-      return typeArguments[0].getText();
+      return typeText(typeArguments[0]);
     }
 
     return typeString;

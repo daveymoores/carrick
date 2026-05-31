@@ -454,7 +454,6 @@ impl MountGraph {
         Some(matching)
     }
 
-    #[allow(dead_code)]
     fn paths_match(&self, endpoint_path: &str, call_path: &str) -> bool {
         // Exact match
         if endpoint_path == call_path {
@@ -474,7 +473,6 @@ impl MountGraph {
         false
     }
 
-    #[allow(dead_code)]
     fn path_matches_with_params(&self, endpoint_path: &str, call_path: &str) -> bool {
         let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
         let call_segments: Vec<&str> = call_path.split('/').collect();
@@ -507,8 +505,13 @@ impl MountGraph {
 
             let call_seg = call_segments[i];
 
-            // Parameter segment matches anything (starts with :)
-            if seg.starts_with(':') {
+            // A path parameter on EITHER side matches the other side. This must be
+            // symmetric: a caller URL with a variable normalizes to a `:param` segment
+            // and must match a concrete provider segment, just as a caller's concrete
+            // value must match a provider's `:param`. We also accept the other param
+            // syntaxes (`{id}`, `<id>`, `[id]`) so that routes captured verbatim from
+            // frameworks that don't use Express-style colons still match cross-repo.
+            if Self::is_param_segment(seg) || Self::is_param_segment(call_seg) {
                 continue;
             }
 
@@ -521,12 +524,21 @@ impl MountGraph {
         true
     }
 
+    /// Returns true if a single path segment is a route parameter placeholder in any
+    /// of the common syntaxes: `:id` (Express/path-to-regexp), `{id}` (OpenAPI/Fastify),
+    /// `<id>` (Flask-style), or `[id]`/`[...id]` (Next.js dynamic segments).
+    fn is_param_segment(seg: &str) -> bool {
+        seg.starts_with(':')
+            || (seg.starts_with('{') && seg.ends_with('}'))
+            || (seg.starts_with('<') && seg.ends_with('>'))
+            || (seg.starts_with('[') && seg.ends_with(']'))
+    }
+
     /// Match paths with wildcard patterns
     ///
     /// Supports:
     /// - `*` matches a single path segment
     /// - `**` or `(.*)` matches zero or more path segments
-    #[allow(dead_code)]
     fn path_matches_with_wildcards(&self, endpoint_path: &str, call_path: &str) -> bool {
         // Check for catch-all patterns
         if endpoint_path.ends_with("/*") || endpoint_path.ends_with("/**") {
@@ -1169,6 +1181,34 @@ mod tests {
         assert!(graph.path_matches_with_params("/users/:id?", "/users"));
         assert!(graph.path_matches_with_params("/users/:id?", "/users/123"));
         assert!(!graph.path_matches_with_params("/users/:id", "/users")); // Not optional
+    }
+
+    #[test]
+    fn test_path_matches_with_params_is_symmetric() {
+        let graph = MountGraph::new();
+
+        // A param on the endpoint side matches a concrete caller segment.
+        assert!(graph.path_matches_with_params("/users/:id", "/users/123"));
+        // ...and a param on the caller side (a normalized `${id}` interpolation) matches
+        // a concrete provider segment. This direction previously failed.
+        assert!(graph.path_matches_with_params("/users/123", "/users/:id"));
+        // Params on both sides match.
+        assert!(graph.path_matches_with_params("/users/:id", "/users/:userId"));
+    }
+
+    #[test]
+    fn test_path_matches_with_params_across_syntaxes() {
+        let graph = MountGraph::new();
+
+        // A caller normalized to `:id` must match a provider route captured verbatim in
+        // OpenAPI/Fastify (`{id}`), Flask (`<id>`), or Next.js (`[id]`) syntax.
+        assert!(graph.path_matches_with_params("/users/{id}", "/users/:id"));
+        assert!(graph.path_matches_with_params("/users/<id>", "/users/:id"));
+        assert!(graph.path_matches_with_params("/users/[id]", "/users/:id"));
+        // ...and against a concrete value.
+        assert!(graph.path_matches_with_params("/users/{id}", "/users/123"));
+        // Non-param segments must still match exactly.
+        assert!(!graph.path_matches_with_params("/users/{id}", "/orders/123"));
     }
 
     #[test]

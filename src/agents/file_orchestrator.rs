@@ -40,6 +40,7 @@ use crate::{
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
     wrapper_registry::wrapper_rules_for_packages,
 };
+use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
@@ -136,7 +137,21 @@ impl FileOrchestrator {
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
-        // Process each file with AST gatekeeper
+        // A file that passed the SWC gatekeeper and is ready for the (expensive) LLM call.
+        // The CPU-bound preprocessing (read, scan, symbol table) is done serially up front;
+        // the LLM calls themselves are then dispatched concurrently.
+        struct PendingFile {
+            path_str: String,
+            content: String,
+            candidate_hints: Vec<String>,
+            candidate_contexts: Vec<String>,
+            candidate_map: HashMap<String, CandidateTarget>,
+            symbol_table: SymbolTable,
+        }
+
+        // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
+        // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
+        let mut pending: Vec<PendingFile> = Vec::new();
         for file_path in files {
             let path_str = file_path.to_string_lossy().to_string();
 
@@ -197,39 +212,71 @@ impl FileOrchestrator {
 
             let symbol_table = Self::extract_symbol_table(file_path, &cm, &handler);
 
-            // STEP 4: Call Gemini with Full File + Patterns + Candidate Targets +
-            // richer AST-derived import table (Move 3, §9.3 of framework-coverage.md).
-            match self
-                .file_analyzer
-                .analyze_file_with_candidates(
-                    &path_str,
-                    &content,
-                    guidance,
-                    &candidate_hints,
-                    &candidate_contexts,
-                    &symbol_table.imported_symbols,
-                )
-                .await
-            {
+            pending.push(PendingFile {
+                path_str,
+                content,
+                candidate_hints,
+                candidate_contexts,
+                candidate_map,
+                symbol_table,
+            });
+        }
+
+        // PHASE 2 (concurrent, I/O-bound): dispatch the LLM calls. `AgentService` owns a
+        // semaphore (CARRICK_CONCURRENCY_LIMIT, default 20) that enforces the real rate cap,
+        // so we eagerly buffer up to that many in-flight requests. Completion order does not
+        // affect the result: stats are counts and `file_results` is a map, so the aggregate
+        // is deterministic regardless of which call finishes first.
+        let concurrency = std::env::var("CARRICK_CONCURRENCY_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(20)
+            .max(1);
+
+        // STEP 4: Call the file analyzer with Full File + Patterns + Candidate Targets +
+        // richer AST-derived import table (Move 3, §9.3 of framework-coverage.md).
+        let analyzed: Vec<(PendingFile, Result<FileAnalysisResult, String>)> =
+            futures::stream::iter(pending.into_iter().map(|pf| async move {
+                let result = self
+                    .file_analyzer
+                    .analyze_file_with_candidates(
+                        &pf.path_str,
+                        &pf.content,
+                        guidance,
+                        &pf.candidate_hints,
+                        &pf.candidate_contexts,
+                        &pf.symbol_table.imported_symbols,
+                    )
+                    .await
+                    .map_err(|e| e.to_string());
+                (pf, result)
+            }))
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        // PHASE 3 (serial): fold the per-file results into the aggregate.
+        for (pf, result) in analyzed {
+            match result {
                 Ok(result) => {
                     // Note: Type positions are now resolved by the TypeSidecar (src/sidecar)
                     // using the compiler-based approach instead of position-based extraction.
 
                     let mut adjusted = result;
-                    Self::apply_candidate_map(&mut adjusted, &candidate_map);
-                    Self::validate_type_hints(&mut adjusted, &symbol_table);
+                    Self::apply_candidate_map(&mut adjusted, &pf.candidate_map);
+                    Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
                     stats.total_data_calls += adjusted.data_calls.len();
                     stats.files_processed += 1;
-                    file_results.insert(path_str, adjusted);
+                    file_results.insert(pf.path_str, adjusted);
                 }
                 Err(e) => {
                     stats
                         .errors
-                        .push(format!("Failed to analyze {}: {}", path_str, e));
+                        .push(format!("Failed to analyze {}: {}", pf.path_str, e));
                     stats.files_skipped += 1;
                 }
             }

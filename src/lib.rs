@@ -18,7 +18,6 @@ pub mod multi_agent_orchestrator;
 pub mod oidc;
 pub mod packages;
 pub mod parser;
-pub mod router_context;
 pub mod services;
 pub mod signature_pass;
 pub mod swc_scanner;
