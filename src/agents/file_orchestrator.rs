@@ -174,8 +174,14 @@ impl FileOrchestrator {
                 continue;
             }
 
-            // STEP 1: Run SWC Scanner (Gatekeeper)
-            let scan_result = self.swc_scanner.scan_content(file_path, &content);
+            // STEP 1: Run SWC Scanner (Gatekeeper). Pass the LLM-detected
+            // data-fetching packages so import-based recall uses detection's
+            // decision rather than a hardcoded package list.
+            let scan_result = self.swc_scanner.scan_content(
+                file_path,
+                &content,
+                &framework_detection.data_fetchers,
+            );
 
             // STEP 2: Check Relevance - if no candidates, SKIP (zero LLM cost)
             if !scan_result.should_analyze {

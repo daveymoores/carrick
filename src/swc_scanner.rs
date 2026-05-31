@@ -14,6 +14,7 @@
 //! of the compiler sidecar architecture migration.
 
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::Path;
 use swc_common::{
     SourceMap, SourceMapper, Spanned,
@@ -129,7 +130,7 @@ impl SwcScanner {
     /// Returns a ScanResult with candidates and whether the file should be analyzed.
     /// If no candidates are found, `should_analyze` is false and the file can be skipped.
     #[allow(dead_code)]
-    pub fn scan_file(&self, file_path: &Path) -> ScanResult {
+    pub fn scan_file(&self, file_path: &Path, data_fetchers: &[String]) -> ScanResult {
         let handler = Handler::with_tty_emitter(
             ColorConfig::Never,
             true,
@@ -147,7 +148,10 @@ impl SwcScanner {
             }
         };
 
-        let mut visitor = CandidateVisitor::new(self.source_map.clone());
+        let mut visitor = CandidateVisitor::new(
+            self.source_map.clone(),
+            network_import_locals(&module, data_fetchers),
+        );
         module.visit_with(&mut visitor);
 
         let should_analyze = !visitor.candidates.is_empty();
@@ -163,7 +167,12 @@ impl SwcScanner {
     /// Creates a fresh SourceMap for each call to ensure per-file byte offsets.
     /// Previously, reusing `self.source_map` caused cumulative offset accumulation
     /// when scanning multiple files, breaking span-based type inference in the sidecar.
-    pub fn scan_content(&self, file_path: &Path, content: &str) -> ScanResult {
+    pub fn scan_content(
+        &self,
+        file_path: &Path,
+        content: &str,
+        data_fetchers: &[String],
+    ) -> ScanResult {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
         use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
         use swc_ecma_transforms_base::resolver;
@@ -238,7 +247,10 @@ impl SwcScanner {
             module.visit_mut_with(&mut pass);
         });
 
-        let mut visitor = CandidateVisitor::new(file_source_map);
+        let mut visitor = CandidateVisitor::new(
+            file_source_map,
+            network_import_locals(&module, data_fetchers),
+        );
         module.visit_with(&mut visitor);
 
         let should_analyze = !visitor.candidates.is_empty();
@@ -351,14 +363,29 @@ struct CandidateVisitor {
     candidates: Vec<CandidateTarget>,
     source_map: Lrc<SourceMap>,
     function_stack: Vec<String>,
+    /// Local binding names imported from a known network/data-fetching package
+    /// (e.g. `axios` from `import axios from 'axios'`). Calls rooted at one of
+    /// these are emitted as candidates regardless of method name, so bespoke
+    /// client wrappers (`client.users.list()`) are not missed.
+    network_import_locals: HashSet<String>,
+    /// Span ranges already emitted, so the broadened signals below don't push
+    /// the same call site twice (candidate ids are span-based).
+    seen_spans: HashSet<(u32, u32)>,
+    /// Depth of enclosing `await` expressions. An awaited call with a string
+    /// argument is a strong network-call signal even when the callee name is
+    /// unknown.
+    await_depth: usize,
 }
 
 impl CandidateVisitor {
-    fn new(source_map: Lrc<SourceMap>) -> Self {
+    fn new(source_map: Lrc<SourceMap>, network_import_locals: HashSet<String>) -> Self {
         Self {
             candidates: Vec::new(),
             source_map,
             function_stack: Vec::new(),
+            network_import_locals,
+            seen_spans: HashSet::new(),
+            await_depth: 0,
         }
     }
 
@@ -447,14 +474,95 @@ impl CandidateVisitor {
         api_methods.contains(&name.to_lowercase().as_str())
     }
 
-    /// Check if this is a global fetch call
-    fn is_global_fetch(&self, callee: &Callee) -> bool {
+    /// Check if this is a call to a global network primitive (`fetch(...)`).
+    /// Other primitives (`WebSocket`, `EventSource`, `XMLHttpRequest`) are
+    /// constructed with `new` and handled in `visit_new_expr`.
+    fn is_global_network_call(&self, callee: &Callee) -> bool {
         if let Callee::Expr(expr) = callee
             && let Expr::Ident(ident) = &**expr
         {
-            return ident.sym.as_ref() == "fetch";
+            return matches!(ident.sym.as_ref(), "fetch");
         }
         false
+    }
+
+    /// Root identifier of a callee expression, e.g. `client` in
+    /// `client.users.list()` or `client(...)`.
+    fn callee_root_ident(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(ident) => Some(ident.sym.to_string()),
+            Expr::Member(member) => Self::callee_root_ident(&member.obj),
+            Expr::Call(call) => match &call.callee {
+                Callee::Expr(e) => Self::callee_root_ident(e),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Does the first argument look like a URL (has a network scheme)? This is a
+    /// low-noise structural signal that catches bespoke clients without naming
+    /// them, e.g. `httpClient('https://api.example.com/users')`.
+    fn first_arg_has_url_scheme(call: &CallExpr) -> bool {
+        let Some(arg) = call.args.first() else {
+            return false;
+        };
+        let starts_with_scheme = |s: &str| {
+            let s = s.trim_start();
+            s.starts_with("http://")
+                || s.starts_with("https://")
+                || s.starts_with("ws://")
+                || s.starts_with("wss://")
+                || s.starts_with("//")
+        };
+        match &*arg.expr {
+            Expr::Lit(Lit::Str(s)) => starts_with_scheme(s.value.as_ref()),
+            Expr::Tpl(tpl) => tpl
+                .quasis
+                .first()
+                .map(|q| starts_with_scheme(q.raw.as_ref()))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Is the first argument a string or template literal? Combined with an
+    /// enclosing `await`, this flags awaited calls like `await load('/data')`.
+    fn first_arg_is_stringish(call: &CallExpr) -> bool {
+        matches!(
+            call.args.first().map(|a| &*a.expr),
+            Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Tpl(_))
+        )
+    }
+
+    /// Emit a candidate for `call`, deduplicating by span so the multiple
+    /// broadened signals never double-count one call site.
+    fn push_candidate(
+        &mut self,
+        call: &CallExpr,
+        callee_object: String,
+        callee_property: Option<String>,
+    ) {
+        let (span_start, span_end) = self.span_range(call.span);
+        if !self.seen_spans.insert((span_start, span_end)) {
+            return;
+        }
+        let line_number = self.get_line_number(call.span);
+        let candidate_id = self.candidate_id(span_start, span_end);
+        let code_snippet = self.get_code_snippet(call.span);
+        let path_snippet = self.extract_first_arg_snippet(call);
+
+        self.candidates.push(CandidateTarget {
+            candidate_id,
+            span_start,
+            span_end,
+            line_number,
+            callee_object,
+            callee_property,
+            enclosing_function: self.current_function(),
+            path_snippet,
+            code_snippet,
+        });
     }
 
     /// Extract a code snippet for the given span
@@ -574,20 +682,48 @@ impl Visit for CandidateVisitor {
         if let Expr::Call(call) = &*node.expr
             && let Callee::Expr(callee_expr) = &call.callee
         {
-            let callee_name = Self::extract_callee_object(callee_expr);
-            if let Some(name) = callee_name {
-                let line_number = self.get_line_number(call.span);
-                let (span_start, span_end) = self.span_range(call.span);
-                let candidate_id = self.candidate_id(span_start, span_end);
-                let code_snippet = self.get_code_snippet(call.span);
-                let path_snippet = self.extract_first_arg_snippet(call);
+            if let Some(name) = Self::extract_callee_object(callee_expr) {
+                self.push_candidate(call, name, None);
+            }
+        }
+        node.visit_children_with(self);
+    }
 
+    fn visit_await_expr(&mut self, node: &AwaitExpr) {
+        self.await_depth += 1;
+        node.visit_children_with(self);
+        self.await_depth -= 1;
+    }
+
+    fn visit_new_expr(&mut self, node: &NewExpr) {
+        // Network primitives constructed with `new`: `new WebSocket(url)`,
+        // `new EventSource(url)`, `new XMLHttpRequest()`. Emitting these as
+        // candidates keeps files using them from being skipped by the gate.
+        if let Expr::Ident(ident) = &*node.callee
+            && matches!(
+                ident.sym.as_ref(),
+                "WebSocket" | "EventSource" | "XMLHttpRequest"
+            )
+        {
+            // NewExpr args are optional; build a throwaway CallExpr view is not
+            // possible, so push directly with span dedup.
+            let (span_start, span_end) = self.span_range(node.span);
+            if self.seen_spans.insert((span_start, span_end)) {
+                let line_number = self.get_line_number(node.span);
+                let candidate_id = self.candidate_id(span_start, span_end);
+                let code_snippet = self.get_code_snippet(node.span);
+                let path_snippet = node
+                    .args
+                    .as_ref()
+                    .and_then(|args| args.first())
+                    .and_then(|a| self.source_map.span_to_snippet(a.expr.span()).ok())
+                    .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect());
                 self.candidates.push(CandidateTarget {
                     candidate_id,
                     span_start,
                     span_end,
                     line_number,
-                    callee_object: name,
+                    callee_object: ident.sym.to_string(),
                     callee_property: None,
                     enclosing_function: self.current_function(),
                     path_snippet,
@@ -599,32 +735,54 @@ impl Visit for CandidateVisitor {
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
-        // Check for global fetch
-        if self.is_global_fetch(&call.callee) {
-            let line_number = self.get_line_number(call.span);
-            let (span_start, span_end) = self.span_range(call.span);
-            let candidate_id = self.candidate_id(span_start, span_end);
-            let code_snippet = self.get_code_snippet(call.span);
-            let path_snippet = self.extract_first_arg_snippet(call);
-
-            self.candidates.push(CandidateTarget {
-                candidate_id,
-                span_start,
-                span_end,
-                line_number,
-                callee_object: "fetch".to_string(),
-                callee_property: None,
-                enclosing_function: self.current_function(),
-                path_snippet,
-                code_snippet,
-            });
+        // Signal 1: global fetch primitive.
+        if self.is_global_network_call(&call.callee) {
+            self.push_candidate(call, "fetch".to_string(), None);
         }
 
-        // Check for method calls (obj.method())
+        // Signal 2: call rooted at an identifier imported from a known
+        // network/data-fetching package (covers wrappers regardless of method
+        // name), or direct invocation of such an import (`client(url)`).
+        if let Callee::Expr(callee_expr) = &call.callee
+            && let Some(root) = Self::callee_root_ident(callee_expr)
+            && self.network_import_locals.contains(&root)
+        {
+            let property = match &**callee_expr {
+                Expr::Member(member) => match &member.prop {
+                    MemberProp::Ident(id) => Some(id.sym.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            self.push_candidate(call, root, property);
+        }
+
+        // Signal 3: first argument is a URL with a network scheme.
+        if Self::first_arg_has_url_scheme(call) {
+            let obj = match &call.callee {
+                Callee::Expr(e) => {
+                    Self::extract_callee_object(e).unwrap_or_else(|| "<url-call>".to_string())
+                }
+                _ => "<url-call>".to_string(),
+            };
+            self.push_candidate(call, obj, None);
+        }
+
+        // Signal 4: awaited call with a string/template argument.
+        if self.await_depth > 0 && Self::first_arg_is_stringish(call) {
+            let obj = match &call.callee {
+                Callee::Expr(e) => {
+                    Self::extract_callee_object(e).unwrap_or_else(|| "<awaited-call>".to_string())
+                }
+                _ => "<awaited-call>".to_string(),
+            };
+            self.push_candidate(call, obj, None);
+        }
+
+        // Signal 5 (existing): method calls matching the API name heuristics.
         if let Callee::Expr(callee_expr) = &call.callee
             && let Expr::Member(member) = &**callee_expr
         {
-            // Extract method name
             let method_name = match &member.prop {
                 MemberProp::Ident(ident) => Some(ident.sym.to_string()),
                 MemberProp::Computed(computed) => {
@@ -638,10 +796,8 @@ impl Visit for CandidateVisitor {
             };
 
             if let Some(method) = method_name {
-                // Extract object name
                 let obj_name = Self::extract_callee_object(&member.obj);
 
-                // Check if this looks like an API call
                 let is_api_call = match &obj_name {
                     Some(name) => {
                         self.is_potential_api_object(name) || self.is_potential_api_method(&method)
@@ -650,23 +806,11 @@ impl Visit for CandidateVisitor {
                 };
 
                 if is_api_call {
-                    let line_number = self.get_line_number(call.span);
-                    let (span_start, span_end) = self.span_range(call.span);
-                    let candidate_id = self.candidate_id(span_start, span_end);
-                    let code_snippet = self.get_code_snippet(call.span);
-                    let path_snippet = self.extract_first_arg_snippet(call);
-
-                    self.candidates.push(CandidateTarget {
-                        candidate_id,
-                        span_start,
-                        span_end,
-                        line_number,
-                        callee_object: obj_name.unwrap_or_else(|| "<chain>".to_string()),
-                        callee_property: Some(method),
-                        enclosing_function: self.current_function(),
-                        path_snippet,
-                        code_snippet,
-                    });
+                    self.push_candidate(
+                        call,
+                        obj_name.unwrap_or_else(|| "<chain>".to_string()),
+                        Some(method),
+                    );
                 }
             }
         }
@@ -676,15 +820,59 @@ impl Visit for CandidateVisitor {
     }
 }
 
+/// Collect the local binding names introduced by imports from any of the
+/// `data_fetchers` packages, covering default, named (incl. aliases), and
+/// namespace imports. Matched exactly or as a scope/subpath prefix
+/// (`pkg`, `@scope/pkg`, `pkg/sub`).
+///
+/// `data_fetchers` comes from framework detection — the LLM decides which of the
+/// repo's dependencies are data-fetching libraries — so the scanner carries no
+/// hardcoded package list. This is a recall booster for the gatekeeper, not an
+/// authoritative classification: the LLM still decides what each call is.
+fn network_import_locals(module: &Module, data_fetchers: &[String]) -> HashSet<String> {
+    let is_data_fetcher = |src: &str| {
+        data_fetchers
+            .iter()
+            .any(|pkg| src == pkg || src.starts_with(&format!("{}/", pkg)))
+    };
+    let mut locals = HashSet::new();
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
+            continue;
+        };
+        if !is_data_fetcher(import.src.value.as_ref()) {
+            continue;
+        }
+        for spec in &import.specifiers {
+            match spec {
+                ImportSpecifier::Default(d) => {
+                    locals.insert(d.local.sym.to_string());
+                }
+                ImportSpecifier::Named(n) => {
+                    locals.insert(n.local.sym.to_string());
+                }
+                ImportSpecifier::Namespace(ns) => {
+                    locals.insert(ns.local.sym.to_string());
+                }
+            }
+        }
+    }
+    locals
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
     fn scan_test_content(content: &str) -> ScanResult {
+        scan_test_content_with_fetchers(content, &[])
+    }
+
+    fn scan_test_content_with_fetchers(content: &str, data_fetchers: &[String]) -> ScanResult {
         let scanner = SwcScanner::new();
         let path = PathBuf::from("test.ts");
-        scanner.scan_content(&path, content)
+        scanner.scan_content(&path, content, data_fetchers)
     }
 
     fn handler_names(content: &str) -> Vec<String> {
@@ -724,6 +912,66 @@ export default function handler() {}
     fn exported_handlers_empty_when_no_exports() {
         let content = "const x = 1; function f() {}";
         assert!(handler_names(content).is_empty());
+    }
+
+    #[test]
+    fn detects_imported_client_wrapper_calls() {
+        // `sdk`/`doThing` match none of the name heuristics; only the
+        // import-based signal catches this, and only because detection flagged
+        // `got` as a data fetcher (no hardcoded package list in the scanner).
+        let content = r#"
+import sdk from 'got';
+async function run() { return sdk.doThing(); }
+"#;
+        let fetchers = vec!["got".to_string()];
+        assert!(scan_test_content_with_fetchers(content, &fetchers).should_analyze);
+        // Without detection flagging the package, the wrapper call is invisible
+        // to the import signal (the other signals don't apply here either).
+        assert!(!scan_test_content(content).should_analyze);
+    }
+
+    #[test]
+    fn detects_url_scheme_first_arg() {
+        let content = r#"function run() { return notanapi('https://api.example.com/users'); }"#;
+        assert!(scan_test_content(content).should_analyze);
+    }
+
+    #[test]
+    fn detects_new_network_primitives() {
+        let content =
+            r#"function run() { const ws = new WebSocket('wss://example.com'); return ws; }"#;
+        assert!(scan_test_content(content).should_analyze);
+    }
+
+    #[test]
+    fn detects_awaited_stringish_call() {
+        let content = r#"async function run() { return await loadData('/data.json'); }"#;
+        assert!(scan_test_content(content).should_analyze);
+    }
+
+    #[test]
+    fn ignores_non_network_code() {
+        let content = r#"
+function run() {
+    console.log('hello');
+    const x = compute(1, 2);
+    return x;
+}
+"#;
+        assert!(!scan_test_content(content).should_analyze);
+    }
+
+    #[test]
+    fn dedupes_candidate_spans_across_signals() {
+        // `await axios.get('https://x.com/y')` matches the import-local,
+        // url-scheme, awaited-stringish, and name heuristics simultaneously,
+        // but the single call site must yield exactly one candidate.
+        let content = r#"
+import axios from 'axios';
+async function run() { return await axios.get('https://x.com/y'); }
+"#;
+        let result = scan_test_content(content);
+        assert_eq!(result.candidates.len(), 1);
     }
 
     #[test]
@@ -929,8 +1177,8 @@ createRouter()
         let file_a_content = "fetch('/api/a');";
         let file_b_content = "fetch('/api/b');";
 
-        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content);
-        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content);
+        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content, &[]);
+        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content, &[]);
 
         assert!(
             !result_a.candidates.is_empty(),
