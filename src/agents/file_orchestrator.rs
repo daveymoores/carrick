@@ -24,7 +24,7 @@ use crate::{
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
-    file_based_router::{builtin_conventions, derive_route, MethodSource, RoutingConvention},
+    file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     packages::Packages,
@@ -2405,9 +2405,11 @@ export const runtime = "edge";
 
         assert_eq!(added, 1);
         assert_eq!(result.endpoints.len(), 2);
-        assert!(result
-            .endpoints
-            .iter()
-            .any(|e| e.method == "POST" && e.path == "/users"));
+        assert!(
+            result
+                .endpoints
+                .iter()
+                .any(|e| e.method == "POST" && e.path == "/users")
+        );
     }
 }
