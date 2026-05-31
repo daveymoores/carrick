@@ -79,6 +79,7 @@ impl MultiAgentOrchestrator {
         files: Vec<std::path::PathBuf>,
         packages: &Packages,
         imported_symbols: &HashMap<String, ImportedSymbol>,
+        repo_path: &str,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
@@ -113,7 +114,12 @@ impl MultiAgentOrchestrator {
         debug!("=== Stage 2: AST-Gated File-Centric Analysis ===");
         let file_orchestrator = FileOrchestrator::new(self.agent_service.clone());
         let file_centric_result = file_orchestrator
-            .analyze_files(&files, &framework_guidance, &framework_detection)
+            .analyze_files(
+                &files,
+                &framework_guidance,
+                &framework_detection,
+                std::path::Path::new(repo_path),
+            )
             .await?;
 
         self.print_analysis_summary(&file_centric_result);

@@ -256,6 +256,7 @@ fn test_processing_stats_tracking() {
         files_skipped_no_candidates: 1,
         total_mounts: 3,
         total_endpoints: 10,
+        file_based_endpoints: 2,
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
     };
@@ -743,7 +744,7 @@ app.post('/users', (req, res) => res.json({ created: true }));
 
     let files = vec![test_file];
     let result = orchestrator
-        .analyze_files(&files, &guidance, &detection)
+        .analyze_files(&files, &guidance, &detection, temp_dir.path())
         .await;
 
     // Verify the analysis completed (even with mock responses)
@@ -776,7 +777,7 @@ async fn test_file_orchestrator_handles_empty_files() {
 
     let files = vec![empty_file];
     let result = orchestrator
-        .analyze_files(&files, &guidance, &detection)
+        .analyze_files(&files, &guidance, &detection, temp_dir.path())
         .await;
 
     assert!(result.is_ok());
@@ -804,7 +805,7 @@ async fn test_file_orchestrator_handles_missing_files() {
     // Try to analyze a non-existent file
     let files = vec![PathBuf::from("/nonexistent/file.ts")];
     let result = orchestrator
-        .analyze_files(&files, &guidance, &detection)
+        .analyze_files(&files, &guidance, &detection, PathBuf::from("/").as_path())
         .await;
 
     assert!(result.is_ok());

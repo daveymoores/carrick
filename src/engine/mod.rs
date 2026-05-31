@@ -574,7 +574,12 @@ async fn analyze_current_repo_incremental(
 
             let new_file_results = if !files_to_analyze.is_empty() {
                 let result = file_orchestrator
-                    .analyze_files(&files_to_analyze, &guidance, &detection)
+                    .analyze_files(
+                        &files_to_analyze,
+                        &guidance,
+                        &detection,
+                        Path::new(repo_path),
+                    )
                     .await?;
                 result.file_results
             } else {
@@ -1247,7 +1252,7 @@ async fn analyze_current_repo(
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files, &packages, &all_imported_symbols)
+        .run_complete_analysis(files, &packages, &all_imported_symbols, repo_path)
         .await?;
 
     // 4b. Generate function intents using LLM

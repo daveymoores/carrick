@@ -19,11 +19,12 @@
 use crate::{
     agent_service::AgentService,
     agents::{
-        file_analyzer_agent::{FileAnalysisResult, FileAnalyzerAgent},
+        file_analyzer_agent::{EndpointResult, FileAnalysisResult, FileAnalyzerAgent},
         framework_guidance_agent::FrameworkGuidance,
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
+    file_based_router::{builtin_conventions, derive_route, MethodSource, RoutingConvention},
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     packages::Packages,
@@ -75,9 +76,18 @@ pub struct ProcessingStats {
     pub files_skipped_no_candidates: usize,
     pub total_mounts: usize,
     pub total_endpoints: usize,
+    /// Endpoints derived structurally from file-based routing conventions
+    /// (Next.js app router, etc.) rather than from a call-site scan. A subset
+    /// of `total_endpoints`.
+    pub file_based_endpoints: usize,
     pub total_data_calls: usize,
     pub errors: Vec<String>,
 }
+
+/// Owner assigned to endpoints declared by file location (file-based routing).
+/// These routes have no mount chain — their derived path is already absolute —
+/// so the owner is a sentinel that matches no mount during path resolution.
+const FILE_BASED_ROUTE_OWNER: &str = "__file_based_route__";
 
 type EndpointLookup = HashMap<(String, u32), Vec<(String, String)>>;
 type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
@@ -128,6 +138,7 @@ impl FileOrchestrator {
         files: &[PathBuf],
         guidance: &FrameworkGuidance,
         framework_detection: &DetectionResult,
+        repo_root: &Path,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
@@ -136,6 +147,11 @@ impl FileOrchestrator {
         let mut stats = ProcessingStats::default();
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
+
+        // Routing conventions for file-based routes (Next.js app/pages router,
+        // etc.). Empty when no convention-bearing framework is detected, in
+        // which case the file-based pass below is a no-op.
+        let conventions = builtin_conventions(&framework_detection.frameworks);
 
         // A file that passed the SWC gatekeeper and is ready for the (expensive) LLM call.
         // The CPU-bound preprocessing (read, scan, symbol table) is done serially up front;
@@ -147,6 +163,9 @@ impl FileOrchestrator {
             candidate_contexts: Vec<String>,
             candidate_map: HashMap<String, CandidateTarget>,
             symbol_table: SymbolTable,
+            /// Endpoints derived from file-based routing conventions, merged in
+            /// after the LLM pass. Empty for non-route files.
+            route_endpoints: Vec<EndpointResult>,
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -183,13 +202,50 @@ impl FileOrchestrator {
                 &framework_detection.data_fetchers,
             );
 
-            // STEP 2: Check Relevance - if no candidates, SKIP (zero LLM cost)
+            // File-based routing: routes declared by file location (Next.js app
+            // router, etc.) have no call-site candidate — the endpoint *is* the
+            // exported handler declaration. The path comes from the layout and the
+            // methods from exported handler names; both are invisible to a
+            // call-site scan, so they are derived deterministically here.
+            let route_endpoints = if conventions.is_empty() {
+                Vec::new()
+            } else {
+                let rel_path = file_path.strip_prefix(repo_root).unwrap_or(file_path);
+                Self::file_based_endpoints(
+                    &self.swc_scanner,
+                    rel_path,
+                    file_path,
+                    &content,
+                    &conventions,
+                )
+            };
+
+            // STEP 2: Check Relevance - if no candidates, SKIP the (expensive) LLM
+            // call. File-based route endpoints are still recorded: they're derived
+            // structurally and need no LLM.
             if !scan_result.should_analyze {
-                debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
-                stats.files_skipped += 1;
-                stats.files_skipped_no_candidates += 1;
-                // Store empty result so incremental cache knows this file was processed
-                file_results.insert(path_str, FileAnalysisResult::default());
+                if route_endpoints.is_empty() {
+                    debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
+                    stats.files_skipped += 1;
+                    stats.files_skipped_no_candidates += 1;
+                    // Store empty result so incremental cache knows this file was processed
+                    file_results.insert(path_str, FileAnalysisResult::default());
+                } else {
+                    debug!(
+                        "File-based route (no call-site candidates): {} [{} endpoint(s)]",
+                        path_str,
+                        route_endpoints.len()
+                    );
+                    stats.total_endpoints += route_endpoints.len();
+                    stats.file_based_endpoints += route_endpoints.len();
+                    file_results.insert(
+                        path_str,
+                        FileAnalysisResult {
+                            endpoints: route_endpoints,
+                            ..Default::default()
+                        },
+                    );
+                }
                 continue;
             }
 
@@ -225,6 +281,7 @@ impl FileOrchestrator {
                 candidate_contexts,
                 candidate_map,
                 symbol_table,
+                route_endpoints,
             });
         }
 
@@ -273,6 +330,11 @@ impl FileOrchestrator {
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
+                    // Merge file-based route endpoints the LLM pass didn't already
+                    // produce. The structural (method, path) facts are authoritative.
+                    stats.file_based_endpoints +=
+                        Self::merge_file_based_endpoints(&mut adjusted, pf.route_endpoints);
+
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
                     stats.total_data_calls += adjusted.data_calls.len();
@@ -297,6 +359,10 @@ impl FileOrchestrator {
         );
         debug!("  - Total mounts: {}", stats.total_mounts);
         debug!("  - Total endpoints: {}", stats.total_endpoints);
+        debug!(
+            "  - File-based route endpoints: {}",
+            stats.file_based_endpoints
+        );
         debug!("  - Total data calls: {}", stats.total_data_calls);
 
         // STEP 5: Build aggregated mount graph from all file results
@@ -835,6 +901,85 @@ impl FileOrchestrator {
         for call in &mut result.data_calls {
             scrub(&mut call.primary_type_symbol, &mut call.type_import_source);
         }
+    }
+
+    /// Derive endpoints for a file whose route is declared by its location in
+    /// the project layout (file-based routing) rather than by a call expression
+    /// the SWC gatekeeper can see. `derive_route` supplies the path from the
+    /// filesystem; the exported handler extractor supplies the HTTP methods and
+    /// declaration spans. Neither is recoverable from a call-site scan, so these
+    /// endpoints are built deterministically.
+    ///
+    /// Payload/response type fields are left empty: the structural facts
+    /// (method and path) are owned here, while type enrichment stays the job of
+    /// the LLM/sidecar pipeline.
+    fn file_based_endpoints(
+        scanner: &SwcScanner,
+        rel_path: &Path,
+        file_path: &Path,
+        content: &str,
+        conventions: &[RoutingConvention],
+    ) -> Vec<EndpointResult> {
+        let Some(route) = derive_route(rel_path, conventions) else {
+            return Vec::new();
+        };
+
+        match route.method_source {
+            // App-router style: one exported function per HTTP method. The export
+            // name *is* the method (GET/POST/...), and its declaration span lets
+            // the sidecar locate the handler body later.
+            MethodSource::ExportName => scanner
+                .exported_handlers(file_path, content)
+                .into_iter()
+                .filter(|h| is_http_method(&h.name))
+                .map(|h| {
+                    let method = h.name.to_uppercase();
+                    EndpointResult {
+                        candidate_id: format!("file-route:{}:{}", method, h.span_start),
+                        line_number: h.line_number as i32,
+                        owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
+                        method,
+                        path: route.path.clone(),
+                        handler_name: h.name.clone(),
+                        pattern_matched: route.convention.clone(),
+                        call_expression_span_start: Some(h.span_start),
+                        call_expression_span_end: Some(h.span_end),
+                        payload_expression_text: None,
+                        payload_expression_line: None,
+                        response_expression_text: None,
+                        response_expression_line: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    }
+                })
+                .collect(),
+            // Pages-router style: a single default export serves every method. The
+            // concrete method set isn't recoverable from the layout alone, so we
+            // leave these to a follow-up rather than emit an endpoint with an
+            // unknown method (which the mount graph would drop anyway).
+            MethodSource::DefaultExport => Vec::new(),
+        }
+    }
+
+    /// Append file-based route endpoints the LLM pass didn't already produce
+    /// (matched by method + path), keeping the deterministic structural entries.
+    /// Returns the number actually added.
+    fn merge_file_based_endpoints(
+        result: &mut FileAnalysisResult,
+        route_endpoints: Vec<EndpointResult>,
+    ) -> usize {
+        let mut added = 0;
+        for ep in route_endpoints {
+            let duplicate = result
+                .endpoints
+                .iter()
+                .any(|e| e.method.eq_ignore_ascii_case(&ep.method) && e.path == ep.path);
+            if !duplicate {
+                result.endpoints.push(ep);
+                added += 1;
+            }
+        }
+        added
     }
 
     fn apply_candidate_map(
@@ -2117,6 +2262,152 @@ mod tests {
         assert_eq!(stats.total_mounts, 0);
         assert_eq!(stats.total_endpoints, 0);
         assert_eq!(stats.total_data_calls, 0);
+        assert_eq!(stats.file_based_endpoints, 0);
         assert!(stats.errors.is_empty());
+    }
+
+    fn next_conventions() -> Vec<RoutingConvention> {
+        builtin_conventions(&["Next.js".to_string()])
+    }
+
+    #[test]
+    fn test_file_based_endpoints_app_router_method_per_export() {
+        let scanner = SwcScanner::new();
+        let content = r#"
+export async function GET() { return Response.json([]); }
+export async function POST(req: Request) { return Response.json({}); }
+export const runtime = "edge";
+"#;
+        let mut endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("app/users/route.ts"),
+            Path::new("app/users/route.ts"),
+            content,
+            &next_conventions(),
+        );
+        endpoints.sort_by(|a, b| a.method.cmp(&b.method));
+
+        // GET + POST become endpoints; `runtime` is not an HTTP method.
+        assert_eq!(endpoints.len(), 2, "expected GET and POST only");
+        assert_eq!(endpoints[0].method, "GET");
+        assert_eq!(endpoints[1].method, "POST");
+        for ep in &endpoints {
+            assert_eq!(ep.path, "/users");
+            assert_eq!(ep.owner_node, FILE_BASED_ROUTE_OWNER);
+            assert_eq!(ep.pattern_matched, "nextjs-app");
+            assert!(ep.call_expression_span_start.is_some());
+            assert!(ep.call_expression_span_end.is_some());
+            // Type enrichment is deferred to the LLM/sidecar pass.
+            assert!(ep.response_expression_text.is_none());
+        }
+    }
+
+    #[test]
+    fn test_file_based_endpoints_dynamic_segment() {
+        let scanner = SwcScanner::new();
+        let content = "export async function GET() {}\n";
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("app/users/[id]/route.ts"),
+            Path::new("app/users/[id]/route.ts"),
+            content,
+            &next_conventions(),
+        );
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].method, "GET");
+        assert_eq!(endpoints[0].path, "/users/:id");
+    }
+
+    #[test]
+    fn test_file_based_endpoints_pages_router_default_export_deferred() {
+        // Pages-router default export serves every method; the method set isn't
+        // recoverable from the layout, so no endpoint is synthesized (yet).
+        let scanner = SwcScanner::new();
+        let content = "export default function handler(req, res) {}\n";
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("pages/api/users.ts"),
+            Path::new("pages/api/users.ts"),
+            content,
+            &next_conventions(),
+        );
+        assert!(endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_file_based_endpoints_non_route_file() {
+        let scanner = SwcScanner::new();
+        let content = "export async function GET() {}\n";
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("src/services/users.ts"),
+            Path::new("src/services/users.ts"),
+            content,
+            &next_conventions(),
+        );
+        assert!(
+            endpoints.is_empty(),
+            "non-route files should yield no file-based endpoints"
+        );
+    }
+
+    #[test]
+    fn test_file_based_endpoints_no_conventions_is_noop() {
+        let scanner = SwcScanner::new();
+        let content = "export async function GET() {}\n";
+        // No convention-bearing framework detected → empty conventions.
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("app/users/route.ts"),
+            Path::new("app/users/route.ts"),
+            content,
+            &builtin_conventions(&["express".to_string()]),
+        );
+        assert!(endpoints.is_empty());
+    }
+
+    fn synthetic_endpoint(method: &str, path: &str) -> EndpointResult {
+        EndpointResult {
+            candidate_id: format!("file-route:{}:0", method),
+            line_number: 1,
+            owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler_name: method.to_string(),
+            pattern_matched: "nextjs-app".to_string(),
+            call_expression_span_start: Some(0),
+            call_expression_span_end: Some(1),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_file_based_endpoints_dedups_by_method_and_path() {
+        let mut result = FileAnalysisResult {
+            // The LLM pass already produced GET /users (e.g. via a Response.json
+            // candidate). The structural entry for it must not be duplicated.
+            endpoints: vec![synthetic_endpoint("GET", "/users")],
+            ..Default::default()
+        };
+
+        let added = FileOrchestrator::merge_file_based_endpoints(
+            &mut result,
+            vec![
+                synthetic_endpoint("get", "/users"), // duplicate (case-insensitive method)
+                synthetic_endpoint("POST", "/users"), // new method, same path
+            ],
+        );
+
+        assert_eq!(added, 1);
+        assert_eq!(result.endpoints.len(), 2);
+        assert!(result
+            .endpoints
+            .iter()
+            .any(|e| e.method == "POST" && e.path == "/users"));
     }
 }
