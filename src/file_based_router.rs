@@ -168,21 +168,22 @@ impl RoutingConvention {
             return None;
         }
 
-        // Optional catch-all "[[...slug]]" → also handled as catch-all (we emit a
-        // single concrete route; the optional/empty case is a superset match).
+        // Catch-all "[...slug]" / optional catch-all "[[...slug]]" → `**`, the
+        // multi-segment wildcard the mount graph matcher recognizes as a suffix
+        // catch-all (see `path_matches_with_wildcards` in src/mount_graph.rs).
+        // The param name plays no part in matching, so it is dropped. Catch-alls
+        // are always terminal in these conventions, so `**` lands at the end.
         let double_open = format!("{}{}", self.dynamic_open, self.dynamic_open);
         let double_close = format!("{}{}", self.dynamic_close, self.dynamic_close);
         if raw.starts_with(&double_open) && raw.ends_with(&double_close) {
-            let inner = &raw[double_open.len()..raw.len() - double_close.len()];
-            let name = inner.strip_prefix(&self.catch_all_marker).unwrap_or(inner);
-            return Some(format!("*{}", sanitize_param(name)));
+            return Some("**".to_string());
         }
 
         // Dynamic segment "[id]" or catch-all "[...slug]".
         if raw.starts_with(&self.dynamic_open) && raw.ends_with(&self.dynamic_close) {
             let inner = &raw[self.dynamic_open.len()..raw.len() - self.dynamic_close.len()];
-            if let Some(name) = inner.strip_prefix(&self.catch_all_marker) {
-                return Some(format!("*{}", sanitize_param(name)));
+            if inner.starts_with(&self.catch_all_marker) {
+                return Some("**".to_string());
             }
             return Some(format!(":{}", sanitize_param(inner)));
         }
@@ -339,7 +340,7 @@ mod tests {
     fn app_router_catch_all() {
         assert_eq!(
             route("app/files/[...slug]/route.ts").unwrap().path,
-            "/files/*slug"
+            "/files/**"
         );
     }
 
@@ -347,7 +348,7 @@ mod tests {
     fn app_router_optional_catch_all() {
         assert_eq!(
             route("app/shop/[[...slug]]/route.ts").unwrap().path,
-            "/shop/*slug"
+            "/shop/**"
         );
     }
 
@@ -402,7 +403,7 @@ mod tests {
     fn pages_api_catch_all_filename() {
         assert_eq!(
             route("pages/api/proxy/[...path].ts").unwrap().path,
-            "/api/proxy/*path"
+            "/api/proxy/**"
         );
     }
 
