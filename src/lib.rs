@@ -8,6 +8,7 @@ pub mod cloud_storage;
 pub mod config;
 pub mod engine;
 pub mod extractor;
+pub mod file_based_router;
 pub mod file_finder;
 pub mod formatter;
 pub mod framework_detector;
