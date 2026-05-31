@@ -8,6 +8,7 @@ mod cloud_storage;
 mod config;
 mod engine;
 mod extractor;
+mod file_based_router;
 mod file_finder;
 mod formatter;
 mod framework_detector;

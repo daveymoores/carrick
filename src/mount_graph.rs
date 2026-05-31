@@ -1219,6 +1219,15 @@ mod tests {
         assert!(graph.path_matches_with_wildcards("/api/*", "/api/users"));
         assert!(graph.path_matches_with_wildcards("/api/**", "/api/users/123/orders"));
         assert!(graph.path_matches_with_wildcards("/files/(.*)", "/files/path/to/file.txt"));
+
+        // Regression: file-based routing synthesizes Next.js catch-all routes
+        // (`app/files/[...slug]/route.ts`) as `/files/**`, which must match
+        // single- and multi-segment caller URLs. A named catch-all (the old
+        // `*slug` emission) would be treated as a literal and NOT match —
+        // guards against regressing the router.
+        assert!(graph.path_matches_with_wildcards("/files/**", "/files/foo"));
+        assert!(graph.path_matches_with_wildcards("/files/**", "/files/foo/bar"));
+        assert!(!graph.path_matches_with_wildcards("/files/*slug", "/files/foo"));
     }
 
     #[test]
