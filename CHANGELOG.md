@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.24](https://github.com/daveymoores/carrick/compare/carrick-v0.1.23...carrick-v0.1.24) (2026-05-31)
+
+
+### Features
+
+* framework-agnostic file-based routing ([#126](https://github.com/daveymoores/carrick/issues/126)) ([7939fe4](https://github.com/daveymoores/carrick/commit/7939fe42a5fa7dd4be1254614a3a49cf59e028b9))
+
+
+### Performance
+
+* **scanner:** parallelize file analysis and fix matching/extraction correctness ([#124](https://github.com/daveymoores/carrick/issues/124)) ([72b3ff1](https://github.com/daveymoores/carrick/commit/72b3ff1ed1912763aed0521ba4759bbc33bb66dd))
+
 ## [0.1.23](https://github.com/daveymoores/carrick/compare/carrick-v0.1.22...carrick-v0.1.23) (2026-05-29)
 
 
