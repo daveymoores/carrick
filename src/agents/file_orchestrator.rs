@@ -630,7 +630,7 @@ impl FileOrchestrator {
 
                 // File-based routes (Next.js app router, etc.) have no call-site
                 // payload expression: the handler's return type *is* the response
-                // contract (`export async function GET(): Promise<User[]>` or an
+                // contract (e.g., `export async function GET(): Promise<Response>` or `Promise<NextResponse<User[]>>`, or an
                 // inferred `return new Response(...)`). Their stored span points at
                 // the whole handler declaration, which the response-body locators
                 // would misread as the payload — so request a `FunctionReturn`
