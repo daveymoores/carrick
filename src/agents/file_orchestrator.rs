@@ -450,6 +450,11 @@ impl FileOrchestrator {
                 expression_text: Option<&'a str>,
                 expression_line: Option<i32>,
             },
+            /// Locate purely by line number (no span, no text). Used for
+            /// file-based route handlers, where the only reliable anchor is the
+            /// handler's declaration line and the sidecar resolves the function
+            /// via `findFunctionByLine`.
+            Line,
         }
 
         let mut push_infer = |file_path: &str,
@@ -497,6 +502,20 @@ impl FileOrchestrator {
                         expression_text: Some(text.to_string()),
                         expression_line: expression_line
                             .map(|l| if l > 0 { l as u32 } else { line_number }),
+                        alias: Some(alias),
+                        param_name: None,
+                    });
+                    true
+                }
+                InferLocator::Line => {
+                    infer_requests.push(InferRequestItem {
+                        file_path: file_path.to_string(),
+                        line_number,
+                        infer_kind,
+                        span_start: None,
+                        span_end: None,
+                        expression_text: None,
+                        expression_line: None,
                         alias: Some(alias),
                         param_name: None,
                     });
@@ -607,6 +626,30 @@ impl FileOrchestrator {
                         "[FileOrchestrator] Endpoint at {}:{} has import source {:?} but no symbol; relying on inference",
                         file_path, line_number, endpoint.type_import_source
                     );
+                }
+
+                // File-based routes (Next.js app router, etc.) have no call-site
+                // payload expression: the handler's return type *is* the response
+                // contract (e.g., `export async function GET(): Promise<Response>` or `Promise<NextResponse<User[]>>`, or an
+                // inferred `return new Response(...)`). Their stored span points at
+                // the whole handler declaration, which the response-body locators
+                // would misread as the payload — so request a `FunctionReturn`
+                // anchored on the handler line instead, which the sidecar resolves
+                // via `findFunctionByLine` and Promise-unwraps. Request-body
+                // inference is skipped: a Next.js request body isn't recoverable
+                // from the signature.
+                if endpoint.owner_node == FILE_BASED_ROUTE_OWNER {
+                    let inferred = push_infer(
+                        &file_path_absolute,
+                        line_number,
+                        InferKind::FunctionReturn,
+                        response_alias.clone(),
+                        InferLocator::Line,
+                    );
+                    if !inferred && let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
+                        inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    }
+                    continue;
                 }
 
                 let response_inferred = push_infer(
@@ -910,9 +953,11 @@ impl FileOrchestrator {
     /// declaration spans. Neither is recoverable from a call-site scan, so these
     /// endpoints are built deterministically.
     ///
-    /// Payload/response type fields are left empty: the structural facts
-    /// (method and path) are owned here, while type enrichment stays the job of
-    /// the LLM/sidecar pipeline.
+    /// Payload/response *symbol* fields are left empty here: the structural
+    /// facts (method and path) are owned at synthesis time, while the response
+    /// type is recovered downstream in `collect_type_requests`, which asks the
+    /// sidecar for the handler's (Promise-unwrapped) return type — the response
+    /// contract for a file-based route.
     fn file_based_endpoints(
         scanner: &SwcScanner,
         rel_path: &Path,
@@ -2020,6 +2065,63 @@ mod tests {
         assert!(aliases[0].contains("_Call"));
         assert!(aliases[1].contains("_Call"));
         assert_ne!(aliases[0], aliases[1]);
+    }
+
+    #[test]
+    fn test_collect_type_requests_file_based_route_uses_function_return() {
+        // A file-based route endpoint (sentinel owner) carries a handler span but
+        // no call-site payload expression. Its response type must be requested as
+        // a line-anchored FunctionReturn (the handler's return type), NOT a
+        // span/text ResponseBody — which would misread the function declaration.
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "app/users/route.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![EndpointResult {
+                    candidate_id: "file-route:GET:42".to_string(),
+                    line_number: 7,
+                    owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
+                    method: "GET".to_string(),
+                    path: "/users".to_string(),
+                    handler_name: "GET".to_string(),
+                    pattern_matched: "nextjs-app".to_string(),
+                    // Span points at the whole handler declaration — the landmine
+                    // the old code would have fed to the response-body locator.
+                    call_expression_span_start: Some(42),
+                    call_expression_span_end: Some(300),
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                }],
+                data_calls: vec![],
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(&file_results);
+        let config = Config::default();
+        let (_explicit, infer, _inline) =
+            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+
+        // Exactly one inference: the response. No request-body inference for a
+        // file-based GET (and none even for POST — not recoverable from the sig).
+        assert_eq!(infer.len(), 1);
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::FunctionReturn);
+        assert_eq!(item.line_number, 7);
+        // Line-only locator: no span, no text — so the sidecar uses findFunctionByLine
+        // and can't misresolve the declaration span as a payload.
+        assert!(item.span_start.is_none());
+        assert!(item.span_end.is_none());
+        assert!(item.expression_text.is_none());
+        let alias = item.alias.as_deref().unwrap_or_default();
+        assert!(alias.contains("Response"), "alias was {alias}");
     }
 
     #[test]
