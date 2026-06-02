@@ -14,6 +14,25 @@ impl FormattedOutput {
     pub fn print(&self) {
         println!("{}", self.content);
     }
+
+    /// The comment body to relay to the cloud: the rendered markdown without
+    /// the machine-only marker lines (`CARRICK_OUTPUT_START`/`_END` and
+    /// `CARRICK_ISSUE_COUNT`). The cloud adds its own idempotency marker, so
+    /// these would only be noise in the posted comment. Mirrors the `grep -v`
+    /// the GitHub Action previously applied before posting.
+    pub fn pr_comment_body(&self) -> String {
+        self.content
+            .lines()
+            .filter(|line| {
+                !line.contains("CARRICK_OUTPUT_START")
+                    && !line.contains("CARRICK_OUTPUT_END")
+                    && !line.contains("CARRICK_ISSUE_COUNT")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
 }
 
 pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
@@ -882,6 +901,38 @@ mod tests {
         // Check that no issues message is displayed
         assert!(output.contains("All cross-repo calls match the indexed contracts"));
         assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
+    }
+
+    #[test]
+    fn test_pr_comment_body_strips_machine_markers() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+        };
+
+        let formatted = FormattedOutput::new(result);
+        let body = formatted.pr_comment_body();
+
+        // The marker lines the old Action stripped before posting must not
+        // leak into the comment the cloud relays.
+        assert!(!body.contains("CARRICK_OUTPUT_START"));
+        assert!(!body.contains("CARRICK_OUTPUT_END"));
+        assert!(!body.contains("CARRICK_ISSUE_COUNT"));
+        // The human-facing content is preserved.
+        assert!(body.contains("All cross-repo calls match the indexed contracts"));
+        // No leading/trailing blank lines left behind by the stripped markers.
+        assert_eq!(body, body.trim());
     }
 
     #[test]

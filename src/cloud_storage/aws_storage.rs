@@ -368,6 +368,39 @@ impl CloudStorage for AwsStorage {
         Ok(())
     }
 
+    async fn post_pr_comment(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        body: &str,
+    ) -> Result<(), StorageError> {
+        // Dedicated action: unlike store-metadata/complete-upload it writes no
+        // index data — the cloud only gates on the project's pr_comments_enabled
+        // toggle and upserts the marked comment via the GitHub App. We keep the
+        // rendered markdown as the source of truth here and let the cloud relay
+        // it verbatim.
+        #[derive(Serialize)]
+        struct PostPrCommentRequest<'a> {
+            action: &'a str,
+            repo: &'a str,
+            pr_number: u64,
+            pr_comment_body: &'a str,
+        }
+
+        let request = PostPrCommentRequest {
+            action: "post-pr-comment",
+            repo,
+            pr_number,
+            pr_comment_body: body,
+        };
+
+        // Best-effort by contract (caller logs and swallows), but surface the
+        // transport error so the caller can log a useful message.
+        self.send_lambda(&request).await?;
+        debug!("Posted PR comment for {} (PR #{})", repo, pr_number);
+        Ok(())
+    }
+
     async fn health_check(&self) -> Result<(), StorageError> {
         let request = LambdaRequest {
             action: "check-or-upload".to_string(),
