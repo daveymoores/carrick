@@ -35,6 +35,16 @@ impl CloudStorage for MockStorage {
         Ok(())
     }
 
+    async fn post_pr_comment(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        _body: &str,
+    ) -> Result<(), StorageError> {
+        debug!("MOCK: post_pr_comment for {} (PR #{})", repo, pr_number);
+        Ok(())
+    }
+
     async fn upload_type_file(
         &self,
         repo_name: &str,

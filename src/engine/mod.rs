@@ -84,6 +84,15 @@ fn should_upload_data() -> bool {
     true
 }
 
+/// The PR number for a `pull_request` run, or None on push/dispatch/local
+/// runs. GitHub sets GITHUB_REF to `refs/pull/<n>/merge` (or `/head`) on PRs;
+/// returning None on any other ref is exactly the "only post on PR runs" gate.
+fn pr_number_from_env() -> Option<u64> {
+    let ref_name = env::var("GITHUB_REF").ok()?;
+    let rest = ref_name.strip_prefix("refs/pull/")?;
+    rest.split('/').next()?.parse::<u64>().ok()
+}
+
 #[allow(dead_code)]
 pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
@@ -209,7 +218,21 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
-    print_results(results);
+    let formatted = crate::formatter::FormattedOutput::new(results);
+    formatted.print();
+
+    // On pull_request runs we deliberately skip the index upload (see
+    // should_upload_data — PR-branch data must not pollute the cross-repo
+    // index), but we still relay the rendered findings to the cloud, which
+    // posts (and updates in place on later pushes) a single PR comment via
+    // the GitHub App, gated on the project's pr_comments_enabled toggle.
+    // Best-effort: a comment failure is logged, never fatal.
+    if let Some(pr_number) = pr_number_from_env() {
+        let body = formatted.pr_comment_body();
+        if let Err(e) = storage.post_pr_comment(&repo_name, pr_number, &body).await {
+            warn!("Failed to post PR comment: {}", e);
+        }
+    }
 
     Ok(())
 }
@@ -1606,11 +1629,6 @@ fn recreate_package_and_tsconfig(
     debug!("Recreated tsconfig.json at {}", tsconfig_path.display());
 
     Ok(())
-}
-
-fn print_results(result: crate::analyzer::ApiAnalysisResult) {
-    let formatted_output = crate::formatter::FormattedOutput::new(result);
-    formatted_output.print();
 }
 
 #[cfg(test)]

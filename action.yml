@@ -18,9 +18,6 @@ outputs:
   issues-found:
     description: "Number of API issues detected"
     value: ${{ steps.analysis.outputs.issues-found }}
-  pr-comment:
-    description: "Formatted PR comment with cross-repo analysis"
-    value: ${{ steps.analysis.outputs.pr-comment }}
 
 runs:
   using: "composite"
@@ -76,27 +73,11 @@ runs:
 
         echo "issues-found=$ISSUES" >> $GITHUB_OUTPUT
 
-        # Extract formatted markdown output between delimiters
-        if grep -q "CARRICK_OUTPUT_START" analysis.log; then
-          # Extract content between delimiters
-          sed -n '/<!-- CARRICK_OUTPUT_START -->/,/<!-- CARRICK_OUTPUT_END -->/p' analysis.log | \
-            grep -v "CARRICK_OUTPUT_START\|CARRICK_OUTPUT_END\|CARRICK_ISSUE_COUNT" > pr_comment.md
-
-          # Set multiline output for PR comment
-          {
-            echo "pr-comment<<EOF"
-            cat pr_comment.md
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
-        else
-          {
-            echo "pr-comment<<EOF"
-            echo "### 🪢 Carrick: Cross-repo analysis"
-            echo ""
-            echo "⚠️ No API analysis results found in output."
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
-        fi
+        # PR comments are posted by the Carrick GitHub App from the cloud, not
+        # by this workflow: on pull_request runs the scanner relays the
+        # rendered findings to api.carrick.tools, which upserts one marked
+        # comment (gated on the project's pr_comments_enabled toggle). No
+        # github-script step or pull-requests:write permission is needed here.
 
         cat analysis.log
         exit $EXIT_CODE

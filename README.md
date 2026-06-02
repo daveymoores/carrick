@@ -37,7 +37,7 @@ The recommended authentication is sign-in-with-Carrick: your agent opens a brows
 
 ## Populate the index
 
-The index is populated by running the Carrick GitHub Action on each TypeScript repo you want indexed. On the main branch the action refreshes that repo's contribution to the index. On pull requests it can optionally post a drift comment.
+The index is populated by running the Carrick GitHub Action on each TypeScript repo you want indexed. On the main branch the action refreshes that repo's contribution to the index. On pull requests the Carrick App posts a drift comment for you (no extra workflow steps required).
 
 ```yaml
 name: Carrick
@@ -51,8 +51,6 @@ on:
 permissions:
   id-token: write
   contents: read
-  issues: write
-  pull-requests: write
 
 jobs:
   carrick:
@@ -60,60 +58,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - id: carrick
-        uses: daveymoores/carrick@v1
-
-      - if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        env:
-          COMMENT_BODY: ${{ steps.carrick.outputs.pr-comment }}
-        with:
-          script: |
-            const body = process.env.COMMENT_BODY;
-            if (!body || !body.trim()) return;
-            const marker = '<!-- CARRICK_OUTPUT_START -->';
-            const iterator = github.paginate.iterator(
-              github.rest.issues.listComments,
-              {
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                per_page: 100,
-              }
-            );
-            let previous = null;
-            for await (const { data: page } of iterator) {
-              previous = page.find(c =>
-                c.user && c.user.type === 'Bot' &&
-                c.user.login === 'github-actions[bot]' &&
-                c.body && c.body.includes(marker)
-              );
-              if (previous) break;
-            }
-            const createNew = () => github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body,
-            });
-            if (previous) {
-              try {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: previous.id,
-                  body,
-                });
-              } catch (err) {
-                core.warning(`updateComment failed (${err.status}); creating a fresh comment instead.`);
-                await createNew();
-              }
-            } else {
-              await createNew();
-            }
+      - uses: daveymoores/carrick@v1
 ```
 
-No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project in the dashboard.
+No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. On pull requests the Carrick App posts the drift comment itself, so the workflow needs no `pull-requests: write` permission and no comment-posting step. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project in the dashboard.
 
 ## MCP tools
 
@@ -131,7 +79,7 @@ The MCP endpoint exposes the index as structured tools your agent can call direc
 
 ## On pull requests
 
-The Carrick action can also post a comment on pull requests. The comment summarises drift detected against the indexed services: type mismatches between producers and consumers, mismatched HTTP verbs, missing or orphaned routes, and npm-dependency-version conflicts.
+On pull requests the Carrick App posts a comment summarising drift detected against the indexed services: type mismatches between producers and consumers, mismatched HTTP verbs, missing or orphaned routes, and npm-dependency-version conflicts. It updates the same comment in place on each push to the PR. Enable it per project with the PR comments toggle in the dashboard; PR runs never alter the index.
 
 ## Configuration
 

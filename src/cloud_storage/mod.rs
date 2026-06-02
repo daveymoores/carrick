@@ -282,6 +282,17 @@ pub trait CloudStorage {
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
     async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError>;
+
+    /// Relay a rendered PR-comment body to the cloud, which posts (and
+    /// updates in place on later pushes) a single GitHub App comment on the
+    /// PR. Only called on `pull_request` runs — index data is deliberately
+    /// not uploaded there, so this is the one signal a PR run sends.
+    async fn post_pr_comment(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        body: &str,
+    ) -> Result<(), StorageError>;
 }
 
 pub fn get_current_commit_hash(repo_path: &str) -> String {
