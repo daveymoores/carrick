@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.25](https://github.com/daveymoores/carrick/compare/carrick-v0.1.24...carrick-v0.1.25) (2026-06-02)
+
+
+### Features
+
+* post PR drift comments from the cloud GitHub App ([8181c35](https://github.com/daveymoores/carrick/commit/8181c3508d4c54da9e4951a0194a67e9b33dec8a))
+
 ## [0.1.24](https://github.com/daveymoores/carrick/compare/carrick-v0.1.23...carrick-v0.1.24) (2026-05-31)
 
 
