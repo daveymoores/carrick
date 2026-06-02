@@ -685,8 +685,8 @@ async fn analyze_current_repo_incremental(
     let (files, all_imported_symbols, function_definitions, repo_name) =
         discover_files_and_symbols(repo_path, cm.clone())?;
 
-    // 2. Load config and packages
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    // 2. Load config and packages (merging root config defaults in monorepo mode)
+    let (config, packages) = load_config_and_packages(repo_path, repo_root)?;
 
     // 3. Check if we can use incremental mode
     let can_use_incremental = previous_data.and_then(|prev| {
@@ -930,7 +930,7 @@ async fn analyze_current_repo_incremental(
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
     debug!("Running full analysis...");
-    let cloud_data = analyze_current_repo(repo_path, sidecar).await?;
+    let cloud_data = analyze_current_repo(repo_path, sidecar, repo_root).await?;
 
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
@@ -1156,20 +1156,53 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
 }
 
 /// Extract config and package loading logic
+/// Load config and packages for an analysis unit.
+///
+/// `repo_root` is the monorepo root when `repo_path` is an app subdirectory.
+/// When set and distinct from `repo_path`, the root `carrick.json` is merged in
+/// as a source of *defaults*: the app's own `carrick.json` wins for
+/// `serviceName`, while `internalDomains`/`internalEnvVars`/`externalDomains`/
+/// `externalEnvVars` are unioned with the root's. This lets shared call
+/// classification live once at the monorepo root (as the README documents).
 fn load_config_and_packages(
     repo_path: &str,
+    repo_root: Option<&str>,
 ) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
     let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
     let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
 
-    let config = if let Some(config_path) = config_file_path {
-        debug!("Found carrick.json: {}", config_path.display());
-        Config::new(vec![config_path]).unwrap_or_else(|e| {
-            warn!("Error parsing config file: {}", e);
+    // Build the config file list: app config first (so its serviceName wins),
+    // then the monorepo root config (contributes shared domains/env-vars).
+    // Config::new unions the set fields and takes the first non-None serviceName.
+    let mut config_paths: Vec<PathBuf> = Vec::new();
+    if let Some(app_config) = config_file_path {
+        debug!("Found carrick.json: {}", app_config.display());
+        config_paths.push(app_config);
+    }
+    if let Some(root) = repo_root {
+        // Only merge the root config when it's a *different* file than the app's
+        // own — i.e. genuine monorepo mode, not a single repo analyzing itself.
+        let canon_root = std::fs::canonicalize(root).ok();
+        let canon_app = std::fs::canonicalize(repo_path).ok();
+        if canon_root != canon_app {
+            let root_config = Path::new(root).join("carrick.json");
+            if root_config.is_file() {
+                debug!(
+                    "Merging root carrick.json defaults: {}",
+                    root_config.display()
+                );
+                config_paths.push(root_config);
+            }
+        }
+    }
+
+    let config = if config_paths.is_empty() {
+        Config::default()
+    } else {
+        Config::new(config_paths).unwrap_or_else(|e| {
+            warn!("Error parsing config file(s): {}", e);
             Config::default()
         })
-    } else {
-        Config::default()
     };
 
     let packages = if let Some(package_path) = package_json_path {
@@ -1447,6 +1480,7 @@ struct TypeManifestFile {
 async fn analyze_current_repo(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
+    repo_root: Option<&str>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     // Canonicalize repo_path for consistent path normalization between runs
     let canonical = std::fs::canonicalize(repo_path)
@@ -1467,8 +1501,8 @@ async fn analyze_current_repo(
         function_definitions.len()
     );
 
-    // 2. Load config and packages using existing logic
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    // 2. Load config and packages using existing logic (merging root defaults in monorepo mode)
+    let (config, packages) = load_config_and_packages(repo_path, repo_root)?;
 
     // 3. Get API key and create MultiAgentOrchestrator
     let api_key = env::var("CARRICK_API_KEY")
@@ -2618,5 +2652,52 @@ mod tests {
         // Only the orders file survives, stripped to app-relative.
         assert_eq!(result.len(), 1);
         assert!(result.contains("src/handler.ts"));
+    }
+
+    #[test]
+    fn app_config_inherits_root_defaults() {
+        // Root carrick.json defines shared call classification; the app's own
+        // config sets only serviceName. The merged config must carry both.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("carrick.json"),
+            r#"{"projects": ["apps/*"], "internalEnvVars": ["BILLING_URL"], "internalDomains": ["https://api.acme.com"]}"#,
+        )
+        .unwrap();
+        let app = root.join("apps/orders");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("carrick.json"), r#"{"serviceName": "orders"}"#).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name": "orders"}"#).unwrap();
+
+        let (config, _) =
+            load_config_and_packages(app.to_str().unwrap(), Some(root.to_str().unwrap()))
+                .expect("load failed");
+
+        // App's serviceName wins.
+        assert_eq!(config.service_name.as_deref(), Some("orders"));
+        // Root's shared classification is inherited.
+        assert!(config.internal_env_vars.contains("BILLING_URL"));
+        assert!(config.is_internal_call("ENV_VAR:BILLING_URL:/invoices"));
+        assert!(config.is_internal_call("https://api.acme.com/x"));
+    }
+
+    #[test]
+    fn single_repo_does_not_double_merge_own_config() {
+        // When repo_root == repo_path (single-repo mode), the root config must
+        // not be merged twice or treated as a separate file.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("carrick.json"),
+            r#"{"serviceName": "solo", "internalEnvVars": ["API"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name": "solo"}"#).unwrap();
+
+        let path = root.to_str().unwrap();
+        let (config, _) = load_config_and_packages(path, Some(path)).expect("load failed");
+        assert_eq!(config.service_name.as_deref(), Some("solo"));
+        assert!(config.internal_env_vars.contains("API"));
     }
 }
