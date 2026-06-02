@@ -287,10 +287,15 @@ pub trait CloudStorage {
     /// updates in place on later pushes) a single GitHub App comment on the
     /// PR. Only called on `pull_request` runs — index data is deliberately
     /// not uploaded there, so this is the one signal a PR run sends.
+    ///
+    /// `run_id` is the GitHub Actions run id of this PR check; the cloud
+    /// records it so a later sibling main change can re-run this exact run and
+    /// refresh the comment (see carrick-cloud docs/internal/fanout-pr-rerun.md).
     async fn post_pr_comment(
         &self,
         repo: &str,
         pr_number: u64,
+        run_id: &str,
         body: &str,
     ) -> Result<(), StorageError>;
 }

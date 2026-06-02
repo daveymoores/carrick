@@ -43,9 +43,10 @@ impl CloudStorage for SharedMock {
         &self,
         repo: &str,
         pr_number: u64,
+        run_id: &str,
         body: &str,
     ) -> Result<(), StorageError> {
-        self.0.post_pr_comment(repo, pr_number, body).await
+        self.0.post_pr_comment(repo, pr_number, run_id, body).await
     }
 }
 
@@ -86,6 +87,7 @@ impl CloudStorage for StubStorage {
         &self,
         _repo: &str,
         _pr_number: u64,
+        _run_id: &str,
         _body: &str,
     ) -> Result<(), StorageError> {
         Ok(())

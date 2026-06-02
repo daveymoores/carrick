@@ -47,6 +47,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets Carrick re-trigger this repo's main scan when a sibling repo in the
+  # project changes. Optional today and dormant unless enabled server-side —
+  # included here so it's already wired if you ever turn it on.
+  repository_dispatch:
+    types: [carrick-sibling-updated]
 
 permissions:
   id-token: write

@@ -372,18 +372,22 @@ impl CloudStorage for AwsStorage {
         &self,
         repo: &str,
         pr_number: u64,
+        run_id: &str,
         body: &str,
     ) -> Result<(), StorageError> {
         // Dedicated action: unlike store-metadata/complete-upload it writes no
         // index data — the cloud only gates on the project's pr_comments_enabled
         // toggle and upserts the marked comment via the GitHub App. We keep the
         // rendered markdown as the source of truth here and let the cloud relay
-        // it verbatim.
+        // it verbatim. `run_id` lets the cloud re-run this PR's workflow later
+        // when a sibling repo's main changes.
         #[derive(Serialize)]
         struct PostPrCommentRequest<'a> {
             action: &'a str,
             repo: &'a str,
             pr_number: u64,
+            #[serde(skip_serializing_if = "str::is_empty")]
+            run_id: &'a str,
             pr_comment_body: &'a str,
         }
 
@@ -391,6 +395,7 @@ impl CloudStorage for AwsStorage {
             action: "post-pr-comment",
             repo,
             pr_number,
+            run_id,
             pr_comment_body: body,
         };
 

@@ -93,6 +93,13 @@ fn pr_number_from_env() -> Option<u64> {
     rest.split('/').next()?.parse::<u64>().ok()
 }
 
+/// This run's GitHub Actions run id (`GITHUB_RUN_ID`), or empty if unset. The
+/// cloud records it against the PR so a later sibling main change can re-run
+/// this exact workflow run and refresh the comment.
+fn run_id_from_env() -> String {
+    env::var("GITHUB_RUN_ID").unwrap_or_default()
+}
+
 #[allow(dead_code)]
 pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
@@ -229,7 +236,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // Best-effort: a comment failure is logged, never fatal.
     if let Some(pr_number) = pr_number_from_env() {
         let body = formatted.pr_comment_body();
-        if let Err(e) = storage.post_pr_comment(&repo_name, pr_number, &body).await {
+        let run_id = run_id_from_env();
+        if let Err(e) = storage
+            .post_pr_comment(&repo_name, pr_number, &run_id, &body)
+            .await
+        {
             warn!("Failed to post PR comment: {}", e);
         }
     }
