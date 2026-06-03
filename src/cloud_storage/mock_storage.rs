@@ -39,6 +39,7 @@ impl CloudStorage for MockStorage {
         &self,
         repo: &str,
         pr_number: u64,
+        _run_id: &str,
         _body: &str,
     ) -> Result<(), StorageError> {
         debug!("MOCK: post_pr_comment for {} (PR #{})", repo, pr_number);
