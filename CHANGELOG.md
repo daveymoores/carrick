@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.26](https://github.com/daveymoores/carrick/compare/carrick-v0.1.25...carrick-v0.1.26) (2026-06-03)
+
+
+### Features
+
+* send workflow run_id with PR comment for cross-repo re-runs ([859fe8b](https://github.com/daveymoores/carrick/commit/859fe8b67d4b3f5b5b884aa78800bb65c3258e62))
+
 ## [0.1.25](https://github.com/daveymoores/carrick/compare/carrick-v0.1.24...carrick-v0.1.25) (2026-06-02)
 
 
