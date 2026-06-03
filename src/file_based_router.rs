@@ -145,12 +145,11 @@ impl RoutingConvention {
             name: "astro".to_string(),
             root_globs: vec!["src/pages".to_string()],
             segment_source: SegmentSource::FileName {
-                extensions: vec![
-                    "ts".to_string(),
-                    "js".to_string(),
-                    "mts".to_string(),
-                    "mjs".to_string(),
-                ],
+                // Astro routes only `.ts`/`.js` endpoint files under src/pages
+                // (`.astro` files are HTML pages, handled elsewhere). `.mts`/
+                // `.mjs` are not Astro route extensions, and the SWC handler
+                // extractor doesn't parse TS syntax in `.mts` anyway.
+                extensions: vec!["ts".to_string(), "js".to_string()],
             },
             path_prefix: String::new(),
             dynamic_open: "[".to_string(),

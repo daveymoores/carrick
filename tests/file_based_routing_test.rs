@@ -51,6 +51,23 @@ fn synthesized_routes(fixture: &str, conventions: &[RoutingConvention]) -> BTree
         let endpoints =
             FileOrchestrator::file_based_endpoints(&scanner, rel, file, &content, conventions);
         for ep in endpoints {
+            // Every synthesized file-based endpoint must carry the metadata the
+            // downstream sidecar type-resolution relies on: a convention label,
+            // the file-based owner marker, and a declaration span. Asserting it
+            // here means a regression that produced the right method+path but
+            // dropped this metadata is caught, not silently projected away.
+            assert!(
+                !ep.pattern_matched.is_empty(),
+                "{rel:?}: endpoint missing convention label"
+            );
+            assert_eq!(
+                ep.owner_node, "__file_based_route__",
+                "{rel:?}: endpoint not tagged as file-based"
+            );
+            assert!(
+                ep.call_expression_span_start.is_some(),
+                "{rel:?}: endpoint missing handler declaration span"
+            );
             routes.insert(format!("{} {}", ep.method, ep.path));
         }
     }
@@ -102,11 +119,25 @@ fn astro_fixture_derives_expected_routes() {
 
 #[test]
 fn file_based_pass_is_noop_without_matching_framework() {
-    // With no convention-bearing framework detected, the same on-disk Astro
-    // project must produce nothing: framework knowledge is the only gate.
+    // No convention-bearing framework detected → empty conventions → no routes,
+    // regardless of what's on disk.
     let routes = synthesized_routes("astro", &builtin_conventions(&["express".to_string()]));
     assert!(
         routes.is_empty(),
         "no endpoints expected when no file-based framework is detected, got {routes:?}"
+    );
+}
+
+#[test]
+fn astro_convention_rejects_a_non_astro_layout() {
+    // Stronger than the empty-conventions gate: run a *non-empty* Astro
+    // convention set over the Next.js app-router tree (which has no `src/pages`).
+    // The matcher must reject every file via strip_root/raw_segments and yield
+    // nothing — proving the convention is correctly scoped, not just that an
+    // empty slice produces nothing.
+    let routes = synthesized_routes("nextjs-app", &builtin_conventions(&["Astro".to_string()]));
+    assert!(
+        routes.is_empty(),
+        "astro conventions must not match app-router files, got {routes:?}"
     );
 }
