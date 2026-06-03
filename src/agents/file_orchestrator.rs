@@ -958,6 +958,11 @@ impl FileOrchestrator {
     /// type is recovered downstream in `collect_type_requests`, which asks the
     /// sidecar for the handler's (Promise-unwrapped) return type — the response
     /// contract for a file-based route.
+    ///
+    /// `pub` + `#[doc(hidden)]`: this is exposed only so the end-to-end fixture
+    /// test (`tests/file_based_routing_test.rs`) can drive the real synthesis
+    /// path. It is not part of the supported crate API.
+    #[doc(hidden)]
     pub fn file_based_endpoints(
         scanner: &SwcScanner,
         rel_path: &Path,

@@ -138,7 +138,7 @@ impl RoutingConvention {
     /// `src/pages` — and methods come from export names, not a single default
     /// export. Only `.ts`/`.js` files are endpoints; `.astro` files are HTML
     /// pages and are deliberately excluded. (Astro's `ALL` fallback export is
-    /// not an HTTP method per [`is_http_method`](crate::type_manifest), so a
+    /// not an HTTP method per [`crate::type_manifest::is_http_method`], so a
     /// route defined solely via `ALL` is not synthesized.)
     pub fn astro() -> Self {
         Self {
