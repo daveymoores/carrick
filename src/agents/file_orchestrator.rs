@@ -958,7 +958,12 @@ impl FileOrchestrator {
     /// type is recovered downstream in `collect_type_requests`, which asks the
     /// sidecar for the handler's (Promise-unwrapped) return type — the response
     /// contract for a file-based route.
-    fn file_based_endpoints(
+    ///
+    /// `pub` + `#[doc(hidden)]`: this is exposed only so the end-to-end fixture
+    /// test (`tests/file_based_routing_test.rs`) can drive the real synthesis
+    /// path. It is not part of the supported crate API.
+    #[doc(hidden)]
+    pub fn file_based_endpoints(
         scanner: &SwcScanner,
         rel_path: &Path,
         file_path: &Path,
@@ -2418,6 +2423,54 @@ export const runtime = "edge";
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].method, "GET");
         assert_eq!(endpoints[0].path, "/users/:id");
+    }
+
+    #[test]
+    fn test_file_based_endpoints_astro_filename_with_export_methods() {
+        // Astro is the FileName + ExportName combination: the path comes from
+        // the filename (like pages-router) but methods come from named exports
+        // (like app-router). Both `export function` and `export const` forms
+        // must be recognized.
+        let scanner = SwcScanner::new();
+        let content = r#"
+export async function GET() { return new Response("[]"); }
+export const POST = async (ctx) => new Response("{}");
+export const prerender = false;
+"#;
+        let mut endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("src/pages/api/users.ts"),
+            Path::new("src/pages/api/users.ts"),
+            content,
+            &builtin_conventions(&["Astro".to_string()]),
+        );
+        endpoints.sort_by(|a, b| a.method.cmp(&b.method));
+
+        // GET + POST become endpoints; `prerender` is not an HTTP method.
+        assert_eq!(endpoints.len(), 2, "expected GET and POST only");
+        assert_eq!(endpoints[0].method, "GET");
+        assert_eq!(endpoints[1].method, "POST");
+        for ep in &endpoints {
+            assert_eq!(ep.path, "/api/users");
+            assert_eq!(ep.owner_node, FILE_BASED_ROUTE_OWNER);
+            assert_eq!(ep.pattern_matched, "astro");
+        }
+    }
+
+    #[test]
+    fn test_file_based_endpoints_astro_dynamic_segment() {
+        let scanner = SwcScanner::new();
+        let content = "export function GET() {}\n";
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("src/pages/posts/[id].ts"),
+            Path::new("src/pages/posts/[id].ts"),
+            content,
+            &builtin_conventions(&["Astro".to_string()]),
+        );
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].method, "GET");
+        assert_eq!(endpoints[0].path, "/posts/:id");
     }
 
     #[test]

@@ -131,6 +131,38 @@ impl RoutingConvention {
         }
     }
 
+    /// Astro endpoints: `src/pages/**` where the filename is the last path
+    /// segment and methods are named exports (`export function GET() {}`,
+    /// `export const POST = ...`). Unlike Next.js pages-router, Astro has no
+    /// forced `/api` prefix — the route is literally the file's path under
+    /// `src/pages` — and methods come from export names, not a single default
+    /// export. Only `.ts`/`.js` files are endpoints; `.astro` files are HTML
+    /// pages and are deliberately excluded. (Astro's `ALL` fallback export is
+    /// not an HTTP method per [`crate::type_manifest::is_http_method`], so a
+    /// route defined solely via `ALL` is not synthesized.)
+    pub fn astro() -> Self {
+        Self {
+            name: "astro".to_string(),
+            root_globs: vec!["src/pages".to_string()],
+            segment_source: SegmentSource::FileName {
+                // Astro routes only `.ts`/`.js` endpoint files under src/pages
+                // (`.astro` files are HTML pages, handled elsewhere). `.mts`/
+                // `.mjs` are not Astro route extensions, and the SWC handler
+                // extractor doesn't parse TS syntax in `.mts` anyway.
+                extensions: vec!["ts".to_string(), "js".to_string()],
+            },
+            path_prefix: String::new(),
+            dynamic_open: "[".to_string(),
+            dynamic_close: "]".to_string(),
+            catch_all_marker: "...".to_string(),
+            // Astro has no route-group syntax; leave the delimiters empty so the
+            // group check in `transform_segment` never fires.
+            group_open: String::new(),
+            group_close: String::new(),
+            method_source: MethodSource::ExportName,
+        }
+    }
+
     /// Strip the longest matching root prefix from a `/`-normalized relative
     /// path. Returns the remainder, or `None` if no root matches.
     fn strip_root<'a>(&self, rel: &'a str) -> Option<&'a str> {
@@ -287,6 +319,9 @@ pub fn builtin_conventions(frameworks: &[String]) -> Vec<RoutingConvention> {
         out.push(RoutingConvention::nextjs_app());
         out.push(RoutingConvention::nextjs_pages());
     }
+    if mentions("astro") {
+        out.push(RoutingConvention::astro());
+    }
     out
 }
 
@@ -415,6 +450,72 @@ mod tests {
     #[test]
     fn pages_api_skips_private_files() {
         assert!(route("pages/api/_middleware.ts").is_none());
+    }
+
+    // --- Astro ---
+
+    fn astro_route(p: &str) -> Option<DerivedRoute> {
+        derive_route(&PathBuf::from(p), &[RoutingConvention::astro()])
+    }
+
+    #[test]
+    fn astro_static_endpoint() {
+        // No forced /api prefix: "api" here is just a literal directory segment.
+        let r = astro_route("src/pages/api/users.ts").unwrap();
+        assert_eq!(r.path, "/api/users");
+        // Methods come from named exports, not a single default handler.
+        assert_eq!(r.method_source, MethodSource::ExportName);
+        assert_eq!(r.convention, "astro");
+    }
+
+    #[test]
+    fn astro_top_level_endpoint() {
+        assert_eq!(astro_route("src/pages/health.ts").unwrap().path, "/health");
+    }
+
+    #[test]
+    fn astro_index_collapses() {
+        assert_eq!(astro_route("src/pages/index.ts").unwrap().path, "/");
+        assert_eq!(astro_route("src/pages/api/index.ts").unwrap().path, "/api");
+    }
+
+    #[test]
+    fn astro_dynamic_filename() {
+        assert_eq!(
+            astro_route("src/pages/posts/[id].ts").unwrap().path,
+            "/posts/:id"
+        );
+    }
+
+    #[test]
+    fn astro_rest_param() {
+        assert_eq!(
+            astro_route("src/pages/files/[...path].ts").unwrap().path,
+            "/files/**"
+        );
+    }
+
+    #[test]
+    fn astro_javascript_endpoint() {
+        assert_eq!(astro_route("src/pages/ping.js").unwrap().path, "/ping");
+    }
+
+    #[test]
+    fn astro_ignores_page_components_and_private_files() {
+        // `.astro` files are HTML pages, not API endpoints.
+        assert!(astro_route("src/pages/about.astro").is_none());
+        // `_`-prefixed files are excluded from Astro routing.
+        assert!(astro_route("src/pages/_helpers.ts").is_none());
+        // Pages outside `src/pages` are not endpoints.
+        assert!(astro_route("src/lib/db.ts").is_none());
+    }
+
+    #[test]
+    fn astro_gated_on_framework_detection() {
+        assert!(builtin_conventions(&["express".to_string()]).is_empty());
+        let astro = builtin_conventions(&["Astro".to_string()]);
+        assert_eq!(astro.len(), 1);
+        assert_eq!(astro[0].name, "astro");
     }
 
     // --- Negative / boundary ---
