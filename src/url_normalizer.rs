@@ -452,7 +452,6 @@ mod tests {
 
     fn create_test_config() -> Config {
         Config {
-            service_name: None,
             internal_domains: [
                 "user-service.internal",
                 "api.company.com",
@@ -473,6 +472,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -788,14 +788,11 @@ mod tests {
     #[test]
     fn test_normalize_template_literal_strips_trailing_backtick() {
         let config = Config {
-            service_name: None,
-            internal_domains: HashSet::new(),
-            external_domains: HashSet::new(),
             internal_env_vars: ["ORDER_SERVICE_URL"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            external_env_vars: HashSet::new(),
+            ..Default::default()
         };
         let normalizer = UrlNormalizer::new(&config);
 

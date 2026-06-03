@@ -975,10 +975,24 @@ fn load_config_and_packages(
 
     let config = if let Some(config_path) = config_file_path {
         debug!("Found carrick.json: {}", config_path.display());
-        Config::new(vec![config_path]).unwrap_or_else(|e| {
+        let mut services = Config::load_services(vec![config_path]).unwrap_or_else(|e| {
             warn!("Error parsing config file: {}", e);
+            Vec::new()
+        });
+        if services.len() > 1 {
+            // Multi-service fan-out is not wired into the engine yet; for now the
+            // first declared service is used. Remaining services are picked up
+            // once the engine iterates per service.
+            debug!(
+                "carrick.json declares {} services; using the first until fan-out lands",
+                services.len()
+            );
+        }
+        if services.is_empty() {
             Config::default()
-        })
+        } else {
+            services.swap_remove(0)
+        }
     } else {
         Config::default()
     };
