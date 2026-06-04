@@ -173,9 +173,16 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     );
 
     // 4. Analyze (incremental if possible)
+    let (config, packages) = load_config_and_packages(repo_path)?;
     let sp = logging::spinner("Analyzing repository...");
-    let current_repo_data =
-        analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref()).await?;
+    let current_repo_data = analyze_current_repo_incremental(
+        repo_path,
+        &config,
+        &packages,
+        sidecar,
+        previous_data.as_ref(),
+    )
+    .await?;
     logging::finish_spinner(&sp, &format!("Analyzed {}", current_repo_data.repo_name));
 
     // Log sidecar type resolution results if available
@@ -487,6 +494,8 @@ fn strip_diagnostic_fields(
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
 async fn analyze_current_repo_incremental(
     repo_path: &str,
+    service: &Config,
+    packages: &Packages,
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
@@ -498,13 +507,12 @@ async fn analyze_current_repo_incremental(
         .unwrap_or_else(|_| repo_path.to_string());
     let repo_path = canonical.as_str();
 
-    // 1. Load config and packages (resolves the service that scopes discovery)
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    let config = service;
 
-    // 2. Discover files and symbols (fast SWC pass, always full), scoped to the service
+    // Discover files and symbols (fast SWC pass, always full), scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, &config, cm.clone())?;
+        discover_files_and_symbols(repo_path, config, cm.clone())?;
 
     // 3. Check if we can use incremental mode
     let can_use_incremental = previous_data.and_then(|prev| {
@@ -591,11 +599,11 @@ async fn analyze_current_repo_incremental(
                     debug!("Reusing cached framework detection and guidance");
                     (det.clone(), guid.clone())
                 } else {
-                    run_framework_detection_and_guidance(&packages, &all_imported_symbols).await?
+                    run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
                 }
             } else {
                 debug!("package.json changed, re-running framework detection");
-                run_framework_detection_and_guidance(&packages, &all_imported_symbols).await?
+                run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
             };
 
             // Run Gemini file analysis ONLY on changed files
@@ -692,8 +700,8 @@ async fn analyze_current_repo_incremental(
                 &repo_name,
                 repo_path,
                 &mount_graph,
-                &config,
-                &packages,
+                config,
+                packages,
                 function_definitions,
             );
 
@@ -707,7 +715,7 @@ async fn analyze_current_repo_incremental(
             cloud_data.cache_version = Some(CACHE_VERSION);
 
             // Build type manifest
-            let manifest_entries = build_type_manifest_entries(&mount_graph, &config);
+            let manifest_entries = build_type_manifest_entries(&mount_graph, config);
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -718,9 +726,9 @@ async fn analyze_current_repo_incremental(
                 &file_orchestrator,
                 &merged_results,
                 repo_path,
-                &packages,
+                packages,
                 &mount_graph,
-                &config,
+                config,
                 &mut cloud_data,
             );
 
@@ -743,7 +751,7 @@ async fn analyze_current_repo_incremental(
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
     debug!("Running full analysis...");
-    let cloud_data = analyze_current_repo(repo_path, sidecar).await?;
+    let cloud_data = analyze_current_repo(repo_path, config, packages, sidecar).await?;
 
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
@@ -1278,6 +1286,8 @@ struct TypeManifestFile {
 
 async fn analyze_current_repo(
     repo_path: &str,
+    service: &Config,
+    packages: &Packages,
     sidecar: Option<&TypeSidecar>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     // Canonicalize repo_path for consistent path normalization between runs
@@ -1288,13 +1298,12 @@ async fn analyze_current_repo(
 
     debug!("Running multi-agent analysis on: {}", repo_path);
 
-    // 1. Load config and packages (resolves the service that scopes discovery)
-    let (config, packages) = load_config_and_packages(repo_path)?;
+    let config = service;
 
-    // 2. Create shared SourceMap and discover files and symbols, scoped to the service
+    // Create shared SourceMap and discover files and symbols, scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, &config, cm.clone())?;
+        discover_files_and_symbols(repo_path, config, cm.clone())?;
     debug!(
         "Repository '{}': {} files, {} function definitions",
         repo_name,
@@ -1307,7 +1316,7 @@ async fn analyze_current_repo(
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files, &packages, &all_imported_symbols, repo_path)
+        .run_complete_analysis(files, packages, &all_imported_symbols, repo_path)
         .await?;
 
     // 4b. Generate function intents using LLM
@@ -1330,13 +1339,13 @@ async fn analyze_current_repo(
         repo_name.clone(),
         repo_path,
         &analysis_result,
-        serde_json::to_string(&config).ok(),
-        serde_json::to_string(&packages).ok(),
+        serde_json::to_string(config).ok(),
+        serde_json::to_string(packages).ok(),
         Some(packages.clone()),
         function_definitions.clone(),
     );
 
-    let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, &config);
+    let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -1350,9 +1359,9 @@ async fn analyze_current_repo(
         &file_orchestrator,
         &analysis_result.file_results,
         repo_path,
-        &packages,
+        packages,
         &analysis_result.mount_graph,
-        &config,
+        config,
         &mut cloud_data,
     );
 
