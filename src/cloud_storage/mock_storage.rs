@@ -30,9 +30,18 @@ impl MockStorage {
 #[async_trait]
 impl CloudStorage for MockStorage {
     async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
-        debug!("MOCK: Uploading repo data for repo: {}", data.repo_name);
+        debug!(
+            "MOCK: Uploading repo data for repo: {} (service: {:?})",
+            data.repo_name, data.service_name
+        );
         self.data.lock().unwrap().push(data.clone());
         Ok(())
+    }
+
+    // In-memory store keyed per uploaded entry — safe to hold many services
+    // per repo, so multi-service fan-out can be exercised under CARRICK_MOCK_ALL.
+    fn supports_multi_service(&self) -> bool {
+        true
     }
 
     async fn post_pr_comment(
