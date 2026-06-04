@@ -7,7 +7,7 @@ use crate::cloud_storage::{
     TypeManifestEntry, get_current_commit_hash,
 };
 use crate::config::{Config, create_dynamic_tsconfig};
-use crate::file_finder::{find_files, find_service_files};
+use crate::file_finder::find_service_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::intent_generator::generate_function_intents;
 use crate::logging;
@@ -1006,7 +1006,7 @@ fn discover_files_and_symbols(
     let repo_name = get_repository_name(repo_path);
 
     // Find files scoped to this service's directory (+ include roots).
-    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
+    let ignore_patterns = service_ignore_patterns(service);
     let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
@@ -1052,10 +1052,12 @@ fn discover_files_and_symbols(
 /// root (zero-config single-service mode). A `services` array yields one entry
 /// per declared service. Always returns at least one service.
 fn resolve_services(repo_path: &str) -> Vec<Config> {
-    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (_, config_file_path, _) = find_files(repo_path, &ignore_patterns);
+    // carrick.json belongs at the scan root. Read it there directly rather than
+    // walking the tree (a tree walk would pick up nested example/fixture
+    // configs in a repo that contains them).
+    let config_path = std::path::Path::new(repo_path).join("carrick.json");
 
-    let services = if let Some(config_path) = config_file_path {
+    let services = if config_path.is_file() {
         debug!("Found carrick.json: {}", config_path.display());
         Config::load_services(vec![config_path]).unwrap_or_else(|e| {
             warn!("Error parsing config file: {}", e);
@@ -1072,10 +1074,25 @@ fn resolve_services(repo_path: &str) -> Vec<Config> {
     }
 }
 
+/// Build-artifact directories to skip everywhere.
+///
+/// `ts_check` is the scanner's own bundled type-checker, which sits at the scan
+/// root when the GitHub Action runs `./carrick .`. It's only ignored for the
+/// implicit whole-repo scan (`directory: None`); an explicitly declared service
+/// directory is honoured even if it is named `ts_check`, so a repo can index
+/// such a directory on purpose.
+fn service_ignore_patterns(service: &Config) -> Vec<&'static str> {
+    let mut patterns = vec!["node_modules", "dist", "build", ".next"];
+    if service.directory.is_none() {
+        patterns.push("ts_check");
+    }
+    patterns
+}
+
 /// Load the package data for a single service, scoped to its own
 /// `package.json` (within its directory), not an arbitrary one from the repo.
 fn load_packages_for_service(repo_path: &str, service: &Config) -> Packages {
-    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
+    let ignore_patterns = service_ignore_patterns(service);
     let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
     if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
