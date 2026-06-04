@@ -175,6 +175,9 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     for service in &services {
         let packages = load_packages_for_service(repo_path, service);
 
+        // Scope the sidecar's type extraction to this service's directory/tsconfig.
+        scope_sidecar_to_service(sidecar, repo_path, service);
+
         // Incremental cache is per service: match on repo + service name so
         // editing one service does not invalidate the others.
         let previous_data = if no_cache {
@@ -896,6 +899,44 @@ fn build_cloud_data_from_mount_graph(
         cached_guidance: None,
         package_json_hash: None,
         cache_version: None,
+    }
+}
+
+/// Re-scope the already-spawned sidecar to a single service's project so type
+/// extraction uses that service's directory and tsconfig instead of the whole
+/// repo. No-op for a whole-repo service (no `directory` and no `tsconfig`),
+/// which keeps the single-service path on the warm init done in `main`.
+///
+/// Re-init rebuilds the sidecar's ts-morph project; for a large monorepo this
+/// runs once per scoped service. A future optimization could load all service
+/// projects in a single init via the sidecar's monorepo builder.
+fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, service: &Config) {
+    let Some(sidecar) = sidecar else { return };
+    if service.directory.is_none() && service.tsconfig.is_none() {
+        return; // whole-repo service: already initialized at the repo root
+    }
+
+    // Match main()'s absolute-path init so the sidecar resolves files the same way.
+    let canonical =
+        std::fs::canonicalize(repo_path).unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
+    let service_root = match &service.directory {
+        Some(dir) => canonical.join(dir),
+        None => canonical,
+    };
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+
+    debug!(
+        "Re-initializing sidecar for service '{}' at {}",
+        label,
+        service_root.display()
+    );
+    sidecar.start_init(&service_root, service.tsconfig.as_deref());
+    if let Err(e) = sidecar.wait_ready(Duration::from_secs(30)) {
+        warn!(
+            "Sidecar re-init for service '{}' failed: {} — type extraction may be skipped \
+             for this service",
+            label, e
+        );
     }
 }
 
