@@ -9,6 +9,11 @@ use tracing::{debug, warn};
 pub struct AwsStorage {
     lambda_url: String,
     http_client: Client,
+    /// Whether the cloud advertises a service-aware index key (set from the
+    /// health-check response). Until the cloud key includes a service
+    /// discriminator this stays false, which gates multi-service uploads so
+    /// they can't clobber each other.
+    multi_service: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -39,6 +44,11 @@ struct LambdaResponse {
     #[serde(default)]
     #[allow(dead_code)]
     adjacent: Vec<AdjacentRepo>,
+    /// Cloud capability: true once the index key includes a service
+    /// discriminator, so multiple services per repo can coexist. Absent on
+    /// older clouds, defaulting to false (gated).
+    #[serde(default, rename = "multiService")]
+    multi_service: bool,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +95,7 @@ impl AwsStorage {
         Ok(Self {
             lambda_url,
             http_client: Client::new(),
+            multi_service: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -417,7 +428,14 @@ impl CloudStorage for AwsStorage {
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
-            Ok(_) => Ok(()),
+            Ok(resp) => {
+                // Record whether the cloud advertises a service-aware key, so
+                // the multi-service upload gate can open without a scanner
+                // release once the cloud deploys the key change.
+                self.multi_service
+                    .store(resp.multi_service, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
             Err(StorageError::ConnectionError(msg))
                 if msg.contains("401") || msg.contains("403") =>
             {
@@ -425,5 +443,10 @@ impl CloudStorage for AwsStorage {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn supports_multi_service(&self) -> bool {
+        self.multi_service
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }

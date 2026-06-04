@@ -7,7 +7,7 @@ use crate::cloud_storage::{
     TypeManifestEntry, get_current_commit_hash,
 };
 use crate::config::{Config, create_dynamic_tsconfig};
-use crate::file_finder::find_files;
+use crate::file_finder::find_service_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::intent_generator::generate_function_intents;
 use crate::logging;
@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use serde::Serialize;
 use swc_common::{
@@ -152,76 +152,113 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
 
-    // 3. Extract previous data for current repo (if any)
+    // 3. Resolve the services declared for this repo (one for the common
+    //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
-    let previous_data = if no_cache {
-        debug!("--no-cache: skipping incremental cache");
-        None
-    } else {
-        let data = all_repo_data
-            .iter()
-            .find(|r| r.repo_name == repo_name)
-            .cloned();
-        if data.is_some() {
-            debug!("Found previous analysis data for {}", repo_name);
-        }
-        data
-    };
+    let services = resolve_services(repo_path);
+    let multi_service = services.len() > 1;
+    if multi_service {
+        info!(
+            "carrick.json declares {} services in {}",
+            services.len(),
+            repo_name
+        );
+    }
     logging::finish_spinner(
         &sp,
         &format!("Downloaded data from {} repos", all_repo_data.len()),
     );
 
-    // 4. Analyze (incremental if possible)
+    // 4. Analyze each service (incremental per service where possible).
     let sp = logging::spinner("Analyzing repository...");
-    let current_repo_data =
-        analyze_current_repo_incremental(repo_path, sidecar, previous_data.as_ref()).await?;
-    logging::finish_spinner(&sp, &format!("Analyzed {}", current_repo_data.repo_name));
+    let mut current_services_data = Vec::with_capacity(services.len());
+    for service in &services {
+        let packages = load_packages_for_service(repo_path, service);
 
-    // Log sidecar type resolution results if available
-    if current_repo_data.bundled_types.is_some() {
-        debug!(
-            "Type resolution: {} bundled types, {} manifest entries",
-            current_repo_data
-                .bundled_types
-                .as_ref()
-                .map(|s| s.lines().count())
-                .unwrap_or(0),
-            current_repo_data
-                .type_manifest
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0)
-        );
+        // Scope the sidecar's type extraction to this service's directory/tsconfig.
+        scope_sidecar_to_service(sidecar, repo_path, service);
+
+        // Incremental cache is per service: match on repo + service name so
+        // editing one service does not invalidate the others.
+        let previous_data = if no_cache {
+            None
+        } else {
+            all_repo_data
+                .iter()
+                .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
+                .cloned()
+        };
+
+        let data = analyze_current_repo_incremental(
+            repo_path,
+            service,
+            &packages,
+            sidecar,
+            previous_data.as_ref(),
+        )
+        .await?;
+
+        if data.bundled_types.is_some() {
+            debug!(
+                "Type resolution ({}): {} bundled types, {} manifest entries",
+                data.service_name.as_deref().unwrap_or(&repo_name),
+                data.bundled_types
+                    .as_ref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0),
+                data.type_manifest.as_ref().map(|v| v.len()).unwrap_or(0)
+            );
+        }
+
+        current_services_data.push(data);
     }
+    logging::finish_spinner(
+        &sp,
+        &format!("Analyzed {} ({} service(s))", repo_name, services.len()),
+    );
 
-    // 5. Conditionally upload current repo data to cloud storage
+    // 5. Conditionally upload each service's data to cloud storage.
+    //    The production index keys on (workspace, project, repo) only, so it
+    //    cannot yet hold more than one service per repo — a multi-service
+    //    upload would clobber. Gate it on the backend advertising support;
+    //    cross-repo analysis below still runs locally regardless.
     if should_upload {
-        let sp = logging::spinner("Uploading results...");
-        let cloud_data_serialized = strip_ast_nodes(current_repo_data.clone());
-        storage
-            .upload_repo_data(&cloud_data_serialized)
-            .await
-            .map_err(|e| format!("Failed to upload repo data: {}", e))?;
-        logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
+        if multi_service && !storage.supports_multi_service() {
+            warn!(
+                "Skipping index upload: {} services declared but the cloud key has no \
+                 service discriminator yet, so uploads would overwrite each other. \
+                 Cross-repo analysis still runs locally.",
+                services.len()
+            );
+        } else {
+            let sp = logging::spinner("Uploading results...");
+            for data in &current_services_data {
+                let cloud_data_serialized = strip_ast_nodes(data.clone());
+                storage
+                    .upload_repo_data(&cloud_data_serialized)
+                    .await
+                    .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+            }
+            logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
+        }
     } else {
         debug!("Skipping upload (PR/branch mode)");
     }
 
-    // 6. Cross-repo analysis (reuse already-downloaded data)
-    // Remove current repo from cross-repo data to prevent duplicate processing
-    let current_repo_name = &current_repo_data.repo_name;
-    all_repo_data.retain(|repo| &repo.repo_name != current_repo_name);
+    // 6. Cross-repo analysis (reuse already-downloaded data).
+    // Remove this repo's downloaded copies so the freshly-analyzed services
+    // are the ones used.
+    all_repo_data.retain(|repo| repo.repo_name != repo_name);
 
     debug!(
-        "Cross-repo analysis with {} repos (excluding {})",
+        "Cross-repo analysis with {} other repos + {} local service(s)",
         all_repo_data.len(),
-        current_repo_name
+        current_services_data.len()
     );
 
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
-        build_cross_repo_analyzer(all_repo_data, current_repo_data, ts_check_dir).await?;
+        build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await?;
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
@@ -487,6 +524,8 @@ fn strip_diagnostic_fields(
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
 async fn analyze_current_repo_incremental(
     repo_path: &str,
+    service: &Config,
+    packages: &Packages,
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
@@ -498,13 +537,12 @@ async fn analyze_current_repo_incremental(
         .unwrap_or_else(|_| repo_path.to_string());
     let repo_path = canonical.as_str();
 
-    // 1. Discover files and symbols (fast SWC pass, always full)
+    let config = service;
+
+    // Discover files and symbols (fast SWC pass, always full), scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, cm.clone())?;
-
-    // 2. Load config and packages
-    let (config, packages) = load_config_and_packages(repo_path)?;
+        discover_files_and_symbols(repo_path, config, cm.clone())?;
 
     // 3. Check if we can use incremental mode
     let can_use_incremental = previous_data.and_then(|prev| {
@@ -591,11 +629,11 @@ async fn analyze_current_repo_incremental(
                     debug!("Reusing cached framework detection and guidance");
                     (det.clone(), guid.clone())
                 } else {
-                    run_framework_detection_and_guidance(&packages, &all_imported_symbols).await?
+                    run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
                 }
             } else {
                 debug!("package.json changed, re-running framework detection");
-                run_framework_detection_and_guidance(&packages, &all_imported_symbols).await?
+                run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
             };
 
             // Run Gemini file analysis ONLY on changed files
@@ -692,8 +730,8 @@ async fn analyze_current_repo_incremental(
                 &repo_name,
                 repo_path,
                 &mount_graph,
-                &config,
-                &packages,
+                config,
+                packages,
                 function_definitions,
             );
 
@@ -707,7 +745,7 @@ async fn analyze_current_repo_incremental(
             cloud_data.cache_version = Some(CACHE_VERSION);
 
             // Build type manifest
-            let manifest_entries = build_type_manifest_entries(&mount_graph, &config);
+            let manifest_entries = build_type_manifest_entries(&mount_graph, config);
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -718,9 +756,9 @@ async fn analyze_current_repo_incremental(
                 &file_orchestrator,
                 &merged_results,
                 repo_path,
-                &packages,
+                packages,
                 &mount_graph,
-                &config,
+                config,
                 &mut cloud_data,
             );
 
@@ -743,7 +781,7 @@ async fn analyze_current_repo_incremental(
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
     debug!("Running full analysis...");
-    let cloud_data = analyze_current_repo(repo_path, sidecar).await?;
+    let cloud_data = analyze_current_repo(repo_path, config, packages, sidecar).await?;
 
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
@@ -864,6 +902,44 @@ fn build_cloud_data_from_mount_graph(
     }
 }
 
+/// Re-scope the already-spawned sidecar to a single service's project so type
+/// extraction uses that service's directory and tsconfig instead of the whole
+/// repo. No-op for a whole-repo service (no `directory` and no `tsconfig`),
+/// which keeps the single-service path on the warm init done in `main`.
+///
+/// Re-init rebuilds the sidecar's ts-morph project; for a large monorepo this
+/// runs once per scoped service. A future optimization could load all service
+/// projects in a single init via the sidecar's monorepo builder.
+fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, service: &Config) {
+    let Some(sidecar) = sidecar else { return };
+    if service.directory.is_none() && service.tsconfig.is_none() {
+        return; // whole-repo service: already initialized at the repo root
+    }
+
+    // Match main()'s absolute-path init so the sidecar resolves files the same way.
+    let canonical =
+        std::fs::canonicalize(repo_path).unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
+    let service_root = match &service.directory {
+        Some(dir) => canonical.join(dir),
+        None => canonical,
+    };
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+
+    debug!(
+        "Re-initializing sidecar for service '{}' at {}",
+        label,
+        service_root.display()
+    );
+    sidecar.start_init(&service_root, service.tsconfig.as_deref());
+    if let Err(e) = sidecar.wait_ready(Duration::from_secs(30)) {
+        warn!(
+            "Sidecar re-init for service '{}' failed: {} — type extraction may be skipped \
+             for this service",
+            label, e
+        );
+    }
+}
+
 /// Resolve types via sidecar if available (shared logic for full and incremental paths).
 #[allow(clippy::too_many_arguments)]
 fn resolve_types_if_available(
@@ -921,13 +997,17 @@ fn resolve_types_if_available(
 }
 
 /// Discover files and extract symbols for MultiAgentOrchestrator
-fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
+fn discover_files_and_symbols(
+    repo_path: &str,
+    service: &Config,
+    cm: Lrc<SourceMap>,
+) -> FileDiscoveryResult {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
-    // Find files in current repo only
-    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (files, _, _) = find_files(repo_path, &ignore_patterns);
+    // Find files scoped to this service's directory (+ include roots).
+    let ignore_patterns = service_ignore_patterns(service);
+    let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
 
@@ -966,24 +1046,55 @@ fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscov
     ))
 }
 
-/// Extract config and package loading logic
-fn load_config_and_packages(
-    repo_path: &str,
-) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
-    let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
+/// Resolve a repo's `carrick.json` into one service config per service.
+///
+/// No config, or a flat config, yields a single service rooted at the repo
+/// root (zero-config single-service mode). A `services` array yields one entry
+/// per declared service. Always returns at least one service.
+fn resolve_services(repo_path: &str) -> Vec<Config> {
+    // carrick.json belongs at the scan root. Read it there directly rather than
+    // walking the tree (a tree walk would pick up nested example/fixture
+    // configs in a repo that contains them).
+    let config_path = std::path::Path::new(repo_path).join("carrick.json");
 
-    let config = if let Some(config_path) = config_file_path {
+    let services = if config_path.is_file() {
         debug!("Found carrick.json: {}", config_path.display());
-        Config::new(vec![config_path]).unwrap_or_else(|e| {
+        Config::load_services(vec![config_path]).unwrap_or_else(|e| {
             warn!("Error parsing config file: {}", e);
-            Config::default()
+            Vec::new()
         })
     } else {
-        Config::default()
+        Vec::new()
     };
 
-    let packages = if let Some(package_path) = package_json_path {
+    if services.is_empty() {
+        vec![Config::default()]
+    } else {
+        services
+    }
+}
+
+/// Build-artifact directories to skip everywhere.
+///
+/// `ts_check` is the scanner's own bundled type-checker, which sits at the scan
+/// root when the GitHub Action runs `./carrick .`. It's only ignored for the
+/// implicit whole-repo scan (`directory: None`); an explicitly declared service
+/// directory is honoured even if it is named `ts_check`, so a repo can index
+/// such a directory on purpose.
+fn service_ignore_patterns(service: &Config) -> Vec<&'static str> {
+    let mut patterns = vec!["node_modules", "dist", "build", ".next"];
+    if service.directory.is_none() {
+        patterns.push("ts_check");
+    }
+    patterns
+}
+
+/// Load the package data for a single service, scoped to its own
+/// `package.json` (within its directory), not an arbitrary one from the repo.
+fn load_packages_for_service(repo_path: &str, service: &Config) -> Packages {
+    let ignore_patterns = service_ignore_patterns(service);
+    let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
+    if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
         Packages::new(vec![package_path]).unwrap_or_else(|e| {
             warn!("Error parsing package.json: {}", e);
@@ -991,9 +1102,7 @@ fn load_config_and_packages(
         })
     } else {
         Packages::default()
-    };
-
-    Ok((config, packages))
+    }
 }
 
 /// Resolve per-endpoint type definitions using the sidecar's compiler.
@@ -1257,6 +1366,8 @@ struct TypeManifestFile {
 
 async fn analyze_current_repo(
     repo_path: &str,
+    service: &Config,
+    packages: &Packages,
     sidecar: Option<&TypeSidecar>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     // Canonicalize repo_path for consistent path normalization between runs
@@ -1267,10 +1378,12 @@ async fn analyze_current_repo(
 
     debug!("Running multi-agent analysis on: {}", repo_path);
 
-    // 1. Create shared SourceMap and discover files and symbols
+    let config = service;
+
+    // Create shared SourceMap and discover files and symbols, scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, cm.clone())?;
+        discover_files_and_symbols(repo_path, config, cm.clone())?;
     debug!(
         "Repository '{}': {} files, {} function definitions",
         repo_name,
@@ -1278,15 +1391,12 @@ async fn analyze_current_repo(
         function_definitions.len()
     );
 
-    // 2. Load config and packages using existing logic
-    let (config, packages) = load_config_and_packages(repo_path)?;
-
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files, &packages, &all_imported_symbols, repo_path)
+        .run_complete_analysis(files, packages, &all_imported_symbols, repo_path)
         .await?;
 
     // 4b. Generate function intents using LLM
@@ -1309,13 +1419,13 @@ async fn analyze_current_repo(
         repo_name.clone(),
         repo_path,
         &analysis_result,
-        serde_json::to_string(&config).ok(),
-        serde_json::to_string(&packages).ok(),
+        serde_json::to_string(config).ok(),
+        serde_json::to_string(packages).ok(),
         Some(packages.clone()),
         function_definitions.clone(),
     );
 
-    let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, &config);
+    let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -1329,9 +1439,9 @@ async fn analyze_current_repo(
         &file_orchestrator,
         &analysis_result.file_results,
         repo_path,
-        &packages,
+        packages,
         &analysis_result.mount_graph,
-        &config,
+        config,
         &mut cloud_data,
     );
 
@@ -1364,11 +1474,11 @@ async fn analyze_current_repo(
 
 async fn build_cross_repo_analyzer(
     mut all_repo_data: Vec<CloudRepoData>,
-    current_repo_data: CloudRepoData,
+    current_repos: Vec<CloudRepoData>,
     ts_check_dir: Option<&std::path::Path>,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
-    // Add current repo data to the mix
-    all_repo_data.push(current_repo_data);
+    // Add the freshly-analyzed local services (one per service) to the mix
+    all_repo_data.extend(current_repos);
     // 1. Merge configs and packages using generic function
     let combined_config = merge_serialized_data(&all_repo_data, |data| data.config_json.as_ref())?;
     let combined_packages =
@@ -1383,10 +1493,17 @@ async fn build_cross_repo_analyzer(
     let merged_mount_graph = MountGraph::merge_from_repos(&all_repo_data);
     analyzer.set_mount_graph(merged_mount_graph);
 
-    // 4. Add packages data from all repos for dependency analysis
+    // 4. Add packages data from all repos for dependency analysis. Key by
+    //    service identity (service_name, falling back to repo_name) so two
+    //    services in the same monorepo don't overwrite each other — matching
+    //    the cloud's service_name ?? repo_name attribution convention.
     for repo_data in &all_repo_data {
         if let Some(packages) = &repo_data.packages {
-            analyzer.add_repo_packages(repo_data.repo_name.clone(), packages.clone());
+            let key = repo_data
+                .service_name
+                .clone()
+                .unwrap_or_else(|| repo_data.repo_name.clone());
+            analyzer.add_repo_packages(key, packages.clone());
         }
     }
 

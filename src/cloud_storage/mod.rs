@@ -270,6 +270,17 @@ impl Error for StorageError {}
 #[async_trait]
 pub trait CloudStorage {
     async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError>;
+
+    /// Whether this backend can store more than one service per git repo
+    /// without collision. The production index keys on
+    /// (workspace, project, repo) only — no service discriminator — so real
+    /// uploads of multiple services from one repo would overwrite each other.
+    /// Mock storage records uploads in memory and is safe, so it overrides
+    /// this. Gates multi-service index upload in the engine.
+    fn supports_multi_service(&self) -> bool {
+        false
+    }
+
     async fn download_all_repo_data(
         &self,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError>;

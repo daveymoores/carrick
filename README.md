@@ -110,6 +110,37 @@ Add a `carrick.json` to each indexed service to help classify outbound calls.
 
 When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`, it needs to know whether `ORDER_SERVICE_URL` points internally or externally. Unclassified env vars surface as a configuration suggestion in the PR comment.
 
+### Monorepos
+
+`carrick.json` is optional — with no config (or a flat config like above) Carrick scans the repo as a single service. To index several services from one repository (e.g. a set of lambdas plus a dashboard), declare them with a `services` array instead. Each entry is scanned independently and indexed as its own service:
+
+```json
+{
+  "services": [
+    {
+      "name": "check-or-upload",
+      "directory": "lambdas/check-or-upload",
+      "include": ["lambdas/_shared"],
+      "internalEnvVars": ["CARRICK_API_ENDPOINT"]
+    },
+    {
+      "name": "dashboard",
+      "directory": "app",
+      "tsconfig": "tsconfig.json"
+    }
+  ]
+}
+```
+
+| Field | Description |
+| :--- | :--- |
+| `name` | Service name (alias for `serviceName` inside a `services` entry) |
+| `directory` | Service root, relative to `carrick.json`. Files outside every declared directory are ignored |
+| `include` | Extra source roots to pull in for type/function resolution (e.g. shared libraries copied in at build time), relative to `carrick.json` |
+| `tsconfig` | Path to this service's `tsconfig.json`, relative to `directory`. Scopes type extraction to the service |
+
+Each service also accepts the call-classification fields (`internalEnvVars`, `externalEnvVars`, `internalDomains`, `externalDomains`). When `services` is present, any sibling top-level flat fields are ignored. Cross-service drift, dependency conflicts, and duplicate intents are detected between the declared services just as they are across repositories.
+
 ## How it works
 
 1. SWC parses each TypeScript file into an AST.

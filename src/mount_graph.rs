@@ -811,11 +811,9 @@ mod tests {
 
         // Create config with internal domain
         let config = Config {
-            service_name: None,
             internal_domains: ["user-service.internal".to_string()].into_iter().collect(),
             external_domains: ["api.stripe.com".to_string()].into_iter().collect(),
-            internal_env_vars: Default::default(),
-            external_env_vars: Default::default(),
+            ..Default::default()
         };
 
         // Test: Full internal URL should match
@@ -1085,11 +1083,9 @@ mod tests {
         });
 
         let config = Config {
-            service_name: None,
-            internal_domains: Default::default(),
-            external_domains: Default::default(),
             internal_env_vars: ["ORDER_SERVICE_URL".to_string()].into_iter().collect(),
             external_env_vars: ["STRIPE_API".to_string()].into_iter().collect(),
+            ..Default::default()
         };
 
         // Test: Internal env var pattern should match
@@ -1127,11 +1123,8 @@ mod tests {
         });
 
         let config = Config {
-            service_name: None,
-            internal_domains: Default::default(),
-            external_domains: Default::default(),
             internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
-            external_env_vars: Default::default(),
+            ..Default::default()
         };
 
         // Test: Template literal should be normalized and matched
