@@ -7,7 +7,7 @@ use crate::cloud_storage::{
     TypeManifestEntry, get_current_commit_hash,
 };
 use crate::config::{Config, create_dynamic_tsconfig};
-use crate::file_finder::find_files;
+use crate::file_finder::{find_files, find_service_files};
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::intent_generator::generate_function_intents;
 use crate::logging;
@@ -498,13 +498,13 @@ async fn analyze_current_repo_incremental(
         .unwrap_or_else(|_| repo_path.to_string());
     let repo_path = canonical.as_str();
 
-    // 1. Discover files and symbols (fast SWC pass, always full)
+    // 1. Load config and packages (resolves the service that scopes discovery)
+    let (config, packages) = load_config_and_packages(repo_path)?;
+
+    // 2. Discover files and symbols (fast SWC pass, always full), scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, cm.clone())?;
-
-    // 2. Load config and packages
-    let (config, packages) = load_config_and_packages(repo_path)?;
+        discover_files_and_symbols(repo_path, &config, cm.clone())?;
 
     // 3. Check if we can use incremental mode
     let can_use_incremental = previous_data.and_then(|prev| {
@@ -921,13 +921,17 @@ fn resolve_types_if_available(
 }
 
 /// Discover files and extract symbols for MultiAgentOrchestrator
-fn discover_files_and_symbols(repo_path: &str, cm: Lrc<SourceMap>) -> FileDiscoveryResult {
+fn discover_files_and_symbols(
+    repo_path: &str,
+    service: &Config,
+    cm: Lrc<SourceMap>,
+) -> FileDiscoveryResult {
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
-    // Find files in current repo only
+    // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (files, _, _) = find_files(repo_path, &ignore_patterns);
+    let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
 
@@ -971,7 +975,7 @@ fn load_config_and_packages(
     repo_path: &str,
 ) -> Result<(Config, Packages), Box<dyn std::error::Error>> {
     let ignore_patterns = ["node_modules", "dist", "build", ".next", "ts_check"];
-    let (_, config_file_path, package_json_path) = find_files(repo_path, &ignore_patterns);
+    let (_, config_file_path, _) = find_files(repo_path, &ignore_patterns);
 
     let config = if let Some(config_path) = config_file_path {
         debug!("Found carrick.json: {}", config_path.display());
@@ -997,6 +1001,9 @@ fn load_config_and_packages(
         Config::default()
     };
 
+    // Resolve packages from the service's own package.json (scoped to its
+    // directory), not an arbitrary one from anywhere in the repo.
+    let (_, package_json_path) = find_service_files(repo_path, &config, &ignore_patterns);
     let packages = if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
         Packages::new(vec![package_path]).unwrap_or_else(|e| {
@@ -1281,19 +1288,19 @@ async fn analyze_current_repo(
 
     debug!("Running multi-agent analysis on: {}", repo_path);
 
-    // 1. Create shared SourceMap and discover files and symbols
+    // 1. Load config and packages (resolves the service that scopes discovery)
+    let (config, packages) = load_config_and_packages(repo_path)?;
+
+    // 2. Create shared SourceMap and discover files and symbols, scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, cm.clone())?;
+        discover_files_and_symbols(repo_path, &config, cm.clone())?;
     debug!(
         "Repository '{}': {} files, {} function definitions",
         repo_name,
         files.len(),
         function_definitions.len()
     );
-
-    // 2. Load config and packages using existing logic
-    let (config, packages) = load_config_and_packages(repo_path)?;
 
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
