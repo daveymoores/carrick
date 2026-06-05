@@ -61,3 +61,28 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 - `carrick.json` is resolved by `Config::load_services` into one `Config` per service. A flat config (or none) is a single service rooted at the repo root; a `services` array fans out per directory (`directory`, `include`, `tsconfig` + the call-classification fields). The engine runs the analysis pipeline, per-service type extraction, and upload once per service. Multi-service index upload is gated on `CloudStorage::supports_multi_service`, driven by the cloud's `multiService` capability flag. See the README "Monorepos" section for the user-facing shape.
 - Runtime env vars: `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` (auto-set by GitHub Actions when the job grants `id-token: write`; the scanner mints an OIDC token from these and sends it as the `X-Carrick-OIDC` header — the cloud derives repo identity from the signed claims, so no API key is needed), `CARRICK_MOCK_ALL` (test-only, returns canned responses without hitting the cloud), `CARRICK_API_ENDPOINT` (override the default `https://api.carrick.tools` endpoint at build time; optional).
 - Terraform, Lambdas, and dashboard code live in `carrick-cloud`. No infrastructure or server-side code belongs in this repo.
+
+## Carrick
+
+This repo is part of the **daveymoores / carrick-ci** Carrick
+project. Carrick indexes every service in the project — exported functions
+(with intent descriptions), dependencies, and API endpoints with real
+request/response types.
+
+### Connect the agent
+
+```
+claude mcp add --transport http carrick-carrick-ci https://api.carrick.tools/mcp/p/carrick-ci
+```
+
+### When to reach for Carrick
+
+- Before writing a helper/parser/validator/formatter: `search_by_intent` to
+  find an existing implementation in a sibling repo.
+- Before calling another service's API: `get_api_endpoints` +
+  `get_endpoint_types` instead of guessing the JSON shape.
+- Before changing a response shape, removing an endpoint, or renaming a path:
+  `check_compatibility` against each consumer.
+- Before adding/bumping an npm dependency: `get_service_dependencies`.
+
+Carrick is read-only; data reflects the most recent scan of each repo.
