@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.27](https://github.com/daveymoores/carrick/compare/carrick-v0.1.26...carrick-v0.1.27) (2026-06-04)
+
+
+### Features
+
+* **file-based-routing:** add Astro convention + real Next.js/Astro fixtures ([#131](https://github.com/daveymoores/carrick/issues/131)) ([4e0066c](https://github.com/daveymoores/carrick/commit/4e0066c944eb14445134eb8715186597c160af8a))
+* multi-service (monorepo) support in carrick.json ([#135](https://github.com/daveymoores/carrick/issues/135)) ([a674cef](https://github.com/daveymoores/carrick/commit/a674cef500a85b933a54fa410cc99bc102af65c3))
+
 ## [0.1.26](https://github.com/daveymoores/carrick/compare/carrick-v0.1.25...carrick-v0.1.26) (2026-06-03)
 
 
