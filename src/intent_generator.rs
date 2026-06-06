@@ -231,6 +231,16 @@ pub async fn generate_function_intents(
                         hashes.insert(name.clone(), hash);
                         intents.insert(name, intent);
                         generated += 1;
+                    } else {
+                        // Empty or over-long response: drop it. The function
+                        // keeps `intent = None`, so it (and its callers) retry
+                        // next scan. Log it — otherwise this is a silent,
+                        // permanent cache miss.
+                        warn!(
+                            "Discarding intent for {} ({} chars, expected 1..500)",
+                            name,
+                            intent.len()
+                        );
                     }
                 }
                 Err(e) => {

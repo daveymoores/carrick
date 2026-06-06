@@ -2461,6 +2461,70 @@ mod tests {
     }
 
     #[test]
+    fn test_function_definition_intent_hash_roundtrips() {
+        // The content-hash cache only works if `intent` and `intent_input_hash`
+        // survive the upload/download JSON round-trip. A silently-dropped hash
+        // would turn every incremental scan into a full cache miss.
+        let mut function_definitions = HashMap::new();
+        function_definitions.insert(
+            "getUser".to_string(),
+            crate::visitor::FunctionDefinition {
+                name: "getUser".to_string(),
+                file_path: "src/users.ts".into(),
+                node_type: Default::default(),
+                arguments: vec![],
+                body_source: None, // stripped before upload
+                is_exported: true,
+                line_number: 1,
+                intent: Some("fetches a user by id".to_string()),
+                calls: vec![],
+                return_type: None,
+                return_is_explicit: false,
+                signature: None,
+                intent_input_hash: Some("deadbeef".to_string()),
+            },
+        );
+
+        let data = CloudRepoData {
+            repo_name: "svc".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions,
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "abc123".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            package_json_hash: None,
+            cache_version: Some(CACHE_VERSION),
+        };
+
+        let json = serde_json::to_string(&data).expect("should serialize");
+        let deserialized: CloudRepoData = serde_json::from_str(&json).expect("should deserialize");
+
+        let def = &deserialized.function_definitions["getUser"];
+        assert_eq!(def.intent.as_deref(), Some("fetches a user by id"));
+        assert_eq!(def.intent_input_hash.as_deref(), Some("deadbeef"));
+
+        // And the map feeding the cache is rebuilt correctly from that blob.
+        let by_hash = crate::intent_generator::intents_by_hash(&deserialized.function_definitions);
+        assert_eq!(
+            by_hash.get("deadbeef").map(String::as_str),
+            Some("fetches a user by id")
+        );
+    }
+
+    #[test]
     fn test_cloud_repo_data_without_cache_fields_deserializes() {
         // Old CloudRepoData without cache fields should still deserialize (backwards compat)
         let json = r#"{
