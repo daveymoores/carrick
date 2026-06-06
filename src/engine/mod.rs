@@ -9,7 +9,7 @@ use crate::cloud_storage::{
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_service_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
-use crate::intent_generator::generate_function_intents;
+use crate::intent_generator::{generate_function_intents, intents_by_hash};
 use crate::logging;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
@@ -685,34 +685,20 @@ async fn analyze_current_repo_incremental(
             // Run on the same path as the full analysis so incremental scans
             // populate FunctionDefinition.intent in DDB (issue #110).
             //
-            // Optimization: copy intents from `prev.function_definitions` for
-            // functions whose source file did not change. The intent generator
-            // skips entries that already have `intent` set, so this avoids
-            // re-calling /generate-intent for code that hasn't moved. Caveat:
-            // if a function in an unchanged file calls a function in a
-            // changed file, the cached intent may be slightly stale relative
-            // to its callee's new behavior — acceptable trade-off; a full
-            // scan or a touch of the caller's file refreshes it.
+            // Caching is content-addressed: a `content_hash -> intent` map from
+            // the previous scan lets the generator reuse an intent whenever a
+            // function's body and its callees' intents are unchanged — without
+            // re-calling /generate-intent. Unlike the old name+file seeding,
+            // this also refreshes a caller in an unchanged file when one of its
+            // callees changed (the caller's hash includes its callee intents),
+            // so cross-file staleness no longer slips through.
             let mut function_definitions = function_definitions;
-            for (name, def) in function_definitions.iter_mut() {
-                if def.intent.is_some() {
-                    continue;
-                }
-                let rel = normalize_path(&def.file_path);
-                if changed_set.contains(&rel) {
-                    continue;
-                }
-                if let Some(prev_def) = prev.function_definitions.get(name)
-                    && prev_def.intent.is_some()
-                    && normalize_path(&prev_def.file_path) == rel
-                {
-                    def.intent = prev_def.intent.clone();
-                }
-            }
+            let prev_intents = intents_by_hash(&prev.function_definitions);
             generate_function_intents(
                 &agent_service,
                 &mut function_definitions,
                 &all_imported_symbols,
+                &prev_intents,
             )
             .await;
 
@@ -1403,10 +1389,13 @@ async fn analyze_current_repo(
     let mut function_definitions = function_definitions;
     {
         let intent_agent = AgentService::new();
+        // Full scan: no previous data, so nothing to reuse — every intent is
+        // generated fresh and its content hash recorded for the next scan.
         generate_function_intents(
             &intent_agent,
             &mut function_definitions,
             &all_imported_symbols,
+            &HashMap::new(),
         )
         .await;
     }
