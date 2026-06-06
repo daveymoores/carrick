@@ -278,11 +278,15 @@ impl UrlNormalizer {
         // The whole URL was a single opaque variable (e.g. `${url}` from
         // `fetch(new Request(url))`) when stripping the leading `${...}` left no
         // path behind and the variable wasn't a configured internal/external
-        // host. There's nothing to match, so flag it for callers to skip.
+        // host. There's nothing to match, so flag it for callers to skip. A
+        // query string or fragment alone (`${url}?x=1`, `${url}#h`) is not a
+        // path — strip it before the emptiness check, or it would slip through
+        // and `clean_path` would reduce it to `/` and falsely match root.
+        let result_path = result.split(['?', '#']).next().unwrap_or("");
         let is_unresolved = leading_var_stripped
             && !is_internal
             && !is_external
-            && result.trim_matches('/').is_empty();
+            && result_path.trim_matches('/').is_empty();
 
         // Convert remaining ${varName} to :varName for path parameter matching
         let path = self.convert_interpolations_to_params(&result);
@@ -397,13 +401,16 @@ impl UrlNormalizer {
     /// comparing. Without this, a `https://`-prefixed entry never matches and
     /// the call is misclassified as internal (reported as a missing endpoint).
     fn domain_host(domain: &str) -> String {
-        let without_scheme = domain
+        // Lowercase first so a mixed-case scheme (`HTTPS://`) still strips —
+        // URL schemes are case-insensitive.
+        let lower = domain.to_ascii_lowercase();
+        let without_scheme = lower
             .strip_prefix("https://")
-            .or_else(|| domain.strip_prefix("http://"))
-            .unwrap_or(domain);
+            .or_else(|| lower.strip_prefix("http://"))
+            .unwrap_or(&lower);
         // Drop anything from the first '/' (path) onward, then the port.
         let host = without_scheme.split('/').next().unwrap_or(without_scheme);
-        host.split(':').next().unwrap_or(host).to_ascii_lowercase()
+        host.split(':').next().unwrap_or(host).to_string()
     }
 
     /// Clean up a path by removing query strings, fragments, and normalizing slashes
@@ -578,6 +585,19 @@ mod tests {
             "scheme-prefixed internal domain should match"
         );
         assert!(!internal.is_external);
+
+        // Schemes are case-insensitive — a mixed-case config entry must still match.
+        let mixed = UrlNormalizer::new(&Config {
+            external_domains: ["HTTPS://api.resend.com"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        });
+        assert!(
+            mixed.normalize("https://api.resend.com/emails").is_external,
+            "mixed-case scheme in config should still match"
+        );
     }
 
     /// Regression: a call whose URL is a single opaque variable (e.g.
@@ -592,6 +612,9 @@ mod tests {
 
         assert!(normalizer.normalize("${url}").is_unresolved);
         assert!(normalizer.normalize("${url}/").is_unresolved);
+        // A query string or fragment alone is not a path.
+        assert!(normalizer.normalize("${url}?x=1").is_unresolved);
+        assert!(normalizer.normalize("${url}#section").is_unresolved);
         // An unknown base var followed by a real path is NOT unresolved — the
         // path segment is still comparable.
         assert!(!normalizer.normalize("${base}/users").is_unresolved);
