@@ -130,6 +130,12 @@ pub struct FunctionDefinition {
     /// until the signature pass runs. The MCP layer surfaces this verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Content hash of the exact inputs that produced `intent` (cache version +
+    /// function body + callees' intents). Lets a later scan reuse the cached
+    /// intent when nothing affecting it changed, and regenerate it when a
+    /// callee's intent shifts. `None` until an intent is generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_input_hash: Option<String>,
 }
 
 /// A reference to a called function, for navigating to its source via GitHub.
@@ -471,6 +477,7 @@ impl Visit for FunctionDefinitionExtractor {
                             return_is_explicit: return_type.is_some(),
                             return_type,
                             signature: None,
+                            intent_input_hash: None,
                         },
                     );
                 }
@@ -539,6 +546,7 @@ impl Visit for FunctionDefinitionExtractor {
                 return_is_explicit: return_type.is_some(),
                 return_type,
                 signature: None,
+                intent_input_hash: None,
             },
         );
 
@@ -577,6 +585,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 return_is_explicit: return_type.is_some(),
                                 return_type,
                                 signature: None,
+                                intent_input_hash: None,
                             },
                         );
                     }
@@ -610,6 +619,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 return_is_explicit: return_type.is_some(),
                                 return_type,
                                 signature: None,
+                                intent_input_hash: None,
                             },
                         );
                     }
@@ -659,6 +669,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     return_is_explicit: return_type.is_some(),
                                     return_type,
                                     signature: None,
+                                    intent_input_hash: None,
                                 },
                             );
                         }
@@ -696,6 +707,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     return_is_explicit: return_type.is_some(),
                                     return_type,
                                     signature: None,
+                                    intent_input_hash: None,
                                 },
                             );
                         }

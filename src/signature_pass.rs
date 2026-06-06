@@ -255,6 +255,7 @@ mod tests {
             return_type: return_type.map(|t| t.to_string()),
             return_is_explicit: return_type.is_some(),
             signature: None,
+            intent_input_hash: None,
         }
     }
 
