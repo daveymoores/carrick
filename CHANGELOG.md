@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.29](https://github.com/daveymoores/carrick/compare/carrick-v0.1.28...carrick-v0.1.29) (2026-06-06)
+
+
+### Bug Fixes
+
+* key uploads by service; drop false-positive call extractions ([#143](https://github.com/daveymoores/carrick/issues/143)) ([802c5eb](https://github.com/daveymoores/carrick/commit/802c5ebf1327c2deb9c55cdec5b5603a5bc6bf9c))
+
 ## [0.1.28](https://github.com/daveymoores/carrick/compare/carrick-v0.1.27...carrick-v0.1.28) (2026-06-06)
 
 
