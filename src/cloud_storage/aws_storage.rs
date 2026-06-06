@@ -20,6 +20,14 @@ pub struct AwsStorage {
 struct LambdaRequest {
     action: String,
     repo: String,
+    /// Service discriminator for the cloud index key. Repos can declare
+    /// multiple services in carrick.json; the cloud keys each upload by
+    /// (repo, service) so they don't clobber each other. Must be sent on
+    /// every keyed action (including the bare existence check, which carries
+    /// no `cloudRepoData`), or the cloud falls back to the repo name and all
+    /// services collapse onto one row.
+    #[serde(rename = "service_name", skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
     hash: String,
     filename: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,6 +217,7 @@ impl AwsStorage {
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
             repo: data.repo_name.clone(),
+            service_name: data.service_name.clone(),
             hash: data.commit_hash.clone(),
             filename: "types.d.ts".to_string(),
             cloud_repo_data: Some(data.clone()),
@@ -231,6 +240,7 @@ impl CloudStorage for AwsStorage {
         let check_request = LambdaRequest {
             action: "check-or-upload".to_string(),
             repo: repo.clone(),
+            service_name: data.service_name.clone(),
             hash: data.commit_hash.clone(),
             filename: "types.d.ts".to_string(),
             cloud_repo_data: None,
@@ -249,6 +259,7 @@ impl CloudStorage for AwsStorage {
                 let complete_request = LambdaRequest {
                     action: "complete-upload".to_string(),
                     repo: repo.clone(),
+                    service_name: data.service_name.clone(),
                     hash: data.commit_hash.clone(),
                     filename: "types.d.ts".to_string(),
                     cloud_repo_data: Some(data.clone()),
@@ -286,6 +297,9 @@ impl CloudStorage for AwsStorage {
         let request = LambdaRequest {
             action: "check-or-upload".to_string(),
             repo: repo_name.to_string(),
+            // upload_type_file is not service-scoped (no CloudRepoData in scope);
+            // the cloud falls back to the repo name, matching legacy behaviour.
+            service_name: None,
             hash: commit_hash,
             filename: file_name.to_string(),
             cloud_repo_data: None,
@@ -421,6 +435,7 @@ impl CloudStorage for AwsStorage {
         let request = LambdaRequest {
             action: "check-or-upload".to_string(),
             repo: "health".to_string(),
+            service_name: None,
             hash: "health-check".to_string(),
             filename: "health.ts".to_string(),
             cloud_repo_data: None,

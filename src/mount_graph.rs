@@ -437,8 +437,10 @@ impl MountGraph {
     ) -> Option<Vec<&ResolvedEndpoint>> {
         let normalized = normalizer.normalize(url);
 
-        // Skip external calls
-        if normalized.is_external {
+        // Skip external calls and calls whose URL was a single opaque variable
+        // we couldn't resolve (e.g. `${url}`) — there's no path to match, and
+        // reporting them produces bogus "missing endpoint" noise.
+        if normalized.is_external || normalized.is_unresolved {
             return None;
         }
 
