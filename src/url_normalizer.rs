@@ -37,6 +37,11 @@ pub struct NormalizedUrl {
     pub original: String,
     /// Any host/domain that was stripped
     pub stripped_host: Option<String>,
+    /// True when the entire URL was a single opaque variable the scanner could
+    /// not resolve (e.g. `fetch(new Request(url))` → `${url}`). Such a "call"
+    /// has no comparable path, so callers should skip it rather than report a
+    /// bogus missing endpoint like `GET ${url}`.
+    pub is_unresolved: bool,
 }
 
 /// URL normalizer that uses configuration to identify internal/external domains
@@ -126,6 +131,7 @@ impl UrlNormalizer {
             is_external: false,
             original,
             stripped_host: None,
+            is_unresolved: false,
         }
     }
 
@@ -153,6 +159,7 @@ impl UrlNormalizer {
                 is_external,
                 original,
                 stripped_host: Some(format!("ENV_VAR:{}", env_var_name)),
+                is_unresolved: false,
             }
         } else {
             NormalizedUrl {
@@ -161,6 +168,7 @@ impl UrlNormalizer {
                 is_external: false,
                 original,
                 stripped_host: None,
+                is_unresolved: false,
             }
         }
     }
@@ -191,6 +199,7 @@ impl UrlNormalizer {
             is_external,
             original,
             stripped_host: env_var_name.map(|v| format!("process.env.{}", v)),
+            is_unresolved: false,
         }
     }
 
@@ -246,6 +255,8 @@ impl UrlNormalizer {
         let mut is_internal = false;
         let mut is_external = false;
 
+        let mut leading_var_stripped = false;
+
         // Check if starts with a variable that might be a base URL
         if url.starts_with("${")
             && let Some(end) = url.find('}')
@@ -261,7 +272,17 @@ impl UrlNormalizer {
             }
             // Remove the base URL variable
             result = url[end + 1..].to_string();
+            leading_var_stripped = true;
         }
+
+        // The whole URL was a single opaque variable (e.g. `${url}` from
+        // `fetch(new Request(url))`) when stripping the leading `${...}` left no
+        // path behind and the variable wasn't a configured internal/external
+        // host. There's nothing to match, so flag it for callers to skip.
+        let is_unresolved = leading_var_stripped
+            && !is_internal
+            && !is_external
+            && result.trim_matches('/').is_empty();
 
         // Convert remaining ${varName} to :varName for path parameter matching
         let path = self.convert_interpolations_to_params(&result);
@@ -272,6 +293,7 @@ impl UrlNormalizer {
             is_external,
             original,
             stripped_host,
+            is_unresolved,
         }
     }
 
@@ -328,6 +350,7 @@ impl UrlNormalizer {
             is_external,
             original,
             stripped_host: Some(host),
+            is_unresolved: false,
         }
     }
 
@@ -360,9 +383,27 @@ impl UrlNormalizer {
         let host_without_port = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
 
         domains.iter().any(|domain| {
-            let domain = domain.to_ascii_lowercase();
+            let domain = Self::domain_host(domain);
             host_without_port == domain || host_without_port.ends_with(&format!(".{}", domain))
         })
+    }
+
+    /// Reduce a configured domain entry to a bare, comparable hostname.
+    ///
+    /// carrick.json lets users write `externalDomains`/`internalDomains` either
+    /// as bare hosts (`api.resend.com`) or full URLs (`https://api.resend.com`).
+    /// Incoming call hosts are always bare, so we normalize config entries the
+    /// same way — strip the scheme, any path/query, and the port — before
+    /// comparing. Without this, a `https://`-prefixed entry never matches and
+    /// the call is misclassified as internal (reported as a missing endpoint).
+    fn domain_host(domain: &str) -> String {
+        let without_scheme = domain
+            .strip_prefix("https://")
+            .or_else(|| domain.strip_prefix("http://"))
+            .unwrap_or(domain);
+        // Drop anything from the first '/' (path) onward, then the port.
+        let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+        host.split(':').next().unwrap_or(host).to_ascii_lowercase()
     }
 
     /// Clean up a path by removing query strings, fragments, and normalizing slashes
@@ -502,6 +543,60 @@ mod tests {
         assert_eq!(result.path, "/v1/charges");
         assert!(!result.is_internal);
         assert!(result.is_external);
+    }
+
+    /// Regression: carrick.json domain lists are often written as full URLs
+    /// (`https://api.resend.com`) rather than bare hosts. The incoming call host
+    /// is always bare, so config entries must be scheme/path/port-stripped
+    /// before comparison — otherwise the external call is misclassified as
+    /// internal and reported as a bogus missing endpoint.
+    #[test]
+    fn test_external_domain_with_scheme_prefix_matches() {
+        let config = Config {
+            external_domains: ["https://api.resend.com", "https://eu.posthog.com/"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            internal_domains: ["https://api.company.com"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let normalizer = UrlNormalizer::new(&config);
+
+        let external = normalizer.normalize("https://api.resend.com/contacts");
+        assert!(
+            external.is_external,
+            "scheme-prefixed external domain should match"
+        );
+        assert!(!external.is_internal);
+
+        let internal = normalizer.normalize("https://api.company.com/v1/users");
+        assert!(
+            internal.is_internal,
+            "scheme-prefixed internal domain should match"
+        );
+        assert!(!internal.is_external);
+    }
+
+    /// Regression: a call whose URL is a single opaque variable (e.g.
+    /// `fetch(new Request(url))` surfacing as `${url}`) has no resolvable path.
+    /// It must be flagged unresolved so callers skip it instead of emitting a
+    /// bogus `GET ${url}` missing endpoint. A variable that only supplies the
+    /// host but is followed by a real path stays resolvable.
+    #[test]
+    fn test_whole_url_variable_is_unresolved() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        assert!(normalizer.normalize("${url}").is_unresolved);
+        assert!(normalizer.normalize("${url}/").is_unresolved);
+        // An unknown base var followed by a real path is NOT unresolved — the
+        // path segment is still comparable.
+        assert!(!normalizer.normalize("${base}/users").is_unresolved);
+        // A configured internal base var is resolved, not unresolved.
+        assert!(!normalizer.normalize("${API_URL}/users").is_unresolved);
     }
 
     #[test]
