@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.28](https://github.com/daveymoores/carrick/compare/carrick-v0.1.27...carrick-v0.1.28) (2026-06-06)
+
+
+### Features
+
+* **intent:** content-hash caching for generate-intent ([#139](https://github.com/daveymoores/carrick/issues/139)) ([78e1f2a](https://github.com/daveymoores/carrick/commit/78e1f2a465a27c46ce8e85f38cfbea7c264e9505))
+
 ## [0.1.27](https://github.com/daveymoores/carrick/compare/carrick-v0.1.26...carrick-v0.1.27) (2026-06-04)
 
 
