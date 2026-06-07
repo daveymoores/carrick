@@ -135,6 +135,64 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Accept only values whose *shape* is an extractable outgoing-call route, as
+/// produced by the file-analyzer LLM's `target` field (see that lambda's
+/// system prompt): an absolute path (`/users`), a full URL (`http(s)://…`), or
+/// an env-var base form (`${VAR}/path`, `${process.env.VAR}/…`). Template
+/// params like `${id}` are legal *inside* a path and are preserved.
+///
+/// Everything else — bare identifiers (`query`, `DynamoDB`, `CarrickApiKeys`),
+/// member/call expressions (`res.json()`, `params.service`), SDK operation
+/// tokens (`Service:Op`, `Service.Op`), and literals (`null`, `new`, `.`,
+/// `unknown`) — is rejected. Pure string-shape logic: it names no framework,
+/// client, or SDK. The shape-blind residue (a bare `${TABLE_NAME}` that is
+/// really a datastore resource, not a base URL) is handled on the prompt side.
+pub fn is_valid_route_shape(route: &str) -> bool {
+    let route = route.trim();
+    if route.is_empty() {
+        return false;
+    }
+    // No leftover JavaScript-source markers that prove the value is an
+    // unresolved expression (`a || b`, a call/group) rather than a route.
+    let is_clean = |s: &str| {
+        !s.contains("||")
+            && !s.contains('(')
+            && !s.contains(')')
+            && !s.chars().any(|c| c.is_whitespace())
+    };
+
+    // Explicit `ENV_VAR:NAME:/path` form (the analyzer's canonical env-var
+    // route; see `is_env_var_base_url` / `extract_env_var_name`).
+    if let Some(rest) = route.strip_prefix("ENV_VAR:") {
+        let mut parts = rest.splitn(2, ':');
+        let name = parts.next().unwrap_or("");
+        return match parts.next() {
+            Some(path) => {
+                !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && path.starts_with('/')
+                    && is_clean(path)
+                    && path.trim_start_matches('/') != name
+            }
+            None => false,
+        };
+    }
+    // Env-var base form: `${VAR}/path`, `${process.env.VAR}/…`, bare `${VAR}`.
+    if let Some(rest) = route.strip_prefix("${") {
+        return rest.contains('}') && is_clean(route);
+    }
+    // Full URL.
+    if route.starts_with("http://") || route.starts_with("https://") {
+        return is_clean(route);
+    }
+    // Absolute path (may carry `${id}` / `:id` template params).
+    if route.starts_with('/') {
+        return is_clean(route);
+    }
+    // Bare identifier, member/call expression, `Service:Op`, `#…`, literal.
+    false
+}
+
 pub struct Analyzer {
     // <Route, http_method, handler_name, source>
     pub imported_handlers: Vec<(String, String, String, String)>,
@@ -905,6 +963,18 @@ impl Analyzer {
         let mut unique_calls = Vec::new();
         let mut seen_calls = HashSet::new();
         for call in &self.calls {
+            // Drop anything whose route is not a real outgoing-call shape. The
+            // file-analyzer LLM sometimes emits SDK ops, bare identifiers, or
+            // member expressions as a call `target` (e.g. `DynamoDB:PutItem`,
+            // `res.json()`); those never match a producer and would otherwise
+            // flood the report as "missing endpoints" / env-var suggestions.
+            if !is_valid_route_shape(&call.route) {
+                debug!(
+                    "Skipping call with non-route value: {} {}",
+                    call.method, call.route
+                );
+                continue;
+            }
             let key = format!(
                 "{}:{}:{}",
                 call.method,
@@ -1491,6 +1561,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn route_shape_drops_non_route_values() {
+        // Exact values the file-analyzer LLM mis-emitted as call targets on the
+        // carrick-cloud run (SDK ops, bare identifiers, member/call expressions,
+        // literals, leaked `||`).
+        let dropped = [
+            "DynamoDB:PutItem",
+            "DynamoDB:Query",
+            "DynamoDB.TransactWriteItems",
+            "DynamoDBClient",
+            "DynamoDB",
+            "GetCommand",
+            "QueryCommand",
+            "new",
+            "null",
+            ".",
+            "unknown",
+            "query",
+            "request",
+            "request.formData()",
+            "res.json()",
+            ".json()",
+            "result.response.text()",
+            "ordersResp",
+            "listRes",
+            "serviceName",
+            "params.service",
+            "getAllRepoData",
+            "search_by_intent",
+            "scaffold",
+            "CarrickApiKeys",
+            "user#${auth.user_id}",
+            "${API_KEYS_TABLE}||CarrickApiKeys",
+            "",
+        ];
+        for route in dropped {
+            assert!(
+                !is_valid_route_shape(route),
+                "expected route to be dropped: {route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_shape_keeps_real_routes() {
+        let kept = [
+            "/mcp",
+            "/getAllRepoData",
+            "/findService",
+            "/users/${userId}",
+            "/api/orders/:id",
+            "${GITHUB_API}/repos/:owner/:repo",
+            "${RESEND_ENDPOINT}/",
+            "${lambdaUrl}",
+            "${process.env.API_BASE}/users",
+            "https://api.github.com/repos/owner/repo",
+            "http://localhost:3000/health",
+        ];
+        for route in kept {
+            assert!(
+                is_valid_route_shape(route),
+                "expected route to be kept: {route:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_filter_graphql_libraries() {
         let data_fetchers = vec![
             "axios".to_string(),
@@ -1830,11 +1966,12 @@ mod tests {
                 .any(|i| i.contains("Unclassified env var") && i.contains("OTHER_VAR"))
         );
 
-        // 4. Raw UPPERCASE var should be in env_var_calls
-        assert!(
-            env_var_calls
-                .iter()
-                .any(|i| i.contains("Unclassified env var") && i.contains("LEGACY_API_URL"))
-        );
+        // 4. Raw, unresolved `LEGACY_API_URL + "/users"` expressions are now
+        // dropped by is_valid_route_shape: the file-analyzer contract requires
+        // composed URLs to be normalized to `${VAR}/path`, so a raw JS
+        // expression here is unreliable. This is the same tightening that stops
+        // bare uppercase identifiers (`CarrickApiKeys`, `DynamoDB`) from being
+        // mis-reported as env-var calls.
+        assert!(!env_var_calls.iter().any(|i| i.contains("LEGACY_API_URL")));
     }
 }

@@ -250,6 +250,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // are the ones used.
     all_repo_data.retain(|repo| repo.repo_name != repo_name);
 
+    // No peer repos means this is the first repo indexed for the project;
+    // connectivity findings are inconclusive and the formatter frames them as
+    // informational rather than headline issues.
+    let has_cross_repo_baseline = !all_repo_data.is_empty();
+
     debug!(
         "Cross-repo analysis with {} other repos + {} local service(s)",
         all_repo_data.len(),
@@ -262,7 +267,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
-    let formatted = crate::formatter::FormattedOutput::new(results);
+    let formatted = crate::formatter::FormattedOutput::new(results, has_cross_repo_baseline);
     formatted.print();
 
     // On pull_request runs we deliberately skip the index upload (see
@@ -1671,19 +1676,31 @@ fn recreate_package_and_tsconfig(
     let package_json_path = output_dir.join("package.json");
     let package_dependencies = packages.get_dependencies();
 
-    // Convert PackageInfo objects to simple version strings for npm
+    // Convert PackageInfo objects to simple version strings for npm. Drop
+    // entries whose version is unusable (empty, the literal "undefined", or a
+    // value with no digit) — a merged repo can carry these, and npm turns
+    // `typescript@undefined` into a hard ERESOLVE that aborts the whole
+    // cross-repo type pass.
     let mut dependencies = std::collections::HashMap::new();
     for (name, package_info) in package_dependencies {
-        dependencies.insert(name.clone(), package_info.version.clone());
+        let version = package_info.version.trim();
+        if version.is_empty()
+            || version == "undefined"
+            || !version.chars().any(|c| c.is_ascii_digit())
+        {
+            debug!("Skipping dependency {name} with unusable version {version:?}");
+            continue;
+        }
+        dependencies.insert(name.clone(), version.to_string());
     }
 
-    // Only add essential TypeScript dependencies if they're missing
-    if !dependencies.contains_key("typescript") {
-        dependencies.insert("typescript".to_string(), "5.8.3".to_string());
-    }
-    if !dependencies.contains_key("ts-node") {
-        dependencies.insert("ts-node".to_string(), "10.9.2".to_string());
-    }
+    // Pin the TypeScript toolchain we control for this synthetic type-check
+    // package. Overwrite (not insert-if-missing): a merged repo may pin a
+    // different/older typescript that conflicts with ts-node's peer range, so
+    // forcing a known-good pair is what keeps `npm install` resolvable. These
+    // match ts_check/package.json's pins.
+    dependencies.insert("typescript".to_string(), "5.8.3".to_string());
+    dependencies.insert("ts-node".to_string(), "10.9.2".to_string());
 
     let package_json_content = serde_json::json!({
         "name": "carrick-type-check",
@@ -1721,8 +1738,13 @@ fn recreate_package_and_tsconfig(
         use std::process::Command;
         debug!("Installing dependencies...");
 
+        // `--legacy-peer-deps` so a transitive peer-range disagreement (e.g.
+        // ts-node's `typescript@>=2.7` vs a repo's pinned major) can't abort
+        // the install. This package only feeds ts-morph type extraction, so a
+        // looser peer graph is harmless.
         let install_output = Command::new("npm")
             .arg("install")
+            .arg("--legacy-peer-deps")
             .current_dir(output_dir)
             .output()
             .map_err(|e| format!("Failed to run npm install: {}", e))?;

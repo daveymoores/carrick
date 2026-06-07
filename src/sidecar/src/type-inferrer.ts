@@ -120,6 +120,14 @@ export class TypeInferrer {
     const errors: string[] = [];
 
     for (const request of requests) {
+      // Plain JavaScript has no type annotations to extract, and `checkJs` is
+      // off, so inferring against a `.js` file yields nothing useful — it only
+      // crashes deep in the compiler API on undefined symbols (`escapedName`,
+      // `flags`) and floods the log with the resulting error strings. Skip it.
+      // `allowJs` stays on so `.ts` files can still resolve `.js` imports.
+      if (/\.(js|jsx|mjs|cjs)$/i.test(request.file_path)) {
+        continue;
+      }
       try {
         const loc = this.formatRequestLocation(request);
         const result = this.inferSingle(request, wrappers, extractionConfig);
