@@ -231,8 +231,12 @@ frameworks. **Lift: low-medium once the foundation exists.**
 1. **Phase 0 — foundation** (prerequisite tax): `OperationKey` refactor across
    scanner + lockstep carrick-cloud schema/tooling change. The only step that touches
    the working REST path; risk is ordinary regression risk, covered by the
-   `examples/` e2e fixtures. Everything after it is additive. Don't do it
-   speculatively — land it in the same arc as Phase 1.
+   `examples/` e2e fixtures and the fixture-driven mock-LLM pipeline harness
+   (`CARRICK_MOCK_FIXTURE_DIR`, `tests/llm_mock_pipeline_test.rs`). Everything after
+   it is additive. Don't do it speculatively — land it in the same arc as Phase 1.
+   Each subsequent protocol phase should ship with its own mock-LLM fixture project,
+   so extraction → matching → checking is regression-tested end to end without live
+   LLM calls.
 2. **Phase 1 — GraphQL queries/mutations**: SDL + document parsing, validation-based
    checking, attribution via existing domain classification. Out of scope: Relay,
    persisted queries, federation composition, code-first without an SDL artifact.
