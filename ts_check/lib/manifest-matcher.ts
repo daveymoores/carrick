@@ -443,13 +443,18 @@ export class ManifestMatcher {
     const producerEntries = producers.entries.filter((e) => e.role === 'producer');
     const consumerEntries = consumers.entries.filter((e) => e.role === 'consumer');
 
-    // For each consumer, try to find matching producers
+    // For each consumer, find candidate producers, then keep only the most
+    // specific ones. This mirrors routing semantics: a request to /users/me
+    // is served by a literal /users/me route when one exists, not by
+    // /users/:id — matching both would produce duplicate or contradictory
+    // verdicts. Equally specific candidates (e.g. the same route registered
+    // by two service versions) are all kept.
     for (let ci = 0; ci < consumerEntries.length; ci++) {
       const consumer = consumerEntries[ci];
       const consumerMethod = normalizeMethod(consumer.method);
       const consumerPath = normalizePath(consumer.path);
 
-      let foundMatch = false;
+      const candidates: Array<{ pi: number; score: number }> = [];
 
       for (let pi = 0; pi < producerEntries.length; pi++) {
         const producer = producerEntries[pi];
@@ -460,27 +465,35 @@ export class ManifestMatcher {
           pathsMatch(consumer.path, producer.path) &&
           consumer.type_kind === producer.type_kind
         ) {
-          matches.push({
-            method: consumerMethod,
-            path: consumerPath,
-            type_kind: consumer.type_kind,
-            producer,
-            consumer,
-            match_score: this.calculateMatchScore(producer, consumer),
+          candidates.push({
+            pi,
+            score: this.calculateMatchScore(producer, consumer),
           });
-
-          matchedProducerIndices.add(pi);
-          matchedConsumerIndices.add(ci);
-          foundMatch = true;
-          // Don't break - a consumer might match multiple producers (e.g., different versions)
         }
       }
 
-      if (!foundMatch) {
+      if (candidates.length === 0) {
         orphanedConsumers.push({
           entry: consumer,
           reason: `No producer found for ${consumer.method} ${consumer.path} (${consumer.type_kind})`,
         });
+        continue;
+      }
+
+      const bestScore = Math.max(...candidates.map((c) => c.score));
+      for (const candidate of candidates) {
+        if (candidate.score !== bestScore) continue;
+        const producer = producerEntries[candidate.pi];
+        matches.push({
+          method: consumerMethod,
+          path: consumerPath,
+          type_kind: consumer.type_kind,
+          producer,
+          consumer,
+          match_score: candidate.score,
+        });
+        matchedProducerIndices.add(candidate.pi);
+        matchedConsumerIndices.add(ci);
       }
     }
 

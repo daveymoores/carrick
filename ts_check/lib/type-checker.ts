@@ -12,6 +12,7 @@ import {
   TypeAliasDeclaration,
   Type,
   SyntaxKind,
+  ts,
 } from "ts-morph";
 import {
   ManifestMatcher,
@@ -204,18 +205,19 @@ export class TypeCompatibilityChecker {
       }
 
       try {
-        const mismatch = await this.compareTypes(
-          project,
+        const outcome = this.compareTypes(
           endpoint,
           match.producer,
           match.consumer,
-          producerTypeInfo?.type,
-          consumerTypeInfo?.type
+          producerTypeInfo?.type ?? this.findTypeInProject(project, match.producer.type_alias),
+          consumerTypeInfo?.type ?? this.findTypeInProject(project, match.consumer.type_alias)
         );
 
-        if (mismatch) {
-          result.mismatches.push(mismatch);
+        if (outcome.kind === "incompatible") {
+          result.mismatches.push(outcome.mismatch);
           result.incompatiblePairs++;
+        } else if (outcome.kind === "unverifiable") {
+          result.unknownPairs.push(outcome.unknown);
         } else {
           result.compatiblePairs++;
         }
@@ -249,136 +251,107 @@ export class TypeCompatibilityChecker {
   }
 
   /**
-   * Compare types from manifest entries
+   * Compare resolved producer/consumer types.
    *
-   * @param project - The ts-morph project containing bundled types
-   * @param endpoint - The endpoint being checked
-   * @param producer - The producer manifest entry
-   * @param consumer - The consumer manifest entry
-   * @returns TypeMismatch if incompatible, null if compatible
+   * The verdict comes from the compiler's own assignability relation on the
+   * Type objects (same checker that resolved them). Re-serializing the types
+   * into a probe file is deliberately avoided: the printed text references
+   * `import("...")` specifiers that may not resolve in the probe's project,
+   * which degraded every such check to a silent "compatible".
+   *
+   * Aliases that resolve to `any` are unverifiable, not compatible: `any` is
+   * assignable to everything, and in bundled .d.ts surfaces it almost always
+   * means a broken import rather than an intentional payload type.
    */
-  private async compareTypes(
-    project: Project,
+  private compareTypes(
     endpoint: string,
     producer: ManifestEntry,
     consumer: ManifestEntry,
-    resolvedProducerType?: Type | null,
-    resolvedConsumerType?: Type | null
-  ): Promise<TypeMismatch | null> {
-    // Try to find the type aliases in the project
-    const producerType =
-      resolvedProducerType ??
-      this.findTypeInProject(project, producer.type_alias);
-    const consumerType =
-      resolvedConsumerType ??
-      this.findTypeInProject(project, consumer.type_alias);
-
-    if (!producerType) {
+    producerType: Type | null | undefined,
+    consumerType: Type | null | undefined
+  ):
+    | { kind: "compatible" }
+    | { kind: "incompatible"; mismatch: TypeMismatch }
+    | { kind: "unverifiable"; unknown: UnknownTypePair } {
+    const notFound = !producerType
+      ? `Producer type '${producer.type_alias}' not found in project`
+      : !consumerType
+        ? `Consumer type '${consumer.type_alias}' not found in project`
+        : undefined;
+    if (notFound || !producerType || !consumerType) {
       return {
+        kind: "incompatible",
+        mismatch: {
+          endpoint,
+          producerType: producer.type_alias,
+          consumerCall: consumer.type_alias,
+          consumerType: consumer.type_alias,
+          isAssignable: false,
+          errorDetails: notFound ?? "Types are not compatible",
+          producerLocation: this.formatEntryLocation(producer),
+          consumerLocation: this.formatEntryLocation(consumer),
+          producerEvidence: producer.evidence,
+          consumerEvidence: consumer.evidence,
+        },
+      };
+    }
+
+    if (producerType.isAny() || consumerType.isAny()) {
+      const reasonParts = [];
+      if (producerType.isAny()) {
+        reasonParts.push("producer type resolves to any (broken import in bundled types?)");
+      }
+      if (consumerType.isAny()) {
+        reasonParts.push("consumer type resolves to any (broken import in bundled types?)");
+      }
+      return {
+        kind: "unverifiable",
+        unknown: {
+          endpoint,
+          reason: reasonParts.join(", "),
+          producerTypeAlias: producer.type_alias,
+          consumerTypeAlias: consumer.type_alias,
+          producerLocation: this.formatEntryLocation(producer),
+          consumerLocation: this.formatEntryLocation(consumer),
+          producerEvidence: producer.evidence,
+          consumerEvidence: consumer.evidence,
+        },
+      };
+    }
+
+    // Producer payload must satisfy what the consumer expects.
+    if (producerType.isAssignableTo(consumerType)) {
+      return { kind: "compatible" };
+    }
+
+    const producerText = this.typeText(producerType);
+    const consumerText = this.typeText(consumerType);
+    return {
+      kind: "incompatible",
+      mismatch: {
         endpoint,
-        producerType: producer.type_alias,
+        producerType: producerText,
         consumerCall: consumer.type_alias,
-        consumerType: consumer.type_alias,
+        consumerType: consumerText,
         isAssignable: false,
-        errorDetails: `Producer type '${producer.type_alias}' not found in project`,
+        errorDetails: `Type '${producerText}' is not assignable to type '${consumerText}'`,
         producerLocation: this.formatEntryLocation(producer),
         consumerLocation: this.formatEntryLocation(consumer),
         producerEvidence: producer.evidence,
         consumerEvidence: consumer.evidence,
-      };
-    }
-
-    if (!consumerType) {
-      return {
-        endpoint,
-        producerType: producer.type_alias,
-        consumerCall: consumer.type_alias,
-        consumerType: consumer.type_alias,
-        isAssignable: false,
-        errorDetails: `Consumer type '${consumer.type_alias}' not found in project`,
-        producerLocation: this.formatEntryLocation(producer),
-        consumerLocation: this.formatEntryLocation(consumer),
-        producerEvidence: producer.evidence,
-        consumerEvidence: consumer.evidence,
-      };
-    }
-
-    // Check assignability: consumer type should be assignable from producer type
-    // This means the producer should provide at least what the consumer expects
-    const diagnosticMessage = this.getTypeCompatibilityError(
-      producerType,
-      consumerType
-    );
-
-    const isAssignable = !diagnosticMessage;
-
-    if (!isAssignable) {
-      return {
-        endpoint,
-        producerType: producerType.getText(),
-        consumerCall: consumer.type_alias,
-        consumerType: consumerType.getText(),
-        isAssignable: false,
-        errorDetails: diagnosticMessage || "Types are not compatible",
-        producerLocation: this.formatEntryLocation(producer),
-        consumerLocation: this.formatEntryLocation(consumer),
-        producerEvidence: producer.evidence,
-        consumerEvidence: consumer.evidence,
-      };
-    }
-
-    return null;
+      },
+    };
   }
 
   /**
-   * Get a human-readable error message if types are not compatible
-   *
-   * @param producerType - The producer's type
-   * @param consumerType - The consumer's expected type
-   * @returns Error message if incompatible, undefined if compatible
+   * Print a type without the compiler's ~160-char display truncation, which
+   * inserts `...` into wide payload types and makes reports useless.
    */
-  private getTypeCompatibilityError(
-    producerType: Type,
-    consumerType: Type
-  ): string | undefined {
-    // Create a temporary file to check type assignability
-    const testCode = `
-      type Producer = ${producerType.getText()};
-      type Consumer = ${consumerType.getText()};
-      declare const producer: Producer;
-      const consumer: Consumer = producer;
-    `;
-
-    const tempFile = this.project.createSourceFile(
-      `__type_check_${Date.now()}.ts`,
-      testCode,
-      { overwrite: true }
+  private typeText(type: Type): string {
+    return type.getText(
+      undefined,
+      ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias
     );
-
-    try {
-      const diagnostics = tempFile.getPreEmitDiagnostics();
-
-      // Find assignment error
-      const assignmentError = diagnostics.find((d) => {
-        const message = d.getMessageText();
-        const messageStr =
-          typeof message === "string" ? message : message.getMessageText();
-        return (
-          messageStr.includes("not assignable") ||
-          messageStr.includes("is missing")
-        );
-      });
-
-      if (assignmentError) {
-        const message = assignmentError.getMessageText();
-        return typeof message === "string" ? message : message.getMessageText();
-      }
-
-      return undefined;
-    } finally {
-      // Clean up temporary file
-      this.project.removeSourceFile(tempFile);
-    }
   }
 
   /**
