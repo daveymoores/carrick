@@ -17,6 +17,7 @@ pub mod logging;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;
 pub mod oidc;
+pub mod operation;
 pub mod packages;
 pub mod parser;
 pub mod services;

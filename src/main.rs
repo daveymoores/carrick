@@ -17,6 +17,7 @@ mod logging;
 mod mount_graph;
 mod multi_agent_orchestrator;
 mod oidc;
+mod operation;
 mod packages;
 mod parser;
 mod services;

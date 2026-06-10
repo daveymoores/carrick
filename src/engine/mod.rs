@@ -13,6 +13,7 @@ use crate::intent_generator::{generate_function_intents, intents_by_hash};
 use crate::logging;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
+use crate::operation::OperationKey;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::services::{
@@ -43,7 +44,7 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -878,8 +879,7 @@ fn build_cloud_data_from_mount_graph(
         .iter()
         .map(|endpoint| ApiEndpointDetails {
             owner: Some(crate::visitor::OwnerType::App(endpoint.owner.clone())),
-            route: endpoint.full_path.clone(),
-            method: endpoint.method.clone(),
+            key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -895,8 +895,7 @@ fn build_cloud_data_from_mount_graph(
         .iter()
         .map(|call| ApiEndpointDetails {
             owner: None,
-            route: call.target_url.clone(),
-            method: call.method.clone(),
+            key: OperationKey::http(&call.method, call.target_url.clone()),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -1897,8 +1896,7 @@ mod tests {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
             owner: Some(OwnerType::App("test_app".to_string())),
-            route: "/test".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "/test"),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -2010,8 +2008,7 @@ mod tests {
         // Create test data with TypeReferences that would cause SourceMap issues
         let endpoint = ApiEndpointDetails {
             owner: Some(OwnerType::App("test_app".to_string())),
-            route: "/test".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "/test"),
             params: vec![],
             request_body: None,
             response_body: None,

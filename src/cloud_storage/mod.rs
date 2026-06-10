@@ -7,6 +7,7 @@ use crate::{
     framework_detector::DetectionResult,
     mount_graph::MountGraph,
     multi_agent_orchestrator::MultiAgentAnalysisResult,
+    operation::OperationKey,
     packages::Packages,
     services::type_sidecar::InferKind,
     visitor::{FunctionDefinition, Mount, OwnerType},
@@ -175,8 +176,7 @@ impl CloudRepoData {
             .iter()
             .map(|endpoint| ApiEndpointDetails {
                 owner: Some(OwnerType::App(endpoint.owner.clone())),
-                route: endpoint.full_path.clone(),
-                method: endpoint.method.clone(),
+                key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
                 params: vec![],
                 request_body: None,
                 response_body: None,
@@ -193,8 +193,7 @@ impl CloudRepoData {
             .iter()
             .map(|call| ApiEndpointDetails {
                 owner: None,
-                route: call.target_url.clone(),
-                method: call.method.clone(),
+                key: OperationKey::http(&call.method, call.target_url.clone()),
                 params: vec![],
                 request_body: None,
                 response_body: None,
