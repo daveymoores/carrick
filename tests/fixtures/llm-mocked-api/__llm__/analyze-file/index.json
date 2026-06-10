@@ -1,0 +1,30 @@
+{
+  "mounts": [
+    {
+      "line_number": 6,
+      "parent_node": "app",
+      "child_node": "usersRouter",
+      "mount_path": "/api/users",
+      "import_source": "./routes/users",
+      "pattern_matched": ".use("
+    }
+  ],
+  "endpoints": [
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/health",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ status: 'ok' }",
+      "response_expression_line": 9,
+      "primary_type_symbol": "ExpressApp",
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

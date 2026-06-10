@@ -134,44 +134,50 @@ export const SymbolRequestSchema = z.object({
 // Infer Request Item Schema
 // ============================================================================
 
-export const InferRequestItemSchema = z
-  .object({
-    file_path: z.string().min(1, 'File path cannot be empty'),
-    line_number: z.number().int().positive('Line number must be positive'),
-    span_start: z.number().int().nonnegative('Span start must be non-negative').optional(),
-    span_end: z.number().int().nonnegative('Span end must be non-negative').optional(),
-    expression_text: z.string().optional(),
-    expression_line: z.number().int().positive('Expression line must be positive').optional(),
-    infer_kind: InferKindSchema,
-    alias: z.string().optional(),
-    param_name: z.string().optional(),
-  })
-  .superRefine((value, ctx) => {
-    if (
-      value.span_start !== undefined &&
-      value.span_end !== undefined &&
-      value.span_end < value.span_start
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'span_end must be greater than or equal to span_start',
-        path: ['span_end'],
-      });
-    }
-    const hasSpan = value.span_start !== undefined && value.span_end !== undefined;
-    const hasText = value.expression_text !== undefined;
-    // Signature inference (signature_return / function_param) locates the
-    // function by line_number alone, so it does not require a span or text.
-    const lineOnlyOk =
-      value.infer_kind === 'signature_return' || value.infer_kind === 'function_param';
-    if (!hasSpan && !hasText && !lineOnlyOk) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'At least one of (span_start + span_end) or expression_text must be provided',
-        path: [],
-      });
-    }
-  });
+export const InferRequestItemSchema = z.object({
+  file_path: z.string().min(1, 'File path cannot be empty'),
+  line_number: z.number().int().positive('Line number must be positive'),
+  span_start: z.number().int().nonnegative('Span start must be non-negative').optional(),
+  span_end: z.number().int().nonnegative('Span end must be non-negative').optional(),
+  expression_text: z.string().optional(),
+  expression_line: z.number().int().positive('Expression line must be positive').optional(),
+  infer_kind: InferKindSchema,
+  alias: z.string().optional(),
+  param_name: z.string().optional(),
+});
+
+/**
+ * Per-item locator validation for infer requests.
+ *
+ * This is deliberately NOT part of the envelope schema: real runs batch
+ * every alias of a repo into one infer request, and a single bad item
+ * must produce a per-item error (the alias then pads to `unknown`
+ * downstream), not reject the whole batch.
+ *
+ * Returns an error message, or null when the item is valid.
+ */
+export function validateInferRequestItem(item: InferRequestItem): string | null {
+  if (
+    item.span_start !== undefined &&
+    item.span_end !== undefined &&
+    item.span_end < item.span_start
+  ) {
+    return 'span_end must be greater than or equal to span_start';
+  }
+  const hasSpan = item.span_start !== undefined && item.span_end !== undefined;
+  const hasText = item.expression_text !== undefined;
+  // Function-anchored inference (function_return for file-based routes,
+  // signature_return / function_param for the signature pass) locates the
+  // function by line_number alone, so it does not require a span or text.
+  const lineOnlyOk =
+    item.infer_kind === 'function_return' ||
+    item.infer_kind === 'signature_return' ||
+    item.infer_kind === 'function_param';
+  if (!hasSpan && !hasText && !lineOnlyOk) {
+    return 'at least one of (span_start + span_end) or expression_text is required';
+  }
+  return null;
+}
 
 // ============================================================================
 // Payload Definition Schema (New)

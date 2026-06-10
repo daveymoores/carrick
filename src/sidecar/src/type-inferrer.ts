@@ -44,6 +44,7 @@ import type {
   ExtractionConfig,
   ExtractionRule,
 } from './types.js';
+import { validateInferRequestItem } from './validators.js';
 
 /**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
@@ -122,6 +123,13 @@ export class TypeInferrer {
     for (const request of requests) {
       try {
         const loc = this.formatRequestLocation(request);
+        const itemError = validateInferRequestItem(request);
+        if (itemError) {
+          errors.push(
+            `Invalid infer item at ${request.file_path}:${loc} (${request.infer_kind}): ${itemError}`
+          );
+          continue;
+        }
         const result = this.inferSingle(request, wrappers, extractionConfig);
         if (result) {
           inferredTypes.push(result);
@@ -342,6 +350,20 @@ export class TypeInferrer {
     let payloadNode: Node = node;
     if (Node.isCallExpression(node)) {
       const args = node.getArguments();
+      // A call that receives a function is a callback registration (e.g. an
+      // endpoint registration like `app.get('/path', handler)`) — its first
+      // argument is the route path, not a payload. The span locator falls
+      // back to exactly this shape when no payload expression was reported,
+      // so drilling here would put the path literal's type in the manifest.
+      const registersCallback = args.some(
+        (arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)
+      );
+      if (registersCallback) {
+        this.log(
+          `Span resolves to a callback-registration call at ${request.file_path}:${request.line_number}; no payload to infer`
+        );
+        return null;
+      }
       if (args.length > 0) {
         payloadNode = args[0];
       }
@@ -1498,6 +1520,15 @@ export class TypeInferrer {
       return this.pickBestMatch(exactMatches.map((c) => c.node), lineNumber) as T;
     }
 
+    // A bare identifier target must match a node exactly: substring matching
+    // would bind `users` to `usersCsv` (or to any enclosing node that merely
+    // contains the identifier somewhere) and report a confidently wrong type.
+    // Failing here is correct — the caller records an error and the alias
+    // pads to `unknown` downstream.
+    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(normalizedTarget)) {
+      return undefined;
+    }
+
     // Fall back to substring match
     // For the reverse direction (target contains node text), require a minimum node text
     // length to avoid matching tiny identifiers like "res" or "body" too broadly
@@ -1665,9 +1696,13 @@ export class TypeInferrer {
   // ===========================================================================
 
   private unwrapPromise(typeString: string, type: Type): string {
-    const promiseMatch = typeString.match(/^Promise<(.+)>$/);
-    if (promiseMatch) {
-      return promiseMatch[1];
+    // Operate per top-level union member: a naive `^Promise<(.+)>$` regex
+    // matches the WHOLE of `Promise<A> | Promise<B>` and produces the
+    // mangled capture `A> | Promise<B`.
+    const parts = this.splitTopLevelUnion(typeString);
+    const unwrapped = parts.map((part) => this.unwrapPromiseText(part));
+    if (unwrapped.some((u, i) => u !== parts[i])) {
+      return [...new Set(unwrapped)].join(' | ');
     }
 
     // Handle nested Promise via type arguments
@@ -1677,6 +1712,53 @@ export class TypeInferrer {
     }
 
     return typeString;
+  }
+
+  /**
+   * Unwrap a single `Promise<...>` type string, only when the inner text is
+   * bracket-balanced (so `Promise<A> | B` is left alone for the caller's
+   * union handling rather than mangled).
+   */
+  private unwrapPromiseText(part: string): string {
+    if (!part.startsWith('Promise<') || !part.endsWith('>')) {
+      return part;
+    }
+    const inner = part.slice('Promise<'.length, -1);
+    return this.isBracketBalanced(inner) ? inner : part;
+  }
+
+  /**
+   * Split a type string on `|` at bracket depth 0. `=>` is not treated as a
+   * closing bracket.
+   */
+  private splitTopLevelUnion(typeString: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < typeString.length; i++) {
+      const ch = typeString[i];
+      if (ch === '>' && typeString[i - 1] === '=') continue;
+      if (ch === '<' || ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === '>' || ch === ')' || ch === ']' || ch === '}') depth--;
+      else if (ch === '|' && depth === 0) {
+        parts.push(typeString.slice(start, i).trim());
+        start = i + 1;
+      }
+    }
+    parts.push(typeString.slice(start).trim());
+    return parts;
+  }
+
+  private isBracketBalanced(text: string): boolean {
+    let depth = 0;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '>' && text[i - 1] === '=') continue;
+      if (ch === '<' || ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === '>' || ch === ')' || ch === ']' || ch === '}') depth--;
+      if (depth < 0) return false;
+    }
+    return depth === 0;
   }
 
   // ===========================================================================
