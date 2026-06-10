@@ -442,6 +442,9 @@ fn generate_mock_for_task<B: Serialize + ?Sized>(
     body: &B,
     mock_seed: &str,
 ) -> String {
+    if let Some(canned) = fixture_mock_response(task_path, mock_seed) {
+        return canned;
+    }
     match task_path {
         "/generate-intent" => "Mock intent: function does something.".to_string(),
         "/extract-calls" => "[]".to_string(),
@@ -457,6 +460,66 @@ fn generate_mock_for_task<B: Serialize + ?Sized>(
             generate_mock_response(&schema, mock_seed)
         }
     }
+}
+
+/// Fixture-driven mock responses for integration tests.
+///
+/// When `CARRICK_MOCK_FIXTURE_DIR` is set (alongside `CARRICK_MOCK_ALL`),
+/// look up a canned response at `<dir>/<task>/<file_stem>.json`, keyed by the
+/// analyzed file's path parsed from the user message. This lets tests replay
+/// realistic agent output — including its known imperfections — through the
+/// full sanitize/validate/mount-graph pipeline. Falls back to the schema-based
+/// generated mocks when no fixture exists for the task/file.
+fn fixture_mock_response(task_path: &str, mock_seed: &str) -> Option<String> {
+    let dir = env::var("CARRICK_MOCK_FIXTURE_DIR").ok()?;
+    let task = task_path.trim_start_matches('/');
+    let marker = "### FILE CONTENT (Path: ";
+    let key = match mock_seed.find(marker) {
+        Some(idx) => {
+            let rest = &mock_seed[idx + marker.len()..];
+            let path = rest.split(')').next()?;
+            std::path::Path::new(path)
+                .file_stem()?
+                .to_string_lossy()
+                .into_owned()
+        }
+        None => "default".to_string(),
+    };
+    let fixture_path = std::path::Path::new(&dir)
+        .join(task)
+        .join(format!("{}.json", key));
+    let canned = std::fs::read_to_string(&fixture_path).ok()?;
+    debug!(
+        "Mock fixture hit for {}: {}",
+        task_path,
+        fixture_path.display()
+    );
+    Some(substitute_candidate_placeholders(&canned, mock_seed))
+}
+
+/// Replace `"@line:<n>"` candidate-id placeholders in a canned response with
+/// the real SWC candidate id for that line, parsed from the prompt's
+/// candidate hints (`- Candidate span:<a>-<b>: Line <n> ...`). This mirrors
+/// the real agent contract — the LLM echoes the candidate_id it sees in the
+/// CANDIDATE TARGETS section — without fixtures having to hard-code byte
+/// offsets. Placeholders for lines with no candidate are left as-is, so they
+/// fail the candidate map exactly like a hallucinated candidate_id would.
+fn substitute_candidate_placeholders(canned: &str, mock_seed: &str) -> String {
+    let mut out = canned.to_string();
+    for line in mock_seed.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("- Candidate ") else {
+            continue;
+        };
+        let Some((id, after)) = rest.split_once(": Line ") else {
+            continue;
+        };
+        let line_no: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if line_no.is_empty() {
+            continue;
+        }
+        out = out.replace(&format!("\"@line:{}\"", line_no), &format!("\"{}\"", id));
+    }
+    out
 }
 
 /// Generate mock response based on schema type

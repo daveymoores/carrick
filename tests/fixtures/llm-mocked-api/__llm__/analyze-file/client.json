@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "https://orders.internal/api/orders?user=${userId}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "getJson(`https://orders.internal/api/orders?user=${userId}`)",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Order",
+      "type_import_source": "./types"
+    }
+  ]
+}
