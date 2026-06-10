@@ -1,4 +1,5 @@
 use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
+use crate::operation::OperationKey;
 
 pub fn normalize_manifest_method(method: &str) -> String {
     let trimmed = method.trim();
@@ -16,7 +17,7 @@ pub fn is_http_method(method: &str) -> bool {
     )
 }
 
-pub fn build_display_name(method: &str, path: &str, type_kind: &str) -> String {
+pub fn build_display_name(key: &OperationKey, type_kind: &str) -> String {
     let kind = if type_kind.is_empty() {
         type_kind.to_string()
     } else {
@@ -26,12 +27,11 @@ pub fn build_display_name(method: &str, path: &str, type_kind: &str) -> String {
             None => String::new(),
         }
     };
-    format!("{} {} → {}", method, path, kind)
+    format!("{} → {}", key, kind)
 }
 
 pub fn build_manifest_type_alias(
-    method: &str,
-    path: &str,
+    key: &OperationKey,
     role: ManifestRole,
     type_kind: ManifestTypeKind,
 ) -> String {
@@ -44,25 +44,24 @@ pub fn build_manifest_type_alias(
         ManifestTypeKind::Response => "Response",
     };
 
-    let key = format!("{}|{}|{}|{}", method, path, role_label, type_label);
-    let hash = fnv1a_hash(&key);
+    let hash_input = format!("{}|{}|{}", key.canonical(), role_label, type_label);
+    let hash = fnv1a_hash(&hash_input);
 
     format!("Endpoint_{:016x}_{}", hash, type_label)
 }
 
-pub fn build_call_site_id(file_path: &str, line_number: u32, method: &str, path: &str) -> String {
-    let key = format!("{}|{}|{}|{}", file_path, line_number, method, path);
-    format!("{:016x}", fnv1a_hash(&key))
+pub fn build_call_site_id(file_path: &str, line_number: u32, key: &OperationKey) -> String {
+    let hash_input = format!("{}|{}|{}", file_path, line_number, key.canonical());
+    format!("{:016x}", fnv1a_hash(&hash_input))
 }
 
 pub fn build_manifest_type_alias_with_call_id(
-    method: &str,
-    path: &str,
+    key: &OperationKey,
     role: ManifestRole,
     type_kind: ManifestTypeKind,
     call_id: Option<&str>,
 ) -> String {
-    let base = build_manifest_type_alias(method, path, role, type_kind);
+    let base = build_manifest_type_alias(key, role, type_kind);
     match call_id {
         Some(id) if !id.trim().is_empty() => format!("{}_Call{}", base, id.trim()),
         _ => base,
@@ -120,16 +119,12 @@ mod tests {
 
     #[test]
     fn test_build_manifest_type_alias_with_call_id() {
-        let base = build_manifest_type_alias(
-            "GET",
-            "/users",
-            ManifestRole::Consumer,
-            ManifestTypeKind::Response,
-        );
-        let call_id = build_call_site_id("src/service.ts", 12, "GET", "/users");
+        let key = OperationKey::http("GET", "/users");
+        let base =
+            build_manifest_type_alias(&key, ManifestRole::Consumer, ManifestTypeKind::Response);
+        let call_id = build_call_site_id("src/service.ts", 12, &key);
         let with_call = build_manifest_type_alias_with_call_id(
-            "GET",
-            "/users",
+            &key,
             ManifestRole::Consumer,
             ManifestTypeKind::Response,
             Some(&call_id),
@@ -151,15 +146,15 @@ mod tests {
     #[test]
     fn test_build_display_name() {
         assert_eq!(
-            build_display_name("GET", "/users/:param", "response"),
+            build_display_name(&OperationKey::http("GET", "/users/:param"), "response"),
             "GET /users/:param → Response"
         );
         assert_eq!(
-            build_display_name("POST", "/api/orders", "request"),
+            build_display_name(&OperationKey::http("POST", "/api/orders"), "request"),
             "POST /api/orders → Request"
         );
         assert_eq!(
-            build_display_name("DELETE", "/items/:id", "Response"),
+            build_display_name(&OperationKey::http("DELETE", "/items/:id"), "Response"),
             "DELETE /items/:id → Response"
         );
     }

@@ -69,10 +69,10 @@ pub struct TypeEvidence {
 /// Entry in the type manifest mapping endpoints to their type information
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TypeManifestEntry {
-    /// HTTP method (GET, POST, PUT, DELETE, etc.)
-    pub method: String,
-    /// API path (e.g., /api/users/:id)
-    pub path: String,
+    /// Operation identity. Flattened so the JSON keeps the flat
+    /// `protocol`/`method`/`path` fields the ts_check matcher reads.
+    #[serde(flatten)]
+    pub key: OperationKey,
     /// Whether this is a producer or consumer
     pub role: ManifestRole,
     /// Whether this entry represents request or response
@@ -324,4 +324,47 @@ pub fn get_current_commit_hash(repo_path: &str) -> String {
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::type_sidecar::InferKind;
+
+    /// The flattened key is the wire contract with ts_check's manifest
+    /// matcher: entries must serialize with flat `protocol`/`method`/`path`
+    /// fields, and round-trip back into the tagged key.
+    #[test]
+    fn manifest_entry_serializes_flat_protocol_fields() {
+        let key = OperationKey::http("GET", "/api/users/:id");
+        let entry = TypeManifestEntry {
+            key: key.clone(),
+            role: ManifestRole::Producer,
+            type_kind: ManifestTypeKind::Response,
+            type_alias: "Endpoint_abc_Response".to_string(),
+            file_path: "src/routes.ts".to_string(),
+            line_number: 12,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+            evidence: TypeEvidence {
+                file_path: "src/routes.ts".to_string(),
+                span_start: None,
+                span_end: None,
+                line_number: 12,
+                infer_kind: InferKind::ResponseBody,
+                is_explicit: false,
+                type_state: ManifestTypeState::Unknown,
+            },
+            resolved_definition: None,
+            expanded_definition: None,
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["protocol"], "http");
+        assert_eq!(json["method"], "GET");
+        assert_eq!(json["path"], "/api/users/:id");
+
+        let back: TypeManifestEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.key, key);
+    }
 }

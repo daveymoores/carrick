@@ -1360,15 +1360,17 @@ impl Analyzer {
                 continue;
             };
             for entry in entries {
-                if let (Some(alias), Some(method), Some(path), Some(type_kind)) = (
-                    entry.get("type_alias").and_then(|v| v.as_str()),
-                    entry.get("method").and_then(|v| v.as_str()),
-                    entry.get("path").and_then(|v| v.as_str()),
-                    entry.get("type_kind").and_then(|v| v.as_str()),
-                ) {
-                    let display = crate::type_manifest::build_display_name(method, path, type_kind);
-                    map.insert(alias.to_string(), display);
-                }
+                let Ok(entry) = serde_json::from_value::<crate::cloud_storage::TypeManifestEntry>(
+                    entry.clone(),
+                ) else {
+                    continue;
+                };
+                let type_kind = match entry.type_kind {
+                    crate::cloud_storage::ManifestTypeKind::Request => "request",
+                    crate::cloud_storage::ManifestTypeKind::Response => "response",
+                };
+                let display = crate::type_manifest::build_display_name(&entry.key, type_kind);
+                map.insert(entry.type_alias.clone(), display);
             }
         }
 

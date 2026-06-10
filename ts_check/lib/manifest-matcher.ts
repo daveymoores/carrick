@@ -51,6 +51,13 @@ export interface TypeEvidence {
 }
 
 export interface ManifestEntry {
+  /**
+   * Protocol tag carried by the operation key. ts_check is the
+   * TS-assignability checker for HTTP contracts, so only "http" entries are
+   * valid here; other protocols are checked by their own pipelines and must
+   * not be written into these manifests.
+   */
+  protocol: 'http';
   /** HTTP method (GET, POST, PUT, DELETE, etc.) */
   method: string;
   /** API path (e.g., /api/users/:id) */
@@ -281,6 +288,9 @@ export class ManifestMatcher {
     if (!entry.path) {
       throw new Error('ManifestEntry missing required field: path');
     }
+    if (entry.protocol !== 'http') {
+      throw new Error('ManifestEntry missing or invalid field: protocol (must be "http")');
+    }
     if (!entry.type_alias) {
       throw new Error('ManifestEntry missing required field: type_alias');
     }
@@ -461,6 +471,7 @@ export class ManifestMatcher {
         const producerMethod = normalizeMethod(producer.method);
 
         if (
+          consumer.protocol === producer.protocol &&
           consumerMethod === producerMethod &&
           pathsMatch(consumer.path, producer.path) &&
           consumer.type_kind === producer.type_kind
@@ -627,6 +638,7 @@ export function createManifestEntry(
   };
 
   return {
+    protocol: 'http',
     method: normalizeMethod(method),
     path: entryPath,
     type_alias: typeAlias,

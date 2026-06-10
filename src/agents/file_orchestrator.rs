@@ -27,6 +27,7 @@ use crate::{
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
+    operation::OperationKey,
     packages::Packages,
     parser::parse_file,
     services::type_sidecar::{
@@ -569,7 +570,11 @@ impl FileOrchestrator {
                 continue;
             };
             let path = normalizer.extract_path(&data_call.target_url);
-            let call_id = build_call_site_id(&file_path, line_number, &method, &path);
+            let call_id = build_call_site_id(
+                &file_path,
+                line_number,
+                &OperationKey::http(&method, path.clone()),
+            );
             data_call_lookup
                 .entry((file_path, line_number))
                 .or_default()
@@ -613,15 +618,14 @@ impl FileOrchestrator {
                 if !is_http_method(&method) || !path.starts_with('/') {
                     continue;
                 }
+                let key = OperationKey::http(&method, path.clone());
                 let response_alias = build_manifest_type_alias(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Producer,
                     ManifestTypeKind::Response,
                 );
                 let request_alias = build_manifest_type_alias(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Producer,
                     ManifestTypeKind::Request,
                 );
@@ -767,21 +771,19 @@ impl FileOrchestrator {
                             build_call_site_id(
                                 file_path,
                                 line_number,
-                                &method_fallback,
-                                &target_path,
+                                &OperationKey::http(&method_fallback, target_path.clone()),
                             ),
                         )
                     });
+                let key = OperationKey::http(&method, path.clone());
                 let response_alias = build_manifest_type_alias_with_call_id(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Response,
                     Some(&call_id),
                 );
                 let request_alias = build_manifest_type_alias_with_call_id(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Request,
                     Some(&call_id),

@@ -1297,8 +1297,7 @@ fn build_type_manifest_entries(
 
         add_manifest_pair(
             &mut entries,
-            &method,
-            &path,
+            OperationKey::http(&method, path),
             ManifestRole::Producer,
             &file_path,
             line_number,
@@ -1316,12 +1315,12 @@ fn build_type_manifest_entries(
             continue;
         }
         let path = normalizer.extract_path(&call.target_url);
-        let call_id = build_call_site_id(&file_path, line_number, &method, &path);
+        let key = OperationKey::http(&method, path);
+        let call_id = build_call_site_id(&file_path, line_number, &key);
 
         add_manifest_pair(
             &mut entries,
-            &method,
-            &path,
+            key,
             ManifestRole::Consumer,
             &file_path,
             line_number,
@@ -1334,23 +1333,24 @@ fn build_type_manifest_entries(
 
 fn add_manifest_pair(
     entries: &mut Vec<TypeManifestEntry>,
-    method: &str,
-    path: &str,
+    key: OperationKey,
     role: ManifestRole,
     file_path: &str,
     line_number: u32,
     call_id: Option<&str>,
 ) {
     // Producers for GET/HEAD/OPTIONS never have request bodies
-    let skip_request =
-        role == ManifestRole::Producer && matches!(method, "GET" | "HEAD" | "OPTIONS");
+    let skip_request = role == ManifestRole::Producer
+        && matches!(
+            key.as_http().map(|(method, _)| method),
+            Some("GET" | "HEAD" | "OPTIONS")
+        );
 
     for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
         if skip_request && type_kind == ManifestTypeKind::Request {
             continue;
         }
-        let type_alias =
-            build_manifest_type_alias_with_call_id(method, path, role, type_kind, call_id);
+        let type_alias = build_manifest_type_alias_with_call_id(&key, role, type_kind, call_id);
         let infer_kind = infer_kind_for_manifest(role, type_kind);
         let evidence = crate::cloud_storage::TypeEvidence {
             file_path: file_path.to_string(),
@@ -1362,8 +1362,7 @@ fn add_manifest_pair(
             type_state: ManifestTypeState::Unknown,
         };
         entries.push(TypeManifestEntry {
-            method: method.to_string(),
-            path: path.to_string(),
+            key: key.clone(),
             role,
             type_kind,
             type_alias,
