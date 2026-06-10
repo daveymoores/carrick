@@ -16,8 +16,9 @@ them). The REST coupling is concentrated in one assumption repeated across ~6 la
 The work splits into:
 
 1. **A one-time foundation refactor** — replace `(method, path)` with a
-   protocol-tagged operation key everywhere it appears. Moderate, mechanical, but it
-   touches the cloud contract, so it is a coordinated two-repo change.
+   protocol-tagged operation key everywhere it appears. Moderate and mechanical. It
+   touches the cloud contract, but with no users (per repo rules) that just means
+   changing both repos in lockstep — no compatibility ceremony.
 2. **Per-protocol extraction + matching + compatibility modules** — mostly *new* code
    hanging off the foundation, not rewrites. GraphQL is the standout: its contract is
    declared (SDL + documents), so extraction is deterministic parsing and
@@ -106,15 +107,16 @@ enum OperationKey {
   `formatter/mod.rs:250-310` should be replaced with structured findings as part of
   this (it's already fragile).
 
-**The hidden cost is coordination, not Rust.** `CloudRepoData` is the wire contract
-with carrick-cloud: the index schema, `get_api_endpoints` / `get_endpoint_types` /
-`check_compatibility` MCP tools, and the file-analysis prompts all mirror the
-`(method, path)` shape and live in the other repo. The precedent is the
-`multiService` capability flag: ship a `protocols` capability the same way, bump
-`CACHE_VERSION` (invalidating per-file LLM caches), and land paired deploys.
-Framework-guidance and file-analyzer prompt changes are also carrick-cloud work
-(prompt-leak guard keeps them out of this repo); only the response-schema structs in
-`src/agents/schemas.rs` / `file_analyzer_agent.rs` change here.
+**The refactor spans two repos, but with no users it carries no compat cost.**
+`CloudRepoData` is the wire contract with carrick-cloud: the index schema,
+`get_api_endpoints` / `get_endpoint_types` / `check_compatibility` MCP tools, and the
+file-analysis prompts all mirror the `(method, path)` shape and live in the other
+repo. Per the no-users/no-backwards-compat rule, there is no capability flag or
+staged deploy: change both repos in lockstep, redeploy, bump `CACHE_VERSION`, and let
+per-file caches and the index rebuild on the next scan. Framework-guidance and
+file-analyzer prompt changes are also carrick-cloud work (prompt-leak guard keeps
+them out of this repo); only the response-schema structs in `src/agents/schemas.rs` /
+`file_analyzer_agent.rs` change here.
 
 ## 3. GraphQL (queries + mutations first)
 
@@ -216,7 +218,7 @@ frameworks. **Lift: low-medium once the foundation exists.**
 | Component | Change | Lift |
 |---|---|---|
 | Data model (`ApiEndpointDetails`, manifest, `CloudRepoData`) | `OperationKey`/`Protocol`, optional input/output | Medium, mechanical, one shot |
-| carrick-cloud contract (index, MCP tools, prompts, capability flag) | Mirror the above; `protocols` capability like `multiService`; `CACHE_VERSION` bump | Medium — the coordination risk lives here |
+| carrick-cloud contract (index, MCP tools, prompts) | Mirror the above; lockstep redeploy; `CACHE_VERSION` bump (no compat needed — no users) | Medium, mechanical |
 | SWC scanner | Stop suppressing WS/GQL candidates; add `gql` tag / `.graphql` / socket patterns | Low |
 | LLM schemas + guidance | Extend `FileAnalysisResult` with per-protocol result arrays; prompts in carrick-cloud | Medium |
 | Mount graph / matching | Keep for HTTP; add trivial exact-key matchers per protocol | Low |
@@ -227,8 +229,10 @@ frameworks. **Lift: low-medium once the foundation exists.**
 ## 8. Suggested phasing
 
 1. **Phase 0 — foundation** (prerequisite tax): `OperationKey` refactor across
-   scanner + paired carrick-cloud schema/tooling change + capability flag. Riskiest
-   step because of the two-repo deploy; everything after it is additive.
+   scanner + lockstep carrick-cloud schema/tooling change. The only step that touches
+   the working REST path; risk is ordinary regression risk, covered by the
+   `examples/` e2e fixtures. Everything after it is additive. Don't do it
+   speculatively — land it in the same arc as Phase 1.
 2. **Phase 1 — GraphQL queries/mutations**: SDL + document parsing, validation-based
    checking, attribution via existing domain classification. Out of scope: Relay,
    persisted queries, federation composition, code-first without an SDL artifact.
@@ -237,15 +241,42 @@ frameworks. **Lift: low-medium once the foundation exists.**
 4. **Phase 3 — async messaging** (kafkajs/SQS/BullMQ topic matching).
 5. **Phase 4 — gRPC checking, tRPC index-only.**
 
-Order-of-magnitude effort (solo, including carrick-cloud halves): Phase 0 ≈ 1–2
-weeks; Phase 1 ≈ 3–4 weeks; Phase 2 ≈ 2–3 weeks; Phase 3 ≈ 2 weeks. These are
+Order-of-magnitude effort (solo, including carrick-cloud halves): Phase 0 ≈ 1
+week; Phase 1 ≈ 3–4 weeks; Phase 2 ≈ 2–3 weeks; Phase 3 ≈ 2 weeks. These are
 calibration anchors, not commitments.
 
-## 9. Open questions
+## 9. MVP brittleness guardrails
 
-- **Index key migration in carrick-cloud**: production index keys on
+The expansion must not lower finding precision below today's REST baseline. Rules
+that keep it that way:
+
+- **Drift findings only from deterministic evidence** — parsed SDL, `gql` document
+  literals, literal Socket.IO event names, literal queue/topic strings.
+  LLM-inferred protocol facts go into the index (queryable over MCP) but never into
+  PR-comment drift findings. Extraction misses become silent coverage gaps, not
+  false positives.
+- **No raw-`ws` drift detection in MVP.** Raw WebSocket frames have no
+  protocol-level operation key; anything reported there is a guess. Index-only at
+  most.
+- **Orphan findings for new protocols default to informational** — unscanned
+  consumers (mobile apps, third parties) make "provided but never invoked" a soft
+  signal, same as orphaned REST endpoints today.
+- **Gateway invisibility argues *for* the new protocols, not against.** REST
+  matching is fragile precisely because gateways rewrite the operation key
+  (paths/base URLs) — hence `UrlNormalizer` and env-var classification. GraphQL
+  operation names, socket event names, and queue topics pass through
+  infrastructure untouched, so their matchers have strictly fewer failure modes
+  than the REST matcher already shipped.
+- **GraphQL checking has no LLM in the loop** (parse + spec-defined validation),
+  unlike the REST chain (LLM call-site extraction → sidecar inference → TS
+  assignability). Where it fires, it's right.
+
+## 10. Open questions
+
+- **Index key design in carrick-cloud**: production index keys on
   (workspace, project, repo[, service]); operations need protocol in their identity
-  or GraphQL ops named like REST paths could collide.
+  or GraphQL ops named like REST paths could collide. No migration needed — just
+  redefine the key and rebuild.
 - **Payload growth**: `CloudRepoData` already gates at 5 MB (Lambda limit) by
   dropping caches; adding operation classes makes overflow more likely — may force
   the chunked-upload path sooner.
