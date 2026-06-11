@@ -563,7 +563,19 @@ function main(): void {
   });
 
   process.on('unhandledRejection', (reason) => {
-    logError(`Unhandled rejection (exiting): ${reason}`);
+    // This log is the last diagnostic before exit, so it must be actionable:
+    // a bare interpolation renders non-Error reasons as [object Object].
+    let detail: string;
+    if (reason instanceof Error) {
+      detail = reason.stack || reason.message;
+    } else {
+      try {
+        detail = JSON.stringify(reason) ?? String(reason);
+      } catch {
+        detail = String(reason);
+      }
+    }
+    logError(`Unhandled rejection (exiting): ${detail}`);
     process.exit(1);
   });
 }
