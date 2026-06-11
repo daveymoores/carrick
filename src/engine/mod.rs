@@ -155,7 +155,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // 3. Resolve the services declared for this repo (one for the common
     //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
-    let services = resolve_services(repo_path);
+    let services = resolve_services(repo_path)?;
     let multi_service = services.len() > 1;
     if multi_service {
         info!(
@@ -173,7 +173,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     let sp = logging::spinner("Analyzing repository...");
     let mut current_services_data = Vec::with_capacity(services.len());
     for service in &services {
-        let packages = load_packages_for_service(repo_path, service);
+        let packages = load_packages_for_service(repo_path, service)?;
 
         // Scope the sidecar's type extraction to this service's directory/tsconfig.
         scope_sidecar_to_service(sidecar, repo_path, service);
@@ -232,12 +232,35 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             );
         } else {
             let sp = logging::spinner("Uploading results...");
-            for data in &current_services_data {
-                let cloud_data_serialized = strip_ast_nodes(data.clone());
-                storage
-                    .upload_repo_data(&cloud_data_serialized)
-                    .await
-                    .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+            // Prepare every payload before uploading any, so a serialization
+            // problem can't surface halfway through a multi-service upload.
+            let payloads: Vec<CloudRepoData> = current_services_data
+                .iter()
+                .map(|data| strip_ast_nodes(data.clone()))
+                .collect();
+            for (i, payload) in payloads.iter().enumerate() {
+                if let Err(e) = storage.upload_repo_data(payload).await {
+                    // Uploads are keyed per (repo, service) and idempotent, so
+                    // a re-run restores consistency — but until then the index
+                    // holds this run's data for some services and the previous
+                    // run's for the rest. Make that state explicit.
+                    let uploaded: Vec<&str> = payloads[..i]
+                        .iter()
+                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                        .collect();
+                    let not_uploaded: Vec<&str> = payloads[i..]
+                        .iter()
+                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                        .collect();
+                    return Err(format!(
+                        "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
+                         The index is mixed-generation for this repo until a successful re-run.",
+                        e,
+                        uploaded.join(", "),
+                        not_uploaded.join(", ")
+                    )
+                    .into());
+                }
             }
             logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
         }
@@ -416,17 +439,34 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     // Payload size guard: Lambda function URLs have a 6MB request payload limit.
     // If serialized data exceeds ~5MB, drop file_results to stay under the limit.
     const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
+    const LAMBDA_HARD_LIMIT_BYTES: usize = 6 * 1024 * 1024;
     if let Ok(serialized) = serde_json::to_string(&data)
         && serialized.len() > MAX_PAYLOAD_BYTES
     {
         warn!(
-            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
+            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this \
+             upload — the next scan cannot run incrementally and will re-analyze every file",
             serialized.len() / 1024,
             MAX_PAYLOAD_BYTES / 1024
         );
         data.file_results = None;
         data.cached_detection = None;
         data.cached_guidance = None;
+
+        // Re-check: if the payload is still over Lambda's hard request limit
+        // even without the cache, say so up front — the upload will be
+        // rejected with an otherwise cryptic 413.
+        if let Ok(reserialized) = serde_json::to_string(&data)
+            && reserialized.len() > LAMBDA_HARD_LIMIT_BYTES
+        {
+            warn!(
+                "Payload is still {}KB after dropping caches, which exceeds the cloud's \
+                 {}KB request limit — the upload will likely be rejected. Consider splitting \
+                 the repo into services via carrick.json.",
+                reserialized.len() / 1024,
+                LAMBDA_HARD_LIMIT_BYTES / 1024
+            );
+        }
     }
 
     data
@@ -443,8 +483,29 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("git diff failed (shallow clone?): {}", stderr.trim());
-        debug!("Set fetch-depth: 0 in your workflow for incremental mode.");
+        // Surface this at warn level with the cause: a shallow clone
+        // (actions/checkout defaults to fetch-depth: 1) silently forces a
+        // full re-analysis — including its full LLM cost — on every run.
+        let is_shallow = std::process::Command::new("git")
+            .args(["rev-parse", "--is-shallow-repository"])
+            .current_dir(repo_path)
+            .output()
+            .ok()
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+        if is_shallow {
+            warn!(
+                "Incremental mode unavailable: this is a shallow clone, so the previous \
+                 scan's commit isn't reachable for diffing. Set `fetch-depth: 0` on \
+                 actions/checkout to avoid re-analyzing every file on each run."
+            );
+        } else {
+            warn!(
+                "Incremental mode unavailable: git diff against {} failed ({}). \
+                 Falling back to full analysis.",
+                base_commit,
+                stderr.trim()
+            );
+        }
         return None;
     }
 
@@ -885,6 +946,7 @@ fn build_cloud_data_from_mount_graph(
         cached_guidance: None,
         package_json_hash: None,
         cache_version: None,
+        type_extraction_status: None,
     }
 }
 
@@ -938,7 +1000,14 @@ fn resolve_types_if_available(
     config: &Config,
     cloud_data: &mut CloudRepoData,
 ) {
-    let Some(sidecar) = sidecar else { return };
+    let Some(sidecar) = sidecar else {
+        cloud_data.type_extraction_status = Some(
+            "type extraction skipped: sidecar unavailable (not found, failed to start, \
+             or failed to initialize)"
+                .to_string(),
+        );
+        return;
+    };
 
     debug!("Starting sidecar type resolution");
     match sidecar.wait_ready(Duration::from_secs(10)) {
@@ -972,12 +1041,16 @@ fn resolve_types_if_available(
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
                     debug!("Continuing without bundled types");
+                    cloud_data.type_extraction_status =
+                        Some(format!("type resolution failed: {}", e));
                 }
             }
         }
         Err(e) => {
             warn!("Sidecar not ready: {}", e);
             debug!("Skipping type resolution");
+            cloud_data.type_extraction_status =
+                Some(format!("type extraction skipped: sidecar not ready: {}", e));
         }
     }
 }
@@ -994,6 +1067,22 @@ fn discover_files_and_symbols(
     // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = service_ignore_patterns(service);
     let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
+
+    // Zero files means the scan target is wrong (typo'd path, empty checkout):
+    // proceeding would upload an empty service and silently erase its
+    // coverage from the index.
+    if files.is_empty() {
+        let scope = match &service.directory {
+            Some(dir) => format!("service directory '{}'", dir),
+            None => "repository root".to_string(),
+        };
+        return Err(format!(
+            "No JS/TS source files found under {} in '{}'. Check the scan path \
+             and the directory/include entries in carrick.json.",
+            scope, repo_path
+        )
+        .into());
+    }
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
 
@@ -1037,7 +1126,11 @@ fn discover_files_and_symbols(
 /// No config, or a flat config, yields a single service rooted at the repo
 /// root (zero-config single-service mode). A `services` array yields one entry
 /// per declared service. Always returns at least one service.
-fn resolve_services(repo_path: &str) -> Vec<Config> {
+///
+/// A config that exists but cannot be parsed, or that declares paths that
+/// don't exist, is a hard error: silently falling back to defaults would
+/// ignore the user's declared service layout and upload a wrong index.
+fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
     // carrick.json belongs at the scan root. Read it there directly rather than
     // walking the tree (a tree walk would pick up nested example/fixture
     // configs in a repo that contains them).
@@ -1045,18 +1138,57 @@ fn resolve_services(repo_path: &str) -> Vec<Config> {
 
     let services = if config_path.is_file() {
         debug!("Found carrick.json: {}", config_path.display());
-        Config::load_services(vec![config_path]).unwrap_or_else(|e| {
-            warn!("Error parsing config file: {}", e);
-            Vec::new()
-        })
+        Config::load_services(vec![config_path.clone()]).map_err(|e| {
+            format!(
+                "Failed to parse {}: {}. Fix the config or delete it to scan \
+                 the repo as a single zero-config service.",
+                config_path.display(),
+                e
+            )
+        })?
     } else {
         Vec::new()
     };
 
+    // A typo'd directory would otherwise walk nothing and upload an empty
+    // service, silently erasing its coverage from the index.
+    let root = std::path::Path::new(repo_path);
+    for service in &services {
+        let label = service
+            .service_name
+            .as_deref()
+            .or(service.directory.as_deref())
+            .unwrap_or("<unnamed>");
+        if let Some(dir) = &service.directory
+            && !root.join(dir).is_dir()
+        {
+            return Err(format!(
+                "Service '{}' in {} declares directory '{}', which does not exist under '{}'",
+                label,
+                config_path.display(),
+                dir,
+                repo_path
+            )
+            .into());
+        }
+        for inc in &service.include {
+            if !root.join(inc).exists() {
+                return Err(format!(
+                    "Service '{}' in {} declares include path '{}', which does not exist under '{}'",
+                    label,
+                    config_path.display(),
+                    inc,
+                    repo_path
+                )
+                .into());
+            }
+        }
+    }
+
     if services.is_empty() {
-        vec![Config::default()]
+        Ok(vec![Config::default()])
     } else {
-        services
+        Ok(services)
     }
 }
 
@@ -1077,17 +1209,22 @@ fn service_ignore_patterns(service: &Config) -> Vec<&'static str> {
 
 /// Load the package data for a single service, scoped to its own
 /// `package.json` (within its directory), not an arbitrary one from the repo.
-fn load_packages_for_service(repo_path: &str, service: &Config) -> Packages {
+///
+/// A missing `package.json` is fine (empty dependency set); one that exists
+/// but cannot be parsed is a hard error — defaulting to zero dependencies
+/// would silently gut framework detection and endpoint extraction.
+fn load_packages_for_service(
+    repo_path: &str,
+    service: &Config,
+) -> Result<Packages, Box<dyn std::error::Error>> {
     let ignore_patterns = service_ignore_patterns(service);
     let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
     if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
-        Packages::new(vec![package_path]).unwrap_or_else(|e| {
-            warn!("Error parsing package.json: {}", e);
-            Packages::default()
-        })
+        Packages::new(vec![package_path.clone()])
+            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e).into())
     } else {
-        Packages::default()
+        Ok(Packages::default())
     }
 }
 
@@ -1805,6 +1942,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -1843,6 +1981,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         }];
 
         // Test Config merging
@@ -1916,6 +2055,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -2265,6 +2405,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -2306,6 +2447,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -2438,6 +2580,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: Some("abc123hash".to_string()),
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -2507,6 +2650,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -2547,5 +2691,109 @@ mod tests {
         assert!(data.cached_guidance.is_none());
         assert!(data.package_json_hash.is_none());
         assert!(data.cache_version.is_none());
+    }
+
+    #[test]
+    fn resolve_services_without_config_defaults_to_single_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(services.len(), 1);
+        assert!(services[0].directory.is_none());
+    }
+
+    #[test]
+    fn resolve_services_rejects_malformed_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("carrick.json"), "{ not valid json").unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_rejects_missing_service_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "does-not-exist" }] }"#,
+        )
+        .unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("does-not-exist")
+                && err.to_string().contains("does not exist"),
+            "expected missing-directory error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_rejects_missing_include_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("svc")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "svc", "include": ["shared"] }] }"#,
+        )
+        .unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("include path 'shared'"),
+            "expected missing-include error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_accepts_valid_service_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("svc")).unwrap();
+        std::fs::create_dir(tmp.path().join("shared")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "svc", "include": ["shared"] }] }"#,
+        )
+        .unwrap();
+
+        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].directory.as_deref(), Some("svc"));
+    }
+
+    #[test]
+    fn load_packages_rejects_malformed_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{ trailing-comma: ,}").unwrap();
+
+        let err = load_packages_for_service(tmp.path().to_str().unwrap(), &Config::default())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_packages_missing_package_json_defaults_to_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages =
+            load_packages_for_service(tmp.path().to_str().unwrap(), &Config::default()).unwrap();
+        assert!(packages.merged_dependencies.is_empty());
+    }
+
+    #[test]
+    fn discovery_rejects_service_with_no_source_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cm: Lrc<SourceMap> = Default::default();
+
+        let err = discover_files_and_symbols(tmp.path().to_str().unwrap(), &Config::default(), cm)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("No JS/TS source files"),
+            "expected empty-scan error, got: {err}"
+        );
     }
 }

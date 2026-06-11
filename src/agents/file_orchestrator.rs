@@ -74,6 +74,10 @@ pub struct ProcessingStats {
     pub files_skipped: usize,
     /// Files skipped because SWC found no API candidates (zero-cost skips)
     pub files_skipped_no_candidates: usize,
+    /// Files excluded because they could not be parsed. Counted separately
+    /// from zero-cost skips: a parse failure silently removes the file's
+    /// endpoints from the index. A subset of `files_skipped`.
+    pub files_parse_failed: usize,
     pub total_mounts: usize,
     pub total_endpoints: usize,
     /// Endpoints derived structurally from file-based routing conventions
@@ -202,6 +206,23 @@ impl FileOrchestrator {
                 &framework_detection.data_fetchers,
             );
 
+            // A parse failure excludes the whole file (and any endpoints in
+            // it) from the index — surface it instead of letting it look like
+            // a healthy file with no API patterns.
+            if scan_result.parse_failed {
+                warn!(
+                    "Failed to parse {} — file excluded from analysis; any endpoints in it \
+                     will be missing from the index",
+                    path_str
+                );
+                stats.errors.push(format!("Parse failure: {}", path_str));
+                stats.files_skipped += 1;
+                stats.files_parse_failed += 1;
+                // Store empty result so incremental cache knows this file was processed
+                file_results.insert(path_str, FileAnalysisResult::default());
+                continue;
+            }
+
             // File-based routing: routes declared by file location (Next.js app
             // router, etc.) have no call-site candidate — the endpoint *is* the
             // exported handler declaration. The path comes from the layout and the
@@ -326,7 +347,7 @@ impl FileOrchestrator {
                     // using the compiler-based approach instead of position-based extraction.
 
                     let mut adjusted = result;
-                    Self::apply_candidate_map(&mut adjusted, &pf.candidate_map);
+                    Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
@@ -357,6 +378,12 @@ impl FileOrchestrator {
             "  - Zero-cost skips (no API patterns): {}",
             stats.files_skipped_no_candidates
         );
+        if stats.files_parse_failed > 0 {
+            warn!(
+                "{} file(s) failed to parse and are excluded from the index",
+                stats.files_parse_failed
+            );
+        }
         debug!("  - Total mounts: {}", stats.total_mounts);
         debug!("  - Total endpoints: {}", stats.total_endpoints);
         debug!(
@@ -1035,19 +1062,38 @@ impl FileOrchestrator {
     fn apply_candidate_map(
         result: &mut FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
+        file_path: &str,
     ) {
-        // Endpoints: keep filter_map (endpoints without candidates are unreliable)
+        // Endpoints: keep filter_map (endpoints without candidates are unreliable),
+        // but a drop means an endpoint the LLM reported vanishes from the index —
+        // log which, so silent loss is at least diagnosable.
+        let mut dropped_endpoints: Vec<String> = Vec::new();
         result.endpoints = result
             .endpoints
             .drain(..)
             .filter_map(|mut endpoint| {
-                let candidate = candidate_map.get(&endpoint.candidate_id)?;
+                let Some(candidate) = candidate_map.get(&endpoint.candidate_id) else {
+                    dropped_endpoints.push(format!(
+                        "{} {} (candidate_id '{}')",
+                        endpoint.method, endpoint.path, endpoint.candidate_id
+                    ));
+                    return None;
+                };
                 endpoint.line_number = candidate.line_number as i32;
                 endpoint.call_expression_span_start = Some(candidate.span_start);
                 endpoint.call_expression_span_end = Some(candidate.span_end);
                 Some(endpoint)
             })
             .collect();
+
+        if !dropped_endpoints.is_empty() {
+            warn!(
+                "[FileOrchestrator] {} endpoint(s) in {} dropped — no matching SWC candidate: {}",
+                dropped_endpoints.len(),
+                file_path,
+                dropped_endpoints.join(", ")
+            );
+        }
 
         // Data calls: preserve even without candidate match (inline aliases still work)
         let mut dropped_count = 0;

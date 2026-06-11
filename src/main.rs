@@ -127,6 +127,16 @@ async fn main() {
 }
 
 async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the scan target up front. A nonexistent path would otherwise
+    // walk zero files and "succeed" with an empty analysis.
+    if !Path::new(&args.repo_path).is_dir() {
+        return Err(format!(
+            "Repository path '{}' does not exist or is not a directory",
+            args.repo_path
+        )
+        .into());
+    }
+
     // =======================================================================
     // STEP 1: Discover and spawn sidecar (non-blocking)
     // The sidecar is bundled with the tool - auto-discover its location

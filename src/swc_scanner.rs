@@ -85,6 +85,10 @@ pub struct ScanResult {
     pub candidates: Vec<CandidateTarget>,
     /// Whether the file should be analyzed (has candidates)
     pub should_analyze: bool,
+    /// True when the file could not be parsed at all. Callers must surface
+    /// this: a parse failure excludes the whole file from the index, which is
+    /// very different from a healthy file with no API candidates.
+    pub parse_failed: bool,
 }
 
 /// A value exported from a module. Used by file-based routing to recover the
@@ -144,6 +148,7 @@ impl SwcScanner {
                 return ScanResult {
                     candidates: Vec::new(),
                     should_analyze: false,
+                    parse_failed: true,
                 };
             }
         };
@@ -159,6 +164,7 @@ impl SwcScanner {
         ScanResult {
             candidates: visitor.candidates,
             should_analyze,
+            parse_failed: false,
         }
     }
 
@@ -235,6 +241,7 @@ impl SwcScanner {
                 return ScanResult {
                     candidates: Vec::new(),
                     should_analyze: false,
+                    parse_failed: true,
                 };
             }
         };
@@ -258,6 +265,7 @@ impl SwcScanner {
         ScanResult {
             candidates: visitor.candidates,
             should_analyze,
+            parse_failed: false,
         }
     }
 
@@ -883,6 +891,17 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn scan_content_flags_parse_failures() {
+        let result = scan_test_content("function broken( {{{");
+        assert!(result.parse_failed);
+        assert!(!result.should_analyze);
+
+        let healthy = scan_test_content("const x = 1;");
+        assert!(!healthy.parse_failed);
+        assert!(!healthy.should_analyze);
     }
 
     #[test]

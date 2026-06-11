@@ -4,7 +4,30 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::{debug, warn};
+
+/// Total per-request deadline. Generous because uploads can carry multi-MB
+/// payloads over slow CI links, but bounded so a hung connection can't stall
+/// the scan until the CI job timeout.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Retries after the first attempt for transient failures (network errors,
+/// 408/429/5xx). A scan's cloud calls bookend a long, expensive analysis, so
+/// one Lambda cold start or load-balancer blip must not discard the run.
+const MAX_TRANSIENT_RETRIES: u32 = 3;
+
+fn retry_backoff(retries_so_far: u32) -> Duration {
+    // 2s, 4s, 8s
+    Duration::from_secs(2u64 << retries_so_far)
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
 
 pub struct AwsStorage {
     lambda_url: String,
@@ -100,9 +123,17 @@ impl AwsStorage {
         // from the signed OIDC claims, so there is no other way to authenticate.
         OidcProvider::global().map_err(|e| StorageError::ConnectionError(e.to_string()))?;
 
+        let http_client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| {
+                StorageError::ConnectionError(format!("Failed to build HTTP client: {}", e))
+            })?;
+
         Ok(Self {
             lambda_url,
-            http_client: Client::new(),
+            http_client,
             multi_service: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -110,6 +141,8 @@ impl AwsStorage {
     /// POSTs a JSON body to the upload endpoint with the OIDC bearer header,
     /// returning the raw response body on success. OIDC tokens are short-lived,
     /// so on a 401 (token likely expired mid-run) we re-mint once and retry.
+    /// Transient failures (network errors, 408/429/5xx) are retried with
+    /// exponential backoff up to [`MAX_TRANSIENT_RETRIES`] times.
     async fn send_lambda<B>(&self, body: &B) -> Result<String, StorageError>
     where
         B: serde::Serialize + ?Sized,
@@ -122,41 +155,69 @@ impl AwsStorage {
             .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
 
         let mut reminted = false;
+        let mut retries = 0u32;
         loop {
-            let response = self
+            let transient_error = match self
                 .http_client
                 .post(&self.lambda_url)
                 .header("X-Carrick-OIDC", &token)
                 .json(body)
                 .send()
                 .await
-                .map_err(|e| {
-                    StorageError::ConnectionError(format!("Lambda request failed: {}", e))
-                })?;
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    match response.text().await {
+                        Ok(response_text) => {
+                            if status.as_u16() == 401 && !reminted {
+                                warn!(
+                                    "Upload returned 401; re-minting OIDC token and retrying once"
+                                );
+                                token = provider
+                                    .remint()
+                                    .await
+                                    .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
+                                reminted = true;
+                                continue;
+                            }
 
-            let status = response.status();
-            let response_text = response.text().await.map_err(|e| {
-                StorageError::ConnectionError(format!("Failed to read response: {}", e))
-            })?;
+                            if status.is_success() {
+                                return Ok(response_text);
+                            }
 
-            if status.as_u16() == 401 && !reminted {
-                warn!("Upload returned 401; re-minting OIDC token and retrying once");
-                token = provider
-                    .remint()
-                    .await
-                    .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
-                reminted = true;
-                continue;
-            }
+                            if !is_transient_status(status) {
+                                return Err(StorageError::ConnectionError(format!(
+                                    "Lambda returned error {}: {}",
+                                    status, response_text
+                                )));
+                            }
 
-            if !status.is_success() {
+                            format!("Lambda returned {}: {}", status, response_text)
+                        }
+                        Err(e) => format!("Failed to read response: {}", e),
+                    }
+                }
+                Err(e) => format!("Lambda request failed: {}", e),
+            };
+
+            if retries >= MAX_TRANSIENT_RETRIES {
                 return Err(StorageError::ConnectionError(format!(
-                    "Lambda returned error {}: {}",
-                    status, response_text
+                    "{} (after {} attempts)",
+                    transient_error,
+                    retries + 1
                 )));
             }
 
-            return Ok(response_text);
+            let backoff = retry_backoff(retries);
+            warn!(
+                "{}; retrying in {}s ({}/{})",
+                transient_error,
+                backoff.as_secs(),
+                retries + 1,
+                MAX_TRANSIENT_RETRIES
+            );
+            tokio::time::sleep(backoff).await;
+            retries += 1;
         }
     }
 
@@ -184,29 +245,57 @@ impl AwsStorage {
         })
     }
 
+    /// PUTs content to a pre-signed S3 URL. The PUT is idempotent, so
+    /// transient failures (network errors, 5xx) are retried with backoff.
     async fn upload_to_s3(&self, upload_url: &str, content: &str) -> Result<(), StorageError> {
-        let response = self
-            .http_client
-            .put(upload_url)
-            .header("Content-Type", "text/plain")
-            .body(content.to_string())
-            .send()
-            .await
-            .map_err(|e| StorageError::ConnectionError(format!("S3 upload failed: {}", e)))?;
+        let mut retries = 0u32;
+        loop {
+            let transient_error = match self
+                .http_client
+                .put(upload_url)
+                .header("Content-Type", "text/plain")
+                .body(content.to_string())
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) => {
+                    // Always include the response body — S3 returns the actual
+                    // cause (AccessDenied, signature mismatch, missing header,
+                    // etc.) in the XML error document. A bare status code is
+                    // rarely actionable.
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    if !is_transient_status(status) {
+                        return Err(StorageError::ConnectionError(format!(
+                            "S3 upload returned {}: {}",
+                            status, body
+                        )));
+                    }
+                    format!("S3 upload returned {}: {}", status, body)
+                }
+                Err(e) => format!("S3 upload failed: {}", e),
+            };
 
-        if !response.status().is_success() {
-            // Always include the response body — S3 returns the actual cause
-            // (AccessDenied, signature mismatch, missing header, etc.) in the
-            // XML error document. A bare status code is rarely actionable.
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(StorageError::ConnectionError(format!(
-                "S3 upload returned {}: {}",
-                status, body
-            )));
+            if retries >= MAX_TRANSIENT_RETRIES {
+                return Err(StorageError::ConnectionError(format!(
+                    "{} (after {} attempts)",
+                    transient_error,
+                    retries + 1
+                )));
+            }
+
+            let backoff = retry_backoff(retries);
+            warn!(
+                "{}; retrying in {}s ({}/{})",
+                transient_error,
+                backoff.as_secs(),
+                retries + 1,
+                MAX_TRANSIENT_RETRIES
+            );
+            tokio::time::sleep(backoff).await;
+            retries += 1;
         }
-
-        Ok(())
     }
 
     async fn store_repo_metadata(
@@ -356,6 +445,7 @@ impl CloudStorage for AwsStorage {
                     cached_guidance: None,
                     package_json_hash: None,
                     cache_version: None,
+                    type_extraction_status: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);
@@ -463,5 +553,37 @@ impl CloudStorage for AwsStorage {
     fn supports_multi_service(&self) -> bool {
         self.multi_service
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn transient_statuses_are_retryable() {
+        assert!(is_transient_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_transient_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_transient_status(StatusCode::BAD_GATEWAY));
+        assert!(is_transient_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_transient_status(StatusCode::GATEWAY_TIMEOUT));
+    }
+
+    #[test]
+    fn permanent_statuses_are_not_retryable() {
+        assert!(!is_transient_status(StatusCode::BAD_REQUEST));
+        assert!(!is_transient_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_status(StatusCode::FORBIDDEN));
+        assert!(!is_transient_status(StatusCode::NOT_FOUND));
+        assert!(!is_transient_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[test]
+    fn backoff_grows_exponentially() {
+        assert_eq!(retry_backoff(0), Duration::from_secs(2));
+        assert_eq!(retry_backoff(1), Duration::from_secs(4));
+        assert_eq!(retry_backoff(2), Duration::from_secs(8));
     }
 }
