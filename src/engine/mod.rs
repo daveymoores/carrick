@@ -232,12 +232,35 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             );
         } else {
             let sp = logging::spinner("Uploading results...");
-            for data in &current_services_data {
-                let cloud_data_serialized = strip_ast_nodes(data.clone());
-                storage
-                    .upload_repo_data(&cloud_data_serialized)
-                    .await
-                    .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+            // Prepare every payload before uploading any, so a serialization
+            // problem can't surface halfway through a multi-service upload.
+            let payloads: Vec<CloudRepoData> = current_services_data
+                .iter()
+                .map(|data| strip_ast_nodes(data.clone()))
+                .collect();
+            for (i, payload) in payloads.iter().enumerate() {
+                if let Err(e) = storage.upload_repo_data(payload).await {
+                    // Uploads are keyed per (repo, service) and idempotent, so
+                    // a re-run restores consistency — but until then the index
+                    // holds this run's data for some services and the previous
+                    // run's for the rest. Make that state explicit.
+                    let uploaded: Vec<&str> = payloads[..i]
+                        .iter()
+                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                        .collect();
+                    let not_uploaded: Vec<&str> = payloads[i..]
+                        .iter()
+                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                        .collect();
+                    return Err(format!(
+                        "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
+                         The index is mixed-generation for this repo until a successful re-run.",
+                        e,
+                        uploaded.join(", "),
+                        not_uploaded.join(", ")
+                    )
+                    .into());
+                }
             }
             logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
         }
@@ -416,17 +439,34 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     // Payload size guard: Lambda function URLs have a 6MB request payload limit.
     // If serialized data exceeds ~5MB, drop file_results to stay under the limit.
     const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
+    const LAMBDA_HARD_LIMIT_BYTES: usize = 6 * 1024 * 1024;
     if let Ok(serialized) = serde_json::to_string(&data)
         && serialized.len() > MAX_PAYLOAD_BYTES
     {
         warn!(
-            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
+            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this \
+             upload — the next scan cannot run incrementally and will re-analyze every file",
             serialized.len() / 1024,
             MAX_PAYLOAD_BYTES / 1024
         );
         data.file_results = None;
         data.cached_detection = None;
         data.cached_guidance = None;
+
+        // Re-check: if the payload is still over Lambda's hard request limit
+        // even without the cache, say so up front — the upload will be
+        // rejected with an otherwise cryptic 413.
+        if let Ok(reserialized) = serde_json::to_string(&data)
+            && reserialized.len() > LAMBDA_HARD_LIMIT_BYTES
+        {
+            warn!(
+                "Payload is still {}KB after dropping caches, which exceeds the cloud's \
+                 {}KB request limit — the upload will likely be rejected. Consider splitting \
+                 the repo into services via carrick.json.",
+                reserialized.len() / 1024,
+                LAMBDA_HARD_LIMIT_BYTES / 1024
+            );
+        }
     }
 
     data
@@ -443,8 +483,29 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("git diff failed (shallow clone?): {}", stderr.trim());
-        debug!("Set fetch-depth: 0 in your workflow for incremental mode.");
+        // Surface this at warn level with the cause: a shallow clone
+        // (actions/checkout defaults to fetch-depth: 1) silently forces a
+        // full re-analysis — including its full LLM cost — on every run.
+        let is_shallow = std::process::Command::new("git")
+            .args(["rev-parse", "--is-shallow-repository"])
+            .current_dir(repo_path)
+            .output()
+            .ok()
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+        if is_shallow {
+            warn!(
+                "Incremental mode unavailable: this is a shallow clone, so the previous \
+                 scan's commit isn't reachable for diffing. Set `fetch-depth: 0` on \
+                 actions/checkout to avoid re-analyzing every file on each run."
+            );
+        } else {
+            warn!(
+                "Incremental mode unavailable: git diff against {} failed ({}). \
+                 Falling back to full analysis.",
+                base_commit,
+                stderr.trim()
+            );
+        }
         return None;
     }
 
