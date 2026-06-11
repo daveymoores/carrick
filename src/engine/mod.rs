@@ -885,6 +885,7 @@ fn build_cloud_data_from_mount_graph(
         cached_guidance: None,
         package_json_hash: None,
         cache_version: None,
+        type_extraction_status: None,
     }
 }
 
@@ -938,7 +939,14 @@ fn resolve_types_if_available(
     config: &Config,
     cloud_data: &mut CloudRepoData,
 ) {
-    let Some(sidecar) = sidecar else { return };
+    let Some(sidecar) = sidecar else {
+        cloud_data.type_extraction_status = Some(
+            "type extraction skipped: sidecar unavailable (not found, failed to start, \
+             or failed to initialize)"
+                .to_string(),
+        );
+        return;
+    };
 
     debug!("Starting sidecar type resolution");
     match sidecar.wait_ready(Duration::from_secs(10)) {
@@ -972,12 +980,16 @@ fn resolve_types_if_available(
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
                     debug!("Continuing without bundled types");
+                    cloud_data.type_extraction_status =
+                        Some(format!("type resolution failed: {}", e));
                 }
             }
         }
         Err(e) => {
             warn!("Sidecar not ready: {}", e);
             debug!("Skipping type resolution");
+            cloud_data.type_extraction_status =
+                Some(format!("type extraction skipped: sidecar not ready: {}", e));
         }
     }
 }
@@ -1869,6 +1881,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -1907,6 +1920,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         }];
 
         // Test Config merging
@@ -1980,6 +1994,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -2329,6 +2344,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -2370,6 +2386,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -2502,6 +2519,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: Some("abc123hash".to_string()),
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -2571,6 +2589,7 @@ mod tests {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");

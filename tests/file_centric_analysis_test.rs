@@ -254,6 +254,7 @@ fn test_processing_stats_tracking() {
         files_processed: 5,
         files_skipped: 2,
         files_skipped_no_candidates: 1,
+        files_parse_failed: 1,
         total_mounts: 3,
         total_endpoints: 10,
         file_based_endpoints: 2,

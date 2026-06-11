@@ -137,6 +137,12 @@ pub struct CloudRepoData {
     /// Cache format version — discard cached data if mismatched
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_version: Option<u32>,
+    /// Why type extraction was skipped or failed for this service, if it was.
+    /// `None` means types were resolved normally. Set so the index records
+    /// that this service's data is degraded (endpoints without types) instead
+    /// of that being indistinguishable from "endpoints have no types".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_extraction_status: Option<String>,
 }
 
 impl CloudRepoData {
@@ -240,6 +246,7 @@ impl CloudRepoData {
             cached_guidance: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         }
     }
 }
