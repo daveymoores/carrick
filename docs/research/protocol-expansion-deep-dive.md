@@ -275,7 +275,47 @@ that keep it that way:
   unlike the REST chain (LLM call-site extraction → sidecar inference → TS
   assignability). Where it fires, it's right.
 
-## 10. Open questions
+## 10. LLM pipeline: protocol-routed prompts, not one diluted prompt
+
+A single analyze-file prompt asked to extract every protocol degrades on two
+axes: instruction dilution (more rules competing for attention per token of
+code) and **response-schema dilution** (every protocol's fields present on
+every call invites hallucinated socket events in pure Express files). The
+cost would land on the common case — most files are single-protocol REST.
+Instead, route:
+
+- **Detection stays generic.** The existing framework-detection inventory
+  implies the active protocol set per repo (`express` → http, `socket.io` →
+  websocket, `kafkajs` → queue). It is an inventory task, not
+  precision-critical: a false protocol only costs one extra guidance call.
+- **Guidance becomes per-protocol.** One focused guidance prompt per active
+  protocol in carrick-cloud (`system_prompt_http.txt`,
+  `system_prompt_websocket.txt`, …); `cached_guidance` becomes a map keyed
+  by protocol. Undetected protocols cost nothing.
+- **Protocol-tagged SWC candidates are the dispatcher.** The candidate gate
+  already decides whether a file reaches the LLM; tagging candidates by
+  protocol decides *which prompt* it reaches. Files with only http
+  candidates get today's HTTP prompt byte-for-byte unchanged — REST
+  extraction precision cannot regress. Mixed files (rare) get one pass per
+  protocol with that protocol's prompt and schema; the per-file cache keys
+  on `(file, protocol)`.
+- **Each pass returns its own result type** (`endpoints`/`data_calls` for
+  http, `listeners`/`emits` for sockets), validated by the same generic
+  machinery — candidate-ID gating, span attachment, symbol scrubbing are
+  protocol-agnostic — then mapped into `OperationKey`s.
+
+Adding a protocol to the LLM layer is then exactly three artifacts: candidate
+matchers in the SWC scanner, one prompt + one response schema (carrick-cloud
++ `agents/schemas.rs` in lockstep), and the key mapping. Everything else —
+orchestration loop, validation, sidecar, index — is shared.
+
+Standing rule, sharpened by the GraphQL phase (which needed no prompt at
+all): a protocol enters the LLM pipeline only where its evidence is not
+deterministic. Socket event names and queue topics are literal strings most
+of the time — SWC extraction is the default path; the protocol prompt is the
+fallback, and its output feeds the index, never drift findings.
+
+## 11. Open questions
 
 - **Index key design in carrick-cloud**: production index keys on
   (workspace, project, repo[, service]); operations need protocol in their identity
