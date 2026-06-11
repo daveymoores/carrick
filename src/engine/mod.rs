@@ -155,7 +155,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // 3. Resolve the services declared for this repo (one for the common
     //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
-    let services = resolve_services(repo_path);
+    let services = resolve_services(repo_path)?;
     let multi_service = services.len() > 1;
     if multi_service {
         info!(
@@ -173,7 +173,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     let sp = logging::spinner("Analyzing repository...");
     let mut current_services_data = Vec::with_capacity(services.len());
     for service in &services {
-        let packages = load_packages_for_service(repo_path, service);
+        let packages = load_packages_for_service(repo_path, service)?;
 
         // Scope the sidecar's type extraction to this service's directory/tsconfig.
         scope_sidecar_to_service(sidecar, repo_path, service);
@@ -995,6 +995,22 @@ fn discover_files_and_symbols(
     let ignore_patterns = service_ignore_patterns(service);
     let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
 
+    // Zero files means the scan target is wrong (typo'd path, empty checkout):
+    // proceeding would upload an empty service and silently erase its
+    // coverage from the index.
+    if files.is_empty() {
+        let scope = match &service.directory {
+            Some(dir) => format!("service directory '{}'", dir),
+            None => "repository root".to_string(),
+        };
+        return Err(format!(
+            "No JS/TS source files found under {} in '{}'. Check the scan path \
+             and the directory/include entries in carrick.json.",
+            scope, repo_path
+        )
+        .into());
+    }
+
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
 
     // Extract imported symbols and function definitions by parsing files
@@ -1037,7 +1053,11 @@ fn discover_files_and_symbols(
 /// No config, or a flat config, yields a single service rooted at the repo
 /// root (zero-config single-service mode). A `services` array yields one entry
 /// per declared service. Always returns at least one service.
-fn resolve_services(repo_path: &str) -> Vec<Config> {
+///
+/// A config that exists but cannot be parsed, or that declares paths that
+/// don't exist, is a hard error: silently falling back to defaults would
+/// ignore the user's declared service layout and upload a wrong index.
+fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
     // carrick.json belongs at the scan root. Read it there directly rather than
     // walking the tree (a tree walk would pick up nested example/fixture
     // configs in a repo that contains them).
@@ -1045,18 +1065,57 @@ fn resolve_services(repo_path: &str) -> Vec<Config> {
 
     let services = if config_path.is_file() {
         debug!("Found carrick.json: {}", config_path.display());
-        Config::load_services(vec![config_path]).unwrap_or_else(|e| {
-            warn!("Error parsing config file: {}", e);
-            Vec::new()
-        })
+        Config::load_services(vec![config_path.clone()]).map_err(|e| {
+            format!(
+                "Failed to parse {}: {}. Fix the config or delete it to scan \
+                 the repo as a single zero-config service.",
+                config_path.display(),
+                e
+            )
+        })?
     } else {
         Vec::new()
     };
 
+    // A typo'd directory would otherwise walk nothing and upload an empty
+    // service, silently erasing its coverage from the index.
+    let root = std::path::Path::new(repo_path);
+    for service in &services {
+        let label = service
+            .service_name
+            .as_deref()
+            .or(service.directory.as_deref())
+            .unwrap_or("<unnamed>");
+        if let Some(dir) = &service.directory
+            && !root.join(dir).is_dir()
+        {
+            return Err(format!(
+                "Service '{}' in {} declares directory '{}', which does not exist under '{}'",
+                label,
+                config_path.display(),
+                dir,
+                repo_path
+            )
+            .into());
+        }
+        for inc in &service.include {
+            if !root.join(inc).exists() {
+                return Err(format!(
+                    "Service '{}' in {} declares include path '{}', which does not exist under '{}'",
+                    label,
+                    config_path.display(),
+                    inc,
+                    repo_path
+                )
+                .into());
+            }
+        }
+    }
+
     if services.is_empty() {
-        vec![Config::default()]
+        Ok(vec![Config::default()])
     } else {
-        services
+        Ok(services)
     }
 }
 
@@ -1077,17 +1136,22 @@ fn service_ignore_patterns(service: &Config) -> Vec<&'static str> {
 
 /// Load the package data for a single service, scoped to its own
 /// `package.json` (within its directory), not an arbitrary one from the repo.
-fn load_packages_for_service(repo_path: &str, service: &Config) -> Packages {
+///
+/// A missing `package.json` is fine (empty dependency set); one that exists
+/// but cannot be parsed is a hard error — defaulting to zero dependencies
+/// would silently gut framework detection and endpoint extraction.
+fn load_packages_for_service(
+    repo_path: &str,
+    service: &Config,
+) -> Result<Packages, Box<dyn std::error::Error>> {
     let ignore_patterns = service_ignore_patterns(service);
     let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
     if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
-        Packages::new(vec![package_path]).unwrap_or_else(|e| {
-            warn!("Error parsing package.json: {}", e);
-            Packages::default()
-        })
+        Packages::new(vec![package_path.clone()])
+            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e).into())
     } else {
-        Packages::default()
+        Ok(Packages::default())
     }
 }
 
@@ -2547,5 +2611,109 @@ mod tests {
         assert!(data.cached_guidance.is_none());
         assert!(data.package_json_hash.is_none());
         assert!(data.cache_version.is_none());
+    }
+
+    #[test]
+    fn resolve_services_without_config_defaults_to_single_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(services.len(), 1);
+        assert!(services[0].directory.is_none());
+    }
+
+    #[test]
+    fn resolve_services_rejects_malformed_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("carrick.json"), "{ not valid json").unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_rejects_missing_service_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "does-not-exist" }] }"#,
+        )
+        .unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("does-not-exist")
+                && err.to_string().contains("does not exist"),
+            "expected missing-directory error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_rejects_missing_include_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("svc")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "svc", "include": ["shared"] }] }"#,
+        )
+        .unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("include path 'shared'"),
+            "expected missing-include error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_accepts_valid_service_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("svc")).unwrap();
+        std::fs::create_dir(tmp.path().join("shared")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "svc", "include": ["shared"] }] }"#,
+        )
+        .unwrap();
+
+        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].directory.as_deref(), Some("svc"));
+    }
+
+    #[test]
+    fn load_packages_rejects_malformed_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{ trailing-comma: ,}").unwrap();
+
+        let err = load_packages_for_service(tmp.path().to_str().unwrap(), &Config::default())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_packages_missing_package_json_defaults_to_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages =
+            load_packages_for_service(tmp.path().to_str().unwrap(), &Config::default()).unwrap();
+        assert!(packages.merged_dependencies.is_empty());
+    }
+
+    #[test]
+    fn discovery_rejects_service_with_no_source_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cm: Lrc<SourceMap> = Default::default();
+
+        let err = discover_files_and_symbols(tmp.path().to_str().unwrap(), &Config::default(), cm)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("No JS/TS source files"),
+            "expected empty-scan error, got: {err}"
+        );
     }
 }
