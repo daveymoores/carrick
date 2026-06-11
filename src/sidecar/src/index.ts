@@ -551,16 +551,20 @@ function main(): void {
     process.exit(0);
   });
 
-  // Handle uncaught errors
+  // Fail fast on uncaught errors. Continuing after one means serving later
+  // requests from a possibly corrupted state and returning garbage types
+  // with a success status; exiting surfaces as ProcessDied on the Rust side,
+  // which degrades cleanly (scan continues, type_extraction_status records
+  // the loss).
   process.on('uncaughtException', (err) => {
-    logError(`Uncaught exception: ${err.message}`);
+    logError(`Uncaught exception (exiting): ${err.message}`);
     logError(err.stack || '');
-    // Keep running, but log the error
+    process.exit(1);
   });
 
   process.on('unhandledRejection', (reason) => {
-    logError(`Unhandled rejection: ${reason}`);
-    // Keep running, but log the error
+    logError(`Unhandled rejection (exiting): ${reason}`);
+    process.exit(1);
   });
 }
 
