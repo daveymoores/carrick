@@ -14,10 +14,20 @@
 
 use std::env;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 /// Audience the cloud requires in the OIDC token's `aud` claim.
 const AUDIENCE: &str = "https://api.carrick.tools";
+
+/// Deadline for the token request — minting must be fast, and a hung GitHub
+/// endpoint must not stall the scan indefinitely.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Retries after the first attempt for transient mint failures (transport
+/// errors, 5xx from the GitHub token endpoint).
+const MAX_FETCH_RETRIES: u32 = 2;
 
 #[derive(Debug)]
 pub enum OidcError {
@@ -72,7 +82,10 @@ impl OidcProvider {
         let request_url = env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok()?;
         let request_token = env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok()?;
         Some(OidcProvider {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(FETCH_TIMEOUT)
+                .build()
+                .expect("default reqwest client construction cannot fail"),
             request_url,
             request_token,
             cached: Mutex::new(None),
@@ -100,37 +113,64 @@ impl OidcProvider {
     }
 
     async fn fetch(&self) -> Result<String, OidcError> {
-        // `.query()` merges into the URL's existing query string (the request
-        // URL already carries `?api-version=...`) and percent-encodes the
-        // audience, matching the official @actions/core toolkit behaviour.
-        let response = self
-            .client
-            .get(&self.request_url)
-            .query(&[("audience", AUDIENCE)])
-            .header("Authorization", format!("Bearer {}", self.request_token))
-            .send()
-            .await
-            .map_err(|e| OidcError::Request(e.to_string()))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(OidcError::BadResponse(format!(
-                "GitHub token endpoint returned {}: {}",
-                status, body
-            )));
-        }
-
         #[derive(serde::Deserialize)]
         struct TokenResponse {
             value: String,
         }
 
-        let parsed: TokenResponse = response.json().await.map_err(|e| {
-            OidcError::BadResponse(format!("failed to parse token response: {}", e))
-        })?;
+        let mut retries = 0u32;
+        loop {
+            // `.query()` merges into the URL's existing query string (the
+            // request URL already carries `?api-version=...`) and
+            // percent-encodes the audience, matching the official
+            // @actions/core toolkit behaviour.
+            let transient_error = match self
+                .client
+                .get(&self.request_url)
+                .query(&[("audience", AUDIENCE)])
+                .header("Authorization", format!("Bearer {}", self.request_token))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        let parsed: TokenResponse = response.json().await.map_err(|e| {
+                            OidcError::BadResponse(format!("failed to parse token response: {}", e))
+                        })?;
+                        return Ok(parsed.value);
+                    }
 
-        Ok(parsed.value)
+                    let body = response.text().await.unwrap_or_default();
+                    let err = OidcError::BadResponse(format!(
+                        "GitHub token endpoint returned {}: {}",
+                        status, body
+                    ));
+                    // 4xx means the request itself is bad (missing permission,
+                    // bad token) — retrying can't fix it.
+                    if !status.is_server_error() {
+                        return Err(err);
+                    }
+                    err
+                }
+                Err(e) => OidcError::Request(e.to_string()),
+            };
+
+            if retries >= MAX_FETCH_RETRIES {
+                return Err(transient_error);
+            }
+
+            let backoff = Duration::from_secs(1u64 << retries);
+            warn!(
+                "{}; retrying OIDC token mint in {}s ({}/{})",
+                transient_error,
+                backoff.as_secs(),
+                retries + 1,
+                MAX_FETCH_RETRIES
+            );
+            tokio::time::sleep(backoff).await;
+            retries += 1;
+        }
     }
 }
 
@@ -206,5 +246,74 @@ mod tests {
                 .contains("authorization: bearer request-token-xyz"),
             "bearer auth header missing: {request}"
         );
+    }
+
+    /// A transient 5xx from the token endpoint is retried; the mint succeeds
+    /// on the second attempt instead of aborting the scan.
+    #[tokio::test]
+    async fn fetch_retries_transient_server_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let responses = [
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                {
+                    let body = r#"{"value":"retried.token.ok"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                },
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let url = format!("http://{}/token?api-version=2.0", addr);
+        let provider = OidcProvider::for_test(url, "request-token-xyz".to_string());
+
+        let token = provider.fetch().await.unwrap();
+        assert_eq!(token, "retried.token.ok");
+        server.join().unwrap();
+    }
+
+    /// A 4xx from the token endpoint (bad permission/token) is permanent —
+    /// no retry, error returned immediately.
+    #[tokio::test]
+    async fn fetch_does_not_retry_client_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).unwrap();
+            let response =
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            // A second connection attempt would block here and fail the test
+            // via join timeout if fetch retried; instead the listener is
+            // dropped right after the first response.
+        });
+
+        let url = format!("http://{}/token?api-version=2.0", addr);
+        let provider = OidcProvider::for_test(url, "request-token-xyz".to_string());
+
+        let err = provider.fetch().await.unwrap_err();
+        assert!(
+            matches!(&err, OidcError::BadResponse(msg) if msg.contains("403")),
+            "expected permanent 403 error, got: {err}"
+        );
+        server.join().unwrap();
     }
 }
