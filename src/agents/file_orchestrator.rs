@@ -20,14 +20,14 @@ use crate::{
     agent_service::AgentService,
     agents::{
         file_analyzer_agent::{EndpointResult, FileAnalysisResult, FileAnalyzerAgent},
-        framework_guidance_agent::FrameworkGuidance,
+        framework_guidance_agent::ProtocolGuidance,
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
-    operation::OperationKey,
+    operation::{OperationKey, Protocol},
     packages::Packages,
     parser::parse_file,
     services::type_sidecar::{
@@ -79,6 +79,10 @@ pub struct ProcessingStats {
     /// from zero-cost skips: a parse failure silently removes the file's
     /// endpoints from the index. A subset of `files_skipped`.
     pub files_parse_failed: usize,
+    /// Files whose only candidates belong to protocols without a registered
+    /// analyze-file prompt (e.g. raw WebSocket constructors). Skipped instead
+    /// of being fed to the HTTP prompt, which couldn't classify them.
+    pub files_skipped_unrouted_protocol: usize,
     pub total_mounts: usize,
     pub total_endpoints: usize,
     /// Endpoints derived structurally from file-based routing conventions
@@ -141,12 +145,19 @@ impl FileOrchestrator {
     pub async fn analyze_files(
         &self,
         files: &[PathBuf],
-        guidance: &FrameworkGuidance,
+        guidance: &ProtocolGuidance,
         framework_detection: &DetectionResult,
         repo_root: &Path,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
+
+        // Per-protocol prompt routing: each protocol with a registered LLM
+        // pass analyzes only its own candidates, so prompts stay focused.
+        // HTTP is the only routed protocol today.
+        let guidance = guidance
+            .get(&Protocol::Http)
+            .ok_or("missing HTTP guidance: guidance map must contain the http protocol")?;
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
@@ -224,6 +235,16 @@ impl FileOrchestrator {
                 continue;
             }
 
+            // Protocol dispatch: the HTTP analyze-file prompt only ever sees
+            // HTTP candidates. Candidates of protocols without a registered
+            // prompt (raw WebSocket/EventSource constructors today) are set
+            // aside; a file with only those is skipped, not sent to a prompt
+            // that has no instructions for them.
+            let (http_candidates, unrouted_candidates): (Vec<_>, Vec<_>) = scan_result
+                .candidates
+                .into_iter()
+                .partition(|candidate| candidate.protocol == Protocol::Http);
+
             // File-based routing: routes declared by file location (Next.js app
             // router, etc.) have no call-site candidate — the endpoint *is* the
             // exported handler declaration. The path comes from the layout and the
@@ -242,17 +263,11 @@ impl FileOrchestrator {
                 )
             };
 
-            // STEP 2: Check Relevance - if no candidates, SKIP the (expensive) LLM
-            // call. File-based route endpoints are still recorded: they're derived
-            // structurally and need no LLM.
-            if !scan_result.should_analyze {
-                if route_endpoints.is_empty() {
-                    debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
-                    stats.files_skipped += 1;
-                    stats.files_skipped_no_candidates += 1;
-                    // Store empty result so incremental cache knows this file was processed
-                    file_results.insert(path_str, FileAnalysisResult::default());
-                } else {
+            // STEP 2: Check Relevance - if there are no candidates for a routed
+            // protocol, SKIP the (expensive) LLM call. File-based route endpoints
+            // are still recorded: they're derived structurally and need no LLM.
+            if http_candidates.is_empty() {
+                if !route_endpoints.is_empty() {
                     debug!(
                         "File-based route (no call-site candidates): {} [{} endpoint(s)]",
                         path_str,
@@ -267,29 +282,40 @@ impl FileOrchestrator {
                             ..Default::default()
                         },
                     );
+                } else if unrouted_candidates.is_empty() {
+                    debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
+                    stats.files_skipped += 1;
+                    stats.files_skipped_no_candidates += 1;
+                    // Store empty result so incremental cache knows this file was processed
+                    file_results.insert(path_str, FileAnalysisResult::default());
+                } else {
+                    debug!(
+                        "Skipped (only unrouted-protocol candidates): {} [{} candidate(s)]",
+                        path_str,
+                        unrouted_candidates.len()
+                    );
+                    stats.files_skipped += 1;
+                    stats.files_skipped_unrouted_protocol += 1;
+                    file_results.insert(path_str, FileAnalysisResult::default());
                 }
                 continue;
             }
 
             debug!(
-                "Analyzing: {} [{} candidates detected by SWC]",
+                "Analyzing: {} [{} HTTP candidate(s), {} unrouted]",
                 path_str,
-                scan_result.candidates.len()
+                http_candidates.len(),
+                unrouted_candidates.len()
             );
 
             // STEP 3: Prepare Candidate Targets as hints for the LLM
-            let candidate_hints: Vec<String> = scan_result
-                .candidates
-                .iter()
-                .map(|c| c.format_hint())
-                .collect();
-            let candidate_contexts: Vec<String> = scan_result
-                .candidates
+            let candidate_hints: Vec<String> =
+                http_candidates.iter().map(|c| c.format_hint()).collect();
+            let candidate_contexts: Vec<String> = http_candidates
                 .iter()
                 .map(|c| serde_json::to_string(c).unwrap_or_default())
                 .collect();
-            let candidate_map: HashMap<String, CandidateTarget> = scan_result
-                .candidates
+            let candidate_map: HashMap<String, CandidateTarget> = http_candidates
                 .iter()
                 .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
                 .collect();

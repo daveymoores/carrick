@@ -1,7 +1,5 @@
 use crate::{
-    agents::{
-        file_analyzer_agent::FileAnalysisResult, framework_guidance_agent::FrameworkGuidance,
-    },
+    agents::{file_analyzer_agent::FileAnalysisResult, framework_guidance_agent::ProtocolGuidance},
     analyzer::ApiEndpointDetails,
     app_context::AppContext,
     framework_detector::DetectionResult,
@@ -129,9 +127,9 @@ pub struct CloudRepoData {
     /// Cached framework detection result
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_detection: Option<DetectionResult>,
-    /// Cached framework guidance result
+    /// Cached per-protocol framework guidance
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached_guidance: Option<FrameworkGuidance>,
+    pub cached_guidance: Option<ProtocolGuidance>,
     /// Hash of package.json content — if it matches, cached detection/guidance are reusable
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_json_hash: Option<String>,

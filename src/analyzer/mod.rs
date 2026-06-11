@@ -1290,7 +1290,7 @@ impl Analyzer {
             .endpoints
             .iter()
             .chain(self.calls.iter())
-            .any(|details| details.key.as_graphql().is_some());
+            .any(|details| details.key.protocol() == crate::operation::Protocol::Graphql);
 
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),

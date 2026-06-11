@@ -18,8 +18,11 @@
 
 use carrick::agent_service::AgentService;
 use carrick::agents::file_orchestrator::FileOrchestrator;
-use carrick::agents::framework_guidance_agent::{FrameworkGuidance, PatternExample};
+use carrick::agents::framework_guidance_agent::{
+    FrameworkGuidance, PatternExample, ProtocolGuidance,
+};
 use carrick::framework_detector::DetectionResult;
+use carrick::operation::Protocol;
 use serial_test::serial;
 use std::path::PathBuf;
 
@@ -76,11 +79,17 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
         root.join("src/routes/users.ts"),
         root.join("src/client.ts"),
         root.join("src/types.ts"),
+        root.join("src/socket.ts"),
     ];
 
     let orchestrator = FileOrchestrator::new(AgentService::new());
     let result = orchestrator
-        .analyze_files(&files, &express_guidance(), &express_detection(), &root)
+        .analyze_files(
+            &files,
+            &ProtocolGuidance::from([(Protocol::Http, express_guidance())]),
+            &express_detection(),
+            &root,
+        )
         .await
         .expect("analysis should succeed");
 
@@ -94,6 +103,24 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
     assert_eq!(
         result.stats.files_skipped_no_candidates, 1,
         "types.ts should be skipped by the SWC gatekeeper"
+    );
+
+    // socket.ts only contains WebSocket/EventSource constructors — a protocol
+    // with no registered analyze-file prompt. It must be routed away from the
+    // HTTP prompt, not analyzed by it.
+    assert_eq!(
+        result.stats.files_skipped_unrouted_protocol, 1,
+        "socket.ts should be skipped as unrouted-protocol, not sent to the HTTP prompt"
+    );
+    let socket_result = result
+        .file_results
+        .iter()
+        .find(|(path, _)| path.ends_with("socket.ts"))
+        .map(|(_, r)| r)
+        .expect("socket.ts should have an (empty) cached result");
+    assert!(
+        socket_result.endpoints.is_empty() && socket_result.data_calls.is_empty(),
+        "no HTTP facts may be invented for a socket-only file"
     );
 
     let users_result = result

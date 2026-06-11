@@ -51,7 +51,7 @@ fn koa_api_fixture_produces_expected_candidates() {
     let result = scan(&file);
 
     assert!(
-        result.should_analyze,
+        !result.candidates.is_empty(),
         "koa-api/server.ts should produce at least one candidate"
     );
 
@@ -84,7 +84,7 @@ fn fastify_api_fixture_produces_expected_candidates() {
     let result = scan(&file);
 
     assert!(
-        result.should_analyze,
+        !result.candidates.is_empty(),
         "fastify-api/server.ts should produce at least one candidate"
     );
 
@@ -107,7 +107,7 @@ fn hapi_api_fixture_produces_expected_candidates() {
     let result = scan(&file);
 
     assert!(
-        result.should_analyze,
+        !result.candidates.is_empty(),
         "hapi-api/server.ts should produce at least one candidate"
     );
 
@@ -146,7 +146,7 @@ fn nestjs_controller_fixture_emits_decorator_candidates() {
     let result = scan(&file);
 
     assert!(
-        result.should_analyze,
+        !result.candidates.is_empty(),
         "nestjs-api controller should produce candidates after Move 2"
     );
 
@@ -197,7 +197,7 @@ fn react_tsx_fixture_captures_fetch_calls() {
     let result = scan(&file);
 
     assert!(
-        result.should_analyze,
+        !result.candidates.is_empty(),
         "react-app/UserList.tsx should produce at least one candidate"
     );
 
@@ -216,7 +216,7 @@ fn react_jsx_fixture_captures_fetch_calls() {
     let result = scan(&file);
 
     assert!(
-        result.should_analyze,
+        !result.candidates.is_empty(),
         "react-app/LegacyWidget.jsx should produce at least one candidate"
     );
 

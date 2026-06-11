@@ -1,6 +1,6 @@
 use crate::agent_service::AgentService;
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::agents::framework_guidance_agent::{FrameworkGuidance, FrameworkGuidanceAgent};
+use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
@@ -44,7 +44,7 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -838,11 +838,11 @@ async fn analyze_current_repo_incremental(
     Ok(cloud_data)
 }
 
-/// Run framework detection and guidance generation.
+/// Run framework detection and per-protocol guidance generation.
 async fn run_framework_detection_and_guidance(
     packages: &Packages,
     imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
-) -> Result<(DetectionResult, FrameworkGuidance), Box<dyn std::error::Error>> {
+) -> Result<(DetectionResult, ProtocolGuidance), Box<dyn std::error::Error>> {
     let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
@@ -850,7 +850,9 @@ async fn run_framework_detection_and_guidance(
         .await?;
 
     let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
-    let guidance = guidance_agent.generate_guidance(&detection).await?;
+    let guidance = guidance_agent
+        .generate_for_active_protocols(&detection)
+        .await?;
 
     Ok((detection, guidance))
 }

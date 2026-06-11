@@ -277,6 +277,13 @@ that keep it that way:
 
 ## 10. LLM pipeline: protocol-routed prompts, not one diluted prompt
 
+**Status: scanner side implemented.** `CandidateTarget` carries a `Protocol`
+tag, the orchestrator partitions per file (HTTP prompt sees only HTTP
+candidates; unrouted-protocol files are skipped with a stat), and guidance is
+a per-protocol map (`ProtocolGuidance`) with `protocol` sent on
+`/framework-guidance` requests. The carrick-cloud half (accepting the
+protocol field; per-protocol prompt files) goes in the lockstep batch.
+
 A single analyze-file prompt asked to extract every protocol degrades on two
 axes: instruction dilution (more rules competing for attention per token of
 code) and **response-schema dilution** (every protocol's fields present on

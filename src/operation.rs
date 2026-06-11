@@ -10,6 +10,22 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Protocol families Carrick recognizes. Used to tag operation keys and to
+/// route the LLM pipeline: SWC candidates carry a protocol, and each
+/// protocol with non-deterministic evidence gets its own guidance and
+/// analyze-file prompt instead of diluting one prompt across all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    Http,
+    /// Extracted deterministically (SDL + documents); never LLM-routed.
+    Graphql,
+    /// `new WebSocket(...)` / `new EventSource(...)` call sites. Tagged by
+    /// the scanner today so they stop reaching the HTTP prompt; the
+    /// socket-specific prompt arrives with the Phase 2 work.
+    Websocket,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphqlOperationKind {
@@ -46,6 +62,13 @@ pub enum OperationKey {
 }
 
 impl OperationKey {
+    pub fn protocol(&self) -> Protocol {
+        match self {
+            OperationKey::Http { .. } => Protocol::Http,
+            OperationKey::Graphql { .. } => Protocol::Graphql,
+        }
+    }
+
     /// Build an HTTP key. The method is stored trimmed and uppercased so one
     /// canonical form flows into aliases, matching, and the index; an empty
     /// method becomes `UNKNOWN` (mirroring `normalize_manifest_method`).
