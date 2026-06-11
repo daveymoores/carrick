@@ -107,9 +107,14 @@ pub struct ApiAnalysisResult {
     /// runs otherwise produce no positive signal.
     pub verified_endpoints: Vec<(String, String)>,
     /// GraphQL libraries detected across all scanned repos (subset of
-    /// `detected_data_fetchers`). Populated so the formatter can show a
-    /// "REST-only for v1" banner; Carrick doesn't analyze GraphQL schemas.
+    /// `detected_data_fetchers`). When libraries are present but no
+    /// operations were extracted, the formatter suggests committing an
+    /// emitted schema (code-first schemas and Relay artifacts are not
+    /// statically extractable).
     pub detected_graphql_libraries: Vec<String>,
+    /// Whether any GraphQL operations (schema fields or documents) made it
+    /// into the index. Gates the "no GraphQL extracted" banner.
+    pub graphql_operations_indexed: bool,
 }
 
 /// Return the subset of `data_fetchers` that are GraphQL libraries.
@@ -1012,6 +1017,76 @@ impl Analyzer {
         (call_issues, endpoint_issues, env_var_calls, verified)
     }
 
+    /// Match GraphQL consumer documents against indexed schema root fields.
+    /// Returns `(call_issues, endpoint_issues, verified)`.
+    ///
+    /// Matching is exact on `(operation kind, field name)` — GraphQL has no
+    /// URL or mount hierarchy to normalize. If no GraphQL producer schema is
+    /// indexed anywhere, consumers are skipped silently: the producing
+    /// service may simply not be scanned, and guessing would create false
+    /// "missing endpoint" noise. Unconsumed schema fields are reported as
+    /// orphans, the same soft signal REST orphans get.
+    fn analyze_graphql_matches(&self) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
+        let producer_keys: HashSet<&OperationKey> = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.key.as_graphql().is_some())
+            .map(|endpoint| &endpoint.key)
+            .collect();
+        if producer_keys.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let mut call_issues = Vec::new();
+        let mut matched: HashSet<&OperationKey> = HashSet::new();
+        let mut seen_calls = HashSet::new();
+        for call in &self.calls {
+            let Some((kind, field)) = call.key.as_graphql() else {
+                continue;
+            };
+            let dedup = format!("{}:{}", call.key.canonical(), call.file_path.display());
+            if !seen_calls.insert(dedup) {
+                continue;
+            }
+            if producer_keys.contains(&call.key) {
+                matched.insert(&call.key);
+            } else {
+                call_issues.push(format!(
+                    "Missing endpoint for {} {} (GraphQL; called from {})",
+                    kind.as_str().to_uppercase(),
+                    field,
+                    call.file_path.display()
+                ));
+            }
+        }
+
+        let mut endpoint_issues = Vec::new();
+        let mut verified = Vec::new();
+        let mut seen_producers = HashSet::new();
+        for endpoint in &self.endpoints {
+            let Some((kind, field)) = endpoint.key.as_graphql() else {
+                continue;
+            };
+            if !seen_producers.insert(endpoint.key.canonical()) {
+                continue;
+            }
+            if matched.contains(&endpoint.key) {
+                verified.push((kind.as_str().to_uppercase(), field.to_string()));
+            } else {
+                endpoint_issues.push(format!(
+                    "Orphaned endpoint: {} {} in {}",
+                    kind.as_str().to_uppercase(),
+                    field,
+                    endpoint.file_path.display()
+                ));
+            }
+        }
+        verified.sort();
+        verified.dedup();
+
+        (call_issues, endpoint_issues, verified)
+    }
+
     pub fn compute_full_paths_for_endpoint(
         endpoint: &ApiEndpointDetails,
         mounts: &[Mount],
@@ -1197,14 +1272,25 @@ impl Analyzer {
         let mount_graph = self.mount_graph.as_ref()
             .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
 
-        let (call_issues, endpoint_issues, env_var_calls, verified_endpoints) =
+        let (mut call_issues, mut endpoint_issues, env_var_calls, mut verified_endpoints) =
             self.analyze_matches_with_mount_graph(mount_graph);
+        let (gql_call_issues, gql_endpoint_issues, gql_verified) = self.analyze_graphql_matches();
+        call_issues.extend(gql_call_issues);
+        endpoint_issues.extend(gql_endpoint_issues);
+        verified_endpoints.extend(gql_verified);
+        verified_endpoints.sort();
+        verified_endpoints.dedup();
         // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
         let mismatches = Vec::new();
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 
         let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
+        let graphql_operations_indexed = self
+            .endpoints
+            .iter()
+            .chain(self.calls.iter())
+            .any(|details| details.key.as_graphql().is_some());
 
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
@@ -1219,6 +1305,7 @@ impl Analyzer {
             },
             verified_endpoints,
             detected_graphql_libraries,
+            graphql_operations_indexed,
         }
     }
 
@@ -1732,6 +1819,99 @@ mod tests {
         assert!(!Analyzer::is_env_var_base_url("${camelCase}/path")); // camelCase, not env var
         assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
     }
+    fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
+        ApiEndpointDetails {
+            owner: None,
+            key,
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(file),
+        }
+    }
+
+    #[test]
+    fn test_graphql_matching_verified_missing_and_orphaned() {
+        use crate::operation::GraphqlOperationKind;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "schema.graphql:3",
+        ));
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Mutation, "createUser"),
+            "schema.graphql:8",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "client.ts:12",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "orders"),
+            "client.ts:20",
+        ));
+
+        let (call_issues, endpoint_issues, verified) = analyzer.analyze_graphql_matches();
+
+        assert_eq!(verified, vec![("QUERY".to_string(), "user".to_string())]);
+        assert_eq!(call_issues.len(), 1);
+        assert!(
+            call_issues[0].contains("Missing endpoint for QUERY orders"),
+            "got {}",
+            call_issues[0]
+        );
+        assert_eq!(endpoint_issues.len(), 1);
+        assert!(
+            endpoint_issues[0].contains("Orphaned endpoint: MUTATION createUser"),
+            "got {}",
+            endpoint_issues[0]
+        );
+    }
+
+    #[test]
+    fn test_graphql_consumers_silent_without_indexed_producers() {
+        use crate::operation::GraphqlOperationKind;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // A consumer document but no GraphQL schema indexed anywhere: the
+        // producing service may simply not be scanned — stay silent.
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "client.ts:12",
+        ));
+
+        let (call_issues, endpoint_issues, verified) = analyzer.analyze_graphql_matches();
+        assert!(call_issues.is_empty());
+        assert!(endpoint_issues.is_empty());
+        assert!(verified.is_empty());
+    }
+
+    #[test]
+    fn test_graphql_calls_do_not_hit_http_matcher() {
+        use crate::operation::GraphqlOperationKind;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "client.ts:12",
+        ));
+
+        let mount_graph = MountGraph::new();
+        let (call_issues, endpoint_issues, env_var_calls, verified) =
+            analyzer.analyze_matches_with_mount_graph(&mount_graph);
+        assert!(call_issues.is_empty());
+        assert!(endpoint_issues.is_empty());
+        assert!(env_var_calls.is_empty());
+        assert!(verified.is_empty());
+    }
+
     #[test]
     fn test_analyze_matches_with_mount_graph_env_vars() {
         // Setup config with internal env vars

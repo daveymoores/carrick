@@ -12,6 +12,7 @@ mod file_based_router;
 mod file_finder;
 mod formatter;
 mod framework_detector;
+mod graphql;
 mod intent_generator;
 mod logging;
 mod mount_graph;

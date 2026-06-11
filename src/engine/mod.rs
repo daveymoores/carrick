@@ -782,6 +782,7 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
+            append_graphql_operations(&mut cloud_data, repo_path, &files);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -852,6 +853,38 @@ async fn run_framework_detection_and_guidance(
     let guidance = guidance_agent.generate_guidance(&detection).await?;
 
     Ok((detection, guidance))
+}
+
+/// Append deterministically extracted GraphQL operations (SDL root fields as
+/// endpoints, document top-level fields as calls) to the repo's index data.
+fn append_graphql_operations(cloud_data: &mut CloudRepoData, repo_path: &str, files: &[PathBuf]) {
+    let extraction = crate::graphql::scan_repo(Path::new(repo_path), files);
+    if extraction.is_empty() {
+        return;
+    }
+    debug!(
+        producers = extraction.producers.len(),
+        consumers = extraction.consumers.len(),
+        "Indexing GraphQL operations"
+    );
+    let to_details = |op: crate::graphql::GraphqlOp| ApiEndpointDetails {
+        owner: None,
+        key: op.key,
+        params: vec![],
+        request_body: None,
+        response_body: None,
+        handler_name: None,
+        request_type: None,
+        response_type: None,
+        // Same "{file}:{line}" convention the mount-graph conversions use
+        file_path: PathBuf::from(format!("{}:{}", op.file_path.display(), op.line)),
+    };
+    cloud_data
+        .endpoints
+        .extend(extraction.producers.into_iter().map(to_details));
+    cloud_data
+        .calls
+        .extend(extraction.consumers.into_iter().map(to_details));
 }
 
 /// Build CloudRepoData from a mount graph (used by incremental path).
@@ -1517,7 +1550,7 @@ async fn analyze_current_repo(
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files, packages, &all_imported_symbols, repo_path)
+        .run_complete_analysis(files.clone(), packages, &all_imported_symbols, repo_path)
         .await?;
 
     // 4b. Generate function intents using LLM
@@ -1548,6 +1581,7 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
+    append_graphql_operations(&mut cloud_data, repo_path, &files);
 
     let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     if !manifest_entries.is_empty() {
