@@ -23,6 +23,7 @@ mod packages;
 mod parser;
 mod services;
 mod signature_pass;
+mod socket_io;
 mod swc_scanner;
 mod type_manifest;
 mod url_normalizer;

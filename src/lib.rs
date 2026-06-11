@@ -23,6 +23,7 @@ pub mod packages;
 pub mod parser;
 pub mod services;
 pub mod signature_pass;
+pub mod socket_io;
 pub mod swc_scanner;
 pub mod type_manifest;
 pub mod url_normalizer;

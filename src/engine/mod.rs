@@ -782,7 +782,7 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
-            append_graphql_operations(&mut cloud_data, repo_path, &files);
+            append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -857,36 +857,69 @@ async fn run_framework_detection_and_guidance(
     Ok((detection, guidance))
 }
 
-/// Append deterministically extracted GraphQL operations (SDL root fields as
-/// endpoints, document top-level fields as calls) to the repo's index data.
-fn append_graphql_operations(cloud_data: &mut CloudRepoData, repo_path: &str, files: &[PathBuf]) {
-    let extraction = crate::graphql::scan_repo(Path::new(repo_path), files);
-    if extraction.is_empty() {
-        return;
-    }
-    debug!(
-        producers = extraction.producers.len(),
-        consumers = extraction.consumers.len(),
-        "Indexing GraphQL operations"
-    );
-    let to_details = |op: crate::graphql::GraphqlOp| ApiEndpointDetails {
+/// Append deterministically extracted protocol operations to the repo's
+/// index data: GraphQL (SDL root fields as endpoints, document top-level
+/// fields as calls) and Socket.IO (listeners as endpoints, emitters as
+/// calls). These protocols never go through the LLM pipeline.
+fn append_deterministic_protocol_operations(
+    cloud_data: &mut CloudRepoData,
+    repo_path: &str,
+    files: &[PathBuf],
+) {
+    // Same "{file}:{line}" convention the mount-graph conversions use
+    let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
         owner: None,
-        key: op.key,
+        key,
         params: vec![],
         request_body: None,
         response_body: None,
         handler_name: None,
         request_type: None,
         response_type: None,
-        // Same "{file}:{line}" convention the mount-graph conversions use
-        file_path: PathBuf::from(format!("{}:{}", op.file_path.display(), op.line)),
+        file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
     };
-    cloud_data
-        .endpoints
-        .extend(extraction.producers.into_iter().map(to_details));
-    cloud_data
-        .calls
-        .extend(extraction.consumers.into_iter().map(to_details));
+
+    let graphql = crate::graphql::scan_repo(Path::new(repo_path), files);
+    if !graphql.is_empty() {
+        debug!(
+            producers = graphql.producers.len(),
+            consumers = graphql.consumers.len(),
+            "Indexing GraphQL operations"
+        );
+        cloud_data.endpoints.extend(
+            graphql
+                .producers
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            graphql
+                .consumers
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+    }
+
+    let sockets = crate::socket_io::scan_files(files);
+    if !sockets.is_empty() {
+        debug!(
+            listeners = sockets.listeners.len(),
+            emitters = sockets.emitters.len(),
+            "Indexing Socket.IO operations"
+        );
+        cloud_data.endpoints.extend(
+            sockets
+                .listeners
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            sockets
+                .emitters
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+    }
 }
 
 /// Build CloudRepoData from a mount graph (used by incremental path).
@@ -1583,7 +1616,7 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
-    append_graphql_operations(&mut cloud_data, repo_path, &files);
+    append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
     let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     if !manifest_entries.is_empty() {

@@ -228,20 +228,25 @@ frameworks. **Lift: low-medium once the foundation exists.**
 
 ## 8. Suggested phasing
 
-1. **Phase 0 — foundation** (prerequisite tax): `OperationKey` refactor across
-   scanner + lockstep carrick-cloud schema/tooling change. The only step that touches
-   the working REST path; risk is ordinary regression risk, covered by the
-   `examples/` e2e fixtures and the fixture-driven mock-LLM pipeline harness
-   (`CARRICK_MOCK_FIXTURE_DIR`, `tests/llm_mock_pipeline_test.rs`). Everything after
-   it is additive. Don't do it speculatively — land it in the same arc as Phase 1.
-   Each subsequent protocol phase should ship with its own mock-LLM fixture project,
-   so extraction → matching → checking is regression-tested end to end without live
-   LLM calls.
-2. **Phase 1 — GraphQL queries/mutations**: SDL + document parsing, validation-based
-   checking, attribution via existing domain classification. Out of scope: Relay,
-   persisted queries, federation composition, code-first without an SDL artifact.
-3. **Phase 2 — Socket.IO + typed WebSockets** (+ SSE consumer-side, GraphQL
-   subscriptions on the same direction-aware model). Raw `ws` as labeled best-effort.
+1. **Phase 0 — foundation** — **DONE** (scanner side): `OperationKey` refactor
+   across scanner; type manifest keyed by flattened operation key; ts_check
+   guards on `protocol: "http"`. The carrick-cloud schema/tooling mirror is
+   the remaining lockstep half.
+2. **Phase 1 — GraphQL queries/mutations** — **DONE** (`src/graphql.rs`):
+   SDL + document parsing via `graphql-parser`, exact-key matching, no LLM.
+   Out of scope as planned: Relay, persisted queries, federation
+   composition, code-first without an SDL artifact (banner suggests
+   committing one). Still open: document-vs-schema argument/variable
+   validation (today it's field-existence) and resolver payload types.
+3. **Phase 2 — Socket.IO** — **DONE** (`src/socket_io.rs`): import-anchored
+   socket identification (client factories, `new Server`, connection-handler
+   params), direction-aware keys, literal event names only, reserved
+   lifecycle events excluded, `io.of(...)` files skipped (namespace
+   ambiguity). Needed no LLM at all — the protocol-routed prompt slot for
+   `websocket` remains unused until typed-event-map/payload extraction
+   wants it. Still open: acks (response types), typed event-map interfaces
+   via the sidecar, SSE consumer-side, GraphQL subscriptions on the same
+   direction-aware model, raw `ws` (index-only by guardrail).
 4. **Phase 3 — async messaging** (kafkajs/SQS/BullMQ topic matching).
 5. **Phase 4 — gRPC checking, tRPC index-only.**
 

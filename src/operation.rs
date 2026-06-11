@@ -44,6 +44,34 @@ impl GraphqlOperationKind {
     }
 }
 
+/// Direction a socket message flows in. Listeners for messages flowing in a
+/// direction are producers of that key; emitters sending in that direction
+/// are consumers — so a server `socket.on("x")` matches a client
+/// `socket.emit("x")` and vice versa.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl SocketDirection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SocketDirection::ClientToServer => "client→server",
+            SocketDirection::ServerToClient => "server→client",
+        }
+    }
+
+    /// ASCII label used in canonical identity strings and report tables.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SocketDirection::ClientToServer => "CLIENT->SERVER",
+            SocketDirection::ServerToClient => "SERVER->CLIENT",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case")]
 pub enum OperationKey {
@@ -59,6 +87,14 @@ pub enum OperationKey {
         kind: GraphqlOperationKind,
         field: String,
     },
+    /// A Socket.IO event on the default namespace, identified by event name
+    /// plus message-flow direction. Files using custom namespaces
+    /// (`io.of(...)`) are skipped by extraction, so default-namespace
+    /// identity is unambiguous here.
+    Socket {
+        event: String,
+        direction: SocketDirection,
+    },
 }
 
 impl OperationKey {
@@ -66,6 +102,7 @@ impl OperationKey {
         match self {
             OperationKey::Http { .. } => Protocol::Http,
             OperationKey::Graphql { .. } => Protocol::Graphql,
+            OperationKey::Socket { .. } => Protocol::Websocket,
         }
     }
 
@@ -98,14 +135,27 @@ impl OperationKey {
     pub fn as_http(&self) -> Option<(&str, &str)> {
         match self {
             OperationKey::Http { method, path } => Some((method, path)),
-            OperationKey::Graphql { .. } => None,
+            OperationKey::Graphql { .. } | OperationKey::Socket { .. } => None,
         }
     }
 
-    pub fn as_graphql(&self) -> Option<(GraphqlOperationKind, &str)> {
+    pub fn socket(event: impl Into<String>, direction: SocketDirection) -> Self {
+        OperationKey::Socket {
+            event: event.into(),
+            direction,
+        }
+    }
+
+    /// `(label, name)` pair used by report tables and issue strings: HTTP is
+    /// `(method, path)`, GraphQL is `(KIND, field)`, sockets are
+    /// `(DIRECTION, event)`.
+    pub fn display_labels(&self) -> (String, String) {
         match self {
-            OperationKey::Http { .. } => None,
-            OperationKey::Graphql { kind, field } => Some((*kind, field)),
+            OperationKey::Http { method, path } => (method.clone(), path.clone()),
+            OperationKey::Graphql { kind, field } => (kind.as_str().to_uppercase(), field.clone()),
+            OperationKey::Socket { event, direction } => {
+                (direction.label().to_string(), event.clone())
+            }
         }
     }
 
@@ -116,6 +166,9 @@ impl OperationKey {
             OperationKey::Graphql { kind, field } => {
                 format!("graphql|{}|{}", kind.as_str(), field)
             }
+            OperationKey::Socket { event, direction } => {
+                format!("socket|{}|{}", direction.label(), event)
+            }
         }
     }
 }
@@ -125,6 +178,9 @@ impl fmt::Display for OperationKey {
         match self {
             OperationKey::Http { method, path } => write!(f, "{} {}", method, path),
             OperationKey::Graphql { kind, field } => write!(f, "{} {}", kind.as_str(), field),
+            OperationKey::Socket { event, direction } => {
+                write!(f, "{} ({})", event, direction.as_str())
+            }
         }
     }
 }
@@ -160,9 +216,10 @@ mod tests {
     fn graphql_key_identity_and_dispatch() {
         let key = OperationKey::graphql(GraphqlOperationKind::Query, "user");
         assert_eq!(key.as_http(), None);
+        assert_eq!(key.protocol(), Protocol::Graphql);
         assert_eq!(
-            key.as_graphql(),
-            Some((GraphqlOperationKind::Query, "user"))
+            key.display_labels(),
+            ("QUERY".to_string(), "user".to_string())
         );
         assert_eq!(key.canonical(), "graphql|query|user");
         assert_eq!(key.to_string(), "query user");
@@ -171,6 +228,26 @@ mod tests {
         assert!(json.contains("\"protocol\":\"graphql\""), "got {}", json);
         let back: OperationKey = serde_json::from_str(&json).unwrap();
         assert_eq!(back, key);
+    }
+
+    #[test]
+    fn socket_key_identity_and_dispatch() {
+        let key = OperationKey::socket("chat:message", SocketDirection::ClientToServer);
+        assert_eq!(key.as_http(), None);
+        assert_eq!(key.protocol(), Protocol::Websocket);
+        assert_eq!(key.canonical(), "socket|CLIENT->SERVER|chat:message");
+        assert_eq!(
+            key.display_labels(),
+            ("CLIENT->SERVER".to_string(), "chat:message".to_string())
+        );
+
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(json.contains("\"protocol\":\"socket\""), "got {}", json);
+        let back: OperationKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, key);
+
+        let other_direction = OperationKey::socket("chat:message", SocketDirection::ServerToClient);
+        assert_ne!(key, other_direction);
     }
 
     #[test]

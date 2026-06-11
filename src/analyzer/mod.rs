@@ -1017,20 +1017,25 @@ impl Analyzer {
         (call_issues, endpoint_issues, env_var_calls, verified)
     }
 
-    /// Match GraphQL consumer documents against indexed schema root fields.
-    /// Returns `(call_issues, endpoint_issues, verified)`.
+    /// Match consumers against producers of a protocol whose operations have
+    /// exact key identity (GraphQL fields, socket events) — no URL or mount
+    /// hierarchy to normalize. Returns `(call_issues, endpoint_issues,
+    /// verified)`.
     ///
-    /// Matching is exact on `(operation kind, field name)` — GraphQL has no
-    /// URL or mount hierarchy to normalize. If no GraphQL producer schema is
-    /// indexed anywhere, consumers are skipped silently: the producing
-    /// service may simply not be scanned, and guessing would create false
-    /// "missing endpoint" noise. Unconsumed schema fields are reported as
-    /// orphans, the same soft signal REST orphans get.
-    fn analyze_graphql_matches(&self) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
+    /// If no producer of the protocol is indexed anywhere, consumers are
+    /// skipped silently: the producing service may simply not be scanned,
+    /// and guessing would create false "missing endpoint" noise. Unconsumed
+    /// producers are reported as orphans, the same soft signal REST orphans
+    /// get.
+    fn analyze_exact_key_matches(
+        &self,
+        protocol: crate::operation::Protocol,
+        protocol_label: &str,
+    ) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
         let producer_keys: HashSet<&OperationKey> = self
             .endpoints
             .iter()
-            .filter(|endpoint| endpoint.key.as_graphql().is_some())
+            .filter(|endpoint| endpoint.key.protocol() == protocol)
             .map(|endpoint| &endpoint.key)
             .collect();
         if producer_keys.is_empty() {
@@ -1041,9 +1046,9 @@ impl Analyzer {
         let mut matched: HashSet<&OperationKey> = HashSet::new();
         let mut seen_calls = HashSet::new();
         for call in &self.calls {
-            let Some((kind, field)) = call.key.as_graphql() else {
+            if call.key.protocol() != protocol {
                 continue;
-            };
+            }
             let dedup = format!("{}:{}", call.key.canonical(), call.file_path.display());
             if !seen_calls.insert(dedup) {
                 continue;
@@ -1051,10 +1056,12 @@ impl Analyzer {
             if producer_keys.contains(&call.key) {
                 matched.insert(&call.key);
             } else {
+                let (label, name) = call.key.display_labels();
                 call_issues.push(format!(
-                    "Missing endpoint for {} {} (GraphQL; called from {})",
-                    kind.as_str().to_uppercase(),
-                    field,
+                    "Missing endpoint for {} {} ({}; called from {})",
+                    label,
+                    name,
+                    protocol_label,
                     call.file_path.display()
                 ));
             }
@@ -1064,19 +1071,20 @@ impl Analyzer {
         let mut verified = Vec::new();
         let mut seen_producers = HashSet::new();
         for endpoint in &self.endpoints {
-            let Some((kind, field)) = endpoint.key.as_graphql() else {
+            if endpoint.key.protocol() != protocol {
                 continue;
-            };
+            }
             if !seen_producers.insert(endpoint.key.canonical()) {
                 continue;
             }
+            let (label, name) = endpoint.key.display_labels();
             if matched.contains(&endpoint.key) {
-                verified.push((kind.as_str().to_uppercase(), field.to_string()));
+                verified.push((label, name));
             } else {
                 endpoint_issues.push(format!(
                     "Orphaned endpoint: {} {} in {}",
-                    kind.as_str().to_uppercase(),
-                    field,
+                    label,
+                    name,
                     endpoint.file_path.display()
                 ));
             }
@@ -1274,10 +1282,16 @@ impl Analyzer {
 
         let (mut call_issues, mut endpoint_issues, env_var_calls, mut verified_endpoints) =
             self.analyze_matches_with_mount_graph(mount_graph);
-        let (gql_call_issues, gql_endpoint_issues, gql_verified) = self.analyze_graphql_matches();
-        call_issues.extend(gql_call_issues);
-        endpoint_issues.extend(gql_endpoint_issues);
-        verified_endpoints.extend(gql_verified);
+        for (protocol, label) in [
+            (crate::operation::Protocol::Graphql, "GraphQL"),
+            (crate::operation::Protocol::Websocket, "Socket.IO"),
+        ] {
+            let (protocol_call_issues, protocol_endpoint_issues, protocol_verified) =
+                self.analyze_exact_key_matches(protocol, label);
+            call_issues.extend(protocol_call_issues);
+            endpoint_issues.extend(protocol_endpoint_issues);
+            verified_endpoints.extend(protocol_verified);
+        }
         verified_endpoints.sort();
         verified_endpoints.dedup();
         // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
@@ -1856,7 +1870,8 @@ mod tests {
             "client.ts:20",
         ));
 
-        let (call_issues, endpoint_issues, verified) = analyzer.analyze_graphql_matches();
+        let (call_issues, endpoint_issues, verified) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
 
         assert_eq!(verified, vec![("QUERY".to_string(), "user".to_string())]);
         assert_eq!(call_issues.len(), 1);
@@ -1886,10 +1901,60 @@ mod tests {
             "client.ts:12",
         ));
 
-        let (call_issues, endpoint_issues, verified) = analyzer.analyze_graphql_matches();
+        let (call_issues, endpoint_issues, verified) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
         assert!(call_issues.is_empty());
         assert!(endpoint_issues.is_empty());
         assert!(verified.is_empty());
+    }
+
+    #[test]
+    fn test_socket_matching_is_direction_aware() {
+        use crate::operation::SocketDirection;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // Server side: listens for chat:message, emits chat:broadcast.
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::socket("chat:message", SocketDirection::ClientToServer),
+            "server.ts:10",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::socket("chat:broadcast", SocketDirection::ServerToClient),
+            "server.ts:11",
+        ));
+        // Client side: emits chat:message, listens for chat:broadcast,
+        // and emits one event nobody handles.
+        analyzer.calls.push(graphql_details(
+            OperationKey::socket("chat:message", SocketDirection::ClientToServer),
+            "client.ts:5",
+        ));
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::socket("chat:broadcast", SocketDirection::ServerToClient),
+            "client.ts:6",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::socket("typing", SocketDirection::ClientToServer),
+            "client.ts:9",
+        ));
+
+        let (call_issues, endpoint_issues, verified) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket, "Socket.IO");
+
+        assert_eq!(
+            verified,
+            vec![
+                ("CLIENT->SERVER".to_string(), "chat:message".to_string()),
+                ("SERVER->CLIENT".to_string(), "chat:broadcast".to_string()),
+            ]
+        );
+        assert_eq!(call_issues.len(), 1);
+        assert!(
+            call_issues[0].contains("Missing endpoint for CLIENT->SERVER typing"),
+            "got {}",
+            call_issues[0]
+        );
+        assert!(endpoint_issues.is_empty());
     }
 
     #[test]
