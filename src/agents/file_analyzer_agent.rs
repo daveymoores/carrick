@@ -33,6 +33,51 @@ pub struct MountResult {
     pub pattern_matched: String,
 }
 
+/// How an endpoint handler emits its response payload. Classified by the
+/// analyze-file model (the cloud prompt teaches the semantics; this enum and
+/// the response schema define the wire values). Drives which inference kind
+/// `collect_type_requests` asks the sidecar for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmissionStyle {
+    /// The payload is the argument of a send call — `res.json(users)`,
+    /// `reply.send(users)`, and also `return c.json(users)` /
+    /// `return NextResponse.json(users)` (the payload is the argument,
+    /// never the framework Response wrapper).
+    ImperativeSend,
+    /// The handler's return value IS the payload (Fastify return-style,
+    /// `return users`). The response contract is the handler's return type.
+    ReturnValue,
+    /// No recoverable payload expression: zero-arg sends (`res.json()`),
+    /// streams/buffers handed to send calls, or payloads written by helpers
+    /// invisible at the call site (`renderUsers(res)`).
+    NoPayload,
+}
+
+impl EmissionStyle {
+    /// Parse a model-emitted style string leniently: case-insensitive, with
+    /// `_`/space separators tolerated. Returns `None` for anything off-enum —
+    /// one junk value must not fail deserialization of the whole file (every
+    /// other endpoint field is similarly absorbed rather than rejected).
+    fn parse_lenient(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+        match normalized.as_str() {
+            "imperative-send" => Some(EmissionStyle::ImperativeSend),
+            "return-value" => Some(EmissionStyle::ReturnValue),
+            "no-payload" => Some(EmissionStyle::NoPayload),
+            _ => None,
+        }
+    }
+}
+
+fn deserialize_emission_style<'de, D>(deserializer: D) -> Result<Option<EmissionStyle>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(raw.as_deref().and_then(EmissionStyle::parse_lenient))
+}
+
 /// Result of analyzing a single endpoint definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResult {
@@ -61,6 +106,12 @@ pub struct EndpointResult {
     pub response_expression_text: Option<String>,
     /// Line number where the payload expression starts (from Gemini)
     pub response_expression_line: Option<i32>,
+    /// How the handler emits its response payload (from Gemini). `None` when
+    /// the field is missing or carries an off-enum string (the lenient
+    /// deserializer absorbs model junk instead of failing the whole file);
+    /// treated as `ImperativeSend` downstream.
+    #[serde(default, deserialize_with = "deserialize_emission_style")]
+    pub emission_style: Option<EmissionStyle>,
     /// The primary type symbol name without wrappers (e.g., "User" from "Response<User[]>")
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
@@ -357,6 +408,24 @@ impl FileAnalyzerAgent {
 
         // Sanitize endpoints
         for endpoint in &mut result.endpoints {
+            // Pairing invariant: no-payload means "no recoverable payload
+            // expression". When the model contradicts itself and ships a
+            // usable response expression anyway, keep the recoverable
+            // contract — downgrade to imperative-send instead of discarding
+            // the expression on the strength of a contradicted claim.
+            if endpoint.emission_style == Some(EmissionStyle::NoPayload)
+                && endpoint
+                    .response_expression_text
+                    .as_deref()
+                    .is_some_and(|text| !is_null_string(text.trim()))
+            {
+                debug!(
+                    "Endpoint {} {} claims no-payload but carries response expression {:?}; \
+                     treating as imperative-send",
+                    endpoint.method, endpoint.path, endpoint.response_expression_text
+                );
+                endpoint.emission_style = Some(EmissionStyle::ImperativeSend);
+            }
             normalize_optional_string(&mut endpoint.primary_type_symbol);
             if normalize_import_source(&mut endpoint.type_import_source) {
                 needs_retry = true;
@@ -635,6 +704,105 @@ mod tests {
     use crate::agents::framework_guidance_agent::PatternExample;
     use std::collections::HashMap;
 
+    fn endpoint_json(extra_fields: &str) -> String {
+        format!(
+            r#"{{
+                "candidate_id": "span:1-2",
+                "line_number": 5,
+                "owner_node": "app",
+                "method": "GET",
+                "path": "/users",
+                "handler_name": "anonymous",
+                "pattern_matched": ".get(",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null{}
+            }}"#,
+            extra_fields
+        )
+    }
+
+    #[test]
+    fn emission_style_deserializes_wire_values() {
+        for (wire, expected) in [
+            ("imperative-send", EmissionStyle::ImperativeSend),
+            ("return-value", EmissionStyle::ReturnValue),
+            ("no-payload", EmissionStyle::NoPayload),
+        ] {
+            let json = endpoint_json(&format!(r#", "emission_style": "{}""#, wire));
+            let endpoint: EndpointResult = serde_json::from_str(&json).unwrap();
+            assert_eq!(endpoint.emission_style, Some(expected), "wire {}", wire);
+        }
+    }
+
+    #[test]
+    fn emission_style_absorbs_model_junk_instead_of_failing_the_file() {
+        // One off-enum string must not fail deserialization of the whole
+        // FileAnalysisResult (which would drop every endpoint in the file).
+        for junk in ["return_value", "Imperative-Send", "NO PAYLOAD", "", "???"] {
+            let json = endpoint_json(&format!(r#", "emission_style": "{}""#, junk));
+            let endpoint: EndpointResult = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("junk {:?} failed the parse: {}", junk, e));
+            let expected = EmissionStyle::parse_lenient(junk);
+            assert_eq!(endpoint.emission_style, expected, "junk {:?}", junk);
+        }
+        // Lenient parsing still recovers obvious separator/case variants.
+        assert_eq!(
+            EmissionStyle::parse_lenient("return_value"),
+            Some(EmissionStyle::ReturnValue)
+        );
+        assert_eq!(EmissionStyle::parse_lenient("???"), None);
+
+        // Missing and null both map to None.
+        for json in [
+            endpoint_json(""),
+            endpoint_json(r#", "emission_style": null"#),
+        ] {
+            let endpoint: EndpointResult = serde_json::from_str(&json).unwrap();
+            assert_eq!(endpoint.emission_style, None);
+        }
+    }
+
+    #[test]
+    fn sanitize_downgrades_contradictory_no_payload_to_imperative_send() {
+        let json = endpoint_json(
+            r#", "emission_style": "no-payload""#,
+        );
+        let mut endpoint: EndpointResult = serde_json::from_str(&json).unwrap();
+        endpoint.response_expression_text = Some("users".to_string());
+        endpoint.response_expression_line = Some(6);
+        let mut result = FileAnalysisResult {
+            mounts: vec![],
+            endpoints: vec![endpoint],
+            data_calls: vec![],
+        };
+
+        FileAnalyzerAgent::sanitize_result(&mut result);
+
+        assert_eq!(
+            result.endpoints[0].emission_style,
+            Some(EmissionStyle::ImperativeSend),
+            "a contradicted no-payload claim must not discard a recoverable contract"
+        );
+
+        // An honest no-payload claim (null expression) is left alone.
+        let json = endpoint_json(r#", "emission_style": "no-payload""#);
+        let endpoint: EndpointResult = serde_json::from_str(&json).unwrap();
+        let mut result = FileAnalysisResult {
+            mounts: vec![],
+            endpoints: vec![endpoint],
+            data_calls: vec![],
+        };
+        FileAnalyzerAgent::sanitize_result(&mut result);
+        assert_eq!(
+            result.endpoints[0].emission_style,
+            Some(EmissionStyle::NoPayload)
+        );
+    }
+
     fn create_test_guidance() -> FrameworkGuidance {
         FrameworkGuidance {
             mount_patterns: vec![
@@ -728,6 +896,7 @@ mod tests {
             payload_expression_line: None,
             response_expression_text: None,
             response_expression_line: None,
+            emission_style: None,
             primary_type_symbol: Some("User".to_string()),
             type_import_source: Some("./types/user".to_string()),
         };
@@ -786,6 +955,7 @@ mod tests {
                 payload_expression_line: None,
                 response_expression_text: None,
                 response_expression_line: None,
+                emission_style: None,
                 primary_type_symbol: Some("-".to_string()),
                 type_import_source: Some(".repo-a_types.ts".to_string()),
             }],
@@ -844,6 +1014,7 @@ mod tests {
                 payload_expression_line: None,
                 response_expression_text: None,
                 response_expression_line: None,
+                emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],
@@ -886,6 +1057,7 @@ mod tests {
                 payload_expression_line: None,
                 response_expression_text: None,
                 response_expression_line: None,
+                emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
             }],

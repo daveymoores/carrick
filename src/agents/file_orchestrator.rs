@@ -19,7 +19,7 @@
 use crate::{
     agent_service::AgentService,
     agents::{
-        file_analyzer_agent::{EndpointResult, FileAnalysisResult, FileAnalyzerAgent},
+        file_analyzer_agent::{EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent},
         framework_guidance_agent::ProtocolGuidance,
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
@@ -656,7 +656,16 @@ impl FileOrchestrator {
                     ManifestTypeKind::Request,
                 );
 
-                if let (Some(symbol), Some(import_source)) =
+                // no-payload endpoints have no recoverable response contract:
+                // skip the explicit-symbol bundling as well as inference below,
+                // so the manifest entry stays honestly `unknown` (with its
+                // evidence) instead of publishing a phantom contract from a
+                // type hint the handler never sends.
+                let no_payload = endpoint.emission_style == Some(EmissionStyle::NoPayload);
+
+                if no_payload {
+                    // fall through to request-body handling below
+                } else if let (Some(symbol), Some(import_source)) =
                     (&endpoint.primary_type_symbol, &endpoint.type_import_source)
                 {
                     // Explicit type with import source - bundle it
@@ -696,40 +705,80 @@ impl FileOrchestrator {
                 // inference is skipped: a Next.js request body isn't recoverable
                 // from the signature.
                 if endpoint.owner_node == FILE_BASED_ROUTE_OWNER {
-                    let inferred = push_infer(
+                    // The Line locator is infallible, so no inline-alias
+                    // fallback is needed here.
+                    push_infer(
                         &file_path_absolute,
                         line_number,
                         InferKind::FunctionReturn,
                         response_alias.clone(),
                         InferLocator::Line,
                     );
-                    if !inferred && let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
-                        inline_aliases.push((response_alias.clone(), symbol.clone()));
-                    }
                     continue;
                 }
 
-                let response_inferred = push_infer(
-                    &file_path_absolute,
-                    line_number,
-                    InferKind::ResponseBody,
-                    response_alias.clone(),
-                    InferLocator::Text {
-                        expression_text: endpoint.response_expression_text.as_deref(),
-                        expression_line: endpoint.response_expression_line,
-                    },
-                ) || push_infer(
-                    &file_path_absolute,
-                    line_number,
-                    InferKind::ResponseBody,
-                    response_alias.clone(),
-                    InferLocator::Span {
-                        span_start: endpoint.call_expression_span_start,
-                        span_end: endpoint.call_expression_span_end,
-                    },
-                );
-                if !response_inferred && let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
-                    inline_aliases.push((response_alias.clone(), symbol.clone()));
+                // Route response inference by the model's emission_style
+                // classification. `None` (field omitted — e.g. cached
+                // pre-emission-style analysis) falls back to imperative-send,
+                // which is the historical behavior.
+                match endpoint.emission_style {
+                    // The handler's return value IS the payload: ask for the
+                    // handler's return type. Prefer the text locator — the
+                    // sidecar resolves the expression's *containing* function,
+                    // which finds the exact handler even when it's a named
+                    // reference declared far from the registration line. Fall
+                    // back to the registration line (correct for inline
+                    // handlers, whose function starts on that line) when the
+                    // model gave no expression.
+                    Some(EmissionStyle::ReturnValue) => {
+                        let _ = push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::FunctionReturn,
+                            response_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: endpoint.response_expression_text.as_deref(),
+                                expression_line: endpoint.response_expression_line,
+                            },
+                        ) || push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::FunctionReturn,
+                            response_alias.clone(),
+                            InferLocator::Line,
+                        );
+                    }
+                    // No recoverable payload expression (zero-arg sends,
+                    // streams, helper-written payloads): skip inference. The
+                    // manifest entry keeps `unknown` with its evidence —
+                    // honest, instead of inferring from the wrong node.
+                    Some(EmissionStyle::NoPayload) => {}
+                    Some(EmissionStyle::ImperativeSend) | None => {
+                        let response_inferred = push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::ResponseBody,
+                            response_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: endpoint.response_expression_text.as_deref(),
+                                expression_line: endpoint.response_expression_line,
+                            },
+                        ) || push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::ResponseBody,
+                            response_alias.clone(),
+                            InferLocator::Span {
+                                span_start: endpoint.call_expression_span_start,
+                                span_end: endpoint.call_expression_span_end,
+                            },
+                        );
+                        if !response_inferred
+                            && let Some(symbol) = endpoint.primary_type_symbol.as_ref()
+                        {
+                            inline_aliases.push((response_alias.clone(), symbol.clone()));
+                        }
+                    }
                 }
 
                 if should_infer_request_body(&method) {
@@ -1053,6 +1102,7 @@ impl FileOrchestrator {
                         payload_expression_line: None,
                         response_expression_text: None,
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     }
@@ -1926,6 +1976,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -2176,6 +2227,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -2203,6 +2255,187 @@ mod tests {
         assert!(alias.contains("Response"), "alias was {alias}");
     }
 
+    /// Build a call-site endpoint with the given emission style. Carries both
+    /// a response expression and SWC spans so the test proves the routing
+    /// decision comes from `emission_style`, not from locator availability.
+    fn endpoint_with_emission_style(
+        method: &str,
+        path: &str,
+        emission_style: Option<EmissionStyle>,
+    ) -> EndpointResult {
+        EndpointResult {
+            candidate_id: "span:100-200".to_string(),
+            line_number: 12,
+            owner_node: "app".to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler_name: "anonymous".to_string(),
+            pattern_matched: ".get(".to_string(),
+            call_expression_span_start: Some(100),
+            call_expression_span_end: Some(200),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: Some("users".to_string()),
+            response_expression_line: Some(13),
+            emission_style,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    type CollectedRequests = (
+        Vec<SymbolRequest>,
+        Vec<InferRequestItem>,
+        Vec<(String, String)>,
+    );
+
+    fn collect_for_endpoint(endpoint: EndpointResult) -> CollectedRequests {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/server.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![endpoint],
+                data_calls: vec![],
+            },
+        );
+        let graph = orchestrator.build_mount_graph(&file_results);
+        let config = Config::default();
+        orchestrator.collect_type_requests(&file_results, ".", &graph, &config)
+    }
+
+    fn infer_for_endpoint(endpoint: EndpointResult) -> Vec<InferRequestItem> {
+        collect_for_endpoint(endpoint).1
+    }
+
+    #[test]
+    fn test_collect_type_requests_return_value_uses_function_return_via_text() {
+        // Fastify return-style: the handler's return value IS the payload.
+        // With a response expression available, the request must be a
+        // text-located FunctionReturn — the sidecar resolves the expression's
+        // containing function, which finds the exact handler even when it's a
+        // named reference declared far from the registration line.
+        let infer = infer_for_endpoint(endpoint_with_emission_style(
+            "GET",
+            "/users",
+            Some(EmissionStyle::ReturnValue),
+        ));
+
+        assert_eq!(infer.len(), 1);
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::FunctionReturn);
+        assert_eq!(item.line_number, 12);
+        assert_eq!(item.expression_text.as_deref(), Some("users"));
+        assert_eq!(item.expression_line, Some(13));
+        assert!(
+            item.span_start.is_none() && item.span_end.is_none(),
+            "the call-expression span must not be sent — the registration call \
+             contains the handler, so span resolution would bind the wrong function: {:?}",
+            item
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_return_value_falls_back_to_line_anchor() {
+        // Pairing-invariant violation (return-value but no expression): fall
+        // back to anchoring on the registration line, which is correct for
+        // inline handlers (their function starts on that line).
+        let mut endpoint =
+            endpoint_with_emission_style("GET", "/users", Some(EmissionStyle::ReturnValue));
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+
+        let infer = infer_for_endpoint(endpoint);
+        assert_eq!(infer.len(), 1);
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::FunctionReturn);
+        assert_eq!(item.line_number, 12);
+        assert!(
+            item.span_start.is_none() && item.span_end.is_none() && item.expression_text.is_none(),
+            "fallback must be line-anchored only: {:?}",
+            item
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_no_payload_skips_response_inference() {
+        // Zero-arg sends / helper-written payloads: no recoverable payload
+        // expression exists, so no inference is requested at all — the
+        // manifest entry stays honestly `unknown` with its evidence. The
+        // spans on the endpoint are the landmine: without the emission_style
+        // gate the span fallback would infer from the whole `app.get(...)`
+        // call expression.
+        let mut endpoint =
+            endpoint_with_emission_style("GET", "/export", Some(EmissionStyle::NoPayload));
+        // Pairing invariant: no-payload ⇒ response expression is null.
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+
+        let infer = infer_for_endpoint(endpoint);
+        assert!(
+            infer.is_empty(),
+            "no-payload endpoints must not request response inference: {:?}",
+            infer
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_no_payload_skips_explicit_symbol_too() {
+        // A no-payload endpoint may still carry a (validated) type hint the
+        // model picked up from imports — but the handler never sends it, so
+        // bundling it would publish a phantom response contract. Both the
+        // explicit-symbol path and the inline-alias fallback must be gated,
+        // not just inference.
+        let mut endpoint =
+            endpoint_with_emission_style("GET", "/export", Some(EmissionStyle::NoPayload));
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+        endpoint.primary_type_symbol = Some("User".to_string());
+        endpoint.type_import_source = Some("./types".to_string());
+
+        let (explicit, infer, inline) = collect_for_endpoint(endpoint);
+        assert!(
+            explicit.is_empty(),
+            "no-payload endpoints must not bundle explicit response symbols: {:?}",
+            explicit
+        );
+        assert!(infer.is_empty(), "got: {:?}", infer);
+        assert!(inline.is_empty(), "got: {:?}", inline);
+    }
+
+    #[test]
+    fn test_collect_type_requests_no_payload_keeps_request_body_inference() {
+        // The classification is about the RESPONSE payload; request-body
+        // inference for mutating methods is unaffected.
+        let mut endpoint =
+            endpoint_with_emission_style("POST", "/orders", Some(EmissionStyle::NoPayload));
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+        endpoint.payload_expression_text = Some("req.body".to_string());
+        endpoint.payload_expression_line = Some(13);
+
+        let infer = infer_for_endpoint(endpoint);
+        assert_eq!(infer.len(), 1, "got: {:?}", infer);
+        assert_eq!(infer[0].infer_kind, InferKind::RequestBody);
+        assert_eq!(infer[0].expression_text.as_deref(), Some("req.body"));
+    }
+
+    #[test]
+    fn test_collect_type_requests_imperative_send_matches_legacy_default() {
+        // Explicit imperative-send and an absent emission_style (cached
+        // pre-emission-style analysis) must produce the identical request:
+        // text-located ResponseBody.
+        for style in [Some(EmissionStyle::ImperativeSend), None] {
+            let infer = infer_for_endpoint(endpoint_with_emission_style("GET", "/users", style));
+            assert_eq!(infer.len(), 1, "style {:?} got: {:?}", style, infer);
+            let item = &infer[0];
+            assert_eq!(item.infer_kind, InferKind::ResponseBody);
+            assert_eq!(item.expression_text.as_deref(), Some("users"));
+            assert_eq!(item.expression_line, Some(13));
+        }
+    }
+
     #[test]
     fn test_validate_type_hints_rejects_invalid_symbols() {
         let mut result = FileAnalysisResult {
@@ -2222,6 +2455,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: Some("User".to_string()),
                     type_import_source: Some("react".to_string()),
                 },
@@ -2239,6 +2473,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: Some("Models.User".to_string()),
                     type_import_source: Some("./models".to_string()),
                 },
@@ -2350,6 +2585,7 @@ mod tests {
                         payload_expression_line: None,
                         response_expression_text: None,
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -2367,6 +2603,7 @@ mod tests {
                         payload_expression_line: None,
                         response_expression_text: None,
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -2610,6 +2847,7 @@ export const prerender = false;
             payload_expression_line: None,
             response_expression_text: None,
             response_expression_line: None,
+            emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
         }

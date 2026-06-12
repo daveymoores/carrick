@@ -315,6 +315,12 @@ impl AgentSchemas {
                                 "nullable": true,
                                 "description": "Line number where the payload subexpression starts (read from the line-number prefix in the source code)"
                             },
+                            "emission_style": {
+                                "type": "STRING",
+                                "enum": ["imperative-send", "return-value", "no-payload"],
+                                "nullable": true,
+                                "description": "How the handler emits its response payload. 'imperative-send': the payload is the argument of a send call — res.json(users), reply.send(users), and also return c.json(users) / return NextResponse.json(users) (the payload is the argument, never the framework Response). 'return-value': the handler's return value IS the payload (e.g. Fastify 'return users'). 'no-payload': zero-arg sends (res.json()), streams/buffers handed to send calls, or payloads written by helper functions (renderUsers(res)). Pairing: imperative-send and return-value require non-null response_expression_text; no-payload requires response_expression_text and response_expression_line to be null."
+                            },
                             "primary_type_symbol": {
                                 "type": "STRING",
                                 "nullable": true,
@@ -326,7 +332,7 @@ impl AgentSchemas {
                                 "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
                             }
                         },
-                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched"]
+                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched", "emission_style"]
                     }
                 },
                 "data_calls": {
@@ -481,6 +487,47 @@ mod tests {
         assert!(schema["items"]["properties"]["location"].is_object());
         assert!(schema["items"]["properties"]["classification"]["enum"].is_array());
         assert!(schema["items"]["required"].is_array());
+    }
+
+    #[test]
+    fn emission_style_schema_enum_matches_serde_wire_values() {
+        // The schema's enum list and EmissionStyle's serde rename output must
+        // stay in lockstep: a value the schema advertises but the enum can't
+        // parse would be absorbed to None by the lenient deserializer and
+        // silently lose the classification.
+        use crate::agents::file_analyzer_agent::EmissionStyle;
+
+        let schema = AgentSchemas::file_analysis_schema();
+        let schema_values: Vec<String> = schema["properties"]["endpoints"]["items"]["properties"]
+            ["emission_style"]["enum"]
+            .as_array()
+            .expect("emission_style enum must exist")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        let serde_values: Vec<String> = [
+            EmissionStyle::ImperativeSend,
+            EmissionStyle::ReturnValue,
+            EmissionStyle::NoPayload,
+        ]
+        .iter()
+        .map(|style| {
+            serde_json::to_value(style)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+
+        assert_eq!(schema_values, serde_values);
+
+        // The model must always decide (field is required); null stays legal.
+        let required = schema["properties"]["endpoints"]["items"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.iter().any(|v| v == "emission_style"));
     }
 
     #[test]

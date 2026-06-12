@@ -13,6 +13,7 @@
       "payload_expression_line": null,
       "response_expression_text": "users",
       "response_expression_line": 8,
+      "emission_style": "imperative-send",
       "primary_type_symbol": "User",
       "type_import_source": "../types"
     },
@@ -28,6 +29,7 @@
       "payload_expression_line": 12,
       "response_expression_text": "created",
       "response_expression_line": 14,
+      "emission_style": "imperative-send",
       "primary_type_symbol": "User",
       "type_import_source": "express"
     },
@@ -43,6 +45,7 @@
       "payload_expression_line": null,
       "response_expression_text": null,
       "response_expression_line": null,
+      "emission_style": null,
       "primary_type_symbol": null,
       "type_import_source": null
     }

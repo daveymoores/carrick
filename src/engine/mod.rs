@@ -44,7 +44,10 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
-const CACHE_VERSION: u32 = 3;
+/// 4: EndpointResult gained `emission_style` — pre-4 cached results would
+/// replay with `None` forever and never take the return-value/no-payload
+/// inference paths for unchanged files.
+const CACHE_VERSION: u32 = 4;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -2162,6 +2165,7 @@ mod tests {
                     payload_expression_line: Some(11),
                     response_expression_text: Some("res.json(data)".to_string()),
                     response_expression_line: Some(12),
+                    emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 })
@@ -2440,6 +2444,7 @@ mod tests {
                         payload_expression_line: None,
                         response_expression_text: Some(large_string),
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     }],
