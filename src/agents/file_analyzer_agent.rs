@@ -20,7 +20,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// Result of analyzing a single mount relationship
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,9 +261,12 @@ impl FileAnalyzerAgent {
             .analyze_with_lambda("/analyze-file", &user_message, Some(schema.clone()))
             .await?;
 
-        debug!("=== RAW FILE ANALYSIS RESPONSE ===");
-        debug!("{}", response);
-        debug!("=== END RAW RESPONSE ===");
+        // Raw bodies at trace only — debug logs are persisted and uploaded,
+        // and the response quotes source snippets from the scanned repo (#61).
+        trace!("=== RAW FILE ANALYSIS RESPONSE ===");
+        trace!("{}", response);
+        trace!("=== END RAW RESPONSE ===");
+        debug!("File analysis response: {} chars", response.len());
 
         let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
             format!(
@@ -282,9 +285,10 @@ impl FileAnalyzerAgent {
                 .analyze_with_lambda("/analyze-file", &user_message, Some(schema))
                 .await?;
 
-            debug!("=== RAW FILE ANALYSIS RESPONSE ===");
-            debug!("{}", response);
-            debug!("=== END RAW RESPONSE ===");
+            trace!("=== RAW FILE ANALYSIS RESPONSE ===");
+            trace!("{}", response);
+            trace!("=== END RAW RESPONSE ===");
+            debug!("File analysis retry response: {} chars", response.len());
 
             let mut retry_result: FileAnalysisResult =
                 serde_json::from_str(&response).map_err(|e| {

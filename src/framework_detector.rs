@@ -1,7 +1,7 @@
 use crate::{agent_service::AgentService, packages::Packages, visitor::ImportedSymbol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Result of framework and library detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,9 +165,13 @@ impl FrameworkDetector {
             .post_to_lambda("/framework-detect", &body, "framework-detect")
             .await?;
 
-        debug!("Framework Detection LLM Response:");
-        debug!("{}", response);
-        debug!("--- End of Response ---");
+        // Full response bodies go to trace: debug logs are persisted to
+        // ~/.carrick/logs and uploaded, and the body can quote source from
+        // the scanned repo (#61).
+        trace!("Framework Detection LLM Response:");
+        trace!("{}", response);
+        trace!("--- End of Response ---");
+        debug!("Framework detection response: {} chars", response.len());
 
         // Lambda returns Gemini's raw text — same JSON-extraction step.
         let json_str = self.extract_json_from_response(&response)?;

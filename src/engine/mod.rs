@@ -2051,11 +2051,26 @@ fn recreate_package_and_tsconfig(
             .map_err(|e| format!("Failed to run npm install: {}", e))?;
 
         if !install_output.status.success() {
+            // Fail loudly (#149): a swallowed install failure used to let the
+            // run print "✓ Cross-repo analysis complete" while type checking
+            // silently degraded — masking, e.g., an ERESOLVE conflict.
             let stderr = String::from_utf8_lossy(&install_output.stderr);
-            warn!("npm install failed: {}", stderr);
-        } else {
-            debug!("Dependencies installed successfully");
+            let tail_start = stderr
+                .char_indices()
+                .rev()
+                .nth(1999)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let excerpt = &stderr[tail_start..];
+            return Err(format!(
+                "npm install failed for the cross-repo type-check package — type checking \
+                 cannot run. Set CARRICK_SKIP_NPM_INSTALL=1 to bypass (type checking will \
+                 be skipped). npm stderr (tail):\n{}",
+                excerpt
+            )
+            .into());
         }
+        debug!("Dependencies installed successfully");
     }
 
     // Create tsconfig.json with dynamic path mappings based on actual type files
