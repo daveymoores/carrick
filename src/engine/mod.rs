@@ -2319,16 +2319,12 @@ mod tests {
             );
         }
         assert!(
-            consumer_paths
-                .iter()
-                .any(|p| *p == "/api/users/:order.userId"),
+            consumer_paths.contains(&"/api/users/:order.userId"),
             "expected normalized user-service path, got {:?}",
             consumer_paths
         );
         assert!(
-            consumer_paths
-                .iter()
-                .any(|p| *p == "/api/notifications/status"),
+            consumer_paths.contains(&"/api/notifications/status"),
             "expected normalized notification path, got {:?}",
             consumer_paths
         );

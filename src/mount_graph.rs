@@ -1,9 +1,42 @@
-use crate::{
-    call_site_classifier::{CallSiteType, ClassifiedCallSite},
-    url_normalizer::UrlNormalizer,
-};
+use crate::{call_site_extractor::CallSite, url_normalizer::UrlNormalizer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+/// A call site with its structural classification. Produced today only by
+/// tests and [`MountGraph::build_from_classified_sites`]; the LLM-based
+/// classifier that originally emitted these was deleted long ago.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifiedCallSite {
+    #[serde(flatten)]
+    pub call_site: CallSite,
+    pub classification: CallSiteType,
+    pub confidence: f32,
+    pub reasoning: String,
+    // Mount information (for RouterMounts)
+    pub mount_parent: Option<String>,
+    pub mount_child: Option<String>,
+    pub mount_prefix: Option<String>,
+    // Handler information (for HttpEndpoint or Middleware)
+    pub handler_name: Option<String>,
+    pub handler_args: Vec<HandlerArgument>,
+}
+
+/// Handler argument information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandlerArgument {
+    pub name: String,
+    pub arg_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CallSiteType {
+    RouterMount,
+    Middleware,
+    HttpEndpoint,
+    DataFetchingCall,
+    GraphQLCall,
+    Irrelevant,
+}
 
 /// Represents a node in the mount graph (router or app)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -639,7 +672,6 @@ impl Default for MountGraph {
 mod tests {
     use super::*;
 
-    use crate::call_site_classifier::{CallSiteType, ClassifiedCallSite};
     use crate::call_site_extractor::{ArgumentType, CallArgument, CallSite};
     use crate::config::Config;
 
