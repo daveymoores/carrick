@@ -688,11 +688,21 @@ async fn analyze_current_repo_incremental(
 
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
 
-            // Get framework detection and guidance (cached or fresh)
-            let (detection, guidance) = if !pkg_changed {
+            // Get framework detection, guidance, and extraction config
+            // (cached or fresh — all three share the package_json_hash gate)
+            let (detection, guidance, extraction_config) = if !pkg_changed {
                 if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
                     debug!("Reusing cached framework detection and guidance");
-                    (det.clone(), guid.clone())
+                    // A missing cached config (older cache entry, or an earlier
+                    // failed generation) is regenerated on its own.
+                    let extraction = match &prev.cached_extraction_config {
+                        Some(config) => Some(config.clone()),
+                        None => {
+                            let agent = FrameworkGuidanceAgent::new(AgentService::new());
+                            generate_extraction_config(&agent, det, packages).await
+                        }
+                    };
+                    (det.clone(), guid.clone(), extraction)
                 } else {
                     run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
                 }
@@ -791,8 +801,9 @@ async fn analyze_current_repo_incremental(
             let mut cached_file_results = merged_results.clone();
             strip_diagnostic_fields(&mut cached_file_results);
             cloud_data.file_results = Some(cached_file_results);
-            cloud_data.cached_detection = Some(detection);
+            cloud_data.cached_detection = Some(detection.clone());
             cloud_data.cached_guidance = Some(guidance);
+            cloud_data.cached_extraction_config = extraction_config.clone();
             cloud_data.package_json_hash = Some(current_pkg_hash);
             cloud_data.cache_version = Some(CACHE_VERSION);
 
@@ -808,7 +819,7 @@ async fn analyze_current_repo_incremental(
                 &file_orchestrator,
                 &merged_results,
                 repo_path,
-                packages,
+                extraction_config.as_ref(),
                 &mount_graph,
                 config,
                 &mut cloud_data,
@@ -841,11 +852,20 @@ async fn analyze_current_repo_incremental(
     Ok(cloud_data)
 }
 
-/// Run framework detection and per-protocol guidance generation.
+/// Run framework detection, per-protocol guidance generation, and
+/// extraction-config generation (machinery-unwrap rules). All three are
+/// cached together under the package_json_hash gate.
 async fn run_framework_detection_and_guidance(
     packages: &Packages,
     imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
-) -> Result<(DetectionResult, ProtocolGuidance), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        DetectionResult,
+        ProtocolGuidance,
+        Option<crate::services::type_sidecar::ExtractionConfig>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
@@ -857,7 +877,61 @@ async fn run_framework_detection_and_guidance(
         .generate_for_active_protocols(&detection)
         .await?;
 
-    Ok((detection, guidance))
+    let extraction_config = generate_extraction_config(&guidance_agent, &detection, packages).await;
+
+    Ok((detection, guidance, extraction_config))
+}
+
+/// Cap on the dependency names sent to the extraction_config task. The cloud
+/// caps at 500 server-side; staying under it keeps the request deterministic.
+const EXTRACTION_DEPENDENCY_CAP: usize = 500;
+
+/// Clean npm dependency names for the extraction_config request: the cloud
+/// drops entries with whitespace or longer than 256 chars and caps the list,
+/// so filter here and send only well-formed names, sorted for determinism.
+fn extraction_dependency_names(packages: &Packages) -> Vec<String> {
+    let mut names: Vec<String> = packages
+        .get_dependencies()
+        .keys()
+        .filter(|name| {
+            !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_whitespace)
+        })
+        .cloned()
+        .collect();
+    names.sort();
+    names.truncate(EXTRACTION_DEPENDENCY_CAP);
+    names
+}
+
+/// Generate machinery-unwrap rules via the cloud's extraction_config task.
+/// Non-fatal: on failure the scan proceeds without unwrapping (machinery
+/// types like `AxiosResponse<T>` stay wrapped in the manifest).
+async fn generate_extraction_config(
+    agent: &FrameworkGuidanceAgent,
+    detection: &DetectionResult,
+    packages: &Packages,
+) -> Option<crate::services::type_sidecar::ExtractionConfig> {
+    let dependencies = extraction_dependency_names(packages);
+    match agent
+        .fetch_extraction_config(detection, &dependencies)
+        .await
+    {
+        Ok(config) => {
+            debug!(
+                "Extraction config generated: {} unwrap rule(s)",
+                config.rules.len()
+            );
+            Some(config)
+        }
+        Err(e) => {
+            warn!(
+                "Extraction-config generation failed: {} — machinery wrapper types will not \
+                 be unwrapped this run",
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Append deterministically extracted protocol operations to the repo's
@@ -1014,6 +1088,7 @@ fn build_cloud_data_from_mount_graph(
         file_results: None,
         cached_detection: None,
         cached_guidance: None,
+        cached_extraction_config: None,
         package_json_hash: None,
         cache_version: None,
         type_extraction_status: None,
@@ -1065,7 +1140,7 @@ fn resolve_types_if_available(
     file_orchestrator: &FileOrchestrator,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     repo_path: &str,
-    packages: &Packages,
+    extraction_config: Option<&crate::services::type_sidecar::ExtractionConfig>,
     mount_graph: &MountGraph,
     config: &Config,
     cloud_data: &mut CloudRepoData,
@@ -1086,7 +1161,7 @@ fn resolve_types_if_available(
                 sidecar,
                 file_results,
                 repo_path,
-                packages,
+                extraction_config,
                 mount_graph,
                 config,
             ) {
@@ -1628,14 +1703,23 @@ async fn analyze_current_repo(
 
     // 6. Resolve types using sidecar if available
     let agent_service = AgentService::new();
-    let file_orchestrator = FileOrchestrator::new(agent_service);
+    let file_orchestrator = FileOrchestrator::new(agent_service.clone());
+
+    let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
+    let extraction_config = generate_extraction_config(
+        &guidance_agent,
+        &analysis_result.framework_detection,
+        packages,
+    )
+    .await;
+    cloud_data.cached_extraction_config = extraction_config.clone();
 
     resolve_types_if_available(
         sidecar,
         &file_orchestrator,
         &analysis_result.file_results,
         repo_path,
-        packages,
+        extraction_config.as_ref(),
         &analysis_result.mount_graph,
         config,
         &mut cloud_data,
@@ -2009,6 +2093,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
@@ -2048,6 +2133,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
@@ -2121,6 +2207,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
@@ -2473,6 +2560,7 @@ mod tests {
             file_results: Some(large_results),
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
@@ -2515,6 +2603,7 @@ mod tests {
             file_results: Some(small_results),
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
@@ -2648,6 +2737,7 @@ mod tests {
                 notes: "test".to_string(),
             }),
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: Some("abc123hash".to_string()),
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
@@ -2718,6 +2808,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,

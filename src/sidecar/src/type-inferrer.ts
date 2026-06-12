@@ -28,8 +28,6 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
-  type PropertyAccessExpression,
-  type TypeReferenceNode,
   type Type,
   type Symbol as TsSymbol,
   ts,
@@ -40,7 +38,7 @@ import type {
   InferredType,
   InferKind,
   SourceLocation,
-  WrapperRule,
+
   ExtractionConfig,
   ExtractionRule,
 } from './types.js';
@@ -95,7 +93,7 @@ interface UnwrapResult {
  *
  * Usage:
  *   const inferrer = new TypeInferrer({ project });
- *   const result = inferrer.infer(requests, undefined, extractionConfig);
+ *   const result = inferrer.infer(requests, extractionConfig);
  */
 export class TypeInferrer {
   private readonly project: Project;
@@ -108,13 +106,11 @@ export class TypeInferrer {
    * Infer types for the given requests
    *
    * @param requests - Array of inference requests
-   * @param wrappers - Legacy wrapper rules (deprecated, use extractionConfig)
-   * @param extractionConfig - New extraction config for payload unwrapping
+   * @param extractionConfig - Agent-generated extraction config for payload unwrapping
    * @returns InferResult with inferred types or errors
    */
   infer(
     requests: InferRequestItem[],
-    wrappers: WrapperRule[] = [],
     extractionConfig?: ExtractionConfig
   ): InferResult {
     const inferredTypes: InferredType[] = [];
@@ -130,7 +126,7 @@ export class TypeInferrer {
           );
           continue;
         }
-        const result = this.inferSingle(request, wrappers, extractionConfig);
+        const result = this.inferSingle(request, extractionConfig);
         if (result) {
           inferredTypes.push(result);
         } else {
@@ -159,7 +155,6 @@ export class TypeInferrer {
    */
   private inferSingle(
     request: InferRequestItem,
-    wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     const sourceFile = this.getSourceFile(request.file_path);
@@ -170,17 +165,17 @@ export class TypeInferrer {
 
     switch (request.infer_kind) {
       case 'function_return':
-        return this.inferFunctionReturn(sourceFile, request, wrappers, extractionConfig);
+        return this.inferFunctionReturn(sourceFile, request, extractionConfig);
       case 'response_body':
-        return this.inferResponseBody(sourceFile, request, wrappers, extractionConfig);
+        return this.inferResponseBody(sourceFile, request, extractionConfig);
       case 'call_result':
-        return this.inferCallResult(sourceFile, request, wrappers, extractionConfig);
+        return this.inferCallResult(sourceFile, request, extractionConfig);
       case 'variable':
-        return this.inferVariable(sourceFile, request, wrappers, extractionConfig);
+        return this.inferVariable(sourceFile, request, extractionConfig);
       case 'expression':
-        return this.inferExpression(sourceFile, request, wrappers, extractionConfig);
+        return this.inferExpression(sourceFile, request, extractionConfig);
       case 'request_body':
-        return this.inferRequestBody(sourceFile, request, wrappers, extractionConfig);
+        return this.inferRequestBody(sourceFile, request, extractionConfig);
       case 'signature_return':
         return this.inferSignatureReturn(sourceFile, request);
       case 'function_param':
@@ -216,7 +211,6 @@ export class TypeInferrer {
   private inferFunctionReturn(
     sourceFile: SourceFile,
     request: InferRequestItem,
-    wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     const func = this.resolveContainingFunction(sourceFile, request);
@@ -231,13 +225,8 @@ export class TypeInferrer {
     let returnType = func.getReturnType();
     let typeString = typeText(returnType, func);
 
-    // Apply extraction config or legacy wrappers
-    const unwrapResult = this.unwrapTypeWithConfig(
-      returnType,
-      func,
-      extractionConfig,
-      wrappers
-    );
+    // Apply the agent-generated extraction config
+    const unwrapResult = this.unwrapTypeWithConfig(returnType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
     }
@@ -330,7 +319,6 @@ export class TypeInferrer {
   private inferResponseBody(
     sourceFile: SourceFile,
     request: InferRequestItem,
-    wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     const node = this.resolveTargetNode(sourceFile, request);
@@ -341,7 +329,7 @@ export class TypeInferrer {
       this.log(
         `No payload node found for request at ${request.file_path}:${request.line_number}; falling back to function return`
       );
-      return this.inferFunctionReturn(sourceFile, request, wrappers, extractionConfig);
+      return this.inferFunctionReturn(sourceFile, request, extractionConfig);
     }
 
     // The resolved node IS the payload subexpression in the MVP schema.
@@ -375,8 +363,7 @@ export class TypeInferrer {
     const unwrapResult = this.unwrapTypeWithConfig(
       payloadType,
       payloadNode,
-      extractionConfig,
-      wrappers
+      extractionConfig
     );
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
@@ -394,13 +381,12 @@ export class TypeInferrer {
   private inferCallResult(
     sourceFile: SourceFile,
     request: InferRequestItem,
-    wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     const callExpr = this.resolveTargetCallExpression(sourceFile, request);
 
     if (!callExpr) {
-      return this.inferExpression(sourceFile, request, wrappers, extractionConfig);
+      return this.inferExpression(sourceFile, request, extractionConfig);
     }
 
     // Walk up from the already-found call expression instead of re-searching
@@ -410,28 +396,15 @@ export class TypeInferrer {
     let typeString = typeText(returnType, terminalNode);
     let isExplicit = false;
 
-    // Try extraction config first, then legacy wrappers
     const unwrapResult = this.unwrapTypeWithConfig(
       returnType,
       terminalNode,
-      extractionConfig,
-      wrappers
+      extractionConfig
     );
 
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
       isExplicit = unwrapResult.isExplicit;
-    } else {
-      // Legacy wrapper resolution
-      const wrapperResolution = this.resolveWrapperType(
-        terminalNode,
-        returnType,
-        wrappers
-      );
-      if (wrapperResolution) {
-        typeString = wrapperResolution.typeString;
-        isExplicit = wrapperResolution.isExplicit;
-      }
     }
 
     const explicitType = this.extractExplicitTypeFromAncestor(terminalNode);
@@ -454,7 +427,6 @@ export class TypeInferrer {
   private inferVariable(
     sourceFile: SourceFile,
     request: InferRequestItem,
-    wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     const node = this.resolveTargetNode(sourceFile, request);
@@ -468,7 +440,7 @@ export class TypeInferrer {
       : node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
 
     if (!varDecl) {
-      return this.inferExpression(sourceFile, request, wrappers, extractionConfig);
+      return this.inferExpression(sourceFile, request, extractionConfig);
     }
 
     const typeNode = varDecl.getTypeNode();
@@ -480,8 +452,7 @@ export class TypeInferrer {
     const unwrapResult = this.unwrapTypeWithConfig(
       varType,
       varDecl,
-      extractionConfig,
-      wrappers
+      extractionConfig
     );
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
@@ -501,7 +472,6 @@ export class TypeInferrer {
   private inferExpression(
     sourceFile: SourceFile,
     request: InferRequestItem,
-    wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     const node = this.resolveTargetNode(sourceFile, request);
@@ -514,7 +484,7 @@ export class TypeInferrer {
     let typeString = typeText(type, node);
 
     // Apply extraction config
-    const unwrapResult = this.unwrapTypeWithConfig(type, node, extractionConfig, wrappers);
+    const unwrapResult = this.unwrapTypeWithConfig(type, node, extractionConfig);
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
     }
@@ -533,7 +503,6 @@ export class TypeInferrer {
   private inferRequestBody(
     sourceFile: SourceFile,
     request: InferRequestItem,
-    wrappers: WrapperRule[],
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     const node = this.resolveTargetNode(sourceFile, request);
@@ -549,8 +518,7 @@ export class TypeInferrer {
     const unwrapResult = this.unwrapTypeWithConfig(
       payloadType,
       node,
-      extractionConfig,
-      wrappers
+      extractionConfig
     );
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
@@ -758,27 +726,14 @@ export class TypeInferrer {
   // ===========================================================================
 
   /**
-   * Unwrap a type using the new ExtractionConfig system.
-   * Falls back to legacy wrappers if extractionConfig is not provided.
+   * Unwrap a type using the agent-generated ExtractionConfig.
    */
   private unwrapTypeWithConfig(
     type: Type,
     node: Node,
-    extractionConfig?: ExtractionConfig,
-    legacyWrappers?: WrapperRule[]
+    extractionConfig?: ExtractionConfig
   ): UnwrapResult {
-    // If no extraction config, try legacy wrappers
     if (!extractionConfig || extractionConfig.rules.length === 0) {
-      if (legacyWrappers && legacyWrappers.length > 0) {
-        const result = this.resolveWrapperType(node, type, legacyWrappers);
-        if (result) {
-          return {
-            typeString: result.typeString,
-            isExplicit: result.isExplicit,
-            wasUnwrapped: true,
-          };
-        }
-      }
       return {
         typeString: typeText(type, node),
         isExplicit: false,
@@ -886,9 +841,20 @@ export class TypeInferrer {
     const symbol = type.getSymbol() || type.getAliasSymbol();
     const symbolName = symbol?.getName();
 
-    // 1. Check exact wrapperSymbols match
+    // 1. Check exact wrapperSymbols match. When the rule also carries
+    // originModuleGlobs, the symbol's declaration must come from a matching
+    // module — names like `Response` are shared by the DOM, frameworks, and
+    // HTTP clients, so a bare name match would unwrap unrelated types.
     if (rule.wrapperSymbols && symbolName && rule.wrapperSymbols.includes(symbolName)) {
-      return this.extractPayloadFromWrapper(type, node, rule, config, depth);
+      const originGated = rule.originModuleGlobs && rule.originModuleGlobs.length > 0;
+      if (!originGated || this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs!)) {
+        return this.extractPayloadFromWrapper(type, node, rule, config, depth);
+      }
+      return {
+        typeString: typeText(type, node),
+        isExplicit: false,
+        wasUnwrapped: false,
+      };
     }
 
     // 2. Check machineryIndicators + originModuleGlobs
@@ -1009,11 +975,15 @@ export class TypeInferrer {
       }
     }
 
-    // Fallback: return type unchanged
+    // The rule matched (exact symbol, or verified machinery), but no payload
+    // is recoverable from generics or property paths. Publish `unknown` —
+    // a verified machinery type is not the contract, and the manifest
+    // enrichment treats `unknown` as unresolved instead of comparing the
+    // wrapper against producer payload types.
     return {
-      typeString: typeText(type, node),
+      typeString: 'unknown',
       isExplicit: false,
-      wasUnwrapped: false,
+      wasUnwrapped: true,
     };
   }
 
@@ -1114,120 +1084,6 @@ export class TypeInferrer {
     return useless.includes(trimmed) || trimmed === '';
   }
 
-  // ===========================================================================
-  // Legacy Wrapper Unwrapping (Preserved for backwards compatibility)
-  // ===========================================================================
-
-  private resolveWrapperType(
-    node: Node,
-    type: Type,
-    wrappers: WrapperRule[]
-  ): { typeString: string; isExplicit: boolean } | null {
-    if (wrappers.length === 0) {
-      return null;
-    }
-
-    for (const wrapper of wrappers) {
-      if (wrapper.unwrap.kind === 'property') {
-        const propertyAccess = this.getPropertyAccessNode(node);
-        if (propertyAccess) {
-          const baseExpr = propertyAccess.getExpression();
-          const baseType = baseExpr.getType();
-          if (this.matchesWrapperType(baseType, baseExpr, wrapper)) {
-            if (propertyAccess.getName() === wrapper.unwrap.property) {
-              const propertyType = propertyAccess.getType();
-              let typeString = typeText(propertyType, propertyAccess);
-              typeString = this.unwrapPromise(typeString, propertyType);
-              return { typeString, isExplicit: false };
-            }
-            return { typeString: 'unknown', isExplicit: false };
-          }
-        }
-
-        if (this.matchesWrapperType(type, node, wrapper)) {
-          return { typeString: 'unknown', isExplicit: false };
-        }
-
-        continue;
-      }
-
-      if (wrapper.unwrap.kind === 'generic_param') {
-        if (!this.matchesWrapperType(type, node, wrapper)) {
-          continue;
-        }
-
-        const explicitArg = this.findExplicitWrapperTypeArgument(node, wrapper);
-        if (!explicitArg) {
-          return { typeString: 'unknown', isExplicit: false };
-        }
-
-        return { typeString: explicitArg.typeString, isExplicit: true };
-      }
-    }
-
-    return null;
-  }
-
-  private findExplicitWrapperTypeArgument(
-    node: Node,
-    wrapper: WrapperRule
-  ): { typeString: string } | null {
-    const index = wrapper.unwrap.index;
-    if (index === undefined) {
-      return null;
-    }
-
-    const callExpr = this.getCallExpressionFromNode(node);
-    if (callExpr) {
-      const typeArgs = callExpr.getTypeArguments();
-      if (typeArgs.length > index) {
-        return { typeString: typeArgs[index].getText() };
-      }
-    }
-
-    const typeRef = this.findWrapperTypeReference(node, wrapper.type_name);
-    if (typeRef) {
-      const typeArgs = typeRef.getTypeArguments();
-      if (typeArgs.length > index) {
-        return { typeString: typeArgs[index].getText() };
-      }
-    }
-
-    return null;
-  }
-
-  private getPropertyAccessNode(
-    node: Node
-  ): PropertyAccessExpression | null {
-    const unwrapped = this.unwrapExpressionNode(node);
-    if (Node.isPropertyAccessExpression(unwrapped)) {
-      return unwrapped;
-    }
-    return null;
-  }
-
-  private getCallExpressionFromNode(node: Node): CallExpression | null {
-    const unwrapped = this.unwrapExpressionNode(node);
-    if (Node.isCallExpression(unwrapped)) {
-      return unwrapped;
-    }
-    return null;
-  }
-
-  private findWrapperTypeReference(
-    node: Node,
-    typeName: string
-  ): TypeReferenceNode | null {
-    const typeRefs = node.getDescendantsOfKind(SyntaxKind.TypeReference);
-    for (const ref of typeRefs) {
-      const nameText = ref.getTypeName().getText();
-      if (nameText === typeName || nameText.endsWith(`.${typeName}`)) {
-        return ref;
-      }
-    }
-    return null;
-  }
-
   private unwrapExpressionNode(node: Node | undefined): Node {
     let current = node;
     while (current) {
@@ -1250,59 +1106,6 @@ export class TypeInferrer {
       break;
     }
     return current ?? node!;
-  }
-
-  private matchesWrapperType(
-    type: Type,
-    node: Node,
-    wrapper: WrapperRule
-  ): boolean {
-    const symbol = type.getSymbol();
-    if (!symbol) {
-      return false;
-    }
-
-    if (symbol.getName() !== wrapper.type_name) {
-      return false;
-    }
-
-    if (!this.declarationFromPackage(symbol, wrapper.package)) {
-      if (!this.sourceFileImportsWrapper(node.getSourceFile(), wrapper)) {
-        return false;
-      }
-
-      const aliasedSymbol = symbol.getAliasedSymbol?.();
-      if (!aliasedSymbol) {
-        return false;
-      }
-      if (!this.declarationFromPackage(aliasedSymbol, wrapper.package)) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  private sourceFileImportsWrapper(
-    sourceFile: SourceFile,
-    wrapper: WrapperRule
-  ): boolean {
-    for (const importDecl of sourceFile.getImportDeclarations()) {
-      const moduleSpecifier = importDecl.getModuleSpecifierValue();
-      if (
-        moduleSpecifier === wrapper.package ||
-        moduleSpecifier.startsWith(`${wrapper.package}/`)
-      ) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private declarationFromPackage(symbol: TsSymbol, packageName: string): boolean {
-    const filePath = symbol.getDeclarations()?.[0]?.getSourceFile()?.getFilePath();
-    const normalized = filePath?.replace(/\\/g, '/');
-    return !!normalized && normalized.includes(`node_modules/${packageName}/`);
   }
 
   private extractExplicitTypeFromAncestor(node: Node): string | null {

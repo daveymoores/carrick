@@ -400,6 +400,65 @@ impl AgentSchemas {
         })
     }
 
+    /// Schema for the framework-guidance `extraction_config` task: rules for
+    /// unwrapping machinery/wrapper types around response payloads. Field
+    /// names are camelCase to match the sidecar's `ExtractionRule`
+    /// (`src/sidecar/src/types.ts`); semantics are taught by the cloud-side
+    /// prompt. All rule fields are required so the model decides each one;
+    /// empty arrays / null mean "not applicable".
+    pub fn extraction_config_schema() -> Value {
+        json!({
+            "type": "OBJECT",
+            "properties": {
+                "rules": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "wrapperSymbols": {
+                                "type": "ARRAY",
+                                "items": { "type": "STRING" },
+                                "description": "Exact wrapper type/symbol names to unwrap. Use only for distinctive names (AxiosResponse, ApiEnvelope). For generic names shared with the DOM or frameworks (Response, Request) ALWAYS pair with originModuleGlobs — when globs are present the symbol must also originate from a matching module."
+                            },
+                            "machineryIndicators": {
+                                "type": "ARRAY",
+                                "items": { "type": "STRING" },
+                                "description": "Method/property names that mark a machinery type (e.g. statusCode, headers). Only applied together with originModuleGlobs."
+                            },
+                            "originModuleGlobs": {
+                                "type": "ARRAY",
+                                "items": { "type": "STRING" },
+                                "description": "Package-path globs the wrapper's declaration must come from, resolved against node_modules (e.g. got/*, @types/node/*, typescript/lib/*). Emit multiple candidate globs when the origin is ambiguous; entries that match nothing are ignored. Leave empty for workspace-local wrapper types and rely on a distinctive wrapperSymbols name instead."
+                            },
+                            "payloadGenericIndex": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Index of the generic type argument holding the payload. Null when the wrapper is not generic; defaults to 0."
+                            },
+                            "payloadPropertyPath": {
+                                "type": "ARRAY",
+                                "items": { "type": "STRING" },
+                                "description": "Property path to the payload when generics are unavailable (e.g. [\"body\"] for got's Response.body)."
+                            },
+                            "unwrapRecursively": {
+                                "type": "BOOLEAN",
+                                "nullable": true,
+                                "description": "Recursively unwrap nested wrappers (Promise<AxiosResponse<T>> resolves to T). Null defaults to false."
+                            },
+                            "maxDepth": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Maximum nesting depth for recursive unwrapping. Null defaults to 4."
+                            }
+                        },
+                        "required": ["wrapperSymbols", "machineryIndicators", "originModuleGlobs", "payloadGenericIndex", "payloadPropertyPath", "unwrapRecursively", "maxDepth"]
+                    }
+                }
+            },
+            "required": ["rules"]
+        })
+    }
+
     /// Schema for MountAgent output - array of MountRelationship
     pub fn mount_schema() -> Value {
         json!({

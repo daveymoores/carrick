@@ -28,13 +28,14 @@ export type InferKind =
  * A rule for unwrapping machinery/wrapper types to extract payload types.
  *
  * The unwrapping logic follows these priorities:
- * 1. Exact wrapperSymbols match wins immediately
+ * 1. Exact wrapperSymbols match wins (gated on originModuleGlobs when present)
  * 2. machineryIndicators only trigger unwrap if originModuleGlobs also match
  * 3. Payload extraction: prefer generic args, then property paths
  */
 export interface ExtractionRule {
   /**
-   * Exact wrapper type/symbol names to unwrap.
+   * Exact wrapper type/symbol names to unwrap. When originModuleGlobs is
+   * also set, the symbol must originate from a matching module.
    * Examples: ["Response", "AxiosResponse", "Promise", "Observable"]
    */
   wrapperSymbols?: string[];
@@ -154,24 +155,6 @@ export interface RepoMetadata {
 }
 
 // ============================================================================
-// Legacy Wrapper Registry Types (kept for backwards compat during migration)
-// ============================================================================
-
-export type WrapperUnwrapKind = 'property' | 'generic_param';
-
-export interface WrapperUnwrapRule {
-  kind: WrapperUnwrapKind;
-  property?: string;
-  index?: number;
-}
-
-export interface WrapperRule {
-  package: string;
-  type_name: string;
-  unwrap: WrapperUnwrapRule;
-}
-
-// ============================================================================
 // Request Types
 // ============================================================================
 
@@ -236,8 +219,7 @@ export interface PayloadDefinition {
 export interface InferRequest extends BaseRequest {
   action: 'infer';
   requests: InferRequestItem[];
-  wrappers?: WrapperRule[];
-  /** New extraction config (preferred over wrappers) */
+  /** Agent-generated extraction config for machinery unwrapping */
   extraction_config?: ExtractionConfig;
 }
 

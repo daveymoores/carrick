@@ -74,7 +74,7 @@ fn infer_missing_types(
 
     debug!("Inferring {} unannotated signature slot(s)", requests.len());
 
-    let response = match sidecar.infer_types(&requests, &[]) {
+    let response = match sidecar.infer_types(&requests, None) {
         Ok(response) => response,
         Err(e) => {
             warn!("Signature inference failed: {e}");

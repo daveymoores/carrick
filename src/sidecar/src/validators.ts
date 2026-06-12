@@ -86,41 +86,6 @@ const RepoMetadataSchema = z.object({
 });
 
 // ============================================================================
-// Wrapper Registry Schemas (Legacy)
-// ============================================================================
-
-const WrapperUnwrapKindSchema = z.enum(['property', 'generic_param']);
-
-const WrapperUnwrapRuleSchema = z
-  .object({
-    kind: WrapperUnwrapKindSchema,
-    property: z.string().min(1, 'Property must be non-empty').optional(),
-    index: z.number().int().nonnegative('Index must be non-negative').optional(),
-  })
-  .superRefine((value, ctx) => {
-    if (value.kind === 'property' && !value.property) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'property is required for property unwrap rules',
-        path: ['property'],
-      });
-    }
-    if (value.kind === 'generic_param' && value.index === undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'index is required for generic_param unwrap rules',
-        path: ['index'],
-      });
-    }
-  });
-
-const WrapperRuleSchema = z.object({
-  package: z.string().min(1, 'Package name cannot be empty'),
-  type_name: z.string().min(1, 'Type name cannot be empty'),
-  unwrap: WrapperUnwrapRuleSchema,
-});
-
-// ============================================================================
 // Symbol Request Schema
 // ============================================================================
 
@@ -241,7 +206,6 @@ export const EmitSurfaceRequestSchema = BaseRequestSchema.extend({
 export const InferRequestSchema = BaseRequestSchema.extend({
   action: z.literal('infer'),
   requests: z.array(InferRequestItemSchema).min(1, 'At least one infer request is required'),
-  wrappers: z.array(WrapperRuleSchema).optional(),
   extraction_config: ExtractionConfigSchema.optional(),
 });
 

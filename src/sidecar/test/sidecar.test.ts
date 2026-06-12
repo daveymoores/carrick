@@ -728,9 +728,7 @@ describe('Type Sidecar Integration Tests', () => {
       }
     });
 
-    // TODO: Re-enable after wrapper unwrapping with property access verification
-    // This test requires tracking property access on wrapper types
-    it.skip('should unwrap wrapper types when access is verified', async () => {
+    it('extraction config unwraps a node_modules wrapper via exact symbol match', async () => {
       const response = await client.send<{
         request_id: string;
         status: string;
@@ -742,34 +740,40 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'infer',
         request_id: 'infer-9',
-        wrappers: [
-          {
-            package: 'wrapper-lib',
-            type_name: 'ApiResponse',
-            unwrap: { kind: 'property', property: 'data' },
-          },
-        ],
+        extraction_config: {
+          rules: [
+            {
+              wrapperSymbols: ['ApiResponse'],
+              originModuleGlobs: ['wrapper-lib', 'wrapper-lib/*'],
+              payloadGenericIndex: 0,
+            },
+          ],
+        },
         requests: [
           {
             file_path: path.join(FIXTURES_PATH, 'src/wrapper-usage.ts'),
-            line_number: 15,
-            span_start: 266,
-            span_end: 284,
+            line_number: 20,
+            span_start: 371,
+            span_end: 389,
             infer_kind: 'call_result',
           },
         ],
       });
 
       assert.strictEqual(response.request_id, 'infer-9');
-      if (response.inferred_types && response.inferred_types.length > 0) {
-        const inferred = response.inferred_types[0];
-        assert.strictEqual(inferred.infer_kind, 'call_result');
-        assert.ok(inferred.type_string.includes('UserData'));
-        assert.ok(inferred.type_string !== 'unknown');
-      }
+      assert.ok(response.inferred_types && response.inferred_types.length > 0);
+      const inferred = response.inferred_types[0];
+      assert.strictEqual(inferred.infer_kind, 'call_result');
+      assert.ok(
+        inferred.type_string.includes('UserData'),
+        `expected payload type, got: ${inferred.type_string}`
+      );
+      assert.ok(!inferred.type_string.includes('ApiResponse'));
     });
 
-    it('should return unknown when wrapper access is not verified', async () => {
+    it('origin-gated rule tolerates a glob list where only some entries match', async () => {
+      // Ambient/global machinery types ship several candidate origin globs;
+      // entries that match nothing must be no-ops, not failures.
       const response = await client.send<{
         request_id: string;
         status: string;
@@ -781,13 +785,19 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'infer',
         request_id: 'infer-10',
-        wrappers: [
-          {
-            package: 'wrapper-lib',
-            type_name: 'ApiResponse',
-            unwrap: { kind: 'property', property: 'data' },
-          },
-        ],
+        extraction_config: {
+          rules: [
+            {
+              machineryIndicators: ['data'],
+              originModuleGlobs: [
+                'definitely-not-installed/*',
+                '@types/never-present/*',
+                'wrapper-lib/*',
+              ],
+              payloadGenericIndex: 0,
+            },
+          ],
+        },
         requests: [
           {
             file_path: path.join(FIXTURES_PATH, 'src/wrapper-usage.ts'),
@@ -800,14 +810,65 @@ describe('Type Sidecar Integration Tests', () => {
       });
 
       assert.strictEqual(response.request_id, 'infer-10');
-      if (response.inferred_types && response.inferred_types.length > 0) {
-        const inferred = response.inferred_types[0];
-        assert.strictEqual(inferred.infer_kind, 'call_result');
-        assert.strictEqual(inferred.type_string, 'unknown');
-      }
+      assert.ok(response.inferred_types && response.inferred_types.length > 0);
+      const inferred = response.inferred_types[0];
+      assert.ok(
+        inferred.type_string.includes('UserData'),
+        `unmatched globs must be no-ops, got: ${inferred.type_string}`
+      );
     });
 
-    it('should ignore wrapper rules for local types', async () => {
+    it('wrapperSymbols with origin globs do not match same-named local types', async () => {
+      // `Response`-style names are shared by the DOM, frameworks, and HTTP
+      // clients. When a rule carries origin globs, an exact symbol match must
+      // still verify the declaration's origin.
+      const response = await client.send<{
+        request_id: string;
+        status: string;
+        inferred_types?: Array<{
+          alias: string;
+          type_string: string;
+          infer_kind: string;
+        }>;
+      }>({
+        action: 'infer',
+        request_id: 'infer-12',
+        extraction_config: {
+          rules: [
+            {
+              wrapperSymbols: ['ApiResponse'],
+              originModuleGlobs: ['wrapper-lib', 'wrapper-lib/*'],
+              payloadGenericIndex: 0,
+            },
+          ],
+        },
+        requests: [
+          {
+            file_path: path.join(
+              FIXTURES_PATH,
+              'src/wrapper-false-positive.ts'
+            ),
+            line_number: 8,
+            span_start: 197,
+            span_end: 215,
+            infer_kind: 'call_result',
+          },
+        ],
+      });
+
+      assert.strictEqual(response.request_id, 'infer-12');
+      assert.ok(response.inferred_types && response.inferred_types.length > 0);
+      const inferred = response.inferred_types[0];
+      assert.ok(
+        inferred.type_string.includes('ApiResponse'),
+        `symbol match must be origin-gated, got: ${inferred.type_string}`
+      );
+    });
+
+    it('origin-gated rule leaves workspace-local lookalike types wrapped', async () => {
+      // A local type named like a machinery wrapper, with matching indicator
+      // properties, must NOT unwrap when its declaration does not come from
+      // one of the origin globs.
       const response = await client.send<{
         request_id: string;
         status: string;
@@ -819,13 +880,15 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'infer',
         request_id: 'infer-11',
-        wrappers: [
-          {
-            package: 'wrapper-lib',
-            type_name: 'ApiResponse',
-            unwrap: { kind: 'property', property: 'data' },
-          },
-        ],
+        extraction_config: {
+          rules: [
+            {
+              machineryIndicators: ['data'],
+              originModuleGlobs: ['wrapper-lib', 'wrapper-lib/*'],
+              payloadGenericIndex: 0,
+            },
+          ],
+        },
         requests: [
           {
             file_path: path.join(
@@ -841,12 +904,14 @@ describe('Type Sidecar Integration Tests', () => {
       });
 
       assert.strictEqual(response.request_id, 'infer-11');
-      if (response.inferred_types && response.inferred_types.length > 0) {
-        const inferred = response.inferred_types[0];
-        assert.strictEqual(inferred.infer_kind, 'call_result');
-        assert.ok(inferred.type_string.includes('ApiResponse'));
-        assert.ok(inferred.type_string !== 'unknown');
-      }
+      assert.ok(response.inferred_types && response.inferred_types.length > 0);
+      const inferred = response.inferred_types[0];
+      assert.strictEqual(inferred.infer_kind, 'call_result');
+      assert.ok(
+        inferred.type_string.includes('ApiResponse'),
+        `local lookalike must stay wrapped, got: ${inferred.type_string}`
+      );
+      assert.ok(inferred.type_string !== 'unknown');
     });
 
     it('signature_return keeps Promise wrapper and reports explicit', async () => {

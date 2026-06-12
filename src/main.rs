@@ -29,7 +29,6 @@ mod type_manifest;
 mod url_normalizer;
 mod utils;
 mod visitor;
-mod wrapper_registry;
 
 use crate::cloud_storage::{AwsStorage, MockStorage};
 use crate::services::TypeSidecar;
