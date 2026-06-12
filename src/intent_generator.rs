@@ -62,6 +62,34 @@ pub fn intents_by_hash(
         .collect()
 }
 
+/// True when `body` references `name` as a standalone JS identifier.
+///
+/// A plain `contains` over-matches short names — `id` inside `userId`, `get`
+/// inside `getUser`, names inside comments notwithstanding — which fabricates
+/// call-graph edges: callers fold phantom callees' intents into their content
+/// hash (needless regeneration) and phantom back-edges create cycles that dump
+/// real functions into the unordered final topological level (#55, #141). A
+/// match counts only when not flanked by identifier characters (`[A-Za-z0-9_$]`).
+fn body_references_identifier(body: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let is_ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut search_from = 0;
+    while let Some(pos) = body[search_from..].find(name) {
+        let start = search_from + pos;
+        let end = start + name.len();
+        let before_ok = !body[..start].chars().next_back().is_some_and(is_ident_char);
+        let after_ok = !body[end..].chars().next().is_some_and(is_ident_char);
+        if before_ok && after_ok {
+            return true;
+        }
+        // Overlap-safe: re-search from the next character of this match.
+        search_from = start + name.chars().next().map_or(1, |c| c.len_utf8());
+    }
+    false
+}
+
 /// Generate intents for all exported functions that have body source.
 ///
 /// After generation:
@@ -104,7 +132,9 @@ pub async fn generate_function_intents(
         {
             let called: Vec<String> = local_fn_names
                 .iter()
-                .filter(|&&fn_name| fn_name != name.as_str() && body.contains(fn_name))
+                .filter(|&&fn_name| {
+                    fn_name != name.as_str() && body_references_identifier(body, fn_name)
+                })
                 .map(|&s| s.to_string())
                 .collect();
             deps.insert(name.clone(), called);
@@ -346,6 +376,68 @@ fn topological_levels(names: &[String], deps: &HashMap<String, Vec<String>>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifier_match_requires_word_boundaries() {
+        // Substrings of longer identifiers are not references (#55, #141).
+        assert!(!body_references_identifier("return userId;", "id"));
+        assert!(!body_references_identifier("return getUser();", "get"));
+        assert!(!body_references_identifier("run_all();", "run"));
+        assert!(!body_references_identifier("fetchData$();", "fetchData"));
+
+        // Real references still match.
+        assert!(body_references_identifier("return id;", "id"));
+        assert!(body_references_identifier("const x = get();", "get"));
+        assert!(body_references_identifier("await helper(1)", "helper"));
+        // Passed as a callback — still a dependency for intent purposes.
+        assert!(body_references_identifier("arr.map(helper)", "helper"));
+        // Boundary positions: start and end of the body.
+        assert!(body_references_identifier("helper()", "helper"));
+        assert!(body_references_identifier("return helper", "helper"));
+    }
+
+    #[test]
+    fn identifier_match_finds_later_occurrence_after_substring_hit() {
+        // First occurrence is embedded in a longer identifier; a later
+        // standalone occurrence must still be found.
+        assert!(body_references_identifier("getUser(); get();", "get"));
+        // Overlap-safety: "aa" inside "aaa" — no standalone "aa" with
+        // boundaries on both sides.
+        assert!(!body_references_identifier("aaab", "aa"));
+    }
+
+    #[test]
+    fn phantom_substring_edges_no_longer_create_cycles() {
+        // `processId` contains "id"; with substring matching, `id` ← processId
+        // plus a real processId ← id edge formed a fake cycle that dumped both
+        // functions into the unordered cycle level.
+        let names = vec!["id".to_string(), "processId".to_string()];
+        let mut defs = HashMap::new();
+        defs.insert("id".to_string(), def_with_body("id", "return 1;"));
+        defs.insert(
+            "processId".to_string(),
+            def_with_body("processId", "return id();"),
+        );
+
+        let mut deps = HashMap::new();
+        for name in &names {
+            let body = defs[name].body_source.as_ref().unwrap();
+            let called: Vec<String> = names
+                .iter()
+                .filter(|n| n.as_str() != name && body_references_identifier(body, n))
+                .cloned()
+                .collect();
+            deps.insert(name.clone(), called);
+        }
+
+        assert_eq!(deps["id"], Vec::<String>::new());
+        assert_eq!(deps["processId"], vec!["id".to_string()]);
+
+        let levels = topological_levels(&names, &deps);
+        assert_eq!(levels.len(), 2, "leaf level then caller level, no cycle");
+        assert_eq!(levels[0], vec!["id".to_string()]);
+        assert_eq!(levels[1], vec!["processId".to_string()]);
+    }
 
     #[test]
     fn topological_levels_leaves_first() {
