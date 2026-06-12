@@ -2,6 +2,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, io, path::PathBuf};
 
+/// Cap on the dependency names sent to cloud tasks. The cloud caps at 500
+/// server-side; staying under it keeps requests deterministic.
+pub const DEPENDENCY_NAME_CAP: usize = 500;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PackageJson {
     pub name: Option<String>,
@@ -144,5 +148,23 @@ impl Packages {
     /// Gets all merged dependencies
     pub fn get_dependencies(&self) -> &HashMap<String, PackageInfo> {
         &self.merged_dependencies
+    }
+
+    /// Merged dependency names cleaned for cloud requests: the cloud drops
+    /// entries with whitespace or longer than 256 chars and caps the list at
+    /// [`DEPENDENCY_NAME_CAP`], so filter here and send only well-formed
+    /// names, sorted for determinism.
+    pub fn cleaned_dependency_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .merged_dependencies
+            .keys()
+            .filter(|name| {
+                !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_whitespace)
+            })
+            .cloned()
+            .collect();
+        names.sort();
+        names.truncate(DEPENDENCY_NAME_CAP);
+        names
     }
 }

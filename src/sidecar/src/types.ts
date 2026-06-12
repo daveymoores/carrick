@@ -28,9 +28,12 @@ export type InferKind =
  * A rule for unwrapping machinery/wrapper types to extract payload types.
  *
  * The unwrapping logic follows these priorities:
- * 1. Exact wrapperSymbols match wins (gated on originModuleGlobs when present)
+ * 1. Exact wrapperSymbols match extracts (gated on originModuleGlobs when present)
  * 2. machineryIndicators only trigger unwrap if originModuleGlobs also match
  * 3. Payload extraction: prefer generic args, then property paths
+ * 4. A rule that matches but extracts nothing never blocks later rules; an
+ *    origin-verified match with no recoverable payload collapses to `unknown`
+ *    only after every rule has run
  */
 export interface ExtractionRule {
   /**

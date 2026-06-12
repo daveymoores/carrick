@@ -549,6 +549,55 @@ mod tests {
     }
 
     #[test]
+    fn extraction_rule_schema_fields_match_serde_wire_names() {
+        // Three copies of the rule field names exist: this schema, the serde
+        // struct in services::type_sidecar, and the sidecar's zod validator.
+        // Every Rust field is #[serde(default)], so a drifted key would not
+        // error anywhere — the rule would parse as an empty no-op and
+        // unwrapping would silently go dead. Pin schema ↔ serde here (the
+        // sidecar's own tests pin the zod side).
+        use crate::services::type_sidecar::ExtractionRule;
+
+        let rule = ExtractionRule {
+            wrapper_symbols: vec!["AxiosResponse".to_string()],
+            machinery_indicators: vec!["statusCode".to_string()],
+            origin_module_globs: vec!["axios/*".to_string()],
+            payload_generic_index: Some(0),
+            payload_property_path: vec!["data".to_string()],
+            unwrap_recursively: Some(true),
+            max_depth: Some(4),
+        };
+        let serialized = serde_json::to_value(&rule).unwrap();
+        let mut serde_keys: Vec<&str> = serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        serde_keys.sort_unstable();
+
+        let schema = AgentSchemas::extraction_config_schema();
+        let rule_schema = &schema["properties"]["rules"]["items"];
+        let mut schema_keys: Vec<&str> = rule_schema["properties"]
+            .as_object()
+            .expect("rule properties must exist")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        schema_keys.sort_unstable();
+        assert_eq!(schema_keys, serde_keys);
+
+        let mut required_keys: Vec<&str> = rule_schema["required"]
+            .as_array()
+            .expect("rule required list must exist")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        required_keys.sort_unstable();
+        assert_eq!(required_keys, serde_keys);
+    }
+
+    #[test]
     fn emission_style_schema_enum_matches_serde_wire_values() {
         // The schema's enum list and EmissionStyle's serde rename output must
         // stay in lockstep: a value the schema advertises but the enum can't

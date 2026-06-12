@@ -37,7 +37,10 @@ const ExtractionRuleSchema = z.object({
   payloadGenericIndex: z.number().int().nonnegative().optional(),
   payloadPropertyPath: z.array(z.string()).optional(),
   unwrapRecursively: z.boolean().optional(),
-  maxDepth: z.number().int().positive().optional(),
+  // Nonnegative, not positive: the Rust side accepts a model-emitted
+  // maxDepth of 0 (a harmless no-op rule), and one rule rejected here would
+  // fail the entire infer request.
+  maxDepth: z.number().int().nonnegative().optional(),
 });
 
 const ExtractionConfigSchema = z.object({

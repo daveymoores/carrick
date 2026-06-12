@@ -89,6 +89,17 @@ interface UnwrapResult {
 }
 
 /**
+ * Outcome of trying one ExtractionRule against one type. A rule that verifies
+ * wrapper identity but recovers no payload must neither win (stomping the
+ * type) nor be indistinguishable from a non-match (the wrapper is verified
+ * machinery, never the contract) — so the three cases are explicit.
+ */
+type RuleAttempt =
+  | { kind: 'extracted'; result: UnwrapResult }
+  | { kind: 'verified-no-payload' }
+  | { kind: 'no-match' };
+
+/**
  * TypeInferrer - Extracts types from source code, both explicit and inferred
  *
  * Usage:
@@ -225,8 +236,12 @@ export class TypeInferrer {
     let returnType = func.getReturnType();
     let typeString = typeText(returnType, func);
 
-    // Apply the agent-generated extraction config
-    const unwrapResult = this.unwrapTypeWithConfig(returnType, func, extractionConfig);
+    // Apply the agent-generated extraction config to the AWAITED type: an
+    // async handler's return is Promise<Wrapper<T>>, whose symbol is
+    // `Promise` — a rule naming the wrapper could never match it, and the
+    // textual unwrapPromise below runs too late for the rules to see T.
+    const awaitedType = this.unwrapPromiseType(returnType);
+    const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
     }
@@ -725,6 +740,27 @@ export class TypeInferrer {
   // Extraction Config-based Payload Unwrapping (NEW)
   // ===========================================================================
 
+  /** `Promise<T>` → `T` at the type level; any other type passes through. */
+  private unwrapPromiseType(type: Type): Type {
+    const symbolName = (type.getSymbol() || type.getAliasSymbol())?.getName();
+    if (symbolName === 'Promise') {
+      const args = type.getTypeArguments();
+      if (args.length === 1) {
+        return args[0];
+      }
+    }
+    return type;
+  }
+
+  /** The "leave the type as it is" result every bail-out path shares. */
+  private noUnwrap(type: Type, node: Node): UnwrapResult {
+    return {
+      typeString: typeText(type, node),
+      isExplicit: false,
+      wasUnwrapped: false,
+    };
+  }
+
   /**
    * Unwrap a type using the agent-generated ExtractionConfig.
    */
@@ -734,11 +770,7 @@ export class TypeInferrer {
     extractionConfig?: ExtractionConfig
   ): UnwrapResult {
     if (!extractionConfig || extractionConfig.rules.length === 0) {
-      return {
-        typeString: typeText(type, node),
-        isExplicit: false,
-        wasUnwrapped: false,
-      };
+      return this.noUnwrap(type, node);
     }
 
     return this.unwrapType(type, node, extractionConfig, 0);
@@ -748,10 +780,15 @@ export class TypeInferrer {
    * Core unwrapping implementation with ExtractionConfig rules.
    *
    * Requirements:
-   * 1. Exact wrapperSymbols match wins immediately
+   * 1. Exact wrapperSymbols match extracts (gated on originModuleGlobs when
+   *    the rule carries them — names like `Response` are shared by the DOM,
+   *    frameworks, and HTTP clients)
    * 2. machineryIndicators only trigger unwrap if originModuleGlobs also match
    * 3. Handle unions and intersections
    * 4. Support recursive unwrapping with depth limits
+   * 5. A rule that matches but extracts nothing never blocks later rules;
+   *    only after every rule has run does an origin-verified match with no
+   *    recoverable payload collapse to `unknown`
    */
   private unwrapType(
     type: Type,
@@ -761,11 +798,7 @@ export class TypeInferrer {
   ): UnwrapResult {
     const maxGlobalDepth = 10; // Safety limit
     if (depth >= maxGlobalDepth) {
-      return {
-        typeString: typeText(type, node),
-        isExplicit: false,
-        wasUnwrapped: false,
-      };
+      return this.noUnwrap(type, node);
     }
 
     // Handle union types: Response<A> | Response<B> → unwrap to A | B
@@ -783,10 +816,15 @@ export class TypeInferrer {
       }
 
       if (anyUnwrapped) {
-        // Dedupe and join
+        // Dedupe and join. A member that collapsed to `unknown` (verified
+        // machinery with no recoverable payload) must not pollute the join —
+        // `unknown | User` would read downstream as a real composite type
+        // instead of partially-unresolved.
         const unique = [...new Set(unwrappedParts)];
+        const informative = unique.filter((part) => part !== 'unknown');
+        const parts = informative.length > 0 ? informative : unique;
         return {
-          typeString: unique.length === 1 ? unique[0] : unique.join(' | '),
+          typeString: parts.length === 1 ? parts[0] : parts.join(' | '),
           isExplicit: false,
           wasUnwrapped: true,
         };
@@ -804,19 +842,33 @@ export class TypeInferrer {
       }
     }
 
-    // Try each rule
+    // Try each rule. A rule that verifies the wrapper's identity but cannot
+    // recover a payload must not stop the loop — the model is encouraged to
+    // emit several overlapping rules (e.g. a generic-index variant and a
+    // property-path variant for the same wrapper), and a later one may still
+    // extract. Only when every rule has had its chance does a verified match
+    // collapse to `unknown`: the wrapper itself is never the contract, and
+    // downstream treats `unknown` as unresolved instead of comparing it.
+    let verifiedMachinery = false;
     for (const rule of config.rules) {
-      const result = this.tryUnwrapWithRule(type, node, rule, config, depth);
-      if (result.wasUnwrapped) {
-        return result;
+      const attempt = this.tryUnwrapWithRule(type, node, rule, config, depth);
+      if (attempt.kind === 'extracted') {
+        return attempt.result;
+      }
+      if (attempt.kind === 'verified-no-payload') {
+        verifiedMachinery = true;
       }
     }
 
-    return {
-      typeString: typeText(type, node),
-      isExplicit: false,
-      wasUnwrapped: false,
-    };
+    if (verifiedMachinery) {
+      return {
+        typeString: 'unknown',
+        isExplicit: false,
+        wasUnwrapped: true,
+      };
+    }
+
+    return this.noUnwrap(type, node);
   }
 
   /**
@@ -828,14 +880,10 @@ export class TypeInferrer {
     rule: ExtractionRule,
     config: ExtractionConfig,
     depth: number
-  ): UnwrapResult {
+  ): RuleAttempt {
     const maxDepth = rule.maxDepth ?? 4;
     if (depth >= maxDepth) {
-      return {
-        typeString: typeText(type, node),
-        isExplicit: false,
-        wasUnwrapped: false,
-      };
+      return { kind: 'no-match' };
     }
 
     const symbol = type.getSymbol() || type.getAliasSymbol();
@@ -846,61 +894,53 @@ export class TypeInferrer {
     // module — names like `Response` are shared by the DOM, frameworks, and
     // HTTP clients, so a bare name match would unwrap unrelated types.
     if (rule.wrapperSymbols && symbolName && rule.wrapperSymbols.includes(symbolName)) {
-      const originGated = rule.originModuleGlobs && rule.originModuleGlobs.length > 0;
+      const originGated = !!(rule.originModuleGlobs && rule.originModuleGlobs.length > 0);
       if (!originGated || this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs!)) {
-        return this.extractPayloadFromWrapper(type, node, rule, config, depth);
+        const extracted = this.extractPayloadFromWrapper(type, node, rule, config, depth);
+        if (extracted) {
+          return { kind: 'extracted', result: extracted };
+        }
+        // A name-only match is not proof of machinery: a local type that
+        // happens to share the name must keep its real structural type when
+        // nothing was extracted. Only origin-verified matches may collapse
+        // to `unknown`.
+        return originGated ? { kind: 'verified-no-payload' } : { kind: 'no-match' };
       }
-      return {
-        typeString: typeText(type, node),
-        isExplicit: false,
-        wasUnwrapped: false,
-      };
+      return { kind: 'no-match' };
     }
 
-    // 2. Check machineryIndicators + originModuleGlobs
+    // 2. Check machineryIndicators + originModuleGlobs. Indicators alone are
+    // too many false positives, so the origin gate is mandatory here — which
+    // also means a match in this branch is always origin-verified.
     if (rule.machineryIndicators && rule.machineryIndicators.length > 0) {
-      // Only proceed if we also have originModuleGlobs
       if (!rule.originModuleGlobs || rule.originModuleGlobs.length === 0) {
-        // Skip: machineryIndicators alone are too many false positives
-        return {
-          typeString: typeText(type, node),
-          isExplicit: false,
-          wasUnwrapped: false,
-        };
+        return { kind: 'no-match' };
       }
 
-      // Check if the type has machinery indicators (properties/methods)
-      const hasMachineryIndicators = this.typeHasMachineryIndicators(type, rule.machineryIndicators);
-      if (!hasMachineryIndicators) {
-        return {
-          typeString: typeText(type, node),
-          isExplicit: false,
-          wasUnwrapped: false,
-        };
+      if (!this.typeHasMachineryIndicators(type, rule.machineryIndicators)) {
+        return { kind: 'no-match' };
       }
 
-      // Check if symbol originates from allowed modules
-      const originatesFromAllowed = this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs);
-      if (!originatesFromAllowed) {
-        return {
-          typeString: typeText(type, node),
-          isExplicit: false,
-          wasUnwrapped: false,
-        };
+      if (!this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs)) {
+        return { kind: 'no-match' };
       }
 
-      return this.extractPayloadFromWrapper(type, node, rule, config, depth);
+      const extracted = this.extractPayloadFromWrapper(type, node, rule, config, depth);
+      if (extracted) {
+        return { kind: 'extracted', result: extracted };
+      }
+      return { kind: 'verified-no-payload' };
     }
 
-    return {
-      typeString: typeText(type, node),
-      isExplicit: false,
-      wasUnwrapped: false,
-    };
+    return { kind: 'no-match' };
   }
 
   /**
-   * Extract the payload type from a matched wrapper.
+   * Extract the payload type from a matched wrapper. Returns null when the
+   * rule matched the wrapper but no payload is recoverable from generics or
+   * property paths — the caller decides what a payload-less match means
+   * (verified machinery collapses to `unknown` after every rule has run;
+   * a name-only match leaves the type untouched).
    */
   private extractPayloadFromWrapper(
     type: Type,
@@ -908,7 +948,15 @@ export class TypeInferrer {
     rule: ExtractionRule,
     config: ExtractionConfig,
     depth: number
-  ): UnwrapResult {
+  ): UnwrapResult | null {
+    // The outer extraction already succeeded on the paths below; a recursive
+    // inner pass that finds nothing more must not demote the result back to
+    // "not unwrapped" (which would discard the recovered payload).
+    const recurse = (payload: Type): UnwrapResult => ({
+      ...this.unwrapType(payload, node, config, depth + 1),
+      wasUnwrapped: true,
+    });
+
     // 1. Try generic type argument at payloadGenericIndex
     const genericIndex = rule.payloadGenericIndex ?? 0;
     const typeArgs = type.getTypeArguments();
@@ -921,7 +969,7 @@ export class TypeInferrer {
       if (!this.isUselessType(argText)) {
         // Recursive unwrap if configured
         if (rule.unwrapRecursively) {
-          return this.unwrapType(payloadArg, node, config, depth + 1);
+          return recurse(payloadArg);
         }
         return {
           typeString: argText,
@@ -936,7 +984,7 @@ export class TypeInferrer {
         const text = typeText(argType, node);
         if (!this.isUselessType(text)) {
           if (rule.unwrapRecursively) {
-            return this.unwrapType(argType, node, config, depth + 1);
+            return recurse(argType);
           }
           return {
             typeString: text,
@@ -964,7 +1012,7 @@ export class TypeInferrer {
         const propText = typeText(currentType, node);
         if (!this.isUselessType(propText)) {
           if (rule.unwrapRecursively) {
-            return this.unwrapType(currentType, node, config, depth + 1);
+            return recurse(currentType);
           }
           return {
             typeString: propText,
@@ -975,16 +1023,7 @@ export class TypeInferrer {
       }
     }
 
-    // The rule matched (exact symbol, or verified machinery), but no payload
-    // is recoverable from generics or property paths. Publish `unknown` —
-    // a verified machinery type is not the contract, and the manifest
-    // enrichment treats `unknown` as unresolved instead of comparing the
-    // wrapper against producer payload types.
-    return {
-      typeString: 'unknown',
-      isExplicit: false,
-      wasUnwrapped: true,
-    };
+    return null;
   }
 
   /**
@@ -1048,31 +1087,44 @@ export class TypeInferrer {
 
   /**
    * Simple glob matching for module paths.
-   * Supports: exact match, "*" suffix, and "package/*" patterns.
+   * Supports: exact match, a trailing "*" wildcard, and "package/*" patterns.
+   *
+   * Matches are segment-bounded: the glob names a package (or package
+   * subpath) under node_modules, and the match must end at a path-segment
+   * boundary — `got` matches `node_modules/got/...` but never
+   * `node_modules/got-scraping/...`. This matters because the exact-symbol
+   * origin gate routes shared names like `Response` through here.
    */
   private filePathMatchesModuleGlob(filePath: string, glob: string): boolean {
     const normalizedPath = filePath.replace(/\\/g, '/');
 
-    // Check if path contains node_modules/<glob>
-    const nodeModulesPattern = `node_modules/${glob.replace(/\*/g, '')}`;
-    if (normalizedPath.includes(nodeModulesPattern)) {
-      return true;
+    const candidates = [glob];
+    if (!glob.startsWith('@types/')) {
+      // Auto-try the DefinitelyTyped variant: pkg → @types/pkg,
+      // @scope/pkg → @types/scope__pkg.
+      candidates.push(
+        glob.startsWith('@')
+          ? `@types/${glob.slice(1).replace('/', '__')}`
+          : `@types/${glob}`
+      );
     }
 
-    // Also check for @types/<glob>
-    if (glob.startsWith('@types/')) {
-      if (normalizedPath.includes(`node_modules/${glob.replace(/\*/g, '')}`)) {
-        return true;
+    return candidates.some((candidate) => {
+      const base = candidate.replace(/\/?\*+$/, '').replace(/\*/g, '');
+      if (base === '') {
+        return false;
       }
-    } else {
-      // Auto-check @types version
-      const typesGlob = `@types/${glob.replace('@', '').replace(/\*/g, '')}`;
-      if (normalizedPath.includes(`node_modules/${typesGlob}`)) {
-        return true;
+      const needle = `node_modules/${base}`;
+      let idx = normalizedPath.indexOf(needle);
+      while (idx !== -1) {
+        const next = normalizedPath[idx + needle.length];
+        if (next === undefined || next === '/') {
+          return true;
+        }
+        idx = normalizedPath.indexOf(needle, idx + 1);
       }
-    }
-
-    return false;
+      return false;
+    });
   }
 
   /**

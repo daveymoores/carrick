@@ -662,35 +662,35 @@ impl FileOrchestrator {
                 // type hint the handler never sends.
                 let no_payload = endpoint.emission_style == Some(EmissionStyle::NoPayload);
 
-                if no_payload {
-                    // fall through to request-body handling below
-                } else if let (Some(symbol), Some(import_source)) =
-                    (&endpoint.primary_type_symbol, &endpoint.type_import_source)
-                {
-                    // Explicit type with import source - bundle it
-                    push_explicit(
-                        symbol.clone(),
-                        Self::resolve_import_path(&file_path_absolute, import_source),
-                        Some(response_alias.clone()),
-                    );
-                } else if endpoint.primary_type_symbol.is_some()
-                    && endpoint.type_import_source.is_none()
-                {
-                    // Type symbol exists but no import - it might be in the same file
-                    if let Some(ref symbol) = endpoint.primary_type_symbol {
+                if !no_payload {
+                    if let (Some(symbol), Some(import_source)) =
+                        (&endpoint.primary_type_symbol, &endpoint.type_import_source)
+                    {
+                        // Explicit type with import source - bundle it
                         push_explicit(
                             symbol.clone(),
-                            file_path_absolute.clone(),
+                            Self::resolve_import_path(&file_path_absolute, import_source),
                             Some(response_alias.clone()),
                         );
+                    } else if endpoint.primary_type_symbol.is_some()
+                        && endpoint.type_import_source.is_none()
+                    {
+                        // Type symbol exists but no import - it might be in the same file
+                        if let Some(ref symbol) = endpoint.primary_type_symbol {
+                            push_explicit(
+                                symbol.clone(),
+                                file_path_absolute.clone(),
+                                Some(response_alias.clone()),
+                            );
+                        }
+                    } else if endpoint.type_import_source.is_some()
+                        && endpoint.primary_type_symbol.is_none()
+                    {
+                        warn!(
+                            "[FileOrchestrator] Endpoint at {}:{} has import source {:?} but no symbol; relying on inference",
+                            file_path, line_number, endpoint.type_import_source
+                        );
                     }
-                } else if endpoint.type_import_source.is_some()
-                    && endpoint.primary_type_symbol.is_none()
-                {
-                    warn!(
-                        "[FileOrchestrator] Endpoint at {}:{} has import source {:?} but no symbol; relying on inference",
-                        file_path, line_number, endpoint.type_import_source
-                    );
                 }
 
                 // File-based routes (Next.js app router, etc.) have no call-site
@@ -704,15 +704,21 @@ impl FileOrchestrator {
                 // inference is skipped: a Next.js request body isn't recoverable
                 // from the signature.
                 if endpoint.owner_node == FILE_BASED_ROUTE_OWNER {
-                    // The Line locator is infallible, so no inline-alias
-                    // fallback is needed here.
-                    push_infer(
-                        &file_path_absolute,
-                        line_number,
-                        InferKind::FunctionReturn,
-                        response_alias.clone(),
-                        InferLocator::Line,
-                    );
+                    // Structurally derived endpoints never carry an
+                    // emission_style today, but the no-payload gate must hold
+                    // here too if that ever changes — a no-payload claim means
+                    // the manifest stays honestly unknown, with no inference.
+                    if !no_payload {
+                        // The Line locator is infallible, so no inline-alias
+                        // fallback is needed here.
+                        push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::FunctionReturn,
+                            response_alias.clone(),
+                            InferLocator::Line,
+                        );
+                    }
                     continue;
                 }
 

@@ -74,8 +74,14 @@ fn deserialize_emission_style<'de, D>(deserializer: D) -> Result<Option<Emission
 where
     D: serde::Deserializer<'de>,
 {
-    let raw: Option<String> = Option::deserialize(deserializer)?;
-    Ok(raw.as_deref().and_then(EmissionStyle::parse_lenient))
+    // Deserialize as a raw JSON value, not Option<String>: a non-string value
+    // (number, bool, object) from the model must degrade to None like any
+    // other junk, not fail the whole file's parse.
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(EmissionStyle::parse_lenient))
 }
 
 /// Result of analyzing a single endpoint definition
@@ -748,6 +754,13 @@ mod tests {
                 .unwrap_or_else(|e| panic!("junk {:?} failed the parse: {}", junk, e));
             let expected = EmissionStyle::parse_lenient(junk);
             assert_eq!(endpoint.emission_style, expected, "junk {:?}", junk);
+        }
+        // Non-string JSON values degrade to None the same way.
+        for junk in ["0", "false", "{}", "[\"return-value\"]"] {
+            let json = endpoint_json(&format!(r#", "emission_style": {}"#, junk));
+            let endpoint: EndpointResult = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("non-string {:?} failed the parse: {}", junk, e));
+            assert_eq!(endpoint.emission_style, None, "non-string {:?}", junk);
         }
         // Lenient parsing still recovers obvious separator/case variants.
         assert_eq!(

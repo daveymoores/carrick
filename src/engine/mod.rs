@@ -537,6 +537,40 @@ fn hash_file_content(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Hash every discovered package.json (sorted, keyed by repo-relative path)
+/// for the detection/guidance/extraction-config cache gate. The artifacts
+/// behind the gate are generated from the MERGED dependency set, so the gate
+/// must cover workspace manifests too — hashing only the root package.json
+/// would let a dependency added in `packages/api/package.json` reuse a stale
+/// extraction config (and stale detection) indefinitely.
+fn hash_workspace_package_jsons(packages: &Packages, repo_path: &str) -> String {
+    let repo_root = Path::new(repo_path);
+    let mut keyed: Vec<(String, &PathBuf)> = packages
+        .source_paths
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            (relative, path)
+        })
+        .collect();
+    keyed.sort();
+
+    let mut combined = String::new();
+    for (relative, path) in keyed {
+        combined.push_str(&relative);
+        combined.push('\0');
+        if let Ok(content) = std::fs::read_to_string(path) {
+            combined.push_str(&content);
+        }
+        combined.push('\0');
+    }
+    hash_file_content(&combined)
+}
+
 /// Normalize file_results keys to be relative to repo root.
 /// This ensures cache key consistency between runs.
 fn normalize_file_results_keys(
@@ -564,6 +598,14 @@ fn normalize_file_results_keys(
 
 /// Strip diagnostic-only fields from file_results before caching.
 /// These fields are not needed by build_mount_graph() or collect_type_requests().
+///
+/// `response_expression_text` is deliberately KEPT: it is the primary locator
+/// for return-value endpoints (`EmissionStyle::ReturnValue`), whose only
+/// fallback is an inexact registration-line anchor (the sidecar's
+/// `findFunctionByLine` tolerates ±2 lines and can bind an adjacent handler).
+/// Stripping it would make cached replays of unchanged files silently degrade
+/// to that fallback. Every other stripped text field has an exact span
+/// fallback, so replays lose nothing.
 fn strip_diagnostic_fields(
     file_results: &mut HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) {
@@ -572,7 +614,6 @@ fn strip_diagnostic_fields(
             endpoint.candidate_id = String::new();
             endpoint.pattern_matched = String::new();
             endpoint.payload_expression_text = None;
-            endpoint.response_expression_text = None;
         }
         for data_call in &mut result.data_calls {
             data_call.candidate_id = String::new();
@@ -679,12 +720,11 @@ async fn analyze_current_repo_incremental(
                 changed_count, total_files, reused_count
             );
 
-            // Check if package.json changed → need fresh framework detection/guidance
-            // Hash raw file content (not serialized struct) for deterministic comparison
-            let current_pkg_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
-                .ok()
-                .map(|content| hash_file_content(&content))
-                .unwrap_or_default();
+            // Check if any package.json changed → need fresh framework
+            // detection/guidance/extraction config. Covers workspace
+            // manifests, not just the repo root (raw file content, not the
+            // serialized struct, for deterministic comparison).
+            let current_pkg_hash = hash_workspace_package_jsons(packages, repo_path);
 
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
 
@@ -873,34 +913,14 @@ async fn run_framework_detection_and_guidance(
         .await?;
 
     let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
-    let guidance = guidance_agent
-        .generate_for_active_protocols(&detection)
-        .await?;
+    // Guidance and extraction config both depend only on detection — run
+    // them concurrently instead of paying a lone extra lambda round-trip.
+    let (guidance, extraction_config) = tokio::join!(
+        guidance_agent.generate_for_active_protocols(&detection),
+        generate_extraction_config(&guidance_agent, &detection, packages),
+    );
 
-    let extraction_config = generate_extraction_config(&guidance_agent, &detection, packages).await;
-
-    Ok((detection, guidance, extraction_config))
-}
-
-/// Cap on the dependency names sent to the extraction_config task. The cloud
-/// caps at 500 server-side; staying under it keeps the request deterministic.
-const EXTRACTION_DEPENDENCY_CAP: usize = 500;
-
-/// Clean npm dependency names for the extraction_config request: the cloud
-/// drops entries with whitespace or longer than 256 chars and caps the list,
-/// so filter here and send only well-formed names, sorted for determinism.
-fn extraction_dependency_names(packages: &Packages) -> Vec<String> {
-    let mut names: Vec<String> = packages
-        .get_dependencies()
-        .keys()
-        .filter(|name| {
-            !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_whitespace)
-        })
-        .cloned()
-        .collect();
-    names.sort();
-    names.truncate(EXTRACTION_DEPENDENCY_CAP);
-    names
+    Ok((detection, guidance?, extraction_config))
 }
 
 /// Generate machinery-unwrap rules via the cloud's extraction_config task.
@@ -911,7 +931,7 @@ async fn generate_extraction_config(
     detection: &DetectionResult,
     packages: &Packages,
 ) -> Option<crate::services::type_sidecar::ExtractionConfig> {
-    let dependencies = extraction_dependency_names(packages);
+    let dependencies = packages.cleaned_dependency_names();
     match agent
         .fetch_extraction_config(detection, &dependencies)
         .await
@@ -1182,6 +1202,20 @@ fn resolve_types_if_available(
                     }
                     // Per-symbol failures are logged in FileOrchestrator at the
                     // resolution call site (with capped warn + spillover to debug).
+
+                    // A missing extraction config means the cloud's rule
+                    // generation failed (an empty rule set arrives as
+                    // Some(config) with zero rules). Types still resolve, but
+                    // machinery wrappers stay wrapped — surface the
+                    // degradation instead of letting the run look healthy.
+                    if extraction_config.is_none() {
+                        cloud_data.type_extraction_status = Some(
+                            "machinery unwrapping disabled this run: extraction-config \
+                             generation failed; wrapper types (e.g. AxiosResponse<T>) may \
+                             surface in the type manifest"
+                                .to_string(),
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
@@ -1744,10 +1778,8 @@ async fn analyze_current_repo(
     cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
-    // Hash raw file content (not serialized struct) for deterministic comparison
-    cloud_data.package_json_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
-        .ok()
-        .map(|content| hash_file_content(&content));
+    // Same workspace-wide hash the incremental gate compares against.
+    cloud_data.package_json_hash = Some(hash_workspace_package_jsons(packages, repo_path));
 
     Ok(cloud_data)
 }
@@ -2416,7 +2448,13 @@ mod tests {
         assert_eq!(result.endpoints[0].candidate_id, "");
         assert_eq!(result.endpoints[0].pattern_matched, "");
         assert!(result.endpoints[0].payload_expression_text.is_none());
-        assert!(result.endpoints[0].response_expression_text.is_none());
+        // The response expression text is load-bearing for ReturnValue
+        // endpoints on cached replays (its only fallback locator is an
+        // inexact line anchor) — it must survive the strip.
+        assert_eq!(
+            result.endpoints[0].response_expression_text.as_deref(),
+            Some("res.json(data)")
+        );
         // Non-diagnostic fields should be preserved
         assert_eq!(result.endpoints[0].path, "/api/users");
         assert_eq!(result.endpoints[0].method, "GET");
