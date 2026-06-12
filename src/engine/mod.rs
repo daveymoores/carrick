@@ -2278,6 +2278,62 @@ mod tests {
         }
     }
 
+    /// Regression for #102: consumer manifest paths must run through the same
+    /// UrlNormalizer::normalize as the live mount-graph matcher. The exact
+    /// targets from the bad run (backticked template literals with env-var
+    /// base URLs) previously surfaced in the consumer manifest as
+    /// `/:USER_SERVICE_URL/api/users/:order.userId`, so ts_check reported
+    /// orphans the live matcher had already correlated.
+    #[test]
+    fn test_consumer_manifest_paths_strip_env_var_base_urls() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "`${USER_SERVICE_URL}/api/users/${order.userId}`".to_string(),
+                client: "fetch".to_string(),
+                file_location: "src/orders.ts:42".to_string(),
+            },
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "`${NOTIFICATION_SERVICE_URL}/api/notifications/status`".to_string(),
+                client: "fetch".to_string(),
+                file_location: "src/notify.ts:7".to_string(),
+            },
+        ];
+
+        let config = Config::default();
+        let entries = build_type_manifest_entries(&mount_graph, &config);
+
+        let consumer_paths: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.role == ManifestRole::Consumer)
+            .filter_map(|e| e.key.as_http().map(|(_, path)| path))
+            .collect();
+        assert!(!consumer_paths.is_empty(), "consumer entries expected");
+        for path in &consumer_paths {
+            assert!(
+                !path.contains("_SERVICE_URL"),
+                "env-var base URL leaked into consumer manifest path: {}",
+                path
+            );
+        }
+        assert!(
+            consumer_paths
+                .iter()
+                .any(|p| *p == "/api/users/:order.userId"),
+            "expected normalized user-service path, got {:?}",
+            consumer_paths
+        );
+        assert!(
+            consumer_paths
+                .iter()
+                .any(|p| *p == "/api/notifications/status"),
+            "expected normalized notification path, got {:?}",
+            consumer_paths
+        );
+    }
+
     #[test]
     fn test_hash_file_content_deterministic() {
         let hash1 = hash_file_content("hello world");
