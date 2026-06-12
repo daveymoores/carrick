@@ -8,6 +8,7 @@ use crate::{
     config::{Config, create_standard_tsconfig},
     extractor::CoreExtractor,
     mount_graph::MountGraph,
+    operation::OperationKey,
     packages::Packages,
     url_normalizer::UrlNormalizer,
     utils::join_prefix_and_path,
@@ -30,7 +31,7 @@ static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"Array<([^>]+)>").unwrap());
 
 // Type aliases to reduce complexity
-type RouteFieldMap = HashMap<(String, String), Json>;
+type RouteFieldMap = HashMap<OperationKey, Json>;
 /// Result of `analyze_matches_with_mount_graph`:
 ///   `(call_issues, endpoint_issues, env_var_calls, verified_endpoints)`.
 type MountGraphMatches = (Vec<String>, Vec<String>, Vec<String>, Vec<(String, String)>);
@@ -81,8 +82,7 @@ pub struct ApiEndpointDetails {
     // owner is Option as we store both call ands endpoints in this data structure.
     // It might make sense to split this out into its own type
     pub owner: Option<OwnerType>,
-    pub route: String,
-    pub method: String,
+    pub key: OperationKey,
     #[allow(dead_code)]
     pub params: Vec<String>,
     // - For endpoints, `request_body` is what the server expects to receive
@@ -107,9 +107,14 @@ pub struct ApiAnalysisResult {
     /// runs otherwise produce no positive signal.
     pub verified_endpoints: Vec<(String, String)>,
     /// GraphQL libraries detected across all scanned repos (subset of
-    /// `detected_data_fetchers`). Populated so the formatter can show a
-    /// "REST-only for v1" banner; Carrick doesn't analyze GraphQL schemas.
+    /// `detected_data_fetchers`). When libraries are present but no
+    /// operations were extracted, the formatter suggests committing an
+    /// emitted schema (code-first schemas and Relay artifacts are not
+    /// statically extractable).
     pub detected_graphql_libraries: Vec<String>,
+    /// Whether any GraphQL operations (schema fields or documents) made it
+    /// into the index. Gates the "no GraphQL extracted" banner.
+    pub graphql_operations_indexed: bool,
 }
 
 /// Return the subset of `data_fetchers` that are GraphQL libraries.
@@ -325,8 +330,7 @@ impl Analyzer {
             let params = self.extract_params_from_route(&call.route);
             self.calls.push(ApiEndpointDetails {
                 owner: None,
-                route: call.route.clone(),
-                method: call.method.clone(),
+                key: OperationKey::http(&call.method, call.route.clone()),
                 params,
                 request_body: call.request.clone(),
                 response_body: Some(Json::Null),
@@ -736,16 +740,15 @@ impl Analyzer {
         // Routers that are mounted on routers can cause duplicate endpoints
         // Lets fix this through dedupe rather than editing the mounting
         self.endpoints.retain(|endpoint| {
-            let key = (
-                endpoint.route.clone(),
-                endpoint.method.clone(),
-                endpoint.handler_name.clone(),
-            );
+            let key = (endpoint.key.clone(), endpoint.handler_name.clone());
             // returns true or false if the value in the set already exists
             seen.insert(key)
         });
 
         for endpoint in &self.endpoints {
+            let Some((method, route)) = endpoint.key.as_http() else {
+                continue;
+            };
             if let Some(handler_name) = &endpoint.handler_name
                 && let Some(func_def) = self.function_definitions.get(handler_name)
                 && func_def.arguments.len() >= 2
@@ -753,9 +756,7 @@ impl Analyzer {
                 // Process Request Type (argument 0)
                 if let Some(req_type_ann_swc) = &func_def.arguments[0].type_ann {
                     let alias = Self::generate_common_type_alias_name(
-                        &endpoint.route,
-                        &endpoint.method,
-                        true,  // is_request_type
+                        route, method, true,  // is_request_type
                         false, // is_consumer = false (endpoints are producers)
                     );
                     if let Some(type_ref) = Self::create_type_reference_from_swc(
@@ -764,17 +765,14 @@ impl Analyzer {
                         &func_def.file_path,
                         alias,
                     ) {
-                        request_types_map
-                            .insert((endpoint.route.clone(), endpoint.method.clone()), type_ref);
+                        request_types_map.insert(endpoint.key.clone(), type_ref);
                     }
                 }
 
                 // Process Response Type (argument 1)
                 if let Some(res_type_ann_swc) = &func_def.arguments[1].type_ann {
                     let alias = Self::generate_common_type_alias_name(
-                        &endpoint.route,
-                        &endpoint.method,
-                        false, // is_request_type = false
+                        route, method, false, // is_request_type = false
                         false, // is_consumer = false (endpoints are producers)
                     );
                     if let Some(type_ref) = Self::create_type_reference_from_swc(
@@ -783,8 +781,7 @@ impl Analyzer {
                         &func_def.file_path,
                         alias,
                     ) {
-                        response_types_map
-                            .insert((endpoint.route.clone(), endpoint.method.clone()), type_ref);
+                        response_types_map.insert(endpoint.key.clone(), type_ref);
                     }
                 }
             }
@@ -792,11 +789,10 @@ impl Analyzer {
 
         // Update all endpoints with the resolved types
         for endpoint in &mut self.endpoints {
-            let key = (endpoint.route.clone(), endpoint.method.clone());
-            if let Some(req_type) = request_types_map.get(&key) {
+            if let Some(req_type) = request_types_map.get(&endpoint.key) {
                 endpoint.request_type = Some(req_type.clone());
             }
-            if let Some(resp_type) = response_types_map.get(&key) {
+            if let Some(resp_type) = response_types_map.get(&endpoint.key) {
                 endpoint.response_type = Some(resp_type.clone());
             }
         }
@@ -859,9 +855,10 @@ impl Analyzer {
                 };
 
                 // Store with composite key
-                response_fields.insert((route.clone(), method.clone()), resp_json);
+                let key = OperationKey::http(method, route.clone());
+                response_fields.insert(key.clone(), resp_json);
                 if let Some(req) = req_json {
-                    request_fields.insert((route.clone(), method.clone()), req);
+                    request_fields.insert(key, req);
                 }
             }
         }
@@ -872,15 +869,14 @@ impl Analyzer {
     // We know endpoints will exist for each imported handler
     pub fn update_endpoints_with_resolved_fields(
         &mut self,
-        response_fields: HashMap<(String, String), Json>,
-        request_fields: HashMap<(String, String), Json>,
+        response_fields: RouteFieldMap,
+        request_fields: RouteFieldMap,
     ) -> &mut Self {
         for endpoint in &mut self.endpoints {
-            let key = (endpoint.route.clone(), endpoint.method.clone());
-            if let Some(response) = response_fields.get(&key) {
+            if let Some(response) = response_fields.get(&endpoint.key) {
                 endpoint.response_body = Some(response.clone());
             }
-            if let Some(request) = request_fields.get(&key) {
+            if let Some(request) = request_fields.get(&endpoint.key) {
                 endpoint.request_body = Some(request.clone());
             }
         }
@@ -905,12 +901,7 @@ impl Analyzer {
         let mut unique_calls = Vec::new();
         let mut seen_calls = HashSet::new();
         for call in &self.calls {
-            let key = format!(
-                "{}:{}:{}",
-                call.method,
-                call.route,
-                call.file_path.display()
-            );
+            let key = format!("{}:{}", call.key.canonical(), call.file_path.display());
             if seen_calls.insert(key) {
                 unique_calls.push(call);
             }
@@ -919,13 +910,18 @@ impl Analyzer {
         // Create URL normalizer once for all calls
         let normalizer = UrlNormalizer::new(&self.config);
 
-        // For each call, try to find matching endpoint using mount graph
+        // For each call, try to find matching endpoint using mount graph.
+        // This is the HTTP matcher: non-HTTP operations are dispatched to
+        // their own matchers and skipped here.
         for call in &unique_calls {
+            let Some((method, target)) = call.key.as_http() else {
+                continue;
+            };
             // Check for environment variable URLs (framework-agnostic)
             // Use smarter detection to avoid false positives on path parameters
-            if Self::is_env_var_base_url(&call.route) {
-                let env_var_name = Self::extract_env_var_name(&call.route);
-                let normalized_path = normalizer.extract_path(&call.route);
+            if Self::is_env_var_base_url(target) {
+                let env_var_name = Self::extract_env_var_name(target);
+                let normalized_path = normalizer.extract_path(target);
                 let canonical_env_var_route =
                     format!("ENV_VAR:{}:{}", env_var_name, normalized_path);
 
@@ -936,15 +932,15 @@ impl Analyzer {
                 if self.config.is_internal_call(&canonical_env_var_route) {
                     match mount_graph.find_matching_endpoints_with_normalizer(
                         &canonical_env_var_route,
-                        &call.method,
+                        method,
                         &normalizer,
                     ) {
                         Some(matching_endpoints) => {
                             if matching_endpoints.is_empty() {
                                 call_issues.push(format!(
                                     "Missing endpoint for {} {} (normalized: {}) (called from {})",
-                                    call.method,
-                                    call.route,
+                                    method,
+                                    target,
                                     normalized_path,
                                     call.file_path.display()
                                 ));
@@ -964,7 +960,7 @@ impl Analyzer {
 
                 env_var_calls.push(format!(
                     "Unclassified env var: {} {} using [{}] (from {}) - add to internalEnvVars or externalEnvVars in carrick.json",
-                    call.method,
+                    method,
                     normalized_path,
                     env_var_name,
                     call.file_path.display()
@@ -974,11 +970,7 @@ impl Analyzer {
 
             // Use mount graph to find matching endpoints with URL normalization
             // This handles full URLs, env var patterns, template literals, etc.
-            match mount_graph.find_matching_endpoints_with_normalizer(
-                &call.route,
-                &call.method,
-                &normalizer,
-            ) {
+            match mount_graph.find_matching_endpoints_with_normalizer(target, method, &normalizer) {
                 None => {
                     // URL was identified as external - skip it
                     continue;
@@ -986,11 +978,11 @@ impl Analyzer {
                 Some(matching_endpoints) => {
                     if matching_endpoints.is_empty() {
                         // Extract normalized path for better error message
-                        let normalized_path = normalizer.extract_path(&call.route);
+                        let normalized_path = normalizer.extract_path(target);
                         call_issues.push(format!(
                             "Missing endpoint for {} {} (normalized: {}) (called from {})",
-                            call.method,
-                            call.route,
+                            method,
+                            target,
                             normalized_path,
                             call.file_path.display()
                         ));
@@ -1025,6 +1017,84 @@ impl Analyzer {
         (call_issues, endpoint_issues, env_var_calls, verified)
     }
 
+    /// Match consumers against producers of a protocol whose operations have
+    /// exact key identity (GraphQL fields, socket events) — no URL or mount
+    /// hierarchy to normalize. Returns `(call_issues, endpoint_issues,
+    /// verified)`.
+    ///
+    /// If no producer of the protocol is indexed anywhere, consumers are
+    /// skipped silently: the producing service may simply not be scanned,
+    /// and guessing would create false "missing endpoint" noise. Unconsumed
+    /// producers are reported as orphans, the same soft signal REST orphans
+    /// get.
+    fn analyze_exact_key_matches(
+        &self,
+        protocol: crate::operation::Protocol,
+        protocol_label: &str,
+    ) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
+        let producer_keys: HashSet<&OperationKey> = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.key.protocol() == protocol)
+            .map(|endpoint| &endpoint.key)
+            .collect();
+        if producer_keys.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let mut call_issues = Vec::new();
+        let mut matched: HashSet<&OperationKey> = HashSet::new();
+        let mut seen_calls = HashSet::new();
+        for call in &self.calls {
+            if call.key.protocol() != protocol {
+                continue;
+            }
+            let dedup = format!("{}:{}", call.key.canonical(), call.file_path.display());
+            if !seen_calls.insert(dedup) {
+                continue;
+            }
+            if producer_keys.contains(&call.key) {
+                matched.insert(&call.key);
+            } else {
+                let (label, name) = call.key.display_labels();
+                call_issues.push(format!(
+                    "Missing endpoint for {} {} ({}; called from {})",
+                    label,
+                    name,
+                    protocol_label,
+                    call.file_path.display()
+                ));
+            }
+        }
+
+        let mut endpoint_issues = Vec::new();
+        let mut verified = Vec::new();
+        let mut seen_producers = HashSet::new();
+        for endpoint in &self.endpoints {
+            if endpoint.key.protocol() != protocol {
+                continue;
+            }
+            if !seen_producers.insert(endpoint.key.canonical()) {
+                continue;
+            }
+            let (label, name) = endpoint.key.display_labels();
+            if matched.contains(&endpoint.key) {
+                verified.push((label, name));
+            } else {
+                endpoint_issues.push(format!(
+                    "Orphaned endpoint: {} {} in {}",
+                    label,
+                    name,
+                    endpoint.file_path.display()
+                ));
+            }
+        }
+        verified.sort();
+        verified.dedup();
+
+        (call_issues, endpoint_issues, verified)
+    }
+
     pub fn compute_full_paths_for_endpoint(
         endpoint: &ApiEndpointDetails,
         mounts: &[Mount],
@@ -1038,7 +1108,11 @@ impl Analyzer {
             None => return results,
         };
 
-        let mut path = endpoint.route.clone();
+        // Mount-prefix resolution only applies to HTTP routes
+        let Some((_, route)) = endpoint.key.as_http() else {
+            return results;
+        };
+        let mut path = route.to_string();
         let mut visited = std::collections::HashSet::new();
 
         // Walk up the mount chain, prepending prefixes
@@ -1080,10 +1154,15 @@ impl Analyzer {
     ) -> Vec<ApiEndpointDetails> {
         let mut new_endpoints = Vec::new();
         for endpoint in endpoints {
+            let Some((method, _)) = endpoint.key.as_http() else {
+                new_endpoints.push(endpoint.clone());
+                continue;
+            };
+            let method = method.to_string();
             let full_paths = Self::compute_full_paths_for_endpoint(endpoint, mounts, apps);
             for path in full_paths {
                 let mut ep = endpoint.clone();
-                ep.route = path;
+                ep.key = OperationKey::http(&method, path);
                 new_endpoints.push(ep);
             }
         }
@@ -1102,12 +1181,15 @@ impl Analyzer {
         let mut path_to_endpoints: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for endpoint in &self.endpoints {
-            let normalized_route = self.normalize_route_params(&endpoint.route);
+            let Some((method, route)) = endpoint.key.as_http() else {
+                continue;
+            };
+            let normalized_route = self.normalize_route_params(route);
 
             path_to_endpoints
                 .entry(normalized_route)
                 .or_default()
-                .push((endpoint.route.clone(), endpoint.method.clone()));
+                .push((route.to_string(), method.to_string()));
         }
 
         debug!("Unique endpoint paths: {}", path_to_endpoints.len());
@@ -1198,14 +1280,31 @@ impl Analyzer {
         let mount_graph = self.mount_graph.as_ref()
             .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
 
-        let (call_issues, endpoint_issues, env_var_calls, verified_endpoints) =
+        let (mut call_issues, mut endpoint_issues, env_var_calls, mut verified_endpoints) =
             self.analyze_matches_with_mount_graph(mount_graph);
+        for (protocol, label) in [
+            (crate::operation::Protocol::Graphql, "GraphQL"),
+            (crate::operation::Protocol::Websocket, "Socket.IO"),
+        ] {
+            let (protocol_call_issues, protocol_endpoint_issues, protocol_verified) =
+                self.analyze_exact_key_matches(protocol, label);
+            call_issues.extend(protocol_call_issues);
+            endpoint_issues.extend(protocol_endpoint_issues);
+            verified_endpoints.extend(protocol_verified);
+        }
+        verified_endpoints.sort();
+        verified_endpoints.dedup();
         // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
         let mismatches = Vec::new();
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 
         let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
+        let graphql_operations_indexed = self
+            .endpoints
+            .iter()
+            .chain(self.calls.iter())
+            .any(|details| details.key.protocol() == crate::operation::Protocol::Graphql);
 
         ApiAnalysisResult {
             endpoints: self.endpoints.clone(),
@@ -1220,6 +1319,7 @@ impl Analyzer {
             },
             verified_endpoints,
             detected_graphql_libraries,
+            graphql_operations_indexed,
         }
     }
 
@@ -1361,15 +1461,17 @@ impl Analyzer {
                 continue;
             };
             for entry in entries {
-                if let (Some(alias), Some(method), Some(path), Some(type_kind)) = (
-                    entry.get("type_alias").and_then(|v| v.as_str()),
-                    entry.get("method").and_then(|v| v.as_str()),
-                    entry.get("path").and_then(|v| v.as_str()),
-                    entry.get("type_kind").and_then(|v| v.as_str()),
-                ) {
-                    let display = crate::type_manifest::build_display_name(method, path, type_kind);
-                    map.insert(alias.to_string(), display);
-                }
+                let Ok(entry) = serde_json::from_value::<crate::cloud_storage::TypeManifestEntry>(
+                    entry.clone(),
+                ) else {
+                    continue;
+                };
+                let type_kind = match entry.type_kind {
+                    crate::cloud_storage::ManifestTypeKind::Request => "request",
+                    crate::cloud_storage::ManifestTypeKind::Response => "response",
+                };
+                let display = crate::type_manifest::build_display_name(&entry.key, type_kind);
+                map.insert(entry.type_alias.clone(), display);
             }
         }
 
@@ -1731,6 +1833,150 @@ mod tests {
         assert!(!Analyzer::is_env_var_base_url("${camelCase}/path")); // camelCase, not env var
         assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
     }
+    fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
+        ApiEndpointDetails {
+            owner: None,
+            key,
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(file),
+        }
+    }
+
+    #[test]
+    fn test_graphql_matching_verified_missing_and_orphaned() {
+        use crate::operation::GraphqlOperationKind;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "schema.graphql:3",
+        ));
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Mutation, "createUser"),
+            "schema.graphql:8",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "client.ts:12",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "orders"),
+            "client.ts:20",
+        ));
+
+        let (call_issues, endpoint_issues, verified) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
+
+        assert_eq!(verified, vec![("QUERY".to_string(), "user".to_string())]);
+        assert_eq!(call_issues.len(), 1);
+        assert!(
+            call_issues[0].contains("Missing endpoint for QUERY orders"),
+            "got {}",
+            call_issues[0]
+        );
+        assert_eq!(endpoint_issues.len(), 1);
+        assert!(
+            endpoint_issues[0].contains("Orphaned endpoint: MUTATION createUser"),
+            "got {}",
+            endpoint_issues[0]
+        );
+    }
+
+    #[test]
+    fn test_graphql_consumers_silent_without_indexed_producers() {
+        use crate::operation::GraphqlOperationKind;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // A consumer document but no GraphQL schema indexed anywhere: the
+        // producing service may simply not be scanned — stay silent.
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "client.ts:12",
+        ));
+
+        let (call_issues, endpoint_issues, verified) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
+        assert!(call_issues.is_empty());
+        assert!(endpoint_issues.is_empty());
+        assert!(verified.is_empty());
+    }
+
+    #[test]
+    fn test_socket_matching_is_direction_aware() {
+        use crate::operation::SocketDirection;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // Server side: listens for chat:message, emits chat:broadcast.
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::socket("chat:message", SocketDirection::ClientToServer),
+            "server.ts:10",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::socket("chat:broadcast", SocketDirection::ServerToClient),
+            "server.ts:11",
+        ));
+        // Client side: emits chat:message, listens for chat:broadcast,
+        // and emits one event nobody handles.
+        analyzer.calls.push(graphql_details(
+            OperationKey::socket("chat:message", SocketDirection::ClientToServer),
+            "client.ts:5",
+        ));
+        analyzer.endpoints.push(graphql_details(
+            OperationKey::socket("chat:broadcast", SocketDirection::ServerToClient),
+            "client.ts:6",
+        ));
+        analyzer.calls.push(graphql_details(
+            OperationKey::socket("typing", SocketDirection::ClientToServer),
+            "client.ts:9",
+        ));
+
+        let (call_issues, endpoint_issues, verified) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket, "Socket.IO");
+
+        assert_eq!(
+            verified,
+            vec![
+                ("CLIENT->SERVER".to_string(), "chat:message".to_string()),
+                ("SERVER->CLIENT".to_string(), "chat:broadcast".to_string()),
+            ]
+        );
+        assert_eq!(call_issues.len(), 1);
+        assert!(
+            call_issues[0].contains("Missing endpoint for CLIENT->SERVER typing"),
+            "got {}",
+            call_issues[0]
+        );
+        assert!(endpoint_issues.is_empty());
+    }
+
+    #[test]
+    fn test_graphql_calls_do_not_hit_http_matcher() {
+        use crate::operation::GraphqlOperationKind;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(graphql_details(
+            OperationKey::graphql(GraphqlOperationKind::Query, "user"),
+            "client.ts:12",
+        ));
+
+        let mount_graph = MountGraph::new();
+        let (call_issues, endpoint_issues, env_var_calls, verified) =
+            analyzer.analyze_matches_with_mount_graph(&mount_graph);
+        assert!(call_issues.is_empty());
+        assert!(endpoint_issues.is_empty());
+        assert!(env_var_calls.is_empty());
+        assert!(verified.is_empty());
+    }
+
     #[test]
     fn test_analyze_matches_with_mount_graph_env_vars() {
         // Setup config with internal env vars
@@ -1747,8 +1993,7 @@ mod tests {
         // 1. Valid internal call (should match if endpoint exists, or report missing)
         analyzer.calls.push(ApiEndpointDetails {
             owner: None,
-            route: "ENV_VAR:API_URL:/users".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "ENV_VAR:API_URL:/users"),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -1761,8 +2006,7 @@ mod tests {
         // 2. Unclassified env var (not in internal/external list)
         analyzer.calls.push(ApiEndpointDetails {
             owner: None,
-            route: "ENV_VAR:UNKNOWN_VAR:/posts".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "ENV_VAR:UNKNOWN_VAR:/posts"),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -1775,8 +2019,7 @@ mod tests {
         // 3. Process.env pattern (should be detected as env var)
         analyzer.calls.push(ApiEndpointDetails {
             owner: None,
-            route: "${process.env.OTHER_VAR}/comments".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "${process.env.OTHER_VAR}/comments"),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -1790,8 +2033,7 @@ mod tests {
         // e.g. LEGACY_API_URL + "/users"
         analyzer.calls.push(ApiEndpointDetails {
             owner: None,
-            route: "LEGACY_API_URL + \"/users\"".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "LEGACY_API_URL + \"/users\""),
             params: vec![],
             request_body: None,
             response_body: None,

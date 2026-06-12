@@ -1,6 +1,6 @@
 use crate::agent_service::AgentService;
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::agents::framework_guidance_agent::{FrameworkGuidance, FrameworkGuidanceAgent};
+use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
@@ -13,6 +13,7 @@ use crate::intent_generator::{generate_function_intents, intents_by_hash};
 use crate::logging;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
+use crate::operation::OperationKey;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::services::{
@@ -43,7 +44,7 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 3;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -781,6 +782,7 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
+            append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -836,11 +838,11 @@ async fn analyze_current_repo_incremental(
     Ok(cloud_data)
 }
 
-/// Run framework detection and guidance generation.
+/// Run framework detection and per-protocol guidance generation.
 async fn run_framework_detection_and_guidance(
     packages: &Packages,
     imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
-) -> Result<(DetectionResult, FrameworkGuidance), Box<dyn std::error::Error>> {
+) -> Result<(DetectionResult, ProtocolGuidance), Box<dyn std::error::Error>> {
     let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
@@ -848,9 +850,76 @@ async fn run_framework_detection_and_guidance(
         .await?;
 
     let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
-    let guidance = guidance_agent.generate_guidance(&detection).await?;
+    let guidance = guidance_agent
+        .generate_for_active_protocols(&detection)
+        .await?;
 
     Ok((detection, guidance))
+}
+
+/// Append deterministically extracted protocol operations to the repo's
+/// index data: GraphQL (SDL root fields as endpoints, document top-level
+/// fields as calls) and Socket.IO (listeners as endpoints, emitters as
+/// calls). These protocols never go through the LLM pipeline.
+fn append_deterministic_protocol_operations(
+    cloud_data: &mut CloudRepoData,
+    repo_path: &str,
+    files: &[PathBuf],
+) {
+    // Same "{file}:{line}" convention the mount-graph conversions use
+    let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+        owner: None,
+        key,
+        params: vec![],
+        request_body: None,
+        response_body: None,
+        handler_name: None,
+        request_type: None,
+        response_type: None,
+        file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
+    };
+
+    let graphql = crate::graphql::scan_repo(Path::new(repo_path), files);
+    if !graphql.is_empty() {
+        debug!(
+            producers = graphql.producers.len(),
+            consumers = graphql.consumers.len(),
+            "Indexing GraphQL operations"
+        );
+        cloud_data.endpoints.extend(
+            graphql
+                .producers
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            graphql
+                .consumers
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+    }
+
+    let sockets = crate::socket_io::scan_files(files);
+    if !sockets.is_empty() {
+        debug!(
+            listeners = sockets.listeners.len(),
+            emitters = sockets.emitters.len(),
+            "Indexing Socket.IO operations"
+        );
+        cloud_data.endpoints.extend(
+            sockets
+                .listeners
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            sockets
+                .emitters
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+    }
 }
 
 /// Build CloudRepoData from a mount graph (used by incremental path).
@@ -878,8 +947,7 @@ fn build_cloud_data_from_mount_graph(
         .iter()
         .map(|endpoint| ApiEndpointDetails {
             owner: Some(crate::visitor::OwnerType::App(endpoint.owner.clone())),
-            route: endpoint.full_path.clone(),
-            method: endpoint.method.clone(),
+            key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -895,8 +963,7 @@ fn build_cloud_data_from_mount_graph(
         .iter()
         .map(|call| ApiEndpointDetails {
             owner: None,
-            route: call.target_url.clone(),
-            method: call.method.clone(),
+            key: OperationKey::http(&call.method, call.target_url.clone()),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -1298,8 +1365,7 @@ fn build_type_manifest_entries(
 
         add_manifest_pair(
             &mut entries,
-            &method,
-            &path,
+            OperationKey::http(&method, path),
             ManifestRole::Producer,
             &file_path,
             line_number,
@@ -1317,12 +1383,12 @@ fn build_type_manifest_entries(
             continue;
         }
         let path = normalizer.extract_path(&call.target_url);
-        let call_id = build_call_site_id(&file_path, line_number, &method, &path);
+        let key = OperationKey::http(&method, path);
+        let call_id = build_call_site_id(&file_path, line_number, &key);
 
         add_manifest_pair(
             &mut entries,
-            &method,
-            &path,
+            key,
             ManifestRole::Consumer,
             &file_path,
             line_number,
@@ -1335,23 +1401,24 @@ fn build_type_manifest_entries(
 
 fn add_manifest_pair(
     entries: &mut Vec<TypeManifestEntry>,
-    method: &str,
-    path: &str,
+    key: OperationKey,
     role: ManifestRole,
     file_path: &str,
     line_number: u32,
     call_id: Option<&str>,
 ) {
     // Producers for GET/HEAD/OPTIONS never have request bodies
-    let skip_request =
-        role == ManifestRole::Producer && matches!(method, "GET" | "HEAD" | "OPTIONS");
+    let skip_request = role == ManifestRole::Producer
+        && matches!(
+            key.as_http().map(|(method, _)| method),
+            Some("GET" | "HEAD" | "OPTIONS")
+        );
 
     for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
         if skip_request && type_kind == ManifestTypeKind::Request {
             continue;
         }
-        let type_alias =
-            build_manifest_type_alias_with_call_id(method, path, role, type_kind, call_id);
+        let type_alias = build_manifest_type_alias_with_call_id(&key, role, type_kind, call_id);
         let infer_kind = infer_kind_for_manifest(role, type_kind);
         let evidence = crate::cloud_storage::TypeEvidence {
             file_path: file_path.to_string(),
@@ -1363,8 +1430,7 @@ fn add_manifest_pair(
             type_state: ManifestTypeState::Unknown,
         };
         entries.push(TypeManifestEntry {
-            method: method.to_string(),
-            path: path.to_string(),
+            key: key.clone(),
             role,
             type_kind,
             type_alias,
@@ -1519,7 +1585,7 @@ async fn analyze_current_repo(
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files, packages, &all_imported_symbols, repo_path)
+        .run_complete_analysis(files.clone(), packages, &all_imported_symbols, repo_path)
         .await?;
 
     // 4b. Generate function intents using LLM
@@ -1550,6 +1616,7 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
+    append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
     let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     if !manifest_entries.is_empty() {
@@ -1897,8 +1964,7 @@ mod tests {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
             owner: Some(OwnerType::App("test_app".to_string())),
-            route: "/test".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "/test"),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -2010,8 +2076,7 @@ mod tests {
         // Create test data with TypeReferences that would cause SourceMap issues
         let endpoint = ApiEndpointDetails {
             owner: Some(OwnerType::App("test_app".to_string())),
-            route: "/test".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "/test"),
             params: vec![],
             request_body: None,
             response_body: None,

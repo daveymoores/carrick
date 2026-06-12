@@ -64,7 +64,10 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
         categorized_issues.configuration.len()
     ));
 
-    output.push_str(&format_graphql_banner(&result.detected_graphql_libraries));
+    output.push_str(&format_graphql_banner(
+        &result.detected_graphql_libraries,
+        result.graphql_operations_indexed,
+    ));
 
     // Verified-matches section runs first so users see what *worked* before
     // the failure list — clean runs would otherwise produce no positive
@@ -120,7 +123,10 @@ fn format_no_issues(result: &ApiAnalysisResult) -> String {
         "<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n### 🪢 Carrick: Cross-repo analysis\n\nIndexed **{} endpoints** and **{} cross-repo calls** across the org.\n\n✅ **All cross-repo calls match the indexed contracts.**\n\n{}{}<!-- CARRICK_OUTPUT_END -->\n",
         result.endpoints.len(),
         result.calls.len(),
-        format_graphql_banner(&result.detected_graphql_libraries),
+        format_graphql_banner(
+            &result.detected_graphql_libraries,
+            result.graphql_operations_indexed,
+        ),
         verified,
     )
 }
@@ -147,10 +153,13 @@ fn format_verified_section(verified: &[(String, String)]) -> String {
     output
 }
 
-/// Render a banner noting that GraphQL usage was detected but is out of scope
-/// for v1 (REST-only). See the carrick-cloud repo's docs/internal/framework-coverage.md §4.3.
-fn format_graphql_banner(graphql_libraries: &[String]) -> String {
-    if graphql_libraries.is_empty() {
+/// Render a banner when GraphQL libraries are detected but no operations
+/// could be extracted. GraphQL extraction is parse-based (SDL files,
+/// `gql` template literals); code-first schemas and Relay compiled
+/// artifacts produce nothing statically, so the banner suggests committing
+/// an emitted schema instead of staying silent about the coverage gap.
+fn format_graphql_banner(graphql_libraries: &[String], operations_indexed: bool) -> String {
+    if graphql_libraries.is_empty() || operations_indexed {
         return String::new();
     }
     let mut libs: Vec<&String> = graphql_libraries.iter().collect();
@@ -162,7 +171,7 @@ fn format_graphql_banner(graphql_libraries: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "> ℹ️ **GraphQL detected** ({}). Carrick v1 analyzes REST contracts only. GraphQL schema drift and resolver typing are not yet supported. REST endpoints in this repo were analyzed normally.\n\n",
+        "> ℹ️ **GraphQL detected** ({}), but no schema or operation documents were found. Carrick extracts GraphQL contracts from SDL (`.graphql`/`.gql` files, `gql` template literals). If your schema is code-first (Pothos, TypeGraphQL, Nexus), commit the emitted `schema.graphql` to index it. Relay compiled artifacts and persisted queries are out of scope.\n\n",
         lib_list,
     )
 }
@@ -783,6 +792,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
 
         let output = format_analysis_results(result);
@@ -817,6 +827,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
 
         let output = format_analysis_results(result);
@@ -848,12 +859,35 @@ mod tests {
                 "graphql-request".to_string(),
                 "@apollo/client".to_string(),
             ],
+            graphql_operations_indexed: false,
         };
         let output = format_analysis_results(result);
         assert!(output.contains("GraphQL detected"));
         assert!(output.contains("graphql-request"));
         assert!(output.contains("@apollo/client"));
-        assert!(output.contains("REST contracts only"));
+        assert!(output.contains("no schema or operation documents were found"));
+    }
+
+    #[test]
+    fn test_graphql_banner_absent_when_operations_indexed() {
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec!["@apollo/client".to_string()],
+            graphql_operations_indexed: true,
+        };
+        let output = format_analysis_results(result);
+        assert!(!output.contains("GraphQL detected"));
     }
 
     #[test]
@@ -872,6 +906,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
         let output = format_analysis_results(result);
         assert!(!output.contains("GraphQL detected"));
@@ -894,6 +929,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
 
         let output = format_analysis_results(result);
@@ -919,6 +955,7 @@ mod tests {
             issues,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
 
         let formatted = FormattedOutput::new(result);
@@ -954,6 +991,7 @@ mod tests {
                 ("POST".to_string(), "/api/orders".to_string()),
             ],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
 
         let output = format_analysis_results(result);
@@ -979,6 +1017,7 @@ mod tests {
             issues,
             verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
 
         let output = format_analysis_results(result);
@@ -1007,6 +1046,7 @@ mod tests {
             issues,
             verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
             detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
         };
 
         let output = format_analysis_results(result);

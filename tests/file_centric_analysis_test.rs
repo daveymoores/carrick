@@ -8,13 +8,20 @@ use carrick::agents::file_analyzer_agent::{
     DataCallResult, EndpointResult, FileAnalysisResult, FileAnalyzerAgent, MountResult,
 };
 use carrick::agents::file_orchestrator::{FileOrchestrator, ProcessingStats};
-use carrick::agents::framework_guidance_agent::{FrameworkGuidance, PatternExample};
+use carrick::agents::framework_guidance_agent::{
+    FrameworkGuidance, PatternExample, ProtocolGuidance,
+};
 use carrick::framework_detector::DetectionResult;
+use carrick::operation::Protocol;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Create test framework guidance with Express patterns
+fn http_guidance(guidance: &FrameworkGuidance) -> ProtocolGuidance {
+    ProtocolGuidance::from([(Protocol::Http, guidance.clone())])
+}
+
 fn create_express_guidance() -> FrameworkGuidance {
     FrameworkGuidance {
         mount_patterns: vec![
@@ -255,6 +262,7 @@ fn test_processing_stats_tracking() {
         files_skipped: 2,
         files_skipped_no_candidates: 1,
         files_parse_failed: 1,
+        files_skipped_unrouted_protocol: 0,
         total_mounts: 3,
         total_endpoints: 10,
         file_based_endpoints: 2,
@@ -745,7 +753,12 @@ app.post('/users', (req, res) => res.json({ created: true }));
 
     let files = vec![test_file];
     let result = orchestrator
-        .analyze_files(&files, &guidance, &detection, temp_dir.path())
+        .analyze_files(
+            &files,
+            &http_guidance(&guidance),
+            &detection,
+            temp_dir.path(),
+        )
         .await;
 
     // Verify the analysis completed (even with mock responses)
@@ -778,7 +791,12 @@ async fn test_file_orchestrator_handles_empty_files() {
 
     let files = vec![empty_file];
     let result = orchestrator
-        .analyze_files(&files, &guidance, &detection, temp_dir.path())
+        .analyze_files(
+            &files,
+            &http_guidance(&guidance),
+            &detection,
+            temp_dir.path(),
+        )
         .await;
 
     assert!(result.is_ok());
@@ -806,7 +824,12 @@ async fn test_file_orchestrator_handles_missing_files() {
     // Try to analyze a non-existent file
     let files = vec![PathBuf::from("/nonexistent/file.ts")];
     let result = orchestrator
-        .analyze_files(&files, &guidance, &detection, PathBuf::from("/").as_path())
+        .analyze_files(
+            &files,
+            &http_guidance(&guidance),
+            &detection,
+            PathBuf::from("/").as_path(),
+        )
         .await;
 
     assert!(result.is_ok());
