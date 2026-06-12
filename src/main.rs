@@ -2,7 +2,6 @@ mod agent_service;
 mod agents;
 mod analyzer;
 mod app_context;
-mod call_site_classifier;
 mod call_site_extractor;
 mod cloud_storage;
 mod config;
@@ -29,7 +28,6 @@ mod type_manifest;
 mod url_normalizer;
 mod utils;
 mod visitor;
-mod wrapper_registry;
 
 use crate::cloud_storage::{AwsStorage, MockStorage};
 use crate::services::TypeSidecar;

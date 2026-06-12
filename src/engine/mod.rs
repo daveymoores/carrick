@@ -44,7 +44,10 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
-const CACHE_VERSION: u32 = 3;
+/// 4: EndpointResult gained `emission_style` — pre-4 cached results would
+/// replay with `None` forever and never take the return-value/no-payload
+/// inference paths for unchanged files.
+const CACHE_VERSION: u32 = 4;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -534,6 +537,40 @@ fn hash_file_content(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Hash every discovered package.json (sorted, keyed by repo-relative path)
+/// for the detection/guidance/extraction-config cache gate. The artifacts
+/// behind the gate are generated from the MERGED dependency set, so the gate
+/// must cover workspace manifests too — hashing only the root package.json
+/// would let a dependency added in `packages/api/package.json` reuse a stale
+/// extraction config (and stale detection) indefinitely.
+fn hash_workspace_package_jsons(packages: &Packages, repo_path: &str) -> String {
+    let repo_root = Path::new(repo_path);
+    let mut keyed: Vec<(String, &PathBuf)> = packages
+        .source_paths
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            (relative, path)
+        })
+        .collect();
+    keyed.sort();
+
+    let mut combined = String::new();
+    for (relative, path) in keyed {
+        combined.push_str(&relative);
+        combined.push('\0');
+        if let Ok(content) = std::fs::read_to_string(path) {
+            combined.push_str(&content);
+        }
+        combined.push('\0');
+    }
+    hash_file_content(&combined)
+}
+
 /// Normalize file_results keys to be relative to repo root.
 /// This ensures cache key consistency between runs.
 fn normalize_file_results_keys(
@@ -561,6 +598,14 @@ fn normalize_file_results_keys(
 
 /// Strip diagnostic-only fields from file_results before caching.
 /// These fields are not needed by build_mount_graph() or collect_type_requests().
+///
+/// `response_expression_text` is deliberately KEPT: it is the primary locator
+/// for return-value endpoints (`EmissionStyle::ReturnValue`), whose only
+/// fallback is an inexact registration-line anchor (the sidecar's
+/// `findFunctionByLine` tolerates ±2 lines and can bind an adjacent handler).
+/// Stripping it would make cached replays of unchanged files silently degrade
+/// to that fallback. Every other stripped text field has an exact span
+/// fallback, so replays lose nothing.
 fn strip_diagnostic_fields(
     file_results: &mut HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) {
@@ -569,7 +614,6 @@ fn strip_diagnostic_fields(
             endpoint.candidate_id = String::new();
             endpoint.pattern_matched = String::new();
             endpoint.payload_expression_text = None;
-            endpoint.response_expression_text = None;
         }
         for data_call in &mut result.data_calls {
             data_call.candidate_id = String::new();
@@ -676,20 +720,29 @@ async fn analyze_current_repo_incremental(
                 changed_count, total_files, reused_count
             );
 
-            // Check if package.json changed → need fresh framework detection/guidance
-            // Hash raw file content (not serialized struct) for deterministic comparison
-            let current_pkg_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
-                .ok()
-                .map(|content| hash_file_content(&content))
-                .unwrap_or_default();
+            // Check if any package.json changed → need fresh framework
+            // detection/guidance/extraction config. Covers workspace
+            // manifests, not just the repo root (raw file content, not the
+            // serialized struct, for deterministic comparison).
+            let current_pkg_hash = hash_workspace_package_jsons(packages, repo_path);
 
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
 
-            // Get framework detection and guidance (cached or fresh)
-            let (detection, guidance) = if !pkg_changed {
+            // Get framework detection, guidance, and extraction config
+            // (cached or fresh — all three share the package_json_hash gate)
+            let (detection, guidance, extraction_config) = if !pkg_changed {
                 if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
                     debug!("Reusing cached framework detection and guidance");
-                    (det.clone(), guid.clone())
+                    // A missing cached config (older cache entry, or an earlier
+                    // failed generation) is regenerated on its own.
+                    let extraction = match &prev.cached_extraction_config {
+                        Some(config) => Some(config.clone()),
+                        None => {
+                            let agent = FrameworkGuidanceAgent::new(AgentService::new());
+                            generate_extraction_config(&agent, det, packages).await
+                        }
+                    };
+                    (det.clone(), guid.clone(), extraction)
                 } else {
                     run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
                 }
@@ -788,8 +841,9 @@ async fn analyze_current_repo_incremental(
             let mut cached_file_results = merged_results.clone();
             strip_diagnostic_fields(&mut cached_file_results);
             cloud_data.file_results = Some(cached_file_results);
-            cloud_data.cached_detection = Some(detection);
+            cloud_data.cached_detection = Some(detection.clone());
             cloud_data.cached_guidance = Some(guidance);
+            cloud_data.cached_extraction_config = extraction_config.clone();
             cloud_data.package_json_hash = Some(current_pkg_hash);
             cloud_data.cache_version = Some(CACHE_VERSION);
 
@@ -805,7 +859,7 @@ async fn analyze_current_repo_incremental(
                 &file_orchestrator,
                 &merged_results,
                 repo_path,
-                packages,
+                extraction_config.as_ref(),
                 &mount_graph,
                 config,
                 &mut cloud_data,
@@ -838,11 +892,20 @@ async fn analyze_current_repo_incremental(
     Ok(cloud_data)
 }
 
-/// Run framework detection and per-protocol guidance generation.
+/// Run framework detection, per-protocol guidance generation, and
+/// extraction-config generation (machinery-unwrap rules). All three are
+/// cached together under the package_json_hash gate.
 async fn run_framework_detection_and_guidance(
     packages: &Packages,
     imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
-) -> Result<(DetectionResult, ProtocolGuidance), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        DetectionResult,
+        ProtocolGuidance,
+        Option<crate::services::type_sidecar::ExtractionConfig>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
@@ -850,11 +913,45 @@ async fn run_framework_detection_and_guidance(
         .await?;
 
     let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
-    let guidance = guidance_agent
-        .generate_for_active_protocols(&detection)
-        .await?;
+    // Guidance and extraction config both depend only on detection — run
+    // them concurrently instead of paying a lone extra lambda round-trip.
+    let (guidance, extraction_config) = tokio::join!(
+        guidance_agent.generate_for_active_protocols(&detection),
+        generate_extraction_config(&guidance_agent, &detection, packages),
+    );
 
-    Ok((detection, guidance))
+    Ok((detection, guidance?, extraction_config))
+}
+
+/// Generate machinery-unwrap rules via the cloud's extraction_config task.
+/// Non-fatal: on failure the scan proceeds without unwrapping (machinery
+/// types like `AxiosResponse<T>` stay wrapped in the manifest).
+async fn generate_extraction_config(
+    agent: &FrameworkGuidanceAgent,
+    detection: &DetectionResult,
+    packages: &Packages,
+) -> Option<crate::services::type_sidecar::ExtractionConfig> {
+    let dependencies = packages.cleaned_dependency_names();
+    match agent
+        .fetch_extraction_config(detection, &dependencies)
+        .await
+    {
+        Ok(config) => {
+            debug!(
+                "Extraction config generated: {} unwrap rule(s)",
+                config.rules.len()
+            );
+            Some(config)
+        }
+        Err(e) => {
+            warn!(
+                "Extraction-config generation failed: {} — machinery wrapper types will not \
+                 be unwrapped this run",
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Append deterministically extracted protocol operations to the repo's
@@ -1011,6 +1108,7 @@ fn build_cloud_data_from_mount_graph(
         file_results: None,
         cached_detection: None,
         cached_guidance: None,
+        cached_extraction_config: None,
         package_json_hash: None,
         cache_version: None,
         type_extraction_status: None,
@@ -1062,7 +1160,7 @@ fn resolve_types_if_available(
     file_orchestrator: &FileOrchestrator,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     repo_path: &str,
-    packages: &Packages,
+    extraction_config: Option<&crate::services::type_sidecar::ExtractionConfig>,
     mount_graph: &MountGraph,
     config: &Config,
     cloud_data: &mut CloudRepoData,
@@ -1083,7 +1181,7 @@ fn resolve_types_if_available(
                 sidecar,
                 file_results,
                 repo_path,
-                packages,
+                extraction_config,
                 mount_graph,
                 config,
             ) {
@@ -1104,6 +1202,20 @@ fn resolve_types_if_available(
                     }
                     // Per-symbol failures are logged in FileOrchestrator at the
                     // resolution call site (with capped warn + spillover to debug).
+
+                    // A missing extraction config means the cloud's rule
+                    // generation failed (an empty rule set arrives as
+                    // Some(config) with zero rules). Types still resolve, but
+                    // machinery wrappers stay wrapped — surface the
+                    // degradation instead of letting the run look healthy.
+                    if extraction_config.is_none() {
+                        cloud_data.type_extraction_status = Some(
+                            "machinery unwrapping disabled this run: extraction-config \
+                             generation failed; wrapper types (e.g. AxiosResponse<T>) may \
+                             surface in the type manifest"
+                                .to_string(),
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
@@ -1625,14 +1737,23 @@ async fn analyze_current_repo(
 
     // 6. Resolve types using sidecar if available
     let agent_service = AgentService::new();
-    let file_orchestrator = FileOrchestrator::new(agent_service);
+    let file_orchestrator = FileOrchestrator::new(agent_service.clone());
+
+    let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
+    let extraction_config = generate_extraction_config(
+        &guidance_agent,
+        &analysis_result.framework_detection,
+        packages,
+    )
+    .await;
+    cloud_data.cached_extraction_config = extraction_config.clone();
 
     resolve_types_if_available(
         sidecar,
         &file_orchestrator,
         &analysis_result.file_results,
         repo_path,
-        packages,
+        extraction_config.as_ref(),
         &analysis_result.mount_graph,
         config,
         &mut cloud_data,
@@ -1657,10 +1778,8 @@ async fn analyze_current_repo(
     cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
-    // Hash raw file content (not serialized struct) for deterministic comparison
-    cloud_data.package_json_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
-        .ok()
-        .map(|content| hash_file_content(&content));
+    // Same workspace-wide hash the incremental gate compares against.
+    cloud_data.package_json_hash = Some(hash_workspace_package_jsons(packages, repo_path));
 
     Ok(cloud_data)
 }
@@ -1932,11 +2051,26 @@ fn recreate_package_and_tsconfig(
             .map_err(|e| format!("Failed to run npm install: {}", e))?;
 
         if !install_output.status.success() {
+            // Fail loudly (#149): a swallowed install failure used to let the
+            // run print "✓ Cross-repo analysis complete" while type checking
+            // silently degraded — masking, e.g., an ERESOLVE conflict.
             let stderr = String::from_utf8_lossy(&install_output.stderr);
-            warn!("npm install failed: {}", stderr);
-        } else {
-            debug!("Dependencies installed successfully");
+            let tail_start = stderr
+                .char_indices()
+                .rev()
+                .nth(1999)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let excerpt = &stderr[tail_start..];
+            return Err(format!(
+                "npm install failed for the cross-repo type-check package — type checking \
+                 cannot run. Set CARRICK_SKIP_NPM_INSTALL=1 to bypass (type checking will \
+                 be skipped). npm stderr (tail):\n{}",
+                excerpt
+            )
+            .into());
         }
+        debug!("Dependencies installed successfully");
     }
 
     // Create tsconfig.json with dynamic path mappings based on actual type files
@@ -2006,6 +2140,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
@@ -2045,6 +2180,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
@@ -2118,6 +2254,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
@@ -2162,6 +2299,7 @@ mod tests {
                     payload_expression_line: Some(11),
                     response_expression_text: Some("res.json(data)".to_string()),
                     response_expression_line: Some(12),
+                    emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 })
@@ -2185,6 +2323,58 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Regression for #102: consumer manifest paths must run through the same
+    /// UrlNormalizer::normalize as the live mount-graph matcher. The exact
+    /// targets from the bad run (backticked template literals with env-var
+    /// base URLs) previously surfaced in the consumer manifest as
+    /// `/:USER_SERVICE_URL/api/users/:order.userId`, so ts_check reported
+    /// orphans the live matcher had already correlated.
+    #[test]
+    fn test_consumer_manifest_paths_strip_env_var_base_urls() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "`${USER_SERVICE_URL}/api/users/${order.userId}`".to_string(),
+                client: "fetch".to_string(),
+                file_location: "src/orders.ts:42".to_string(),
+            },
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "`${NOTIFICATION_SERVICE_URL}/api/notifications/status`".to_string(),
+                client: "fetch".to_string(),
+                file_location: "src/notify.ts:7".to_string(),
+            },
+        ];
+
+        let config = Config::default();
+        let entries = build_type_manifest_entries(&mount_graph, &config);
+
+        let consumer_paths: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.role == ManifestRole::Consumer)
+            .filter_map(|e| e.key.as_http().map(|(_, path)| path))
+            .collect();
+        assert!(!consumer_paths.is_empty(), "consumer entries expected");
+        for path in &consumer_paths {
+            assert!(
+                !path.contains("_SERVICE_URL"),
+                "env-var base URL leaked into consumer manifest path: {}",
+                path
+            );
+        }
+        assert!(
+            consumer_paths.contains(&"/api/users/:order.userId"),
+            "expected normalized user-service path, got {:?}",
+            consumer_paths
+        );
+        assert!(
+            consumer_paths.contains(&"/api/notifications/status"),
+            "expected normalized notification path, got {:?}",
+            consumer_paths
+        );
     }
 
     #[test]
@@ -2273,7 +2463,13 @@ mod tests {
         assert_eq!(result.endpoints[0].candidate_id, "");
         assert_eq!(result.endpoints[0].pattern_matched, "");
         assert!(result.endpoints[0].payload_expression_text.is_none());
-        assert!(result.endpoints[0].response_expression_text.is_none());
+        // The response expression text is load-bearing for ReturnValue
+        // endpoints on cached replays (its only fallback locator is an
+        // inexact line anchor) — it must survive the strip.
+        assert_eq!(
+            result.endpoints[0].response_expression_text.as_deref(),
+            Some("res.json(data)")
+        );
         // Non-diagnostic fields should be preserved
         assert_eq!(result.endpoints[0].path, "/api/users");
         assert_eq!(result.endpoints[0].method, "GET");
@@ -2440,6 +2636,7 @@ mod tests {
                         payload_expression_line: None,
                         response_expression_text: Some(large_string),
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     }],
@@ -2468,6 +2665,7 @@ mod tests {
             file_results: Some(large_results),
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
@@ -2510,6 +2708,7 @@ mod tests {
             file_results: Some(small_results),
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
@@ -2643,6 +2842,7 @@ mod tests {
                 notes: "test".to_string(),
             }),
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: Some("abc123hash".to_string()),
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
@@ -2713,6 +2913,7 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,

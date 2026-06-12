@@ -42,6 +42,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         file_results: None,
         cached_detection: None,
         cached_guidance: None,
+        cached_extraction_config: None,
         package_json_hash: None,
         cache_version: None,
         type_extraction_status: None,

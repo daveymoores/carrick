@@ -1,0 +1,18 @@
+{
+  "rules": [
+    {
+      "wrapperSymbols": ["Response"],
+      "machineryIndicators": ["statusCode", "headers", "body"],
+      "originModuleGlobs": ["got", "got/*", "@types/got/*"],
+      "payloadGenericIndex": null,
+      "payloadPropertyPath": ["body"]
+    },
+    {
+      "wrapperSymbols": ["ApiEnvelope"],
+      "machineryIndicators": [],
+      "originModuleGlobs": [],
+      "payloadGenericIndex": 0,
+      "payloadPropertyPath": []
+    }
+  ]
+}

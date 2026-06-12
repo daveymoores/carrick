@@ -443,6 +443,7 @@ impl CloudStorage for AwsStorage {
                     file_results: None,
                     cached_detection: None,
                     cached_guidance: None,
+                    cached_extraction_config: None,
                     package_json_hash: None,
                     cache_version: None,
                     type_extraction_status: None,

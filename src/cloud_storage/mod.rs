@@ -130,6 +130,11 @@ pub struct CloudRepoData {
     /// Cached per-protocol framework guidance
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_guidance: Option<ProtocolGuidance>,
+    /// Cached machinery-unwrap rules from the extraction_config task.
+    /// Reusable under the same `package_json_hash` gate as detection/guidance
+    /// (its inputs are the detected stack + dependency names).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
     /// Hash of package.json content — if it matches, cached detection/guidance are reusable
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_json_hash: Option<String>,
@@ -241,6 +246,7 @@ impl CloudRepoData {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,

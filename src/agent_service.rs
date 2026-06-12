@@ -483,6 +483,10 @@ fn fixture_mock_response(task_path: &str, mock_seed: &str) -> Option<String> {
                 .to_string_lossy()
                 .into_owned()
         }
+        // Tasks without a file in the prompt (framework-guidance) seed with a
+        // short category token ("mount", "extraction_config", ...); use it as
+        // the fixture key so one fixture dir can serve multiple tasks.
+        None if is_fixture_key_token(mock_seed) => mock_seed.to_string(),
         None => "default".to_string(),
     };
     let fixture_path = std::path::Path::new(&dir)
@@ -495,6 +499,17 @@ fn fixture_mock_response(task_path: &str, mock_seed: &str) -> Option<String> {
         fixture_path.display()
     );
     Some(substitute_candidate_placeholders(&canned, mock_seed))
+}
+
+/// A mock seed usable directly as a fixture file stem: short and free of
+/// path/glob characters. Long seeds (full user messages) fall back to
+/// `default`.
+fn is_fixture_key_token(seed: &str) -> bool {
+    !seed.is_empty()
+        && seed.len() <= 64
+        && seed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Replace `"@line:<n>"` candidate-id placeholders in a canned response with
@@ -570,6 +585,11 @@ fn generate_mock_response(schema: &Option<serde_json::Value>, prompt: &str) -> S
                         && props.get("triage_hints").is_some()
                     {
                         return generate_mock_framework_guidance_response(prompt);
+                    }
+                    // Check for extraction_config_schema - has a rules array.
+                    // An empty rule set is a valid config (no unwrapping).
+                    if props.get("rules").is_some() {
+                        return r#"{"rules": []}"#.to_string();
                     }
                     // Check for pattern_list_schema - has patterns, descriptions, frameworks arrays
                     if props.get("patterns").is_some()

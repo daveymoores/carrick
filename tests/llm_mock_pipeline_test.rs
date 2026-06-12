@@ -17,12 +17,15 @@
 //!   SWC spans), plus a cross-file mount that must resolve to full paths.
 
 use carrick::agent_service::AgentService;
+use carrick::agents::file_analyzer_agent::EmissionStyle;
 use carrick::agents::file_orchestrator::FileOrchestrator;
 use carrick::agents::framework_guidance_agent::{
     FrameworkGuidance, PatternExample, ProtocolGuidance,
 };
+use carrick::config::Config;
 use carrick::framework_detector::DetectionResult;
 use carrick::operation::Protocol;
+use carrick::services::type_sidecar::InferKind;
 use serial_test::serial;
 use std::path::PathBuf;
 
@@ -80,6 +83,7 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
         root.join("src/client.ts"),
         root.join("src/types.ts"),
         root.join("src/socket.ts"),
+        root.join("src/reports.ts"),
     ];
 
     let orchestrator = FileOrchestrator::new(AgentService::new());
@@ -184,6 +188,65 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
         post_endpoint.response_expression_text.as_deref(),
         Some("created"),
         "expression locators must survive type-hint scrubbing"
+    );
+    assert_eq!(
+        post_endpoint.emission_style,
+        Some(EmissionStyle::ImperativeSend),
+        "emission_style must survive validation and candidate gating"
+    );
+
+    // reports.ts: emission_style routes type inference. The return-value
+    // endpoint asks for the handler's return type (line-anchored
+    // FunctionReturn); the no-payload endpoint asks for nothing at all,
+    // leaving its manifest entry honestly unknown.
+    let reports_result = result
+        .file_results
+        .iter()
+        .find(|(path, _)| path.ends_with("reports.ts"))
+        .map(|(_, r)| r)
+        .expect("reports.ts should have a result");
+    assert_eq!(reports_result.endpoints.len(), 2);
+    let summary = reports_result
+        .endpoints
+        .iter()
+        .find(|e| e.path == "/summary")
+        .expect("/summary endpoint should survive");
+    assert_eq!(summary.emission_style, Some(EmissionStyle::ReturnValue));
+    let export = reports_result
+        .endpoints
+        .iter()
+        .find(|e| e.path == "/export")
+        .expect("/export endpoint should survive");
+    assert_eq!(export.emission_style, Some(EmissionStyle::NoPayload));
+
+    let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+        &result.file_results,
+        &root.to_string_lossy(),
+        &result.mount_graph,
+        &Config::default(),
+    );
+    let reports_items: Vec<_> = infer
+        .iter()
+        .filter(|item| item.file_path.ends_with("reports.ts"))
+        .collect();
+    assert_eq!(
+        reports_items.len(),
+        1,
+        "only the return-value endpoint may request inference, got: {:?}",
+        reports_items
+    );
+    let summary_item = reports_items[0];
+    assert_eq!(summary_item.line_number, summary.line_number as u32);
+    assert_eq!(summary_item.infer_kind, InferKind::FunctionReturn);
+    assert_eq!(
+        summary_item.expression_text.as_deref(),
+        Some("buildSummary()"),
+        "return-value inference must locate the handler via the payload expression"
+    );
+    assert!(
+        summary_item.span_start.is_none() && summary_item.span_end.is_none(),
+        "the registration-call span must not be sent for return-value endpoints: {:?}",
+        summary_item
     );
 
     // index.ts: the bogus symbol (defined nowhere in the file) is nulled.

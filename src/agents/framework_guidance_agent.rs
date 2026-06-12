@@ -1,6 +1,7 @@
 use crate::{
     agent_service::AgentService, agents::schemas::AgentSchemas,
     framework_detector::DetectionResult, operation::Protocol,
+    services::type_sidecar::ExtractionConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -179,21 +180,95 @@ impl FrameworkGuidanceAgent {
         Ok(guidance)
     }
 
+    /// Common /framework-guidance request body: task + protocol + the
+    /// detection inventory + the response schema the lambda forwards to the
+    /// model. Task-specific fields are added by the caller.
+    fn guidance_request_body(
+        task: &str,
+        framework_detection: &DetectionResult,
+        protocol: Protocol,
+        schema: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "task": task,
+            "protocol": protocol,
+            "frameworks": framework_detection.frameworks,
+            "data_fetchers": framework_detection.data_fetchers,
+            "response_schema": schema,
+        })
+    }
+
+    /// Fetch agent-generated machinery-unwrap rules for the repo's HTTP
+    /// clients (the `extraction_config` task). `dependencies` is the cleaned
+    /// list of merged package.json dependency names — the cloud prompt uses
+    /// it to ground rules in packages the repo actually uses.
+    pub async fn fetch_extraction_config(
+        &self,
+        framework_detection: &DetectionResult,
+        dependencies: &[String],
+    ) -> Result<ExtractionConfig, Box<dyn std::error::Error>> {
+        let mut body = Self::guidance_request_body(
+            "extraction_config",
+            framework_detection,
+            Protocol::Http,
+            AgentSchemas::extraction_config_schema(),
+        );
+        body["dependencies"] = serde_json::json!(dependencies);
+
+        let response = self
+            .agent_service
+            .post_to_lambda("/framework-guidance", &body, "extraction_config")
+            .await?;
+
+        // Per-rule tolerant parsing: one malformed rule (a float index, a
+        // mistyped field) must not throw away every valid rule in the
+        // response. Only a response without a `rules` array fails outright.
+        #[derive(Deserialize)]
+        struct RawConfig {
+            rules: Vec<serde_json::Value>,
+        }
+        let raw: RawConfig = serde_json::from_str(&response).map_err(|e| {
+            format!(
+                "Failed to parse extraction config: {}. Raw response: {}",
+                e, response
+            )
+        })?;
+        let total = raw.rules.len();
+        let rules: Vec<crate::services::type_sidecar::ExtractionRule> = raw
+            .rules
+            .into_iter()
+            .filter_map(|rule| match serde_json::from_value(rule.clone()) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    debug!("Dropping malformed extraction rule ({}): {}", e, rule);
+                    None
+                }
+            })
+            .collect();
+        if rules.len() < total {
+            debug!(
+                "Extraction config: kept {}/{} rules after validation",
+                rules.len(),
+                total
+            );
+        }
+
+        Ok(ExtractionConfig { rules })
+    }
+
     async fn fetch_patterns(
         &self,
         category: &str,
         framework_detection: &DetectionResult,
         protocol: Protocol,
     ) -> Result<Vec<PatternExample>, Box<dyn std::error::Error>> {
-        let schema = AgentSchemas::pattern_list_schema();
-        let body = serde_json::json!({
-            "task": "patterns",
-            "category": category,
-            "protocol": protocol,
-            "frameworks": framework_detection.frameworks,
-            "data_fetchers": framework_detection.data_fetchers,
-            "response_schema": schema,
-        });
+        let mut body = Self::guidance_request_body(
+            "patterns",
+            framework_detection,
+            protocol,
+            AgentSchemas::pattern_list_schema(),
+        );
+        body["category"] = serde_json::json!(category);
 
         let response = self
             .agent_service
@@ -215,14 +290,12 @@ impl FrameworkGuidanceAgent {
         framework_detection: &DetectionResult,
         protocol: Protocol,
     ) -> Result<GeneralGuidanceResponse, Box<dyn std::error::Error>> {
-        let schema = AgentSchemas::general_guidance_schema();
-        let body = serde_json::json!({
-            "task": "general",
-            "protocol": protocol,
-            "frameworks": framework_detection.frameworks,
-            "data_fetchers": framework_detection.data_fetchers,
-            "response_schema": schema,
-        });
+        let body = Self::guidance_request_body(
+            "general",
+            framework_detection,
+            protocol,
+            AgentSchemas::general_guidance_schema(),
+        );
 
         let response = self
             .agent_service
