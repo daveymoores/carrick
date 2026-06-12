@@ -19,7 +19,9 @@
 use crate::{
     agent_service::AgentService,
     agents::{
-        file_analyzer_agent::{EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent},
+        file_analyzer_agent::{
+            EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
+        },
         framework_guidance_agent::ProtocolGuidance,
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},

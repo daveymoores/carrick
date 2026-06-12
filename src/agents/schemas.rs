@@ -606,13 +606,13 @@ mod tests {
         use crate::agents::file_analyzer_agent::EmissionStyle;
 
         let schema = AgentSchemas::file_analysis_schema();
-        let schema_values: Vec<String> = schema["properties"]["endpoints"]["items"]["properties"]
-            ["emission_style"]["enum"]
-            .as_array()
-            .expect("emission_style enum must exist")
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
+        let schema_values: Vec<String> =
+            schema["properties"]["endpoints"]["items"]["properties"]["emission_style"]["enum"]
+                .as_array()
+                .expect("emission_style enum must exist")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
 
         let serde_values: Vec<String> = [
             EmissionStyle::ImperativeSend,

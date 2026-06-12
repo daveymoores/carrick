@@ -785,9 +785,7 @@ mod tests {
 
     #[test]
     fn sanitize_downgrades_contradictory_no_payload_to_imperative_send() {
-        let json = endpoint_json(
-            r#", "emission_style": "no-payload""#,
-        );
+        let json = endpoint_json(r#", "emission_style": "no-payload""#);
         let mut endpoint: EndpointResult = serde_json::from_str(&json).unwrap();
         endpoint.response_expression_text = Some("users".to_string());
         endpoint.response_expression_line = Some(6);
