@@ -61,17 +61,21 @@ impl Topology {
     }
 }
 
-/// An endpoint added by the current PR (present now, absent from the repo's
-/// previously-indexed state).
+/// An endpoint present in the current scan but absent from the repo's
+/// previously-indexed state. `label`/`name` are protocol-agnostic
+/// (`OperationKey::display_labels`): for HTTP they are method + path, for
+/// GraphQL the operation kind + field, for sockets the direction + event.
 #[derive(Debug, Clone)]
 pub struct NewEndpoint {
-    pub method: String,
-    pub path: String,
+    pub label: String,
+    pub name: String,
     pub service: Option<String>,
 }
 
-/// What changed in this PR relative to the repo's last-indexed (main) state.
-/// `None` outside a PR run or when there is no prior index to diff against.
+/// What this PR added relative to the repo's last-indexed (main) state. Because
+/// the baseline is the last *uploaded* index, this can include an endpoint that
+/// landed on main since its last scan rather than in this PR. `None` outside a
+/// PR run or when there is no prior index to diff against.
 #[derive(Debug, Clone)]
 pub struct PrDelta {
     pub new_endpoints: Vec<NewEndpoint>,
@@ -230,8 +234,8 @@ fn format_pr_delta(pr_delta: Option<&PrDelta>) -> String {
             .unwrap_or_default();
         output.push_str(&format!(
             "- New endpoint `{} {}`{}\n",
-            code_span(&ep.method),
-            code_span(&ep.path),
+            code_span(&ep.label),
+            code_span(&ep.name),
             suffix
         ));
     }
@@ -1657,13 +1661,13 @@ mod tests {
         let delta = PrDelta {
             new_endpoints: vec![
                 NewEndpoint {
-                    method: "POST".to_string(),
-                    path: "/v2/invoices".to_string(),
+                    label: "POST".to_string(),
+                    name: "/v2/invoices".to_string(),
                     service: Some("billing".to_string()),
                 },
                 NewEndpoint {
-                    method: "GET".to_string(),
-                    path: "/charges".to_string(),
+                    label: "GET".to_string(),
+                    name: "/charges".to_string(),
                     service: None,
                 },
             ],
@@ -1703,8 +1707,8 @@ mod tests {
         // must also appear on the clean (TIP) path.
         let delta = PrDelta {
             new_endpoints: vec![NewEndpoint {
-                method: "GET".to_string(),
-                path: "/health".to_string(),
+                label: "GET".to_string(),
+                name: "/health".to_string(),
                 service: None,
             }],
         };
@@ -1725,8 +1729,8 @@ mod tests {
         // the way a table cell would), and a backtick in the service is dropped.
         let delta = PrDelta {
             new_endpoints: vec![NewEndpoint {
-                method: "GET".to_string(),
-                path: "/a|b".to_string(),
+                label: "GET".to_string(),
+                name: "/a|b".to_string(),
                 service: Some("sv`c".to_string()),
             }],
         };
@@ -1749,8 +1753,8 @@ mod tests {
         // render an empty " (``)" suffix.
         let delta = PrDelta {
             new_endpoints: vec![NewEndpoint {
-                method: "GET".to_string(),
-                path: "/x".to_string(),
+                label: "GET".to_string(),
+                name: "/x".to_string(),
                 service: Some("``".to_string()),
             }],
         };

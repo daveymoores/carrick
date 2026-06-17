@@ -274,7 +274,8 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
     // On a PR run, capture this repo's previously-indexed endpoints (its last
     // uploaded state, i.e. main) before they're removed below, so the diff can
-    // surface what THIS change added. Keyed by (service, key) so that in a
+    // surface what this change added relative to that baseline. Keyed by
+    // (service, key) so that in a
     // monorepo an endpoint newly added to one service still counts as new even
     // if a sibling service already exposes the same route. `had_prior_index` is
     // tracked separately so a prior scan that indexed zero endpoints still
@@ -319,9 +320,12 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         peer_repo_count, local_service_count
     );
 
-    // On a PR run with a prior index, surface what this change added: endpoints
-    // in the freshly-analyzed services that the previous index didn't have.
-    // Computed before `current_services_data` is moved into the analyzer.
+    // On a PR run with a prior index, surface what this change added: operations
+    // in the freshly-analyzed services that the previous (last-uploaded) index
+    // didn't have. Because the baseline is the last uploaded index, this can
+    // include an operation that landed on main since its last scan rather than
+    // in this PR. Computed before `current_services_data` is moved into the
+    // analyzer.
     let pr_delta = if is_pr_run && had_prior_index {
         let mut new_endpoints = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -329,20 +333,19 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             for endpoint in &service_data.endpoints {
                 let id = (service_data.service_name.clone(), endpoint.key.clone());
                 if !previous_self_keys.contains(&id) && seen.insert(id) {
-                    let (method, path) = endpoint.key.display_labels();
+                    let (label, name) = endpoint.key.display_labels();
                     new_endpoints.push(crate::formatter::NewEndpoint {
-                        method,
-                        path,
+                        label,
+                        name,
                         service: service_data.service_name.clone(),
                     });
                 }
             }
         }
-        // Sort by (method, path, service) for deterministic output even when two
-        // services add the same route.
-        new_endpoints.sort_by(|a, b| {
-            (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
-        });
+        // Sort by (label, name, service) for deterministic output even when two
+        // services add the same operation.
+        new_endpoints
+            .sort_by(|a, b| (&a.label, &a.name, &a.service).cmp(&(&b.label, &b.name, &b.service)));
         Some(crate::formatter::PrDelta { new_endpoints })
     } else {
         None
