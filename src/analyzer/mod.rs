@@ -34,7 +34,12 @@ static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
 type RouteFieldMap = HashMap<OperationKey, Json>;
 /// Result of `analyze_matches_with_mount_graph`:
 ///   `(call_issues, endpoint_issues, env_var_calls, verified_endpoints)`.
-type MountGraphMatches = (Vec<String>, Vec<String>, Vec<String>, Vec<(String, String)>);
+type MountGraphMatches = (
+    Vec<String>,
+    Vec<OrphanedEndpoint>,
+    Vec<String>,
+    Vec<(String, String)>,
+);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
@@ -57,9 +62,20 @@ pub struct RepoPackageInfo {
     pub source_path: PathBuf,
 }
 
+/// A producer endpoint with no consumer in the indexed services. `service`
+/// names the owning service (monorepo `serviceName`) or repo (poly-repo) when
+/// known; it is `None` for protocols whose orphans are not repo-tagged
+/// (GraphQL/socket).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OrphanedEndpoint {
+    pub method: String,
+    pub path: String,
+    pub service: Option<String>,
+}
+
 pub struct ApiIssues {
     pub call_issues: Vec<String>,
-    pub endpoint_issues: Vec<String>,
+    pub endpoint_issues: Vec<OrphanedEndpoint>,
     pub env_var_calls: Vec<String>,
     pub mismatches: Vec<String>,
     pub type_mismatches: Vec<String>,
@@ -1076,10 +1092,16 @@ impl Analyzer {
             if matched_endpoints.contains(&key) {
                 verified.push((endpoint.method.clone(), endpoint.full_path.clone()));
             } else {
-                endpoint_issues.push(format!(
-                    "Orphaned endpoint: {} {} in {}",
-                    endpoint.method, endpoint.full_path, endpoint.file_location
-                ));
+                endpoint_issues.push(OrphanedEndpoint {
+                    method: endpoint.method.clone(),
+                    path: endpoint.full_path.clone(),
+                    // Prefer the monorepo service name, falling back to the repo
+                    // (matches the cloud's service_name ?? repo_name convention).
+                    service: endpoint
+                        .service_name
+                        .clone()
+                        .or_else(|| endpoint.repo_name.clone()),
+                });
             }
         }
         verified.sort();
@@ -1102,7 +1124,7 @@ impl Analyzer {
         &self,
         protocol: crate::operation::Protocol,
         protocol_label: &str,
-    ) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
+    ) -> (Vec<String>, Vec<OrphanedEndpoint>, Vec<(String, String)>) {
         let producer_keys: HashSet<&OperationKey> = self
             .endpoints
             .iter()
@@ -1152,12 +1174,13 @@ impl Analyzer {
             if matched.contains(&endpoint.key) {
                 verified.push((label, name));
             } else {
-                endpoint_issues.push(format!(
-                    "Orphaned endpoint: {} {} in {}",
-                    label,
-                    name,
-                    endpoint.file_path.display()
-                ));
+                // GraphQL/socket producers are not repo-tagged at this layer, so
+                // the owning service is unknown.
+                endpoint_issues.push(OrphanedEndpoint {
+                    method: label,
+                    path: name,
+                    service: None,
+                });
             }
         }
         verified.sort();
@@ -2018,11 +2041,10 @@ mod tests {
             call_issues[0]
         );
         assert_eq!(endpoint_issues.len(), 1);
-        assert!(
-            endpoint_issues[0].contains("Orphaned endpoint: MUTATION createUser"),
-            "got {}",
-            endpoint_issues[0]
-        );
+        assert_eq!(endpoint_issues[0].method, "MUTATION");
+        assert_eq!(endpoint_issues[0].path, "createUser");
+        // GraphQL orphans are not repo-tagged at this layer.
+        assert!(endpoint_issues[0].service.is_none());
     }
 
     #[test]

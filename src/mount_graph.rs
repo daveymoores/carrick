@@ -76,6 +76,10 @@ pub struct ResolvedEndpoint {
     /// Optional repo identifier for cross-repo matching
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
+    /// Optional service identifier (monorepo carrick.json serviceName), tagged
+    /// during cross-repo merge so findings can name the owning service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 /// Represents a data-fetching call with its target
@@ -265,6 +269,7 @@ impl MountGraph {
             file_location: site.call_site.location.clone(),
             middleware_chain: Vec::new(), // TODO: Could extract from handler_args if needed
             repo_name: None,              // Will be set during cross-repo merge
+            service_name: None,
         })
     }
 
@@ -625,17 +630,25 @@ impl MountGraph {
                         .or_insert_with(|| node.clone());
                 }
 
-                // Merge endpoints (deduplicate by method + full_path)
-                // Tag each endpoint with its source repo for cross-repo matching
+                // Merge endpoints, deduplicating by repo + service + method +
+                // full_path. Keying on BOTH repo and service means neither two
+                // monorepo services that share a route (e.g. a common `/health`),
+                // nor two repos that happen to declare the same `serviceName`,
+                // collapse into one endpoint and lose an orphan finding.
                 for endpoint in &mount_graph.endpoints {
                     let key = format!(
-                        "{}:{}:{}",
-                        repo_data.repo_name, endpoint.method, endpoint.full_path
+                        "{}:{}:{}:{}",
+                        repo_data.repo_name,
+                        repo_data.service_name.as_deref().unwrap_or(""),
+                        endpoint.method,
+                        endpoint.full_path
                     );
                     if seen_endpoints.insert(key) {
                         let mut tagged_endpoint = endpoint.clone();
-                        // Tag endpoint with repo name for service resolution
+                        // Tag endpoint with its owning repo and (monorepo) service
+                        // so cross-repo findings can name where it lives.
                         tagged_endpoint.repo_name = Some(repo_data.repo_name.clone());
+                        tagged_endpoint.service_name = repo_data.service_name.clone();
                         merged.endpoints.push(tagged_endpoint);
                     }
                 }
@@ -841,6 +854,7 @@ mod tests {
             file_location: "routes/users.js:10:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         // Create config with internal domain
@@ -1114,6 +1128,7 @@ mod tests {
             file_location: "routes/orders.js:15:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         let config = Config {
@@ -1154,6 +1169,7 @@ mod tests {
             file_location: "routes/orders.js:20:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         let config = Config {
@@ -1185,6 +1201,7 @@ mod tests {
             file_location: "routes/users.js:5:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         let config = Config::default();
@@ -1301,5 +1318,89 @@ mod tests {
             graph.nodes.get("userRouter").unwrap().node_type,
             NodeType::Mountable
         );
+    }
+
+    fn cloud_repo_with_health(
+        repo: &str,
+        service: Option<&str>,
+    ) -> crate::cloud_storage::CloudRepoData {
+        let mut mg = MountGraph::new();
+        mg.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/health".to_string(),
+            full_path: "/health".to_string(),
+            handler: None,
+            owner: repo.to_string(),
+            file_location: format!("{}/health.ts:1", repo),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+        });
+        crate::cloud_storage::CloudRepoData {
+            repo_name: repo.to_string(),
+            service_name: service.map(|s| s.to_string()),
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test".to_string(),
+            mount_graph: Some(mg),
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_keeps_same_route_across_monorepo_services() {
+        // Two services in the same repo both exposing GET /health must survive
+        // the merge as distinct, service-tagged endpoints rather than collapse
+        // into one (which would hide an orphan finding).
+        let repos = vec![
+            cloud_repo_with_health("platform", Some("auth")),
+            cloud_repo_with_health("platform", Some("billing")),
+        ];
+        let merged = MountGraph::merge_from_repos(&repos);
+        let health: Vec<_> = merged
+            .endpoints
+            .iter()
+            .filter(|e| e.full_path == "/health")
+            .collect();
+        assert_eq!(health.len(), 2, "both services' /health must be kept");
+        let services: std::collections::HashSet<_> = health
+            .iter()
+            .filter_map(|e| e.service_name.as_deref())
+            .collect();
+        assert!(services.contains("auth"));
+        assert!(services.contains("billing"));
+    }
+
+    #[test]
+    fn test_merge_keeps_same_route_across_repos_with_shared_service_name() {
+        // Two distinct repos that happen to declare the same serviceName must
+        // not collapse — repo identity is part of the dedup key.
+        let repos = vec![
+            cloud_repo_with_health("repo-a", Some("api")),
+            cloud_repo_with_health("repo-b", Some("api")),
+        ];
+        let merged = MountGraph::merge_from_repos(&repos);
+        let health = merged
+            .endpoints
+            .iter()
+            .filter(|e| e.full_path == "/health")
+            .count();
+        assert_eq!(health, 2, "endpoints from different repos must be kept");
     }
 }

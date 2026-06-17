@@ -1,4 +1,6 @@
-use crate::analyzer::{ApiAnalysisResult, ApiIssues, ConflictSeverity, DependencyConflict};
+use crate::analyzer::{
+    ApiAnalysisResult, ApiIssues, ConflictSeverity, DependencyConflict, OrphanedEndpoint,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Shape of the project being analyzed, threaded from the engine so the PR
@@ -106,7 +108,7 @@ pub fn format_analysis_results(result: ApiAnalysisResult, topology: &Topology) -
     // informational. Configuration suggestions are advisory and never gate CI,
     // so they are excluded from the count as well.
     let connectivity_in_headline = if has_baseline {
-        categorized_issues.connectivity.len()
+        categorized_issues.connectivity_len()
     } else {
         0
     };
@@ -151,9 +153,10 @@ pub fn format_analysis_results(result: ApiAnalysisResult, topology: &Topology) -
         output.push_str(&format_critical_section(&categorized_issues.critical));
         output.push_str("\n\n");
     }
-    if !categorized_issues.connectivity.is_empty() {
+    if !categorized_issues.connectivity_is_empty() {
         output.push_str(&format_connectivity_section(
-            &categorized_issues.connectivity,
+            &categorized_issues.missing,
+            &categorized_issues.orphaned,
             has_baseline,
         ));
         output.push_str("\n\n");
@@ -203,7 +206,7 @@ fn format_verdict(
             plural(categorized.critical.len())
         ));
     }
-    if !categorized.connectivity.is_empty() {
+    if !categorized.connectivity_is_empty() {
         let noun = if has_baseline {
             "connectivity gap"
         } else {
@@ -211,9 +214,9 @@ fn format_verdict(
         };
         parts.push(format!(
             "{} {}{}",
-            categorized.connectivity.len(),
+            categorized.connectivity_len(),
             noun,
-            plural(categorized.connectivity.len())
+            plural(categorized.connectivity_len())
         ));
     }
     if !categorized.dependencies.is_empty() {
@@ -240,7 +243,7 @@ fn format_verdict(
     // Only explain the informational framing when there are connectivity
     // findings to frame; otherwise the note would reference connectivity that
     // isn't present (e.g. a lone repo with only configuration suggestions).
-    let baseline_note = if !has_baseline && !categorized.connectivity.is_empty() {
+    let baseline_note = if !has_baseline && !categorized.connectivity_is_empty() {
         " First repo indexed, so connectivity findings are informational.".to_string()
     } else {
         String::new()
@@ -360,14 +363,28 @@ struct EnvVarSuggestionGroup {
 
 struct CategorizedIssues {
     critical: Vec<String>,
-    connectivity: Vec<String>,
+    /// Consumer calls with no producer (still string-based; consumer-repo
+    /// attribution is a follow-up).
+    missing: Vec<String>,
+    /// Producers with no consumer, carrying their owning service/repo.
+    orphaned: Vec<OrphanedEndpoint>,
     configuration: Vec<EnvVarSuggestionGroup>,
     dependencies: Vec<DependencyConflict>,
 }
 
+impl CategorizedIssues {
+    fn connectivity_len(&self) -> usize {
+        self.missing.len() + self.orphaned.len()
+    }
+
+    fn connectivity_is_empty(&self) -> bool {
+        self.missing.is_empty() && self.orphaned.is_empty()
+    }
+}
+
 fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
     let mut critical = Vec::new();
-    let mut connectivity = Vec::new();
+    let mut missing = Vec::new();
 
     critical.extend(issues.mismatches.clone());
     critical.extend(issues.type_mismatches.clone());
@@ -376,18 +393,15 @@ fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
         if issue.contains("Method mismatch") {
             critical.push(issue.clone());
         } else {
-            connectivity.push(issue.clone());
+            missing.push(issue.clone());
         }
     }
 
-    connectivity.extend(issues.endpoint_issues.clone());
-
-    let configuration = group_env_var_suggestions(&issues.env_var_calls);
-
     CategorizedIssues {
         critical,
-        connectivity,
-        configuration,
+        missing,
+        orphaned: issues.endpoint_issues.clone(),
+        configuration: group_env_var_suggestions(&issues.env_var_calls),
         dependencies: issues.dependency_conflicts.clone(),
     }
 }
@@ -435,37 +449,31 @@ fn summarize_critical(issue: &str) -> (String, String) {
     }
 }
 
-/// Escape a value for a Markdown table cell: no pipes, no newlines.
+/// Escape a value for a Markdown table cell: no pipes, and no line breaks
+/// (CRLF, lone CR, or LF) that would otherwise split the row.
 fn cell(value: &str) -> String {
     value
         .replace('|', "\\|")
-        .replace('\n', " ")
+        .replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
         .trim()
         .to_string()
 }
 
-/// Separates endpoint issues into missing and orphaned categories
-fn separate_missing_orphaned(issues: &[String]) -> (Vec<&String>, Vec<&String>) {
-    let mut missing = Vec::new();
-    let mut orphaned = Vec::new();
-
-    // Prefixes must match what `analyzer::mod` emits:
-    //   "Missing endpoint for {METHOD} {PATH} ..." (no colon)
-    //   "Orphaned endpoint: {METHOD} {PATH} ..."   (has colon)
-    // Pre-2026-05 the missing-side check used a colon and silently dropped
-    // every entry. Tests below pin both literals.
-    for issue in issues {
-        if issue.starts_with("Missing endpoint for") {
-            missing.push(issue);
-        } else if issue.starts_with("Orphaned endpoint:") {
-            orphaned.push(issue);
-        }
-    }
-
-    (missing, orphaned)
+/// Sanitize a value that will be wrapped in inline-code backticks inside a
+/// table cell. Beyond `cell()`'s pipe/newline escaping, drop backticks: an
+/// HTTP method, route, or service name should never contain one, and a stray
+/// backtick (e.g. from a hand-written carrick.json `serviceName`) would break
+/// out of the code span and could inject Markdown.
+fn code_cell(value: &str) -> String {
+    cell(value).replace('`', "")
 }
 
-fn format_connectivity_section(issues: &[String], has_baseline: bool) -> String {
+fn format_connectivity_section(
+    missing: &[String],
+    orphaned: &[OrphanedEndpoint],
+    has_baseline: bool,
+) -> String {
     let mut output = String::new();
 
     let heading = if has_baseline {
@@ -476,7 +484,7 @@ fn format_connectivity_section(issues: &[String], has_baseline: bool) -> String 
     output.push_str(&format!(
         "<details>\n<summary><strong>{} ({})</strong></summary>\n\n",
         heading,
-        issues.len()
+        missing.len() + orphaned.len()
     ));
 
     output.push_str("> Orphaned endpoints have no consumer in the indexed services. Missing endpoints have a consumer call but no producer.\n\n");
@@ -485,24 +493,51 @@ fn format_connectivity_section(issues: &[String], has_baseline: bool) -> String 
         output.push_str("> **First repo indexed for this project.** With nothing else to match against, every endpoint without a same-repo consumer is listed below; most resolve once you connect the repos that call them.\n\n");
     }
 
-    let (missing, orphaned) = separate_missing_orphaned(issues);
-
     if !missing.is_empty() {
         output.push_str(&format!("**Missing ({})**\n\n", missing.len()));
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
-        for endpoint in missing {
-            let (method, path) = extract_method_path(endpoint);
-            output.push_str(&format!("| `{}` | `{}` |\n", method, path));
+        for issue in missing {
+            let (method, path) = extract_method_path(issue);
+            output.push_str(&format!(
+                "| `{}` | `{}` |\n",
+                code_cell(&method),
+                code_cell(&path)
+            ));
         }
         output.push('\n');
     }
 
     if !orphaned.is_empty() {
         output.push_str(&format!("**Orphaned ({})**\n\n", orphaned.len()));
-        output.push_str("| Method | Path |\n| :--- | :--- |\n");
-        for endpoint in orphaned {
-            let (method, path) = extract_method_path(endpoint);
-            output.push_str(&format!("| `{}` | `{}` |\n", method, path));
+        // Show the owning-service column only when at least one orphan is
+        // attributed (single-repo runs have none, so the column is dropped).
+        if orphaned.iter().any(|o| o.service.is_some()) {
+            output.push_str("| Method | Path | Service |\n| :--- | :--- | :--- |\n");
+            for o in orphaned {
+                // A row can be unattributed even when the column is shown (e.g.
+                // a GraphQL orphan alongside an attributed HTTP one); use a dash
+                // rather than an empty cell.
+                let service = o
+                    .service
+                    .as_deref()
+                    .map(|s| format!("`{}`", code_cell(s)))
+                    .unwrap_or_else(|| "-".to_string());
+                output.push_str(&format!(
+                    "| `{}` | `{}` | {} |\n",
+                    code_cell(&o.method),
+                    code_cell(&o.path),
+                    service
+                ));
+            }
+        } else {
+            output.push_str("| Method | Path |\n| :--- | :--- |\n");
+            for o in orphaned {
+                output.push_str(&format!(
+                    "| `{}` | `{}` |\n",
+                    code_cell(&o.method),
+                    code_cell(&o.path)
+                ));
+            }
         }
     }
 
@@ -1241,48 +1276,6 @@ mod tests {
     }
 
     #[test]
-    fn test_separate_missing_orphaned_routes_both_kinds() {
-        // Regression test: pre-fix, the "Missing endpoint for ..." prefix
-        // was checked as "Missing endpoint:" (with colon) which never matched
-        // the analyzer's actual output, so every missing-endpoint entry was
-        // silently filtered out before rendering.
-        let issues = vec![
-            "Missing endpoint for POST /api/orders (normalized: /api/orders) (called from src/client.ts)".to_string(),
-            "Orphaned endpoint: GET /api/users in src/routes.ts:42".to_string(),
-            "Missing endpoint for DELETE /items/:id (normalized: /items/:id) (called from src/items.ts)".to_string(),
-            "Orphaned endpoint: PUT /api/sessions in src/sessions.ts:7".to_string(),
-        ];
-
-        let (missing, orphaned) = separate_missing_orphaned(&issues);
-
-        assert_eq!(
-            missing.len(),
-            2,
-            "both missing-endpoint entries must route to the missing bucket"
-        );
-        assert_eq!(
-            orphaned.len(),
-            2,
-            "both orphaned-endpoint entries must route to the orphaned bucket"
-        );
-        assert!(missing[0].contains("POST /api/orders"));
-        assert!(missing[1].contains("DELETE /items/:id"));
-        assert!(orphaned[0].contains("GET /api/users"));
-        assert!(orphaned[1].contains("PUT /api/sessions"));
-    }
-
-    #[test]
-    fn test_separate_missing_orphaned_ignores_unrelated() {
-        let issues = vec![
-            "Some other diagnostic about types".to_string(),
-            "Missing endpoint for GET /a (normalized: /a) (called from src/x.ts)".to_string(),
-        ];
-        let (missing, orphaned) = separate_missing_orphaned(&issues);
-        assert_eq!(missing.len(), 1);
-        assert!(orphaned.is_empty());
-    }
-
-    #[test]
     fn test_no_baseline_excludes_connectivity_from_headline_count() {
         // First repo indexed (has_cross_repo_baseline = false): connectivity
         // findings are inconclusive (no peers to match against) so they must be
@@ -1292,8 +1285,16 @@ mod tests {
         let issues = ApiIssues {
             call_issues: vec![],
             endpoint_issues: vec![
-                "Orphaned endpoint: GET /api/users in src/routes.ts:42".to_string(),
-                "Orphaned endpoint: PUT /api/sessions in src/sessions.ts:7".to_string(),
+                OrphanedEndpoint {
+                    method: "GET".to_string(),
+                    path: "/api/users".to_string(),
+                    service: None,
+                },
+                OrphanedEndpoint {
+                    method: "PUT".to_string(),
+                    path: "/api/sessions".to_string(),
+                    service: None,
+                },
             ],
             env_var_calls: vec![],
             mismatches: vec![],
@@ -1481,8 +1482,11 @@ mod tests {
         issues.type_mismatches = vec![
             "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
         ];
-        issues.endpoint_issues =
-            vec!["Orphaned endpoint: GET /legacy/ping in src/legacy.ts:3".to_string()];
+        issues.endpoint_issues = vec![OrphanedEndpoint {
+            method: "GET".to_string(),
+            path: "/legacy/ping".to_string(),
+            service: Some("billing".to_string()),
+        }];
         let output = format_analysis_results(result_with(issues), &topology_baseline());
 
         for banned in ["✅", "ℹ️", "⚠️", "❌", "🔁"] {
@@ -1495,5 +1499,80 @@ mod tests {
         }
         // The brand mark is intentionally retained.
         assert!(output.contains("🪢"));
+    }
+
+    #[test]
+    fn test_orphaned_endpoints_show_service_when_attributed() {
+        // When orphans carry an owning service, the connectivity table gains a
+        // Service column naming where each lives.
+        let mut issues = empty_issues();
+        issues.endpoint_issues = vec![
+            OrphanedEndpoint {
+                method: "GET".to_string(),
+                path: "/users".to_string(),
+                service: Some("auth".to_string()),
+            },
+            OrphanedEndpoint {
+                method: "POST".to_string(),
+                path: "/charges".to_string(),
+                service: Some("billing".to_string()),
+            },
+        ];
+        let output = format_analysis_results(result_with(issues), &topology_baseline());
+
+        assert!(output.contains("| Method | Path | Service |"));
+        assert!(output.contains("| `GET` | `/users` | `auth` |"));
+        assert!(output.contains("| `POST` | `/charges` | `billing` |"));
+    }
+
+    #[test]
+    fn test_orphaned_endpoints_omit_service_column_when_unattributed() {
+        // A lone repo has no service attribution, so the column is dropped
+        // rather than rendering an empty cell per row.
+        let mut issues = empty_issues();
+        issues.endpoint_issues = vec![OrphanedEndpoint {
+            method: "GET".to_string(),
+            path: "/legacy/ping".to_string(),
+            service: None,
+        }];
+        let output = format_analysis_results(result_with(issues), &topology_first_repo());
+
+        assert!(!output.contains("Service |"));
+        assert!(output.contains("| `GET` | `/legacy/ping` |"));
+    }
+
+    #[test]
+    fn test_cell_escapes_pipes_and_collapses_line_breaks() {
+        assert_eq!(cell("a|b"), "a\\|b");
+        assert_eq!(cell("a\r\nb"), "a b");
+        assert_eq!(cell("a\rb"), "a b");
+        assert_eq!(cell("a\nb"), "a b");
+        // code_cell additionally drops backticks for inline-code cells.
+        assert_eq!(code_cell("x`y|z"), "xy\\|z");
+    }
+
+    #[test]
+    fn test_orphaned_mixed_attribution_uses_dash_and_escapes_cells() {
+        // When the Service column is shown, an unattributed row gets a dash, and
+        // any pipe in a value is escaped so it can't break the table.
+        let mut issues = empty_issues();
+        issues.endpoint_issues = vec![
+            OrphanedEndpoint {
+                method: "GET".to_string(),
+                path: "/users".to_string(),
+                // Backtick must be stripped so it can't break the code span.
+                service: Some("au`th".to_string()),
+            },
+            OrphanedEndpoint {
+                method: "QUERY".to_string(),
+                path: "weird|field".to_string(),
+                service: None,
+            },
+        ];
+        let output = format_analysis_results(result_with(issues), &topology_baseline());
+
+        assert!(output.contains("| `GET` | `/users` | `auth` |"));
+        // Unattributed row → dash, and the pipe in the path is escaped.
+        assert!(output.contains("| `QUERY` | `weird\\|field` | - |"));
     }
 }
