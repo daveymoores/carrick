@@ -272,26 +272,35 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         debug!("Skipping upload (PR/branch mode)");
     }
 
-    // Capture this repo's previously-indexed endpoints (its last uploaded state,
-    // i.e. main) before they're removed below. On a PR run, diffing the current
-    // scan against them yields what THIS change added. Keyed by (service, key)
-    // so that in a monorepo an endpoint newly added to one service still counts
-    // as new even if a sibling service already exposes the same route.
+    // On a PR run, capture this repo's previously-indexed endpoints (its last
+    // uploaded state, i.e. main) before they're removed below, so the diff can
+    // surface what THIS change added. Keyed by (service, key) so that in a
+    // monorepo an endpoint newly added to one service still counts as new even
+    // if a sibling service already exposes the same route. `had_prior_index` is
+    // tracked separately so a prior scan that indexed zero endpoints still
+    // counts as a baseline, rather than being conflated with a first-ever scan
+    // where "new" is meaningless. Skipped entirely off PR runs, where the block
+    // is suppressed anyway.
     type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
-    // Whether this repo was indexed at all before. Tracked separately from the
-    // key set so that a prior scan which happened to index zero endpoints still
-    // counts as a baseline (its newly-added endpoints are genuinely new), rather
-    // than being conflated with a first-ever scan where "new" is meaningless.
-    let had_prior_index = all_repo_data.iter().any(|repo| repo.repo_name == repo_name);
-    let previous_self_keys: std::collections::HashSet<ServiceEndpointKey> = all_repo_data
-        .iter()
-        .filter(|repo| repo.repo_name == repo_name)
-        .flat_map(|repo| {
-            repo.endpoints
-                .iter()
-                .map(|e| (repo.service_name.clone(), e.key.clone()))
-        })
-        .collect();
+    let is_pr_run = pr_number_from_env().is_some();
+    let (had_prior_index, previous_self_keys): (
+        bool,
+        std::collections::HashSet<ServiceEndpointKey>,
+    ) = if is_pr_run {
+        let had = all_repo_data.iter().any(|repo| repo.repo_name == repo_name);
+        let keys = all_repo_data
+            .iter()
+            .filter(|repo| repo.repo_name == repo_name)
+            .flat_map(|repo| {
+                repo.endpoints
+                    .iter()
+                    .map(|e| (repo.service_name.clone(), e.key.clone()))
+            })
+            .collect();
+        (had, keys)
+    } else {
+        (false, std::collections::HashSet::new())
+    };
 
     // 6. Cross-repo analysis (reuse already-downloaded data).
     // Remove this repo's downloaded copies so the freshly-analyzed services
@@ -313,7 +322,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // On a PR run with a prior index, surface what this change added: endpoints
     // in the freshly-analyzed services that the previous index didn't have.
     // Computed before `current_services_data` is moved into the analyzer.
-    let pr_delta = if pr_number_from_env().is_some() && had_prior_index {
+    let pr_delta = if is_pr_run && had_prior_index {
         let mut new_endpoints = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for service_data in &current_services_data {
