@@ -449,11 +449,13 @@ fn summarize_critical(issue: &str) -> (String, String) {
     }
 }
 
-/// Escape a value for a Markdown table cell: no pipes, no newlines.
+/// Escape a value for a Markdown table cell: no pipes, and no line breaks
+/// (CRLF, lone CR, or LF) that would otherwise split the row.
 fn cell(value: &str) -> String {
     value
         .replace('|', "\\|")
-        .replace('\n', " ")
+        .replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
         .trim()
         .to_string()
 }
@@ -1537,6 +1539,16 @@ mod tests {
 
         assert!(!output.contains("Service |"));
         assert!(output.contains("| `GET` | `/legacy/ping` |"));
+    }
+
+    #[test]
+    fn test_cell_escapes_pipes_and_collapses_line_breaks() {
+        assert_eq!(cell("a|b"), "a\\|b");
+        assert_eq!(cell("a\r\nb"), "a b");
+        assert_eq!(cell("a\rb"), "a b");
+        assert_eq!(cell("a\nb"), "a b");
+        // code_cell additionally drops backticks for inline-code cells.
+        assert_eq!(code_cell("x`y|z"), "xy\\|z");
     }
 
     #[test]
