@@ -224,12 +224,12 @@ fn format_pr_delta(pr_delta: Option<&PrDelta>) -> String {
         let suffix = ep
             .service
             .as_deref()
-            .map(|s| format!(" ({})", s))
+            .map(|s| format!(" (`{}`)", code_span(s)))
             .unwrap_or_default();
         output.push_str(&format!(
             "- New endpoint `{} {}`{}\n",
-            code_cell(&ep.method),
-            code_cell(&ep.path),
+            code_span(&ep.method),
+            code_span(&ep.path),
             suffix
         ));
     }
@@ -528,6 +528,19 @@ fn cell(value: &str) -> String {
 /// out of the code span and could inject Markdown.
 fn code_cell(value: &str) -> String {
     cell(value).replace('`', "")
+}
+
+/// Sanitize a value wrapped in inline-code backticks in prose (not a table):
+/// collapse line breaks and drop backticks so the value can't break out of the
+/// span. Unlike `code_cell` it does not escape pipes, which are literal in a
+/// code span outside a table (escaping them would show a stray backslash).
+fn code_span(value: &str) -> String {
+    value
+        .replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
+        .replace('`', "")
+        .trim()
+        .to_string()
 }
 
 fn format_connectivity_section(
@@ -1667,7 +1680,7 @@ mod tests {
             format_analysis_results(result_with(issues), &topology_baseline(), Some(&delta));
 
         assert!(output.contains("**In this PR**"));
-        assert!(output.contains("- New endpoint `POST /v2/invoices` (billing)"));
+        assert!(output.contains("- New endpoint `POST /v2/invoices` (`billing`)"));
         assert!(output.contains("- New endpoint `GET /charges`"));
         // The strip sits above the findings sections.
         let strip_at = output.find("**In this PR**").unwrap();
@@ -1702,5 +1715,29 @@ mod tests {
         assert!(output.contains("> [!TIP]"));
         assert!(output.contains("**In this PR**"));
         assert!(output.contains("- New endpoint `GET /health`"));
+    }
+
+    #[test]
+    fn test_pr_delta_strip_inline_code_is_prose_safe() {
+        // In a prose code span a pipe is literal (must not be backslash-escaped
+        // the way a table cell would), and a backtick in the service is dropped.
+        let delta = PrDelta {
+            new_endpoints: vec![NewEndpoint {
+                method: "GET".to_string(),
+                path: "/a|b".to_string(),
+                service: Some("sv`c".to_string()),
+            }],
+        };
+        let output = format_analysis_results(
+            result_with(empty_issues()),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains("- New endpoint `GET /a|b` (`svc`)"));
+        assert!(
+            !output.contains("\\|"),
+            "prose code span must not escape pipes"
+        );
     }
 }

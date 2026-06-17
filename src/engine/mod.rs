@@ -272,16 +272,22 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         debug!("Skipping upload (PR/branch mode)");
     }
 
-    // Capture this repo's previously-indexed endpoint keys (its last uploaded
-    // state, i.e. main) before they're removed below. On a PR run, diffing the
-    // current scan against them yields what THIS change added. Empty on the
-    // first scan, in which case the "In this PR" block is suppressed.
-    let previous_self_keys: std::collections::HashSet<crate::operation::OperationKey> =
-        all_repo_data
-            .iter()
-            .filter(|repo| repo.repo_name == repo_name)
-            .flat_map(|repo| repo.endpoints.iter().map(|e| e.key.clone()))
-            .collect();
+    // Capture this repo's previously-indexed endpoints (its last uploaded state,
+    // i.e. main) before they're removed below. On a PR run, diffing the current
+    // scan against them yields what THIS change added. Keyed by (service, key)
+    // so that in a monorepo an endpoint newly added to one service still counts
+    // as new even if a sibling service already exposes the same route. Empty on
+    // the first scan, in which case the "In this PR" block is suppressed.
+    type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
+    let previous_self_keys: std::collections::HashSet<ServiceEndpointKey> = all_repo_data
+        .iter()
+        .filter(|repo| repo.repo_name == repo_name)
+        .flat_map(|repo| {
+            repo.endpoints
+                .iter()
+                .map(|e| (repo.service_name.clone(), e.key.clone()))
+        })
+        .collect();
 
     // 6. Cross-repo analysis (reuse already-downloaded data).
     // Remove this repo's downloaded copies so the freshly-analyzed services
@@ -308,8 +314,8 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         let mut seen = std::collections::HashSet::new();
         for service_data in &current_services_data {
             for endpoint in &service_data.endpoints {
-                if !previous_self_keys.contains(&endpoint.key) && seen.insert(endpoint.key.clone())
-                {
+                let id = (service_data.service_name.clone(), endpoint.key.clone());
+                if !previous_self_keys.contains(&id) && seen.insert(id) {
                     let (method, path) = endpoint.key.display_labels();
                     new_endpoints.push(crate::formatter::NewEndpoint {
                         method,
