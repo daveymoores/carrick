@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.31](https://github.com/daveymoores/carrick/compare/carrick-v0.1.30...carrick-v0.1.31) (2026-06-17)
+
+
+### Bug Fixes
+
+* **action:** stop 404 body poisoning the release download URL ([#160](https://github.com/daveymoores/carrick/issues/160)) ([6de05f7](https://github.com/daveymoores/carrick/commit/6de05f798e43673828be27e4eab80afa6d840597))
+
 ## [0.1.30](https://github.com/daveymoores/carrick/compare/carrick-v0.1.29...carrick-v0.1.30) (2026-06-12)
 
 
