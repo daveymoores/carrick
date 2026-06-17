@@ -28,22 +28,71 @@ runs:
         node-version: "24"
 
     - name: Download Carrick
+      id: download
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases/latest --jq '.assets[] | select(.name=="carrick-action-linux.tar.gz") | .browser_download_url')
-        curl -L -o carrick-action.tar.gz "$DOWNLOAD_URL"
-        tar -xzf carrick-action.tar.gz
-        chmod +x carrick
+        ASSET="carrick-action-linux.tar.gz"
+        JQ_ASSET_URL=".assets[] | select(.name==\"$ASSET\") | .browser_download_url"
+
+        # `gh api` prints the JSON error body to stdout on a 404 (e.g. a release
+        # tag that doesn't exist). Captured into DOWNLOAD_URL that blob is
+        # non-empty, so it slips past the `-z` fallback guards below and is
+        # handed to curl as a "URL". Only accept a value that is actually one.
+        valid_url() { case "$1" in https://*) return 0 ;; *) return 1 ;; esac; }
+
+        # Pin the binary to the release matching this action checkout:
+        # release-please bumps Cargo.toml in the same commit it tags, so the
+        # version here identifies the release this ref shipped with. Without
+        # this, every run floated to the latest release regardless of which
+        # action ref the workflow pinned.
+        VERSION=$(grep -m1 '^version' "$GITHUB_ACTION_PATH/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+        echo "Resolving Carrick release for version $VERSION"
+
+        # release-please tags releases as carrick-v<version>.
+        DOWNLOAD_URL=$(gh api "repos/daveymoores/carrick/releases/tags/carrick-v$VERSION" \
+          --jq "$JQ_ASSET_URL" 2>/dev/null || true)
+        valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
+
+        if [ -z "$DOWNLOAD_URL" ]; then
+          # Fallback for any other tag scheme: match a release whose tag ends
+          # with this version.
+          DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases --paginate \
+            --jq ".[] | select(.tag_name | endswith(\"$VERSION\")) | $JQ_ASSET_URL" \
+            2>/dev/null | head -n 1 || true)
+          valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
+        fi
+
+        if [ -z "$DOWNLOAD_URL" ]; then
+          echo "::warning::No release found matching version $VERSION (expected when running from an untagged ref); falling back to the latest release"
+          DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases/latest --jq "$JQ_ASSET_URL" 2>/dev/null || true)
+          valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
+        fi
+
+        if [ -z "$DOWNLOAD_URL" ]; then
+          echo "::error::Could not resolve a download URL for $ASSET from any release of daveymoores/carrick"
+          exit 1
+        fi
+
+        # Extract into a scratch directory: extracting into the workspace
+        # would clobber any carrick/ts_check/sidecar paths in the user's repo
+        # and pollute their scan root.
+        DIST_DIR="$RUNNER_TEMP/carrick-dist"
+        mkdir -p "$DIST_DIR"
+        echo "Downloading $DOWNLOAD_URL"
+        curl -fsSL --retry 3 --retry-delay 2 -o "$DIST_DIR/$ASSET" "$DOWNLOAD_URL"
+        tar -xzf "$DIST_DIR/$ASSET" -C "$DIST_DIR"
+        chmod +x "$DIST_DIR/carrick"
+        echo "dist-dir=$DIST_DIR" >> "$GITHUB_OUTPUT"
 
     - name: Install ts_check dependencies
       shell: bash
-      run: cd ts_check && npm ci
+      run: cd "${{ steps.download.outputs.dist-dir }}/ts_check" && npm ci
 
     - name: Install sidecar dependencies
       shell: bash
-      run: cd sidecar && npm ci
+      run: cd "${{ steps.download.outputs.dist-dir }}/sidecar" && npm ci
 
     - name: Run analysis
       id: analysis
@@ -56,7 +105,7 @@ runs:
         CI: "true"
       run: |
         set +e
-        ./carrick ${{ inputs.path }} > analysis.log 2>&1
+        "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" > analysis.log 2>&1
         EXIT_CODE=$?
         set -e
 

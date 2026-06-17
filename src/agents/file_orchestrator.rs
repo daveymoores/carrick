@@ -19,18 +19,21 @@
 use crate::{
     agent_service::AgentService,
     agents::{
-        file_analyzer_agent::{EndpointResult, FileAnalysisResult, FileAnalyzerAgent},
-        framework_guidance_agent::FrameworkGuidance,
+        file_analyzer_agent::{
+            EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
+        },
+        framework_guidance_agent::ProtocolGuidance,
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
-    packages::Packages,
+    operation::{OperationKey, Protocol},
     parser::parse_file,
     services::type_sidecar::{
-        InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult, TypeSidecar,
+        ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
+        TypeSidecar,
     },
     swc_scanner::{CandidateTarget, SwcScanner},
     type_manifest::{
@@ -39,7 +42,6 @@ use crate::{
     },
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
-    wrapper_registry::wrapper_rules_for_packages,
 };
 use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -74,6 +76,14 @@ pub struct ProcessingStats {
     pub files_skipped: usize,
     /// Files skipped because SWC found no API candidates (zero-cost skips)
     pub files_skipped_no_candidates: usize,
+    /// Files excluded because they could not be parsed. Counted separately
+    /// from zero-cost skips: a parse failure silently removes the file's
+    /// endpoints from the index. A subset of `files_skipped`.
+    pub files_parse_failed: usize,
+    /// Files whose only candidates belong to protocols without a registered
+    /// analyze-file prompt (e.g. raw WebSocket constructors). Skipped instead
+    /// of being fed to the HTTP prompt, which couldn't classify them.
+    pub files_skipped_unrouted_protocol: usize,
     pub total_mounts: usize,
     pub total_endpoints: usize,
     /// Endpoints derived structurally from file-based routing conventions
@@ -136,12 +146,19 @@ impl FileOrchestrator {
     pub async fn analyze_files(
         &self,
         files: &[PathBuf],
-        guidance: &FrameworkGuidance,
+        guidance: &ProtocolGuidance,
         framework_detection: &DetectionResult,
         repo_root: &Path,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
+
+        // Per-protocol prompt routing: each protocol with a registered LLM
+        // pass analyzes only its own candidates, so prompts stay focused.
+        // HTTP is the only routed protocol today.
+        let guidance = guidance
+            .get(&Protocol::Http)
+            .ok_or("missing HTTP guidance: guidance map must contain the http protocol")?;
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
@@ -202,6 +219,33 @@ impl FileOrchestrator {
                 &framework_detection.data_fetchers,
             );
 
+            // A parse failure excludes the whole file (and any endpoints in
+            // it) from the index — surface it instead of letting it look like
+            // a healthy file with no API patterns.
+            if scan_result.parse_failed {
+                warn!(
+                    "Failed to parse {} — file excluded from analysis; any endpoints in it \
+                     will be missing from the index",
+                    path_str
+                );
+                stats.errors.push(format!("Parse failure: {}", path_str));
+                stats.files_skipped += 1;
+                stats.files_parse_failed += 1;
+                // Store empty result so incremental cache knows this file was processed
+                file_results.insert(path_str, FileAnalysisResult::default());
+                continue;
+            }
+
+            // Protocol dispatch: the HTTP analyze-file prompt only ever sees
+            // HTTP candidates. Candidates of protocols without a registered
+            // prompt (raw WebSocket/EventSource constructors today) are set
+            // aside; a file with only those is skipped, not sent to a prompt
+            // that has no instructions for them.
+            let (http_candidates, unrouted_candidates): (Vec<_>, Vec<_>) = scan_result
+                .candidates
+                .into_iter()
+                .partition(|candidate| candidate.protocol == Protocol::Http);
+
             // File-based routing: routes declared by file location (Next.js app
             // router, etc.) have no call-site candidate — the endpoint *is* the
             // exported handler declaration. The path comes from the layout and the
@@ -220,17 +264,11 @@ impl FileOrchestrator {
                 )
             };
 
-            // STEP 2: Check Relevance - if no candidates, SKIP the (expensive) LLM
-            // call. File-based route endpoints are still recorded: they're derived
-            // structurally and need no LLM.
-            if !scan_result.should_analyze {
-                if route_endpoints.is_empty() {
-                    debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
-                    stats.files_skipped += 1;
-                    stats.files_skipped_no_candidates += 1;
-                    // Store empty result so incremental cache knows this file was processed
-                    file_results.insert(path_str, FileAnalysisResult::default());
-                } else {
+            // STEP 2: Check Relevance - if there are no candidates for a routed
+            // protocol, SKIP the (expensive) LLM call. File-based route endpoints
+            // are still recorded: they're derived structurally and need no LLM.
+            if http_candidates.is_empty() {
+                if !route_endpoints.is_empty() {
                     debug!(
                         "File-based route (no call-site candidates): {} [{} endpoint(s)]",
                         path_str,
@@ -245,29 +283,40 @@ impl FileOrchestrator {
                             ..Default::default()
                         },
                     );
+                } else if unrouted_candidates.is_empty() {
+                    debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
+                    stats.files_skipped += 1;
+                    stats.files_skipped_no_candidates += 1;
+                    // Store empty result so incremental cache knows this file was processed
+                    file_results.insert(path_str, FileAnalysisResult::default());
+                } else {
+                    debug!(
+                        "Skipped (only unrouted-protocol candidates): {} [{} candidate(s)]",
+                        path_str,
+                        unrouted_candidates.len()
+                    );
+                    stats.files_skipped += 1;
+                    stats.files_skipped_unrouted_protocol += 1;
+                    file_results.insert(path_str, FileAnalysisResult::default());
                 }
                 continue;
             }
 
             debug!(
-                "Analyzing: {} [{} candidates detected by SWC]",
+                "Analyzing: {} [{} HTTP candidate(s), {} unrouted]",
                 path_str,
-                scan_result.candidates.len()
+                http_candidates.len(),
+                unrouted_candidates.len()
             );
 
             // STEP 3: Prepare Candidate Targets as hints for the LLM
-            let candidate_hints: Vec<String> = scan_result
-                .candidates
-                .iter()
-                .map(|c| c.format_hint())
-                .collect();
-            let candidate_contexts: Vec<String> = scan_result
-                .candidates
+            let candidate_hints: Vec<String> =
+                http_candidates.iter().map(|c| c.format_hint()).collect();
+            let candidate_contexts: Vec<String> = http_candidates
                 .iter()
                 .map(|c| serde_json::to_string(c).unwrap_or_default())
                 .collect();
-            let candidate_map: HashMap<String, CandidateTarget> = scan_result
-                .candidates
+            let candidate_map: HashMap<String, CandidateTarget> = http_candidates
                 .iter()
                 .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
                 .collect();
@@ -326,7 +375,7 @@ impl FileOrchestrator {
                     // using the compiler-based approach instead of position-based extraction.
 
                     let mut adjusted = result;
-                    Self::apply_candidate_map(&mut adjusted, &pf.candidate_map);
+                    Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
@@ -357,6 +406,12 @@ impl FileOrchestrator {
             "  - Zero-cost skips (no API patterns): {}",
             stats.files_skipped_no_candidates
         );
+        if stats.files_parse_failed > 0 {
+            warn!(
+                "{} file(s) failed to parse and are excluded from the index",
+                stats.files_parse_failed
+            );
+        }
         debug!("  - Total mounts: {}", stats.total_mounts);
         debug!("  - Total endpoints: {}", stats.total_endpoints);
         debug!(
@@ -542,7 +597,11 @@ impl FileOrchestrator {
                 continue;
             };
             let path = normalizer.extract_path(&data_call.target_url);
-            let call_id = build_call_site_id(&file_path, line_number, &method, &path);
+            let call_id = build_call_site_id(
+                &file_path,
+                line_number,
+                &OperationKey::http(&method, path.clone()),
+            );
             data_call_lookup
                 .entry((file_path, line_number))
                 .or_default()
@@ -586,46 +645,54 @@ impl FileOrchestrator {
                 if !is_http_method(&method) || !path.starts_with('/') {
                     continue;
                 }
+                let key = OperationKey::http(&method, path.clone());
                 let response_alias = build_manifest_type_alias(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Producer,
                     ManifestTypeKind::Response,
                 );
                 let request_alias = build_manifest_type_alias(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Producer,
                     ManifestTypeKind::Request,
                 );
 
-                if let (Some(symbol), Some(import_source)) =
-                    (&endpoint.primary_type_symbol, &endpoint.type_import_source)
-                {
-                    // Explicit type with import source - bundle it
-                    push_explicit(
-                        symbol.clone(),
-                        Self::resolve_import_path(&file_path_absolute, import_source),
-                        Some(response_alias.clone()),
-                    );
-                } else if endpoint.primary_type_symbol.is_some()
-                    && endpoint.type_import_source.is_none()
-                {
-                    // Type symbol exists but no import - it might be in the same file
-                    if let Some(ref symbol) = endpoint.primary_type_symbol {
+                // no-payload endpoints have no recoverable response contract:
+                // skip the explicit-symbol bundling as well as inference below,
+                // so the manifest entry stays honestly `unknown` (with its
+                // evidence) instead of publishing a phantom contract from a
+                // type hint the handler never sends.
+                let no_payload = endpoint.emission_style == Some(EmissionStyle::NoPayload);
+
+                if !no_payload {
+                    if let (Some(symbol), Some(import_source)) =
+                        (&endpoint.primary_type_symbol, &endpoint.type_import_source)
+                    {
+                        // Explicit type with import source - bundle it
                         push_explicit(
                             symbol.clone(),
-                            file_path_absolute.clone(),
+                            Self::resolve_import_path(&file_path_absolute, import_source),
                             Some(response_alias.clone()),
                         );
+                    } else if endpoint.primary_type_symbol.is_some()
+                        && endpoint.type_import_source.is_none()
+                    {
+                        // Type symbol exists but no import - it might be in the same file
+                        if let Some(ref symbol) = endpoint.primary_type_symbol {
+                            push_explicit(
+                                symbol.clone(),
+                                file_path_absolute.clone(),
+                                Some(response_alias.clone()),
+                            );
+                        }
+                    } else if endpoint.type_import_source.is_some()
+                        && endpoint.primary_type_symbol.is_none()
+                    {
+                        warn!(
+                            "[FileOrchestrator] Endpoint at {}:{} has import source {:?} but no symbol; relying on inference",
+                            file_path, line_number, endpoint.type_import_source
+                        );
                     }
-                } else if endpoint.type_import_source.is_some()
-                    && endpoint.primary_type_symbol.is_none()
-                {
-                    warn!(
-                        "[FileOrchestrator] Endpoint at {}:{} has import source {:?} but no symbol; relying on inference",
-                        file_path, line_number, endpoint.type_import_source
-                    );
                 }
 
                 // File-based routes (Next.js app router, etc.) have no call-site
@@ -639,40 +706,86 @@ impl FileOrchestrator {
                 // inference is skipped: a Next.js request body isn't recoverable
                 // from the signature.
                 if endpoint.owner_node == FILE_BASED_ROUTE_OWNER {
-                    let inferred = push_infer(
-                        &file_path_absolute,
-                        line_number,
-                        InferKind::FunctionReturn,
-                        response_alias.clone(),
-                        InferLocator::Line,
-                    );
-                    if !inferred && let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
-                        inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    // Structurally derived endpoints never carry an
+                    // emission_style today, but the no-payload gate must hold
+                    // here too if that ever changes — a no-payload claim means
+                    // the manifest stays honestly unknown, with no inference.
+                    if !no_payload {
+                        // The Line locator is infallible, so no inline-alias
+                        // fallback is needed here.
+                        push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::FunctionReturn,
+                            response_alias.clone(),
+                            InferLocator::Line,
+                        );
                     }
                     continue;
                 }
 
-                let response_inferred = push_infer(
-                    &file_path_absolute,
-                    line_number,
-                    InferKind::ResponseBody,
-                    response_alias.clone(),
-                    InferLocator::Text {
-                        expression_text: endpoint.response_expression_text.as_deref(),
-                        expression_line: endpoint.response_expression_line,
-                    },
-                ) || push_infer(
-                    &file_path_absolute,
-                    line_number,
-                    InferKind::ResponseBody,
-                    response_alias.clone(),
-                    InferLocator::Span {
-                        span_start: endpoint.call_expression_span_start,
-                        span_end: endpoint.call_expression_span_end,
-                    },
-                );
-                if !response_inferred && let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
-                    inline_aliases.push((response_alias.clone(), symbol.clone()));
+                // Route response inference by the model's emission_style
+                // classification. `None` (field omitted — e.g. cached
+                // pre-emission-style analysis) falls back to imperative-send,
+                // which is the historical behavior.
+                match endpoint.emission_style {
+                    // The handler's return value IS the payload: ask for the
+                    // handler's return type. Prefer the text locator — the
+                    // sidecar resolves the expression's *containing* function,
+                    // which finds the exact handler even when it's a named
+                    // reference declared far from the registration line. Fall
+                    // back to the registration line (correct for inline
+                    // handlers, whose function starts on that line) when the
+                    // model gave no expression.
+                    Some(EmissionStyle::ReturnValue) => {
+                        let _ = push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::FunctionReturn,
+                            response_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: endpoint.response_expression_text.as_deref(),
+                                expression_line: endpoint.response_expression_line,
+                            },
+                        ) || push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::FunctionReturn,
+                            response_alias.clone(),
+                            InferLocator::Line,
+                        );
+                    }
+                    // No recoverable payload expression (zero-arg sends,
+                    // streams, helper-written payloads): skip inference. The
+                    // manifest entry keeps `unknown` with its evidence —
+                    // honest, instead of inferring from the wrong node.
+                    Some(EmissionStyle::NoPayload) => {}
+                    Some(EmissionStyle::ImperativeSend) | None => {
+                        let response_inferred = push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::ResponseBody,
+                            response_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: endpoint.response_expression_text.as_deref(),
+                                expression_line: endpoint.response_expression_line,
+                            },
+                        ) || push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::ResponseBody,
+                            response_alias.clone(),
+                            InferLocator::Span {
+                                span_start: endpoint.call_expression_span_start,
+                                span_end: endpoint.call_expression_span_end,
+                            },
+                        );
+                        if !response_inferred
+                            && let Some(symbol) = endpoint.primary_type_symbol.as_ref()
+                        {
+                            inline_aliases.push((response_alias.clone(), symbol.clone()));
+                        }
+                    }
                 }
 
                 if should_infer_request_body(&method) {
@@ -740,21 +853,19 @@ impl FileOrchestrator {
                             build_call_site_id(
                                 file_path,
                                 line_number,
-                                &method_fallback,
-                                &target_path,
+                                &OperationKey::http(&method_fallback, target_path.clone()),
                             ),
                         )
                     });
+                let key = OperationKey::http(&method, path.clone());
                 let response_alias = build_manifest_type_alias_with_call_id(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Response,
                     Some(&call_id),
                 );
                 let request_alias = build_manifest_type_alias_with_call_id(
-                    &method,
-                    &path,
+                    &key,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Request,
                     Some(&call_id),
@@ -998,6 +1109,7 @@ impl FileOrchestrator {
                         payload_expression_line: None,
                         response_expression_text: None,
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     }
@@ -1035,19 +1147,38 @@ impl FileOrchestrator {
     fn apply_candidate_map(
         result: &mut FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
+        file_path: &str,
     ) {
-        // Endpoints: keep filter_map (endpoints without candidates are unreliable)
+        // Endpoints: keep filter_map (endpoints without candidates are unreliable),
+        // but a drop means an endpoint the LLM reported vanishes from the index —
+        // log which, so silent loss is at least diagnosable.
+        let mut dropped_endpoints: Vec<String> = Vec::new();
         result.endpoints = result
             .endpoints
             .drain(..)
             .filter_map(|mut endpoint| {
-                let candidate = candidate_map.get(&endpoint.candidate_id)?;
+                let Some(candidate) = candidate_map.get(&endpoint.candidate_id) else {
+                    dropped_endpoints.push(format!(
+                        "{} {} (candidate_id '{}')",
+                        endpoint.method, endpoint.path, endpoint.candidate_id
+                    ));
+                    return None;
+                };
                 endpoint.line_number = candidate.line_number as i32;
                 endpoint.call_expression_span_start = Some(candidate.span_start);
                 endpoint.call_expression_span_end = Some(candidate.span_end);
                 Some(endpoint)
             })
             .collect();
+
+        if !dropped_endpoints.is_empty() {
+            warn!(
+                "[FileOrchestrator] {} endpoint(s) in {} dropped — no matching SWC candidate: {}",
+                dropped_endpoints.len(),
+                file_path,
+                dropped_endpoints.join(", ")
+            );
+        }
 
         // Data calls: preserve even without candidate match (inline aliases still work)
         let mut dropped_count = 0;
@@ -1083,7 +1214,7 @@ impl FileOrchestrator {
     /// * `sidecar` - The TypeSidecar instance for type resolution
     /// * `file_results` - Analysis results keyed by file path
     /// * `repo_path` - Path to the repository root (used to convert relative paths to absolute)
-    /// * `packages` - Dependency metadata used for wrapper rule selection
+    /// * `extraction_config` - Agent-generated machinery-unwrap rules
     /// * `mount_graph` - Resolved mount graph for canonical method/path aliases
     /// * `config` - Config used for URL normalization
     pub fn resolve_types_with_sidecar(
@@ -1091,7 +1222,7 @@ impl FileOrchestrator {
         sidecar: &TypeSidecar,
         file_results: &HashMap<String, FileAnalysisResult>,
         repo_path: &str,
-        packages: &Packages,
+        extraction_config: Option<&ExtractionConfig>,
         mount_graph: &MountGraph,
         config: &Config,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
@@ -1104,10 +1235,8 @@ impl FileOrchestrator {
             infer.len()
         );
 
-        let wrappers = wrapper_rules_for_packages(packages);
-
         let result = sidecar
-            .resolve_all_types(&explicit, &infer, &wrappers)
+            .resolve_all_types(&explicit, &infer, extraction_config)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
         let result = self.append_inline_aliases(result, inline_aliases);
@@ -1882,6 +2011,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -2132,6 +2262,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
@@ -2159,6 +2290,187 @@ mod tests {
         assert!(alias.contains("Response"), "alias was {alias}");
     }
 
+    /// Build a call-site endpoint with the given emission style. Carries both
+    /// a response expression and SWC spans so the test proves the routing
+    /// decision comes from `emission_style`, not from locator availability.
+    fn endpoint_with_emission_style(
+        method: &str,
+        path: &str,
+        emission_style: Option<EmissionStyle>,
+    ) -> EndpointResult {
+        EndpointResult {
+            candidate_id: "span:100-200".to_string(),
+            line_number: 12,
+            owner_node: "app".to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler_name: "anonymous".to_string(),
+            pattern_matched: ".get(".to_string(),
+            call_expression_span_start: Some(100),
+            call_expression_span_end: Some(200),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: Some("users".to_string()),
+            response_expression_line: Some(13),
+            emission_style,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    type CollectedRequests = (
+        Vec<SymbolRequest>,
+        Vec<InferRequestItem>,
+        Vec<(String, String)>,
+    );
+
+    fn collect_for_endpoint(endpoint: EndpointResult) -> CollectedRequests {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/server.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![endpoint],
+                data_calls: vec![],
+            },
+        );
+        let graph = orchestrator.build_mount_graph(&file_results);
+        let config = Config::default();
+        orchestrator.collect_type_requests(&file_results, ".", &graph, &config)
+    }
+
+    fn infer_for_endpoint(endpoint: EndpointResult) -> Vec<InferRequestItem> {
+        collect_for_endpoint(endpoint).1
+    }
+
+    #[test]
+    fn test_collect_type_requests_return_value_uses_function_return_via_text() {
+        // Fastify return-style: the handler's return value IS the payload.
+        // With a response expression available, the request must be a
+        // text-located FunctionReturn — the sidecar resolves the expression's
+        // containing function, which finds the exact handler even when it's a
+        // named reference declared far from the registration line.
+        let infer = infer_for_endpoint(endpoint_with_emission_style(
+            "GET",
+            "/users",
+            Some(EmissionStyle::ReturnValue),
+        ));
+
+        assert_eq!(infer.len(), 1);
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::FunctionReturn);
+        assert_eq!(item.line_number, 12);
+        assert_eq!(item.expression_text.as_deref(), Some("users"));
+        assert_eq!(item.expression_line, Some(13));
+        assert!(
+            item.span_start.is_none() && item.span_end.is_none(),
+            "the call-expression span must not be sent — the registration call \
+             contains the handler, so span resolution would bind the wrong function: {:?}",
+            item
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_return_value_falls_back_to_line_anchor() {
+        // Pairing-invariant violation (return-value but no expression): fall
+        // back to anchoring on the registration line, which is correct for
+        // inline handlers (their function starts on that line).
+        let mut endpoint =
+            endpoint_with_emission_style("GET", "/users", Some(EmissionStyle::ReturnValue));
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+
+        let infer = infer_for_endpoint(endpoint);
+        assert_eq!(infer.len(), 1);
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::FunctionReturn);
+        assert_eq!(item.line_number, 12);
+        assert!(
+            item.span_start.is_none() && item.span_end.is_none() && item.expression_text.is_none(),
+            "fallback must be line-anchored only: {:?}",
+            item
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_no_payload_skips_response_inference() {
+        // Zero-arg sends / helper-written payloads: no recoverable payload
+        // expression exists, so no inference is requested at all — the
+        // manifest entry stays honestly `unknown` with its evidence. The
+        // spans on the endpoint are the landmine: without the emission_style
+        // gate the span fallback would infer from the whole `app.get(...)`
+        // call expression.
+        let mut endpoint =
+            endpoint_with_emission_style("GET", "/export", Some(EmissionStyle::NoPayload));
+        // Pairing invariant: no-payload ⇒ response expression is null.
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+
+        let infer = infer_for_endpoint(endpoint);
+        assert!(
+            infer.is_empty(),
+            "no-payload endpoints must not request response inference: {:?}",
+            infer
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_no_payload_skips_explicit_symbol_too() {
+        // A no-payload endpoint may still carry a (validated) type hint the
+        // model picked up from imports — but the handler never sends it, so
+        // bundling it would publish a phantom response contract. Both the
+        // explicit-symbol path and the inline-alias fallback must be gated,
+        // not just inference.
+        let mut endpoint =
+            endpoint_with_emission_style("GET", "/export", Some(EmissionStyle::NoPayload));
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+        endpoint.primary_type_symbol = Some("User".to_string());
+        endpoint.type_import_source = Some("./types".to_string());
+
+        let (explicit, infer, inline) = collect_for_endpoint(endpoint);
+        assert!(
+            explicit.is_empty(),
+            "no-payload endpoints must not bundle explicit response symbols: {:?}",
+            explicit
+        );
+        assert!(infer.is_empty(), "got: {:?}", infer);
+        assert!(inline.is_empty(), "got: {:?}", inline);
+    }
+
+    #[test]
+    fn test_collect_type_requests_no_payload_keeps_request_body_inference() {
+        // The classification is about the RESPONSE payload; request-body
+        // inference for mutating methods is unaffected.
+        let mut endpoint =
+            endpoint_with_emission_style("POST", "/orders", Some(EmissionStyle::NoPayload));
+        endpoint.response_expression_text = None;
+        endpoint.response_expression_line = None;
+        endpoint.payload_expression_text = Some("req.body".to_string());
+        endpoint.payload_expression_line = Some(13);
+
+        let infer = infer_for_endpoint(endpoint);
+        assert_eq!(infer.len(), 1, "got: {:?}", infer);
+        assert_eq!(infer[0].infer_kind, InferKind::RequestBody);
+        assert_eq!(infer[0].expression_text.as_deref(), Some("req.body"));
+    }
+
+    #[test]
+    fn test_collect_type_requests_imperative_send_matches_legacy_default() {
+        // Explicit imperative-send and an absent emission_style (cached
+        // pre-emission-style analysis) must produce the identical request:
+        // text-located ResponseBody.
+        for style in [Some(EmissionStyle::ImperativeSend), None] {
+            let infer = infer_for_endpoint(endpoint_with_emission_style("GET", "/users", style));
+            assert_eq!(infer.len(), 1, "style {:?} got: {:?}", style, infer);
+            let item = &infer[0];
+            assert_eq!(item.infer_kind, InferKind::ResponseBody);
+            assert_eq!(item.expression_text.as_deref(), Some("users"));
+            assert_eq!(item.expression_line, Some(13));
+        }
+    }
+
     #[test]
     fn test_validate_type_hints_rejects_invalid_symbols() {
         let mut result = FileAnalysisResult {
@@ -2178,6 +2490,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: Some("User".to_string()),
                     type_import_source: Some("react".to_string()),
                 },
@@ -2195,6 +2508,7 @@ mod tests {
                     payload_expression_line: None,
                     response_expression_text: None,
                     response_expression_line: None,
+                    emission_style: None,
                     primary_type_symbol: Some("Models.User".to_string()),
                     type_import_source: Some("./models".to_string()),
                 },
@@ -2306,6 +2620,7 @@ mod tests {
                         payload_expression_line: None,
                         response_expression_text: None,
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -2323,6 +2638,7 @@ mod tests {
                         payload_expression_line: None,
                         response_expression_text: None,
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -2566,6 +2882,7 @@ export const prerender = false;
             payload_expression_line: None,
             response_expression_text: None,
             response_expression_line: None,
+            emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
         }

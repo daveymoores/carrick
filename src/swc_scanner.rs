@@ -25,12 +25,19 @@ use swc_ecma_ast::*;
 use swc_ecma_parser::{EsSyntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::operation::Protocol;
 use crate::parser::parse_file;
 
 /// A candidate API call site detected by the SWC scanner.
 /// This is passed as a "hint" to the LLM to ensure 100% recall.
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateTarget {
+    /// Protocol family this call site belongs to. Routes the candidate to
+    /// that protocol's analyze-file prompt (or skips it when no prompt is
+    /// registered). Not serialized: the JSON candidate context the HTTP
+    /// prompt receives stays exactly as before.
+    #[serde(skip)]
+    pub protocol: Protocol,
     /// Stable identifier for this call site within the file
     pub candidate_id: String,
     /// Start byte offset of the call expression
@@ -83,8 +90,10 @@ impl CandidateTarget {
 pub struct ScanResult {
     /// List of candidate API call sites
     pub candidates: Vec<CandidateTarget>,
-    /// Whether the file should be analyzed (has candidates)
-    pub should_analyze: bool,
+    /// True when the file could not be parsed at all. Callers must surface
+    /// this: a parse failure excludes the whole file from the index, which is
+    /// very different from a healthy file with no API candidates.
+    pub parse_failed: bool,
 }
 
 /// A value exported from a module. Used by file-based routing to recover the
@@ -128,7 +137,7 @@ impl SwcScanner {
     /// Scan a file for potential API call sites.
     ///
     /// Returns a ScanResult with candidates and whether the file should be analyzed.
-    /// If no candidates are found, `should_analyze` is false and the file can be skipped.
+    /// If no candidates are found, the file can be skipped.
     #[allow(dead_code)]
     pub fn scan_file(&self, file_path: &Path, data_fetchers: &[String]) -> ScanResult {
         let handler = Handler::with_tty_emitter(
@@ -143,7 +152,7 @@ impl SwcScanner {
             None => {
                 return ScanResult {
                     candidates: Vec::new(),
-                    should_analyze: false,
+                    parse_failed: true,
                 };
             }
         };
@@ -154,11 +163,9 @@ impl SwcScanner {
         );
         module.visit_with(&mut visitor);
 
-        let should_analyze = !visitor.candidates.is_empty();
-
         ScanResult {
             candidates: visitor.candidates,
-            should_analyze,
+            parse_failed: false,
         }
     }
 
@@ -234,7 +241,7 @@ impl SwcScanner {
             Err(_) => {
                 return ScanResult {
                     candidates: Vec::new(),
-                    should_analyze: false,
+                    parse_failed: true,
                 };
             }
         };
@@ -253,11 +260,9 @@ impl SwcScanner {
         );
         module.visit_with(&mut visitor);
 
-        let should_analyze = !visitor.candidates.is_empty();
-
         ScanResult {
             candidates: visitor.candidates,
-            should_analyze,
+            parse_failed: false,
         }
     }
 
@@ -553,6 +558,7 @@ impl CandidateVisitor {
         let path_snippet = self.extract_first_arg_snippet(call);
 
         self.candidates.push(CandidateTarget {
+            protocol: Protocol::Http,
             candidate_id,
             span_start,
             span_end,
@@ -717,7 +723,16 @@ impl Visit for CandidateVisitor {
                     .and_then(|args| args.first())
                     .and_then(|a| self.source_map.span_to_snippet(a.expr.span()).ok())
                     .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect());
+                // XMLHttpRequest is an HTTP client; WebSocket and
+                // EventSource belong to the socket family (SSE rides the
+                // socket model) and must not reach the HTTP prompt.
+                let protocol = if ident.sym.as_ref() == "XMLHttpRequest" {
+                    Protocol::Http
+                } else {
+                    Protocol::Websocket
+                };
                 self.candidates.push(CandidateTarget {
+                    protocol,
                     candidate_id,
                     span_start,
                     span_end,
@@ -886,6 +901,17 @@ mod tests {
     }
 
     #[test]
+    fn scan_content_flags_parse_failures() {
+        let result = scan_test_content("function broken( {{{");
+        assert!(result.parse_failed);
+        assert!(result.candidates.is_empty());
+
+        let healthy = scan_test_content("const x = 1;");
+        assert!(!healthy.parse_failed);
+        assert!(healthy.candidates.is_empty());
+    }
+
+    #[test]
     fn exported_handlers_finds_app_router_methods() {
         let content = r#"
 export async function GET(req: Request) { return Response.json({}); }
@@ -923,29 +949,33 @@ import sdk from 'got';
 async function run() { return sdk.doThing(); }
 "#;
         let fetchers = vec!["got".to_string()];
-        assert!(scan_test_content_with_fetchers(content, &fetchers).should_analyze);
+        assert!(
+            !scan_test_content_with_fetchers(content, &fetchers)
+                .candidates
+                .is_empty()
+        );
         // Without detection flagging the package, the wrapper call is invisible
         // to the import signal (the other signals don't apply here either).
-        assert!(!scan_test_content(content).should_analyze);
+        assert!(scan_test_content(content).candidates.is_empty());
     }
 
     #[test]
     fn detects_url_scheme_first_arg() {
         let content = r#"function run() { return notanapi('https://api.example.com/users'); }"#;
-        assert!(scan_test_content(content).should_analyze);
+        assert!(!scan_test_content(content).candidates.is_empty());
     }
 
     #[test]
     fn detects_new_network_primitives() {
         let content =
             r#"function run() { const ws = new WebSocket('wss://example.com'); return ws; }"#;
-        assert!(scan_test_content(content).should_analyze);
+        assert!(!scan_test_content(content).candidates.is_empty());
     }
 
     #[test]
     fn detects_awaited_stringish_call() {
         let content = r#"async function run() { return await loadData('/data.json'); }"#;
-        assert!(scan_test_content(content).should_analyze);
+        assert!(!scan_test_content(content).candidates.is_empty());
     }
 
     #[test]
@@ -957,7 +987,7 @@ function run() {
     return x;
 }
 "#;
-        assert!(!scan_test_content(content).should_analyze);
+        assert!(scan_test_content(content).candidates.is_empty());
     }
 
     #[test]
@@ -995,7 +1025,7 @@ router.delete('/users/:id', deleteUser);
 "#;
 
         let result = scan_test_content(content);
-        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
         assert!(result.candidates.len() >= 3);
 
         // Should detect app.get, app.post, router.delete
@@ -1020,7 +1050,7 @@ async function getData() {
 "#;
 
         let result = scan_test_content(content);
-        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
 
         // Should detect fetch and response.json
         let has_fetch = result.candidates.iter().any(|c| c.callee_object == "fetch");
@@ -1039,7 +1069,7 @@ async function getData() {
     fn test_candidate_spans_and_ids() {
         let content = "fetch('/api/users');";
         let result = scan_test_content(content);
-        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
         assert!(!result.candidates.is_empty());
 
         let candidate = &result.candidates[0];
@@ -1062,7 +1092,7 @@ router.use('/v1', v1Router);
 "#;
 
         let result = scan_test_content(content);
-        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
 
         // Should detect all .use() calls
         let use_calls: Vec<_> = result
@@ -1117,7 +1147,7 @@ async function fetchUser(id: string) {
 "#;
 
         let result = scan_test_content(content);
-        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
 
         let has_axios = result.candidates.iter().any(|c| c.callee_object == "axios");
         assert!(has_axios, "Should detect axios calls");
@@ -1126,6 +1156,7 @@ async function fetchUser(id: string) {
     #[test]
     fn test_candidate_format_hint() {
         let candidate = CandidateTarget {
+            protocol: Protocol::Http,
             candidate_id: "span:100-140".to_string(),
             span_start: 100,
             span_end: 140,
@@ -1155,7 +1186,7 @@ createRouter()
 "#;
 
         let result = scan_test_content(content);
-        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
 
         // Should detect the HTTP methods even in chained form
         let methods: Vec<_> = result
@@ -1240,7 +1271,10 @@ export class UsersController {
 "#;
 
         let result = scan_test_content(content);
-        assert!(result.should_analyze, "NestJS controller should analyze");
+        assert!(
+            !result.candidates.is_empty(),
+            "NestJS controller should analyze"
+        );
 
         // At least four decorator candidates (one Controller + three method decorators).
         let decorator_candidates: Vec<_> = result
@@ -1277,7 +1311,7 @@ apiHandler.route('/data', handleData);
 "#;
 
         let result = scan_test_content(content);
-        assert!(result.should_analyze);
+        assert!(!result.candidates.is_empty());
 
         // Should detect calls on userRouter, authRouter, apiHandler
         assert!(

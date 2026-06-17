@@ -1,8 +1,21 @@
 use crate::{
-    agent_service::AgentService, agents::schemas::AgentSchemas, framework_detector::DetectionResult,
+    agent_service::AgentService, agents::schemas::AgentSchemas,
+    framework_detector::DetectionResult, operation::Protocol,
+    services::type_sidecar::ExtractionConfig,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tracing::debug;
+
+/// Guidance keyed by protocol. Each protocol with a registered LLM
+/// extraction pass gets its own focused guidance (and, downstream, its own
+/// analyze-file prompt) instead of diluting one prompt across protocols.
+pub type ProtocolGuidance = BTreeMap<Protocol, FrameworkGuidance>;
+
+/// Protocols that have a guidance + analyze-file prompt registered in
+/// carrick-cloud. Deterministic protocols (GraphQL) never appear here; new
+/// LLM-routed protocols are added together with their cloud prompts.
+const LLM_ROUTED_PROTOCOLS: &[Protocol] = &[Protocol::Http];
 
 /// A single pattern example for a specific framework
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,24 +101,45 @@ impl FrameworkGuidanceAgent {
     /// Uses parallel calls to the /framework-guidance lambda for each category.
     /// All prompt construction lives lambda-side now (see
     /// carrick-cloud/lambdas/framework-guidance/prompts.js).
+    /// Generate guidance for every protocol with a registered LLM pass.
+    /// Detection's library inventory selects which protocols are active;
+    /// today HTTP is the only routed protocol, so the map has one entry.
+    /// When the websocket prompt lands, socket libraries in the inventory
+    /// activate a second, independently prompted entry.
+    pub async fn generate_for_active_protocols(
+        &self,
+        framework_detection: &DetectionResult,
+    ) -> Result<ProtocolGuidance, Box<dyn std::error::Error>> {
+        let mut guidance = ProtocolGuidance::new();
+        for protocol in LLM_ROUTED_PROTOCOLS {
+            guidance.insert(
+                *protocol,
+                self.generate_guidance(framework_detection, *protocol)
+                    .await?,
+            );
+        }
+        Ok(guidance)
+    }
+
     pub async fn generate_guidance(
         &self,
         framework_detection: &DetectionResult,
+        protocol: Protocol,
     ) -> Result<FrameworkGuidance, Box<dyn std::error::Error>> {
         debug!("=== FRAMEWORK GUIDANCE AGENT DEBUG ===");
         debug!(
-            "Generating guidance for frameworks: {:?}",
-            framework_detection.frameworks
+            "Generating {:?} guidance for frameworks: {:?}",
+            protocol, framework_detection.frameworks
         );
         debug!("Data fetchers: {:?}", framework_detection.data_fetchers);
 
         // Execute calls in parallel for speed (flattened schema makes this fast enough)
         debug!("  Fetching all patterns in parallel...");
-        let mount_task = self.fetch_patterns("mount", framework_detection);
-        let endpoint_task = self.fetch_patterns("endpoint", framework_detection);
-        let middleware_task = self.fetch_patterns("middleware", framework_detection);
-        let fetching_task = self.fetch_patterns("data_fetching", framework_detection);
-        let general_task = self.fetch_general_guidance(framework_detection);
+        let mount_task = self.fetch_patterns("mount", framework_detection, protocol);
+        let endpoint_task = self.fetch_patterns("endpoint", framework_detection, protocol);
+        let middleware_task = self.fetch_patterns("middleware", framework_detection, protocol);
+        let fetching_task = self.fetch_patterns("data_fetching", framework_detection, protocol);
+        let general_task = self.fetch_general_guidance(framework_detection, protocol);
 
         // Wait for all tasks to complete
         let (
@@ -146,19 +180,95 @@ impl FrameworkGuidanceAgent {
         Ok(guidance)
     }
 
+    /// Common /framework-guidance request body: task + protocol + the
+    /// detection inventory + the response schema the lambda forwards to the
+    /// model. Task-specific fields are added by the caller.
+    fn guidance_request_body(
+        task: &str,
+        framework_detection: &DetectionResult,
+        protocol: Protocol,
+        schema: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "task": task,
+            "protocol": protocol,
+            "frameworks": framework_detection.frameworks,
+            "data_fetchers": framework_detection.data_fetchers,
+            "response_schema": schema,
+        })
+    }
+
+    /// Fetch agent-generated machinery-unwrap rules for the repo's HTTP
+    /// clients (the `extraction_config` task). `dependencies` is the cleaned
+    /// list of merged package.json dependency names — the cloud prompt uses
+    /// it to ground rules in packages the repo actually uses.
+    pub async fn fetch_extraction_config(
+        &self,
+        framework_detection: &DetectionResult,
+        dependencies: &[String],
+    ) -> Result<ExtractionConfig, Box<dyn std::error::Error>> {
+        let mut body = Self::guidance_request_body(
+            "extraction_config",
+            framework_detection,
+            Protocol::Http,
+            AgentSchemas::extraction_config_schema(),
+        );
+        body["dependencies"] = serde_json::json!(dependencies);
+
+        let response = self
+            .agent_service
+            .post_to_lambda("/framework-guidance", &body, "extraction_config")
+            .await?;
+
+        // Per-rule tolerant parsing: one malformed rule (a float index, a
+        // mistyped field) must not throw away every valid rule in the
+        // response. Only a response without a `rules` array fails outright.
+        #[derive(Deserialize)]
+        struct RawConfig {
+            rules: Vec<serde_json::Value>,
+        }
+        let raw: RawConfig = serde_json::from_str(&response).map_err(|e| {
+            format!(
+                "Failed to parse extraction config: {}. Raw response: {}",
+                e, response
+            )
+        })?;
+        let total = raw.rules.len();
+        let rules: Vec<crate::services::type_sidecar::ExtractionRule> = raw
+            .rules
+            .into_iter()
+            .filter_map(|rule| match serde_json::from_value(rule.clone()) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    debug!("Dropping malformed extraction rule ({}): {}", e, rule);
+                    None
+                }
+            })
+            .collect();
+        if rules.len() < total {
+            debug!(
+                "Extraction config: kept {}/{} rules after validation",
+                rules.len(),
+                total
+            );
+        }
+
+        Ok(ExtractionConfig { rules })
+    }
+
     async fn fetch_patterns(
         &self,
         category: &str,
         framework_detection: &DetectionResult,
+        protocol: Protocol,
     ) -> Result<Vec<PatternExample>, Box<dyn std::error::Error>> {
-        let schema = AgentSchemas::pattern_list_schema();
-        let body = serde_json::json!({
-            "task": "patterns",
-            "category": category,
-            "frameworks": framework_detection.frameworks,
-            "data_fetchers": framework_detection.data_fetchers,
-            "response_schema": schema,
-        });
+        let mut body = Self::guidance_request_body(
+            "patterns",
+            framework_detection,
+            protocol,
+            AgentSchemas::pattern_list_schema(),
+        );
+        body["category"] = serde_json::json!(category);
 
         let response = self
             .agent_service
@@ -178,14 +288,14 @@ impl FrameworkGuidanceAgent {
     async fn fetch_general_guidance(
         &self,
         framework_detection: &DetectionResult,
+        protocol: Protocol,
     ) -> Result<GeneralGuidanceResponse, Box<dyn std::error::Error>> {
-        let schema = AgentSchemas::general_guidance_schema();
-        let body = serde_json::json!({
-            "task": "general",
-            "frameworks": framework_detection.frameworks,
-            "data_fetchers": framework_detection.data_fetchers,
-            "response_schema": schema,
-        });
+        let body = Self::guidance_request_body(
+            "general",
+            framework_detection,
+            protocol,
+            AgentSchemas::general_guidance_schema(),
+        );
 
         let response = self
             .agent_service

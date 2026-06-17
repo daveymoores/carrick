@@ -229,11 +229,7 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   try {
     log(`Inferring ${request.requests.length} type(s)`);
 
-    const result = typeInferrer.infer(
-      request.requests,
-      request.wrappers || [],
-      request.extraction_config
-    );
+    const result = typeInferrer.infer(request.requests, request.extraction_config);
 
     return {
       request_id: request.request_id,
@@ -551,16 +547,32 @@ function main(): void {
     process.exit(0);
   });
 
-  // Handle uncaught errors
+  // Fail fast on uncaught errors. Continuing after one means serving later
+  // requests from a possibly corrupted state and returning garbage types
+  // with a success status; exiting surfaces as ProcessDied on the Rust side,
+  // which degrades cleanly (scan continues, type_extraction_status records
+  // the loss).
   process.on('uncaughtException', (err) => {
-    logError(`Uncaught exception: ${err.message}`);
+    logError(`Uncaught exception (exiting): ${err.message}`);
     logError(err.stack || '');
-    // Keep running, but log the error
+    process.exit(1);
   });
 
   process.on('unhandledRejection', (reason) => {
-    logError(`Unhandled rejection: ${reason}`);
-    // Keep running, but log the error
+    // This log is the last diagnostic before exit, so it must be actionable:
+    // a bare interpolation renders non-Error reasons as [object Object].
+    let detail: string;
+    if (reason instanceof Error) {
+      detail = reason.stack || reason.message;
+    } else {
+      try {
+        detail = JSON.stringify(reason) ?? String(reason);
+      } catch {
+        detail = String(reason);
+      }
+    }
+    logError(`Unhandled rejection (exiting): ${detail}`);
+    process.exit(1);
   });
 }
 

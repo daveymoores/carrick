@@ -1,6 +1,6 @@
 use crate::agent_service::AgentService;
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::agents::framework_guidance_agent::{FrameworkGuidance, FrameworkGuidanceAgent};
+use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
@@ -13,6 +13,7 @@ use crate::intent_generator::{generate_function_intents, intents_by_hash};
 use crate::logging;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
+use crate::operation::OperationKey;
 use crate::packages::Packages;
 use crate::parser::parse_file;
 use crate::services::{
@@ -43,7 +44,10 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
-const CACHE_VERSION: u32 = 1;
+/// 4: EndpointResult gained `emission_style` — pre-4 cached results would
+/// replay with `None` forever and never take the return-value/no-payload
+/// inference paths for unchanged files.
+const CACHE_VERSION: u32 = 4;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -155,7 +159,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // 3. Resolve the services declared for this repo (one for the common
     //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
-    let services = resolve_services(repo_path);
+    let services = resolve_services(repo_path)?;
     let multi_service = services.len() > 1;
     if multi_service {
         info!(
@@ -173,7 +177,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     let sp = logging::spinner("Analyzing repository...");
     let mut current_services_data = Vec::with_capacity(services.len());
     for service in &services {
-        let packages = load_packages_for_service(repo_path, service);
+        let packages = load_packages_for_service(repo_path, service)?;
 
         // Scope the sidecar's type extraction to this service's directory/tsconfig.
         scope_sidecar_to_service(sidecar, repo_path, service);
@@ -232,12 +236,35 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             );
         } else {
             let sp = logging::spinner("Uploading results...");
-            for data in &current_services_data {
-                let cloud_data_serialized = strip_ast_nodes(data.clone());
-                storage
-                    .upload_repo_data(&cloud_data_serialized)
-                    .await
-                    .map_err(|e| format!("Failed to upload repo data: {}", e))?;
+            // Prepare every payload before uploading any, so a serialization
+            // problem can't surface halfway through a multi-service upload.
+            let payloads: Vec<CloudRepoData> = current_services_data
+                .iter()
+                .map(|data| strip_ast_nodes(data.clone()))
+                .collect();
+            for (i, payload) in payloads.iter().enumerate() {
+                if let Err(e) = storage.upload_repo_data(payload).await {
+                    // Uploads are keyed per (repo, service) and idempotent, so
+                    // a re-run restores consistency — but until then the index
+                    // holds this run's data for some services and the previous
+                    // run's for the rest. Make that state explicit.
+                    let uploaded: Vec<&str> = payloads[..i]
+                        .iter()
+                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                        .collect();
+                    let not_uploaded: Vec<&str> = payloads[i..]
+                        .iter()
+                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                        .collect();
+                    return Err(format!(
+                        "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
+                         The index is mixed-generation for this repo until a successful re-run.",
+                        e,
+                        uploaded.join(", "),
+                        not_uploaded.join(", ")
+                    )
+                    .into());
+                }
             }
             logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
         }
@@ -421,17 +448,34 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     // Payload size guard: Lambda function URLs have a 6MB request payload limit.
     // If serialized data exceeds ~5MB, drop file_results to stay under the limit.
     const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
+    const LAMBDA_HARD_LIMIT_BYTES: usize = 6 * 1024 * 1024;
     if let Ok(serialized) = serde_json::to_string(&data)
         && serialized.len() > MAX_PAYLOAD_BYTES
     {
         warn!(
-            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this upload",
+            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this \
+             upload — the next scan cannot run incrementally and will re-analyze every file",
             serialized.len() / 1024,
             MAX_PAYLOAD_BYTES / 1024
         );
         data.file_results = None;
         data.cached_detection = None;
         data.cached_guidance = None;
+
+        // Re-check: if the payload is still over Lambda's hard request limit
+        // even without the cache, say so up front — the upload will be
+        // rejected with an otherwise cryptic 413.
+        if let Ok(reserialized) = serde_json::to_string(&data)
+            && reserialized.len() > LAMBDA_HARD_LIMIT_BYTES
+        {
+            warn!(
+                "Payload is still {}KB after dropping caches, which exceeds the cloud's \
+                 {}KB request limit — the upload will likely be rejected. Consider splitting \
+                 the repo into services via carrick.json.",
+                reserialized.len() / 1024,
+                LAMBDA_HARD_LIMIT_BYTES / 1024
+            );
+        }
     }
 
     data
@@ -448,8 +492,29 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("git diff failed (shallow clone?): {}", stderr.trim());
-        debug!("Set fetch-depth: 0 in your workflow for incremental mode.");
+        // Surface this at warn level with the cause: a shallow clone
+        // (actions/checkout defaults to fetch-depth: 1) silently forces a
+        // full re-analysis — including its full LLM cost — on every run.
+        let is_shallow = std::process::Command::new("git")
+            .args(["rev-parse", "--is-shallow-repository"])
+            .current_dir(repo_path)
+            .output()
+            .ok()
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+        if is_shallow {
+            warn!(
+                "Incremental mode unavailable: this is a shallow clone, so the previous \
+                 scan's commit isn't reachable for diffing. Set `fetch-depth: 0` on \
+                 actions/checkout to avoid re-analyzing every file on each run."
+            );
+        } else {
+            warn!(
+                "Incremental mode unavailable: git diff against {} failed ({}). \
+                 Falling back to full analysis.",
+                base_commit,
+                stderr.trim()
+            );
+        }
         return None;
     }
 
@@ -475,6 +540,40 @@ fn hash_file_content(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Hash every discovered package.json (sorted, keyed by repo-relative path)
+/// for the detection/guidance/extraction-config cache gate. The artifacts
+/// behind the gate are generated from the MERGED dependency set, so the gate
+/// must cover workspace manifests too — hashing only the root package.json
+/// would let a dependency added in `packages/api/package.json` reuse a stale
+/// extraction config (and stale detection) indefinitely.
+fn hash_workspace_package_jsons(packages: &Packages, repo_path: &str) -> String {
+    let repo_root = Path::new(repo_path);
+    let mut keyed: Vec<(String, &PathBuf)> = packages
+        .source_paths
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            (relative, path)
+        })
+        .collect();
+    keyed.sort();
+
+    let mut combined = String::new();
+    for (relative, path) in keyed {
+        combined.push_str(&relative);
+        combined.push('\0');
+        if let Ok(content) = std::fs::read_to_string(path) {
+            combined.push_str(&content);
+        }
+        combined.push('\0');
+    }
+    hash_file_content(&combined)
 }
 
 /// Normalize file_results keys to be relative to repo root.
@@ -504,6 +603,14 @@ fn normalize_file_results_keys(
 
 /// Strip diagnostic-only fields from file_results before caching.
 /// These fields are not needed by build_mount_graph() or collect_type_requests().
+///
+/// `response_expression_text` is deliberately KEPT: it is the primary locator
+/// for return-value endpoints (`EmissionStyle::ReturnValue`), whose only
+/// fallback is an inexact registration-line anchor (the sidecar's
+/// `findFunctionByLine` tolerates ±2 lines and can bind an adjacent handler).
+/// Stripping it would make cached replays of unchanged files silently degrade
+/// to that fallback. Every other stripped text field has an exact span
+/// fallback, so replays lose nothing.
 fn strip_diagnostic_fields(
     file_results: &mut HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) {
@@ -512,7 +619,6 @@ fn strip_diagnostic_fields(
             endpoint.candidate_id = String::new();
             endpoint.pattern_matched = String::new();
             endpoint.payload_expression_text = None;
-            endpoint.response_expression_text = None;
         }
         for data_call in &mut result.data_calls {
             data_call.candidate_id = String::new();
@@ -619,20 +725,29 @@ async fn analyze_current_repo_incremental(
                 changed_count, total_files, reused_count
             );
 
-            // Check if package.json changed → need fresh framework detection/guidance
-            // Hash raw file content (not serialized struct) for deterministic comparison
-            let current_pkg_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
-                .ok()
-                .map(|content| hash_file_content(&content))
-                .unwrap_or_default();
+            // Check if any package.json changed → need fresh framework
+            // detection/guidance/extraction config. Covers workspace
+            // manifests, not just the repo root (raw file content, not the
+            // serialized struct, for deterministic comparison).
+            let current_pkg_hash = hash_workspace_package_jsons(packages, repo_path);
 
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
 
-            // Get framework detection and guidance (cached or fresh)
-            let (detection, guidance) = if !pkg_changed {
+            // Get framework detection, guidance, and extraction config
+            // (cached or fresh — all three share the package_json_hash gate)
+            let (detection, guidance, extraction_config) = if !pkg_changed {
                 if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
                     debug!("Reusing cached framework detection and guidance");
-                    (det.clone(), guid.clone())
+                    // A missing cached config (older cache entry, or an earlier
+                    // failed generation) is regenerated on its own.
+                    let extraction = match &prev.cached_extraction_config {
+                        Some(config) => Some(config.clone()),
+                        None => {
+                            let agent = FrameworkGuidanceAgent::new(AgentService::new());
+                            generate_extraction_config(&agent, det, packages).await
+                        }
+                    };
+                    (det.clone(), guid.clone(), extraction)
                 } else {
                     run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
                 }
@@ -725,13 +840,15 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
+            append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
             strip_diagnostic_fields(&mut cached_file_results);
             cloud_data.file_results = Some(cached_file_results);
-            cloud_data.cached_detection = Some(detection);
+            cloud_data.cached_detection = Some(detection.clone());
             cloud_data.cached_guidance = Some(guidance);
+            cloud_data.cached_extraction_config = extraction_config.clone();
             cloud_data.package_json_hash = Some(current_pkg_hash);
             cloud_data.cache_version = Some(CACHE_VERSION);
 
@@ -747,7 +864,7 @@ async fn analyze_current_repo_incremental(
                 &file_orchestrator,
                 &merged_results,
                 repo_path,
-                packages,
+                extraction_config.as_ref(),
                 &mount_graph,
                 config,
                 &mut cloud_data,
@@ -780,11 +897,20 @@ async fn analyze_current_repo_incremental(
     Ok(cloud_data)
 }
 
-/// Run framework detection and guidance generation.
+/// Run framework detection, per-protocol guidance generation, and
+/// extraction-config generation (machinery-unwrap rules). All three are
+/// cached together under the package_json_hash gate.
 async fn run_framework_detection_and_guidance(
     packages: &Packages,
     imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
-) -> Result<(DetectionResult, FrameworkGuidance), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        DetectionResult,
+        ProtocolGuidance,
+        Option<crate::services::type_sidecar::ExtractionConfig>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
@@ -792,9 +918,110 @@ async fn run_framework_detection_and_guidance(
         .await?;
 
     let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
-    let guidance = guidance_agent.generate_guidance(&detection).await?;
+    // Guidance and extraction config both depend only on detection — run
+    // them concurrently instead of paying a lone extra lambda round-trip.
+    let (guidance, extraction_config) = tokio::join!(
+        guidance_agent.generate_for_active_protocols(&detection),
+        generate_extraction_config(&guidance_agent, &detection, packages),
+    );
 
-    Ok((detection, guidance))
+    Ok((detection, guidance?, extraction_config))
+}
+
+/// Generate machinery-unwrap rules via the cloud's extraction_config task.
+/// Non-fatal: on failure the scan proceeds without unwrapping (machinery
+/// types like `AxiosResponse<T>` stay wrapped in the manifest).
+async fn generate_extraction_config(
+    agent: &FrameworkGuidanceAgent,
+    detection: &DetectionResult,
+    packages: &Packages,
+) -> Option<crate::services::type_sidecar::ExtractionConfig> {
+    let dependencies = packages.cleaned_dependency_names();
+    match agent
+        .fetch_extraction_config(detection, &dependencies)
+        .await
+    {
+        Ok(config) => {
+            debug!(
+                "Extraction config generated: {} unwrap rule(s)",
+                config.rules.len()
+            );
+            Some(config)
+        }
+        Err(e) => {
+            warn!(
+                "Extraction-config generation failed: {} — machinery wrapper types will not \
+                 be unwrapped this run",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Append deterministically extracted protocol operations to the repo's
+/// index data: GraphQL (SDL root fields as endpoints, document top-level
+/// fields as calls) and Socket.IO (listeners as endpoints, emitters as
+/// calls). These protocols never go through the LLM pipeline.
+fn append_deterministic_protocol_operations(
+    cloud_data: &mut CloudRepoData,
+    repo_path: &str,
+    files: &[PathBuf],
+) {
+    // Same "{file}:{line}" convention the mount-graph conversions use
+    let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+        owner: None,
+        key,
+        params: vec![],
+        request_body: None,
+        response_body: None,
+        handler_name: None,
+        request_type: None,
+        response_type: None,
+        file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
+    };
+
+    let graphql = crate::graphql::scan_repo(Path::new(repo_path), files);
+    if !graphql.is_empty() {
+        debug!(
+            producers = graphql.producers.len(),
+            consumers = graphql.consumers.len(),
+            "Indexing GraphQL operations"
+        );
+        cloud_data.endpoints.extend(
+            graphql
+                .producers
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            graphql
+                .consumers
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+    }
+
+    let sockets = crate::socket_io::scan_files(files);
+    if !sockets.is_empty() {
+        debug!(
+            listeners = sockets.listeners.len(),
+            emitters = sockets.emitters.len(),
+            "Indexing Socket.IO operations"
+        );
+        cloud_data.endpoints.extend(
+            sockets
+                .listeners
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            sockets
+                .emitters
+                .into_iter()
+                .map(|op| to_details(op.key, &op.file_path, op.line)),
+        );
+    }
 }
 
 /// Build CloudRepoData from a mount graph (used by incremental path).
@@ -822,8 +1049,7 @@ fn build_cloud_data_from_mount_graph(
         .iter()
         .map(|endpoint| ApiEndpointDetails {
             owner: Some(crate::visitor::OwnerType::App(endpoint.owner.clone())),
-            route: endpoint.full_path.clone(),
-            method: endpoint.method.clone(),
+            key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -839,8 +1065,7 @@ fn build_cloud_data_from_mount_graph(
         .iter()
         .map(|call| ApiEndpointDetails {
             owner: None,
-            route: call.target_url.clone(),
-            method: call.method.clone(),
+            key: OperationKey::http(&call.method, call.target_url.clone()),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -888,8 +1113,10 @@ fn build_cloud_data_from_mount_graph(
         file_results: None,
         cached_detection: None,
         cached_guidance: None,
+        cached_extraction_config: None,
         package_json_hash: None,
         cache_version: None,
+        type_extraction_status: None,
     }
 }
 
@@ -938,12 +1165,19 @@ fn resolve_types_if_available(
     file_orchestrator: &FileOrchestrator,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     repo_path: &str,
-    packages: &Packages,
+    extraction_config: Option<&crate::services::type_sidecar::ExtractionConfig>,
     mount_graph: &MountGraph,
     config: &Config,
     cloud_data: &mut CloudRepoData,
 ) {
-    let Some(sidecar) = sidecar else { return };
+    let Some(sidecar) = sidecar else {
+        cloud_data.type_extraction_status = Some(
+            "type extraction skipped: sidecar unavailable (not found, failed to start, \
+             or failed to initialize)"
+                .to_string(),
+        );
+        return;
+    };
 
     debug!("Starting sidecar type resolution");
     match sidecar.wait_ready(Duration::from_secs(10)) {
@@ -952,7 +1186,7 @@ fn resolve_types_if_available(
                 sidecar,
                 file_results,
                 repo_path,
-                packages,
+                extraction_config,
                 mount_graph,
                 config,
             ) {
@@ -973,16 +1207,34 @@ fn resolve_types_if_available(
                     }
                     // Per-symbol failures are logged in FileOrchestrator at the
                     // resolution call site (with capped warn + spillover to debug).
+
+                    // A missing extraction config means the cloud's rule
+                    // generation failed (an empty rule set arrives as
+                    // Some(config) with zero rules). Types still resolve, but
+                    // machinery wrappers stay wrapped — surface the
+                    // degradation instead of letting the run look healthy.
+                    if extraction_config.is_none() {
+                        cloud_data.type_extraction_status = Some(
+                            "machinery unwrapping disabled this run: extraction-config \
+                             generation failed; wrapper types (e.g. AxiosResponse<T>) may \
+                             surface in the type manifest"
+                                .to_string(),
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
                     debug!("Continuing without bundled types");
+                    cloud_data.type_extraction_status =
+                        Some(format!("type resolution failed: {}", e));
                 }
             }
         }
         Err(e) => {
             warn!("Sidecar not ready: {}", e);
             debug!("Skipping type resolution");
+            cloud_data.type_extraction_status =
+                Some(format!("type extraction skipped: sidecar not ready: {}", e));
         }
     }
 }
@@ -999,6 +1251,22 @@ fn discover_files_and_symbols(
     // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = service_ignore_patterns(service);
     let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
+
+    // Zero files means the scan target is wrong (typo'd path, empty checkout):
+    // proceeding would upload an empty service and silently erase its
+    // coverage from the index.
+    if files.is_empty() {
+        let scope = match &service.directory {
+            Some(dir) => format!("service directory '{}'", dir),
+            None => "repository root".to_string(),
+        };
+        return Err(format!(
+            "No JS/TS source files found under {} in '{}'. Check the scan path \
+             and the directory/include entries in carrick.json.",
+            scope, repo_path
+        )
+        .into());
+    }
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
 
@@ -1042,7 +1310,11 @@ fn discover_files_and_symbols(
 /// No config, or a flat config, yields a single service rooted at the repo
 /// root (zero-config single-service mode). A `services` array yields one entry
 /// per declared service. Always returns at least one service.
-fn resolve_services(repo_path: &str) -> Vec<Config> {
+///
+/// A config that exists but cannot be parsed, or that declares paths that
+/// don't exist, is a hard error: silently falling back to defaults would
+/// ignore the user's declared service layout and upload a wrong index.
+fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
     // carrick.json belongs at the scan root. Read it there directly rather than
     // walking the tree (a tree walk would pick up nested example/fixture
     // configs in a repo that contains them).
@@ -1050,18 +1322,57 @@ fn resolve_services(repo_path: &str) -> Vec<Config> {
 
     let services = if config_path.is_file() {
         debug!("Found carrick.json: {}", config_path.display());
-        Config::load_services(vec![config_path]).unwrap_or_else(|e| {
-            warn!("Error parsing config file: {}", e);
-            Vec::new()
-        })
+        Config::load_services(vec![config_path.clone()]).map_err(|e| {
+            format!(
+                "Failed to parse {}: {}. Fix the config or delete it to scan \
+                 the repo as a single zero-config service.",
+                config_path.display(),
+                e
+            )
+        })?
     } else {
         Vec::new()
     };
 
+    // A typo'd directory would otherwise walk nothing and upload an empty
+    // service, silently erasing its coverage from the index.
+    let root = std::path::Path::new(repo_path);
+    for service in &services {
+        let label = service
+            .service_name
+            .as_deref()
+            .or(service.directory.as_deref())
+            .unwrap_or("<unnamed>");
+        if let Some(dir) = &service.directory
+            && !root.join(dir).is_dir()
+        {
+            return Err(format!(
+                "Service '{}' in {} declares directory '{}', which does not exist under '{}'",
+                label,
+                config_path.display(),
+                dir,
+                repo_path
+            )
+            .into());
+        }
+        for inc in &service.include {
+            if !root.join(inc).exists() {
+                return Err(format!(
+                    "Service '{}' in {} declares include path '{}', which does not exist under '{}'",
+                    label,
+                    config_path.display(),
+                    inc,
+                    repo_path
+                )
+                .into());
+            }
+        }
+    }
+
     if services.is_empty() {
-        vec![Config::default()]
+        Ok(vec![Config::default()])
     } else {
-        services
+        Ok(services)
     }
 }
 
@@ -1082,17 +1393,22 @@ fn service_ignore_patterns(service: &Config) -> Vec<&'static str> {
 
 /// Load the package data for a single service, scoped to its own
 /// `package.json` (within its directory), not an arbitrary one from the repo.
-fn load_packages_for_service(repo_path: &str, service: &Config) -> Packages {
+///
+/// A missing `package.json` is fine (empty dependency set); one that exists
+/// but cannot be parsed is a hard error — defaulting to zero dependencies
+/// would silently gut framework detection and endpoint extraction.
+fn load_packages_for_service(
+    repo_path: &str,
+    service: &Config,
+) -> Result<Packages, Box<dyn std::error::Error>> {
     let ignore_patterns = service_ignore_patterns(service);
     let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
     if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
-        Packages::new(vec![package_path]).unwrap_or_else(|e| {
-            warn!("Error parsing package.json: {}", e);
-            Packages::default()
-        })
+        Packages::new(vec![package_path.clone()])
+            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e).into())
     } else {
-        Packages::default()
+        Ok(Packages::default())
     }
 }
 
@@ -1166,8 +1482,7 @@ fn build_type_manifest_entries(
 
         add_manifest_pair(
             &mut entries,
-            &method,
-            &path,
+            OperationKey::http(&method, path),
             ManifestRole::Producer,
             &file_path,
             line_number,
@@ -1185,12 +1500,12 @@ fn build_type_manifest_entries(
             continue;
         }
         let path = normalizer.extract_path(&call.target_url);
-        let call_id = build_call_site_id(&file_path, line_number, &method, &path);
+        let key = OperationKey::http(&method, path);
+        let call_id = build_call_site_id(&file_path, line_number, &key);
 
         add_manifest_pair(
             &mut entries,
-            &method,
-            &path,
+            key,
             ManifestRole::Consumer,
             &file_path,
             line_number,
@@ -1203,23 +1518,24 @@ fn build_type_manifest_entries(
 
 fn add_manifest_pair(
     entries: &mut Vec<TypeManifestEntry>,
-    method: &str,
-    path: &str,
+    key: OperationKey,
     role: ManifestRole,
     file_path: &str,
     line_number: u32,
     call_id: Option<&str>,
 ) {
     // Producers for GET/HEAD/OPTIONS never have request bodies
-    let skip_request =
-        role == ManifestRole::Producer && matches!(method, "GET" | "HEAD" | "OPTIONS");
+    let skip_request = role == ManifestRole::Producer
+        && matches!(
+            key.as_http().map(|(method, _)| method),
+            Some("GET" | "HEAD" | "OPTIONS")
+        );
 
     for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
         if skip_request && type_kind == ManifestTypeKind::Request {
             continue;
         }
-        let type_alias =
-            build_manifest_type_alias_with_call_id(method, path, role, type_kind, call_id);
+        let type_alias = build_manifest_type_alias_with_call_id(&key, role, type_kind, call_id);
         let infer_kind = infer_kind_for_manifest(role, type_kind);
         let evidence = crate::cloud_storage::TypeEvidence {
             file_path: file_path.to_string(),
@@ -1231,8 +1547,7 @@ fn add_manifest_pair(
             type_state: ManifestTypeState::Unknown,
         };
         entries.push(TypeManifestEntry {
-            method: method.to_string(),
-            path: path.to_string(),
+            key: key.clone(),
             role,
             type_kind,
             type_alias,
@@ -1387,7 +1702,7 @@ async fn analyze_current_repo(
 
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files, packages, &all_imported_symbols, repo_path)
+        .run_complete_analysis(files.clone(), packages, &all_imported_symbols, repo_path)
         .await?;
 
     // 4b. Generate function intents using LLM
@@ -1418,6 +1733,7 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
+    append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
     let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     if !manifest_entries.is_empty() {
@@ -1426,14 +1742,23 @@ async fn analyze_current_repo(
 
     // 6. Resolve types using sidecar if available
     let agent_service = AgentService::new();
-    let file_orchestrator = FileOrchestrator::new(agent_service);
+    let file_orchestrator = FileOrchestrator::new(agent_service.clone());
+
+    let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
+    let extraction_config = generate_extraction_config(
+        &guidance_agent,
+        &analysis_result.framework_detection,
+        packages,
+    )
+    .await;
+    cloud_data.cached_extraction_config = extraction_config.clone();
 
     resolve_types_if_available(
         sidecar,
         &file_orchestrator,
         &analysis_result.file_results,
         repo_path,
-        packages,
+        extraction_config.as_ref(),
         &analysis_result.mount_graph,
         config,
         &mut cloud_data,
@@ -1458,10 +1783,8 @@ async fn analyze_current_repo(
     cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
-    // Hash raw file content (not serialized struct) for deterministic comparison
-    cloud_data.package_json_hash = std::fs::read_to_string(format!("{}/package.json", repo_path))
-        .ok()
-        .map(|content| hash_file_content(&content));
+    // Same workspace-wide hash the incremental gate compares against.
+    cloud_data.package_json_hash = Some(hash_workspace_package_jsons(packages, repo_path));
 
     Ok(cloud_data)
 }
@@ -1750,11 +2073,26 @@ fn recreate_package_and_tsconfig(
             .map_err(|e| format!("Failed to run npm install: {}", e))?;
 
         if !install_output.status.success() {
+            // Fail loudly (#149): a swallowed install failure used to let the
+            // run print "✓ Cross-repo analysis complete" while type checking
+            // silently degraded — masking, e.g., an ERESOLVE conflict.
             let stderr = String::from_utf8_lossy(&install_output.stderr);
-            warn!("npm install failed: {}", stderr);
-        } else {
-            debug!("Dependencies installed successfully");
+            let tail_start = stderr
+                .char_indices()
+                .rev()
+                .nth(1999)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let excerpt = &stderr[tail_start..];
+            return Err(format!(
+                "npm install failed for the cross-repo type-check package — type checking \
+                 cannot run. Set CARRICK_SKIP_NPM_INSTALL=1 to bypass (type checking will \
+                 be skipped). npm stderr (tail):\n{}",
+                excerpt
+            )
+            .into());
         }
+        debug!("Dependencies installed successfully");
     }
 
     // Create tsconfig.json with dynamic path mappings based on actual type files
@@ -1782,8 +2120,7 @@ mod tests {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
             owner: Some(OwnerType::App("test_app".to_string())),
-            route: "/test".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "/test"),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -1825,8 +2162,10 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -1863,8 +2202,10 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         }];
 
         // Test Config merging
@@ -1893,8 +2234,7 @@ mod tests {
         // Create test data with TypeReferences that would cause SourceMap issues
         let endpoint = ApiEndpointDetails {
             owner: Some(OwnerType::App("test_app".to_string())),
-            route: "/test".to_string(),
-            method: "GET".to_string(),
+            key: OperationKey::http("GET", "/test"),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -1936,8 +2276,10 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: None,
+            type_extraction_status: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -1979,6 +2321,7 @@ mod tests {
                     payload_expression_line: Some(11),
                     response_expression_text: Some("res.json(data)".to_string()),
                     response_expression_line: Some(12),
+                    emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
                 })
@@ -2002,6 +2345,58 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Regression for #102: consumer manifest paths must run through the same
+    /// UrlNormalizer::normalize as the live mount-graph matcher. The exact
+    /// targets from the bad run (backticked template literals with env-var
+    /// base URLs) previously surfaced in the consumer manifest as
+    /// `/:USER_SERVICE_URL/api/users/:order.userId`, so ts_check reported
+    /// orphans the live matcher had already correlated.
+    #[test]
+    fn test_consumer_manifest_paths_strip_env_var_base_urls() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "`${USER_SERVICE_URL}/api/users/${order.userId}`".to_string(),
+                client: "fetch".to_string(),
+                file_location: "src/orders.ts:42".to_string(),
+            },
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "`${NOTIFICATION_SERVICE_URL}/api/notifications/status`".to_string(),
+                client: "fetch".to_string(),
+                file_location: "src/notify.ts:7".to_string(),
+            },
+        ];
+
+        let config = Config::default();
+        let entries = build_type_manifest_entries(&mount_graph, &config);
+
+        let consumer_paths: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.role == ManifestRole::Consumer)
+            .filter_map(|e| e.key.as_http().map(|(_, path)| path))
+            .collect();
+        assert!(!consumer_paths.is_empty(), "consumer entries expected");
+        for path in &consumer_paths {
+            assert!(
+                !path.contains("_SERVICE_URL"),
+                "env-var base URL leaked into consumer manifest path: {}",
+                path
+            );
+        }
+        assert!(
+            consumer_paths.contains(&"/api/users/:order.userId"),
+            "expected normalized user-service path, got {:?}",
+            consumer_paths
+        );
+        assert!(
+            consumer_paths.contains(&"/api/notifications/status"),
+            "expected normalized notification path, got {:?}",
+            consumer_paths
+        );
     }
 
     #[test]
@@ -2090,7 +2485,13 @@ mod tests {
         assert_eq!(result.endpoints[0].candidate_id, "");
         assert_eq!(result.endpoints[0].pattern_matched, "");
         assert!(result.endpoints[0].payload_expression_text.is_none());
-        assert!(result.endpoints[0].response_expression_text.is_none());
+        // The response expression text is load-bearing for ReturnValue
+        // endpoints on cached replays (its only fallback locator is an
+        // inexact line anchor) — it must survive the strip.
+        assert_eq!(
+            result.endpoints[0].response_expression_text.as_deref(),
+            Some("res.json(data)")
+        );
         // Non-diagnostic fields should be preserved
         assert_eq!(result.endpoints[0].path, "/api/users");
         assert_eq!(result.endpoints[0].method, "GET");
@@ -2257,6 +2658,7 @@ mod tests {
                         payload_expression_line: None,
                         response_expression_text: Some(large_string),
                         response_expression_line: None,
+                        emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
                     }],
@@ -2285,8 +2687,10 @@ mod tests {
             file_results: Some(large_results),
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -2326,8 +2730,10 @@ mod tests {
             file_results: Some(small_results),
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -2458,8 +2864,10 @@ mod tests {
                 notes: "test".to_string(),
             }),
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: Some("abc123hash".to_string()),
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -2527,8 +2935,10 @@ mod tests {
             file_results: None,
             cached_detection: None,
             cached_guidance: None,
+            cached_extraction_config: None,
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -2569,5 +2979,109 @@ mod tests {
         assert!(data.cached_guidance.is_none());
         assert!(data.package_json_hash.is_none());
         assert!(data.cache_version.is_none());
+    }
+
+    #[test]
+    fn resolve_services_without_config_defaults_to_single_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(services.len(), 1);
+        assert!(services[0].directory.is_none());
+    }
+
+    #[test]
+    fn resolve_services_rejects_malformed_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("carrick.json"), "{ not valid json").unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_rejects_missing_service_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "does-not-exist" }] }"#,
+        )
+        .unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("does-not-exist")
+                && err.to_string().contains("does not exist"),
+            "expected missing-directory error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_rejects_missing_include_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("svc")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "svc", "include": ["shared"] }] }"#,
+        )
+        .unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("include path 'shared'"),
+            "expected missing-include error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_accepts_valid_service_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("svc")).unwrap();
+        std::fs::create_dir(tmp.path().join("shared")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{ "services": [{ "name": "api", "directory": "svc", "include": ["shared"] }] }"#,
+        )
+        .unwrap();
+
+        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].directory.as_deref(), Some("svc"));
+    }
+
+    #[test]
+    fn load_packages_rejects_malformed_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{ trailing-comma: ,}").unwrap();
+
+        let err = load_packages_for_service(tmp.path().to_str().unwrap(), &Config::default())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_packages_missing_package_json_defaults_to_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages =
+            load_packages_for_service(tmp.path().to_str().unwrap(), &Config::default()).unwrap();
+        assert!(packages.merged_dependencies.is_empty());
+    }
+
+    #[test]
+    fn discovery_rejects_service_with_no_source_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cm: Lrc<SourceMap> = Default::default();
+
+        let err = discover_files_and_symbols(tmp.path().to_str().unwrap(), &Config::default(), cm)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("No JS/TS source files"),
+            "expected empty-scan error, got: {err}"
+        );
     }
 }

@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.1.31](https://github.com/daveymoores/carrick/compare/carrick-v0.1.30...carrick-v0.1.31) (2026-06-17)
+
+
+### Bug Fixes
+
+* **action:** stop 404 body poisoning the release download URL ([#160](https://github.com/daveymoores/carrick/issues/160)) ([6de05f7](https://github.com/daveymoores/carrick/commit/6de05f798e43673828be27e4eab80afa6d840597))
+
+## [0.1.30](https://github.com/daveymoores/carrick/compare/carrick-v0.1.29...carrick-v0.1.30) (2026-06-12)
+
+
+### Features
+
+* **agents:** route the LLM pipeline by protocol ([ef30fac](https://github.com/daveymoores/carrick/commit/ef30facee4bbc3b888e43417ee99950f62a24471))
+* **graphql:** deterministic GraphQL contract extraction and matching ([5720bed](https://github.com/daveymoores/carrick/commit/5720bed18d8b3548b9175a7fbe2da92a9d03439f))
+* multi-protocol contract indexing — GraphQL, Socket.IO, protocol-routed pipeline ([7a174bc](https://github.com/daveymoores/carrick/commit/7a174bcca15e071290c07e06fac10693f4133311))
+* multi-protocol scanner expansion + cloud-protocol companions ([#158](https://github.com/daveymoores/carrick/issues/158)) ([90bf128](https://github.com/daveymoores/carrick/commit/90bf128b4b87affa5db6eea6a2c91b7fbc5b70c1))
+* **socket:** deterministic Socket.IO contract extraction and matching ([9d7451f](https://github.com/daveymoores/carrick/commit/9d7451ff1b2e150d9451c19a9309f870d58eb703))
+
+
+### Bug Fixes
+
+* close scanner failure points — cloud resilience, fail-loud scans, degradation surfacing ([#152](https://github.com/daveymoores/carrick/issues/152)) ([b2f380e](https://github.com/daveymoores/carrick/commit/b2f380e3ed494a3a0cfe52f56e46ce9be0d51418))
+* close type-extraction gaps confirmed by gap-regression tests ([#150](https://github.com/daveymoores/carrick/issues/150)) ([fd869dc](https://github.com/daveymoores/carrick/commit/fd869dc82e03e189d5a9ae814ff6583a1aa3ec30))
+
+
+### Refactoring
+
+* key endpoints and calls by protocol-tagged OperationKey ([b2ccbac](https://github.com/daveymoores/carrick/commit/b2ccbac034f9f3115cbd6327f138a4e436c282eb))
+* key type-manifest entries by OperationKey across Rust and ts_check ([69d78d6](https://github.com/daveymoores/carrick/commit/69d78d6fe4fb822bd07e08c6de6d9a8c7f7015c2))
+
+
+### Documentation
+
+* **research:** cite mock-LLM fixture harness as protocol-phase regression net ([77a6e62](https://github.com/daveymoores/carrick/commit/77a6e62493652272c0bb297451df118d99c43092))
+* **research:** deep dive on multi-protocol expansion (GraphQL, WebSockets, queues) ([42a9ccd](https://github.com/daveymoores/carrick/commit/42a9ccd9e369ba9161d9ee81418ea94e618468cd))
+* **research:** drop compat ceremony from protocol expansion plan, add MVP brittleness guardrails ([e68447c](https://github.com/daveymoores/carrick/commit/e68447caf79d4bc679609627d8b9dc5079041dfe))
+* **research:** protocol-routed LLM prompts design ([ccd35a8](https://github.com/daveymoores/carrick/commit/ccd35a8623d6bb11490675952365f7014a14b279))
+
 ## [0.1.29](https://github.com/daveymoores/carrick/compare/carrick-v0.1.28...carrick-v0.1.29) (2026-06-06)
 
 

@@ -16,7 +16,7 @@ use crate::{
     agents::{
         file_analyzer_agent::FileAnalysisResult,
         file_orchestrator::{FileCentricAnalysisResult, FileOrchestrator, ProcessingStats},
-        framework_guidance_agent::{FrameworkGuidance, FrameworkGuidanceAgent},
+        framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance},
     },
     framework_detector::{DetectionResult, FrameworkDetector},
     mount_graph::MountGraph,
@@ -33,7 +33,7 @@ pub struct MultiAgentAnalysisResult {
     #[allow(dead_code)]
     pub framework_detection: DetectionResult,
     #[allow(dead_code)]
-    pub framework_guidance: FrameworkGuidance,
+    pub framework_guidance: ProtocolGuidance,
     pub mount_graph: MountGraph,
     /// File-centric analysis results (replaces old AnalysisResults)
     pub file_results: HashMap<String, FileAnalysisResult>,
@@ -100,15 +100,18 @@ impl MultiAgentOrchestrator {
         debug!("=== Stage 1: Framework Guidance Generation ===");
         let framework_guidance_agent = FrameworkGuidanceAgent::new(self.agent_service.clone());
         let framework_guidance = framework_guidance_agent
-            .generate_guidance(&framework_detection)
+            .generate_for_active_protocols(&framework_detection)
             .await?;
 
-        debug!(
-            "Generated guidance with {} mount patterns, {} endpoint patterns, {} data fetching patterns",
-            framework_guidance.mount_patterns.len(),
-            framework_guidance.endpoint_patterns.len(),
-            framework_guidance.data_fetching_patterns.len()
-        );
+        for (protocol, guidance) in &framework_guidance {
+            debug!(
+                "Generated {:?} guidance with {} mount patterns, {} endpoint patterns, {} data fetching patterns",
+                protocol,
+                guidance.mount_patterns.len(),
+                guidance.endpoint_patterns.len(),
+                guidance.data_fetching_patterns.len()
+            );
+        }
 
         // Stage 2: AST-Gated File-Centric Analysis
         debug!("=== Stage 2: AST-Gated File-Centric Analysis ===");

@@ -2,7 +2,6 @@ mod agent_service;
 mod agents;
 mod analyzer;
 mod app_context;
-mod call_site_classifier;
 mod call_site_extractor;
 mod cloud_storage;
 mod config;
@@ -12,21 +11,23 @@ mod file_based_router;
 mod file_finder;
 mod formatter;
 mod framework_detector;
+mod graphql;
 mod intent_generator;
 mod logging;
 mod mount_graph;
 mod multi_agent_orchestrator;
 mod oidc;
+mod operation;
 mod packages;
 mod parser;
 mod services;
 mod signature_pass;
+mod socket_io;
 mod swc_scanner;
 mod type_manifest;
 mod url_normalizer;
 mod utils;
 mod visitor;
-mod wrapper_registry;
 
 use crate::cloud_storage::{AwsStorage, MockStorage};
 use crate::services::TypeSidecar;
@@ -127,6 +128,16 @@ async fn main() {
 }
 
 async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the scan target up front. A nonexistent path would otherwise
+    // walk zero files and "succeed" with an empty analysis.
+    if !Path::new(&args.repo_path).is_dir() {
+        return Err(format!(
+            "Repository path '{}' does not exist or is not a directory",
+            args.repo_path
+        )
+        .into());
+    }
+
     // =======================================================================
     // STEP 1: Discover and spawn sidecar (non-blocking)
     // The sidecar is bundled with the tool - auto-discover its location

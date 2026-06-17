@@ -1,6 +1,6 @@
 [package]
 name = "carrick"
-version = "0.1.29"
+version = "0.1.31"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 futures = "0.3.32"
+graphql-parser = "0.4.1"
 indicatif = "0.17"
 
 matchit = "0.8.6"
