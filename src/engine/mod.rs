@@ -272,6 +272,17 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         debug!("Skipping upload (PR/branch mode)");
     }
 
+    // Capture this repo's previously-indexed endpoint keys (its last uploaded
+    // state, i.e. main) before they're removed below. On a PR run, diffing the
+    // current scan against them yields what THIS change added. Empty on the
+    // first scan, in which case the "In this PR" block is suppressed.
+    let previous_self_keys: std::collections::HashSet<crate::operation::OperationKey> =
+        all_repo_data
+            .iter()
+            .filter(|repo| repo.repo_name == repo_name)
+            .flat_map(|repo| repo.endpoints.iter().map(|e| e.key.clone()))
+            .collect();
+
     // 6. Cross-repo analysis (reuse already-downloaded data).
     // Remove this repo's downloaded copies so the freshly-analyzed services
     // are the ones used.
@@ -289,6 +300,31 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         peer_repo_count, local_service_count
     );
 
+    // On a PR run with a prior index, surface what this change added: endpoints
+    // in the freshly-analyzed services that the previous index didn't have.
+    // Computed before `current_services_data` is moved into the analyzer.
+    let pr_delta = if pr_number_from_env().is_some() && !previous_self_keys.is_empty() {
+        let mut new_endpoints = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for service_data in &current_services_data {
+            for endpoint in &service_data.endpoints {
+                if !previous_self_keys.contains(&endpoint.key) && seen.insert(endpoint.key.clone())
+                {
+                    let (method, path) = endpoint.key.display_labels();
+                    new_endpoints.push(crate::formatter::NewEndpoint {
+                        method,
+                        path,
+                        service: service_data.service_name.clone(),
+                    });
+                }
+            }
+        }
+        new_endpoints.sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
+        Some(crate::formatter::PrDelta { new_endpoints })
+    } else {
+        None
+    };
+
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
         build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await?;
@@ -300,7 +336,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         local_service_count,
         peer_repo_count,
     };
-    let formatted = crate::formatter::FormattedOutput::new(results, topology);
+    let formatted = crate::formatter::FormattedOutput::new(results, topology, pr_delta);
     formatted.print();
 
     // On pull_request runs we deliberately skip the index upload (see
