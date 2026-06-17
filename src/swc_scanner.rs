@@ -493,9 +493,11 @@ impl CandidateVisitor {
 
     /// Is this a `navigator.sendBeacon(url, ...)` call? This is a web-platform
     /// data-transmitting primitive (a fire-and-forget HTTP POST), the same
-    /// family as `fetch`/`XMLHttpRequest`. Matching the structural shape
+    /// family as `fetch`/`XMLHttpRequest`. Matching the syntactic shape
     /// `navigator.sendBeacon(...)` keeps the scanner free of any third-party
-    /// client allowlist: only the standard browser built-in is recognized.
+    /// client allowlist. This is shape-based, not resolution-based: it keys off
+    /// a receiver named `navigator`, which a local could shadow, so it does not
+    /// prove the actual browser built-in is being called.
     fn is_navigator_send_beacon(callee: &Callee) -> bool {
         let Callee::Expr(expr) = callee else {
             return false;
@@ -1012,10 +1014,9 @@ async function run() { return sdk.doThing(); }
         // dedicated shape signal keeps this file from being skipped by the gate.
         let content = r#"function track() { const ok = navigator.sendBeacon('/collect', payload); return ok; }"#;
         let result = scan_test_content(content);
-        let beacon = result
-            .candidates
-            .iter()
-            .find(|c| c.callee_object == "navigator");
+        let beacon = result.candidates.iter().find(|c| {
+            c.callee_object == "navigator" && c.callee_property.as_deref() == Some("sendBeacon")
+        });
         assert!(
             beacon.is_some(),
             "expected a navigator.sendBeacon candidate, got {:?}",
@@ -1057,7 +1058,8 @@ async function run() { return sdk.doThing(); }
             !result
                 .candidates
                 .iter()
-                .any(|c| c.callee_object == "navigator"),
+                .any(|c| c.callee_object == "navigator"
+                    && c.callee_property.as_deref() == Some("sendBeacon")),
             "non-navigator.sendBeacon must not be tagged as the navigator primitive"
         );
     }

@@ -1201,4 +1201,69 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert!(orphaned.is_empty());
     }
+
+    #[test]
+    fn test_no_baseline_excludes_connectivity_from_headline_count() {
+        // First repo indexed (has_cross_repo_baseline = false): connectivity
+        // findings are inconclusive (no peers to match against) so they must be
+        // kept OUT of the headline CARRICK_ISSUE_COUNT, yet the section must
+        // still render — framed as informational "Observations". This covers
+        // the previously-untested `false` branch of `has_cross_repo_baseline`.
+        let issues = ApiIssues {
+            call_issues: vec![],
+            endpoint_issues: vec![
+                "Orphaned endpoint: GET /api/users in src/routes.ts:42".to_string(),
+                "Orphaned endpoint: PUT /api/sessions in src/sessions.ts:7".to_string(),
+            ],
+            env_var_calls: vec![],
+            mismatches: vec![],
+            type_mismatches: vec![],
+            dependency_conflicts: vec![],
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![],
+            issues,
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+        };
+
+        let output = format_analysis_results(result, false);
+
+        // Headline count excludes the two connectivity findings → zero issues.
+        assert!(
+            output.contains("<!-- CARRICK_ISSUE_COUNT:0 -->"),
+            "first-run connectivity findings must not inflate the headline count, got:\n{}",
+            output
+        );
+        // But the connectivity section still renders, framed as observations.
+        assert!(
+            output.contains("Connectivity Observations"),
+            "connectivity section must still render as informational observations, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("first repo indexed"),
+            "first-run observations must carry the informational framing, got:\n{}",
+            output
+        );
+        // The orphaned endpoints are rendered as Method/Path table rows.
+        assert!(
+            output.contains("`/api/users`"),
+            "the orphaned endpoints must still be listed, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("`/api/sessions`"),
+            "the orphaned endpoints must still be listed, got:\n{}",
+            output
+        );
+        // Headline phrasing reflects the informational framing, not "gaps".
+        assert!(
+            output.contains("connectivity observations"),
+            "headline should frame first-run connectivity as observations, got:\n{}",
+            output
+        );
+    }
 }
