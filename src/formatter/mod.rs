@@ -61,13 +61,39 @@ impl Topology {
     }
 }
 
+/// An endpoint present in the current scan but absent from the repo's
+/// previously-indexed state. `label`/`name` are protocol-agnostic
+/// (`OperationKey::display_labels`): for HTTP they are method + path, for
+/// GraphQL the operation kind + field, for sockets the direction + event.
+#[derive(Debug, Clone)]
+pub struct NewEndpoint {
+    pub label: String,
+    pub name: String,
+    pub service: Option<String>,
+}
+
+/// What this PR added relative to the repo's last-indexed (main) state. Because
+/// the baseline is the last *uploaded* index, this can include an endpoint that
+/// landed on main since its last scan rather than in this PR. `None` outside a
+/// PR run or when there is no prior index to diff against.
+#[derive(Debug, Clone)]
+pub struct PrDelta {
+    pub new_endpoints: Vec<NewEndpoint>,
+}
+
+impl PrDelta {
+    fn is_empty(&self) -> bool {
+        self.new_endpoints.is_empty()
+    }
+}
+
 pub struct FormattedOutput {
     pub content: String,
 }
 
 impl FormattedOutput {
-    pub fn new(result: ApiAnalysisResult, topology: Topology) -> Self {
-        let content = format_analysis_results(result, &topology);
+    pub fn new(result: ApiAnalysisResult, topology: Topology, pr_delta: Option<PrDelta>) -> Self {
+        let content = format_analysis_results(result, &topology, pr_delta.as_ref());
         Self { content }
     }
 
@@ -95,9 +121,13 @@ impl FormattedOutput {
     }
 }
 
-pub fn format_analysis_results(result: ApiAnalysisResult, topology: &Topology) -> String {
+pub fn format_analysis_results(
+    result: ApiAnalysisResult,
+    topology: &Topology,
+    pr_delta: Option<&PrDelta>,
+) -> String {
     if result.issues.is_empty() {
-        return format_no_issues(&result, topology);
+        return format_no_issues(&result, topology, pr_delta);
     }
 
     let categorized_issues = categorize_issues(&result.issues);
@@ -134,6 +164,8 @@ pub fn format_analysis_results(result: ApiAnalysisResult, topology: &Topology) -
         topology,
     ));
     output.push_str("\n\n");
+
+    output.push_str(&format_pr_delta(pr_delta));
 
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
@@ -178,6 +210,36 @@ pub fn format_analysis_results(result: ApiAnalysisResult, topology: &Topology) -
 
     output.push_str(&dashboard_footer());
     output.push_str("\n<!-- CARRICK_OUTPUT_END -->\n");
+    output
+}
+
+/// The "In this PR" block: endpoints this change added relative to the repo's
+/// last-indexed state. Empty (renders nothing) outside a PR run, when there is
+/// no prior index to diff against, or when nothing new was added.
+fn format_pr_delta(pr_delta: Option<&PrDelta>) -> String {
+    let Some(delta) = pr_delta else {
+        return String::new();
+    };
+    if delta.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from("**In this PR**\n\n");
+    for ep in &delta.new_endpoints {
+        let suffix = ep
+            .service
+            .as_deref()
+            .map(code_span)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" (`{}`)", s))
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "- New endpoint `{} {}`{}\n",
+            code_span(&ep.label),
+            code_span(&ep.name),
+            suffix
+        ));
+    }
+    output.push('\n');
     output
 }
 
@@ -282,7 +344,11 @@ fn join_human(parts: &[String]) -> String {
     }
 }
 
-fn format_no_issues(result: &ApiAnalysisResult, topology: &Topology) -> String {
+fn format_no_issues(
+    result: &ApiAnalysisResult,
+    topology: &Topology,
+    pr_delta: Option<&PrDelta>,
+) -> String {
     let mut output = String::new();
     output.push_str("<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n");
     output.push_str(&format!("## 🪢 Carrick{}\n\n", topology.header_suffix()));
@@ -290,6 +356,7 @@ fn format_no_issues(result: &ApiAnalysisResult, topology: &Topology) -> String {
         "> [!TIP]\n> All cross-service calls match the indexed contracts across {}.\n\n",
         topology.scope_phrase()
     ));
+    output.push_str(&format_pr_delta(pr_delta));
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
         result.endpoints.len(),
@@ -467,6 +534,19 @@ fn cell(value: &str) -> String {
 /// out of the code span and could inject Markdown.
 fn code_cell(value: &str) -> String {
     cell(value).replace('`', "")
+}
+
+/// Sanitize a value wrapped in inline-code backticks in prose (not a table):
+/// collapse line breaks and drop backticks so the value can't break out of the
+/// span. Unlike `code_cell` it does not escape pipes, which are literal in a
+/// code span outside a table (escaping them would show a stray backslash).
+fn code_span(value: &str) -> String {
+    value
+        .replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
+        .replace('`', "")
+        .trim()
+        .to_string()
 }
 
 fn format_connectivity_section(
@@ -952,7 +1032,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
 
         // The endpoints and the raw compiler error are surfaced as table rows.
         assert!(output.contains("GET /users/:param/comments"));
@@ -985,7 +1065,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
 
         // The endpoint, both type names, and the error are surfaced.
         assert!(output.contains("GET /api/users"));
@@ -1015,7 +1095,7 @@ mod tests {
             ],
             graphql_operations_indexed: false,
         };
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("GraphQL detected"));
         assert!(output.contains("graphql-request"));
         assert!(output.contains("@apollo/client"));
@@ -1040,7 +1120,7 @@ mod tests {
             detected_graphql_libraries: vec!["@apollo/client".to_string()],
             graphql_operations_indexed: true,
         };
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(!output.contains("GraphQL detected"));
     }
 
@@ -1062,7 +1142,7 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
         };
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(!output.contains("GraphQL detected"));
     }
 
@@ -1086,7 +1166,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
 
         // Check that no issues message is displayed
         assert!(output.contains("All cross-service calls match the indexed contracts"));
@@ -1112,7 +1192,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let formatted = FormattedOutput::new(result, topology_baseline());
+        let formatted = FormattedOutput::new(result, topology_baseline(), None);
         let body = formatted.pr_comment_body();
 
         // The marker lines the old Action stripped before posting must not
@@ -1148,7 +1228,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
 
         assert!(output.contains("Verified (2)"));
         assert!(output.contains("`GET` | `/api/users`"));
@@ -1174,7 +1254,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
 
         assert!(output.contains("Verified (1)"));
     }
@@ -1201,7 +1281,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result, &topology_baseline());
+        let output = format_analysis_results(result, &topology_baseline(), None);
 
         assert!(output.contains("All cross-service calls match the indexed contracts"));
         assert!(output.contains("Verified (1)"));
@@ -1310,7 +1390,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result, &topology_first_repo());
+        let output = format_analysis_results(result, &topology_first_repo(), None);
 
         // Headline count excludes the two connectivity findings → zero issues.
         assert!(
@@ -1383,7 +1463,7 @@ mod tests {
         issues.type_mismatches = vec![
             "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
         ];
-        let output = format_analysis_results(result_with(issues), &topology);
+        let output = format_analysis_results(result_with(issues), &topology, None);
 
         assert!(output.contains("## 🪢 Carrick · monorepo (3 services)"));
         assert!(output.contains("> [!CAUTION]"));
@@ -1398,7 +1478,7 @@ mod tests {
             local_service_count: 1,
             peer_repo_count: 0,
         };
-        let output = format_analysis_results(result_with(empty_issues()), &topology);
+        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
 
         assert!(output.contains("## 🪢 Carrick · api-server"));
         assert!(output.contains("> [!TIP]"));
@@ -1425,7 +1505,7 @@ mod tests {
             }],
             severity: ConflictSeverity::Warning,
         }];
-        let output = format_analysis_results(result_with(issues), &topology);
+        let output = format_analysis_results(result_with(issues), &topology, None);
 
         assert!(output.contains("## 🪢 Carrick · monorepo (3 services)"));
         assert!(output.contains("across 3 repos"));
@@ -1448,7 +1528,7 @@ mod tests {
             }],
             severity: ConflictSeverity::Warning,
         }];
-        let output = format_analysis_results(result_with(issues), &topology_baseline());
+        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
 
         // No contract risks, but a counted issue → amber, not red.
         assert!(output.contains("> [!WARNING]"));
@@ -1464,7 +1544,7 @@ mod tests {
         issues.env_var_calls = vec![
             "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] (from src/orders.ts) - add to internalEnvVars or externalEnvVars in carrick.json".to_string(),
         ];
-        let output = format_analysis_results(result_with(issues), &topology_first_repo());
+        let output = format_analysis_results(result_with(issues), &topology_first_repo(), None);
 
         assert!(output.contains("configuration suggestion"));
         assert!(
@@ -1487,7 +1567,7 @@ mod tests {
             path: "/legacy/ping".to_string(),
             service: Some("billing".to_string()),
         }];
-        let output = format_analysis_results(result_with(issues), &topology_baseline());
+        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
 
         for banned in ["✅", "ℹ️", "⚠️", "❌", "🔁"] {
             assert!(
@@ -1518,7 +1598,7 @@ mod tests {
                 service: Some("billing".to_string()),
             },
         ];
-        let output = format_analysis_results(result_with(issues), &topology_baseline());
+        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
 
         assert!(output.contains("| Method | Path | Service |"));
         assert!(output.contains("| `GET` | `/users` | `auth` |"));
@@ -1535,7 +1615,7 @@ mod tests {
             path: "/legacy/ping".to_string(),
             service: None,
         }];
-        let output = format_analysis_results(result_with(issues), &topology_first_repo());
+        let output = format_analysis_results(result_with(issues), &topology_first_repo(), None);
 
         assert!(!output.contains("Service |"));
         assert!(output.contains("| `GET` | `/legacy/ping` |"));
@@ -1569,10 +1649,122 @@ mod tests {
                 service: None,
             },
         ];
-        let output = format_analysis_results(result_with(issues), &topology_baseline());
+        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
 
         assert!(output.contains("| `GET` | `/users` | `auth` |"));
         // Unattributed row → dash, and the pipe in the path is escaped.
         assert!(output.contains("| `QUERY` | `weird\\|field` | - |"));
+    }
+
+    #[test]
+    fn test_pr_delta_strip_lists_new_endpoints() {
+        let delta = PrDelta {
+            new_endpoints: vec![
+                NewEndpoint {
+                    label: "POST".to_string(),
+                    name: "/v2/invoices".to_string(),
+                    service: Some("billing".to_string()),
+                },
+                NewEndpoint {
+                    label: "GET".to_string(),
+                    name: "/charges".to_string(),
+                    service: None,
+                },
+            ],
+        };
+        let mut issues = empty_issues();
+        issues.dependency_conflicts = vec![DependencyConflict {
+            package_name: "zod".to_string(),
+            repos: vec![crate::analyzer::RepoPackageInfo {
+                repo_name: "billing".to_string(),
+                version: "^3.22".to_string(),
+                source_path: std::path::PathBuf::from("package.json"),
+            }],
+            severity: ConflictSeverity::Warning,
+        }];
+        let output =
+            format_analysis_results(result_with(issues), &topology_baseline(), Some(&delta));
+
+        assert!(output.contains("**In this PR**"));
+        assert!(output.contains("- New endpoint `POST /v2/invoices` (`billing`)"));
+        assert!(output.contains("- New endpoint `GET /charges`"));
+        // The strip sits above the findings sections.
+        let strip_at = output.find("**In this PR**").unwrap();
+        let deps_at = output.find("Dependency conflicts").unwrap();
+        assert!(strip_at < deps_at, "the strip must precede the sections");
+    }
+
+    #[test]
+    fn test_pr_delta_absent_renders_no_strip() {
+        let output =
+            format_analysis_results(result_with(empty_issues()), &topology_baseline(), None);
+        assert!(!output.contains("In this PR"));
+    }
+
+    #[test]
+    fn test_pr_delta_strip_renders_on_clean_run() {
+        // A PR can add an endpoint without introducing any issue, so the strip
+        // must also appear on the clean (TIP) path.
+        let delta = PrDelta {
+            new_endpoints: vec![NewEndpoint {
+                label: "GET".to_string(),
+                name: "/health".to_string(),
+                service: None,
+            }],
+        };
+        let output = format_analysis_results(
+            result_with(empty_issues()),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains("> [!TIP]"));
+        assert!(output.contains("**In this PR**"));
+        assert!(output.contains("- New endpoint `GET /health`"));
+    }
+
+    #[test]
+    fn test_pr_delta_strip_inline_code_is_prose_safe() {
+        // In a prose code span a pipe is literal (must not be backslash-escaped
+        // the way a table cell would), and a backtick in the service is dropped.
+        let delta = PrDelta {
+            new_endpoints: vec![NewEndpoint {
+                label: "GET".to_string(),
+                name: "/a|b".to_string(),
+                service: Some("sv`c".to_string()),
+            }],
+        };
+        let output = format_analysis_results(
+            result_with(empty_issues()),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains("- New endpoint `GET /a|b` (`svc`)"));
+        assert!(
+            !output.contains("\\|"),
+            "prose code span must not escape pipes"
+        );
+    }
+
+    #[test]
+    fn test_pr_delta_strip_omits_empty_service_suffix() {
+        // A service name that sanitizes to empty (e.g. only backticks) must not
+        // render an empty " (``)" suffix.
+        let delta = PrDelta {
+            new_endpoints: vec![NewEndpoint {
+                label: "GET".to_string(),
+                name: "/x".to_string(),
+                service: Some("``".to_string()),
+            }],
+        };
+        let output = format_analysis_results(
+            result_with(empty_issues()),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains("- New endpoint `GET /x`\n"));
+        assert!(!output.contains("(`"), "empty service must omit the suffix");
     }
 }
