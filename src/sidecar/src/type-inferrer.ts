@@ -520,14 +520,19 @@ export class TypeInferrer {
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const node = this.resolveTargetNode(sourceFile, request);
+    const located = this.resolveTargetNode(sourceFile, request);
 
-    if (!node) {
+    if (!located) {
       return null;
     }
 
+    // Mirror inferCallResult: strip `await`/`as`/parens/`!` so the inner
+    // expression's type (not the surrounding `Promise<any>`) is read.
+    const node = this.unwrapExpressionNode(located);
+
     const payloadType = node.getType();
     let typeString = typeText(payloadType, node);
+    let isExplicit = false;
 
     // Apply extraction config
     const unwrapResult = this.unwrapTypeWithConfig(
@@ -537,12 +542,25 @@ export class TypeInferrer {
     );
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
+      isExplicit = unwrapResult.isExplicit;
     }
+
+    // A declared type — an `as T` cast or a typed variable binding/annotation
+    // on an ancestor — wins over the call's raw `Promise<any>` / `any`. Only
+    // recover when one is genuinely present; untyped `request.formData()`
+    // stays `FormData` / `any`.
+    const explicitType = this.extractExplicitTypeFromAncestor(located);
+    if (explicitType) {
+      typeString = explicitType;
+      isExplicit = true;
+    }
+
+    typeString = this.unwrapPromise(typeString, payloadType);
 
     return this.createInferredType(
       request,
       typeString,
-      false,
+      isExplicit,
       this.getNodeLocation(node),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
     );
