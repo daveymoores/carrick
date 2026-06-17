@@ -45,17 +45,16 @@ impl Topology {
         }
     }
 
-    /// One-line description of the analysis scope, used in the verdict.
+    /// Scope noun phrase rendered after "across" in the verdict, so it must
+    /// not itself contain "across". A monorepo's service count is already shown
+    /// in the header suffix, so once peers exist the scope reports repos.
     fn scope_phrase(&self) -> String {
-        match (self.is_monorepo(), self.has_peers()) {
-            (true, true) => format!(
-                "{} services across {} repos",
-                self.local_service_count,
-                self.peer_repo_count + 1
-            ),
-            (true, false) => format!("{} services", self.local_service_count),
-            (false, true) => format!("{} repos", self.peer_repo_count + 1),
-            (false, false) => self.repo_name.clone(),
+        if self.has_peers() {
+            format!("{} repos", self.peer_repo_count + 1)
+        } else if self.is_monorepo() {
+            format!("{} services", self.local_service_count)
+        } else {
+            self.repo_name.clone()
         }
     }
 }
@@ -429,7 +428,7 @@ fn summarize_critical(issue: &str) -> (String, String) {
             "HTTP method mismatch".to_string(),
         )
     } else {
-        ("—".to_string(), issue.to_string())
+        ("-".to_string(), issue.to_string())
     }
 }
 
@@ -537,7 +536,7 @@ fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
         }
     }
 
-    output.push_str("</details>");
+    output.push_str("\n</details>");
     output
 }
 
@@ -584,7 +583,6 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
             }
             output.push('\n');
         }
-        output.push('\n');
     }
 
     // Warning conflicts (minor version differences)
@@ -607,7 +605,6 @@ fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
             }
             output.push('\n');
         }
-        output.push('\n');
     }
 
     // Info conflicts (patch version differences)
@@ -1402,6 +1399,37 @@ mod tests {
         assert!(output.contains("## 🪢 Carrick · api-server"));
         assert!(output.contains("> [!TIP]"));
         assert!(output.contains("across api-server"));
+    }
+
+    #[test]
+    fn test_monorepo_with_peers_scope_has_no_double_across() {
+        // A monorepo that also has peer repos is the one topology where the
+        // scope phrase and the verdict's "across" could collide. The service
+        // count lives in the header suffix; the scope reports repos.
+        let topology = Topology {
+            repo_name: "platform".to_string(),
+            local_service_count: 3,
+            peer_repo_count: 2,
+        };
+        let mut issues = empty_issues();
+        issues.dependency_conflicts = vec![DependencyConflict {
+            package_name: "zod".to_string(),
+            repos: vec![crate::analyzer::RepoPackageInfo {
+                repo_name: "billing".to_string(),
+                version: "^3.22".to_string(),
+                source_path: std::path::PathBuf::from("package.json"),
+            }],
+            severity: ConflictSeverity::Warning,
+        }];
+        let output = format_analysis_results(result_with(issues), &topology);
+
+        assert!(output.contains("## 🪢 Carrick · monorepo (3 services)"));
+        assert!(output.contains("across 3 repos"));
+        assert!(
+            !output.contains("services across"),
+            "the verdict must not double 'across', got:\n{}",
+            output
+        );
     }
 
     #[test]

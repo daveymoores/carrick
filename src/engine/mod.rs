@@ -286,8 +286,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
     debug!(
         "Cross-repo analysis with {} other repos + {} local service(s)",
-        peer_repo_count,
-        current_services_data.len()
+        peer_repo_count, local_service_count
     );
 
     let sp = logging::spinner("Running cross-repo analysis...");

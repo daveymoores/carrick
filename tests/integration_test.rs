@@ -32,9 +32,10 @@ impl TestOutput {
             })
             .unwrap_or(0);
 
-        // Check for successful analysis (presence of the CARRICK header, which
-        // now carries a topology suffix, e.g. "## 🪢 Carrick · monorepo (3 services)").
-        let has_success = stdout.contains("🪢 Carrick");
+        // Check for successful analysis via the markdown header. The header
+        // may carry a topology suffix after the brand mark, so match the stable
+        // prefix rather than the whole line.
+        let has_success = stdout.contains("## 🪢 Carrick");
 
         Self {
             raw_output,
