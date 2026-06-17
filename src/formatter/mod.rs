@@ -487,7 +487,7 @@ fn format_connectivity_section(
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for issue in missing {
             let (method, path) = extract_method_path(issue);
-            output.push_str(&format!("| `{}` | `{}` |\n", method, path));
+            output.push_str(&format!("| `{}` | `{}` |\n", cell(&method), cell(&path)));
         }
         output.push('\n');
     }
@@ -499,20 +499,29 @@ fn format_connectivity_section(
         if orphaned.iter().any(|o| o.service.is_some()) {
             output.push_str("| Method | Path | Service |\n| :--- | :--- | :--- |\n");
             for o in orphaned {
+                // A row can be unattributed even when the column is shown (e.g.
+                // a GraphQL orphan alongside an attributed HTTP one); use a dash
+                // rather than an empty cell.
                 let service = o
                     .service
                     .as_deref()
-                    .map(|s| format!("`{}`", s))
-                    .unwrap_or_default();
+                    .map(|s| format!("`{}`", cell(s)))
+                    .unwrap_or_else(|| "-".to_string());
                 output.push_str(&format!(
                     "| `{}` | `{}` | {} |\n",
-                    o.method, o.path, service
+                    cell(&o.method),
+                    cell(&o.path),
+                    service
                 ));
             }
         } else {
             output.push_str("| Method | Path |\n| :--- | :--- |\n");
             for o in orphaned {
-                output.push_str(&format!("| `{}` | `{}` |\n", o.method, o.path));
+                output.push_str(&format!(
+                    "| `{}` | `{}` |\n",
+                    cell(&o.method),
+                    cell(&o.path)
+                ));
             }
         }
     }
@@ -1515,5 +1524,29 @@ mod tests {
 
         assert!(!output.contains("Service |"));
         assert!(output.contains("| `GET` | `/legacy/ping` |"));
+    }
+
+    #[test]
+    fn test_orphaned_mixed_attribution_uses_dash_and_escapes_cells() {
+        // When the Service column is shown, an unattributed row gets a dash, and
+        // any pipe in a value is escaped so it can't break the table.
+        let mut issues = empty_issues();
+        issues.endpoint_issues = vec![
+            OrphanedEndpoint {
+                method: "GET".to_string(),
+                path: "/users".to_string(),
+                service: Some("auth".to_string()),
+            },
+            OrphanedEndpoint {
+                method: "QUERY".to_string(),
+                path: "weird|field".to_string(),
+                service: None,
+            },
+        ];
+        let output = format_analysis_results(result_with(issues), &topology_baseline());
+
+        assert!(output.contains("| `GET` | `/users` | `auth` |"));
+        // Unattributed row → dash, and the pipe in the path is escaped.
+        assert!(output.contains("| `QUERY` | `weird\\|field` | - |"));
     }
 }
