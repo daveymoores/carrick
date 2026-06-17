@@ -458,6 +458,15 @@ fn cell(value: &str) -> String {
         .to_string()
 }
 
+/// Sanitize a value that will be wrapped in inline-code backticks inside a
+/// table cell. Beyond `cell()`'s pipe/newline escaping, drop backticks: an
+/// HTTP method, route, or service name should never contain one, and a stray
+/// backtick (e.g. from a hand-written carrick.json `serviceName`) would break
+/// out of the code span and could inject Markdown.
+fn code_cell(value: &str) -> String {
+    cell(value).replace('`', "")
+}
+
 fn format_connectivity_section(
     missing: &[String],
     orphaned: &[OrphanedEndpoint],
@@ -487,7 +496,11 @@ fn format_connectivity_section(
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for issue in missing {
             let (method, path) = extract_method_path(issue);
-            output.push_str(&format!("| `{}` | `{}` |\n", cell(&method), cell(&path)));
+            output.push_str(&format!(
+                "| `{}` | `{}` |\n",
+                code_cell(&method),
+                code_cell(&path)
+            ));
         }
         output.push('\n');
     }
@@ -505,12 +518,12 @@ fn format_connectivity_section(
                 let service = o
                     .service
                     .as_deref()
-                    .map(|s| format!("`{}`", cell(s)))
+                    .map(|s| format!("`{}`", code_cell(s)))
                     .unwrap_or_else(|| "-".to_string());
                 output.push_str(&format!(
                     "| `{}` | `{}` | {} |\n",
-                    cell(&o.method),
-                    cell(&o.path),
+                    code_cell(&o.method),
+                    code_cell(&o.path),
                     service
                 ));
             }
@@ -519,8 +532,8 @@ fn format_connectivity_section(
             for o in orphaned {
                 output.push_str(&format!(
                     "| `{}` | `{}` |\n",
-                    cell(&o.method),
-                    cell(&o.path)
+                    code_cell(&o.method),
+                    code_cell(&o.path)
                 ));
             }
         }
@@ -1535,7 +1548,8 @@ mod tests {
             OrphanedEndpoint {
                 method: "GET".to_string(),
                 path: "/users".to_string(),
-                service: Some("auth".to_string()),
+                // Backtick must be stripped so it can't break the code span.
+                service: Some("au`th".to_string()),
             },
             OrphanedEndpoint {
                 method: "QUERY".to_string(),
