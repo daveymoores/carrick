@@ -1672,6 +1672,7 @@ impl FileOrchestrator {
                     file_location: format!("{}:{}", file_path, endpoint.line_number),
                     middleware_chain: Vec::new(),
                     repo_name: None,
+                    service_name: None,
                 });
             }
         }

@@ -76,6 +76,10 @@ pub struct ResolvedEndpoint {
     /// Optional repo identifier for cross-repo matching
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
+    /// Optional service identifier (monorepo carrick.json serviceName), tagged
+    /// during cross-repo merge so findings can name the owning service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 /// Represents a data-fetching call with its target
@@ -265,6 +269,7 @@ impl MountGraph {
             file_location: site.call_site.location.clone(),
             middleware_chain: Vec::new(), // TODO: Could extract from handler_args if needed
             repo_name: None,              // Will be set during cross-repo merge
+            service_name: None,
         })
     }
 
@@ -634,8 +639,10 @@ impl MountGraph {
                     );
                     if seen_endpoints.insert(key) {
                         let mut tagged_endpoint = endpoint.clone();
-                        // Tag endpoint with repo name for service resolution
+                        // Tag endpoint with its owning repo and (monorepo) service
+                        // so cross-repo findings can name where it lives.
                         tagged_endpoint.repo_name = Some(repo_data.repo_name.clone());
+                        tagged_endpoint.service_name = repo_data.service_name.clone();
                         merged.endpoints.push(tagged_endpoint);
                     }
                 }
@@ -841,6 +848,7 @@ mod tests {
             file_location: "routes/users.js:10:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         // Create config with internal domain
@@ -1114,6 +1122,7 @@ mod tests {
             file_location: "routes/orders.js:15:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         let config = Config {
@@ -1154,6 +1163,7 @@ mod tests {
             file_location: "routes/orders.js:20:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         let config = Config {
@@ -1185,6 +1195,7 @@ mod tests {
             file_location: "routes/users.js:5:1".to_string(),
             middleware_chain: vec![],
             repo_name: None,
+            service_name: None,
         });
 
         let config = Config::default();
