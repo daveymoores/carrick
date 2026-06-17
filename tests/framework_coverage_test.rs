@@ -211,6 +211,30 @@ fn react_tsx_fixture_captures_fetch_calls() {
 }
 
 #[test]
+fn react_tsx_fixture_captures_send_beacon_calls() {
+    // `navigator.sendBeacon` is a web-platform HTTP POST primitive with no
+    // import. Without the scanner recognizing its shape, an analytics component
+    // that only beacons would produce zero candidates and be skipped before the
+    // LLM. Assert both the relative and absolute beacon calls surface.
+    let file = fixture_path("react-app/src/components/AnalyticsBeacon.tsx");
+    let result = scan(&file);
+
+    let beacons: Vec<_> = result
+        .candidates
+        .iter()
+        .filter(|c| {
+            c.callee_object == "navigator" && c.callee_property.as_deref() == Some("sendBeacon")
+        })
+        .collect();
+    assert!(
+        beacons.len() >= 2,
+        "expected >=2 navigator.sendBeacon candidates (relative + absolute), got {}: {:?}",
+        beacons.len(),
+        objects(&result.candidates)
+    );
+}
+
+#[test]
 fn react_jsx_fixture_captures_fetch_calls() {
     let file = fixture_path("react-app/src/legacy/LegacyWidget.jsx");
     let result = scan(&file);
