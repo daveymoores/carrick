@@ -36,6 +36,12 @@ runs:
         ASSET="carrick-action-linux.tar.gz"
         JQ_ASSET_URL=".assets[] | select(.name==\"$ASSET\") | .browser_download_url"
 
+        # `gh api` prints the JSON error body to stdout on a 404 (e.g. a release
+        # tag that doesn't exist). Captured into DOWNLOAD_URL that blob is
+        # non-empty, so it slips past the `-z` fallback guards below and is
+        # handed to curl as a "URL". Only accept a value that is actually one.
+        valid_url() { case "$1" in https://*) return 0 ;; *) return 1 ;; esac; }
+
         # Pin the binary to the release matching this action checkout:
         # release-please bumps Cargo.toml in the same commit it tags, so the
         # version here identifies the release this ref shipped with. Without
@@ -44,19 +50,24 @@ runs:
         VERSION=$(grep -m1 '^version' "$GITHUB_ACTION_PATH/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
         echo "Resolving Carrick release for version $VERSION"
 
-        DOWNLOAD_URL=$(gh api "repos/daveymoores/carrick/releases/tags/v$VERSION" \
+        # release-please tags releases as carrick-v<version>.
+        DOWNLOAD_URL=$(gh api "repos/daveymoores/carrick/releases/tags/carrick-v$VERSION" \
           --jq "$JQ_ASSET_URL" 2>/dev/null || true)
+        valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
 
         if [ -z "$DOWNLOAD_URL" ]; then
-          # Tag naming may carry a prefix (e.g. carrick-v0.1.30); match by suffix.
+          # Fallback for any other tag scheme: match a release whose tag ends
+          # with this version.
           DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases --paginate \
             --jq ".[] | select(.tag_name | endswith(\"$VERSION\")) | $JQ_ASSET_URL" \
             2>/dev/null | head -n 1 || true)
+          valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
         fi
 
         if [ -z "$DOWNLOAD_URL" ]; then
           echo "::warning::No release found matching version $VERSION (expected when running from an untagged ref); falling back to the latest release"
-          DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases/latest --jq "$JQ_ASSET_URL")
+          DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases/latest --jq "$JQ_ASSET_URL" 2>/dev/null || true)
+          valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
         fi
 
         if [ -z "$DOWNLOAD_URL" ]; then
