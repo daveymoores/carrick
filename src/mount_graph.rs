@@ -630,13 +630,17 @@ impl MountGraph {
                         .or_insert_with(|| node.clone());
                 }
 
-                // Merge endpoints (deduplicate by method + full_path)
-                // Tag each endpoint with its source repo for cross-repo matching
+                // Merge endpoints, deduplicating by service identity + method +
+                // full_path. The service discriminator (service_name ?? repo_name,
+                // matching the cloud's convention) keeps two monorepo services
+                // that expose the same route (e.g. a shared `/health`) from
+                // collapsing into one endpoint and losing an orphan finding.
+                let service_id = repo_data
+                    .service_name
+                    .as_deref()
+                    .unwrap_or(&repo_data.repo_name);
                 for endpoint in &mount_graph.endpoints {
-                    let key = format!(
-                        "{}:{}:{}",
-                        repo_data.repo_name, endpoint.method, endpoint.full_path
-                    );
+                    let key = format!("{}:{}:{}", service_id, endpoint.method, endpoint.full_path);
                     if seen_endpoints.insert(key) {
                         let mut tagged_endpoint = endpoint.clone();
                         // Tag endpoint with its owning repo and (monorepo) service
@@ -1312,5 +1316,72 @@ mod tests {
             graph.nodes.get("userRouter").unwrap().node_type,
             NodeType::Mountable
         );
+    }
+
+    fn cloud_repo_with_health(
+        repo: &str,
+        service: Option<&str>,
+    ) -> crate::cloud_storage::CloudRepoData {
+        let mut mg = MountGraph::new();
+        mg.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/health".to_string(),
+            full_path: "/health".to_string(),
+            handler: None,
+            owner: repo.to_string(),
+            file_location: format!("{}/health.ts:1", repo),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+        });
+        crate::cloud_storage::CloudRepoData {
+            repo_name: repo.to_string(),
+            service_name: service.map(|s| s.to_string()),
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test".to_string(),
+            mount_graph: Some(mg),
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_keeps_same_route_across_monorepo_services() {
+        // Two services in the same repo both exposing GET /health must survive
+        // the merge as distinct, service-tagged endpoints rather than collapse
+        // into one (which would hide an orphan finding).
+        let repos = vec![
+            cloud_repo_with_health("platform", Some("auth")),
+            cloud_repo_with_health("platform", Some("billing")),
+        ];
+        let merged = MountGraph::merge_from_repos(&repos);
+        let health: Vec<_> = merged
+            .endpoints
+            .iter()
+            .filter(|e| e.full_path == "/health")
+            .collect();
+        assert_eq!(health.len(), 2, "both services' /health must be kept");
+        let services: std::collections::HashSet<_> = health
+            .iter()
+            .filter_map(|e| e.service_name.as_deref())
+            .collect();
+        assert!(services.contains("auth"));
+        assert!(services.contains("billing"));
     }
 }
