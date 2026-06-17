@@ -1,9 +1,19 @@
 # Compiler Sidecar Architecture for Type Extraction
 
-**Status:** Proposed  
+**Status:** Implemented (2026-06) — historical design record  
 **Author:** Carrick Team  
 **Created:** 2025-01  
 **Replaces:** Position-based type extraction via SWC + ts_check TypeExtractor
+
+> **Note (2026-06):** This proposal has shipped. Type extraction now lives in
+> `src/sidecar/`, and the `ts_check/` extraction modules referenced below
+> (`type-extractor.ts`, `type-processor.ts`, `declaration-collector.ts`,
+> `import-handler.ts`, `output-generator.ts`, `type-resolver.ts`,
+> `dependency-manager.ts`) have since been **deleted**. `ts_check/` is still
+> active but retains only the cross-repo type-compatibility check
+> (`run-type-checking.ts` + `lib/type-checker.ts` + `lib/manifest-matcher.ts`).
+> Module lists in this document describe the pre-sidecar state and are kept for
+> historical context.
 
 ## Executive Summary
 
@@ -1539,9 +1549,11 @@ The type checker then:
 3. **Incremental bundling**: Can we cache type resolutions between files in the same repo?
 4. **Error recovery**: How should we handle partial failures (some types resolve, others don't)?
 
-## Appendix: Current ts_check Module Structure
+## Appendix: ts_check Module Structure (pre-sidecar, historical)
 
-For reference, here's what the current ts_check module does:
+For reference, here's what the ts_check module looked like **before** the sidecar
+refactor (the extraction modules below have since been deleted — see the note at
+the top of this document):
 
 ```
 ts_check/
@@ -1561,6 +1573,27 @@ ts_check/
 │   ├── types.ts               # TypeScript interfaces
 │   └── logger.ts              # Logging utilities
 ├── extract-type-definitions.ts # CLI entry point for extraction
+├── run-type-checking.ts        # CLI entry point for checking
+└── package.json
+```
+
+Current structure (post-sidecar, 2026-06) — extraction is gone, only the
+compatibility check remains:
+
+```
+ts_check/
+├── lib/
+│   ├── type-checker.ts        # Checks producer/consumer compatibility
+│   ├── manifest-matcher.ts    # Matches producer/consumer endpoints
+│   ├── project-utils.ts       # ts-morph project utilities
+│   ├── argument-parser.ts     # CLI argument parsing
+│   ├── config.ts              # Configuration
+│   ├── constants.ts           # Shared constants
+│   ├── error-handler.ts       # Error handling
+│   ├── types.ts               # TypeScript interfaces
+│   ├── logger.ts              # Logging utilities
+│   ├── index.ts               # Library exports
+│   └── *.test.ts              # Test suites
 ├── run-type-checking.ts        # CLI entry point for checking
 └── package.json
 ```
