@@ -6,8 +6,13 @@ pub struct FormattedOutput {
 }
 
 impl FormattedOutput {
-    pub fn new(result: ApiAnalysisResult) -> Self {
-        let content = format_analysis_results(result);
+    /// `has_cross_repo_baseline` is false on the first repo indexed for a
+    /// project (no peer repos downloaded). With no peers, connectivity
+    /// findings are inherently inconclusive — an endpoint looks "orphaned"
+    /// only because nothing else is indexed yet — so the formatter frames
+    /// them as informational rather than headline issues.
+    pub fn new(result: ApiAnalysisResult, has_cross_repo_baseline: bool) -> Self {
+        let content = format_analysis_results(result, has_cross_repo_baseline);
         Self { content }
     }
 
@@ -35,14 +40,24 @@ impl FormattedOutput {
     }
 }
 
-pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
+pub fn format_analysis_results(result: ApiAnalysisResult, has_cross_repo_baseline: bool) -> String {
     if result.issues.is_empty() {
         return format_no_issues(&result);
     }
 
     let categorized_issues = categorize_issues(&result.issues);
+    // On the first repo indexed for a project there are no peers to match
+    // against, so every unmatched call/endpoint shows up as a connectivity
+    // "gap". Keep those out of the headline issue count (and the Action's
+    // CARRICK_ISSUE_COUNT) so a first run doesn't look alarming — they're
+    // still listed below, framed as informational.
+    let connectivity_in_headline = if has_cross_repo_baseline {
+        categorized_issues.connectivity.len()
+    } else {
+        0
+    };
     let total_issues = categorized_issues.critical.len()
-        + categorized_issues.connectivity.len()
+        + connectivity_in_headline
         + categorized_issues.configuration.len()
         + categorized_issues.dependencies.len();
 
@@ -53,13 +68,24 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
     output.push_str(&format!("<!-- CARRICK_ISSUE_COUNT:{} -->\n", total_issues));
 
     // Header
+    let connectivity_phrase = if has_cross_repo_baseline {
+        format!(
+            "**{} connectivity gaps**",
+            categorized_issues.connectivity.len()
+        )
+    } else {
+        format!(
+            "**{} connectivity observations** (first repo indexed — informational)",
+            categorized_issues.connectivity.len()
+        )
+    };
     output.push_str(&format!(
-        "### 🪢 Carrick: Cross-repo analysis\n\nIndexed **{} endpoints** and **{} cross-repo calls** across the org.\n\nFound **{} issues**: **{} mismatches**, **{} connectivity gaps**, **{} dependency conflicts**, and **{} configuration suggestions**.\n\n<br>\n\n",
+        "### 🪢 Carrick: Cross-repo analysis\n\nIndexed **{} endpoints** and **{} cross-repo calls** across the org.\n\nFound **{} issues**: **{} mismatches**, {}, **{} dependency conflicts**, and **{} configuration suggestions**.\n\n<br>\n\n",
         result.endpoints.len(),
         result.calls.len(),
         total_issues,
         categorized_issues.critical.len(),
-        categorized_issues.connectivity.len(),
+        connectivity_phrase,
         categorized_issues.dependencies.len(),
         categorized_issues.configuration.len()
     ));
@@ -87,6 +113,7 @@ pub fn format_analysis_results(result: ApiAnalysisResult) -> String {
     if !categorized_issues.connectivity.is_empty() {
         output.push_str(&format_connectivity_section(
             &categorized_issues.connectivity,
+            has_cross_repo_baseline,
         ));
         output.push_str("\n<hr>\n\n");
     }
@@ -276,15 +303,25 @@ fn separate_missing_orphaned(issues: &[String]) -> (Vec<&String>, Vec<&String>) 
     (missing, orphaned)
 }
 
-fn format_connectivity_section(issues: &[String]) -> String {
+fn format_connectivity_section(issues: &[String], has_cross_repo_baseline: bool) -> String {
     let mut output = String::new();
 
+    let heading = if has_cross_repo_baseline {
+        "Connectivity Issues"
+    } else {
+        "Connectivity Observations"
+    };
     output.push_str(&format!(
-        "<details>\n<summary>\n<strong style=\"font-size: 1.1em;\">{} Connectivity Issues</strong>\n</summary>\n\n",
-        issues.len()
+        "<details>\n<summary>\n<strong style=\"font-size: 1.1em;\">{} {}</strong>\n</summary>\n\n",
+        issues.len(),
+        heading
     ));
 
     output.push_str("> Orphaned endpoints have no consumer in the indexed services. Missing endpoints have a consumer call but no producer.\n\n");
+
+    if !has_cross_repo_baseline {
+        output.push_str("> **This is the first repo indexed for this project.** With no other repos to match against, every endpoint without a same-repo consumer is reported below — most will resolve once you connect the repos that call them. Connect more repos to turn these observations into real cross-repo connectivity checks.\n\n");
+    }
 
     let (missing, orphaned) = separate_missing_orphaned(issues);
 
@@ -795,7 +832,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
 
         // Check that the output contains the TypeScript error details
         assert!(output.contains("TypeScript Error"));
@@ -830,7 +867,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
 
         // Check that the output contains the structured error details
         assert!(output.contains("Type Compatibility Issue"));
@@ -861,7 +898,7 @@ mod tests {
             ],
             graphql_operations_indexed: false,
         };
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
         assert!(output.contains("GraphQL detected"));
         assert!(output.contains("graphql-request"));
         assert!(output.contains("@apollo/client"));
@@ -886,7 +923,7 @@ mod tests {
             detected_graphql_libraries: vec!["@apollo/client".to_string()],
             graphql_operations_indexed: true,
         };
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
         assert!(!output.contains("GraphQL detected"));
     }
 
@@ -908,7 +945,7 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
         };
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
         assert!(!output.contains("GraphQL detected"));
     }
 
@@ -932,7 +969,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
 
         // Check that no issues message is displayed
         assert!(output.contains("All cross-repo calls match the indexed contracts"));
@@ -958,7 +995,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let formatted = FormattedOutput::new(result);
+        let formatted = FormattedOutput::new(result, true);
         let body = formatted.pr_comment_body();
 
         // The marker lines the old Action stripped before posting must not
@@ -994,7 +1031,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
 
         assert!(output.contains("✅ 2 Verified Endpoints"));
         assert!(output.contains("`GET` | `/api/users`"));
@@ -1020,7 +1057,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
 
         assert!(output.contains("✅ 1 Verified Endpoint"));
         // Must not pluralize on a single match.
@@ -1049,7 +1086,7 @@ mod tests {
             graphql_operations_indexed: false,
         };
 
-        let output = format_analysis_results(result);
+        let output = format_analysis_results(result, true);
 
         assert!(output.contains("All cross-repo calls match the indexed contracts"));
         assert!(output.contains("✅ 1 Verified Endpoint"));

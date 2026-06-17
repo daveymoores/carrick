@@ -1249,11 +1249,30 @@ impl FileOrchestrator {
             result.symbol_failures.len()
         );
 
-        if !result.errors.is_empty() {
+        // Cap warn-level error emissions the same way per-symbol failures are
+        // capped below: a TS-loose codebase can produce dozens of multi-line
+        // type-resolution errors that would otherwise dominate the 5 MB log
+        // tail and evict the genuinely-novel diagnostics. Spillover stays at
+        // debug — visible with --verbose / in the file log.
+        const ERROR_WARN_CAP: usize = 10;
+        let total_errors = result.errors.len();
+        if total_errors > 0 {
+            let cap = ERROR_WARN_CAP.min(total_errors);
             warn!(
                 "[FileOrchestrator] Type resolution warnings: {:?}",
-                result.errors
+                &result.errors[..cap]
             );
+            if total_errors > cap {
+                warn!(
+                    shown = cap,
+                    suppressed = total_errors - cap,
+                    "[FileOrchestrator] Additional type resolution warnings (run with --verbose to see all)"
+                );
+                debug!(
+                    "[FileOrchestrator] Suppressed type resolution warnings: {:?}",
+                    &result.errors[cap..]
+                );
+            }
         }
 
         // Per-symbol failures carry the actual diagnostic detail (which symbol,
@@ -1664,6 +1683,17 @@ impl FileOrchestrator {
                 else {
                     continue;
                 };
+                // Drop calls whose target is not a real outgoing-call route
+                // (SDK ops, bare identifiers, member expressions). Filtering at
+                // the producer keeps the uploaded cross-repo index clean, not
+                // just the local report.
+                if !crate::analyzer::is_valid_route_shape(&data_call.target) {
+                    debug!(
+                        "Skipping data call with non-route target: {} ({})",
+                        data_call.target, file_path
+                    );
+                    continue;
+                }
                 graph.data_calls.push(DataFetchingCall {
                     method,
                     target_url: data_call.target.clone(),
