@@ -237,10 +237,13 @@ fn format_verdict(
         join_human(&parts)
     };
 
-    let baseline_note = if has_baseline {
-        String::new()
-    } else {
+    // Only explain the informational framing when there are connectivity
+    // findings to frame; otherwise the note would reference connectivity that
+    // isn't present (e.g. a lone repo with only configuration suggestions).
+    let baseline_note = if !has_baseline && !categorized.connectivity.is_empty() {
         " First repo indexed, so connectivity findings are informational.".to_string()
+    } else {
+        String::new()
     };
 
     format!(
@@ -1450,6 +1453,24 @@ mod tests {
         assert!(output.contains("> [!WARNING]"));
         assert!(!output.contains("> [!CAUTION]"));
         assert!(output.contains("dependency conflict"));
+    }
+
+    #[test]
+    fn test_no_baseline_without_connectivity_omits_baseline_note() {
+        // A lone repo with only a configuration suggestion (no connectivity
+        // findings) must not claim "connectivity findings are informational".
+        let mut issues = empty_issues();
+        issues.env_var_calls = vec![
+            "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] (from src/orders.ts) - add to internalEnvVars or externalEnvVars in carrick.json".to_string(),
+        ];
+        let output = format_analysis_results(result_with(issues), &topology_first_repo());
+
+        assert!(output.contains("configuration suggestion"));
+        assert!(
+            !output.contains("First repo indexed"),
+            "no connectivity findings means no baseline note, got:\n{}",
+            output
+        );
     }
 
     #[test]
