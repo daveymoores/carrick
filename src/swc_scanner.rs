@@ -491,6 +491,25 @@ impl CandidateVisitor {
         false
     }
 
+    /// Is this a `navigator.sendBeacon(url, ...)` call? This is a web-platform
+    /// data-transmitting primitive (a fire-and-forget HTTP POST), the same
+    /// family as `fetch`/`XMLHttpRequest`. Matching the structural shape
+    /// `navigator.sendBeacon(...)` keeps the scanner free of any third-party
+    /// client allowlist: only the standard browser built-in is recognized.
+    fn is_navigator_send_beacon(callee: &Callee) -> bool {
+        let Callee::Expr(expr) = callee else {
+            return false;
+        };
+        let Expr::Member(member) = &**expr else {
+            return false;
+        };
+        let MemberProp::Ident(prop) = &member.prop else {
+            return false;
+        };
+        prop.sym.as_ref() == "sendBeacon"
+            && matches!(&*member.obj, Expr::Ident(obj) if obj.sym.as_ref() == "navigator")
+    }
+
     /// Root identifier of a callee expression, e.g. `client` in
     /// `client.users.list()` or `client(...)`.
     fn callee_root_ident(expr: &Expr) -> Option<String> {
@@ -754,6 +773,19 @@ impl Visit for CandidateVisitor {
             self.push_candidate(call, "fetch".to_string(), None);
         }
 
+        // Signal 1b: `navigator.sendBeacon(url, ...)` — a web-platform HTTP POST
+        // primitive. Its first argument is the URL, so the existing
+        // `push_candidate` (which records the first-arg path snippet and tags
+        // Protocol::Http) routes it through the HTTP prompt, where the method is
+        // inferred as POST. Recognized by structural shape, no client allowlist.
+        if Self::is_navigator_send_beacon(&call.callee) {
+            self.push_candidate(
+                call,
+                "navigator".to_string(),
+                Some("sendBeacon".to_string()),
+            );
+        }
+
         // Signal 2: call rooted at an identifier imported from a known
         // network/data-fetching package (covers wrappers regardless of method
         // name), or direct invocation of such an import (`client(url)`).
@@ -970,6 +1002,64 @@ async function run() { return sdk.doThing(); }
         let content =
             r#"function run() { const ws = new WebSocket('wss://example.com'); return ws; }"#;
         assert!(!scan_test_content(content).candidates.is_empty());
+    }
+
+    #[test]
+    fn detects_navigator_send_beacon_relative_url() {
+        // `navigator.sendBeacon('/collect', payload)` is a web-platform HTTP
+        // POST primitive. None of the name heuristics match `navigator` or
+        // `sendBeacon`, and a relative `/collect` has no URL scheme, so only the
+        // dedicated shape signal keeps this file from being skipped by the gate.
+        let content = r#"function track() { const ok = navigator.sendBeacon('/collect', payload); return ok; }"#;
+        let result = scan_test_content(content);
+        let beacon = result
+            .candidates
+            .iter()
+            .find(|c| c.callee_object == "navigator");
+        assert!(
+            beacon.is_some(),
+            "expected a navigator.sendBeacon candidate, got {:?}",
+            result
+                .candidates
+                .iter()
+                .map(|c| (&c.callee_object, &c.callee_property))
+                .collect::<Vec<_>>()
+        );
+        let beacon = beacon.unwrap();
+        assert_eq!(beacon.callee_property.as_deref(), Some("sendBeacon"));
+        assert_eq!(beacon.protocol, Protocol::Http);
+        assert_eq!(beacon.path_snippet.as_deref(), Some("'/collect'"));
+    }
+
+    #[test]
+    fn detects_navigator_send_beacon_absolute_url() {
+        let content = r#"function track() {
+    navigator.sendBeacon('https://metrics.example.com/collect', JSON.stringify(data));
+}"#;
+        let result = scan_test_content(content);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.callee_object == "navigator"
+                    && c.callee_property.as_deref() == Some("sendBeacon")),
+            "expected a navigator.sendBeacon candidate for an absolute URL"
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_send_beacon_member() {
+        // A `sendBeacon` method on some other object is NOT the web-platform
+        // primitive; the shape guard requires the `navigator` receiver.
+        let content = r#"function f() { return tracker.sendBeacon('/x'); }"#;
+        let result = scan_test_content(content);
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|c| c.callee_object == "navigator"),
+            "non-navigator.sendBeacon must not be tagged as the navigator primitive"
+        );
     }
 
     #[test]
