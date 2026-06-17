@@ -19,7 +19,7 @@ impl TestOutput {
             .lines()
             .find(|line| line.contains("Indexed **") && line.contains(" endpoints**"))
             .and_then(|line| {
-                // Parse "Indexed **4 endpoints** and **5 cross-repo calls**"
+                // Parse "Indexed **4 endpoints** and **5 cross-service calls**"
                 let parts: Vec<&str> = line.split("**").collect();
                 if parts.len() >= 2 {
                     parts[1]
@@ -32,8 +32,9 @@ impl TestOutput {
             })
             .unwrap_or(0);
 
-        // Check for successful analysis (presence of CARRICK header)
-        let has_success = stdout.contains("🪢 Carrick: Cross-repo analysis");
+        // Check for successful analysis (presence of the CARRICK header, which
+        // now carries a topology suffix, e.g. "## 🪢 Carrick · monorepo (3 services)").
+        let has_success = stdout.contains("🪢 Carrick");
 
         Self {
             raw_output,

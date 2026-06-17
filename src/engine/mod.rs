@@ -277,14 +277,16 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // are the ones used.
     all_repo_data.retain(|repo| repo.repo_name != repo_name);
 
-    // No peer repos means this is the first repo indexed for the project;
-    // connectivity findings are inconclusive and the formatter frames them as
-    // informational rather than headline issues.
-    let has_cross_repo_baseline = !all_repo_data.is_empty();
+    // Peer repos and local service count describe the project topology, which
+    // the formatter uses to frame findings (single repo / monorepo / poly-repo)
+    // and to decide whether connectivity findings are conclusive. Captured
+    // before `all_repo_data` is moved into the analyzer below.
+    let peer_repo_count = all_repo_data.len();
+    let local_service_count = services.len();
 
     debug!(
         "Cross-repo analysis with {} other repos + {} local service(s)",
-        all_repo_data.len(),
+        peer_repo_count,
         current_services_data.len()
     );
 
@@ -294,7 +296,12 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
-    let formatted = crate::formatter::FormattedOutput::new(results, has_cross_repo_baseline);
+    let topology = crate::formatter::Topology {
+        repo_name: repo_name.clone(),
+        local_service_count,
+        peer_repo_count,
+    };
+    let formatted = crate::formatter::FormattedOutput::new(results, topology);
     formatted.print();
 
     // On pull_request runs we deliberately skip the index upload (see
