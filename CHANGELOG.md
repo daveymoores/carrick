@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.32](https://github.com/daveymoores/carrick/compare/carrick-v0.1.31...carrick-v0.1.32) (2026-06-17)
+
+
+### Features
+
+* **scanner:** recognize navigator.sendBeacon as an HTTP POST call ([62a77d7](https://github.com/daveymoores/carrick/commit/62a77d76fab84b200ab9e518ebfd76dc0fb64975))
+
+
+### Bug Fixes
+
+* **scanner:** address Copilot review feedback from [#163](https://github.com/daveymoores/carrick/issues/163), [#171](https://github.com/daveymoores/carrick/issues/171), [#145](https://github.com/daveymoores/carrick/issues/145) ([#172](https://github.com/daveymoores/carrick/issues/172)) ([088c532](https://github.com/daveymoores/carrick/commit/088c532071cb6107b492ca1468767f03bd956c98))
+* **scanner:** type-extraction fidelity quick wins — request-body cast unwrap + defaulted-union params ([1aff754](https://github.com/daveymoores/carrick/commit/1aff754b674cbd6fb3a97c2fbe17f2ec07c72e1d))
+
 ## [0.1.31](https://github.com/daveymoores/carrick/compare/carrick-v0.1.30...carrick-v0.1.31) (2026-06-17)
 
 
