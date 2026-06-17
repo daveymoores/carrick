@@ -630,17 +630,19 @@ impl MountGraph {
                         .or_insert_with(|| node.clone());
                 }
 
-                // Merge endpoints, deduplicating by service identity + method +
-                // full_path. The service discriminator (service_name ?? repo_name,
-                // matching the cloud's convention) keeps two monorepo services
-                // that expose the same route (e.g. a shared `/health`) from
-                // collapsing into one endpoint and losing an orphan finding.
-                let service_id = repo_data
-                    .service_name
-                    .as_deref()
-                    .unwrap_or(&repo_data.repo_name);
+                // Merge endpoints, deduplicating by repo + service + method +
+                // full_path. Keying on BOTH repo and service means neither two
+                // monorepo services that share a route (e.g. a common `/health`),
+                // nor two repos that happen to declare the same `serviceName`,
+                // collapse into one endpoint and lose an orphan finding.
                 for endpoint in &mount_graph.endpoints {
-                    let key = format!("{}:{}:{}", service_id, endpoint.method, endpoint.full_path);
+                    let key = format!(
+                        "{}:{}:{}:{}",
+                        repo_data.repo_name,
+                        repo_data.service_name.as_deref().unwrap_or(""),
+                        endpoint.method,
+                        endpoint.full_path
+                    );
                     if seen_endpoints.insert(key) {
                         let mut tagged_endpoint = endpoint.clone();
                         // Tag endpoint with its owning repo and (monorepo) service
@@ -1383,5 +1385,22 @@ mod tests {
             .collect();
         assert!(services.contains("auth"));
         assert!(services.contains("billing"));
+    }
+
+    #[test]
+    fn test_merge_keeps_same_route_across_repos_with_shared_service_name() {
+        // Two distinct repos that happen to declare the same serviceName must
+        // not collapse — repo identity is part of the dedup key.
+        let repos = vec![
+            cloud_repo_with_health("repo-a", Some("api")),
+            cloud_repo_with_health("repo-b", Some("api")),
+        ];
+        let merged = MountGraph::merge_from_repos(&repos);
+        let health = merged
+            .endpoints
+            .iter()
+            .filter(|e| e.full_path == "/health")
+            .count();
+        assert_eq!(health, 2, "endpoints from different repos must be kept");
     }
 }
