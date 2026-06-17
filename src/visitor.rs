@@ -347,33 +347,51 @@ impl FunctionDefinitionExtractor {
             .ok()
     }
 
+    /// Resolve a parameter `Pat` to its `(name, type annotation)`.
+    ///
+    /// Handles plain identifiers, rest params, and defaulted params
+    /// (`role: "a" | "b" = "x"`), where the annotation lives on the inner
+    /// `left` pattern of the `AssignPat`. Destructuring patterns
+    /// (`Pat::Object` / `Pat::Array`) are not yet supported and fall through
+    /// to the unnamed placeholder.
+    fn pat_name_and_type(&self, pat: &Pat) -> (String, Option<TsTypeAnn>) {
+        match pat {
+            Pat::Ident(ident) => (
+                ident.id.sym.to_string(),
+                ident.type_ann.as_ref().map(|t| *t.clone()),
+            ),
+            Pat::Rest(rest) => {
+                let rest_name = match &*rest.arg {
+                    Pat::Ident(ident) => format!("...{}", ident.id.sym),
+                    _ => "...rest".to_string(),
+                };
+                (rest_name, rest.type_ann.as_ref().map(|t| *t.clone()))
+            }
+            // A defaulted param (`role = "x"`); the annotation, if any, is on
+            // the inner left pattern. Recurse so name and type are preserved.
+            Pat::Assign(assign) => self.pat_name_and_type(&assign.left),
+            _ => ("param".to_string(), None),
+        }
+    }
+
+    /// Build a `FunctionArgument` from a resolved `(name, type annotation)`.
+    fn build_argument(&self, name: String, type_ann: Option<TsTypeAnn>) -> FunctionArgument {
+        let type_string = type_ann.as_ref().and_then(|t| self.type_ann_to_string(t));
+        FunctionArgument {
+            name,
+            type_ann,
+            is_explicit: type_string.is_some(),
+            type_string,
+        }
+    }
+
     /// Extract function arguments with their type annotations
     fn extract_arguments(&self, params: &[Param]) -> Vec<FunctionArgument> {
         params
             .iter()
             .map(|param| {
-                let (name, type_ann) = match &param.pat {
-                    Pat::Ident(ident) => (
-                        ident.id.sym.to_string(),
-                        ident.type_ann.as_ref().map(|t| *t.clone()),
-                    ),
-                    Pat::Rest(rest) => {
-                        let rest_name = match &*rest.arg {
-                            Pat::Ident(ident) => format!("...{}", ident.id.sym),
-                            _ => "...rest".to_string(),
-                        };
-                        (rest_name, rest.type_ann.as_ref().map(|t| *t.clone()))
-                    }
-                    _ => ("param".to_string(), None),
-                };
-                let type_string = type_ann.as_ref().and_then(|t| self.type_ann_to_string(t));
-
-                FunctionArgument {
-                    name,
-                    type_ann,
-                    is_explicit: type_string.is_some(),
-                    type_string,
-                }
+                let (name, type_ann) = self.pat_name_and_type(&param.pat);
+                self.build_argument(name, type_ann)
             })
             .collect()
     }
@@ -383,28 +401,8 @@ impl FunctionDefinitionExtractor {
         params
             .iter()
             .map(|pat| {
-                let (name, type_ann) = match pat {
-                    Pat::Ident(ident) => (
-                        ident.id.sym.to_string(),
-                        ident.type_ann.as_ref().map(|t| *t.clone()),
-                    ),
-                    Pat::Rest(rest) => {
-                        let rest_name = match &*rest.arg {
-                            Pat::Ident(ident) => format!("...{}", ident.id.sym),
-                            _ => "...rest".to_string(),
-                        };
-                        (rest_name, rest.type_ann.as_ref().map(|t| *t.clone()))
-                    }
-                    _ => ("param".to_string(), None),
-                };
-                let type_string = type_ann.as_ref().and_then(|t| self.type_ann_to_string(t));
-
-                FunctionArgument {
-                    name,
-                    type_ann,
-                    is_explicit: type_string.is_some(),
-                    type_string,
-                }
+                let (name, type_ann) = self.pat_name_and_type(pat);
+                self.build_argument(name, type_ann)
             })
             .collect()
     }
@@ -1031,6 +1029,51 @@ mod tests {
         let defs = extract("function bare(x) { return x; }");
         let def = defs.get("bare").expect("should find bare");
         assert!(def.arguments[0].type_string.is_none());
+    }
+
+    #[test]
+    fn recovers_defaulted_union_param_on_function_declaration() {
+        let defs = extract(
+            r#"function pick(role: "producer" | "consumer" = "producer") { return role; }"#,
+        );
+        let def = defs.get("pick").expect("should find pick");
+        assert_eq!(def.arguments.len(), 1);
+        assert_eq!(def.arguments[0].name, "role");
+        assert_eq!(
+            def.arguments[0].type_string.as_deref(),
+            Some(r#""producer" | "consumer""#)
+        );
+        assert!(
+            def.arguments[0].is_explicit,
+            "defaulted param with an annotation should be explicit"
+        );
+    }
+
+    #[test]
+    fn recovers_defaulted_union_param_on_arrow_function() {
+        let defs = extract(r#"const pick = (role: "producer" | "consumer" = "producer") => role;"#);
+        let def = defs.get("pick").expect("should find pick");
+        assert_eq!(def.arguments.len(), 1);
+        assert_eq!(def.arguments[0].name, "role");
+        assert_eq!(
+            def.arguments[0].type_string.as_deref(),
+            Some(r#""producer" | "consumer""#)
+        );
+        assert!(
+            def.arguments[0].is_explicit,
+            "defaulted param with an annotation should be explicit"
+        );
+    }
+
+    #[test]
+    fn recovers_defaulted_param_name_without_annotation() {
+        // A defaulted param with no annotation keeps its name but stays
+        // implicit (faithful: there is no declared type to recover).
+        let defs = extract(r#"function pick(role = "producer") { return role; }"#);
+        let def = defs.get("pick").expect("should find pick");
+        assert_eq!(def.arguments[0].name, "role");
+        assert!(def.arguments[0].type_string.is_none());
+        assert!(!def.arguments[0].is_explicit);
     }
 
     #[test]

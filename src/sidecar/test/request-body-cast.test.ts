@@ -1,0 +1,183 @@
+/**
+ * Targeted regression for issue #133 root cause A1.
+ *
+ * `inferRequestBody` used to read the raw type of the located node
+ * (`request.json()` / `await request.json()`), surfacing `Promise<any>` /
+ * `any` even when the caller declared the body type via an `as T` cast or a
+ * typed variable binding. The fix mirrors `inferCallResult`: unwrap the
+ * `await`/`as`/paren/`!` wrappers and let an explicit `as T` cast or typed
+ * binding/annotation on an ancestor win over the call's raw type.
+ *
+ * The control case proves the genuinely-untyped path is preserved: an
+ * untyped `await request.formData()` must stay `FormData`/`any` (faithful,
+ * not a bug — #133 lists it as NOT-a-bug), never "recovered" into a
+ * declared type that was never written.
+ */
+
+import { describe, it, before, after } from 'node:test';
+import * as assert from 'node:assert';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { SidecarClient, FIXTURES_PATH } from './helpers.js';
+
+const FIXTURE = path.join(FIXTURES_PATH, 'src/request-bodies.ts');
+const FIXTURE_SOURCE = fs.readFileSync(FIXTURE, 'utf-8');
+
+/** Byte span of `text` in the fixture (ASCII-only file, so byte == char offsets). */
+function spanOf(text: string): { start: number; end: number; line: number } {
+  const start = FIXTURE_SOURCE.indexOf(text);
+  assert.ok(start >= 0, `fixture must contain: ${text}`);
+  assert.strictEqual(
+    FIXTURE_SOURCE.indexOf(text, start + 1),
+    -1,
+    `fixture must contain exactly one occurrence of: ${text}`
+  );
+  const line = FIXTURE_SOURCE.slice(0, start).split('\n').length;
+  return { start, end: start + text.length, line };
+}
+
+interface InferResponseShape {
+  request_id: string;
+  status: string;
+  inferred_types?: Array<{
+    alias: string;
+    type_string: string;
+    infer_kind: string;
+    is_explicit: boolean;
+  }>;
+  errors?: string[];
+}
+
+describe('Request body cast/binding regressions (#133 A1)', () => {
+  let client: SidecarClient;
+
+  before(async () => {
+    client = new SidecarClient();
+    await client.start();
+    await client.send({
+      action: 'init',
+      request_id: 'reqbody-init',
+      repo_root: FIXTURES_PATH,
+    });
+  });
+
+  after(async () => {
+    await client.stop();
+  });
+
+  it('follows an `as T` cast on an awaited request.json()', async () => {
+    // Locator covers the `request.json()` call inside
+    // `(await request.json()) as RegisterRequest`. The raw type is
+    // `Promise<any>`; the `as RegisterRequest` cast must win.
+    const call = spanOf('(await request.json()) as RegisterRequest');
+    const innerStart = call.start + '(await '.length;
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'reqbody-cast',
+      requests: [
+        {
+          file_path: FIXTURE,
+          line_number: call.line,
+          span_start: innerStart,
+          span_end: innerStart + 'request.json()'.length,
+          infer_kind: 'request_body',
+          alias: 'RegisterCastBody',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'RegisterCastBody'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.type_string,
+      'RegisterRequest',
+      `expected the cast type to win, got ${inferred.type_string}`
+    );
+    assert.strictEqual(
+      inferred.is_explicit,
+      true,
+      'a recovered declared type must be reported explicit'
+    );
+  });
+
+  it('follows a typed variable binding on an awaited request.json()', async () => {
+    // `const body: RegisterRequest = await request.json();` — the typed
+    // binding annotation must win over the call's `Promise<any>`.
+    const stmt = spanOf('const body: RegisterRequest = await request.json();');
+    const callStart = stmt.start + 'const body: RegisterRequest = await '.length;
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'reqbody-binding',
+      requests: [
+        {
+          file_path: FIXTURE,
+          line_number: stmt.line,
+          span_start: callStart,
+          span_end: callStart + 'request.json()'.length,
+          infer_kind: 'request_body',
+          alias: 'RegisterBindingBody',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'RegisterBindingBody'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.type_string,
+      'RegisterRequest',
+      `expected the typed binding to win, got ${inferred.type_string}`
+    );
+    assert.strictEqual(
+      inferred.is_explicit,
+      true,
+      'a recovered declared type must be reported explicit'
+    );
+  });
+
+  it('leaves an untyped request.formData() as FormData/any (NOT-a-bug control)', async () => {
+    // No cast, no typed binding → nothing to recover. Must stay faithful.
+    const stmt = spanOf('const form = await request.formData();');
+    const callStart = stmt.start + 'const form = await '.length;
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'reqbody-formdata',
+      requests: [
+        {
+          file_path: FIXTURE,
+          line_number: stmt.line,
+          span_start: callStart,
+          span_end: callStart + 'request.formData()'.length,
+          infer_kind: 'request_body',
+          alias: 'UntypedFormBody',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'UntypedFormBody'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.ok(
+      inferred.type_string === 'FormData' || inferred.type_string === 'any',
+      `expected untyped formData to stay FormData/any, got ${inferred.type_string}`
+    );
+    assert.notStrictEqual(
+      inferred.type_string,
+      'RegisterRequest',
+      'must not invent a declared type that was never written'
+    );
+  });
+});
