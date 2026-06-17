@@ -279,8 +279,8 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // if a sibling service already exposes the same route. `had_prior_index` is
     // tracked separately so a prior scan that indexed zero endpoints still
     // counts as a baseline, rather than being conflated with a first-ever scan
-    // where "new" is meaningless. Skipped entirely off PR runs, where the block
-    // is suppressed anyway.
+    // where "new" is meaningless. On non-PR runs the capture is skipped
+    // entirely, since the block is suppressed there anyway.
     type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
     let is_pr_run = pr_number_from_env().is_some();
     let (had_prior_index, previous_self_keys): (
