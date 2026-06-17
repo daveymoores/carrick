@@ -224,7 +224,9 @@ fn format_pr_delta(pr_delta: Option<&PrDelta>) -> String {
         let suffix = ep
             .service
             .as_deref()
-            .map(|s| format!(" (`{}`)", code_span(s)))
+            .map(code_span)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" (`{}`)", s))
             .unwrap_or_default();
         output.push_str(&format!(
             "- New endpoint `{} {}`{}\n",
@@ -1739,5 +1741,26 @@ mod tests {
             !output.contains("\\|"),
             "prose code span must not escape pipes"
         );
+    }
+
+    #[test]
+    fn test_pr_delta_strip_omits_empty_service_suffix() {
+        // A service name that sanitizes to empty (e.g. only backticks) must not
+        // render an empty " (``)" suffix.
+        let delta = PrDelta {
+            new_endpoints: vec![NewEndpoint {
+                method: "GET".to_string(),
+                path: "/x".to_string(),
+                service: Some("``".to_string()),
+            }],
+        };
+        let output = format_analysis_results(
+            result_with(empty_issues()),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains("- New endpoint `GET /x`\n"));
+        assert!(!output.contains("(`"), "empty service must omit the suffix");
     }
 }

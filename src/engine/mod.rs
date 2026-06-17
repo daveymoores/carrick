@@ -276,9 +276,13 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // i.e. main) before they're removed below. On a PR run, diffing the current
     // scan against them yields what THIS change added. Keyed by (service, key)
     // so that in a monorepo an endpoint newly added to one service still counts
-    // as new even if a sibling service already exposes the same route. Empty on
-    // the first scan, in which case the "In this PR" block is suppressed.
+    // as new even if a sibling service already exposes the same route.
     type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
+    // Whether this repo was indexed at all before. Tracked separately from the
+    // key set so that a prior scan which happened to index zero endpoints still
+    // counts as a baseline (its newly-added endpoints are genuinely new), rather
+    // than being conflated with a first-ever scan where "new" is meaningless.
+    let had_prior_index = all_repo_data.iter().any(|repo| repo.repo_name == repo_name);
     let previous_self_keys: std::collections::HashSet<ServiceEndpointKey> = all_repo_data
         .iter()
         .filter(|repo| repo.repo_name == repo_name)
@@ -309,7 +313,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // On a PR run with a prior index, surface what this change added: endpoints
     // in the freshly-analyzed services that the previous index didn't have.
     // Computed before `current_services_data` is moved into the analyzer.
-    let pr_delta = if pr_number_from_env().is_some() && !previous_self_keys.is_empty() {
+    let pr_delta = if pr_number_from_env().is_some() && had_prior_index {
         let mut new_endpoints = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for service_data in &current_services_data {
@@ -325,7 +329,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
                 }
             }
         }
-        new_endpoints.sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
+        // Sort by (method, path, service) for deterministic output even when two
+        // services add the same route.
+        new_endpoints.sort_by(|a, b| {
+            (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
+        });
         Some(crate::formatter::PrDelta { new_endpoints })
     } else {
         None
