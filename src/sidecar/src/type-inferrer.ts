@@ -557,7 +557,13 @@ export class TypeInferrer {
     // on an ancestor — wins over the call's raw `Promise<any>` / `any`. Only
     // recover when one is genuinely present; untyped `request.formData()`
     // stays `FormData` / `any`.
-    const explicitType = this.extractExplicitTypeFromAncestor(located);
+    //
+    // Use the unwrapped `node`, not `located`: when the locator lands ON the
+    // `(...) as T` cast itself, the cast is the located node (not an ancestor),
+    // so an ancestor walk from `located` would miss it. `node` is the inner
+    // expression whose ancestors include the `as T`, so the cast is recovered;
+    // the typed-binding and untyped-control cases are unaffected.
+    const explicitType = this.extractExplicitTypeFromAncestor(node);
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;

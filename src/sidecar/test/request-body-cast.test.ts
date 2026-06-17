@@ -105,6 +105,48 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
     );
   });
 
+  it('recovers the cast type when the located node IS the `as T` cast itself', async () => {
+    // Regression for the #163 Copilot finding: when the locator resolves the
+    // span onto the `(await request.json()) as RegisterRequest` cast NODE
+    // (not the inner call), the cast is the located node — not an ancestor —
+    // so the old `extractExplicitTypeFromAncestor(located)` missed it and fell
+    // back to `Promise<any>` / `any`. The fix passes the unwrapped inner node,
+    // whose ancestors include the `as T`, so the cast type is recovered.
+    const cast = spanOf('(await request.json()) as RegisterRequest');
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'reqbody-cast-on-node',
+      requests: [
+        {
+          file_path: FIXTURE,
+          line_number: cast.line,
+          span_start: cast.start,
+          span_end: cast.end,
+          infer_kind: 'request_body',
+          alias: 'RegisterCastNodeBody',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'RegisterCastNodeBody'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.type_string,
+      'RegisterRequest',
+      `expected the cast type to win when located ON the cast, got ${inferred.type_string}`
+    );
+    assert.strictEqual(
+      inferred.is_explicit,
+      true,
+      'a recovered declared type must be reported explicit'
+    );
+  });
+
   it('follows a typed variable binding on an awaited request.json()', async () => {
     // `const body: RegisterRequest = await request.json();` — the typed
     // binding annotation must win over the call's `Promise<any>`.
