@@ -20,7 +20,10 @@ use tracing::{debug, warn};
 /// intents cached by content hash are regenerated rather than reused. The model
 /// and prompt live in the lambda (carrick-cloud), invisible to this crate, so
 /// this constant is the manual invalidation lever.
-const INTENT_CACHE_VERSION: u32 = 1;
+// v2: the /generate-intent lambda moved from the AI Studio gemini-3-flash-preview
+// model to Vertex AI gemini-3.1-flash-lite (carrick-cloud#140). Bumping forces a
+// one-time regeneration of every cached intent on the first post-switch scan.
+const INTENT_CACHE_VERSION: u32 = 2;
 
 /// Content hash of the exact inputs that determine a function's generated
 /// intent: the cache version, the function body, and its callees' intents.
