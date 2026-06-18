@@ -31,8 +31,9 @@ use tracing::{debug, warn};
 /// the backend is exhausted for all of them.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 
-/// Whether the quota circuit breaker has tripped this process.
-fn rate_limit_tripped() -> bool {
+/// Whether the quota circuit breaker has tripped this process. Public so the
+/// engine can abort before uploading a quota-degraded (partial) index.
+pub fn rate_limit_tripped() -> bool {
     RATE_LIMITED.load(Ordering::Relaxed)
 }
 
@@ -49,12 +50,13 @@ fn is_quota_error(err: &AgentError) -> bool {
     err.code == "rate_limited"
 }
 
-/// The user-facing error returned once the breaker is open. Phrased to make
-/// clear this is a backend capacity limit, not a fault in the scanned code.
+/// The error returned for an individual call once the breaker is open. Scoped
+/// to what's true at the call level (this call fails fast); the engine turns a
+/// tripped breaker into a fatal, no-upload abort via [`rate_limit_tripped`].
 fn rate_limit_abort_error() -> Box<dyn std::error::Error> {
-    "Carrick Cloud LLM quota exhausted; aborting scan. This is a rate/quota \
-     limit on the analysis backend, not a problem with the scanned code. \
-     Re-run after the quota resets, or scan fewer files per run."
+    "Carrick Cloud LLM quota exhausted; failing fast. This is a rate/quota \
+     limit on the analysis backend, not a problem with the scanned code. The \
+     scan will stop before uploading; re-run after the quota resets."
         .into()
 }
 
@@ -238,7 +240,7 @@ impl AgentService {
                     if is_quota_error(&err) {
                         trip_rate_limit();
                         warn!(
-                            "Backend LLM quota exhausted ({}); tripping circuit breaker and aborting scan",
+                            "Backend LLM quota exhausted ({}); tripping circuit breaker — remaining calls fail fast and the scan aborts before upload",
                             err.message
                         );
                         return Err(rate_limit_abort_error());
