@@ -221,6 +221,20 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         &format!("Analyzed {} ({} service(s))", repo_name, services.len()),
     );
 
+    // If the LLM quota was exhausted at any point during analysis, the per-call
+    // circuit breaker tripped and the remaining files/functions failed fast — so
+    // the results above are partial. Abort before uploading (or producing any
+    // cross-repo/PR output) so a quota-degraded scan can't overwrite the existing
+    // index with a half-empty one. (Run-log upload still happens in the caller.)
+    if crate::agent_service::rate_limit_tripped() {
+        return Err(
+            "Carrick Cloud LLM quota was exhausted mid-scan; the analysis is \
+                    incomplete, so aborting before upload to avoid overwriting the existing \
+                    index with partial results. Re-run after the quota resets."
+                .into(),
+        );
+    }
+
     // 5. Conditionally upload each service's data to cloud storage.
     //    The production index keys on (workspace, project, repo) only, so it
     //    cannot yet hold more than one service per repo — a multi-service

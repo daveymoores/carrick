@@ -6,9 +6,59 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
+
+/// Process-global circuit breaker for backend LLM quota exhaustion.
+///
+/// A scan runs as a single process, and every lambda call it makes draws on
+/// the same backend LLM quota. A quota / rate-limit error therefore does not
+/// clear within a scan, and — because the cloud counts each attempt before
+/// it calls the model — every retry only burns more of the exhausted budget.
+///
+/// The dominant failure mode without this breaker: ~20 concurrent workers
+/// each independently walk the full 2→64s backoff chain against a wall that
+/// will never lift, so a scan can sit dead for 20+ minutes making no progress
+/// while still consuming quota. The breaker collapses that: the first worker
+/// to see a quota error trips it, and every other in-flight or queued call —
+/// across all phases and all `AgentService` instances — aborts immediately.
+///
+/// This is deliberately a process-global (like [`crate::oidc::OidcProvider`]'s
+/// `global()`): there are several independently-constructed `AgentService`
+/// instances across a single scan, and a quota wall hit by any of them means
+/// the backend is exhausted for all of them.
+static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the quota circuit breaker has tripped this process. Public so the
+/// engine can abort before uploading a quota-degraded (partial) index.
+pub fn rate_limit_tripped() -> bool {
+    RATE_LIMITED.load(Ordering::Relaxed)
+}
+
+/// Trip the quota circuit breaker. Idempotent.
+fn trip_rate_limit() {
+    RATE_LIMITED.store(true, Ordering::Relaxed);
+}
+
+/// Whether a cloud error envelope signals backend quota / rate-limit
+/// exhaustion (which backoff cannot clear within a scan), as opposed to a
+/// transient overload (which it can). The cloud maps both its own per-user
+/// daily cap and upstream provider quota errors to the `rate_limited` code.
+fn is_quota_error(err: &AgentError) -> bool {
+    err.code == "rate_limited"
+}
+
+/// The error returned for an individual call once the breaker is open. Scoped
+/// to what's true at the call level (this call fails fast); the engine turns a
+/// tripped breaker into a fatal, no-upload abort via [`rate_limit_tripped`].
+fn rate_limit_abort_error() -> Box<dyn std::error::Error> {
+    "Carrick Cloud LLM quota exhausted; failing fast. This is a rate/quota \
+     limit on the analysis backend, not a problem with the scanned code. The \
+     scan will stop before uploading; re-run after the quota resets."
+        .into()
+}
 
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
@@ -110,6 +160,14 @@ impl AgentService {
         // non-envelope responses).
         let max_retries = 7;
         for attempt in 1..=max_retries {
+            // A sibling call (any phase, any `AgentService`) may have already
+            // hit the backend quota wall. Re-checked each attempt so a worker
+            // mid-backoff aborts after its current sleep instead of firing a
+            // doomed request that burns more quota.
+            if rate_limit_tripped() {
+                return Err(rate_limit_abort_error());
+            }
+
             let request_builder = self
                 .client
                 .post(&endpoint)
@@ -173,6 +231,20 @@ impl AgentService {
                             .into());
                         }
                     };
+
+                    // A quota / rate-limit error will not clear within a single
+                    // scan, and each retry consumes more of the exhausted
+                    // budget. Trip the process-global breaker so sibling
+                    // workers abort fast instead of each grinding the full
+                    // backoff chain, and fail this call now.
+                    if is_quota_error(&err) {
+                        trip_rate_limit();
+                        warn!(
+                            "Backend LLM quota exhausted ({}); tripping circuit breaker — remaining calls fail fast and the scan aborts before upload",
+                            err.message
+                        );
+                        return Err(rate_limit_abort_error());
+                    }
 
                     if err.retriable && attempt < max_retries {
                         let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
@@ -1552,4 +1624,51 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn err_with_code(code: &str) -> AgentError {
+        AgentError {
+            code: code.to_string(),
+            message: "boom".to_string(),
+            retriable: true,
+        }
+    }
+
+    #[test]
+    fn quota_error_classified_by_code() {
+        // Only the `rate_limited` code trips the breaker; transient overloads
+        // keep their normal backoff path.
+        assert!(is_quota_error(&err_with_code("rate_limited")));
+        assert!(!is_quota_error(&err_with_code("overloaded")));
+        assert!(!is_quota_error(&err_with_code("model_error")));
+    }
+
+    #[test]
+    #[serial]
+    fn breaker_trips_and_is_idempotent() {
+        // Process-global state — reset around the assertions so neither this
+        // run nor a sibling test leaks a tripped breaker.
+        RATE_LIMITED.store(false, Ordering::Relaxed);
+        assert!(!rate_limit_tripped());
+
+        trip_rate_limit();
+        assert!(rate_limit_tripped());
+        trip_rate_limit();
+        assert!(rate_limit_tripped());
+
+        RATE_LIMITED.store(false, Ordering::Relaxed);
+        assert!(!rate_limit_tripped());
+    }
+
+    #[test]
+    fn abort_error_names_the_quota() {
+        // The message must read as a backend capacity limit, not a code fault.
+        let msg = rate_limit_abort_error().to_string().to_lowercase();
+        assert!(msg.contains("quota"));
+    }
 }
