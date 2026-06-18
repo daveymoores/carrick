@@ -340,10 +340,13 @@ fn format_verdict(
 /// (services for a monorepo, repos for poly-repo, endpoints otherwise).
 fn badge_placeholder(state: &str, topology: &Topology, endpoints: usize, risks: usize) -> String {
     let mut query = format!("state={}", state);
+    // One scope count, matching the badge endpoint's priority: a monorepo's
+    // service count, else a poly-repo's repo count. (The endpoint prefers
+    // `services` when both are present, but emitting only one keeps the query
+    // unambiguous.)
     if topology.is_monorepo() {
         query.push_str(&format!("&services={}", topology.local_service_count));
-    }
-    if topology.has_peers() {
+    } else if topology.has_peers() {
         query.push_str(&format!("&repos={}", topology.peer_repo_count + 1));
     }
     query.push_str(&format!("&endpoints={}", endpoints));
@@ -1854,5 +1857,22 @@ mod tests {
         };
         let output = format_analysis_results(result_with(empty_issues()), &topology, None);
         assert!(output.contains("{{CARRICK_BADGE:state=ok&services=3"));
+    }
+
+    #[test]
+    fn test_badge_emits_single_scope_count_for_monorepo_with_peers() {
+        // Monorepo that also has peers: emit the monorepo's service count only,
+        // not both services and repos.
+        let topology = Topology {
+            repo_name: "platform".to_string(),
+            local_service_count: 3,
+            peer_repo_count: 2,
+        };
+        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
+        assert!(output.contains("&services=3"));
+        assert!(
+            !output.contains("&repos="),
+            "a monorepo emits services, not repos"
+        );
     }
 }
