@@ -155,6 +155,20 @@ pub fn format_analysis_results(
 
     output.push_str(&format!("## 🪢 Carrick{}\n\n", topology.header_suffix()));
 
+    let state = if !categorized_issues.critical.is_empty() {
+        "risk"
+    } else if total_issues > 0 {
+        "warn"
+    } else {
+        "ok"
+    };
+    output.push_str(&badge_placeholder(
+        state,
+        topology,
+        result.endpoints.len(),
+        categorized_issues.critical.len(),
+    ));
+
     // Verdict callout. GitHub alert blocks carry severity colour natively, so
     // the comment conveys state without leaning on emoji.
     output.push_str(&format_verdict(
@@ -208,7 +222,7 @@ pub fn format_analysis_results(
         output.push_str("\n\n");
     }
 
-    output.push_str(&dashboard_footer());
+    output.push_str(&dashboard_footer(topology));
     output.push_str("\n<!-- CARRICK_OUTPUT_END -->\n");
     output
 }
@@ -320,11 +334,33 @@ fn format_verdict(
     )
 }
 
-/// Closing line pointing at the dashboard. Deep links are injected cloud-side
-/// (the scanner does not know the workspace/project slug), so this stays as
-/// plain prose for now.
-fn dashboard_footer() -> String {
-    "Full analysis is in the Carrick dashboard.\n".to_string()
+/// The status-badge image. Emits a `{{CARRICK_BADGE:<query>}}` placeholder that
+/// the cloud rewrites to the served SVG URL — the scanner can't know the
+/// dashboard host. Scope counts mirror the badge endpoint's own priority
+/// (services for a monorepo, repos for poly-repo, endpoints otherwise).
+fn badge_placeholder(state: &str, topology: &Topology, endpoints: usize, risks: usize) -> String {
+    let mut query = format!("state={}", state);
+    if topology.is_monorepo() {
+        query.push_str(&format!("&services={}", topology.local_service_count));
+    }
+    if topology.has_peers() {
+        query.push_str(&format!("&repos={}", topology.peer_repo_count + 1));
+    }
+    query.push_str(&format!("&endpoints={}", endpoints));
+    if risks > 0 {
+        query.push_str(&format!("&risks={}", risks));
+    }
+    format!("![Carrick status]({{{{CARRICK_BADGE:{}}}}})\n\n", query)
+}
+
+/// Closing line linking to the dashboard. The scanner can't know the workspace
+/// or project slug (keyless OIDC), so it emits a `{{CARRICK_LINK:<path>}}`
+/// placeholder the cloud rewrites to the absolute dashboard URL.
+fn dashboard_footer(topology: &Topology) -> String {
+    format!(
+        "Full analysis in the [Carrick dashboard]({{{{CARRICK_LINK:explore/{}}}}}).\n",
+        topology.repo_name
+    )
 }
 
 fn plural(n: usize) -> &'static str {
@@ -352,6 +388,12 @@ fn format_no_issues(
     let mut output = String::new();
     output.push_str("<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n");
     output.push_str(&format!("## 🪢 Carrick{}\n\n", topology.header_suffix()));
+    output.push_str(&badge_placeholder(
+        "ok",
+        topology,
+        result.endpoints.len(),
+        0,
+    ));
     output.push_str(&format!(
         "> [!TIP]\n> All cross-service calls match the indexed contracts across {}.\n\n",
         topology.scope_phrase()
@@ -370,7 +412,7 @@ fn format_no_issues(
         output.push_str(&format_verified_section(&result.verified_endpoints));
         output.push_str("\n\n");
     }
-    output.push_str(&dashboard_footer());
+    output.push_str(&dashboard_footer(topology));
     output.push_str("<!-- CARRICK_OUTPUT_END -->\n");
     output
 }
@@ -1766,5 +1808,51 @@ mod tests {
 
         assert!(output.contains("- New endpoint `GET /x`\n"));
         assert!(!output.contains("(`"), "empty service must omit the suffix");
+    }
+
+    #[test]
+    fn test_emits_badge_and_dashboard_link_placeholders() {
+        let topology = Topology {
+            repo_name: "api-server".to_string(),
+            local_service_count: 1,
+            peer_repo_count: 2,
+        };
+        let mut issues = empty_issues();
+        issues.type_mismatches = vec![
+            "Type mismatch on POST /x: Producer (A) incompatible with Consumer (B) - bad"
+                .to_string(),
+        ];
+        let output = format_analysis_results(result_with(issues), &topology, None);
+
+        // Badge image placeholder: risk state, poly-repo repo count, risk count.
+        assert!(output.contains("![Carrick status]({{CARRICK_BADGE:state=risk"));
+        assert!(output.contains("&repos=3"));
+        assert!(output.contains("&risks=1"));
+        // Linked dashboard footer scoped to the repo.
+        assert!(output.contains("[Carrick dashboard]({{CARRICK_LINK:explore/api-server}})"));
+    }
+
+    #[test]
+    fn test_clean_run_emits_ok_badge_and_link() {
+        let topology = Topology {
+            repo_name: "api-server".to_string(),
+            local_service_count: 1,
+            peer_repo_count: 0,
+        };
+        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
+
+        assert!(output.contains("![Carrick status]({{CARRICK_BADGE:state=ok"));
+        assert!(output.contains("[Carrick dashboard]({{CARRICK_LINK:explore/api-server}})"));
+    }
+
+    #[test]
+    fn test_monorepo_badge_carries_service_count() {
+        let topology = Topology {
+            repo_name: "platform".to_string(),
+            local_service_count: 3,
+            peer_repo_count: 0,
+        };
+        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
+        assert!(output.contains("{{CARRICK_BADGE:state=ok&services=3"));
     }
 }
