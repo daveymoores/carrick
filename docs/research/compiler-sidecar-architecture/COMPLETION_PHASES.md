@@ -1,5 +1,10 @@
 # Carrick Compiler Sidecar Completion Phases
 
+> **Note (2026-06):** Implemented — historical handoff record. Type extraction
+> now lives in `src/sidecar/`; the `ts_check/` extraction modules referenced here
+> have since been deleted. `ts_check/` remains active for the cross-repo
+> type-compatibility check only.
+
 This document is a handoff plan for finishing the compiler sidecar refactor and
 restoring correct producer/consumer type checking across repositories.
 

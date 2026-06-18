@@ -1,7 +1,13 @@
 # Compiler Sidecar Implementation Plan
 
-**Status:** Ready for Implementation  
+**Status:** Implemented (2026-06) — historical design record  
 **Prerequisites:** Read `ARCHITECTURE.md` first
+
+> **Note (2026-06):** This plan has shipped. Type extraction now lives in
+> `src/sidecar/`; the `ts_check/` extraction modules this plan describes removing
+> have since been deleted. `ts_check/` remains active for the cross-repo
+> type-compatibility check only. References to extraction modules below are
+> historical.
 
 ## Overview
 

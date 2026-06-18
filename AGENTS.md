@@ -11,7 +11,7 @@
 - `src/` is the main Rust crate (engine, parser, analysis, cloud storage).
 - `tests/` holds Rust integration/unit tests; fixtures live in `tests/fixtures/`.
 - `src/sidecar/` is the TypeScript type-extraction sidecar with tests in `src/sidecar/test/`.
-- `ts_check/` contains legacy/experimental TypeScript utilities.
+- `ts_check/` runs the final cross-repo HTTP type-compatibility check. The scanner discovers it at runtime (`run-type-checking.ts`, via `discover_ts_check_path` in `src/main.rs`) and spawns it with `npx ts-node` to compare producer/consumer manifests. Type *extraction* now lives in `src/sidecar/`; `ts_check/` retains only the compatibility check. It is bundled into the released Action artifact and gated by the pre-commit hook — not legacy or optional.
 - `scripts/` contains developer tooling (pre-commit hook installer).
 - `docs/research/` stores architecture and research notes.
 - `action.yml` defines the GitHub Action entrypoint.
