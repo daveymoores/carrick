@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.35](https://github.com/daveymoores/carrick/compare/carrick-v0.1.34...carrick-v0.1.35) (2026-06-18)
+
+
+### Documentation
+
+* clarify ts_check is the active compatibility checker, not legacy ([#164](https://github.com/daveymoores/carrick/issues/164)) ([41f1453](https://github.com/daveymoores/carrick/commit/41f145300c0927ce5ab6fa8d13bbd15b7d5e0188))
+
 ## [0.1.34](https://github.com/daveymoores/carrick/compare/carrick-v0.1.33...carrick-v0.1.34) (2026-06-18)
 
 
