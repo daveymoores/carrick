@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.34](https://github.com/daveymoores/carrick/compare/carrick-v0.1.33...carrick-v0.1.34) (2026-06-18)
+
+
+### Bug Fixes
+
+* fail fast on LLM quota exhaustion instead of 20-minute backoff storm ([#177](https://github.com/daveymoores/carrick/issues/177)) ([ab14e44](https://github.com/daveymoores/carrick/commit/ab14e44ea2078d40a65511c4d30a9c98094a50e3))
+
 ## [0.1.33](https://github.com/daveymoores/carrick/compare/carrick-v0.1.32...carrick-v0.1.33) (2026-06-18)
 
 
