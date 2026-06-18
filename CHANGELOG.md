@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.33](https://github.com/daveymoores/carrick/compare/carrick-v0.1.32...carrick-v0.1.33) (2026-06-18)
+
+
+### Features
+
+* **scanner:** emit dashboard badge + link placeholders in PR comments ([#176](https://github.com/daveymoores/carrick/issues/176)) ([cd17216](https://github.com/daveymoores/carrick/commit/cd172165138608ce64a127da187e9277934e9644))
+
 ## [0.1.32](https://github.com/daveymoores/carrick/compare/carrick-v0.1.31...carrick-v0.1.32) (2026-06-17)
 
 
