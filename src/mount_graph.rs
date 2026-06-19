@@ -91,7 +91,7 @@ pub struct DataFetchingCall {
     pub file_location: String,
     /// Semantic kind carried from extraction; `None` until the file-analyzer
     /// prompt emits it. Drives compat gating in a later stage.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_kind: Option<crate::operation::CallKind>,
 }
 

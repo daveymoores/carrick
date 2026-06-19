@@ -49,6 +49,26 @@ pub enum CallKind {
     Unresolved,
 }
 
+impl CallKind {
+    /// Parse a model-emitted kind string leniently (case-insensitive; `-`/space
+    /// separators tolerated). Returns `None` for anything off-enum so one junk
+    /// value can't fail the whole file's deserialization (mirrors EmissionStyle).
+    pub fn parse_lenient(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
+            "internal_http" => Some(CallKind::InternalHttp),
+            "external_http" => Some(CallKind::ExternalHttp),
+            "sdk" => Some(CallKind::Sdk),
+            "unresolved" => Some(CallKind::Unresolved),
+            _ => None,
+        }
+    }
+}
+
 impl GraphqlOperationKind {
     pub fn as_str(&self) -> &'static str {
         match self {
