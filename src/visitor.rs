@@ -349,11 +349,11 @@ impl FunctionDefinitionExtractor {
 
     /// Resolve a parameter `Pat` to its `(name, type annotation)`.
     ///
-    /// Handles plain identifiers, rest params, and defaulted params
-    /// (`role: "a" | "b" = "x"`), where the annotation lives on the inner
-    /// `left` pattern of the `AssignPat`. Destructuring patterns
-    /// (`Pat::Object` / `Pat::Array`) are not yet supported and fall through
-    /// to the unnamed placeholder.
+    /// Handles plain identifiers, rest params, defaulted params
+    /// (`role: "a" | "b" = "x"` — annotation on the inner `left`), and
+    /// object/array destructuring (`{ id }: { id: string }` — annotation on the
+    /// pattern's own `type_ann`). Anything else falls through to the unnamed
+    /// placeholder.
     fn pat_name_and_type(&self, pat: &Pat) -> (String, Option<TsTypeAnn>) {
         match pat {
             Pat::Ident(ident) => (
@@ -370,8 +370,59 @@ impl FunctionDefinitionExtractor {
             // A defaulted param (`role = "x"`); the annotation, if any, is on
             // the inner left pattern. Recurse so name and type are preserved.
             Pat::Assign(assign) => self.pat_name_and_type(&assign.left),
+            // Destructuring params carry their annotation on the pattern's own
+            // `type_ann`; recover it and reconstruct a readable binding name so the
+            // param is named and (when annotated) reported explicit.
+            Pat::Object(obj) => (
+                Self::object_pat_name(obj),
+                obj.type_ann.as_ref().map(|t| *t.clone()),
+            ),
+            Pat::Array(arr) => (
+                Self::array_pat_name(arr),
+                arr.type_ann.as_ref().map(|t| *t.clone()),
+            ),
             _ => ("param".to_string(), None),
         }
+    }
+
+    /// Reconstruct a readable name for an object-destructuring param, e.g.
+    /// `{ id, name }`. Nested value patterns collapse to their key.
+    fn object_pat_name(obj: &ObjectPat) -> String {
+        let keys: Vec<String> = obj
+            .props
+            .iter()
+            .map(|prop| match prop {
+                ObjectPatProp::Assign(a) => a.key.sym.to_string(),
+                ObjectPatProp::KeyValue(kv) => match &kv.key {
+                    PropName::Ident(i) => i.sym.to_string(),
+                    PropName::Str(s) => s.value.to_string(),
+                    _ => "_".to_string(),
+                },
+                ObjectPatProp::Rest(rest) => match &*rest.arg {
+                    Pat::Ident(i) => format!("...{}", i.id.sym),
+                    _ => "...rest".to_string(),
+                },
+            })
+            .collect();
+        format!("{{ {} }}", keys.join(", "))
+    }
+
+    /// Reconstruct a readable name for an array-destructuring param, e.g.
+    /// `[a, b]`. Elisions and nested patterns collapse to `_`.
+    fn array_pat_name(arr: &ArrayPat) -> String {
+        let elems: Vec<String> = arr
+            .elems
+            .iter()
+            .map(|elem| match elem {
+                Some(Pat::Ident(i)) => i.id.sym.to_string(),
+                Some(Pat::Rest(rest)) => match &*rest.arg {
+                    Pat::Ident(i) => format!("...{}", i.id.sym),
+                    _ => "...rest".to_string(),
+                },
+                _ => "_".to_string(),
+            })
+            .collect();
+        format!("[{}]", elems.join(", "))
     }
 
     /// Build a `FunctionArgument` from a resolved `(name, type annotation)`.
@@ -1074,6 +1125,47 @@ mod tests {
         assert_eq!(def.arguments[0].name, "role");
         assert!(def.arguments[0].type_string.is_none());
         assert!(!def.arguments[0].is_explicit);
+    }
+
+    #[test]
+    fn recovers_object_destructured_param_on_function_declaration() {
+        let defs = extract(r#"function f({ id }: { id: string }) { return id; }"#);
+        let def = defs.get("f").expect("should find f");
+        assert_eq!(def.arguments.len(), 1);
+        assert_eq!(def.arguments[0].name, "{ id }");
+        assert!(def.arguments[0].is_explicit);
+        assert!(
+            def.arguments[0]
+                .type_string
+                .as_deref()
+                .is_some_and(|t| t.contains("id") && t.contains("string")),
+            "object param should keep its annotation, got {:?}",
+            def.arguments[0].type_string
+        );
+    }
+
+    #[test]
+    fn recovers_object_destructured_param_on_arrow_function() {
+        let defs = extract(r#"const f = ({ id, name }: { id: string; name: string }) => id;"#);
+        let def = defs.get("f").expect("should find f");
+        assert_eq!(def.arguments[0].name, "{ id, name }");
+        assert!(def.arguments[0].is_explicit);
+    }
+
+    #[test]
+    fn recovers_array_destructured_param() {
+        let defs = extract(r#"function f([a, b]: [number, number]) { return a + b; }"#);
+        let def = defs.get("f").expect("should find f");
+        assert_eq!(def.arguments[0].name, "[a, b]");
+        assert!(def.arguments[0].is_explicit);
+        assert!(
+            def.arguments[0]
+                .type_string
+                .as_deref()
+                .is_some_and(|t| t.contains("number")),
+            "array param should keep its tuple annotation, got {:?}",
+            def.arguments[0].type_string
+        );
     }
 
     #[test]
