@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.36](https://github.com/daveymoores/carrick/compare/carrick-v0.1.35...carrick-v0.1.36) (2026-06-19)
+
+
+### Bug Fixes
+
+* **scanner:** extraction determinism + signature fidelity ([#183](https://github.com/daveymoores/carrick/issues/183)) ([9e5c837](https://github.com/daveymoores/carrick/commit/9e5c8373a15766aca1b9e5f4692588fefcdd657f))
+
 ## [0.1.35](https://github.com/daveymoores/carrick/compare/carrick-v0.1.34...carrick-v0.1.35) (2026-06-18)
 
 
