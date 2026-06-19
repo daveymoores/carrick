@@ -1169,9 +1169,11 @@ impl FileOrchestrator {
             if is_catch_all {
                 out.push_str("**");
             } else if seg.len() > 2 && seg.starts_with('[') && seg.ends_with(']') {
+                // trim() mirrors the router's sanitize_param so whitespace-jittered
+                // LLM output (`[ slug ]`) still dedupes against the router's `:slug`.
                 let inner = seg.trim_matches(|c| c == '[' || c == ']').replace('.', "");
                 out.push(':');
-                out.push_str(&inner);
+                out.push_str(inner.trim());
             } else {
                 out.push_str(seg);
             }
@@ -2983,6 +2985,16 @@ export const prerender = false;
         assert_eq!(
             FileOrchestrator::canonicalize_route_path("/blog/[[...slug]]"),
             "/blog/**"
+        );
+        // Whitespace-jittered brackets must still dedupe against the router's
+        // trimmed colon form (Copilot review).
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/w/[ slug ]/x"),
+            "/w/:slug/x"
+        );
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/w/[[ id ]]/x"),
+            "/w/:id/x"
         );
         assert_eq!(
             FileOrchestrator::canonicalize_route_path("/w/:slug/invite"),
