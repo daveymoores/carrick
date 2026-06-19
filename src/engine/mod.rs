@@ -2469,8 +2469,11 @@ mod tests {
                 path
             );
         }
+        // F3c: the member expression `${order.userId}` now collapses to the clean
+        // segment `:userId` rather than the malformed `:order.userId`. Param names
+        // are matching-agnostic, so this is purely a well-formedness improvement.
         assert!(
-            consumer_paths.contains(&"/api/users/:order.userId"),
+            consumer_paths.contains(&"/api/users/:userId"),
             "expected normalized user-service path, got {:?}",
             consumer_paths
         );
