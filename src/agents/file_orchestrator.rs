@@ -379,6 +379,12 @@ impl FileOrchestrator {
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
+                    // Canonicalize LLM-emitted endpoint paths to colon-style params
+                    // (`/w/[slug]` -> `/w/:slug`) so they dedupe against the file-based
+                    // router's structural entries instead of both surviving and flipping
+                    // form between non-deterministic scans.
+                    Self::canonicalize_endpoint_paths(&mut adjusted);
+
                     // Merge file-based route endpoints the LLM pass didn't already
                     // produce. The structural (method, path) facts are authoritative.
                     stats.file_based_endpoints +=
@@ -1142,6 +1148,48 @@ impl FileOrchestrator {
             }
         }
         added
+    }
+
+    /// Canonicalize a route path to colon-style params so structurally identical
+    /// endpoints from the LLM pass (`/w/[slug]`) and the file-based router
+    /// (`/w/:slug`) dedupe to one entry instead of both surviving and flipping
+    /// form between non-deterministic scans. `[id]` -> `:id`, `[...rest]` -> `**`;
+    /// `:id`, `*`, and literal segments are left unchanged (idempotent).
+    fn canonicalize_route_path(path: &str) -> String {
+        let mut out = String::with_capacity(path.len());
+        for (i, seg) in path.split('/').enumerate() {
+            if i > 0 {
+                out.push('/');
+            }
+            // Catch-all (`[...rest]`) and optional catch-all (`[[...rest]]`) both
+            // map to the router's `**`; ordinary dynamic segments (`[id]`, `[[id]]`)
+            // map to `:id`.
+            let is_catch_all = (seg.starts_with("[...") && seg.ends_with(']'))
+                || (seg.starts_with("[[...") && seg.ends_with("]]"));
+            if is_catch_all {
+                out.push_str("**");
+            } else if seg.len() > 2 && seg.starts_with('[') && seg.ends_with(']') {
+                // trim() mirrors the router's sanitize_param so whitespace-jittered
+                // LLM output (`[ slug ]`) still dedupes against the router's `:slug`.
+                let inner = seg.trim_matches(|c| c == '[' || c == ']').replace('.', "");
+                out.push(':');
+                out.push_str(inner.trim());
+            } else {
+                out.push_str(seg);
+            }
+        }
+        out
+    }
+
+    /// Rewrite every LLM-emitted endpoint path to the canonical colon form before
+    /// the file-based merge, so the structural router entries dedupe against them.
+    fn canonicalize_endpoint_paths(result: &mut FileAnalysisResult) {
+        for ep in &mut result.endpoints {
+            let canon = Self::canonicalize_route_path(&ep.path);
+            if canon != ep.path {
+                ep.path = canon;
+            }
+        }
     }
 
     fn apply_candidate_map(
@@ -2914,5 +2962,66 @@ export const prerender = false;
                 .iter()
                 .any(|e| e.method == "POST" && e.path == "/users")
         );
+    }
+
+    #[test]
+    fn test_canonicalize_route_path_brackets_to_colons() {
+        // Astro/Next bracket params -> colon form; catch-alls -> **; colon and
+        // literal segments are untouched (idempotent).
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/w/[slug]/projects/new"),
+            "/w/:slug/projects/new"
+        );
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/w/[slug]/p/[projSlug]/keys/new"),
+            "/w/:slug/p/:projSlug/keys/new"
+        );
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/files/[...path]"),
+            "/files/**"
+        );
+        // Next.js optional catch-all must also reach `**`, matching the router,
+        // not a malformed `:[slug]`.
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/blog/[[...slug]]"),
+            "/blog/**"
+        );
+        // Whitespace-jittered brackets must still dedupe against the router's
+        // trimmed colon form (Copilot review).
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/w/[ slug ]/x"),
+            "/w/:slug/x"
+        );
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/w/[[ id ]]/x"),
+            "/w/:id/x"
+        );
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/w/:slug/invite"),
+            "/w/:slug/invite"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_collapses_bracket_and_colon_duplicate() {
+        // The LLM emitted the bracket form; the file-based router emits the colon
+        // form. After canonicalization they are the same path, so the structural
+        // entry dedupes instead of producing a second, form-flipped endpoint.
+        let mut result = FileAnalysisResult {
+            endpoints: vec![synthetic_endpoint("POST", "/w/[slug]/projects/new")],
+            ..Default::default()
+        };
+        FileOrchestrator::canonicalize_endpoint_paths(&mut result);
+        assert_eq!(result.endpoints[0].path, "/w/:slug/projects/new");
+
+        let added = FileOrchestrator::merge_file_based_endpoints(
+            &mut result,
+            vec![synthetic_endpoint("POST", "/w/:slug/projects/new")],
+        );
+        assert_eq!(
+            added, 0,
+            "colon-form route should dedupe against the canonicalized LLM path"
+        );
+        assert_eq!(result.endpoints.len(), 1);
     }
 }

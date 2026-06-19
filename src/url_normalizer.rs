@@ -301,7 +301,14 @@ impl UrlNormalizer {
         }
     }
 
-    /// Convert ${varName} interpolations to :varName path parameters
+    /// Convert ${varName} interpolations to :varName path parameters.
+    ///
+    /// Member/call/complex inner expressions are reduced to their final
+    /// identifier, so `${row.pr_number}` yields the valid segment `:pr_number`
+    /// rather than the malformed `:row.pr_number`. The param name is cosmetic for
+    /// matching (`:x` and `:y` are equivalent param segments; see
+    /// `is_param_segment` in mount_graph.rs), so collapsing to one clean token is
+    /// safe and keeps each param a single well-formed segment.
     fn convert_interpolations_to_params(&self, path: &str) -> String {
         let mut result = String::new();
         let mut chars = path.chars().peekable();
@@ -318,13 +325,38 @@ impl UrlNormalizer {
                 }
                 // Convert to path parameter format
                 result.push(':');
-                result.push_str(&var_name);
+                result.push_str(&Self::clean_param_name(&var_name));
             } else {
                 result.push(c);
             }
         }
 
         result
+    }
+
+    /// Reduce an interpolation expression to a single clean param identifier.
+    /// `row.pr_number` -> `pr_number`, `userId` -> `userId`; an expression with no
+    /// usable leading-alpha identifier (empty, numeric, operators) -> `param`.
+    fn clean_param_name(expr: &str) -> String {
+        // Take the final run of identifier characters: for a member/bracket/call
+        // expression that is the accessed key, which is the meaningful name.
+        let mut last = String::new();
+        let mut cur = String::new();
+        for c in expr.chars() {
+            if c.is_alphanumeric() || c == '_' {
+                cur.push(c);
+            } else if !cur.is_empty() {
+                last = std::mem::take(&mut cur);
+            }
+        }
+        if !cur.is_empty() {
+            last = cur;
+        }
+        if last.is_empty() || last.starts_with(|c: char| c.is_ascii_digit()) {
+            "param".to_string()
+        } else {
+            last
+        }
     }
 
     /// Normalize a full URL with protocol and host
@@ -667,6 +699,20 @@ mod tests {
         let result = normalizer.normalize("${SERVICE_URL}/orders/${orderId}/items/${itemId}");
 
         assert_eq!(result.path, "/orders/:orderId/items/:itemId");
+        assert!(result.is_internal);
+    }
+
+    /// Regression (F3c): a dotted/member interpolation must collapse to its final
+    /// identifier so the segment is a valid `:pr_number`, not the malformed
+    /// `:row.pr_number` that the verbatim copy used to produce.
+    #[test]
+    fn test_normalize_dotted_interpolation_param() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        let result = normalizer.normalize("${API_URL}/pulls/${row.pr_number}/comments");
+
+        assert_eq!(result.path, "/pulls/:pr_number/comments");
         assert!(result.is_internal);
     }
 
