@@ -306,9 +306,9 @@ impl UrlNormalizer {
     /// Member/call/complex inner expressions are reduced to their final
     /// identifier, so `${row.pr_number}` yields the valid segment `:pr_number`
     /// rather than the malformed `:row.pr_number`. The param name is cosmetic for
-    /// matching (`:x` and `:y` are equivalent param segments — see
+    /// matching (`:x` and `:y` are equivalent param segments; see
     /// `is_param_segment` in mount_graph.rs), so collapsing to one clean token is
-    /// safe and keeps the path well-formed.
+    /// safe and keeps each param a single well-formed segment.
     fn convert_interpolations_to_params(&self, path: &str) -> String {
         let mut result = String::new();
         let mut chars = path.chars().peekable();
@@ -343,7 +343,7 @@ impl UrlNormalizer {
         let mut last = String::new();
         let mut cur = String::new();
         for c in expr.chars() {
-            if c.is_ascii_alphanumeric() || c == '_' {
+            if c.is_alphanumeric() || c == '_' {
                 cur.push(c);
             } else if !cur.is_empty() {
                 last = std::mem::take(&mut cur);

@@ -350,8 +350,8 @@ impl FunctionDefinitionExtractor {
     /// Resolve a parameter `Pat` to its `(name, type annotation)`.
     ///
     /// Handles plain identifiers, rest params, defaulted params
-    /// (`role: "a" | "b" = "x"` — annotation on the inner `left`), and
-    /// object/array destructuring (`{ id }: { id: string }` — annotation on the
+    /// (`role: "a" | "b" = "x"`, annotation on the inner `left`), and
+    /// object/array destructuring (`{ id }: { id: string }`, annotation on the
     /// pattern's own `type_ann`). Anything else falls through to the unnamed
     /// placeholder.
     fn pat_name_and_type(&self, pat: &Pat) -> (String, Option<TsTypeAnn>) {

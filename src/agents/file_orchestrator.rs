@@ -1161,11 +1161,17 @@ impl FileOrchestrator {
             if i > 0 {
                 out.push('/');
             }
-            if seg.starts_with("[...") && seg.ends_with(']') {
+            // Catch-all (`[...rest]`) and optional catch-all (`[[...rest]]`) both
+            // map to the router's `**`; ordinary dynamic segments (`[id]`, `[[id]]`)
+            // map to `:id`.
+            let is_catch_all = (seg.starts_with("[...") && seg.ends_with(']'))
+                || (seg.starts_with("[[...") && seg.ends_with("]]"));
+            if is_catch_all {
                 out.push_str("**");
             } else if seg.len() > 2 && seg.starts_with('[') && seg.ends_with(']') {
+                let inner = seg.trim_matches(|c| c == '[' || c == ']').replace('.', "");
                 out.push(':');
-                out.push_str(&seg[1..seg.len() - 1].replace('.', ""));
+                out.push_str(&inner);
             } else {
                 out.push_str(seg);
             }
@@ -2971,6 +2977,12 @@ export const prerender = false;
         assert_eq!(
             FileOrchestrator::canonicalize_route_path("/files/[...path]"),
             "/files/**"
+        );
+        // Next.js optional catch-all must also reach `**`, matching the router,
+        // not a malformed `:[slug]`.
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/blog/[[...slug]]"),
+            "/blog/**"
         );
         assert_eq!(
             FileOrchestrator::canonicalize_route_path("/w/:slug/invite"),
