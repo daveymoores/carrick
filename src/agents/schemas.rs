@@ -357,6 +357,12 @@ impl AgentSchemas {
                                 "nullable": true,
                                 "description": "HTTP method if detectable (GET, POST, etc.)"
                             },
+                            "call_kind": {
+                                "type": "STRING",
+                                "enum": ["internal_http", "external_http", "sdk", "unresolved"],
+                                "nullable": true,
+                                "description": "How the call target was classified: internal_http (a call to another service's HTTP API), external_http (a third-party or public HTTP API), sdk (a cloud-service or datastore client call), or unresolved (could not be classified)."
+                            },
                             "pattern_matched": {
                                 "type": "STRING",
                                 "description": "The specific pattern that triggered this result"
@@ -636,6 +642,48 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(required.iter().any(|v| v == "emission_style"));
+    }
+
+    #[test]
+    fn call_kind_schema_enum_matches_serde_wire_values() {
+        // The data_calls call_kind enum and CallKind's serde output must stay in
+        // lockstep, or a value the schema advertises but the enum can't parse is
+        // silently absorbed to None and the classification is lost.
+        use crate::operation::CallKind;
+
+        let schema = AgentSchemas::file_analysis_schema();
+        let schema_values: Vec<String> = schema["properties"]["data_calls"]["items"]["properties"]
+            ["call_kind"]["enum"]
+            .as_array()
+            .expect("call_kind enum must exist")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        let serde_values: Vec<String> = [
+            CallKind::InternalHttp,
+            CallKind::ExternalHttp,
+            CallKind::Sdk,
+            CallKind::Unresolved,
+        ]
+        .iter()
+        .map(|k| {
+            serde_json::to_value(k)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+
+        assert_eq!(schema_values, serde_values);
+
+        // call_kind is optional (nullable, not required): a missing label is legal
+        // and defaults to unclassified rather than forcing the model to guess.
+        let required = schema["properties"]["data_calls"]["items"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(!required.iter().any(|v| v == "call_kind"));
     }
 
     #[test]

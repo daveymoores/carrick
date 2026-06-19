@@ -131,6 +131,11 @@ pub struct DataCallResult {
     pub line_number: i32,
     pub target: String,
     pub method: Option<String>,
+    /// LLM classification of the call target (internal_http / external_http /
+    /// sdk / unresolved). `None` when the model omitted it; downstream gating
+    /// treats that as unclassified. See `crate::operation::CallKind`.
+    #[serde(default)]
+    pub call_kind: Option<crate::operation::CallKind>,
     pub pattern_matched: String,
     /// Start byte offset of the data call expression (from SWC via apply_candidate_map)
     #[serde(default)]
@@ -928,6 +933,7 @@ mod tests {
     #[test]
     fn test_data_call_result_serialization() {
         let data_call = DataCallResult {
+            call_kind: None,
             candidate_id: "span:200-260".to_string(),
             line_number: 25,
             target: "https://api.example.com/data".to_string(),
@@ -975,6 +981,7 @@ mod tests {
                 type_import_source: Some(".repo-a_types.ts".to_string()),
             }],
             data_calls: vec![DataCallResult {
+                call_kind: None,
                 candidate_id: "span:60-120".to_string(),
                 line_number: 2,
                 target: "https://example.com".to_string(),
@@ -1077,6 +1084,7 @@ mod tests {
                 type_import_source: None,
             }],
             data_calls: vec![DataCallResult {
+                call_kind: None,
                 candidate_id: "span:190-240".to_string(),
                 line_number: 3,
                 target: "/users".to_string(),
