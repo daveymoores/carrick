@@ -84,6 +84,21 @@ where
         .and_then(EmissionStyle::parse_lenient))
 }
 
+fn deserialize_call_kind<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::operation::CallKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Absorb off-enum / non-string call_kind values to None instead of failing
+    // the whole file's parse (mirrors emission_style; supports fail-closed).
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::operation::CallKind::parse_lenient))
+}
+
 /// Result of analyzing a single endpoint definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResult {
@@ -131,6 +146,12 @@ pub struct DataCallResult {
     pub line_number: i32,
     pub target: String,
     pub method: Option<String>,
+    /// LLM classification of the call target (internal_http / external_http /
+    /// sdk / unresolved). `None` when the model omitted it or emitted an off-enum
+    /// value (lenient, like emission_style); downstream gating treats that as
+    /// unclassified. See `crate::operation::CallKind`.
+    #[serde(default, deserialize_with = "deserialize_call_kind")]
+    pub call_kind: Option<crate::operation::CallKind>,
     pub pattern_matched: String,
     /// Start byte offset of the data call expression (from SWC via apply_candidate_map)
     #[serde(default)]
@@ -735,6 +756,52 @@ mod tests {
         )
     }
 
+    fn data_call_json(extra_fields: &str) -> String {
+        format!(
+            r#"{{
+                "candidate_id": "span:1-2",
+                "line_number": 5,
+                "target": "/api/users",
+                "method": "GET",
+                "pattern_matched": "fetch(",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null{}
+            }}"#,
+            extra_fields
+        )
+    }
+
+    #[test]
+    fn call_kind_absorbs_model_junk_instead_of_failing_the_file() {
+        // An off-enum call_kind must degrade to None, not fail the whole file's
+        // parse (which would drop every data call in the file); this is the
+        // fail-closed behavior the field is meant to provide.
+        for junk in ["internal-http", "INTERNAL_HTTP", "datastore", "", "???"] {
+            let json = data_call_json(&format!(r#", "call_kind": "{}""#, junk));
+            let call: DataCallResult = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("junk {:?} failed the parse: {}", junk, e));
+            assert_eq!(
+                call.call_kind,
+                crate::operation::CallKind::parse_lenient(junk),
+                "junk {:?}",
+                junk
+            );
+        }
+        // Non-string JSON values degrade to None the same way.
+        for junk in ["0", "false", "{}", "[\"sdk\"]"] {
+            let json = data_call_json(&format!(r#", "call_kind": {}"#, junk));
+            let call: DataCallResult = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("non-string {:?} failed the parse: {}", junk, e));
+            assert_eq!(call.call_kind, None, "non-string {:?}", junk);
+        }
+        // Valid wire values still parse.
+        let json = data_call_json(r#", "call_kind": "sdk""#);
+        let call: DataCallResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(call.call_kind, Some(crate::operation::CallKind::Sdk));
+    }
+
     #[test]
     fn emission_style_deserializes_wire_values() {
         for (wire, expected) in [
@@ -928,6 +995,7 @@ mod tests {
     #[test]
     fn test_data_call_result_serialization() {
         let data_call = DataCallResult {
+            call_kind: None,
             candidate_id: "span:200-260".to_string(),
             line_number: 25,
             target: "https://api.example.com/data".to_string(),
@@ -975,6 +1043,7 @@ mod tests {
                 type_import_source: Some(".repo-a_types.ts".to_string()),
             }],
             data_calls: vec![DataCallResult {
+                call_kind: None,
                 candidate_id: "span:60-120".to_string(),
                 line_number: 2,
                 target: "https://example.com".to_string(),
@@ -1077,6 +1146,7 @@ mod tests {
                 type_import_source: None,
             }],
             data_calls: vec![DataCallResult {
+                call_kind: None,
                 candidate_id: "span:190-240".to_string(),
                 line_number: 3,
                 target: "/users".to_string(),

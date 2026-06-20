@@ -130,6 +130,7 @@ fn test_file_analysis_result_structures() {
 
     // Test DataCallResult structure
     let data_call = DataCallResult {
+        call_kind: None,
         candidate_id: "span:200-260".to_string(),
         line_number: 25,
         target: "https://api.example.com/users".to_string(),
@@ -206,6 +207,7 @@ fn test_file_analysis_result_serialization() {
             },
         ],
         data_calls: vec![DataCallResult {
+            call_kind: None,
             candidate_id: "span:410-460".to_string(),
             line_number: 20,
             target: "https://external-api.com/data".to_string(),
@@ -490,6 +492,7 @@ fn test_data_call_extraction() {
         endpoints: vec![],
         data_calls: vec![
             DataCallResult {
+                call_kind: None,
                 candidate_id: "span:670-700".to_string(),
                 line_number: 10,
                 target: "https://api.example.com/users".to_string(),
@@ -505,6 +508,7 @@ fn test_data_call_extraction() {
                 type_import_source: None,
             },
             DataCallResult {
+                call_kind: None,
                 candidate_id: "span:750-780".to_string(),
                 line_number: 15,
                 target: "/api/posts".to_string(),
@@ -520,6 +524,7 @@ fn test_data_call_extraction() {
                 type_import_source: None,
             },
             DataCallResult {
+                call_kind: None,
                 candidate_id: "span:790-820".to_string(),
                 line_number: 20,
                 target: "${baseUrl}/data".to_string(),

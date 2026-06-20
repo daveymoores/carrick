@@ -1748,6 +1748,7 @@ impl FileOrchestrator {
                     target_url: data_call.target.clone(),
                     client: data_call.pattern_matched.clone(),
                     file_location: format!("{}:{}", file_path, data_call.line_number),
+                    call_kind: data_call.call_kind,
                 });
             }
         }
@@ -2101,6 +2102,7 @@ mod tests {
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![DataCallResult {
+                    call_kind: None,
                     candidate_id: "span:200-260".to_string(),
                     line_number: 15,
                     target: "https://api.example.com/data".to_string(),
@@ -2141,6 +2143,7 @@ mod tests {
                 endpoints: vec![],
                 data_calls: vec![
                     DataCallResult {
+                        call_kind: None,
                         candidate_id: "span:300-340".to_string(),
                         line_number: 12,
                         target: "ordersResp".to_string(),
@@ -2156,6 +2159,7 @@ mod tests {
                         type_import_source: None,
                     },
                     DataCallResult {
+                        call_kind: None,
                         candidate_id: "span:350-400".to_string(),
                         line_number: 15,
                         target: "https://api.example.com/data".to_string(),
@@ -2194,6 +2198,7 @@ mod tests {
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![DataCallResult {
+                    call_kind: None,
                     candidate_id: "span:410-460".to_string(),
                     line_number: 12,
                     target: "https://api.example.com/data".to_string(),
@@ -2234,6 +2239,7 @@ mod tests {
                 endpoints: vec![],
                 data_calls: vec![
                     DataCallResult {
+                        call_kind: None,
                         candidate_id: "span:470-520".to_string(),
                         line_number: 10,
                         target: "https://api.example.com/orders".to_string(),
@@ -2249,6 +2255,7 @@ mod tests {
                         type_import_source: None,
                     },
                     DataCallResult {
+                        call_kind: None,
                         candidate_id: "span:530-580".to_string(),
                         line_number: 20,
                         target: "https://api.example.com/orders".to_string(),
@@ -2563,6 +2570,7 @@ mod tests {
                 },
             ],
             data_calls: vec![DataCallResult {
+                call_kind: None,
                 candidate_id: "span:660-700".to_string(),
                 line_number: 12,
                 target: "/users".to_string(),

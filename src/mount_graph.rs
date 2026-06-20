@@ -89,6 +89,10 @@ pub struct DataFetchingCall {
     pub target_url: String,
     pub client: String,
     pub file_location: String,
+    /// Semantic kind carried from extraction; `None` until the file-analyzer
+    /// prompt emits it. Drives compat gating in a later stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_kind: Option<crate::operation::CallKind>,
 }
 
 /// The complete mount and endpoint graph
@@ -311,6 +315,7 @@ impl MountGraph {
             target_url,
             client,
             file_location: site.call_site.location.clone(),
+            call_kind: None,
         })
     }
 

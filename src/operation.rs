@@ -34,6 +34,44 @@ pub enum GraphqlOperationKind {
     Subscription,
 }
 
+/// Semantic classification of an outbound call, orthogonal to `Protocol` (the
+/// wire format). Assigned by the file-analyzer LLM. Only `InternalHttp` is meant
+/// to feed cross-service compatibility matching; `ExternalHttp` / `Sdk` are
+/// excluded from compat and earmarked for a future dependency view — though today
+/// many SDK/external targets are still dropped upstream by
+/// `analyzer::is_valid_route_shape` (non-route shapes: `||`, parens, whitespace)
+/// before they reach the graph, so that retention is not yet complete. `Unresolved`
+/// (and an absent label) is excluded from matching. The gating that acts on this
+/// lands in a later stage; today the field is captured and carried only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    InternalHttp,
+    ExternalHttp,
+    Sdk,
+    Unresolved,
+}
+
+impl CallKind {
+    /// Parse a model-emitted kind string leniently (case-insensitive; `-`/space
+    /// separators tolerated). Returns `None` for anything off-enum so one junk
+    /// value can't fail the whole file's deserialization (mirrors EmissionStyle).
+    pub fn parse_lenient(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
+            "internal_http" => Some(CallKind::InternalHttp),
+            "external_http" => Some(CallKind::ExternalHttp),
+            "sdk" => Some(CallKind::Sdk),
+            "unresolved" => Some(CallKind::Unresolved),
+            _ => None,
+        }
+    }
+}
+
 impl GraphqlOperationKind {
     pub fn as_str(&self) -> &'static str {
         match self {

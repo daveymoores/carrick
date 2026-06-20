@@ -2411,6 +2411,7 @@ mod tests {
             data_calls: data_calls
                 .into_iter()
                 .map(|target| DataCallResult {
+                    call_kind: None,
                     candidate_id: "cand_456".to_string(),
                     line_number: 20,
                     target: target.to_string(),
@@ -2444,12 +2445,14 @@ mod tests {
                 target_url: "`${USER_SERVICE_URL}/api/users/${order.userId}`".to_string(),
                 client: "fetch".to_string(),
                 file_location: "src/orders.ts:42".to_string(),
+                call_kind: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
                 target_url: "`${NOTIFICATION_SERVICE_URL}/api/notifications/status`".to_string(),
                 client: "fetch".to_string(),
                 file_location: "src/notify.ts:7".to_string(),
+                call_kind: None,
             },
         ];
 
