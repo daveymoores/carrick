@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.37](https://github.com/daveymoores/carrick/compare/carrick-v0.1.36...carrick-v0.1.37) (2026-06-20)
+
+
+### Features
+
+* **extraction:** call_kind classification field (groundwork, [#129](https://github.com/daveymoores/carrick/issues/129)) ([359773e](https://github.com/daveymoores/carrick/commit/359773e41f46826819a50358ece6ea1abf6a7ab3))
+
 ## [0.1.36](https://github.com/daveymoores/carrick/compare/carrick-v0.1.35...carrick-v0.1.36) (2026-06-19)
 
 
