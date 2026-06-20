@@ -37,9 +37,12 @@ pub enum GraphqlOperationKind {
 /// Semantic classification of an outbound call, orthogonal to `Protocol` (the
 /// wire format). Assigned by the file-analyzer LLM. Only `InternalHttp` is meant
 /// to feed cross-service compatibility matching; `ExternalHttp` / `Sdk` are
-/// retained for a dependency view but excluded from compat; `Unresolved` (and an
-/// absent label) is excluded from matching. The gating that acts on this lands in
-/// a later stage; today the field is captured and carried only.
+/// excluded from compat and earmarked for a future dependency view — though today
+/// many SDK/external targets are still dropped upstream by
+/// `analyzer::is_valid_route_shape` (non-route shapes: `||`, parens, whitespace)
+/// before they reach the graph, so that retention is not yet complete. `Unresolved`
+/// (and an absent label) is excluded from matching. The gating that acts on this
+/// lands in a later stage; today the field is captured and carried only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallKind {
