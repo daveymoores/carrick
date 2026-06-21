@@ -298,6 +298,11 @@ pub struct FunctionDefinitionExtractor {
     source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
     /// Names of functions that are exported (populated by visit_export_decl / visit_named_export)
     exported_names: HashSet<String>,
+    /// Nesting depth inside function/arrow bodies. Anonymous closures passed to
+    /// method calls (`.every`, `.map`, `.filter`, …) are only captured at depth
+    /// 0; closures nested inside an already-captured function body duplicate the
+    /// parent's intent and only clutter the function index (carrick#58).
+    fn_body_depth: usize,
 }
 
 impl FunctionDefinitionExtractor {
@@ -310,6 +315,7 @@ impl FunctionDefinitionExtractor {
             current_file_path: file_path,
             source_map,
             exported_names: HashSet::new(),
+            fn_body_depth: 0,
         }
     }
 
@@ -682,10 +688,30 @@ impl Visit for FunctionDefinitionExtractor {
     }
 
     /// Capture anonymous closures passed as arguments to method calls.
+    /// Track nesting inside function/arrow bodies so `visit_call_expr` can
+    /// capture top-level handler closures while skipping nested method-callback
+    /// closures (carrick#58).
+    fn visit_function(&mut self, func: &Function) {
+        self.fn_body_depth += 1;
+        func.visit_children_with(self);
+        self.fn_body_depth -= 1;
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        self.fn_body_depth += 1;
+        arrow.visit_children_with(self);
+        self.fn_body_depth -= 1;
+    }
+
     /// e.g. `app.get("/users", async (req, res) => { ... })` → name: "GET_users_handler"
     /// e.g. `emitter.on("data", (chunk) => { ... })` → name: "on_data_handler"
     fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Some((method_name, first_str_arg)) = extract_call_context(call) {
+        // Only capture anonymous closures at the top level; a closure nested
+        // inside an already-captured function body (e.g. `.every(...)` inside a
+        // validator) duplicates the parent's intent (carrick#58).
+        if self.fn_body_depth == 0
+            && let Some((method_name, first_str_arg)) = extract_call_context(call)
+        {
             // Look for function/arrow arguments (skip the first string arg)
             for arg in &call.args {
                 match &*arg.expr {
@@ -869,6 +895,31 @@ mod tests {
         module.visit_with(&mut extractor);
         extractor.finalize_exports();
         extractor.function_definitions
+    }
+
+    #[test]
+    fn skips_closures_nested_inside_a_captured_function_body() {
+        // carrick#58: the `.every(...)` callback duplicates isCommentArray's
+        // intent and must not be captured as its own `every_handler`.
+        let defs =
+            extract("function isCommentArray(arr) { return arr.every((c) => c.id && c.author); }");
+        assert!(defs.contains_key("isCommentArray"), "parent is captured");
+        assert!(
+            !defs.keys().any(|k| k.contains("every")),
+            "nested .every() closure must not be captured, got: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn still_captures_top_level_handler_closures() {
+        // The depth gate must not regress real top-level handler capture.
+        let defs = extract("app.get(\"/users\", (req, res) => { res.json([]); });");
+        assert!(
+            defs.contains_key("get_users_handler"),
+            "top-level handler still captured, got: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
