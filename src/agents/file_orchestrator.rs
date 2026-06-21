@@ -1707,9 +1707,17 @@ impl FileOrchestrator {
                     continue; // Skip non-HTTP methods (e.g., "use", empty)
                 }
 
-                // Try to resolve the owner using import information
-                let resolved_owner =
-                    self.resolve_endpoint_owner(&graph, &endpoint.owner_node, file_path);
+                // Guard against a fabricated owner: when the model bleeds the
+                // HTTP verb into `owner_node` (e.g. Astro `export const POST`,
+                // where the handler export name is the method), the owner reads
+                // as `POST`/`GET`. A verb never matches a mount child, so
+                // overriding it is safe; attribute the route to its file module
+                // instead (carrick-cloud#148, FAR-64).
+                let resolved_owner = if is_http_method(&endpoint.owner_node.trim().to_uppercase()) {
+                    Self::derive_file_owner(file_path)
+                } else {
+                    self.resolve_endpoint_owner(&graph, &endpoint.owner_node, file_path)
+                };
 
                 graph.endpoints.push(ResolvedEndpoint {
                     method,
@@ -1732,6 +1740,22 @@ impl FileOrchestrator {
                 else {
                     continue;
                 };
+                // Drop AWS-SDK-style command dispatches (`client.send(new
+                // XCommand(...))`) — service-SDK calls (DynamoDB/S3/Lambda), not
+                // addressable HTTP. The file-analyzer prompt asks the model to
+                // skip these but does so unreliably (verified leaking into the
+                // index); enforce it deterministically here by call shape
+                // (carrick-cloud#148, #129).
+                if crate::analyzer::is_sdk_command_dispatch(
+                    data_call.call_expression_text.as_deref(),
+                ) || crate::analyzer::is_sdk_command_dispatch(Some(&data_call.pattern_matched))
+                {
+                    debug!(
+                        "Skipping SDK command-dispatch data call: {} ({})",
+                        data_call.target, file_path
+                    );
+                    continue;
+                }
                 // Drop calls whose target is not a real outgoing-call route
                 // (SDK ops, bare identifiers, member expressions). Filtering at
                 // the producer keeps the uploaded cross-repo index clean, not
@@ -1767,6 +1791,25 @@ impl FileOrchestrator {
             .trim_end_matches(".js")
             .trim_end_matches(".tsx")
             .trim_end_matches(".jsx")
+            .to_string()
+    }
+
+    /// Deterministic owner for a file-based route whose `owner_node` was a
+    /// fabricated HTTP verb (e.g. Astro `export const POST`, where the export
+    /// name is the verb). Falls back to the file module (basename without
+    /// extension) so the verb never surfaces as the owner. A verb owner never
+    /// matches a mount child, so this can't change mount resolution
+    /// (carrick-cloud#148, FAR-64).
+    fn derive_file_owner(file_path: &str) -> String {
+        file_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(file_path)
+            .trim_end_matches(".astro")
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".jsx")
+            .trim_end_matches(".ts")
+            .trim_end_matches(".js")
             .to_string()
     }
 
@@ -1866,6 +1909,21 @@ impl FileOrchestrator {
 mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
+
+    #[test]
+    fn test_derive_file_owner_strips_path_and_extension() {
+        // owner=verb fabrication guard falls back to the file module, never a verb.
+        assert_eq!(
+            FileOrchestrator::derive_file_owner("app/src/pages/oauth/token.ts"),
+            "token"
+        );
+        assert_eq!(
+            FileOrchestrator::derive_file_owner("src/pages/index.astro"),
+            "index"
+        );
+        assert_eq!(FileOrchestrator::derive_file_owner("new.tsx"), "new");
+        assert_eq!(FileOrchestrator::derive_file_owner("handler.js"), "handler");
+    }
 
     /// Regression: `tsconfig.json` with `"baseUrl": "."` makes
     /// `import { X } from "types/user"` resolve to `<repo>/types/user.ts`.
