@@ -1732,6 +1732,22 @@ impl FileOrchestrator {
                 else {
                     continue;
                 };
+                // Drop AWS-SDK-style command dispatches (`client.send(new
+                // XCommand(...))`) — service-SDK calls (DynamoDB/S3/Lambda), not
+                // addressable HTTP. The file-analyzer prompt asks the model to
+                // skip these but does so unreliably (verified leaking into the
+                // index); enforce it deterministically here by call shape
+                // (carrick-cloud#148, #129).
+                if crate::analyzer::is_sdk_command_dispatch(
+                    data_call.call_expression_text.as_deref(),
+                ) || crate::analyzer::is_sdk_command_dispatch(Some(&data_call.pattern_matched))
+                {
+                    debug!(
+                        "Skipping SDK command-dispatch data call: {} ({})",
+                        data_call.target, file_path
+                    );
+                    continue;
+                }
                 // Drop calls whose target is not a real outgoing-call route
                 // (SDK ops, bare identifiers, member expressions). Filtering at
                 // the producer keeps the uploaded cross-repo index clean, not

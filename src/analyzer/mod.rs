@@ -200,6 +200,14 @@ pub fn is_valid_route_shape(route: &str) -> bool {
     }
     // Env-var base form: `${VAR}/path`, `${process.env.VAR}/…`, bare `${VAR}`.
     if let Some(rest) = route.strip_prefix("${") {
+        // Reject fully-dynamic pass-through concatenations like
+        // `${host}${url.pathname}` — two or more interpolations with no literal
+        // path segment outside the braces. These are dynamic proxies, not
+        // addressable routes, and surface as bogus missing endpoints
+        // (carrick-cloud#115).
+        if is_fully_dynamic_concat(route) {
+            return false;
+        }
         return rest.contains('}') && is_clean(route);
     }
     // Full URL.
@@ -212,6 +220,65 @@ pub fn is_valid_route_shape(route: &str) -> bool {
     }
     // Bare identifier, member/call expression, `Service:Op`, `#…`, literal.
     false
+}
+
+/// True when a target is two or more `${...}` interpolations concatenated with
+/// no literal path segment outside the braces (e.g. `${host}${url.pathname}`),
+/// i.e. a fully-dynamic pass-through proxy rather than an addressable route
+/// (carrick-cloud#115). `${VAR}/path` (one interpolation + literal) and
+/// `${A}/${B}` (literal `/` between) are kept.
+fn is_fully_dynamic_concat(route: &str) -> bool {
+    let mut skeleton = String::new();
+    let mut chars = route.chars().peekable();
+    let mut interp_count = 0u32;
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut depth = 1u32;
+            for d in chars.by_ref() {
+                match d {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            interp_count += 1;
+        } else {
+            skeleton.push(c);
+        }
+    }
+    interp_count >= 2 && !skeleton.contains('/')
+}
+
+/// True when a data-call expression is an AWS-SDK-style command dispatch
+/// (`client.send(new SomethingCommand(...))`) — a service-SDK call (cloud SDK,
+/// datastore/object-store client), not an addressable HTTP request. This is a
+/// deterministic mirror of the file-analyzer prompt's command-dispatch rule,
+/// enforced in the scanner so the model's (unreliable) adherence can't leak
+/// DynamoDB/S3/Lambda dispatches into the HTTP call graph
+/// (carrick-cloud#148, #129). Matched by call SHAPE, never by client name.
+pub fn is_sdk_command_dispatch(expr: Option<&str>) -> bool {
+    let Some(expr) = expr else {
+        return false;
+    };
+    // `.send(` followed (ignoring whitespace) by `new <Ident>Command(`.
+    let Some(after_send) = expr.split(".send(").nth(1) else {
+        return false;
+    };
+    let Some(after_new) = after_send.trim_start().strip_prefix("new ") else {
+        return false;
+    };
+    let ident: String = after_new
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    !ident.is_empty() && ident.ends_with("Command")
 }
 
 pub struct Analyzer {
@@ -1993,6 +2060,48 @@ mod tests {
         assert!(!Analyzer::is_env_var_base_url("${camelCase}/path")); // camelCase, not env var
         assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
     }
+
+    #[test]
+    fn test_is_valid_route_shape_rejects_dynamic_passthrough() {
+        // carrick-cloud#115: a fully-dynamic proxy concat is not an addressable
+        // route and must not surface as a missing endpoint.
+        assert!(!super::is_valid_route_shape("${host}${url.pathname}"));
+        assert!(!super::is_valid_route_shape("${proto}${rest}"));
+        // Real env-var routes with a literal path are kept.
+        assert!(super::is_valid_route_shape("${SERVICE_URL}/api/users"));
+        assert!(super::is_valid_route_shape("${API_BASE}/orders/${id}"));
+        // A literal slash between two interpolations keeps structure.
+        assert!(super::is_valid_route_shape("${base}/${id}"));
+        // A single bare env var is left to the SDK/shape filters, not dropped here.
+        assert!(super::is_valid_route_shape("${TABLE_NAME}"));
+    }
+
+    #[test]
+    fn test_is_sdk_command_dispatch() {
+        // AWS SDK v3 command dispatches across services (carrick-cloud#148/#129).
+        assert!(super::is_sdk_command_dispatch(Some(
+            "docClient.send(new QueryCommand(queryParams))"
+        )));
+        assert!(super::is_sdk_command_dispatch(Some(
+            "s3Client.send(new GetObjectCommand({ Bucket, Key }))"
+        )));
+        assert!(super::is_sdk_command_dispatch(Some(
+            "lambdaClient.send(new InvokeCommand(params))"
+        )));
+        assert!(super::is_sdk_command_dispatch(Some(
+            "client.send( new  UpdateItemCommand(x) )"
+        )));
+        // Not SDK dispatches — must not be suppressed.
+        assert!(!super::is_sdk_command_dispatch(Some(
+            "fetch(\"/api/users\")"
+        )));
+        assert!(!super::is_sdk_command_dispatch(Some("reply.send(users)")));
+        assert!(!super::is_sdk_command_dispatch(Some(
+            "axios.post(url, body)"
+        )));
+        assert!(!super::is_sdk_command_dispatch(None));
+    }
+
     fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
             owner: None,
