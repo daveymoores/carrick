@@ -345,12 +345,18 @@ fn tier_a_extraction_quality() {
         // Non-flaky floor: at least one expected endpoint found in at least one run.
         assert!(
             ep_at > 0.0,
-            "[eval] {name}: endpoint pass@k is 0 — nothing matched across {n} run(s)"
+            "[eval] {name}: endpoint pass@k is 0 — no expected endpoint matched across \
+             {n} run(s). Expected: {expected_eps:?}"
         );
     }
 
     println!(
-        "\nMEAN  endpoints F1 {:.2}  pass^k {:.2}   |   calls F1 {:.2}  pass^k {:.2}",
+        "\nMEAN (avg over {} fixtures; each pass^k is at that fixture's effective n — \
+         see per-fixture rows for any reduced n)",
+        FIXTURES.len()
+    );
+    println!(
+        "      endpoints F1 {:.2}  pass^k {:.2}   |   calls F1 {:.2}  pass^k {:.2}",
         sum_ep_f1 / nf,
         sum_ep_passpow / nf,
         sum_call_f1 / nf,
