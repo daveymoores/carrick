@@ -1,0 +1,8 @@
+{
+  "endpoints": [
+    { "method": "GET",  "path": "/users" },
+    { "method": "GET",  "path": "/users/:id" },
+    { "method": "POST", "path": "/users" }
+  ],
+  "calls": []
+}

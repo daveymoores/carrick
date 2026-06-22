@@ -63,6 +63,15 @@ type FileDiscoveryResult = Result<
 /// Determine if we should upload data based on GitHub context
 /// Only upload on main/master branch, not on PRs
 fn should_upload_data() -> bool {
+    // Eval runs (`CARRICK_OUTPUT_JSON`) are read-only benchmarks against throwaway
+    // fixtures. Never upload, or a dispatch on main would pollute the real cloud
+    // index with fixture "services". This is the upstream half of eval mode's
+    // no-side-effects guarantee; the JSON output branch skips the markdown
+    // report + PR comment downstream.
+    if env::var("CARRICK_OUTPUT_JSON").is_ok() {
+        return false;
+    }
+
     // Check if we're in a pull request
     if let Ok(event_name) = env::var("GITHUB_EVENT_NAME")
         && event_name == "pull_request"
@@ -371,6 +380,17 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
+
+    // Eval harness output mode: emit a machine-readable projection of the
+    // results and skip the human Markdown report + PR-comment relay. Consumed
+    // by the offline scorer (Slice 1 of the evals plan). Deliberately terminal —
+    // an eval run wants only the JSON, no upload or comment side effects.
+    if std::env::var("CARRICK_OUTPUT_JSON").is_ok() {
+        let projection = crate::eval_output::EvalProjection::from_results(&results);
+        println!("{}", serde_json::to_string_pretty(&projection)?);
+        return Ok(());
+    }
+
     let topology = crate::formatter::Topology {
         repo_name: repo_name.clone(),
         local_service_count,
