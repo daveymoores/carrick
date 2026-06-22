@@ -1,0 +1,11 @@
+{
+  "endpoints": [
+    { "method": "GET",  "path": "/users" },
+    { "method": "GET",  "path": "/users/{id}" },
+    { "method": "POST", "path": "/orders" },
+    { "method": "GET",  "path": "/api/v1/status" }
+  ],
+  "calls": [
+    { "method": "GET", "host_contains": "comment-service", "path_contains": "/api/comments" }
+  ]
+}

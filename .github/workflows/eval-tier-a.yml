@@ -1,0 +1,53 @@
+name: eval-tier-a
+
+# Evals plan, Slice 1: scores endpoint/call precision/recall/F1 for the Tier-A
+# framework fixtures against their expected.json, and prints a report.
+#
+# On-demand only (workflow_dispatch) — each run makes real LLM calls that cost a
+# few cents. Auth is GitHub Actions OIDC: the scanner is keyless, so this needs
+# `id-token: write` and no stored secret. The job's OIDC identity resolves
+# (repo -> App installation -> workspace) entirely on the cloud side, so it is
+# independent of any personal Carrick account.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  eval-tier-a:
+    name: Tier-A extraction quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            src/sidecar/package-lock.json
+
+      - name: Build type sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
+      - name: Install fixture dependencies
+        run: |
+          for f in koa-api fastify-api hapi-api nestjs-api; do
+            (cd "tests/fixtures/$f" && npm install)
+          done
+
+      - name: Build scanner (release)
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+        run: cargo build --release
+
+      - name: Run Tier-A scorer
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+        run: cargo test --release --test eval_tier_a -- --test-threads=1 --nocapture

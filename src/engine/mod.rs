@@ -371,6 +371,17 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
+
+    // Eval harness output mode: emit a machine-readable projection of the
+    // results and skip the human Markdown report + PR-comment relay. Consumed
+    // by the offline scorer (Slice 1 of the evals plan). Deliberately terminal —
+    // an eval run wants only the JSON, no upload or comment side effects.
+    if std::env::var("CARRICK_OUTPUT_JSON").is_ok() {
+        let projection = crate::eval_output::EvalProjection::from_results(&results);
+        println!("{}", serde_json::to_string_pretty(&projection)?);
+        return Ok(());
+    }
+
     let topology = crate::formatter::Topology {
         repo_name: repo_name.clone(),
         local_service_count,
