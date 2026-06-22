@@ -103,10 +103,17 @@ fn run_scanner(bin: &Path, fixture_dir: &Path) -> Option<String> {
         if !stdout.trim().is_empty() {
             return Some(stdout);
         }
+        // Surface the exit status + tail of stderr so a CI failure is
+        // diagnosable rather than a bare "empty output" panic.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail = lines[lines.len().saturating_sub(15)..].join("\n");
         eprintln!(
-            "[eval] empty stdout for {} (attempt {}/2)",
+            "[eval] empty stdout for {} (attempt {}/2): {}\n--- stderr (last 15 lines) ---\n{}",
             fixture_dir.display(),
-            attempt
+            attempt,
+            output.status,
+            tail
         );
     }
     None
@@ -190,6 +197,7 @@ fn tier_a_extraction_quality() {
         let found_calls: Vec<(String, String)> = projection
             .calls
             .iter()
+            .filter(|o| o.protocol == "http")
             .filter_map(|o| {
                 Some((
                     o.method.clone().unwrap_or_default().to_uppercase(),
