@@ -610,6 +610,13 @@ impl FileAnalyzerAgent {
   ]
 }}
 
+### FRAMEWORK-SPECIFIC HINTS
+{}
+
+### FRAMEWORK-SPECIFIC PARSING NOTES
+These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
+{}
+
 ### CANDIDATE TARGETS (AST-Detected Hints)
 {}
 
@@ -617,13 +624,6 @@ impl FileAnalyzerAgent {
 {}  // Use these JSON blobs to decide method/path/consumer vs non-consumer. If missing path/method, set them to null.
 
 ### IMPORT TABLE (Do not hallucinate sources)
-{}
-
-### FRAMEWORK-SPECIFIC HINTS
-{}
-
-### FRAMEWORK-SPECIFIC PARSING NOTES
-These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
 {}
 
 ### FILE CONTENT (Path: {})
@@ -658,14 +658,22 @@ primary_type_symbol, type_import_source
   - For payload_expression_line: read the line number from the prefix
 
 Return ONLY the JSON object, no explanations."#,
+            // Section order is load-bearing for Vertex implicit prompt caching.
+            // The guidance blocks (patterns + triage hints + parsing notes) are
+            // byte-identical across every file in a scan (one FrameworkGuidance is
+            // fetched once and reused), so keeping them as a contiguous front block
+            // — before any per-file content (candidates, imports, source) — lets the
+            // cacheable request prefix extend past the systemInstruction to cover
+            // them too. Per-file content stays last so it never breaks the prefix.
+            // Do not interleave stable and per-file sections.
             mount_patterns,
             endpoint_patterns,
             data_patterns,
+            guidance.triage_hints,
+            guidance.parsing_notes,
             candidates_section,
             candidate_contexts_section,
             imports_section,
-            guidance.triage_hints,
-            guidance.parsing_notes,
             file_path,
             numbered_content
         )
@@ -1320,6 +1328,32 @@ const data = await fetch('/api/users').then(resp => resp.json());
         assert!(message.contains("Line 3"));
         assert!(message.contains("CANDIDATE CONTEXT"));
         assert!(message.contains("/api/users"));
+
+        // Cache-prefix invariant (Vertex implicit caching): the per-scan-stable
+        // guidance blocks must precede every per-file block, so the cacheable
+        // request prefix can extend across them. A regression here silently
+        // strands triage hints / parsing notes after per-file content, killing
+        // the within-scan prefix cache. See the format! comment.
+        // Key off the structural `### ` headers, not bare phrases: a phrase like
+        // "IMPORT TABLE" can occur inside guidance text or file source, which would
+        // make `find` match the wrong offset as the guidance evolves.
+        let pos = |needle: &str| {
+            message
+                .find(needle)
+                .unwrap_or_else(|| panic!("section `{needle}` missing from message:\n{message}"))
+        };
+        let last_stable = pos("### FRAMEWORK-SPECIFIC PARSING NOTES");
+        for per_file in [
+            "### CANDIDATE TARGETS",
+            "### CANDIDATE CONTEXT",
+            "### IMPORT TABLE",
+            "### FILE CONTENT",
+        ] {
+            assert!(
+                last_stable < pos(per_file),
+                "stable guidance must precede per-file `{per_file}` for prefix caching"
+            );
+        }
     }
 
     #[test]
