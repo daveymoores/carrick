@@ -244,6 +244,32 @@ impl FileAnalyzerAgent {
     ///
     /// # Returns
     /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
+    /// Eval-harness diagnostics (off in normal runs). When `CARRICK_EVAL_DUMP_DIR`
+    /// is set, write the file-analyzer's input (`request_user_message` — which
+    /// embeds the framework guidance + candidates the model received) and its
+    /// `raw_response` to `<dir>/<file>.attemptN.json`. This makes prompt-hardening
+    /// evidence-driven: we read what the model actually emitted (owner_node,
+    /// mount_path, whether the endpoint was extracted at all) rather than guess.
+    fn dump_eval_artifact(file_path: &str, attempt: u8, user_message: &str, response: &str) {
+        let Ok(dir) = std::env::var("CARRICK_EVAL_DUMP_DIR") else {
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let stem = file_path.replace(['/', '\\'], "_");
+        let payload = serde_json::json!({
+            "file_path": file_path,
+            "attempt": attempt,
+            "request_user_message": user_message,
+            "raw_response": response,
+        });
+        if let Ok(s) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(dir.join(format!("{stem}.attempt{attempt}.json")), s);
+        }
+    }
+
     pub async fn analyze_file_with_candidates(
         &self,
         file_path: &str,
@@ -289,6 +315,12 @@ impl FileAnalyzerAgent {
         trace!("=== END RAW RESPONSE ===");
         debug!("File analysis response: {} chars", response.len());
 
+        // Eval diagnostics: when CARRICK_EVAL_DUMP_DIR is set (the eval harness's
+        // capture mode), persist the analyzer's input (the guidance/candidates it
+        // received) and raw output so prompt-hardening can be driven by what the
+        // model actually emitted, not by guesswork. Off unless the env is set.
+        Self::dump_eval_artifact(file_path, 1, &user_message, &response);
+
         let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
             format!(
                 "Failed to parse file analysis response: {}. Raw response: {}",
@@ -310,6 +342,7 @@ impl FileAnalyzerAgent {
             trace!("{}", response);
             trace!("=== END RAW RESPONSE ===");
             debug!("File analysis retry response: {} chars", response.len());
+            Self::dump_eval_artifact(file_path, 2, &user_message, &response);
 
             let mut retry_result: FileAnalysisResult =
                 serde_json::from_str(&response).map_err(|e| {

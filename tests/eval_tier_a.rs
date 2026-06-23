@@ -114,13 +114,18 @@ fn mean_sd(xs: &[f64]) -> (f64, f64) {
 /// Run the scanner in JSON mode, retrying once on empty stdout (a known transient
 /// when the cloud/LLM hiccups). The OIDC env (`ACTIONS_ID_TOKEN_REQUEST_URL`/
 /// `_TOKEN`) is inherited from the runner; the API endpoint is compile-time.
-fn run_scanner(bin: &Path, fixture_dir: &Path) -> Option<String> {
+///
+/// `dump_dir`, when set (capture mode), is passed to the scanner as
+/// `CARRICK_EVAL_DUMP_DIR` so the file-analyzer persists its raw input/output
+/// there for prompt-hardening diagnostics.
+fn run_scanner(bin: &Path, fixture_dir: &Path, dump_dir: Option<&Path>) -> Option<String> {
     for attempt in 1..=2 {
-        let output = Command::new(bin)
-            .arg(fixture_dir)
-            .env("CARRICK_OUTPUT_JSON", "1")
-            .output()
-            .expect("failed to spawn the carrick binary");
+        let mut cmd = Command::new(bin);
+        cmd.arg(fixture_dir).env("CARRICK_OUTPUT_JSON", "1");
+        if let Some(d) = dump_dir {
+            cmd.env("CARRICK_EVAL_DUMP_DIR", d);
+        }
+        let output = cmd.output().expect("failed to spawn the carrick binary");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !stdout.trim().is_empty() {
             return Some(stdout);
@@ -493,6 +498,11 @@ fn tier_a_extraction_quality() {
     let scanner_version = env!("CARGO_PKG_VERSION").to_string();
     let carrick_sha = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_string());
     let github_run_id = std::env::var("GITHUB_RUN_ID").ok();
+    // Capture mode (opt-in): dump each run's raw file-analyzer input/output under
+    // target/eval-runs/dump/<fixture>/run<k> for prompt-hardening diagnosis.
+    let capture = std::env::var("CARRICK_EVAL_CAPTURE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     let mut records: Vec<EvalRunRecord> = Vec::new();
 
     for name in FIXTURES {
@@ -512,7 +522,13 @@ fn tier_a_extraction_quality() {
         // N runs; skip a transient failure, keep the rest.
         let mut scores: Vec<RunScore> = Vec::new();
         for run_idx in 1..=runs_n {
-            match run_scanner(&bin, &fixture_dir)
+            let dump_dir = capture.then(|| {
+                manifest_dir()
+                    .join("target/eval-runs/dump")
+                    .join(name)
+                    .join(format!("run{run_idx}"))
+            });
+            match run_scanner(&bin, &fixture_dir, dump_dir.as_deref())
                 .as_deref()
                 .and_then(parse_projection)
             {

@@ -15,6 +15,11 @@ on:
         description: "N repeated scans per fixture (variance / pass^k sample size)"
         required: false
         default: "5"
+      capture:
+        description: "Dump raw file-analyzer input/output per run for prompt diagnosis"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   id-token: write
@@ -56,6 +61,7 @@ jobs:
         env:
           CARRICK_API_ENDPOINT: https://api.carrick.tools
           CARRICK_EVAL_RUNS: ${{ inputs.runs }}
+          CARRICK_EVAL_CAPTURE: ${{ inputs.capture && '1' || '' }}
         run: cargo test --release --test eval_tier_a -- --test-threads=1 --nocapture
 
       # Slice 3 / Layer 3: the scorer writes one JSON line per fixture to
@@ -67,5 +73,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: eval-runs-jsonl
-          path: target/eval-runs/*.jsonl
+          path: |
+            target/eval-runs/*.jsonl
+            target/eval-runs/dump/**
           if-no-files-found: warn
