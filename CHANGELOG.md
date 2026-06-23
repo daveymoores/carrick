@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.39](https://github.com/daveymoores/carrick/compare/carrick-v0.1.38...carrick-v0.1.39) (2026-06-23)
+
+
+### Performance
+
+* **file-analyzer:** front-load stable guidance for implicit prompt caching ([#193](https://github.com/daveymoores/carrick/issues/193)) ([c30dc08](https://github.com/daveymoores/carrick/commit/c30dc08d8bf80e0807f4e01aa3d058e6db92af9b))
+
 ## [0.1.38](https://github.com/daveymoores/carrick/compare/carrick-v0.1.37...carrick-v0.1.38) (2026-06-23)
 
 
