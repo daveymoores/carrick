@@ -1869,10 +1869,10 @@ impl FileOrchestrator {
                 format!("/{}", trimmed_prefix)
             };
             let full = format!("/{}", trimmed_path);
-            if full == pfx || full.starts_with(&format!("{}/", pfx)) {
-                full
-            } else {
-                format!("{}/{}", trimmed_prefix, trimmed_path)
+            match full.strip_prefix(&pfx) {
+                // Already prefixed (exact, or at a segment boundary) — don't double it.
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => full,
+                _ => format!("{}/{}", trimmed_prefix, trimmed_path),
             }
         }
     }

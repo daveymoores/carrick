@@ -419,10 +419,10 @@ impl MountGraph {
                 format!("/{}", normalized_prefix)
             };
             let full = format!("/{}", normalized_path);
-            if full == pfx || full.starts_with(&format!("{}/", pfx)) {
-                full
-            } else {
-                format!("{}/{}", normalized_prefix, normalized_path)
+            match full.strip_prefix(&pfx) {
+                // Already prefixed (exact, or at a segment boundary) — don't double it.
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => full,
+                _ => format!("{}/{}", normalized_prefix, normalized_path),
             }
         }
     }

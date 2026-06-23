@@ -339,9 +339,17 @@ fn load_baseline(path: &Path) -> std::collections::HashMap<String, EvalRunRecord
             continue;
         }
         match serde_json::from_str::<EvalRunRecord>(line) {
-            Ok(rec) => {
+            Ok(rec) if rec.schema_version == RECORD_SCHEMA_VERSION => {
                 by_fixture.insert(rec.fixture.clone(), rec);
             }
+            // Reject a stale baseline rather than silently mis-comparing against an
+            // old schema — the whole point of RECORD_SCHEMA_VERSION.
+            Ok(rec) => eprintln!(
+                "[eval] baseline.jsonl line {}: schema_version {} != {RECORD_SCHEMA_VERSION} — \
+                 skipped (re-pin the baseline)",
+                i + 1,
+                rec.schema_version
+            ),
             Err(e) => eprintln!(
                 "[eval] baseline.jsonl line {}: unparseable ({e}) — skipped",
                 i + 1
@@ -384,31 +392,43 @@ fn compare_to_baseline(
             println!("{:<13} (no baseline row — new fixture)", rec.fixture);
             continue;
         };
-        // (label, current mean, current sd, baseline mean)
+        // (label, current mean, current sd, baseline mean, baseline sd). The noise
+        // band is max(current_sd, baseline_sd) so it reflects BOTH runs' observed
+        // variance, not just this run's sample (pass^k has no sd of its own, so it
+        // borrows the F1 sd as a proxy).
         let rows = [
-            ("ep F1", rec.ep_f1_mean, rec.ep_f1_sd, base.ep_f1_mean),
+            (
+                "ep F1",
+                rec.ep_f1_mean,
+                rec.ep_f1_sd,
+                base.ep_f1_mean,
+                base.ep_f1_sd,
+            ),
             (
                 "ep pass^k",
                 rec.ep_pass_pow_k,
                 rec.ep_f1_sd,
                 base.ep_pass_pow_k,
+                base.ep_f1_sd,
             ),
             (
                 "call F1",
                 rec.call_f1_mean,
                 rec.call_f1_sd,
                 base.call_f1_mean,
+                base.call_f1_sd,
             ),
             (
                 "call pass^k",
                 rec.call_pass_pow_k,
                 rec.call_f1_sd,
                 base.call_pass_pow_k,
+                base.call_f1_sd,
             ),
         ];
-        for (label, cur, sd, base_val) in rows {
+        for (label, cur, cur_sd, base_val, base_sd) in rows {
             let delta = cur - base_val;
-            let flag = if regressed(cur, base_val, sd) {
+            let flag = if regressed(cur, base_val, cur_sd.max(base_sd)) {
                 any_regression = true;
                 "REGRESSED"
             } else if delta > MIN_BAND {
