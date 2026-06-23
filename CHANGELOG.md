@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.38](https://github.com/daveymoores/carrick/compare/carrick-v0.1.37...carrick-v0.1.38) (2026-06-23)
+
+
+### Features
+
+* **evals:** JSON output + Tier-A extraction-quality scorer ([#188](https://github.com/daveymoores/carrick/issues/188)) ([f1bd3d1](https://github.com/daveymoores/carrick/commit/f1bd3d1237835ba19c91273e27cc51d36d3e8895))
+* **evals:** N-run variance + pass@k/pass^k ([#190](https://github.com/daveymoores/carrick/issues/190)) ([3414ce9](https://github.com/daveymoores/carrick/commit/3414ce98f75fe3b07a55c11c6f128006adf946b4))
+* **evals:** Slice 3 store + capture + determinism fixes (resolver guard, scorer retry) ([#192](https://github.com/daveymoores/carrick/issues/192)) ([792bcc2](https://github.com/daveymoores/carrick/commit/792bcc24e6c16cc3e3116b33431436f1335767c6))
+
+
+### Bug Fixes
+
+* **deps:** bump quinn-proto to 0.11.15 (RUSTSEC-2026-0185) ([#191](https://github.com/daveymoores/carrick/issues/191)) ([76f74a3](https://github.com/daveymoores/carrick/commit/76f74a3af32bf703cbfaee418a37e8efd2be7a03))
+
 ## [0.1.37](https://github.com/daveymoores/carrick/compare/carrick-v0.1.36...carrick-v0.1.37) (2026-06-20)
 
 
