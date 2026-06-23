@@ -1334,17 +1334,20 @@ const data = await fetch('/api/users').then(resp => resp.json());
         // request prefix can extend across them. A regression here silently
         // strands triage hints / parsing notes after per-file content, killing
         // the within-scan prefix cache. See the format! comment.
+        // Key off the structural `### ` headers, not bare phrases: a phrase like
+        // "IMPORT TABLE" can occur inside guidance text or file source, which would
+        // make `find` match the wrong offset as the guidance evolves.
         let pos = |needle: &str| {
             message
                 .find(needle)
                 .unwrap_or_else(|| panic!("section `{needle}` missing from message:\n{message}"))
         };
-        let last_stable = pos("FRAMEWORK-SPECIFIC PARSING NOTES");
+        let last_stable = pos("### FRAMEWORK-SPECIFIC PARSING NOTES");
         for per_file in [
-            "CANDIDATE TARGETS",
-            "CANDIDATE CONTEXT",
-            "IMPORT TABLE",
-            "FILE CONTENT",
+            "### CANDIDATE TARGETS",
+            "### CANDIDATE CONTEXT",
+            "### IMPORT TABLE",
+            "### FILE CONTENT",
         ] {
             assert!(
                 last_stable < pos(per_file),
