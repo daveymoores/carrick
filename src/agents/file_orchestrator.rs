@@ -1857,7 +1857,23 @@ impl FileOrchestrator {
         } else if trimmed_path.is_empty() {
             trimmed_prefix.to_string()
         } else {
-            format!("{}/{}", trimmed_prefix, trimmed_path)
+            // Idempotent guard: if the endpoint path already carries this prefix,
+            // don't apply it twice. This happens when a constructor-carried prefix
+            // is baked into the endpoint path AND also (redundantly) emitted as the
+            // mount's path_prefix — without the guard that doubled to
+            // `/api/v1/api/v1/status`. Match on a segment boundary so `/api` does
+            // not spuriously swallow `/apixyz`. Framework-agnostic.
+            let pfx = if trimmed_prefix.starts_with('/') {
+                trimmed_prefix.to_string()
+            } else {
+                format!("/{}", trimmed_prefix)
+            };
+            let full = format!("/{}", trimmed_path);
+            match full.strip_prefix(&pfx) {
+                // Already prefixed (exact, or at a segment boundary) — don't double it.
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => full,
+                _ => format!("{}/{}", trimmed_prefix, trimmed_path),
+            }
         }
     }
 }
@@ -1866,6 +1882,34 @@ impl FileOrchestrator {
 mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
+
+    #[test]
+    fn join_paths_does_not_double_a_baked_prefix() {
+        // The double-prefix bug: a constructor-carried prefix baked into the
+        // endpoint path AND also emitted as the mount prefix must resolve once.
+        assert_eq!(
+            FileOrchestrator::join_paths("/api/v1", "/api/v1/status"),
+            "/api/v1/status"
+        );
+        // Exact match (prefix == path) also collapses to one.
+        assert_eq!(
+            FileOrchestrator::join_paths("/api/v1", "/api/v1"),
+            "/api/v1"
+        );
+        // Normal mount-site prefix (path has no prefix) still applies.
+        assert_eq!(
+            FileOrchestrator::join_paths("/api/v1", "/status"),
+            "/api/v1/status"
+        );
+        // No false positive: a shared textual prefix that is NOT a segment
+        // boundary must still be joined.
+        assert_eq!(
+            FileOrchestrator::join_paths("/api", "/apixyz"),
+            "/api/apixyz"
+        );
+        // Empty prefix passes the path through.
+        assert_eq!(FileOrchestrator::join_paths("", "/users"), "/users");
+    }
 
     /// Regression: `tsconfig.json` with `"baseUrl": "."` makes
     /// `import { X } from "types/user"` resolve to `<repo>/types/user.ts`.

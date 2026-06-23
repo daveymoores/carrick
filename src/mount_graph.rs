@@ -409,7 +409,21 @@ impl MountGraph {
         } else if normalized_path.is_empty() {
             normalized_prefix.to_string()
         } else {
-            format!("{}/{}", normalized_prefix, normalized_path)
+            // Idempotent guard (see FileOrchestrator::join_paths): don't re-apply a
+            // prefix the path already carries — avoids `/api/v1/api/v1/status` when
+            // a constructor-carried prefix is baked into the path and also emitted
+            // as the mount prefix. Segment-boundary match. Framework-agnostic.
+            let pfx = if normalized_prefix.starts_with('/') {
+                normalized_prefix.to_string()
+            } else {
+                format!("/{}", normalized_prefix)
+            };
+            let full = format!("/{}", normalized_path);
+            match full.strip_prefix(&pfx) {
+                // Already prefixed (exact, or at a segment boundary) — don't double it.
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => full,
+                _ => format!("{}/{}", normalized_prefix, normalized_path),
+            }
         }
     }
 
