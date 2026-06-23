@@ -111,14 +111,19 @@ fn mean_sd(xs: &[f64]) -> (f64, f64) {
     (mean, var.sqrt())
 }
 
-/// Run the scanner in JSON mode, retrying once on empty stdout (a known transient
-/// when the cloud/LLM hiccups). The OIDC env (`ACTIONS_ID_TOKEN_REQUEST_URL`/
-/// `_TOKEN`) is inherited from the runner; the API endpoint is compile-time.
+/// Run the scanner in JSON mode and return the parsed projection, retrying once
+/// on a non-result. A "non-result" is empty stdout OR a parsed-but-empty
+/// projection (zero endpoints AND zero calls): for these fixtures every scan
+/// should extract something, so an empty extraction is a transient dead scan
+/// (cloud/LLM hiccup) — retry it rather than score it as a catastrophic zero
+/// (which at low N forces pass^k to 0). The OIDC env
+/// (`ACTIONS_ID_TOKEN_REQUEST_URL`/`_TOKEN`) is inherited from the runner; the
+/// API endpoint is compile-time.
 ///
 /// `dump_dir`, when set (capture mode), is passed to the scanner as
 /// `CARRICK_EVAL_DUMP_DIR` so the file-analyzer persists its raw input/output
 /// there for prompt-hardening diagnostics.
-fn run_scanner(bin: &Path, fixture_dir: &Path, dump_dir: Option<&Path>) -> Option<String> {
+fn run_scanner(bin: &Path, fixture_dir: &Path, dump_dir: Option<&Path>) -> Option<EvalProjection> {
     for attempt in 1..=2 {
         let mut cmd = Command::new(bin);
         cmd.arg(fixture_dir).env("CARRICK_OUTPUT_JSON", "1");
@@ -127,14 +132,16 @@ fn run_scanner(bin: &Path, fixture_dir: &Path, dump_dir: Option<&Path>) -> Optio
         }
         let output = cmd.output().expect("failed to spawn the carrick binary");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if !stdout.trim().is_empty() {
-            return Some(stdout);
+        if let Some(proj) = parse_projection(&stdout)
+            && (!proj.endpoints.is_empty() || !proj.calls.is_empty())
+        {
+            return Some(proj);
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let lines: Vec<&str> = stderr.lines().collect();
         let tail = lines[lines.len().saturating_sub(15)..].join("\n");
         eprintln!(
-            "[eval] empty stdout for {} (attempt {}/2): {}\n--- stderr (last 15 lines) ---\n{}",
+            "[eval] no usable extraction for {} (attempt {}/2): {}\n--- stderr (last 15 lines) ---\n{}",
             fixture_dir.display(),
             attempt,
             output.status,
@@ -528,13 +535,10 @@ fn tier_a_extraction_quality() {
                     .join(name)
                     .join(format!("run{run_idx}"))
             });
-            match run_scanner(&bin, &fixture_dir, dump_dir.as_deref())
-                .as_deref()
-                .and_then(parse_projection)
-            {
+            match run_scanner(&bin, &fixture_dir, dump_dir.as_deref()) {
                 Some(proj) => scores.push(score_run(&proj, &expected_eps, &expected)),
                 None => eprintln!(
-                    "[eval] {name}: run {run_idx}/{runs_n} produced no parseable output — skipped"
+                    "[eval] {name}: run {run_idx}/{runs_n} produced no usable extraction — skipped"
                 ),
             }
         }
