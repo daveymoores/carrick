@@ -1,0 +1,14 @@
+// Pinned Tier-A baseline — the release-over-release comparison point for the
+// eval scorer (tests/eval_tier_a.rs, evals plan Slice 3 / Layer 3). One JSON line
+// per fixture; the scorer indexes by `fixture` (last row wins) and flags any
+// current metric that drops below these beyond the per-fixture noise band.
+//
+// Seeded from the Slice-2 N=5 benchmark (handoff 2026-06-22). Each row's `note`
+// records that P/R are approximated from the reported F1 — re-pin from the next
+// real `eval-tier-a` workflow run, which emits exact P/R. `model_id`/`prompt_hash`
+// are absent until the cloud echoes provenance (Slice 3b). Lines starting with
+// `//` and blank lines are ignored by the loader.
+{"schema_version":1,"ts_unix":1782086400,"scanner_version":"0.1.37","carrick_sha":"3414ce9","fixture":"koa-api","runs_requested":5,"runs_effective":5,"ep_precision_mean":1.0,"ep_precision_sd":0.0,"ep_recall_mean":0.9,"ep_recall_sd":0.13,"ep_f1_mean":0.95,"ep_f1_sd":0.11,"ep_pass_at_k":1.0,"ep_pass_pow_k":0.75,"call_precision_mean":1.0,"call_precision_sd":0.0,"call_recall_mean":1.0,"call_recall_sd":0.0,"call_f1_mean":1.0,"call_f1_sd":0.0,"call_pass_at_k":1.0,"call_pass_pow_k":1.0,"note":"seed; P/R approximated from reported F1, re-pin from next workflow run"}
+{"schema_version":1,"ts_unix":1782086400,"scanner_version":"0.1.37","carrick_sha":"3414ce9","fixture":"fastify-api","runs_requested":5,"runs_effective":5,"ep_precision_mean":1.0,"ep_precision_sd":0.0,"ep_recall_mean":0.9,"ep_recall_sd":0.13,"ep_f1_mean":0.95,"ep_f1_sd":0.11,"ep_pass_at_k":1.0,"ep_pass_pow_k":0.75,"call_precision_mean":1.0,"call_precision_sd":0.0,"call_recall_mean":1.0,"call_recall_sd":0.0,"call_f1_mean":1.0,"call_f1_sd":0.0,"call_pass_at_k":1.0,"call_pass_pow_k":1.0,"note":"seed; P/R approximated from reported F1, re-pin from next workflow run"}
+{"schema_version":1,"ts_unix":1782086400,"scanner_version":"0.1.37","carrick_sha":"3414ce9","fixture":"hapi-api","runs_requested":5,"runs_effective":5,"ep_precision_mean":0.82,"ep_precision_sd":0.1,"ep_recall_mean":0.8,"ep_recall_sd":0.13,"ep_f1_mean":0.8,"ep_f1_sd":0.11,"ep_pass_at_k":1.0,"ep_pass_pow_k":0.75,"call_precision_mean":1.0,"call_precision_sd":0.0,"call_recall_mean":1.0,"call_recall_sd":0.0,"call_f1_mean":1.0,"call_f1_sd":0.0,"call_pass_at_k":1.0,"call_pass_pow_k":1.0,"note":"seed; P/R approximated from reported F1, re-pin from next workflow run"}
+{"schema_version":1,"ts_unix":1782086400,"scanner_version":"0.1.37","carrick_sha":"3414ce9","fixture":"nestjs-api","runs_requested":5,"runs_effective":5,"ep_precision_mean":1.0,"ep_precision_sd":0.0,"ep_recall_mean":1.0,"ep_recall_sd":0.0,"ep_f1_mean":1.0,"ep_f1_sd":0.0,"ep_pass_at_k":1.0,"ep_pass_pow_k":1.0,"call_precision_mean":1.0,"call_precision_sd":0.0,"call_recall_mean":1.0,"call_recall_sd":0.0,"call_f1_mean":1.0,"call_f1_sd":0.0,"call_pass_at_k":1.0,"call_pass_pow_k":1.0,"note":"seed; nestjs has 0 expected calls (call metrics are the empty-set convention)"}

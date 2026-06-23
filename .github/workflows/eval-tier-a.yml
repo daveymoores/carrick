@@ -10,6 +10,11 @@ name: eval-tier-a
 # independent of any personal Carrick account.
 on:
   workflow_dispatch:
+    inputs:
+      runs:
+        description: "N repeated scans per fixture (variance / pass^k sample size)"
+        required: false
+        default: "5"
 
 permissions:
   id-token: write
@@ -50,4 +55,17 @@ jobs:
       - name: Run Tier-A scorer
         env:
           CARRICK_API_ENDPOINT: https://api.carrick.tools
+          CARRICK_EVAL_RUNS: ${{ inputs.runs }}
         run: cargo test --release --test eval_tier_a -- --test-threads=1 --nocapture
+
+      # Slice 3 / Layer 3: the scorer writes one JSON line per fixture to
+      # target/eval-runs/ (the longitudinal store). Keep it as a build artifact so
+      # a run's metrics survive the ephemeral runner and can re-pin
+      # tests/eval/baseline.jsonl after a release.
+      - name: Upload eval run records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-runs-jsonl
+          path: target/eval-runs/*.jsonl
+          if-no-files-found: warn
