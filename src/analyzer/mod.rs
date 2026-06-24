@@ -1408,6 +1408,9 @@ impl Analyzer {
         // cassette hard gate) sees a stable order. Keyed on the canonical
         // operation key then the `<file>:<line>` location to fully disambiguate
         // same-key operations. Mirrors the adjacent `verified_endpoints.sort()`.
+        // The key allocates (canonical() + owned path string), so use
+        // sort_by_cached_key: it computes each element's key once, not once per
+        // comparison.
         let sort_key = |d: &ApiEndpointDetails| {
             (
                 d.key.canonical(),
@@ -1416,8 +1419,8 @@ impl Analyzer {
         };
         let mut endpoints = self.endpoints.clone();
         let mut calls = self.calls.clone();
-        endpoints.sort_by_key(&sort_key);
-        calls.sort_by_key(&sort_key);
+        endpoints.sort_by_cached_key(&sort_key);
+        calls.sort_by_cached_key(&sort_key);
 
         ApiAnalysisResult {
             endpoints,
