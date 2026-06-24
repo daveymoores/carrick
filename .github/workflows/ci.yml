@@ -75,6 +75,9 @@ jobs:
       - name: Run URL alias matching tests
         run: cargo test --test url_alias_matching_test --verbose
 
+      - name: Run cassette hard gate
+        run: cargo test --test llm_cassette_hard_gate_test --verbose
+
       - name: Run sidecar unit tests
         run: cd src/sidecar && npm test
 

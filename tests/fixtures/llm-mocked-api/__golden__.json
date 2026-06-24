@@ -1,0 +1,72 @@
+{
+  "endpoints": [
+    {
+      "key": "http|GET|/api/users",
+      "protocol": "http",
+      "method": "GET",
+      "path": "/api/users",
+      "handler": "anonymous",
+      "request_type": null,
+      "response_type": null,
+      "file": "tests/fixtures/llm-mocked-api/src/routes/users.ts",
+      "line": 6
+    },
+    {
+      "key": "http|GET|/export",
+      "protocol": "http",
+      "method": "GET",
+      "path": "/export",
+      "handler": "anonymous",
+      "request_type": null,
+      "response_type": null,
+      "file": "tests/fixtures/llm-mocked-api/src/reports.ts",
+      "line": 9
+    },
+    {
+      "key": "http|GET|/health",
+      "protocol": "http",
+      "method": "GET",
+      "path": "/health",
+      "handler": "anonymous",
+      "request_type": null,
+      "response_type": null,
+      "file": "tests/fixtures/llm-mocked-api/src/index.ts",
+      "line": 8
+    },
+    {
+      "key": "http|GET|/summary",
+      "protocol": "http",
+      "method": "GET",
+      "path": "/summary",
+      "handler": "anonymous",
+      "request_type": null,
+      "response_type": null,
+      "file": "tests/fixtures/llm-mocked-api/src/reports.ts",
+      "line": 5
+    },
+    {
+      "key": "http|POST|/api/users",
+      "protocol": "http",
+      "method": "POST",
+      "path": "/api/users",
+      "handler": "anonymous",
+      "request_type": null,
+      "response_type": null,
+      "file": "tests/fixtures/llm-mocked-api/src/routes/users.ts",
+      "line": 11
+    }
+  ],
+  "calls": [
+    {
+      "key": "http|GET|https://orders.internal/api/orders?user=${userId}",
+      "protocol": "http",
+      "method": "GET",
+      "path": "https://orders.internal/api/orders?user=${userId}",
+      "handler": "fetch(",
+      "request_type": null,
+      "response_type": null,
+      "file": "tests/fixtures/llm-mocked-api/src/client.ts",
+      "line": 4
+    }
+  ]
+}
