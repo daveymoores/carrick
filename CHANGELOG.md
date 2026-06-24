@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.40](https://github.com/daveymoores/carrick/compare/carrick-v0.1.39...carrick-v0.1.40) (2026-06-24)
+
+
+### Bug Fixes
+
+* **analyzer:** canonical endpoint/call ordering + cassette hard gate ([#195](https://github.com/daveymoores/carrick/issues/195)) ([49f94cf](https://github.com/daveymoores/carrick/commit/49f94cf7f442685769b6143d71c7d0d2759f137f))
+
 ## [0.1.39](https://github.com/daveymoores/carrick/compare/carrick-v0.1.38...carrick-v0.1.39) (2026-06-23)
 
 
