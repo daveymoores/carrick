@@ -64,6 +64,36 @@ jobs:
           CARRICK_EVAL_CAPTURE: ${{ inputs.capture && '1' || '' }}
         run: cargo test --release --test eval_tier_a -- --test-threads=1 --nocapture
 
+      # Push the run's records to the durable Axiom history (carrick-cloud
+      # eval-ingest, evals #8). The scanner binary mints its OIDC token
+      # internally and can't share it, so this step mints its own for the same
+      # audience the cloud expects. Non-blocking: a failed ingest must never red
+      # the eval — the scoring above is the gate, this is just history.
+      - name: Push eval records to cloud history
+        if: always()
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+        run: |
+          set -uo pipefail
+          files=$(ls target/eval-runs/run-*.jsonl 2>/dev/null || true)
+          if [ -z "$files" ]; then echo "no eval records to push"; exit 0; fi
+          oidc=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fapi.carrick.tools" \
+            | jq -r '.value')
+          if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+            echo "could not mint OIDC token; skipping push"; exit 0
+          fi
+          for f in $files; do
+            code=$(curl -sS -o /tmp/ingest_resp.json -w '%{http_code}' -X POST \
+              -H "X-Carrick-OIDC: ${oidc}" \
+              -H "Content-Type: application/x-ndjson" \
+              --data-binary "@${f}" \
+              "${CARRICK_API_ENDPOINT}/eval/ingest" || echo "000")
+            echo "POST ${f} -> HTTP ${code}"
+            cat /tmp/ingest_resp.json 2>/dev/null || true
+            echo
+          done
+
       # Slice 3 / Layer 3: the scorer writes one JSON line per fixture to
       # target/eval-runs/ (the longitudinal store). Keep it as a build artifact so
       # a run's metrics survive the ephemeral runner and can re-pin
