@@ -1400,9 +1400,28 @@ impl Analyzer {
             .chain(self.calls.iter())
             .any(|details| details.key.protocol() == crate::operation::Protocol::Graphql);
 
+        // Canonical ordering: the analyzer collects endpoints/calls in a
+        // non-deterministic order (HashMap iteration + concurrent file joins
+        // upstream), so two scans of the same repo can emit the same set in a
+        // different sequence. Sort here, at the single aggregation point, so
+        // *every* consumer (PR comment, dashboard upload, eval projection, the
+        // cassette hard gate) sees a stable order. Keyed on the canonical
+        // operation key then the `<file>:<line>` location to fully disambiguate
+        // same-key operations. Mirrors the adjacent `verified_endpoints.sort()`.
+        let sort_key = |d: &ApiEndpointDetails| {
+            (
+                d.key.canonical(),
+                d.file_path.to_string_lossy().into_owned(),
+            )
+        };
+        let mut endpoints = self.endpoints.clone();
+        let mut calls = self.calls.clone();
+        endpoints.sort_by_key(&sort_key);
+        calls.sort_by_key(&sort_key);
+
         ApiAnalysisResult {
-            endpoints: self.endpoints.clone(),
-            calls: self.calls.clone(),
+            endpoints,
+            calls,
             issues: ApiIssues {
                 call_issues,
                 endpoint_issues,
