@@ -2167,6 +2167,13 @@ fn write_manifest_files(
     Ok(())
 }
 
+/// Trailing marker stamped onto every `= unknown` alias that
+/// `append_missing_aliases` injects for a manifest entry that never reached the
+/// bundle. It lets `dts_alias_is_trivially_unknown` recognise *our* placeholder
+/// without misclassifying a developer-authored `type X = unknown` in a real API
+/// type (which keeps its resolved shape rather than being downgraded).
+const MISSING_ALIAS_MARKER: &str = "// carrick:missing-alias";
+
 fn append_missing_aliases(content: String, manifest: Option<&Vec<TypeManifestEntry>>) -> String {
     let Some(entries) = manifest else {
         return content;
@@ -2189,7 +2196,9 @@ fn append_missing_aliases(content: String, manifest: Option<&Vec<TypeManifestEnt
         }
         updated.push_str("export type ");
         updated.push_str(&entry.type_alias);
-        updated.push_str(" = unknown;\n");
+        updated.push_str(" = unknown; ");
+        updated.push_str(MISSING_ALIAS_MARKER);
+        updated.push('\n');
     }
 
     updated
@@ -2204,11 +2213,20 @@ fn dts_defines_alias(content: &str, alias: &str) -> bool {
     }
 }
 
-/// Returns true when the .d.ts defines the alias as exactly `= unknown`,
-/// i.e. it's a placeholder for a failed inference, not a real type.
+/// Returns true only when the .d.ts carries the *Carrick-injected* `= unknown`
+/// placeholder for this alias, identified by the `MISSING_ALIAS_MARKER` comment
+/// that `append_missing_aliases` stamps on it. A developer-authored
+/// `type X = unknown` in a real API type carries no marker and is therefore not
+/// treated as a placeholder, so its cross-repo edge keeps its resolved state
+/// instead of being silently downgraded to `Unknown` (#244).
 fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
     let escaped = regex::escape(alias);
-    let pattern = format!(r"type\s+{}\s*=\s*unknown\s*;", escaped);
+    let marker = regex::escape(MISSING_ALIAS_MARKER);
+    // Anchor on the exact form append_missing_aliases emits:
+    //   export type <alias> = unknown; // carrick:missing-alias
+    // The optional `export`, generics, and modifiers are tolerated, but the
+    // trailing marker on the same line is what actually identifies it as ours.
+    let pattern = format!(r"\btype\s+{escaped}\b[^\n]*=\s*unknown\s*;[^\n]*{marker}");
     match regex::Regex::new(&pattern) {
         Ok(re) => re.is_match(content),
         Err(_) => false,
@@ -3455,18 +3473,63 @@ mod tests {
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
     }
 
-    /// A `= unknown` placeholder in the bundled .d.ts must NOT promote the entry,
-    /// even if the bundle nominally "defines" the alias — it is downgraded to
-    /// `Unknown` (#235).
+    /// The Carrick-injected `= unknown` placeholder (carrying the marker) in the
+    /// bundled .d.ts must NOT promote the entry, even if the bundle nominally
+    /// "defines" the alias — it is downgraded to `Unknown` (#235).
     #[test]
     fn enrich_downgrades_trivially_unknown_dts_alias() {
         let mut manifest = vec![consumer_entry("OrderView")];
         let resolution = empty_resolution();
-        let dts = "export type OrderView = unknown;\n";
+        let dts = format!("export type OrderView = unknown; {MISSING_ALIAS_MARKER}\n");
 
-        enrich_manifest_with_type_resolution(&mut manifest, &resolution, Some(dts));
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, Some(&dts));
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+    }
+
+    /// A *developer-authored* `type X = unknown` in a real API type carries no
+    /// Carrick marker and must NOT be mistaken for the injected placeholder, so
+    /// the entry keeps its state rather than being downgraded to `Unknown`
+    /// (#244). The genuine `unknown` shape is still surfaced as unverifiable
+    /// downstream by ts_check's compiler-level `isUnknown()` gate, not by a
+    /// silent recall-losing downgrade here.
+    #[test]
+    fn enrich_does_not_downgrade_developer_authored_unknown() {
+        // No resolution entry and no marker: the alias is "defined" in the
+        // bundle as a genuine `= unknown`, so dts_defined_aliases promotes it to
+        // Implicit and the trivially-unknown gate stays shut.
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let resolution = empty_resolution();
+        let bare = "export type OrderView = unknown;\n";
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, Some(bare));
+
+        assert_ne!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
+            "a developer-authored `type X = unknown` must not be downgraded to Unknown"
+        );
+
+        // And other forms a developer might write are equally not the marker.
+        for form in [
+            "export type OrderView = unknown;\n",
+            "type OrderView = unknown;\n",
+            "export type OrderView<T> = unknown;\n",
+            "export declare type OrderView = unknown;\n",
+            "export type OrderView = unknown; // genuinely unknown\n",
+        ] {
+            assert!(
+                !dts_alias_is_trivially_unknown(form, "OrderView"),
+                "developer-authored form must not match the placeholder marker: {form:?}"
+            );
+        }
+
+        // The tagged placeholder, in the form append_missing_aliases emits, does.
+        let tagged = format!("export type OrderView = unknown; {MISSING_ALIAS_MARKER}\n");
+        assert!(
+            dts_alias_is_trivially_unknown(&tagged, "OrderView"),
+            "the Carrick-injected marker form must match the placeholder gate"
+        );
     }
 
     /// append_missing_aliases injects a `= unknown` placeholder for a manifest
@@ -3479,12 +3542,19 @@ mod tests {
         let out = append_missing_aliases(dts, Some(&manifest));
 
         assert!(
-            out.contains("export type OrderView = unknown;"),
-            "missing alias should be injected as a placeholder, got: {out}"
+            out.contains(&format!(
+                "export type OrderView = unknown; {MISSING_ALIAS_MARKER}"
+            )),
+            "missing alias should be injected as a marked placeholder, got: {out}"
         );
         assert!(
-            !out.contains("export type Payment = unknown;"),
+            !out.contains("export type Payment = unknown"),
             "an already-defined alias must not be overwritten, got: {out}"
+        );
+        // The injected placeholder must be recognised as the Carrick placeholder.
+        assert!(
+            dts_alias_is_trivially_unknown(&out, "OrderView"),
+            "the injected marker must be detected by the placeholder gate, got: {out}"
         );
     }
 }
