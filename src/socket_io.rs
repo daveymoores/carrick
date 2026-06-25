@@ -398,6 +398,19 @@ fn is_builtin_type(name: &str) -> bool {
             | "Map"
             | "Set"
             | "Date"
+            // Capitalized global wrapper / utility types: a payload annotated
+            // with one of these is a TS/lib global, not a user type, so it must
+            // not become a SymbolRequest (the sidecar would try to bundle the
+            // global declaration — noisy and useless).
+            | "Object"
+            | "String"
+            | "Number"
+            | "Boolean"
+            | "Symbol"
+            | "BigInt"
+            | "Function"
+            | "RegExp"
+            | "Error"
     )
 }
 
@@ -746,6 +759,35 @@ const settle = (payment: Payment[]) => { socket.emit("chat:array", payment); };
             assert_eq!(op.payload_type_source, None);
         }
         let listener = find(&result.listeners, "socket|SERVER->CLIENT|chat:broadcast");
+        assert_eq!(listener.payload_type_symbol, None);
+    }
+
+    #[test]
+    fn capitalized_global_payload_types_are_not_anchored() {
+        // Global wrapper/utility types (Object, String, Function, …) are TS/lib
+        // globals, not user types — annotating a payload with one must NOT create
+        // a SymbolRequest (the sidecar would try to bundle the global). Copilot
+        // review of #245 Phase 1.
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+const socket = io("https://chat.internal");
+const a = (p: Object) => { socket.emit("e:object", p); };
+const b = (p: String) => { socket.emit("e:string", p); };
+socket.on("e:fn", (p: Function) => p());
+"#,
+        );
+        for canonical in [
+            "socket|CLIENT->SERVER|e:object",
+            "socket|CLIENT->SERVER|e:string",
+        ] {
+            let op = find(&result.emitters, canonical);
+            assert_eq!(
+                op.payload_type_symbol, None,
+                "{canonical} (global type) must not be anchored"
+            );
+        }
+        let listener = find(&result.listeners, "socket|SERVER->CLIENT|e:fn");
         assert_eq!(listener.payload_type_symbol, None);
     }
 }
