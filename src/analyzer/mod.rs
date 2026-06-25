@@ -1353,11 +1353,17 @@ impl Analyzer {
             return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
 
-        // Producer repo id (service_name ?? repo_name) per canonical key, so a
-        // matched consumer can be attributed to the producer's repo for a
-        // `CrossRepoMatch`. First producer for a key wins; a key with no repo
-        // identity simply yields no edge (the same guard the HTTP path applies).
-        let mut producer_repo_by_key: HashMap<String, String> = HashMap::new();
+        // Producer repo ids (service_name ?? repo_name) per canonical key, so a
+        // matched consumer can be attributed for a `CrossRepoMatch`. A key with
+        // no repo identity yields no edge (the same guard the HTTP path applies).
+        // Multiple producers can legitimately share one exact key — two services
+        // exposing the same GraphQL field, or several listeners for one socket
+        // event — and exact-key matching has no URL to disambiguate them. So
+        // collect ALL distinct producer repos (a `BTreeSet` for deterministic
+        // order) and emit one edge per producer↔consumer pair, rather than
+        // arbitrarily keeping the first by iteration order.
+        let mut producer_repos_by_key: HashMap<String, std::collections::BTreeSet<String>> =
+            HashMap::new();
         for endpoint in &self.endpoints {
             if endpoint.key.protocol() != protocol {
                 continue;
@@ -1367,9 +1373,10 @@ impl Analyzer {
                 .clone()
                 .or_else(|| endpoint.repo_name.clone())
             {
-                producer_repo_by_key
+                producer_repos_by_key
                     .entry(endpoint.key.canonical())
-                    .or_insert(repo);
+                    .or_default()
+                    .insert(repo);
             }
         }
 
@@ -1395,18 +1402,20 @@ impl Analyzer {
                 // `overlay_compat_verdicts` fills it in if compat ran.
                 let consumer_repo = call.service_name.clone().or_else(|| call.repo_name.clone());
                 let canonical = call.key.canonical();
-                if let (Some(producer_repo), Some(consumer_repo)) =
-                    (producer_repo_by_key.get(&canonical).cloned(), consumer_repo)
+                if let (Some(producer_repos), Some(consumer_repo)) =
+                    (producer_repos_by_key.get(&canonical), consumer_repo)
                 {
-                    cross_repo_matches.push(CrossRepoMatch {
-                        producer_repo,
-                        producer_key: canonical.clone(),
-                        consumer_repo,
-                        consumer_key: canonical,
-                        match_score: 1.0,
-                        type_compatible: None,
-                        mismatch_reason: None,
-                    });
+                    for producer_repo in producer_repos {
+                        cross_repo_matches.push(CrossRepoMatch {
+                            producer_repo: producer_repo.clone(),
+                            producer_key: canonical.clone(),
+                            consumer_repo: consumer_repo.clone(),
+                            consumer_key: canonical.clone(),
+                            match_score: 1.0,
+                            type_compatible: None,
+                            mismatch_reason: None,
+                        });
+                    }
                 }
             } else {
                 let (label, name) = call.key.display_labels();
@@ -2602,6 +2611,42 @@ mod tests {
         assert_eq!(s.consumer_repo, "payments-svc");
         assert_eq!(s.producer_key, "socket|SERVER->CLIENT|payment:settled");
         assert_eq!(s.consumer_key, "socket|SERVER->CLIENT|payment:settled");
+    }
+
+    #[test]
+    fn test_exact_key_matches_emit_edge_per_producer_repo() {
+        use crate::operation::GraphqlOperationKind;
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // Two services expose the same GraphQL field; exact-key matching cannot
+        // disambiguate by URL, so a consumer of `order` gets an edge to each.
+        analyzer.endpoints.push(graphql_details_in_repo(
+            OperationKey::graphql(GraphqlOperationKind::Query, "order"),
+            "gateway/schema.graphql:3",
+            "gateway",
+        ));
+        analyzer.endpoints.push(graphql_details_in_repo(
+            OperationKey::graphql(GraphqlOperationKind::Query, "order"),
+            "legacy/schema.graphql:3",
+            "legacy-gateway",
+        ));
+        analyzer.calls.push(graphql_details_in_repo(
+            OperationKey::graphql(GraphqlOperationKind::Query, "order"),
+            "web/lib/graphql.ts:5",
+            "web-frontend",
+        ));
+
+        let (_, _, _, edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
+        assert_eq!(edges.len(), 2, "one edge per producer repo expected");
+        let producer_repos: std::collections::BTreeSet<&str> =
+            edges.iter().map(|e| e.producer_repo.as_str()).collect();
+        assert_eq!(
+            producer_repos,
+            ["gateway", "legacy-gateway"].into_iter().collect()
+        );
+        assert!(edges.iter().all(|e| e.consumer_repo == "web-frontend"));
     }
 
     #[test]

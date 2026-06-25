@@ -1671,24 +1671,32 @@ fn build_type_manifest_entries(
 /// `line_number`. Stamp the symbol onto every manifest entry for that op
 /// (request + response) so the eval projection surfaces the real anchor instead
 /// of the hash. The first non-None symbol per `(file, line)` wins.
+///
+/// The symbol-side line is normalized exactly as the manifest side
+/// (`parse_file_location`): a non-positive/missing line collapses to `1`. Keying
+/// a line-0 anchor at `0` would never join a manifest entry (always `>= 1`), so
+/// the anchor would silently fall back to the hashed `type_alias`.
 fn stamp_manifest_anchor_symbols(
     manifest: &mut [TypeManifestEntry],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) {
+    // Mirror `parse_file_location`'s `Some(0) | None => 1` normalization so the
+    // join keys line up on both sides.
+    let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
     // (file_path, line_number) -> primary_type_symbol, from endpoints and calls.
     let mut symbols: HashMap<(String, u32), String> = HashMap::new();
     for (file_path, result) in file_results {
         for endpoint in &result.endpoints {
             if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
                 symbols
-                    .entry((file_path.clone(), endpoint.line_number.max(0) as u32))
+                    .entry((file_path.clone(), normalize_line(endpoint.line_number)))
                     .or_insert_with(|| symbol.clone());
             }
         }
         for call in &result.data_calls {
             if let Some(symbol) = call.primary_type_symbol.as_ref() {
                 symbols
-                    .entry((file_path.clone(), call.line_number.max(0) as u32))
+                    .entry((file_path.clone(), normalize_line(call.line_number)))
                     .or_insert_with(|| symbol.clone());
             }
         }
