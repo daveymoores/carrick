@@ -66,6 +66,7 @@
     { "repo": "gateway", "side": "producer", "key": "http|GET|/users/:param", "tier": "capability" },
     { "repo": "gateway", "side": "producer", "key": "http|GET|/users/recent", "tier": "capability" },
     { "repo": "gateway", "side": "producer", "key": "http|GET|/gateway/health", "tier": "capability" },
+    { "repo": "gateway", "side": "producer", "key": "graphql|query|orders", "tier": "capability" },
     { "repo": "gateway", "side": "producer", "key": "graphql|mutation|refundOrder", "tier": "capability" },
     { "repo": "payments-svc", "side": "producer", "key": "http|GET|/payments/:param", "tier": "capability" },
     { "repo": "payments-svc", "side": "consumer", "key": "http|POST|/billing/charge", "tier": "capability" },
@@ -81,11 +82,11 @@
   ],
   "summary": {
     "total_repos": 3,
-    "producers": 11,
+    "producers": 12,
     "consumers": 8,
     "matched_edges": 6,
     "incompatible_edges": 2,
-    "orphan_producers": 5,
+    "orphan_producers": 6,
     "orphan_consumers": 2,
     "decoys_must_not_emit": 4,
     "matched_edges_by_protocol": { "http": 3, "graphql": 2, "socket": 1 }

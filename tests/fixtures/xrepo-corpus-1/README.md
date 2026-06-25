@@ -85,10 +85,10 @@ web-frontend client *listens*), the structured `matches` edge has
 flows payments-svc → web-frontend; the *contract producer* is the listener.
 
 Orphan producers: orders `GET /api/v1/status`, gateway `GET /users/:param`,
-`GET /users/recent`, `GET /gateway/health`, gateway `graphql mutation
-refundOrder`; payments `GET /payments/:param`. Orphan consumers: payments
-`POST /billing/charge`, `POST /metrics/ingest`. Decoys (MCP tools, `audit.ts`,
-`settle.ts`) emit nothing.
+`GET /users/recent`, `GET /gateway/health`, gateway `graphql query orders`,
+gateway `graphql mutation refundOrder`; payments `GET /payments/:param`. Orphan
+consumers: payments `POST /billing/charge`, `POST /metrics/ingest`. Decoys (MCP
+tools, `audit.ts`, `settle.ts`) emit nothing.
 
 `dependency_conflicts` carries one deliberate cross-repo conflict (`zod` 3.x vs
 4.x). Its exact version-string and severity are deterministic scanner output,
