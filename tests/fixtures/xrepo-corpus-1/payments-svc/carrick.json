@@ -1,0 +1,3 @@
+{
+  "internalEnvVars": ["ORDERS_SERVICE_URL", "BILLING_URL"]
+}
