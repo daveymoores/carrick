@@ -991,7 +991,8 @@ async fn analyze_current_repo_incremental(
             cloud_data.cache_version = Some(CACHE_VERSION);
 
             // Build type manifest
-            let manifest_entries = build_type_manifest_entries(&mount_graph, config);
+            let mut manifest_entries = build_type_manifest_entries(&mount_graph, config);
+            stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -1117,6 +1118,8 @@ fn append_deterministic_protocol_operations(
         request_type: None,
         response_type: None,
         file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
+        repo_name: None,
+        service_name: None,
     };
 
     let graphql = crate::graphql::scan_repo(Path::new(repo_path), files);
@@ -1195,6 +1198,8 @@ fn build_cloud_data_from_mount_graph(
             request_type: None,
             response_type: None,
             file_path: PathBuf::from(&endpoint.file_location),
+            repo_name: None,
+            service_name: None,
         })
         .collect();
 
@@ -1211,6 +1216,8 @@ fn build_cloud_data_from_mount_graph(
             request_type: None,
             response_type: None,
             file_path: PathBuf::from(&call.file_location),
+            repo_name: None,
+            service_name: None,
         })
         .collect();
 
@@ -1654,6 +1661,56 @@ fn build_type_manifest_entries(
     entries
 }
 
+/// Thread the LLM's real type-anchor symbol onto the manifest entries (#233).
+///
+/// The manifest's `type_alias` is a synthetic hashed name (`Endpoint_<hash>_…`);
+/// the real source symbol (`StatusResponse`) lives on the file-analyzer result.
+/// Join by `(file_path, line_number)`: the mount-graph `file_location` the
+/// manifest is built from is `"{file_path}:{line}"`, where `file_path` is the
+/// same key `file_results` is keyed by and `line` is the same LLM-emitted
+/// `line_number`. Stamp the symbol onto every manifest entry for that op
+/// (request + response) so the eval projection surfaces the real anchor instead
+/// of the hash. The first non-None symbol per `(file, line)` wins.
+///
+/// The symbol-side line is normalized exactly as the manifest side
+/// (`parse_file_location`): a non-positive/missing line collapses to `1`. Keying
+/// a line-0 anchor at `0` would never join a manifest entry (always `>= 1`), so
+/// the anchor would silently fall back to the hashed `type_alias`.
+fn stamp_manifest_anchor_symbols(
+    manifest: &mut [TypeManifestEntry],
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    // Mirror `parse_file_location`'s `Some(0) | None => 1` normalization so the
+    // join keys line up on both sides.
+    let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
+    // (file_path, line_number) -> primary_type_symbol, from endpoints and calls.
+    let mut symbols: HashMap<(String, u32), String> = HashMap::new();
+    for (file_path, result) in file_results {
+        for endpoint in &result.endpoints {
+            if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
+                symbols
+                    .entry((file_path.clone(), normalize_line(endpoint.line_number)))
+                    .or_insert_with(|| symbol.clone());
+            }
+        }
+        for call in &result.data_calls {
+            if let Some(symbol) = call.primary_type_symbol.as_ref() {
+                symbols
+                    .entry((file_path.clone(), normalize_line(call.line_number)))
+                    .or_insert_with(|| symbol.clone());
+            }
+        }
+    }
+    if symbols.is_empty() {
+        return;
+    }
+    for entry in manifest.iter_mut() {
+        if let Some(symbol) = symbols.get(&(entry.file_path.clone(), entry.line_number)) {
+            entry.primary_type_symbol = Some(symbol.clone());
+        }
+    }
+}
+
 fn add_manifest_pair(
     entries: &mut Vec<TypeManifestEntry>,
     key: OperationKey,
@@ -1696,6 +1753,9 @@ fn add_manifest_pair(
             evidence,
             resolved_definition: None,
             expanded_definition: None,
+            // Threaded on after the fact by `stamp_manifest_anchor_symbols`,
+            // which joins the LLM's real anchor symbol by `(file_path, line)`.
+            primary_type_symbol: None,
         });
     }
 }
@@ -1899,7 +1959,8 @@ async fn analyze_current_repo(
     );
     append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
-    let manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
+    let mut manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
+    stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -2306,6 +2367,8 @@ mod tests {
                 alias: "ResponseType".to_string(),
             }),
             handler_name: Some("testHandler".to_string()),
+            repo_name: None,
+            service_name: None,
         };
 
         let test_data = CloudRepoData {
@@ -2420,6 +2483,8 @@ mod tests {
                 alias: "ResponseType".to_string(),
             }),
             handler_name: Some("testHandler".to_string()),
+            repo_name: None,
+            service_name: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -3326,6 +3391,7 @@ mod tests {
             evidence,
             resolved_definition: None,
             expanded_definition: None,
+            primary_type_symbol: None,
         }
     }
 

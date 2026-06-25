@@ -97,6 +97,13 @@ pub struct TypeManifestEntry {
     /// Generated at CI time via ts-morph's type.getText() with NoTruncation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expanded_definition: Option<String>,
+    /// The LLM-emitted type-anchor symbol for this op (e.g. `StatusResponse`),
+    /// joined from the file-analyzer result by `(file_path, line_number)`. Unlike
+    /// `type_alias` (the synthetic `Endpoint_<hash>_Response` name), this is the
+    /// real source symbol the eval anchor metric scores against. `None` when the
+    /// model emitted no anchor for this op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_type_symbol: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -189,6 +196,8 @@ impl CloudRepoData {
                 request_type: None,
                 response_type: None,
                 file_path: PathBuf::from(&endpoint.file_location),
+                repo_name: None,
+                service_name: None,
             })
             .collect();
 
@@ -206,6 +215,8 @@ impl CloudRepoData {
                 request_type: None,
                 response_type: None,
                 file_path: PathBuf::from(&call.file_location),
+                repo_name: None,
+                service_name: None,
             })
             .collect();
 
@@ -370,6 +381,7 @@ mod tests {
             },
             resolved_definition: None,
             expanded_definition: None,
+            primary_type_symbol: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
