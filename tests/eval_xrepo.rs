@@ -177,9 +177,12 @@ struct EvalProjection {
     #[serde(default)]
     endpoints: Vec<EvalOp>,
     #[serde(default)]
+    calls: Vec<EvalOp>,
+    #[serde(default)]
     cross_repo_matches: Vec<EvalCrossRepoMatch>,
-    // `calls`, `dependency_conflicts`, and the per-op type fields exist on the
-    // wire (S1) but are DEFERRED by this slice, so they are not read.
+    // `dependency_conflicts` and the per-op type fields exist on the wire (S1)
+    // but are DEFERRED by this slice. `calls` is read for the extraction
+    // diagnostic only (not yet scored — call-set is a deferred metric).
 }
 
 #[derive(Debug, Deserialize)]
@@ -718,6 +721,31 @@ fn xrepo_live_scorer() {
     let mut scores: Vec<RunScore> = Vec::new();
     for run_idx in 1..=runs_n {
         let proj = run_two_phase(&bin, &corpus, false);
+        // Extraction diagnostic (report-only, run 1 only): a cross-repo match
+        // metric of 0 is otherwise opaque. Surface what the scan produced so a
+        // miss is attributable — were the consumer calls extracted (and with
+        // what URLs), and did any edges form (with which repo identities)?
+        if run_idx == 1 {
+            eprintln!(
+                "[diag] run 1 projection: {} endpoints, {} calls, {} cross_repo_matches",
+                proj.endpoints.len(),
+                proj.calls.len(),
+                proj.cross_repo_matches.len()
+            );
+            for c in &proj.calls {
+                eprintln!(
+                    "[diag]   call {} {}",
+                    c.method.clone().unwrap_or_default(),
+                    c.path.clone().unwrap_or_default()
+                );
+            }
+            for m in &proj.cross_repo_matches {
+                eprintln!(
+                    "[diag]   edge {}|{} -> {}|{}",
+                    m.producer_repo, m.producer_key, m.consumer_repo, m.consumer_key
+                );
+            }
+        }
         scores.push(score_corpus(&proj, &repo_expected, &expected_output));
         let s = scores.last().unwrap();
         println!(
@@ -995,6 +1023,7 @@ mod scoring_tests {
             .collect();
         let proj = EvalProjection {
             endpoints,
+            calls: vec![],
             cross_repo_matches,
         };
 
@@ -1016,6 +1045,7 @@ mod scoring_tests {
 
         let proj = EvalProjection {
             endpoints: vec![],
+            calls: vec![],
             cross_repo_matches: vec![],
         };
         let score = score_corpus(&proj, &repo_expected, &expected_output);

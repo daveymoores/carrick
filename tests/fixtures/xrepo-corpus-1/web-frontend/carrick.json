@@ -1,0 +1,3 @@
+{
+  "internalEnvVars": ["NEXT_PUBLIC_ORDERS_URL", "NEXT_PUBLIC_PAYMENTS_URL"]
+}
