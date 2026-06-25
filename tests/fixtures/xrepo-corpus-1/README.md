@@ -26,7 +26,7 @@ in a separate commit, reviewed against the spec — never to match scanner outpu
 The consumer repos carry a `carrick.json` declaring their env-var base URLs as
 `internalEnvVars`. Cross-repo matching of an `${ENV}`-based call to a producer
 only fires when the env var is classified internal (`Config::is_internal_call`,
-matcher at `analyzer/mod.rs`), so without this the edges never form (a fresh
+matcher at `src/analyzer/mod.rs`), so without this the edges never form (a fresh
 corpus scan showed cross-repo match F1 = 0). This is deliberate: the explicit
 internal/external classification is kept (internal-by-default was considered and
 rejected — see `carrick-cloud/docs/internal/cross-repo-call-classification-decision.md`).
