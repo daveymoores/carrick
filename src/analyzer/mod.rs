@@ -1770,8 +1770,20 @@ impl Analyzer {
             ));
         }
 
-        // Run the type checking script with the minimal tsconfig
+        // Run the type checking script with the minimal tsconfig.
+        //
+        // - `current_dir(ts_check_dir)`: resolve `npx ts-node` against
+        //   `ts_check/node_modules/.bin` instead of letting npx download a
+        //   transient ts-node that can't see ts-morph / @types/node and fails to
+        //   compile (the #226 root cause: ts_check deps weren't installed, so the
+        //   checker never ran and every verdict stayed None).
+        // - `-o <output_dir>` (absolute): the script otherwise defaults its
+        //   output to the CWD-relative `ts_check/output`, which need not coincide
+        //   with the discovered, absolute output dir this analyzer reads back from
+        //   in `check_type_compatibility`. Pin it so the results file always lands
+        //   where the verdict overlay looks for it.
         let output = Command::new("npx")
+            .current_dir(ts_check_dir)
             .arg("ts-node")
             .arg(&script_path)
             .arg(&tsconfig_path)
@@ -1780,6 +1792,8 @@ impl Analyzer {
             .arg("--consumer")
             .arg(&consumer_manifest)
             .arg("--types-dir")
+            .arg(&output_dir)
+            .arg("-o")
             .arg(&output_dir)
             .output()
             .map_err(|e| format!("Failed to run type checking: {}", e))?;
@@ -1800,9 +1814,15 @@ impl Analyzer {
         }
 
         if !output.status.success() {
+            // Surface a stderr tail in the error: a bare exit code hides the
+            // common failure mode (ts-node can't resolve ts_check deps), which is
+            // exactly what made #226 opaque. The caller only `warn!`s this, so the
+            // detail must travel with the message.
+            let tail: String = stderr.lines().rev().take(8).collect::<Vec<_>>().join(" | ");
             return Err(format!(
-                "Type checking script failed with exit code: {:?}",
-                output.status.code()
+                "Type checking script failed with exit code: {:?}. stderr tail: {}",
+                output.status.code(),
+                tail
             ));
         }
 
@@ -2514,5 +2534,115 @@ mod tests {
         // bare uppercase identifiers (`CarrickApiKeys`, `DynamoDB`) from being
         // mis-reported as env-var calls.
         assert!(!env_var_calls.iter().any(|i| i.contains("LEGACY_API_URL")));
+    }
+
+    // -----------------------------------------------------------------------
+    // overlay_compat_verdicts — the S1 verdict-attachment step (#226). These
+    // tests are deterministic: they craft a `type-check-results.json` in a temp
+    // ts_check output dir and assert how its verdicts land on the edges. No
+    // ts-node, no sidecar, no LLM — just the Rust overlay logic that #226's
+    // offline harness exercises end-to-end.
+    // -----------------------------------------------------------------------
+
+    /// Minimal analyzer with `ts_check_dir` pointed at `dir`, and `results_json`
+    /// written to `dir/output/type-check-results.json` (when `Some`).
+    fn analyzer_with_results(dir: &std::path::Path, results_json: Option<&str>) -> Analyzer {
+        let mut analyzer = Analyzer::new(Config::default(), Default::default());
+        analyzer.set_ts_check_dir(dir.to_path_buf());
+        if let Some(json) = results_json {
+            let out = dir.join("output");
+            std::fs::create_dir_all(&out).expect("create output dir");
+            std::fs::write(out.join("type-check-results.json"), json).expect("write results");
+        }
+        analyzer
+    }
+
+    fn edge(producer_key: &str) -> CrossRepoMatch {
+        CrossRepoMatch {
+            producer_repo: "orders-monorepo".to_string(),
+            producer_key: producer_key.to_string(),
+            consumer_repo: "payments-svc".to_string(),
+            consumer_key: producer_key.to_string(),
+            match_score: 1.0,
+            type_compatible: None,
+            mismatch_reason: None,
+        }
+    }
+
+    /// With a results file present, every edge gets a verdict: the producer named
+    /// in the mismatch list → `Some(false)` + reason; all others → `Some(true)`.
+    /// This is the #226 happy path — the offline harness reaches HERE once
+    /// ts_check actually runs and writes its results.
+    #[test]
+    fn overlay_compat_verdicts_attaches_from_results_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // GET /orders/:id is incompatible; POST /payments is not in the mismatch
+        // list, so it is compatible.
+        let results = r#"{
+            "mismatches": [
+                { "endpoint": "GET /orders/:id (response)",
+                  "error": "id: number is not assignable to string" }
+            ],
+            "totalChecked": 2,
+            "compatibleCount": 1
+        }"#;
+        let analyzer = analyzer_with_results(dir.path(), Some(results));
+
+        let mut matches = vec![edge("http|GET|/orders/:id"), edge("http|POST|/payments")];
+        analyzer.overlay_compat_verdicts(&mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible,
+            Some(false),
+            "the producer in the mismatch list is incompatible"
+        );
+        assert_eq!(
+            matches[0].mismatch_reason.as_deref(),
+            Some("id: number is not assignable to string"),
+        );
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(true),
+            "a producer absent from the mismatch list is compatible (verdict reached)"
+        );
+        assert!(matches[1].mismatch_reason.is_none());
+    }
+
+    /// No results file → `check_type_compatibility` errs → every edge keeps
+    /// `None` (the load-bearing absent verdict, NOT a fake `Some(true)`). This is
+    /// exactly the state #226's live run was stuck in: ts_check never wrote
+    /// results, so the verdicts were all absent and the §7 guard tripped.
+    #[test]
+    fn overlay_compat_verdicts_leaves_none_when_results_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // output dir exists but no results file written.
+        std::fs::create_dir_all(dir.path().join("output")).unwrap();
+        let analyzer = analyzer_with_results(dir.path(), None);
+
+        let mut matches = vec![edge("http|GET|/orders/:id")];
+        analyzer.overlay_compat_verdicts(&mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "no results file → compat not evaluated → verdict stays None (never fake true)"
+        );
+    }
+
+    /// A results file carrying an `error` key (ts_check's catch-block output, e.g.
+    /// the compile failure when its deps aren't installed) is treated as compat
+    /// NOT evaluated → edges stay `None`, never scored as compatible.
+    #[test]
+    fn overlay_compat_verdicts_treats_error_result_as_unevaluated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let results = r#"{ "mismatches": [], "error": "Cannot find module 'ts-morph'" }"#;
+        let analyzer = analyzer_with_results(dir.path(), Some(results));
+
+        let mut matches = vec![edge("http|POST|/payments")];
+        analyzer.overlay_compat_verdicts(&mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "an error result is not a verdict — edges stay None"
+        );
     }
 }

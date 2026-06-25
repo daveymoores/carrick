@@ -1049,17 +1049,31 @@ struct RunScore {
     by_tier: std::collections::HashMap<String, TierScore>,
     /// Decoy leakage (not tier-partitioned).
     decoy_leak: usize,
+    /// The §7 compat-presence verdict for this run. `Ok(())` = the answer key
+    /// expected no verdict OR ≥1 actual edge carried a non-null `type_compatible`
+    /// (compat reached). `Err(msg)` = the answer key expected ≥1 verdict but NO
+    /// actual edge carried one (compat silently absent). When `Err`, the
+    /// compat-verdict metric in `by_tier` is meaningless (0/0 → 0.0); the caller
+    /// marks it **unscored** rather than reading the absence as a fake
+    /// "compatible", and reds the run at the very end. This preserves the §7
+    /// contract intent ("never score absent compat as a verdict") without
+    /// blocking the rest of the vector from printing.
+    compat: Result<(), String>,
 }
 
-/// Score one joined projection against the corpus labels. Enforces the §7 compat
-/// guard before computing the compat-verdict metric — failing loud if compat data
-/// is silently absent.
+/// Score one joined projection against the corpus labels. Computes the FULL
+/// per-metric vector unconditionally, and records the §7 compat-presence verdict
+/// in [`RunScore::compat`] rather than failing loud here. Decoupling the §7 check
+/// from scoring is deliberate (#226): when compat is silently absent the rest of
+/// the vector (owner / anchor / resolution / deps / decoys) is still valid and
+/// must still print — only the compat-verdict number is meaningless, so the
+/// caller marks it unscored and reds the run at the end.
 fn score_corpus(
     proj: &EvalProjection,
     repo_expected: &[(String, ExpectedRepo)],
     expected_output: &ExpectedOutput,
-) -> Result<RunScore, String> {
-    compat_guard(expected_output, &proj.cross_repo_matches)?;
+) -> RunScore {
+    let compat = compat_guard(expected_output, &proj.cross_repo_matches);
     let mut by_tier = std::collections::HashMap::new();
     for tier in TIERS {
         by_tier.insert(
@@ -1085,10 +1099,11 @@ fn score_corpus(
             },
         );
     }
-    Ok(RunScore {
+    RunScore {
         by_tier,
         decoy_leak: score_decoy_leak(repo_expected, proj),
-    })
+        compat,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,8 +1472,12 @@ fn agg(scores: &[RunScore], tier: &str, pick: impl Fn(&TierScore) -> f64) -> (f6
     mean_sd(&xs)
 }
 
-/// Print the full metric vector for one tier (report-only).
-fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize) {
+/// Print the full metric vector for one tier (report-only). `compat_absent`
+/// marks the compat-verdict row UNSCORED (§7, #226): when no run produced a
+/// non-null verdict the aggregated `compat_verdict` is a meaningless 0.0, so we
+/// never print it as a number — printing it would read absent compat data as a
+/// real "0% compatible" score.
+fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_absent: bool) {
     let (ep_p, ep_p_sd) = agg(scores, tier, |t| t.ep_prf.0);
     let (ep_r, ep_r_sd) = agg(scores, tier, |t| t.ep_prf.1);
     let (ep_f, ep_f_sd) = agg(scores, tier, |t| t.ep_prf.2);
@@ -1488,7 +1507,11 @@ fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize) {
     println!("  owner accuracy        {own:.2}±{own_sd:.2}");
     println!("  type-anchor accuracy  {anc:.2}±{anc_sd:.2}");
     println!("  type-resolution acc   {res:.2}±{res_sd:.2}");
-    println!("  compat-verdict acc    {cmp:.2}±{cmp_sd:.2}");
+    if compat_absent {
+        println!("  compat-verdict acc    UNSCORED (§7: no run produced a non-null verdict)");
+    } else {
+        println!("  compat-verdict acc    {cmp:.2}±{cmp_sd:.2}");
+    }
     println!("  dependency F1         {dp_f:.2}±{dp_f_sd:.2}");
     println!("  orphans F1            {orph_f:.2}±{orph_f_sd:.2}");
 }
@@ -1589,19 +1612,65 @@ fn xrepo_live_scorer() {
                     m.type_compatible
                 );
             }
+            // Per-op type pipeline state (#226 disambiguator). The compat-verdict
+            // metric and the §7 guard depend on cross-repo `ts_check`; the
+            // type_state / resolved_definition fields below are independent —
+            // they ride the per-repo sidecar manifest, not ts_check. So if these
+            // show resolved types but every edge above is `compat=None`, inference
+            // WAS reached and the gap is the cross-repo ts_check / verdict step
+            // (cause (b)); if these are empty too, the per-repo type pipeline
+            // never resolved (cause (a)).
+            let resolved_ops = proj
+                .endpoints
+                .iter()
+                .chain(proj.calls.iter())
+                .filter(|o| o.resolved_definition.is_some() || o.expanded_definition.is_some())
+                .count();
+            eprintln!(
+                "[diag] type pipeline: {} of {} ops carry a resolved_definition / \
+                 expanded_definition (>0 ⇒ inference reached ⇒ a compat=None gap is \
+                 the ts_check/verdict step, not the type pipeline)",
+                resolved_ops,
+                proj.endpoints.len() + proj.calls.len(),
+            );
+            for o in proj.endpoints.iter().chain(proj.calls.iter()) {
+                let resolved = o
+                    .resolved_definition
+                    .as_deref()
+                    .or(o.expanded_definition.as_deref());
+                eprintln!(
+                    "[diag]   op {} type_state={:?} resolved={} {}",
+                    o.key,
+                    o.type_state.as_deref().unwrap_or("(none)"),
+                    if resolved.is_some() { "yes" } else { "no " },
+                    resolved
+                        .map(|r| format!("-> {}", collapse_ws(r)))
+                        .unwrap_or_default(),
+                );
+            }
         }
-        let score = score_corpus(&proj, &repo_expected, &expected_output)
-            .unwrap_or_else(|e| panic!("[eval] §7 compat guard tripped: {e}"));
+        // Score the FULL vector unconditionally (#226). The §7 compat-presence
+        // check no longer panics inside the scorer: it rides `score.compat`, so
+        // owner / anchor / resolution / deps / decoys still print even when
+        // cross-repo type checking produced no verdict. When compat is absent the
+        // compat-verdict number is meaningless — print `UNSCORED` (never a fake
+        // "compat 1.00"), and red the whole run at the end.
+        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        let compat_absent = score.compat.is_err();
         let cap = score.by_tier.get(TIER_CAPABILITY).expect("capability tier");
+        let compat_cell = if compat_absent {
+            "UNSCORED".to_string()
+        } else {
+            format!("{:.2}", cap.compat_verdict)
+        };
         println!(
             "  run {run_idx}/{runs_n}: endpoint F1 {:.2}  call F1 {:.2}  match F1 {:.2}  \
-             anchor {:.2}  resolution {:.2}  compat {:.2}  dep F1 {:.2}  decoy_leak {}",
+             anchor {:.2}  resolution {:.2}  compat {compat_cell}  dep F1 {:.2}  decoy_leak {}",
             cap.ep_prf.2,
             cap.call_prf.2,
             cap.match_prf.2,
             cap.type_anchor,
             cap.type_resolution,
-            cap.compat_verdict,
             cap.dep_prf.2,
             score.decoy_leak,
         );
@@ -1610,8 +1679,15 @@ fn xrepo_live_scorer() {
     let n = scores.len();
     assert!(n > 0, "[eval] every run failed");
 
-    report_tier(&scores, TIER_CAPABILITY, n, runs_n);
-    report_tier(&scores, TIER_ROADMAP, n, runs_n);
+    // §7 (#226): a run where the answer key expected verdicts but NO actual edge
+    // carried one is compat-absent. Treat the metric as unscored corpus-wide if
+    // *any* run is absent — the aggregate would otherwise mix real verdicts with
+    // meaningless 0.0s. The first absence message is kept for the loud report.
+    let compat_absent = scores.iter().any(|s| s.compat.is_err());
+    let compat_err_msg = scores.iter().find_map(|s| s.compat.as_ref().err().cloned());
+
+    report_tier(&scores, TIER_CAPABILITY, n, runs_n, compat_absent);
+    report_tier(&scores, TIER_ROADMAP, n, runs_n, compat_absent);
 
     let (decoy_mean, decoy_sd) = mean_sd(
         &scores
@@ -1620,7 +1696,10 @@ fn xrepo_live_scorer() {
             .collect::<Vec<_>>(),
     );
     println!("\n  decoy_leak (corpus-wide, lower is better)  {decoy_mean:.2}±{decoy_sd:.2}");
-    println!("=== end cross-repo live scorer (report-only; only the §7 guard fails) ===\n");
+    println!(
+        "=== end cross-repo live scorer (report-only; the §7 compat-absence guard \
+         reds the run at the end) ===\n"
+    );
 
     // The record rides the capability-tier numbers (corpus is all-capability).
     let (ep_p, ep_p_sd) = agg(&scores, TIER_CAPABILITY, |t| t.ep_prf.0);
@@ -1635,7 +1714,15 @@ fn xrepo_live_scorer() {
     let (own, own_sd) = agg(&scores, TIER_CAPABILITY, |t| t.owner);
     let (anc, anc_sd) = agg(&scores, TIER_CAPABILITY, |t| t.type_anchor);
     let (res, res_sd) = agg(&scores, TIER_CAPABILITY, |t| t.type_resolution);
+    // §7 (#226): the longitudinal record must never store an absent compat number
+    // as a real verdict. When compat was absent the mean is a meaningless 0.0, so
+    // null out the record's compat columns (the `Option` fields below).
     let (cmp, cmp_sd) = agg(&scores, TIER_CAPABILITY, |t| t.compat_verdict);
+    let (compat_mean_col, compat_sd_col) = if compat_absent {
+        (None, None)
+    } else {
+        (Some(cmp), Some(cmp_sd))
+    };
     let (dp_f, dp_f_sd) = agg(&scores, TIER_CAPABILITY, |t| t.dep_prf.2);
 
     let record = EvalRunRecord {
@@ -1682,8 +1769,8 @@ fn xrepo_live_scorer() {
         type_anchor_accuracy_sd: Some(anc_sd),
         type_resolution_accuracy_mean: Some(res),
         type_resolution_accuracy_sd: Some(res_sd),
-        compat_verdict_accuracy_mean: Some(cmp),
-        compat_verdict_accuracy_sd: Some(cmp_sd),
+        compat_verdict_accuracy_mean: compat_mean_col,
+        compat_verdict_accuracy_sd: compat_sd_col,
         owner_accuracy_mean: Some(own),
         owner_accuracy_sd: Some(own_sd),
         decoy_leak_mean: Some(decoy_mean),
@@ -1692,6 +1779,20 @@ fn xrepo_live_scorer() {
         dep_f1_sd: Some(dp_f_sd),
     };
     emit_record(&record);
+
+    // §7 compat-absence guard (#226), moved to the VERY END so the full vector +
+    // the JSONL record print first. If the answer key expected verdicts but no
+    // run produced one, cross-repo type checking was silently skipped — red the
+    // run (non-zero exit) so it is still flagged, without hiding owner / anchor /
+    // resolution / deps / decoys behind an early panic. The diag dump above
+    // disambiguates the cause: type-resolution acc > 0 ⇒ inference WAS reached ⇒
+    // the gap is the cross-repo ts_check / verdict step (not the type pipeline).
+    if let Some(msg) = compat_err_msg {
+        panic!(
+            "[eval] §7 compat-absence guard tripped (run flagged RED, but the full \
+             metric vector + record above are valid): {msg}"
+        );
+    }
 }
 
 /// MOCK-mode plumbing smoke check (offline, no OIDC, runs under plain
@@ -2107,6 +2208,57 @@ mod scoring_tests {
         assert!(compat_guard(&no_expect, &absent).is_ok());
     }
 
+    /// #226 regression: when compat is silently absent, `score_corpus` must NOT
+    /// panic — it returns the FULL vector with `compat: Err(..)` so owner /
+    /// anchor / resolution / deps / decoys still print. The compat-verdict number
+    /// is 0.0 (0/0) but is marked UNSCORED by the caller, never read as a
+    /// "0% compatible" verdict.
+    #[test]
+    fn score_corpus_returns_full_vector_when_compat_absent() {
+        let corpus = corpus_dir();
+        if !corpus.is_dir() {
+            eprintln!("[eval] corpus dir missing — skipping");
+            return;
+        }
+        let repos = discover_repos(&corpus);
+        let repo_expected = load_repo_expected(&repos);
+        let expected_output = load_expected_output(&corpus);
+
+        // A projection that DOES match the corpus topology (so the non-compat
+        // metrics are meaningful) but whose matches carry NO verdict → compat
+        // absent. We reuse the perfect-projection builder's matches sans verdict
+        // by emitting one real edge with `type_compatible = None`.
+        let mut proj = empty_proj();
+        // One real labelled edge, but with the verdict stripped (None).
+        if let Some(first) = expected_output.matches.first() {
+            proj.cross_repo_matches.push(cm(
+                &first.producer_repo,
+                &first.producer_key,
+                &first.consumer_repo,
+                &first.consumer_key,
+            ));
+        }
+
+        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        assert!(
+            score.compat.is_err(),
+            "the corpus expects verdicts + no actual edge carries one → §7 trips"
+        );
+        // The full vector is still present (not panicked away).
+        let cap = score
+            .by_tier
+            .get(TIER_CAPABILITY)
+            .expect("capability tier is still scored despite absent compat");
+        // compat_verdict is the meaningless 0/0 → 0.0; the caller renders it
+        // UNSCORED rather than reading it as a real verdict.
+        assert_eq!(
+            cap.compat_verdict, 0.0,
+            "absent compat scores 0/0 → 0.0 (rendered UNSCORED by the caller)"
+        );
+        // The roadmap tier is also present — both tiers were scored.
+        assert!(score.by_tier.contains_key(TIER_ROADMAP));
+    }
+
     #[test]
     fn dep_conflicts_exact_set() {
         let expected = vec![ExpDepConflict {
@@ -2269,8 +2421,11 @@ mod scoring_tests {
             dependency_conflicts,
         };
 
-        let score = score_corpus(&proj, &repo_expected, &expected_output)
-            .expect("§7 guard passes — the perfect projection carries verdicts");
+        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        assert!(
+            score.compat.is_ok(),
+            "§7 guard passes — the perfect projection carries verdicts"
+        );
         let cap = score.by_tier.get(TIER_CAPABILITY).unwrap();
         assert_eq!(cap.ep_prf, (1.0, 1.0, 1.0), "perfect endpoint set");
         assert_eq!(cap.call_prf.1, 1.0, "perfect call recall");
@@ -2366,12 +2521,16 @@ mod scoring_tests {
         let expected_output = load_expected_output(&corpus);
 
         // The empty projection has no compat verdicts, so the §7 guard trips —
-        // that is the correct loud failure (compat data is absent). Verify the
-        // guard, then score over a projection that DOES carry a verdict so the
-        // other metrics' zero-recall behaviour is observable.
+        // that is the correct loud signal (compat data is absent). Post-#226 the
+        // guard no longer panics inside the scorer: it rides `score.compat`, and
+        // the FULL vector is still computed. Verify the guard verdict, then score
+        // over a projection that DOES carry a verdict so the other metrics'
+        // zero-recall behaviour is observable.
         let empty = empty_proj();
         assert!(
-            score_corpus(&empty, &repo_expected, &expected_output).is_err(),
+            score_corpus(&empty, &repo_expected, &expected_output)
+                .compat
+                .is_err(),
             "empty projection → §7 guard trips (no compat verdict present)"
         );
 
@@ -2385,7 +2544,11 @@ mod scoring_tests {
             "http|GET|/nope",
             Some(true),
         ));
-        let score = score_corpus(&proj, &repo_expected, &expected_output).unwrap();
+        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        assert!(
+            score.compat.is_ok(),
+            "one verdict-bearing edge clears the §7 guard"
+        );
         let cap = score.by_tier.get(TIER_CAPABILITY).unwrap();
         assert_eq!(cap.ep_prf.1, 0.0, "no endpoints found → recall 0");
         assert_eq!(cap.ep_prf.0, 0.0, "found==0 with expected>0 → precision 0");
