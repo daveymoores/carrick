@@ -978,7 +978,8 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
-            append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
+            let protocol_extractions =
+                append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -993,9 +994,16 @@ async fn analyze_current_repo_incremental(
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config);
             stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
+            append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
+
+            // Socket payload anchors resolve through the same sidecar bundle
+            // path as HTTP explicit symbols (#245); GraphQL anchors are deferred
+            // to #248.
+            let socket_requests = file_orchestrator
+                .collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
 
             // Type resolution via sidecar
             resolve_types_if_available(
@@ -1006,6 +1014,7 @@ async fn analyze_current_repo_incremental(
                 extraction_config.as_ref(),
                 &mount_graph,
                 config,
+                &socket_requests,
                 &mut cloud_data,
             );
 
@@ -1102,11 +1111,20 @@ async fn generate_extraction_config(
 /// index data: GraphQL (SDL root fields as endpoints, document top-level
 /// fields as calls) and Socket.IO (listeners as endpoints, emitters as
 /// calls). These protocols never go through the LLM pipeline.
+/// Deterministically-extracted non-HTTP operations (GraphQL + Socket.IO).
+/// Returned by `append_deterministic_protocol_operations` so the same scan
+/// feeds both `cloud_data.endpoints/calls` and the type manifest
+/// (`append_protocol_manifest_entries`) without scanning the files twice.
+struct ProtocolExtractions {
+    graphql: crate::graphql::GraphqlExtraction,
+    sockets: crate::socket_io::SocketExtraction,
+}
+
 fn append_deterministic_protocol_operations(
     cloud_data: &mut CloudRepoData,
     repo_path: &str,
     files: &[PathBuf],
-) {
+) -> ProtocolExtractions {
     // Same "{file}:{line}" convention the mount-graph conversions use
     let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
         owner: None,
@@ -1132,14 +1150,14 @@ fn append_deterministic_protocol_operations(
         cloud_data.endpoints.extend(
             graphql
                 .producers
-                .into_iter()
-                .map(|op| to_details(op.key, &op.file_path, op.line)),
+                .iter()
+                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
         );
         cloud_data.calls.extend(
             graphql
                 .consumers
-                .into_iter()
-                .map(|op| to_details(op.key, &op.file_path, op.line)),
+                .iter()
+                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
         );
     }
 
@@ -1153,16 +1171,129 @@ fn append_deterministic_protocol_operations(
         cloud_data.endpoints.extend(
             sockets
                 .listeners
-                .into_iter()
-                .map(|op| to_details(op.key, &op.file_path, op.line)),
+                .iter()
+                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
         );
         cloud_data.calls.extend(
             sockets
                 .emitters
-                .into_iter()
-                .map(|op| to_details(op.key, &op.file_path, op.line)),
+                .iter()
+                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
         );
     }
+
+    ProtocolExtractions { graphql, sockets }
+}
+
+/// Emit type-manifest entries for the deterministically-extracted GraphQL and
+/// Socket.IO operations (#245 Phase 1). Without this, only the HTTP mount-graph
+/// produces manifest entries, so every non-HTTP op reported `type_state=(none)`
+/// with no `type_alias`/anchor.
+///
+/// Each op gets a single Response-kind entry keyed by its real `OperationKey`
+/// (so `OperationKey::canonical()` joins it in the cloud index and eval
+/// projection). Listeners / SDL producers are `Producer`; emitters / document
+/// consumers are `Consumer`. Only the Response kind is emitted: a phantom
+/// Request alias would never resolve and would drag a second `Unknown` entry
+/// into the manifest for ops that have no request body concept.
+///
+/// Socket entries carry `primary_type_symbol` directly (the payload type the
+/// extractor captured), which the sidecar then resolves through the existing
+/// SymbolRequest path. GraphQL entries deliberately leave `primary_type_symbol`
+/// as `None`: mapping an SDL field to its TS resolver return type (or the raw
+/// SDL type expression) is deferred to #248, so Phase 1 only gives GraphQL ops
+/// a stable `type_alias` + projection entry (an honest `Unknown` instead of
+/// `(none)`).
+fn append_protocol_manifest_entries(
+    entries: &mut Vec<TypeManifestEntry>,
+    extractions: &ProtocolExtractions,
+) {
+    for op in &extractions.graphql.producers {
+        add_protocol_manifest_entry(
+            entries,
+            &op.key,
+            ManifestRole::Producer,
+            &op.file_path.to_string_lossy(),
+            op.line,
+            None,
+        );
+    }
+    for op in &extractions.graphql.consumers {
+        add_protocol_manifest_entry(
+            entries,
+            &op.key,
+            ManifestRole::Consumer,
+            &op.file_path.to_string_lossy(),
+            op.line,
+            None,
+        );
+    }
+    for op in &extractions.sockets.listeners {
+        add_protocol_manifest_entry(
+            entries,
+            &op.key,
+            ManifestRole::Producer,
+            &op.file_path.to_string_lossy(),
+            op.line,
+            op.payload_type_symbol.clone(),
+        );
+    }
+    for op in &extractions.sockets.emitters {
+        add_protocol_manifest_entry(
+            entries,
+            &op.key,
+            ManifestRole::Consumer,
+            &op.file_path.to_string_lossy(),
+            op.line,
+            op.payload_type_symbol.clone(),
+        );
+    }
+}
+
+/// Add a single Response-kind manifest entry for a non-HTTP operation. Shared
+/// by `append_protocol_manifest_entries`; the HTTP path uses
+/// `add_manifest_pair` instead (it emits both Request and Response and dispatches
+/// on the HTTP method).
+///
+/// `primary_type_symbol` is threaded straight onto the entry at creation — the
+/// op carries its anchor deterministically, unlike HTTP where it is stamped
+/// later from the LLM result. The `type_alias` MUST be computed with the same
+/// `build_manifest_type_alias(key, role, Response)` the SymbolRequest side uses,
+/// or the enrich-join silently fails to flip `Unknown` → resolved.
+fn add_protocol_manifest_entry(
+    entries: &mut Vec<TypeManifestEntry>,
+    key: &OperationKey,
+    role: ManifestRole,
+    file_path: &str,
+    line_number: u32,
+    primary_type_symbol: Option<String>,
+) {
+    let type_kind = ManifestTypeKind::Response;
+    let type_alias = crate::type_manifest::build_manifest_type_alias(key, role, type_kind);
+    let infer_kind = infer_kind_for_manifest(role, type_kind);
+    let evidence = crate::cloud_storage::TypeEvidence {
+        file_path: file_path.to_string(),
+        span_start: None,
+        span_end: None,
+        line_number,
+        infer_kind,
+        is_explicit: false,
+        type_state: ManifestTypeState::Unknown,
+    };
+    entries.push(TypeManifestEntry {
+        key: key.clone(),
+        role,
+        type_kind,
+        type_alias,
+        file_path: file_path.to_string(),
+        line_number,
+        is_explicit: false,
+        type_state: ManifestTypeState::Unknown,
+        evidence,
+        resolved_definition: None,
+        expanded_definition: None,
+        primary_type_symbol,
+    });
 }
 
 /// Build CloudRepoData from a mount graph (used by incremental path).
@@ -1313,6 +1444,7 @@ fn resolve_types_if_available(
     extraction_config: Option<&crate::services::type_sidecar::ExtractionConfig>,
     mount_graph: &MountGraph,
     config: &Config,
+    extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     cloud_data: &mut CloudRepoData,
 ) {
     let Some(sidecar) = sidecar else {
@@ -1334,6 +1466,7 @@ fn resolve_types_if_available(
                 extraction_config,
                 mount_graph,
                 config,
+                extra_explicit,
             ) {
                 Ok(type_resolution) => {
                     debug!(
@@ -1957,10 +2090,12 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
-    append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
+    let protocol_extractions =
+        append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
 
     let mut manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
+    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -1978,6 +2113,12 @@ async fn analyze_current_repo(
     .await;
     cloud_data.cached_extraction_config = extraction_config.clone();
 
+    // Socket payload anchors resolve through the same sidecar bundle path as
+    // HTTP explicit symbols (#245). GraphQL anchors are deferred to #248, so no
+    // GraphQL SymbolRequests are produced here.
+    let socket_requests =
+        file_orchestrator.collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
+
     resolve_types_if_available(
         sidecar,
         &file_orchestrator,
@@ -1986,6 +2127,7 @@ async fn analyze_current_repo(
         extraction_config.as_ref(),
         &analysis_result.mount_graph,
         config,
+        &socket_requests,
         &mut cloud_data,
     );
 
@@ -3486,5 +3628,145 @@ mod tests {
             !out.contains("export type Payment = unknown;"),
             "an already-defined alias must not be overwritten, got: {out}"
         );
+    }
+
+    // ---- #245 Phase 1: protocol op manifest entries -------------------------
+
+    fn socket_op(
+        event: &str,
+        direction: crate::operation::SocketDirection,
+        symbol: Option<&str>,
+        source: Option<&str>,
+    ) -> crate::socket_io::SocketOp {
+        crate::socket_io::SocketOp {
+            key: OperationKey::socket(event, direction),
+            file_path: PathBuf::from("src/socket.ts"),
+            line: 12,
+            payload_type_symbol: symbol.map(String::from),
+            payload_type_source: source.map(String::from),
+        }
+    }
+
+    fn graphql_op(
+        kind: crate::operation::GraphqlOperationKind,
+        field: &str,
+    ) -> crate::graphql::GraphqlOp {
+        crate::graphql::GraphqlOp {
+            key: OperationKey::graphql(kind, field),
+            file_path: PathBuf::from("src/schema.graphql"),
+            line: 3,
+        }
+    }
+
+    /// A typed socket emitter produces a Response-kind manifest entry keyed by
+    /// the socket OperationKey, carrying the captured payload symbol as the
+    /// anchor. GraphQL ops get an entry but no anchor (deferred to #248).
+    #[test]
+    fn protocol_manifest_entries_anchor_sockets_not_graphql() {
+        use crate::operation::{GraphqlOperationKind, SocketDirection};
+
+        let extractions = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction {
+                producers: vec![graphql_op(GraphqlOperationKind::Query, "order")],
+                consumers: vec![],
+            },
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![],
+                emitters: vec![socket_op(
+                    "payment:settled",
+                    SocketDirection::ServerToClient,
+                    Some("Payment"),
+                    Some("./types/payment"),
+                )],
+            },
+        };
+
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions);
+
+        let socket_entry = entries
+            .iter()
+            .find(|e| e.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
+            .expect("socket manifest entry");
+        assert_eq!(socket_entry.role, ManifestRole::Consumer);
+        assert_eq!(socket_entry.type_kind, ManifestTypeKind::Response);
+        assert_eq!(socket_entry.primary_type_symbol.as_deref(), Some("Payment"));
+        // One entry per op — no phantom Request alias.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
+                .count(),
+            1
+        );
+
+        let graphql_entry = entries
+            .iter()
+            .find(|e| e.key.canonical() == "graphql|query|order")
+            .expect("graphql manifest entry");
+        assert_eq!(graphql_entry.role, ManifestRole::Producer);
+        // Plumbing only: the entry exists (stable alias + projection), but the
+        // anchor is deferred to #248.
+        assert_eq!(graphql_entry.primary_type_symbol, None);
+        assert!(
+            !graphql_entry.type_alias.is_empty(),
+            "graphql op must get a stable type_alias"
+        );
+        assert_eq!(graphql_entry.type_state, ManifestTypeState::Unknown);
+    }
+
+    /// The fragile contract the whole anchor join hinges on: the alias on the
+    /// socket manifest entry MUST equal the alias on the SymbolRequest, both
+    /// computed by `build_manifest_type_alias(key, role, Response)`. If they
+    /// ever diverge the resolved `.d.ts` never joins back and the entry stays
+    /// `Unknown` — silently. (Plan test #3.)
+    #[test]
+    fn socket_symbol_request_alias_matches_manifest_alias() {
+        use crate::operation::SocketDirection;
+
+        let emitter = socket_op(
+            "payment:settled",
+            SocketDirection::ServerToClient,
+            Some("Payment"),
+            Some("./types/payment"),
+        );
+        let extractions = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction::default(),
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![],
+                emitters: vec![emitter.clone()],
+            },
+        };
+
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions);
+        let manifest_alias = entries
+            .iter()
+            .find(|e| e.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
+            .map(|e| e.type_alias.clone())
+            .expect("socket manifest entry");
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_socket_type_requests(&extractions.sockets, ".");
+        let request = requests
+            .iter()
+            .find(|r| r.symbol_name == "Payment")
+            .expect("socket SymbolRequest");
+
+        assert_eq!(
+            request.alias.as_deref(),
+            Some(manifest_alias.as_str()),
+            "SymbolRequest.alias must byte-match the manifest entry's alias \
+             (both build_manifest_type_alias(key, Consumer, Response)) or the \
+             enrich-join silently breaks"
+        );
+        // Independently confirm both equal the canonical builder output.
+        let expected = crate::type_manifest::build_manifest_type_alias(
+            &emitter.key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+        );
+        assert_eq!(manifest_alias, expected);
+        assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
     }
 }

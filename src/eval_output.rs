@@ -571,4 +571,65 @@ mod tests {
         assert_eq!(json["cross_repo_matches"].as_array().unwrap().len(), 0);
         assert_eq!(json["dependency_conflicts"].as_array().unwrap().len(), 0);
     }
+
+    /// #245 Phase 1: a manifest entry keyed by a *socket* OperationKey joins to
+    /// its op in the projection and surfaces `primary_type_symbol`/`type_state`
+    /// on the EvalOp — proving the projection join is protocol-agnostic, not
+    /// HTTP-only. (Plan test #4.)
+    #[test]
+    fn socket_keyed_manifest_entry_surfaces_on_eval_op() {
+        use crate::operation::SocketDirection;
+
+        let socket_key = OperationKey::socket("payment:settled", SocketDirection::ServerToClient);
+        // A socket emitter lands on `calls` (consumer side).
+        let call = ApiEndpointDetails {
+            owner: None,
+            key: socket_key.clone(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("src/socket.ts:12"),
+            repo_name: None,
+            service_name: None,
+        };
+
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![call],
+            issues: empty_issues_with_deps(vec![]),
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+
+        let manifest = vec![manifest_entry(
+            socket_key,
+            ManifestTypeState::Explicit,
+            true,
+            Some("{ id: string; amountCents: number }"),
+            Some("Payment"),
+        )];
+
+        let projection = EvalProjection::from_results(&result, &manifest);
+        let json: Value =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        let op = &json["calls"].as_array().unwrap()[0];
+
+        assert_eq!(op["key"], "socket|SERVER->CLIENT|payment:settled");
+        assert_eq!(op["protocol"], "socket");
+        // method is null for non-HTTP (the field is always present); path
+        // carries the event name.
+        assert_eq!(op["method"], Value::Null);
+        assert_eq!(op["path"], "payment:settled");
+        assert_eq!(op["type_state"], "Explicit");
+        assert_eq!(op["primary_type_symbol"], "Payment");
+        assert_eq!(
+            op["resolved_definition"],
+            "{ id: string; amountCents: number }"
+        );
+    }
 }
