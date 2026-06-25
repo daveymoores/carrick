@@ -78,6 +78,9 @@ jobs:
       - name: Run cassette hard gate
         run: cargo test --test llm_cassette_hard_gate_test --verbose
 
+      - name: Run xrepo harness test
+        run: cargo test --test xrepo_harness_test --verbose
+
       - name: Run sidecar unit tests
         run: cd src/sidecar && npm test
 

@@ -30,7 +30,7 @@ mod url_normalizer;
 mod utils;
 mod visitor;
 
-use crate::cloud_storage::{AwsStorage, MockStorage};
+use crate::cloud_storage::{AwsStorage, LocalDirStorage, MockStorage};
 use crate::services::TypeSidecar;
 use engine::run_analysis_engine_with_sidecar;
 use std::env;
@@ -195,6 +195,16 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // STEP 3: Run analysis engine with sidecar (if ready)
     // =======================================================================
 
+    // Storage selection precedence:
+    //   1. CARRICK_LOCAL_STORAGE_DIR set -> LocalDirStorage (offline eval harness).
+    //      Its only job is ISOLATION: upload writes CloudRepoData to a cache dir
+    //      and download reads it back (or returns empty under
+    //      CARRICK_LOCAL_STORAGE_ISOLATE=1), so the cross-repo join never reaches
+    //      the real cloud and a per-repo Phase-A scan can't pick up siblings.
+    //   2. CARRICK_MOCK_ALL set -> MockStorage (in-memory, synthetic siblings).
+    //   3. otherwise -> AwsStorage (production).
+    // The engine stays storage-agnostic — same pattern as MockStorage.
+    let use_local_dir = env::var(cloud_storage::CACHE_DIR_ENV).is_ok();
     // Use MockStorage if CARRICK_MOCK_ALL env var is set, otherwise use AWS Storage
     let use_mock = env::var("CARRICK_MOCK_ALL").is_ok();
 
@@ -214,7 +224,18 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if use_mock {
+    if use_local_dir {
+        info!("Using LocalDirStorage (offline eval harness)");
+        let storage = LocalDirStorage::from_env()?;
+        run_analysis_engine_with_sidecar(
+            storage,
+            &args.repo_path,
+            sidecar_ref,
+            args.no_cache,
+            ts_check_dir.as_deref(),
+        )
+        .await
+    } else if use_mock {
         info!("Using MockStorage");
         let storage = MockStorage::new();
         run_analysis_engine_with_sidecar(

@@ -22,6 +22,8 @@ mod mock_storage;
 pub use mock_storage::MockStorage;
 mod aws_storage;
 pub use aws_storage::AwsStorage;
+mod local_dir_storage;
+pub use local_dir_storage::{CACHE_DIR_ENV, LocalDirStorage};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

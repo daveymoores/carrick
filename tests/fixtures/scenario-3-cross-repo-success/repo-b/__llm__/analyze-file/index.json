@@ -1,0 +1,35 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/api/products",
+      "handler_name": "anonymous",
+      "pattern_matched": "app.get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "res.json([{ id: 1, name: 'Product A' }])",
+      "response_expression_line": 7,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": [
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "http://localhost:3000/api/users",
+      "method": "GET",
+      "pattern_matched": "axios.get(",
+      "call_expression_text": "axios.get('http://localhost:3000/api/users')",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": "axios"
+    }
+  ]
+}
