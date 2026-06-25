@@ -36,7 +36,7 @@ use crate::{
         ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
         TypeSidecar,
     },
-    swc_scanner::{CandidateTarget, SwcScanner},
+    swc_scanner::{CandidateTarget, RouteDescriptorEndpoint, SwcScanner},
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
         is_http_method, normalize_manifest_method, parse_file_location,
@@ -91,6 +91,10 @@ pub struct ProcessingStats {
     /// (Next.js app router, etc.) rather than from a call-site scan. A subset
     /// of `total_endpoints`.
     pub file_based_endpoints: usize,
+    /// Endpoints derived deterministically from route-descriptor data
+    /// (`{ method, path, handler }` in a registry array) rather than from the
+    /// file-analyzer LLM. A subset of `total_endpoints`. See #234.
+    pub route_descriptor_endpoints: usize,
     pub total_data_calls: usize,
     pub errors: Vec<String>,
 }
@@ -99,6 +103,15 @@ pub struct ProcessingStats {
 /// These routes have no mount chain — their derived path is already absolute —
 /// so the owner is a sentinel that matches no mount during path resolution.
 const FILE_BASED_ROUTE_OWNER: &str = "__file_based_route__";
+
+/// Sentinel owner for a route-descriptor endpoint whose handler is absent or not
+/// a bare identifier. Like `FILE_BASED_ROUTE_OWNER`, it matches no mount during
+/// path resolution, so the descriptor's already-absolute path is used as-is.
+const ROUTE_DESCRIPTOR_OWNER: &str = "__route_descriptor__";
+
+/// `pattern_matched` tag for endpoints emitted deterministically from
+/// route-descriptor data (#234).
+const ROUTE_DESCRIPTOR_PATTERN: &str = "route-descriptor";
 
 type EndpointLookup = HashMap<(String, u32), Vec<(String, String)>>;
 type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
@@ -190,6 +203,11 @@ impl FileOrchestrator {
             /// Endpoints derived from file-based routing conventions, merged in
             /// after the LLM pass. Empty for non-route files.
             route_endpoints: Vec<EndpointResult>,
+            /// Endpoints derived deterministically from route-descriptor data
+            /// (`{ method, path, handler }`), merged in after the LLM pass. The
+            /// LLM ignores route-as-data, so these are the authoritative source
+            /// for such endpoints. Empty for files with no route descriptors.
+            descriptor_endpoints: Vec<EndpointResult>,
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -271,22 +289,51 @@ impl FileOrchestrator {
                 )
             };
 
+            // Route-descriptor routes: a route declared as data
+            // (`{ method, path, handler }` in a registry array) is fully
+            // structural — method, path, and handler owner are literals the
+            // file-analyzer prompt ignores (it only matches framework-call
+            // patterns). Emit it deterministically (#234) instead of relying on
+            // the LLM. The recall-boost candidate the scanner also raised for
+            // such an object is redundant once the route is owned here, so it is
+            // dropped from `http_candidates` below (matched by span): a file whose
+            // only candidates are deterministically-owned descriptors then skips
+            // the LLM entirely, like a file-based route.
+            let descriptor_endpoints =
+                Self::route_descriptor_endpoints(&self.swc_scanner, file_path, &content);
+            let descriptor_spans: HashSet<(u32, u32)> = descriptor_endpoints
+                .iter()
+                .filter_map(|e| Some((e.call_expression_span_start?, e.call_expression_span_end?)))
+                .collect();
+            let http_candidates: Vec<_> = http_candidates
+                .into_iter()
+                .filter(|c| !descriptor_spans.contains(&(c.span_start, c.span_end)))
+                .collect();
+
             // STEP 2: Check Relevance - if there are no candidates for a routed
-            // protocol, SKIP the (expensive) LLM call. File-based route endpoints
-            // are still recorded: they're derived structurally and need no LLM.
+            // protocol, SKIP the (expensive) LLM call. File-based route and
+            // route-descriptor endpoints are still recorded: they're derived
+            // structurally and need no LLM.
             if http_candidates.is_empty() {
-                if !route_endpoints.is_empty() {
+                let structural_endpoints: Vec<EndpointResult> = route_endpoints
+                    .iter()
+                    .cloned()
+                    .chain(descriptor_endpoints.iter().cloned())
+                    .collect();
+                if !structural_endpoints.is_empty() {
                     debug!(
-                        "File-based route (no call-site candidates): {} [{} endpoint(s)]",
+                        "Structural route(s) (no call-site candidates): {} [{} file-based, {} route-descriptor]",
                         path_str,
-                        route_endpoints.len()
+                        route_endpoints.len(),
+                        descriptor_endpoints.len()
                     );
-                    stats.total_endpoints += route_endpoints.len();
+                    stats.total_endpoints += structural_endpoints.len();
                     stats.file_based_endpoints += route_endpoints.len();
+                    stats.route_descriptor_endpoints += descriptor_endpoints.len();
                     file_results.insert(
                         path_str,
                         FileAnalysisResult {
-                            endpoints: route_endpoints,
+                            endpoints: structural_endpoints,
                             ..Default::default()
                         },
                     );
@@ -340,6 +387,7 @@ impl FileOrchestrator {
                 symbol_table,
                 env_alias_map,
                 route_endpoints,
+                descriptor_endpoints,
             });
         }
 
@@ -400,6 +448,13 @@ impl FileOrchestrator {
                     stats.file_based_endpoints +=
                         Self::merge_file_based_endpoints(&mut adjusted, pf.route_endpoints);
 
+                    // Merge route-descriptor endpoints (`{ method, path, handler }`
+                    // data) the LLM pass didn't produce — it ignores route-as-data,
+                    // so these are emitted deterministically and are authoritative
+                    // for such routes (#234).
+                    stats.route_descriptor_endpoints +=
+                        Self::merge_file_based_endpoints(&mut adjusted, pf.descriptor_endpoints);
+
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
                     stats.total_data_calls += adjusted.data_calls.len();
@@ -433,6 +488,10 @@ impl FileOrchestrator {
         debug!(
             "  - File-based route endpoints: {}",
             stats.file_based_endpoints
+        );
+        debug!(
+            "  - Route-descriptor endpoints: {}",
+            stats.route_descriptor_endpoints
         );
         debug!("  - Total data calls: {}", stats.total_data_calls);
 
@@ -1147,9 +1206,57 @@ impl FileOrchestrator {
         }
     }
 
-    /// Append file-based route endpoints the LLM pass didn't already produce
-    /// (matched by method + path), keeping the deterministic structural entries.
-    /// Returns the number actually added.
+    /// Build deterministic endpoints for routes declared as data
+    /// (`{ method: 'GET', path: '/health', handler: healthCheckHandler }` in a
+    /// registry array). The method, path, and handler owner are all structural
+    /// facts the file-analyzer prompt ignores (it only matches framework-call
+    /// patterns), so they are emitted directly instead of through the LLM (#234).
+    ///
+    /// The owner is the handler identifier (`healthCheckHandler`), never the
+    /// HTTP-method literal — the owner-fabrication trap (#227). The descriptor
+    /// path is already absolute and carries no mount chain, so (like file-based
+    /// routes) the owner resolves to no mount prefix and the path is used as-is.
+    /// Descriptors with no resolvable handler fall back to a sentinel owner.
+    fn route_descriptor_endpoints(
+        scanner: &SwcScanner,
+        file_path: &Path,
+        content: &str,
+    ) -> Vec<EndpointResult> {
+        scanner
+            .route_descriptor_endpoints(file_path, content)
+            .into_iter()
+            .filter(|d| is_http_method(&d.method))
+            .map(|d: RouteDescriptorEndpoint| {
+                let method = d.method.to_uppercase();
+                let handler = d
+                    .handler
+                    .unwrap_or_else(|| ROUTE_DESCRIPTOR_OWNER.to_string());
+                EndpointResult {
+                    candidate_id: format!("route-descriptor:{}:{}", method, d.span_start),
+                    line_number: d.line_number as i32,
+                    owner_node: handler.clone(),
+                    method,
+                    path: d.path,
+                    handler_name: handler,
+                    pattern_matched: ROUTE_DESCRIPTOR_PATTERN.to_string(),
+                    call_expression_span_start: Some(d.span_start),
+                    call_expression_span_end: Some(d.span_end),
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                }
+            })
+            .collect()
+    }
+
+    /// Append structurally derived endpoints (file-based routes and
+    /// route-descriptor data) the LLM pass didn't already produce (matched by
+    /// method + path), keeping the deterministic entries. Returns the number
+    /// actually added.
     fn merge_file_based_endpoints(
         result: &mut FileAnalysisResult,
         route_endpoints: Vec<EndpointResult>,
@@ -3008,6 +3115,55 @@ export const prerender = false;
             &builtin_conventions(&["express".to_string()]),
         );
         assert!(endpoints.is_empty());
+    }
+
+    #[test]
+    fn route_descriptor_endpoint_owner_is_handler_not_method() {
+        // #234: a route declared as data is emitted deterministically with the
+        // handler identifier as owner — never the HTTP-method literal "GET"
+        // (the owner-fabrication trap, #227). Drives the real fixture.
+        let scanner = SwcScanner::new();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "tests/fixtures/xrepo-corpus-1/orders-monorepo/packages/gateway/src/health.handler.ts",
+        );
+        let content = std::fs::read_to_string(&fixture).expect("fixture must exist");
+
+        let endpoints = FileOrchestrator::route_descriptor_endpoints(&scanner, &fixture, &content);
+
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "expected exactly one route-descriptor endpoint, got {endpoints:?}"
+        );
+        let ep = &endpoints[0];
+        assert_eq!(ep.method, "GET");
+        assert_eq!(ep.path, "/gateway/health");
+        assert_eq!(
+            ep.owner_node, "healthCheckHandler",
+            "owner must be the handler ident, not the method literal"
+        );
+        assert_ne!(ep.owner_node, "GET");
+        assert_eq!(ep.handler_name, "healthCheckHandler");
+        assert_eq!(ep.pattern_matched, ROUTE_DESCRIPTOR_PATTERN);
+        assert!(ep.call_expression_span_start.is_some());
+        assert!(ep.call_expression_span_end.is_some());
+    }
+
+    #[test]
+    fn route_descriptor_endpoint_missing_handler_uses_sentinel_owner() {
+        let scanner = SwcScanner::new();
+        let content = r#"
+const routes = [
+  { method: 'POST', path: '/widgets' },
+];
+export { routes };
+"#;
+        let endpoints =
+            FileOrchestrator::route_descriptor_endpoints(&scanner, Path::new("routes.ts"), content);
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].method, "POST");
+        assert_eq!(endpoints[0].path, "/widgets");
+        assert_eq!(endpoints[0].owner_node, ROUTE_DESCRIPTOR_OWNER);
     }
 
     fn synthetic_endpoint(method: &str, path: &str) -> EndpointResult {
