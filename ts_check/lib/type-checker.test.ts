@@ -465,6 +465,97 @@ describe('TypeCompatibilityChecker', () => {
       assert.strictEqual(result.mismatches.length, 1);
     });
 
+    it('flags only the Carrick-marked `= unknown` as the injected placeholder (#244)', async () => {
+      // The marked alias is the injected placeholder: it short-circuits on the
+      // type_state=unknown path. The unmarked, developer-authored `= unknown`
+      // resolves to a genuine `unknown` and is caught by the compiler-level
+      // isUnknown() gate instead. Both are unverifiable, but only the marked one
+      // is treated as our placeholder, with the corresponding reason text.
+      const markedProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      markedProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type Order = { id: number };
+        export type OrderView = unknown; // carrick:missing-alias
+        `,
+        { overwrite: true }
+      );
+
+      const bareProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      bareProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type Order = { id: number };
+        export type OrderView = unknown;
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-api',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry('GET', '/orders/:id', 'Order', 'producer', 'routes.ts', 10),
+        ],
+      };
+      // type_state='unknown' so resolveTypeInfo (and isPlaceholderUnknown) runs.
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/orders/:id',
+            'OrderView',
+            'consumer',
+            'api.ts',
+            5,
+            'response',
+            false,
+            'unknown'
+          ),
+        ],
+      };
+
+      const marked = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        markedProject
+      );
+      assert.strictEqual(marked.unknownPairs.length, 1);
+      assert.strictEqual(marked.compatiblePairs, 0);
+      assert.strictEqual(marked.incompatiblePairs, 0);
+      // Marked placeholder takes the early type_state=unknown short-circuit.
+      assert.ok(
+        marked.unknownPairs[0].reason.includes('type_state=unknown'),
+        `marked placeholder should report type_state=unknown, got: ${marked.unknownPairs[0].reason}`
+      );
+
+      const bareChecker = new TypeCompatibilityChecker(bareProject);
+      const bare = await bareChecker.checkCompatibility(
+        producers,
+        consumers,
+        bareProject
+      );
+      assert.strictEqual(bare.unknownPairs.length, 1);
+      assert.strictEqual(bare.compatiblePairs, 0);
+      assert.strictEqual(bare.incompatiblePairs, 0);
+      // Developer-authored `= unknown` is NOT the placeholder: it falls through
+      // to the compiler-level gate, whose reason names the resolved `unknown`.
+      assert.ok(
+        !bare.unknownPairs[0].reason.includes('type_state=unknown'),
+        `developer-authored unknown must not be flagged as the placeholder, got: ${bare.unknownPairs[0].reason}`
+      );
+      assert.ok(
+        bare.unknownPairs[0].reason.includes('unknown'),
+        `developer-authored unknown should still be unverifiable, got: ${bare.unknownPairs[0].reason}`
+      );
+    });
+
     it('should match with path parameter normalization', async () => {
       const producers: TypeManifest = {
         repo_name: 'producer-api',

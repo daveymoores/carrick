@@ -22,6 +22,16 @@ import {
   TypeEvidence,
 } from "./manifest-matcher";
 
+/**
+ * Trailing marker the Rust scanner (`append_missing_aliases` in
+ * `src/engine/mod.rs`) stamps onto every `= unknown` alias it injects for a
+ * manifest entry missing from the bundle. ts_check uses it to recognise the
+ * injected placeholder without misclassifying a developer-authored
+ * `type X = unknown` as one (#244). Must stay byte-identical to the Rust
+ * `MISSING_ALIAS_MARKER` constant.
+ */
+const MISSING_ALIAS_MARKER = "// carrick:missing-alias";
+
 // ============================================================================
 // Type Definitions
 // ============================================================================
@@ -402,10 +412,17 @@ export class TypeCompatibilityChecker {
       const typeAlias = sourceFile.getTypeAlias(typeName);
       if (typeAlias) {
         const typeNode = typeAlias.getTypeNode();
-        const typeText = typeNode?.getText().trim();
-        const isPlaceholderUnknown =
+        const resolvesToUnknown =
           typeNode?.getKind() === SyntaxKind.UnknownKeyword ||
-          typeText === "unknown";
+          typeNode?.getText().trim() === "unknown";
+        // Only the Carrick-injected `= unknown` placeholder carries the marker
+        // comment. A developer-authored `type X = unknown` resolves to unknown
+        // too, but it is a genuine (if uninformative) API type, not our
+        // failed-inference stand-in (#244). The compiler-level isUnknown() gate
+        // in compareTypes still surfaces a genuine `unknown` as unverifiable, so
+        // dropping it here does not let a real shape mismatch read compatible.
+        const isPlaceholderUnknown =
+          resolvesToUnknown && this.hasMissingAliasMarker(typeAlias);
         return { type: typeAlias.getType(), isPlaceholderUnknown };
       }
 
@@ -416,6 +433,21 @@ export class TypeCompatibilityChecker {
     }
 
     return { type: null, isPlaceholderUnknown: false };
+  }
+
+  /**
+   * True when the type alias carries the Carrick `MISSING_ALIAS_MARKER` trailing
+   * comment that marks it as an injected `= unknown` placeholder. ts-morph's
+   * `getText()` omits trailing same-line comments, so this inspects the source
+   * line that holds the alias rather than the node text.
+   */
+  private hasMissingAliasMarker(typeAlias: TypeAliasDeclaration): boolean {
+    const sourceFile = typeAlias.getSourceFile();
+    const fullText = sourceFile.getFullText();
+    const declEnd = typeAlias.getEnd();
+    const lineEnd = fullText.indexOf("\n", declEnd);
+    const tail = fullText.slice(declEnd, lineEnd === -1 ? undefined : lineEnd);
+    return tail.includes(MISSING_ALIAS_MARKER);
   }
 
   private formatEntryLocation(entry: ManifestEntry): string {
