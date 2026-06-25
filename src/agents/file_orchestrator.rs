@@ -26,6 +26,7 @@ use crate::{
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
+    env_alias::{EnvAliasExtractor, EnvAliasMap, resolve_target_env_alias},
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
@@ -180,6 +181,12 @@ impl FileOrchestrator {
             candidate_contexts: Vec<String>,
             candidate_map: HashMap<String, CandidateTarget>,
             symbol_table: SymbolTable,
+            /// `local const -> process.env name` bindings (e.g.
+            /// `ORDERS_BASE -> ORDERS_SERVICE_URL`). Used after the LLM pass to
+            /// rewrite call targets that interpolate an env-var base URL aliased
+            /// through a local const, so the real env-var name reaches
+            /// classification and cross-repo matching. See `crate::env_alias`.
+            env_alias_map: EnvAliasMap,
             /// Endpoints derived from file-based routing conventions, merged in
             /// after the LLM pass. Empty for non-route files.
             route_endpoints: Vec<EndpointResult>,
@@ -321,7 +328,8 @@ impl FileOrchestrator {
                 .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
                 .collect();
 
-            let symbol_table = Self::extract_symbol_table(file_path, &cm, &handler);
+            let (symbol_table, env_alias_map) =
+                Self::extract_symbol_table(file_path, &cm, &handler);
 
             pending.push(PendingFile {
                 path_str,
@@ -330,6 +338,7 @@ impl FileOrchestrator {
                 candidate_contexts,
                 candidate_map,
                 symbol_table,
+                env_alias_map,
                 route_endpoints,
             });
         }
@@ -376,6 +385,7 @@ impl FileOrchestrator {
 
                     let mut adjusted = result;
                     Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
+                    Self::resolve_env_var_aliases(&mut adjusted, &pf.env_alias_map);
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
@@ -955,13 +965,16 @@ impl FileOrchestrator {
         (explicit_requests, infer_requests, inline_aliases)
     }
 
+    /// Parse a file once and extract both the symbol table and the env-var
+    /// alias map (`local const -> process.env name`). Sharing the parse keeps
+    /// the per-file CPU cost flat — both passes are cheap AST walks.
     fn extract_symbol_table(
         file_path: &Path,
         cm: &Lrc<SourceMap>,
         handler: &Handler,
-    ) -> SymbolTable {
+    ) -> (SymbolTable, EnvAliasMap) {
         let Some(module) = parse_file(file_path, cm, handler) else {
-            return SymbolTable::default();
+            return (SymbolTable::default(), EnvAliasMap::default());
         };
 
         let mut import_extractor = ImportSymbolExtractor::new();
@@ -970,10 +983,15 @@ impl FileOrchestrator {
         let mut type_extractor = TypeSymbolExtractor::new();
         module.visit_with(&mut type_extractor);
 
-        SymbolTable {
-            local_types: type_extractor.type_symbols,
-            imported_symbols: import_extractor.imported_symbols,
-        }
+        let env_alias_map = EnvAliasExtractor::build(&module);
+
+        (
+            SymbolTable {
+                local_types: type_extractor.type_symbols,
+                imported_symbols: import_extractor.imported_symbols,
+            },
+            env_alias_map,
+        )
     }
 
     fn validate_type_hints(result: &mut FileAnalysisResult, symbol_table: &SymbolTable) {
@@ -1250,6 +1268,29 @@ impl FileOrchestrator {
                 "[FileOrchestrator] {} data call(s) had no matching SWC candidate (spans unavailable)",
                 dropped_count
             );
+        }
+    }
+
+    /// Rewrite data-call targets that interpolate an env-var base URL aliased
+    /// through a local const so the real `process.env` name reaches downstream
+    /// classification and cross-repo matching (#218).
+    ///
+    /// The file analyzer emits the target verbatim — e.g.
+    /// `${ORDERS_BASE}/orders/${id}` for
+    /// `const ORDERS_BASE = process.env.ORDERS_SERVICE_URL ?? "...";`. Without
+    /// this pass, `Config::is_internal_call` and the cross-repo matcher key on
+    /// the local const `ORDERS_BASE` rather than `ORDERS_SERVICE_URL`, so the
+    /// edge never forms. Rewriting the leading `${ALIAS}` to
+    /// `${process.env.NAME}` funnels the call back through the existing
+    /// direct-`process.env` handling instead of duplicating env-var parsing.
+    fn resolve_env_var_aliases(result: &mut FileAnalysisResult, env_alias_map: &EnvAliasMap) {
+        if env_alias_map.is_empty() {
+            return;
+        }
+        for data_call in &mut result.data_calls {
+            if let Some(resolved) = resolve_target_env_alias(&data_call.target, env_alias_map) {
+                data_call.target = resolved;
+            }
         }
     }
 

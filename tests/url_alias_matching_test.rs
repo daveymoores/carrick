@@ -324,6 +324,82 @@ fn test_expected_alias_format_for_type_checker() {
     );
 }
 
+/// Issue #218 end-to-end: a call whose URL base is an env var aliased through a
+/// local const must resolve to the *real* `process.env` name so internal/external
+/// classification (and cross-repo matching, which keys on the same name) works.
+///
+/// Drives the full chain the orchestrator runs: build the per-file alias map →
+/// rewrite the call target → normalize against a config that declares the real
+/// env var. Before the fix, the target carried the local const `ORDERS_BASE` and
+/// `is_internal` was false; after, it carries `ORDERS_SERVICE_URL` and matches.
+#[test]
+fn test_const_aliased_env_var_resolves_to_real_name() {
+    use carrick::config::Config;
+    use carrick::env_alias::{EnvAliasExtractor, resolve_target_env_alias};
+    use carrick::parser::parse_file;
+    use carrick::url_normalizer::UrlNormalizer;
+
+    // The exact pattern from issue #218 (payments-svc/clients/orders.client.ts).
+    let source = r#"
+const ORDERS_BASE = process.env.ORDERS_SERVICE_URL ?? "http://localhost:3001";
+
+export async function getOrder(orderId: number) {
+  return fetch(`${ORDERS_BASE}/orders/${orderId}`);
+}
+"#;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let file_path = temp_dir.path().join("orders.client.ts");
+    let mut file = fs::File::create(&file_path).expect("Failed to create temp file");
+    file.write_all(source.as_bytes()).expect("write temp file");
+
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
+    let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+
+    // 1. The per-file alias map links the local const to the real env var.
+    let aliases = EnvAliasExtractor::build(&module);
+    assert_eq!(
+        aliases.get("ORDERS_BASE").map(String::as_str),
+        Some("ORDERS_SERVICE_URL"),
+        "alias map should resolve the const to the process.env name"
+    );
+
+    // 2. The call target the LLM emits, rewritten through the alias map.
+    let target = "${ORDERS_BASE}/orders/${orderId}";
+    let rewritten = resolve_target_env_alias(target, &aliases)
+        .expect("leading const alias should be rewritten");
+    assert_eq!(
+        rewritten,
+        "${process.env.ORDERS_SERVICE_URL}/orders/${orderId}"
+    );
+
+    // 3. With ORDERS_SERVICE_URL declared internal, the rewritten target now
+    //    classifies as internal and yields the producer-matchable path. The
+    //    original (unaliased) target does NOT — that is the bug.
+    let config = Config {
+        internal_env_vars: ["ORDERS_SERVICE_URL"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        ..Default::default()
+    };
+    let normalizer = UrlNormalizer::new(&config);
+
+    let resolved = normalizer.normalize(&rewritten);
+    assert_eq!(resolved.path, "/orders/:orderId");
+    assert!(
+        resolved.is_internal,
+        "rewritten target must classify as internal via the real env var"
+    );
+
+    let unresolved = normalizer.normalize(target);
+    assert!(
+        !unresolved.is_internal,
+        "the un-rewritten const-aliased target should NOT classify as internal (this is #218)"
+    );
+}
+
 /// Test edge case: empty path
 #[test]
 fn test_empty_path_alias() {
