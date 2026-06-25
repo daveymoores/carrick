@@ -3,9 +3,12 @@
 //! Scores the *real* scanner over the authored `xrepo-corpus-1` constellation and
 //! reports two metric families, **report-only** (a monitor, never a gate):
 //!
-//!   1. **endpoint-set P/R/F1** per repo — `expected.json.endpoints` vs the joined
-//!      [`EvalProjection`]'s `endpoints`, compared as a set of normalized
-//!      `(METHOD, norm_path(path))` (contract §6 row 1).
+//!   1. **endpoint-set P/R/F1** (corpus-wide) — every repo's
+//!      `expected.json.endpoints` unioned, vs the joined [`EvalProjection`]'s
+//!      `endpoints`, compared as a set of normalized `(METHOD, norm_path(path))`
+//!      (contract §6 row 1). Scored corpus-wide rather than per repo because the
+//!      joined projection carries no per-repo provenance on `endpoints` yet;
+//!      a per-repo breakdown is a TODO (see below).
 //!   2. **cross-repo match P/R/F1** — `expected-output.json.matches` vs
 //!      `EvalProjection.cross_repo_matches`, keyed by
 //!      `(producer_repo, norm(producer_key), consumer_repo, norm(consumer_key))`
