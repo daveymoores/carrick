@@ -296,13 +296,28 @@ export class TypeCompatibilityChecker {
       };
     }
 
-    if (producerType.isAny() || consumerType.isAny()) {
+    // `any` and `unknown` are both top-ish: everything is assignable to
+    // `unknown`, so a side that resolves to either makes `isAssignableTo`
+    // return true and the edge would read compatible without ever comparing
+    // the real shapes. These almost always mean the type never reached the
+    // bundle (a broken import, or an `= unknown` placeholder from
+    // append_missing_aliases). Classify the edge unverifiable, not compatible.
+    if (
+      producerType.isAny() ||
+      consumerType.isAny() ||
+      producerType.isUnknown() ||
+      consumerType.isUnknown()
+    ) {
       const reasonParts = [];
-      if (producerType.isAny()) {
-        reasonParts.push("producer type resolves to any (broken import in bundled types?)");
+      if (producerType.isAny() || producerType.isUnknown()) {
+        reasonParts.push(
+          `producer type resolves to ${producerType.isAny() ? "any" : "unknown"} (type missing from bundled types?)`
+        );
       }
-      if (consumerType.isAny()) {
-        reasonParts.push("consumer type resolves to any (broken import in bundled types?)");
+      if (consumerType.isAny() || consumerType.isUnknown()) {
+        reasonParts.push(
+          `consumer type resolves to ${consumerType.isAny() ? "any" : "unknown"} (type missing from bundled types?)`
+        );
       }
       return {
         kind: "unverifiable",

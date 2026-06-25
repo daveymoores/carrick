@@ -1756,15 +1756,35 @@ fn enrich_manifest_with_type_resolution(
         HashSet::new()
     };
 
+    // A type is genuinely unresolved when it resolves to `unknown`/`any`/empty,
+    // or when the bundled .d.ts only carries the trivial `= unknown` placeholder
+    // that append_missing_aliases injects for a missing alias. Either way the
+    // shape never reached the bundle, so the entry must read `Unknown` — never a
+    // promoted state that asserts a shape we don't actually have.
+    let dts_trivially_unknown = |alias: &str| {
+        bundled_dts
+            .map(|dts| dts_alias_is_trivially_unknown(dts, alias))
+            .unwrap_or(false)
+    };
+
     // Update manifest entries
     for entry in manifest.iter_mut() {
         if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
             // Check if the type is actually resolved (not "unknown")
             let is_unknown_type = type_string.trim() == "unknown"
                 || type_string.trim() == "any"
-                || type_string.is_empty();
+                || type_string.is_empty()
+                || dts_trivially_unknown(&entry.type_alias);
 
-            if !is_unknown_type {
+            if is_unknown_type {
+                // Downgrade to Unknown so the `= unknown` placeholder gate
+                // (resolve_per_endpoint_definitions, ts_check) stays shut and the
+                // edge is reported unverifiable rather than falsely compatible.
+                entry.is_explicit = false;
+                entry.type_state = ManifestTypeState::Unknown;
+                entry.evidence.is_explicit = false;
+                entry.evidence.type_state = ManifestTypeState::Unknown;
+            } else {
                 entry.is_explicit = *is_explicit;
                 entry.type_state = if *is_explicit {
                     ManifestTypeState::Explicit
@@ -1779,6 +1799,12 @@ fn enrich_manifest_with_type_resolution(
             // This can happen for inline aliases or other edge cases
             entry.type_state = ManifestTypeState::Implicit;
             entry.evidence.type_state = ManifestTypeState::Implicit;
+        } else if dts_trivially_unknown(&entry.type_alias) {
+            // Only a `= unknown` placeholder reached the bundle — keep Unknown.
+            entry.is_explicit = false;
+            entry.type_state = ManifestTypeState::Unknown;
+            entry.evidence.is_explicit = false;
+            entry.evidence.type_state = ManifestTypeState::Unknown;
         }
     }
 
@@ -2250,6 +2276,8 @@ fn recreate_package_and_tsconfig(
 mod tests {
     use super::*;
     use crate::analyzer::ApiEndpointDetails;
+    use crate::cloud_storage::TypeEvidence;
+    use crate::services::type_sidecar::{InferredType, SourceLocation};
     use crate::visitor::{OwnerType, TypeReference};
     use std::path::PathBuf;
 
@@ -3269,6 +3297,128 @@ mod tests {
         assert!(
             err.to_string().contains("No JS/TS source files"),
             "expected empty-scan error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Type-state enrichment / placeholder handling (#235)
+    // -----------------------------------------------------------------------
+
+    fn consumer_entry(type_alias: &str) -> TypeManifestEntry {
+        let evidence = TypeEvidence {
+            file_path: "lib/api.ts".to_string(),
+            span_start: None,
+            span_end: None,
+            line_number: 5,
+            infer_kind: InferKind::CallResult,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+        };
+        TypeManifestEntry {
+            key: OperationKey::http("GET", "/orders/:id"),
+            role: ManifestRole::Consumer,
+            type_kind: ManifestTypeKind::Response,
+            type_alias: type_alias.to_string(),
+            file_path: "lib/api.ts".to_string(),
+            line_number: 5,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+            evidence,
+            resolved_definition: None,
+            expanded_definition: None,
+        }
+    }
+
+    fn empty_resolution() -> TypeResolutionResult {
+        TypeResolutionResult {
+            dts_content: None,
+            explicit_manifest: vec![],
+            inferred_types: vec![],
+            symbol_failures: vec![],
+            errors: vec![],
+        }
+    }
+
+    /// A genuine shape resolved by the sidecar promotes the entry to Implicit.
+    #[test]
+    fn enrich_promotes_resolved_consumer_shape() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let mut resolution = empty_resolution();
+        resolution.inferred_types.push(InferredType {
+            alias: "OrderView".to_string(),
+            type_string: "{ id: string; currency: string }".to_string(),
+            is_explicit: false,
+            source_location: SourceLocation {
+                file_path: "lib/api.ts".to_string(),
+                start_line: 5,
+                end_line: 5,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::CallResult,
+        });
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+    }
+
+    /// A consumer alias that only resolves to `unknown` must stay `Unknown` so
+    /// the placeholder gate stays shut and the edge reads unverifiable, not
+    /// compatible (#235).
+    #[test]
+    fn enrich_keeps_unknown_resolution_unknown() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let mut resolution = empty_resolution();
+        resolution.inferred_types.push(InferredType {
+            alias: "OrderView".to_string(),
+            type_string: "unknown".to_string(),
+            is_explicit: false,
+            source_location: SourceLocation {
+                file_path: "lib/api.ts".to_string(),
+                start_line: 5,
+                end_line: 5,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::CallResult,
+        });
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+    }
+
+    /// A `= unknown` placeholder in the bundled .d.ts must NOT promote the entry,
+    /// even if the bundle nominally "defines" the alias — it is downgraded to
+    /// `Unknown` (#235).
+    #[test]
+    fn enrich_downgrades_trivially_unknown_dts_alias() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let resolution = empty_resolution();
+        let dts = "export type OrderView = unknown;\n";
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, Some(dts));
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+    }
+
+    /// append_missing_aliases injects a `= unknown` placeholder for a manifest
+    /// alias absent from the bundle, and leaves an already-defined alias alone.
+    #[test]
+    fn append_missing_aliases_injects_unknown_placeholder() {
+        let manifest = vec![consumer_entry("OrderView"), consumer_entry("Payment")];
+        let dts = "export interface Payment { id: string }\n".to_string();
+
+        let out = append_missing_aliases(dts, Some(&manifest));
+
+        assert!(
+            out.contains("export type OrderView = unknown;"),
+            "missing alias should be injected as a placeholder, got: {out}"
+        );
+        assert!(
+            !out.contains("export type Payment = unknown;"),
+            "an already-defined alias must not be overwritten, got: {out}"
         );
     }
 }

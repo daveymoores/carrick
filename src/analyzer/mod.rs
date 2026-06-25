@@ -1541,8 +1541,26 @@ impl Analyzer {
             })
             .collect::<Vec<_>>();
 
+        // Edges ts_check matched but could not verify — a side resolved to
+        // `any`/`unknown` (e.g. the type never reached the bundled .d.ts). These
+        // are NOT compatible; they are unverifiable, and the overlay must leave
+        // their verdict `None` rather than optimistically claiming `Some(true)`.
+        let unknown_pairs = result
+            .get("unknownPairs")
+            .and_then(|u| u.as_array())
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|pair| {
+                serde_json::json!({
+                    "endpoint": pair.get("endpoint").unwrap_or(&serde_json::Value::Null),
+                    "reason": pair.get("reason").unwrap_or(&serde_json::Value::Null)
+                })
+            })
+            .collect::<Vec<_>>();
+
         Ok(serde_json::json!({
             "mismatches": mismatches,
+            "unknownPairs": unknown_pairs,
             "totalChecked": result.get("totalChecked").unwrap_or(&serde_json::Value::Number(serde_json::Number::from(0))),
             "compatiblePairs": result.get("compatibleCount").unwrap_or(&serde_json::Value::Number(serde_json::Number::from(0))),
             "incompatiblePairs": mismatches.len()
@@ -1642,8 +1660,11 @@ impl Analyzer {
     /// If `check_type_compatibility` returns `Err`, type checking did not run
     /// (or failed) for this scan: every edge keeps `type_compatible: None`
     /// (load-bearing — see [`CrossRepoMatch`]). On `Ok`, an edge whose producer
-    /// appears in the mismatch set gets `Some(false)` + the reason; otherwise
-    /// `Some(true)` (compat evaluated, no mismatch for that producer).
+    /// appears in the mismatch set gets `Some(false)` + the reason; an edge
+    /// whose producer ts_check matched but could NOT verify (a side resolved to
+    /// `any`/`unknown`, e.g. the type never reached the bundled `.d.ts`) keeps
+    /// `None` — unverifiable, not compatible; everything else (genuinely checked
+    /// and compatible) gets `Some(true)`.
     fn overlay_compat_verdicts(&self, matches: &mut [CrossRepoMatch]) {
         let result = match self.check_type_compatibility() {
             Ok(result) => result,
@@ -1675,20 +1696,36 @@ impl Analyzer {
             }
         }
 
+        // Producers ts_check matched but could not verify (a side resolved to
+        // `any`/`unknown`). The compat verdict is genuinely unknown for these
+        // edges — leaving the optimistic `Some(true)` default would assert a
+        // compatibility ts_check never established.
+        let mut unverifiable: HashSet<(String, String)> = HashSet::new();
+        if let Some(unknown_list) = result.get("unknownPairs").and_then(|u| u.as_array()) {
+            for pair in unknown_list {
+                let Some(endpoint) = pair.get("endpoint").and_then(|e| e.as_str()) else {
+                    continue;
+                };
+                if let Some(key) = parse_compat_endpoint(endpoint) {
+                    unverifiable.insert(key);
+                }
+            }
+        }
+
         for edge in matches.iter_mut() {
             // producer_key is `http|METHOD|path`; recover (METHOD, path).
             let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
                 edge.type_compatible = Some(true);
                 continue;
             };
-            match incompatible.get(&(method, path)) {
-                Some(reason) => {
-                    edge.type_compatible = Some(false);
-                    edge.mismatch_reason = Some(reason.clone());
-                }
-                None => {
-                    edge.type_compatible = Some(true);
-                }
+            if let Some(reason) = incompatible.get(&(method.clone(), path.clone())) {
+                edge.type_compatible = Some(false);
+                edge.mismatch_reason = Some(reason.clone());
+            } else if unverifiable.contains(&(method, path)) {
+                // Matched but unverifiable — compat undetermined, NOT compatible.
+                edge.type_compatible = None;
+            } else {
+                edge.type_compatible = Some(true);
             }
         }
     }
@@ -2625,6 +2662,42 @@ mod tests {
         assert_eq!(
             matches[0].type_compatible, None,
             "no results file → compat not evaluated → verdict stays None (never fake true)"
+        );
+    }
+
+    /// An edge ts_check matched but could NOT verify (a side resolved to
+    /// `any`/`unknown`) lands in `unknownPairs`, not `mismatches`. Its verdict
+    /// must stay `None` (unverifiable) rather than the optimistic `Some(true)` —
+    /// asserting compatibility ts_check never established would mask a real
+    /// shape mismatch hidden behind an `= unknown` placeholder (#235).
+    #[test]
+    fn overlay_compat_verdicts_leaves_unverifiable_edge_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // GET /orders/:id is unverifiable (consumer resolved to `unknown`);
+        // POST /payments was genuinely checked and is compatible.
+        let results = r#"{
+            "mismatches": [],
+            "unknownPairs": [
+                { "endpoint": "GET /orders/:id (response)",
+                  "reason": "consumer type resolves to unknown (type missing from bundled types?)" }
+            ],
+            "totalChecked": 1,
+            "compatibleCount": 1
+        }"#;
+        let analyzer = analyzer_with_results(dir.path(), Some(results));
+
+        let mut matches = vec![edge("http|GET|/orders/:id"), edge("http|POST|/payments")];
+        analyzer.overlay_compat_verdicts(&mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "an unverifiable edge stays None, never a fake Some(true)"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(true),
+            "a genuinely-checked edge absent from both lists is compatible"
         );
     }
 
