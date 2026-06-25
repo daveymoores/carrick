@@ -1703,8 +1703,18 @@ fn xrepo_live_scorer() {
                 TIER_CAPABILITY,
                 |key, is_producer, anchor, _rt, _ts| {
                     let idx = if is_producer { &ep_idx } else { &call_idx };
-                    let actual = idx.get(&key).and_then(|a| a.primary_type_symbol.as_deref());
-                    let mark = if anchor == actual { "ok  " } else { "MISS" };
+                    let entry = idx.get(&key);
+                    let actual = entry.and_then(|a| a.primary_type_symbol.as_deref());
+                    // Distinguish "no projection entry at all" (the #245 non-HTTP
+                    // type-pipeline gap) from "entry present but anchor null/wrong"
+                    // so a miss is attributable rather than conflated. `NOENT` =
+                    // the op isn't in the projection; `MISS` = it is, but the
+                    // anchor differs from expected.
+                    let mark = match entry {
+                        None => "NOENT",
+                        Some(_) if anchor == actual => "ok   ",
+                        Some(_) => "MISS ",
+                    };
                     eprintln!(
                         "[diag]   anchor[{mark}] {key:?} expected={anchor:?} actual={actual:?}"
                     );
