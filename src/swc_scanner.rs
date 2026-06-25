@@ -363,6 +363,14 @@ impl SwcScanner {
     }
 }
 
+/// The salient parts of a route-descriptor object literal
+/// (`{ method, path, handler }`): the path literal snippet (when present) and
+/// the handler identifier (when it is a bare identifier reference).
+struct RouteDescriptor {
+    path: Option<String>,
+    handler: Option<String>,
+}
+
 /// Visitor that collects potential API call sites.
 struct CandidateVisitor {
     candidates: Vec<CandidateTarget>,
@@ -592,6 +600,39 @@ impl CandidateVisitor {
         });
     }
 
+    /// Emit a candidate from a raw span (for nodes that are not call
+    /// expressions, e.g. `new WebSocket(...)` or a route-descriptor object
+    /// literal). Deduplicates by span like [`push_candidate`].
+    #[allow(clippy::too_many_arguments)]
+    fn push_span_candidate(
+        &mut self,
+        span: swc_common::Span,
+        protocol: Protocol,
+        callee_object: String,
+        callee_property: Option<String>,
+        path_snippet: Option<String>,
+    ) {
+        let (span_start, span_end) = self.span_range(span);
+        if !self.seen_spans.insert((span_start, span_end)) {
+            return;
+        }
+        let line_number = self.get_line_number(span);
+        let candidate_id = self.candidate_id(span_start, span_end);
+        let code_snippet = self.get_code_snippet(span);
+        self.candidates.push(CandidateTarget {
+            protocol,
+            candidate_id,
+            span_start,
+            span_end,
+            line_number,
+            callee_object,
+            callee_property,
+            enclosing_function: self.current_function(),
+            path_snippet,
+            code_snippet,
+        });
+    }
+
     /// Extract a code snippet for the given span
     fn get_code_snippet(&self, span: swc_common::Span) -> String {
         self.source_map
@@ -629,6 +670,56 @@ impl CandidateVisitor {
             .ok()
             .map(|s| s.lines().next().unwrap_or("").to_string())
             .map(|s| s.chars().take(120).collect())
+    }
+
+    /// Inspect an object literal for the route-descriptor shape
+    /// (`{ method, path, handler }`). Returns the path literal snippet and the
+    /// handler identifier when the object carries *both* a `method` and a
+    /// `path` property; otherwise `None`. Only string-keyed (ident or string)
+    /// properties are considered, so spread/computed config objects don't
+    /// accidentally match.
+    fn route_descriptor(node: &ObjectLit) -> Option<RouteDescriptor> {
+        let key_name = |key: &PropName| -> Option<String> {
+            match key {
+                PropName::Ident(id) => Some(id.sym.to_string()),
+                PropName::Str(s) => Some(s.value.to_string()),
+                _ => None,
+            }
+        };
+
+        let mut has_method = false;
+        let mut has_path = false;
+        let mut path = None;
+        let mut handler = None;
+
+        for prop in &node.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+            let Some(name) = key_name(&kv.key) else {
+                continue;
+            };
+            match name.as_str() {
+                "method" => has_method = true,
+                "path" => {
+                    has_path = true;
+                    if let Expr::Lit(Lit::Str(s)) = &*kv.value {
+                        path = Some(format!("'{}'", s.value));
+                    }
+                }
+                "handler" => {
+                    if let Expr::Ident(id) = &*kv.value {
+                        handler = Some(id.sym.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        (has_method && has_path).then_some(RouteDescriptor { path, handler })
     }
 
     /// Extract callee object name from expression
@@ -731,40 +822,55 @@ impl Visit for CandidateVisitor {
                 "WebSocket" | "EventSource" | "XMLHttpRequest"
             )
         {
-            // NewExpr args are optional; build a throwaway CallExpr view is not
-            // possible, so push directly with span dedup.
-            let (span_start, span_end) = self.span_range(node.span);
-            if self.seen_spans.insert((span_start, span_end)) {
-                let line_number = self.get_line_number(node.span);
-                let candidate_id = self.candidate_id(span_start, span_end);
-                let code_snippet = self.get_code_snippet(node.span);
-                let path_snippet = node
-                    .args
-                    .as_ref()
-                    .and_then(|args| args.first())
-                    .and_then(|a| self.source_map.span_to_snippet(a.expr.span()).ok())
-                    .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect());
-                // XMLHttpRequest is an HTTP client; WebSocket and
-                // EventSource belong to the socket family (SSE rides the
-                // socket model) and must not reach the HTTP prompt.
-                let protocol = if ident.sym.as_ref() == "XMLHttpRequest" {
-                    Protocol::Http
-                } else {
-                    Protocol::Websocket
-                };
-                self.candidates.push(CandidateTarget {
-                    protocol,
-                    candidate_id,
-                    span_start,
-                    span_end,
-                    line_number,
-                    callee_object: ident.sym.to_string(),
-                    callee_property: None,
-                    enclosing_function: self.current_function(),
-                    path_snippet,
-                    code_snippet,
-                });
-            }
+            let path_snippet = node
+                .args
+                .as_ref()
+                .and_then(|args| args.first())
+                .and_then(|a| self.source_map.span_to_snippet(a.expr.span()).ok())
+                .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect());
+            // XMLHttpRequest is an HTTP client; WebSocket and EventSource
+            // belong to the socket family (SSE rides the socket model) and
+            // must not reach the HTTP prompt.
+            let protocol = if ident.sym.as_ref() == "XMLHttpRequest" {
+                Protocol::Http
+            } else {
+                Protocol::Websocket
+            };
+            self.push_span_candidate(
+                node.span,
+                protocol,
+                ident.sym.to_string(),
+                None,
+                path_snippet,
+            );
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_object_lit(&mut self, node: &ObjectLit) {
+        // Signal 6: route-descriptor object literals — a declarative routing
+        // shape where the method, path, and handler are *data*, not a method
+        // call (`{ method: 'GET', path: '/health', handler: healthCheckHandler }`,
+        // typically collected in a `routeRegistry`-style array and registered
+        // in a loop). None of the call-site signals fire on such a file, so the
+        // gate would skip it and the endpoint would be missed entirely.
+        //
+        // The shape guard requires *both* a `method` and a `path` property to
+        // avoid flagging ordinary config objects. The candidate is keyed on the
+        // `handler` identifier when present so the hint points the LLM at the
+        // real owner (the handler fn), not the HTTP method string — the
+        // owner-fabrication trap. The LLM still classifies and extracts; this is
+        // a recall booster for the gate, not an authoritative route emission.
+        if let Some(descriptor) = Self::route_descriptor(node) {
+            self.push_span_candidate(
+                node.span,
+                Protocol::Http,
+                descriptor
+                    .handler
+                    .unwrap_or_else(|| "<route-descriptor>".to_string()),
+                None,
+                descriptor.path,
+            );
         }
         node.visit_children_with(self);
     }
@@ -1103,6 +1209,81 @@ async function run() { return await axios.get('https://x.com/y'); }
         assert_eq!(handlers.len(), 1);
         assert_eq!(handlers[0].name, "GET");
         assert_eq!(handlers[0].line_number, 3);
+    }
+
+    #[test]
+    fn detects_route_descriptor_object_literal() {
+        // The gateway owner-fabrication trap (#227): a raw-handler block where
+        // the route is declarative *data* in a registry array, not a method
+        // call. No call-site signal fires, so without the object-literal signal
+        // the whole file is skipped and `GET /gateway/health` is missed.
+        let content = r#"
+export const healthCheckHandler = async (_req: unknown, _res: unknown) => {
+  return { ok: true, ts: Date.now() };
+};
+
+const routeRegistry = [
+  { method: 'GET', path: '/gateway/health', handler: healthCheckHandler },
+];
+
+export { routeRegistry };
+"#;
+        let result = scan_test_content(content);
+        let descriptor = result
+            .candidates
+            .iter()
+            .find(|c| c.path_snippet.as_deref() == Some("'/gateway/health'"));
+        assert!(
+            descriptor.is_some(),
+            "expected a route-descriptor candidate for the registry object, got {:?}",
+            result
+                .candidates
+                .iter()
+                .map(|c| (&c.callee_object, &c.path_snippet))
+                .collect::<Vec<_>>()
+        );
+        let descriptor = descriptor.unwrap();
+        assert_eq!(descriptor.protocol, Protocol::Http);
+        // The candidate must be keyed on the real handler fn, never the HTTP
+        // method string — the owner-fabrication bait.
+        assert_eq!(descriptor.callee_object, "healthCheckHandler");
+        assert_ne!(descriptor.callee_object, "GET");
+    }
+
+    #[test]
+    fn route_descriptor_without_handler_still_flagged() {
+        // `method` + `path` is enough for the gate to keep the file; a missing
+        // or non-identifier handler falls back to a sentinel so the LLM still
+        // sees and classifies the route.
+        let content = r#"
+const routes = [
+  { method: 'POST', path: '/widgets' },
+];
+export { routes };
+"#;
+        let result = scan_test_content(content);
+        let descriptor = result
+            .candidates
+            .iter()
+            .find(|c| c.path_snippet.as_deref() == Some("'/widgets'"));
+        assert!(
+            descriptor.is_some(),
+            "expected a route-descriptor candidate"
+        );
+        assert_eq!(descriptor.unwrap().callee_object, "<route-descriptor>");
+    }
+
+    #[test]
+    fn plain_config_object_is_not_a_route_descriptor() {
+        // An object with only one of the two required keys (or neither) is
+        // ordinary config and must not be flagged, or the gate would light up
+        // on every options bag in the codebase.
+        let only_method = scan_test_content(r#"const a = { method: 'GET' };"#);
+        let only_path = scan_test_content(r#"const b = { path: '/x' };"#);
+        let neither = scan_test_content(r#"const c = { timeout: 5000, retries: 3 };"#);
+        assert!(only_method.candidates.is_empty());
+        assert!(only_path.candidates.is_empty());
+        assert!(neither.candidates.is_empty());
     }
 
     #[test]
