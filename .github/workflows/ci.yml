@@ -81,6 +81,13 @@ jobs:
       - name: Run xrepo harness test
         run: cargo test --test xrepo_harness_test --verbose
 
+      # Cross-repo scorer math only. Default `cargo test` skips the #[ignore]d
+      # live scorer + mock smoke (both spawn the binary / cost money), so this is
+      # cheap, deterministic, and never triggers a scan. The live scorer runs via
+      # eval-xrepo.yml (workflow_dispatch), NOT here.
+      - name: Run cross-repo scorer unit tests
+        run: cargo test --test eval_xrepo --verbose
+
       - name: Run sidecar unit tests
         run: cd src/sidecar && npm test
 
