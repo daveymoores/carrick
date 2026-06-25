@@ -1480,6 +1480,31 @@ fn agg(scores: &[RunScore], tier: &str, pick: impl Fn(&TierScore) -> f64) -> (f6
 /// non-null verdict the aggregated `compat_verdict` is a meaningless 0.0, so we
 /// never print it as a number — printing it would read absent compat data as a
 /// real "0% compatible" score.
+/// A single "generalised correctness" percentage for a run, so progress across
+/// runs is easy to track at a glance. It is the **unweighted mean of the
+/// fractional accuracy dimensions** — endpoint/call/xrepo-match F1, type-anchor,
+/// type-resolution, dependency F1, and compat-verdict *when it was scored* (§7).
+///
+/// Deliberately coarse: the dimensions matter differently and the type
+/// dimensions are currently floored by structural gaps (#245 non-HTTP type
+/// extraction, #246 expanded-definition inlining), so this number is a trend
+/// indicator, not a contract. Decoy leakage is intentionally excluded — it is a
+/// count (a hard quality failure), not a fraction to average away.
+fn overall_correctness(cap: &TierScore, compat_scored: bool) -> f64 {
+    let mut dims = vec![
+        cap.ep_prf.2,
+        cap.call_prf.2,
+        cap.match_prf.2,
+        cap.type_anchor,
+        cap.type_resolution,
+        cap.dep_prf.2,
+    ];
+    if compat_scored {
+        dims.push(cap.compat_verdict);
+    }
+    dims.iter().sum::<f64>() / dims.len() as f64
+}
+
 fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_absent: bool) {
     let (ep_p, ep_p_sd) = agg(scores, tier, |t| t.ep_prf.0);
     let (ep_r, ep_r_sd) = agg(scores, tier, |t| t.ep_prf.1);
@@ -1497,7 +1522,20 @@ fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_
     let (dp_f, dp_f_sd) = agg(scores, tier, |t| t.dep_prf.2);
     let (orph_f, orph_f_sd) = agg(scores, tier, |t| t.orphan_prf.2);
 
+    // Overall = mean of the fractional dimension means (compat only when scored),
+    // mirroring `overall_correctness` for a per-tier headline.
+    let mut dim_means = vec![ep_f, cl_f, m_f, anc, res, dp_f];
+    if !compat_absent {
+        dim_means.push(cmp);
+    }
+    let overall = dim_means.iter().sum::<f64>() / dim_means.len() as f64;
+
     println!("\n{CORPUS} — tier={tier} (n={n}/{runs_n})");
+    println!(
+        "  OVERALL correctness   {:.0}%  (unweighted mean of {} dims; decoy_leak excluded)",
+        overall * 100.0,
+        dim_means.len()
+    );
     println!(
         "  endpoint-set   P {ep_p:.2}±{ep_p_sd:.2}  R {ep_r:.2}±{ep_r_sd:.2}  F1 {ep_f:.2}±{ep_f_sd:.2}"
     );
@@ -1651,6 +1689,37 @@ fn xrepo_live_scorer() {
                         .unwrap_or_default(),
                 );
             }
+            // Per-op anchor: expected vs actual primary_type_symbol (#240). Makes
+            // the anchor metric attributable — for each expected-typed op, show
+            // whether the real symbol was extracted (`ok`), fell back to the
+            // hashed `type_alias` / a different symbol (`MISS` with the actual
+            // value), or has no projection entry at all (`actual=None`, the
+            // non-HTTP type-pipeline gap, #245).
+            let ep_idx = index_proj_endpoints(&proj);
+            let call_idx = index_proj_calls(&proj);
+            eprintln!("[diag] anchor (expected primary_type_symbol vs actual):");
+            for_each_expected_typed_op(
+                &repo_expected,
+                TIER_CAPABILITY,
+                |key, is_producer, anchor, _rt, _ts| {
+                    let idx = if is_producer { &ep_idx } else { &call_idx };
+                    let entry = idx.get(&key);
+                    let actual = entry.and_then(|a| a.primary_type_symbol.as_deref());
+                    // Distinguish "no projection entry at all" (the #245 non-HTTP
+                    // type-pipeline gap) from "entry present but anchor null/wrong"
+                    // so a miss is attributable rather than conflated. `NOENT` =
+                    // the op isn't in the projection; `MISS` = it is, but the
+                    // anchor differs from expected.
+                    let mark = match entry {
+                        None => "NOENT",
+                        Some(_) if anchor == actual => "ok   ",
+                        Some(_) => "MISS ",
+                    };
+                    eprintln!(
+                        "[diag]   anchor[{mark}] {key:?} expected={anchor:?} actual={actual:?}"
+                    );
+                },
+            );
         }
         // Score the FULL vector unconditionally (#226). The §7 compat-presence
         // check no longer panics inside the scorer: it rides `score.compat`, so
@@ -1667,8 +1736,10 @@ fn xrepo_live_scorer() {
             format!("{:.2}", cap.compat_verdict)
         };
         println!(
-            "  run {run_idx}/{runs_n}: endpoint F1 {:.2}  call F1 {:.2}  match F1 {:.2}  \
-             anchor {:.2}  resolution {:.2}  compat {compat_cell}  dep F1 {:.2}  decoy_leak {}",
+            "  run {run_idx}/{runs_n}: OVERALL {:.0}%  | endpoint F1 {:.2}  call F1 {:.2}  \
+             match F1 {:.2}  anchor {:.2}  resolution {:.2}  compat {compat_cell}  dep F1 {:.2}  \
+             decoy_leak {}",
+            overall_correctness(cap, !compat_absent) * 100.0,
             cap.ep_prf.2,
             cap.call_prf.2,
             cap.match_prf.2,
