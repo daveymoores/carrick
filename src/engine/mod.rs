@@ -589,6 +589,12 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
     let output = std::process::Command::new("git")
         .args(["diff", "--name-only", base_commit, "HEAD"])
         .current_dir(repo_path)
+        // Clear git env vars so git uses repo_path for repo discovery, not an
+        // ambient GIT_DIR / GIT_WORK_TREE inherited from a parent process (e.g.
+        // when invoked from a pre-commit hook inside a git worktree).
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .ok()?;
 
@@ -600,6 +606,9 @@ fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> 
         let is_shallow = std::process::Command::new("git")
             .args(["rev-parse", "--is-shallow-repository"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .ok()
             .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
@@ -2628,20 +2637,31 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let repo_path = temp_dir.path().to_str().unwrap();
 
-        // Init a git repo
+        // Init a git repo. Clear git env vars so the commands are scoped to
+        // repo_path rather than any ambient GIT_DIR set by a parent process
+        // (e.g. a pre-commit hook running inside a git worktree).
         Command::new("git")
             .args(["init"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         Command::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         Command::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
 
@@ -2651,11 +2671,17 @@ mod tests {
         Command::new("git")
             .args(["add", "."])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "initial"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
 
@@ -2664,6 +2690,9 @@ mod tests {
             Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(repo_path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
                 .output()
                 .unwrap()
                 .stdout,
@@ -2683,11 +2712,17 @@ mod tests {
         Command::new("git")
             .args(["add", "."])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "changes"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
 
@@ -2712,27 +2747,42 @@ mod tests {
         Command::new("git")
             .args(["init"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         Command::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         Command::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         std::fs::write(temp_dir.path().join("app.ts"), "x").unwrap();
         Command::new("git")
             .args(["add", "."])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "init"])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
 
