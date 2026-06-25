@@ -1,0 +1,113 @@
+name: eval-xrepo
+
+# Cross-repo accuracy eval (S4 thin slice, #203): scores the live scanner over
+# the authored `xrepo-corpus-1` constellation and reports two metric families,
+# report-only — a MONITOR, never a gate:
+#   1. endpoint-set P/R/F1 (contract §6 row 1)
+#   2. cross-repo match P/R/F1 (contract §6 row 7)
+#
+# On-demand only (workflow_dispatch) — each run makes real LLM calls over a
+# 3-repo (multi-framework) corpus and costs money + is stochastic, so it must
+# NOT sit on the merge/PR path (build plan §7 slice 4: the only per-merge gate is
+# the deterministic cassette seatbelt). The full monitor cadence
+# (debounced-on-main + issue-filing) is DEFERRED to a follow-up.
+#
+# Auth is GitHub Actions OIDC: the scanner is keyless, so this needs
+# `id-token: write` and no stored secret. The two-phase harness strips the
+# runner's GITHUB_REPOSITORY/REF/EVENT_NAME (so each corpus repo keeps its own
+# identity) but KEEPS ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN so the scanner can mint
+# its OIDC token for the real LLM call. Uploads go to a local cache dir
+# (CARRICK_LOCAL_STORAGE_DIR), never the real cloud index.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "N repeated cross-repo scans (variance / mean±sd sample size)"
+        required: false
+        default: "5"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  eval-xrepo:
+    name: Cross-repo extraction quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            src/sidecar/package-lock.json
+
+      - name: Build type sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
+      - name: Install corpus dependencies
+        run: |
+          for repo in orders-monorepo payments-svc web-frontend; do
+            if [ -f "tests/fixtures/xrepo-corpus-1/$repo/package.json" ]; then
+              (cd "tests/fixtures/xrepo-corpus-1/$repo" && npm install)
+            fi
+          done
+
+      - name: Build scanner (release)
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+        run: cargo build --release
+
+      - name: Run cross-repo live scorer
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+          CARRICK_EVAL_LIVE: "1"
+          CARRICK_EVAL_RUNS: ${{ inputs.runs }}
+        run: |
+          cargo test --release --test eval_xrepo -- \
+            --ignored xrepo_live_scorer --test-threads=1 --nocapture
+
+      # Push the run's record to the durable Axiom history (carrick-cloud
+      # eval-ingest). The scanner mints its own OIDC token internally and can't
+      # share it, so this step mints one for the same audience the cloud expects.
+      # Non-blocking: a failed ingest must never red the eval — the monitor's
+      # value is the printed report + the artifact below.
+      - name: Push eval records to cloud history
+        if: always()
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+        run: |
+          set -uo pipefail
+          files=$(ls target/eval-runs/xrepo-run-*.jsonl 2>/dev/null || true)
+          if [ -z "$files" ]; then echo "no eval records to push"; exit 0; fi
+          oidc=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fapi.carrick.tools" \
+            | jq -r '.value')
+          if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+            echo "could not mint OIDC token; skipping push"; exit 0
+          fi
+          for f in $files; do
+            code=$(curl -sS -o /tmp/ingest_resp.json -w '%{http_code}' -X POST \
+              -H "X-Carrick-OIDC: ${oidc}" \
+              -H "Content-Type: application/x-ndjson" \
+              --data-binary "@${f}" \
+              "${CARRICK_API_ENDPOINT}/eval/ingest" || echo "000")
+            echo "POST ${f} -> HTTP ${code}"
+            cat /tmp/ingest_resp.json 2>/dev/null || true
+            echo
+          done
+
+      - name: Upload eval run records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-xrepo-runs-jsonl
+          path: |
+            target/eval-runs/xrepo-run-*.jsonl
+          if-no-files-found: warn
