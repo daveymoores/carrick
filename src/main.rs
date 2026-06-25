@@ -6,6 +6,7 @@ mod call_site_extractor;
 mod cloud_storage;
 mod config;
 mod engine;
+mod env_alias;
 mod eval_output;
 mod extractor;
 mod file_based_router;
