@@ -53,10 +53,17 @@ impl LocalDirStorage {
         Ok(Self { cache_dir, isolate })
     }
 
-    /// Sanitize a repo name into a single-segment file stem so a repo id that
-    /// contains a path separator can't escape the cache dir.
-    fn cache_path(&self, repo_name: &str) -> PathBuf {
-        let safe: String = repo_name
+    /// Sanitize a `(repo, service)` pair into a single-segment file stem. The
+    /// service is part of the key so a multi-service repo writes one file per
+    /// service instead of clobbering itself down to a single repo file; the
+    /// sanitisation also stops a repo/service id containing a path separator
+    /// from escaping the cache dir.
+    fn cache_path(&self, repo_name: &str, service_name: Option<&str>) -> PathBuf {
+        let key = match service_name {
+            Some(svc) if !svc.is_empty() => format!("{repo_name}__{svc}"),
+            _ => repo_name.to_string(),
+        };
+        let safe: String = key
             .chars()
             .map(|c| if c == '/' || c == '\\' { '_' } else { c })
             .collect();
@@ -67,7 +74,7 @@ impl LocalDirStorage {
 #[async_trait]
 impl CloudStorage for LocalDirStorage {
     async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
-        let path = self.cache_path(&data.repo_name);
+        let path = self.cache_path(&data.repo_name, data.service_name.as_deref());
         debug!(
             "LOCAL: Uploading repo data for {} (service: {:?}) -> {}",
             data.repo_name,
@@ -82,8 +89,9 @@ impl CloudStorage for LocalDirStorage {
         Ok(())
     }
 
-    // Cache entries are keyed per file (one JSON per repo id), so multiple
-    // services upload without clobbering — same property as MockStorage.
+    // Cache files are keyed by (repo, service), so each service of a
+    // multi-service repo persists to its own file without clobbering — same
+    // property as MockStorage.
     fn supports_multi_service(&self) -> bool {
         true
     }
@@ -168,5 +176,34 @@ impl CloudStorage for LocalDirStorage {
             repo, pr_number
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_service_cache_paths_do_not_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDirStorage::new(dir.path().to_path_buf(), false).unwrap();
+
+        // Two services in the SAME repo must land in distinct files (the bug:
+        // keying by repo_name alone clobbered orders-pkg with gateway).
+        let orders = store.cache_path("orders-monorepo", Some("orders-pkg"));
+        let gateway = store.cache_path("orders-monorepo", Some("gateway"));
+        assert_ne!(orders, gateway);
+
+        // A single-service repo (no service name) keeps the bare repo file name.
+        assert_eq!(
+            store.cache_path("payments-svc", None),
+            dir.path().join("payments-svc.json")
+        );
+
+        // Path separators in either component are neutralised (no dir escape).
+        assert_eq!(
+            store.cache_path("a/b", Some("c\\d")),
+            dir.path().join("a_b__c_d.json")
+        );
     }
 }

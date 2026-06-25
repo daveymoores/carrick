@@ -180,9 +180,10 @@ fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path) -> (EvalProjection, String
     assert!(
         !stderr.contains("Skipping type checking"),
         "ts_check/ was not found, so cross-repo type checking was silently \
-         skipped — compat data would be absent, not 'all compatible'. Build the \
-         sidecar (cd src/sidecar && npm ci && npm run build) so ts_check/ \
-         resolves.\n{stderr}"
+         skipped — compat data would be absent, not 'all compatible'. \
+         discover_ts_check_path() resolves ts_check/run-type-checking.ts; \
+         ensure the ts_check/ dir is present at the repo root (it ships with \
+         the checkout).\n{stderr}"
     );
 
     let stdout = String::from_utf8(output.stdout).expect("Phase B stdout was not UTF-8");
