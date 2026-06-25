@@ -72,6 +72,15 @@ fn should_upload_data() -> bool {
         return false;
     }
 
+    // LocalDirStorage (the offline cross-repo eval harness, Phase A) writes
+    // CloudRepoData to a local cache dir, never the real cloud — so the
+    // PR/branch anti-pollution guards below do not apply. Without this, a CI
+    // run (GITHUB_EVENT_NAME=pull_request) skips the upload and Phase A
+    // persists nothing. Phase B sets CARRICK_OUTPUT_JSON and returns above.
+    if env::var("CARRICK_LOCAL_STORAGE_DIR").is_ok() {
+        return true;
+    }
+
     // Check if we're in a pull request
     if let Ok(event_name) = env::var("GITHUB_EVENT_NAME")
         && event_name == "pull_request"

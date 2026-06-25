@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "http://localhost:3000/api/users",
+      "method": "GET",
+      "pattern_matched": "axios.get(",
+      "call_expression_text": "axios.get('http://localhost:3000/api/users')",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": "axios"
+    },
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "target": "http://localhost:3001/api/products",
+      "method": "GET",
+      "pattern_matched": "axios.get(",
+      "call_expression_text": "axios.get('http://localhost:3001/api/products')",
+      "call_expression_line": 10,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": "axios"
+    }
+  ]
+}
