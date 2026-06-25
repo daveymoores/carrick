@@ -447,29 +447,70 @@ impl SwcScanner {
     }
 }
 
-/// Walks every object literal collecting deterministic route descriptors
-/// (`{ method, path, handler }` with literal method + path). Shares the shape
-/// guard with the recall-boost candidate via [`CandidateVisitor::route_descriptor`].
+/// Collects deterministic route descriptors (`{ method, path, handler }` with
+/// literal method + path) for the no-LLM emission path (#234). The shape guard
+/// is shared with the recall-boost candidate via
+/// [`CandidateVisitor::route_descriptor`], but the deterministic gate is
+/// strictly narrower (#241): a descriptor is emitted only when it is a *direct
+/// element of an array literal* (a routes registry, not a standalone config
+/// object) and its path is *route-shaped* (leading `/` or an http(s) URL, not a
+/// bare token like `some-message`). Anything failing this gate is left for the
+/// LLM extraction path; only genuine route registries are authoritative.
 struct RouteDescriptorVisitor {
     source_map: Lrc<SourceMap>,
     endpoints: Vec<RouteDescriptorEndpoint>,
 }
 
+impl RouteDescriptorVisitor {
+    /// A path is route-shaped when it is an absolute path (`/widgets`) or an
+    /// http(s) URL. This rejects bare tokens (`some-message`), RPC method names,
+    /// and other non-route strings that happen to sit under a `path` key.
+    fn is_route_shaped_path(path: &str) -> bool {
+        let trimmed = path.trim();
+        trimmed.starts_with('/')
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+    }
+
+    /// Emit a deterministic endpoint for `node` when it carries a literal
+    /// method + a route-shaped literal path. Used only for object literals that
+    /// are direct elements of an array literal (the registry context, #241).
+    fn try_emit(&mut self, node: &ObjectLit) {
+        let Some(descriptor) = CandidateVisitor::route_descriptor(node) else {
+            return;
+        };
+        // The deterministic path requires literal method *and* path; a
+        // descriptor missing either keeps only its recall-boost candidate.
+        let (Some(method), Some(path)) = (descriptor.method, descriptor.path) else {
+            return;
+        };
+        // #241: reject non-route paths (bare tokens, RPC method names) so a
+        // config object that merely carries `method`/`path` keys is not
+        // fabricated as an endpoint.
+        if !Self::is_route_shaped_path(&path) {
+            return;
+        }
+        let span = node.span;
+        self.endpoints.push(RouteDescriptorEndpoint {
+            method,
+            path,
+            handler: descriptor.handler,
+            line_number: self.source_map.lookup_char_pos(span.lo).line,
+            span_start: span.lo.0,
+            span_end: span.hi.0,
+        });
+    }
+}
+
 impl Visit for RouteDescriptorVisitor {
-    fn visit_object_lit(&mut self, node: &ObjectLit) {
-        if let Some(descriptor) = CandidateVisitor::route_descriptor(node) {
-            // The deterministic path requires literal method *and* path; a
-            // descriptor missing either keeps only its recall-boost candidate.
-            if let (Some(method), Some(path)) = (descriptor.method, descriptor.path) {
-                let span = node.span;
-                self.endpoints.push(RouteDescriptorEndpoint {
-                    method,
-                    path,
-                    handler: descriptor.handler,
-                    line_number: self.source_map.lookup_char_pos(span.lo).line,
-                    span_start: span.lo.0,
-                    span_end: span.hi.0,
-                });
+    fn visit_array_lit(&mut self, node: &ArrayLit) {
+        // #241: only object literals that are *direct elements* of an array
+        // (a routes registry) qualify for deterministic emission. A standalone
+        // config object — e.g. an axios `{ method, path, headers }` options bag
+        // — never reaches `try_emit`, so it falls through to the LLM path.
+        for element in node.elems.iter().flatten() {
+            if let Expr::Object(obj) = &*element.expr {
+                self.try_emit(obj);
             }
         }
         node.visit_children_with(self);
@@ -1486,6 +1527,74 @@ export { routes };
         assert_eq!(endpoints[0].method, "POST");
         assert_eq!(endpoints[0].path, "/widgets");
         assert_eq!(endpoints[0].handler, None);
+    }
+
+    #[test]
+    fn standalone_two_key_config_object_is_not_a_deterministic_endpoint() {
+        // #241 (the real gap): a *standalone* config object that happens to carry
+        // string-literal `method` + `path` keys — an axios-style request spec — is
+        // NOT a route registry. It must not be emitted as a deterministic endpoint
+        // (which would also suppress the LLM that classifies the file correctly).
+        // The one-key case was already covered; this is the two-key misfire.
+        let axios_config = r#"
+const response = await client({
+  method: 'GET',
+  path: '/data',
+  headers: { 'x-api-key': key },
+});
+"#;
+        let scanner = SwcScanner::new();
+        let endpoints =
+            scanner.route_descriptor_endpoints(&PathBuf::from("client.ts"), axios_config);
+        assert!(
+            endpoints.is_empty(),
+            "standalone {{ method, path, headers }} config must not be a route descriptor, got {endpoints:?}"
+        );
+
+        // The recall-boost candidate still fires (the object has the shape), so
+        // `http_candidates` stays non-empty and the file is NOT suppressed: it
+        // falls through to the LLM extraction path, which is the whole point.
+        let result = scan_test_content(axios_config);
+        assert!(
+            !result.candidates.is_empty(),
+            "the LLM fall-through candidate must survive so the file is not skipped"
+        );
+    }
+
+    #[test]
+    fn registry_descriptor_with_non_route_path_is_not_a_deterministic_endpoint() {
+        // #241: even inside an array, a `path` that is a bare token (`some-message`)
+        // — an RPC channel name, message key, etc. — is not route-shaped, so it must
+        // not be fabricated as a `GET some-message` endpoint. It falls through.
+        let content = r#"
+const handlers = [
+  { method: 'GET', path: 'some-message', handler: onMessage },
+];
+export { handlers };
+"#;
+        let scanner = SwcScanner::new();
+        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("handlers.ts"), content);
+        assert!(
+            endpoints.is_empty(),
+            "a non-route path (bare token) must not yield a deterministic endpoint, got {endpoints:?}"
+        );
+    }
+
+    #[test]
+    fn registry_descriptor_with_url_path_is_a_deterministic_endpoint() {
+        // #241: an http(s) URL is route-shaped and qualifies inside a registry.
+        let content = r#"
+const routes = [
+  { method: 'POST', path: 'https://api.example.com/webhook', handler: onHook },
+];
+export { routes };
+"#;
+        let scanner = SwcScanner::new();
+        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), content);
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].method, "POST");
+        assert_eq!(endpoints[0].path, "https://api.example.com/webhook");
+        assert_eq!(endpoints[0].handler.as_deref(), Some("onHook"));
     }
 
     #[test]
