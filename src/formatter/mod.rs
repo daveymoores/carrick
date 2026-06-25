@@ -1075,6 +1075,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1108,6 +1109,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1139,6 +1141,7 @@ mod tests {
                 "@apollo/client".to_string(),
             ],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("GraphQL detected"));
@@ -1164,6 +1167,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec!["@apollo/client".to_string()],
             graphql_operations_indexed: true,
+            cross_repo_matches: vec![],
         };
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(!output.contains("GraphQL detected"));
@@ -1186,6 +1190,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(!output.contains("GraphQL detected"));
@@ -1209,6 +1214,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1235,6 +1241,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let formatted = FormattedOutput::new(result, topology_baseline(), None);
@@ -1271,6 +1278,7 @@ mod tests {
             ],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1297,6 +1305,7 @@ mod tests {
             verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1324,6 +1333,7 @@ mod tests {
             verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1433,6 +1443,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         };
 
         let output = format_analysis_results(result, &topology_first_repo(), None);
@@ -1492,6 +1503,7 @@ mod tests {
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
         }
     }
 

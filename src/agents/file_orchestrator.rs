@@ -1749,6 +1749,7 @@ impl FileOrchestrator {
                     client: data_call.pattern_matched.clone(),
                     file_location: format!("{}:{}", file_path, data_call.line_number),
                     call_kind: data_call.call_kind,
+                    repo_name: None,
                 });
             }
         }

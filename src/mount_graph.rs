@@ -93,6 +93,11 @@ pub struct DataFetchingCall {
     /// prompt emits it. Drives compat gating in a later stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_kind: Option<crate::operation::CallKind>,
+    /// Owning repo, tagged during cross-repo merge (`merge_from_repos`) so a
+    /// matched consumer can be attributed to its repo for cross-repo edges.
+    /// `None` until merge (single-repo graphs don't carry it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
 }
 
 /// The complete mount and endpoint graph
@@ -316,6 +321,7 @@ impl MountGraph {
             client,
             file_location: site.call_site.location.clone(),
             call_kind: None,
+            repo_name: None,
         })
     }
 
@@ -672,11 +678,16 @@ impl MountGraph {
                     }
                 }
 
-                // Merge data calls (deduplicate by method + target_url + file_location)
+                // Merge data calls (deduplicate by method + target_url + file_location).
+                // Tag each consumer with its owning repo (symmetric with the
+                // endpoint tagging above) so a matched call can be attributed to
+                // its repo for cross-repo edge capture.
                 for call in &mount_graph.data_calls {
                     let key = format!("{}:{}:{}", call.method, call.target_url, call.file_location);
                     if seen_data_calls.insert(key) {
-                        merged.data_calls.push(call.clone());
+                        let mut tagged_call = call.clone();
+                        tagged_call.repo_name = Some(repo_data.repo_name.clone());
+                        merged.data_calls.push(tagged_call);
                     }
                 }
 
