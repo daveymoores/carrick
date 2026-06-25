@@ -1,0 +1,12 @@
+{
+  "name": "@orders-monorepo/orders-pkg",
+  "version": "1.0.0",
+  "main": "src/index.ts",
+  "dependencies": {
+    "fastify": "^4.26.0",
+    "zod": "^3.22.0"
+  },
+  "scripts": {
+    "build": "tsc"
+  }
+}

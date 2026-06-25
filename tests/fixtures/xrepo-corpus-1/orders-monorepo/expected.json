@@ -1,0 +1,55 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/orders/:id",
+      "owner": "ordersRouter",
+      "primary_type_symbol": "Order",
+      "resolved_type": "{ id: number; amountCents: number; currency: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/status",
+      "owner": "statusRouter",
+      "primary_type_symbol": "StatusResponse",
+      "resolved_type": "{ status: string; version: string; uptime: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/users/:id",
+      "owner": "findOne",
+      "primary_type_symbol": "UserSummary",
+      "resolved_type": "{ id: string; displayName: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/gateway/health",
+      "owner": "healthCheckHandler",
+      "primary_type_symbol": "HealthResponse",
+      "resolved_type": "{ ok: boolean; ts: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "calls": [],
+  "_must_not_emit": [
+    {
+      "kind": "endpoint",
+      "method": "*",
+      "path": "/__mcp__/lookup-order",
+      "evidence": "MCP server.tool('lookup-order', ...) registration in mcp-tools.ts — not an HTTP endpoint"
+    },
+    {
+      "kind": "endpoint",
+      "method": "*",
+      "path": "/__mcp__/cancel-order",
+      "evidence": "MCP server.tool('cancel-order', ...) registration in mcp-tools.ts — not an HTTP endpoint"
+    }
+  ]
+}

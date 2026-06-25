@@ -1,0 +1,27 @@
+{
+  "endpoints": [],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/orders/:param",
+      "host_contains": "NEXT_PUBLIC_ORDERS_URL",
+      "path_contains": "/orders/",
+      "import_source": null,
+      "primary_type_symbol": "OrderView",
+      "resolved_type": "{ id: string; currency: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/payments",
+      "host_contains": "NEXT_PUBLIC_PAYMENTS_URL",
+      "path_contains": "/payments",
+      "import_source": null,
+      "primary_type_symbol": "Payment",
+      "resolved_type": "{ id: string; orderId: number; amountCents: number; status: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ]
+}
