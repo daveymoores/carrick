@@ -374,6 +374,23 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         None
     };
 
+    // Collect the merged type manifest before `all_repo_data` /
+    // `current_services_data` are moved into the analyzer. The eval projection
+    // joins these to each op (keyed by OperationKey) for the type-resolution
+    // metrics; nothing else reads it. Cheap clone, only materialised for the
+    // eval path (it's just a flatten of each repo's already-built manifest).
+    let eval_type_manifest: Vec<TypeManifestEntry> = if std::env::var("CARRICK_OUTPUT_JSON").is_ok()
+    {
+        all_repo_data
+            .iter()
+            .chain(current_services_data.iter())
+            .filter_map(|repo| repo.type_manifest.as_ref())
+            .flat_map(|entries| entries.iter().cloned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
         build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await?;
@@ -386,7 +403,8 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // by the offline scorer (Slice 1 of the evals plan). Deliberately terminal —
     // an eval run wants only the JSON, no upload or comment side effects.
     if std::env::var("CARRICK_OUTPUT_JSON").is_ok() {
-        let projection = crate::eval_output::EvalProjection::from_results(&results);
+        let projection =
+            crate::eval_output::EvalProjection::from_results(&results, &eval_type_manifest);
         println!("{}", serde_json::to_string_pretty(&projection)?);
         return Ok(());
     }
@@ -2475,6 +2493,7 @@ mod tests {
                 client: "fetch".to_string(),
                 file_location: "src/orders.ts:42".to_string(),
                 call_kind: None,
+                repo_name: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -2482,6 +2501,7 @@ mod tests {
                 client: "fetch".to_string(),
                 file_location: "src/notify.ts:7".to_string(),
                 call_kind: None,
+                repo_name: None,
             },
         ];
 

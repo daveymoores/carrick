@@ -33,12 +33,14 @@ static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
 // Type aliases to reduce complexity
 type RouteFieldMap = HashMap<OperationKey, Json>;
 /// Result of `analyze_matches_with_mount_graph`:
-///   `(call_issues, endpoint_issues, env_var_calls, verified_endpoints)`.
+///   `(call_issues, endpoint_issues, env_var_calls, verified_endpoints,
+///     cross_repo_matches)`.
 type MountGraphMatches = (
     Vec<String>,
     Vec<OrphanedEndpoint>,
     Vec<String>,
     Vec<(String, String)>,
+    Vec<CrossRepoMatch>,
 );
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -71,6 +73,33 @@ pub struct OrphanedEndpoint {
     pub method: String,
     pub path: String,
     pub service: Option<String>,
+}
+
+/// A structured producer→consumer edge captured at the matching site. This is
+/// the load-bearing cross-repo signal the eval scorer reads (contract §2): an
+/// endpoint in one repo matched by an outbound call in another (or the same)
+/// repo, with the type-compatibility verdict for that producer endpoint.
+///
+/// `type_compatible == None` is deliberate and load-bearing: it means compat
+/// was never evaluated for this edge (e.g. `ts_check_dir` was absent, so type
+/// checking did not run), as distinct from `Some(true)` "evaluated, compatible".
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CrossRepoMatch {
+    /// Repo id of the producer endpoint (service_name ?? repo_name).
+    pub producer_repo: String,
+    /// `OperationKey::canonical()` of the producer endpoint (mount-resolved path).
+    pub producer_key: String,
+    /// Repo id of the consumer call.
+    pub consumer_repo: String,
+    /// `OperationKey::canonical()` of the consumer call (URL-normalized path).
+    pub consumer_key: String,
+    /// Matcher confidence in `[0, 1]`. `1.0` for an exact normalized-key match
+    /// (the only kind captured today; there is no finer score yet).
+    pub match_score: f64,
+    /// `None` = compat NOT evaluated for this edge; `Some(b)` = evaluated.
+    pub type_compatible: Option<bool>,
+    /// `Some(..)` iff `type_compatible == Some(false)`; human-readable reason.
+    pub mismatch_reason: Option<String>,
 }
 
 pub struct ApiIssues {
@@ -131,6 +160,10 @@ pub struct ApiAnalysisResult {
     /// Whether any GraphQL operations (schema fields or documents) made it
     /// into the index. Gates the "no GraphQL extracted" banner.
     pub graphql_operations_indexed: bool,
+    /// Structured producer→consumer edges captured at the matching site, with
+    /// per-edge type-compat verdicts. Populated by `get_results`; consumed by
+    /// the eval projection (it has no effect on the human Markdown report).
+    pub cross_repo_matches: Vec<CrossRepoMatch>,
 }
 
 /// Return the subset of `data_fetchers` that are GraphQL libraries.
@@ -154,6 +187,35 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+/// Parse a ts_check compat `endpoint` string back into `(METHOD, path)`. The
+/// string is built as `"<METHOD> <path> (<request|response>)"` by ts_check's
+/// type-checker, so split off the leading method and the trailing
+/// `" (type_kind)"` suffix. Returns `None` for an unrecognized shape.
+fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
+    let (method, rest) = endpoint.split_once(' ')?;
+    // Drop the trailing " (request)" / " (response)" annotation if present.
+    let path = match rest.rfind(" (") {
+        Some(idx) if rest.ends_with(')') => &rest[..idx],
+        _ => rest,
+    };
+    if method.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((method.to_uppercase(), path.to_string()))
+}
+
+/// Recover `(METHOD, path)` from a canonical HTTP producer key
+/// (`"http|METHOD|path"`). Returns `None` for non-HTTP keys.
+fn parse_producer_key(key: &str) -> Option<(String, String)> {
+    let mut parts = key.splitn(3, '|');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("http"), Some(method), Some(path)) if !method.is_empty() && !path.is_empty() => {
+            Some((method.to_uppercase(), path.to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// Accept only values whose *shape* is an extractable outgoing-call route, as
@@ -959,14 +1021,39 @@ impl Analyzer {
     }
 
     /// Framework-agnostic analysis using mount graph.
-    /// Returns `(call_issues, endpoint_issues, env_var_calls, verified_endpoints)`
-    /// — the fourth element captures (method, path) of every endpoint that
-    /// at least one consumer call successfully matched, so the formatter can
-    /// surface them as positive signal in the PR comment.
+    /// Returns `(call_issues, endpoint_issues, env_var_calls, verified_endpoints,
+    /// cross_repo_matches)` — the fourth element captures (method, path) of every
+    /// endpoint that at least one consumer call successfully matched (positive
+    /// signal for the PR comment), and the fifth captures the structured
+    /// producer→consumer edges (consumed only by the eval projection).
     fn analyze_matches_with_mount_graph(&self, mount_graph: &MountGraph) -> MountGraphMatches {
         let mut call_issues = Vec::new();
         let mut endpoint_issues = Vec::new();
         let mut env_var_calls = Vec::new();
+        // Structured producer→consumer edges for the eval projection.
+        let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
+
+        // Consumer repo lookup: a call's `(METHOD, target_url, file_location)`
+        // → owning repo. `merge_from_repos` tags each merged data call with its
+        // repo; `self.calls` carry only `(key, file_path)`, so this re-attaches
+        // the repo identity at the matching site. Keyed on the full triple
+        // because two calls in one file can share a target.
+        let consumer_repo_by_call: HashMap<(String, String, String), String> = mount_graph
+            .get_data_calls()
+            .iter()
+            .filter_map(|c| {
+                c.repo_name.as_ref().map(|repo| {
+                    (
+                        (
+                            c.method.to_uppercase(),
+                            c.target_url.clone(),
+                            c.file_location.clone(),
+                        ),
+                        repo.clone(),
+                    )
+                })
+            })
+            .collect();
 
         // Track which endpoints have been matched
         let mut matched_endpoints: HashSet<String> = HashSet::new();
@@ -1035,6 +1122,16 @@ impl Analyzer {
                                 for endpoint in matching_endpoints {
                                     let key = format!("{}:{}", endpoint.method, endpoint.full_path);
                                     matched_endpoints.insert(key);
+                                    if let Some(edge) = Self::build_cross_repo_match(
+                                        call,
+                                        method,
+                                        target,
+                                        &normalized_path,
+                                        endpoint,
+                                        &consumer_repo_by_call,
+                                    ) {
+                                        cross_repo_matches.push(edge);
+                                    }
                                 }
                             }
                         }
@@ -1075,9 +1172,20 @@ impl Analyzer {
                         ));
                     } else {
                         // Mark endpoints as matched
+                        let normalized_path = normalizer.normalize(target).path;
                         for endpoint in matching_endpoints {
                             let key = format!("{}:{}", endpoint.method, endpoint.full_path);
                             matched_endpoints.insert(key);
+                            if let Some(edge) = Self::build_cross_repo_match(
+                                call,
+                                method,
+                                target,
+                                &normalized_path,
+                                endpoint,
+                                &consumer_repo_by_call,
+                            ) {
+                                cross_repo_matches.push(edge);
+                            }
                         }
                     }
                 }
@@ -1107,7 +1215,79 @@ impl Analyzer {
         verified.sort();
         verified.dedup();
 
-        (call_issues, endpoint_issues, env_var_calls, verified)
+        // Deterministic order for the projection (mirrors verified.sort()): the
+        // matcher iterates calls/endpoints in a non-deterministic order, so sort
+        // and dedup the captured edges on their identity tuple.
+        cross_repo_matches.sort_by(|a, b| {
+            (
+                &a.producer_repo,
+                &a.producer_key,
+                &a.consumer_repo,
+                &a.consumer_key,
+            )
+                .cmp(&(
+                    &b.producer_repo,
+                    &b.producer_key,
+                    &b.consumer_repo,
+                    &b.consumer_key,
+                ))
+        });
+        cross_repo_matches.dedup_by(|a, b| {
+            a.producer_repo == b.producer_repo
+                && a.producer_key == b.producer_key
+                && a.consumer_repo == b.consumer_repo
+                && a.consumer_key == b.consumer_key
+        });
+
+        (
+            call_issues,
+            endpoint_issues,
+            env_var_calls,
+            verified,
+            cross_repo_matches,
+        )
+    }
+
+    /// Build a [`CrossRepoMatch`] from a matched consumer call + producer
+    /// endpoint. Returns `None` only when the consumer's repo cannot be
+    /// attributed (no `repo_name` tag in the merged graph for this call) — an
+    /// edge without both repo ids is not useful to the scorer.
+    ///
+    /// `match_score` is `1.0`: every edge captured here is an exact
+    /// normalized-key match (there is no finer scorer yet). `type_compatible`
+    /// is left `None` here; `get_results` overlays the per-endpoint compat
+    /// verdict after type checking has (or has not) run.
+    fn build_cross_repo_match(
+        call: &ApiEndpointDetails,
+        method: &str,
+        target: &str,
+        normalized_consumer_path: &str,
+        endpoint: &crate::mount_graph::ResolvedEndpoint,
+        consumer_repo_by_call: &HashMap<(String, String, String), String>,
+    ) -> Option<CrossRepoMatch> {
+        let producer_repo = endpoint
+            .service_name
+            .clone()
+            .or_else(|| endpoint.repo_name.clone())?;
+        let lookup_key = (
+            method.to_uppercase(),
+            target.to_string(),
+            call.file_path.display().to_string(),
+        );
+        let consumer_repo = consumer_repo_by_call.get(&lookup_key).cloned()?;
+
+        let producer_key = OperationKey::http(&endpoint.method, endpoint.full_path.clone());
+        let consumer_key = OperationKey::http(method, normalized_consumer_path.to_string());
+
+        Some(CrossRepoMatch {
+            producer_repo,
+            producer_key: producer_key.canonical(),
+            consumer_repo,
+            consumer_key: consumer_key.canonical(),
+            match_score: 1.0,
+            type_compatible: None,
+            mismatch_reason: None,
+        })
     }
 
     /// Match consumers against producers of a protocol whose operations have
@@ -1374,8 +1554,13 @@ impl Analyzer {
         let mount_graph = self.mount_graph.as_ref()
             .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
 
-        let (mut call_issues, mut endpoint_issues, env_var_calls, mut verified_endpoints) =
-            self.analyze_matches_with_mount_graph(mount_graph);
+        let (
+            mut call_issues,
+            mut endpoint_issues,
+            env_var_calls,
+            mut verified_endpoints,
+            mut cross_repo_matches,
+        ) = self.analyze_matches_with_mount_graph(mount_graph);
         for (protocol, label) in [
             (crate::operation::Protocol::Graphql, "GraphQL"),
             (crate::operation::Protocol::Websocket, "Socket.IO"),
@@ -1392,6 +1577,17 @@ impl Analyzer {
         let mismatches = Vec::new();
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
+
+        // Overlay the per-producer-endpoint type-compat verdict onto the captured
+        // edges. The verdict is keyed by the producer's (METHOD, full_path) — the
+        // ts_check output collapses all consumers of a producer into one verdict,
+        // so every edge into a given producer shares that producer's verdict.
+        //
+        // `type_compatible` stays `None` when compat was not evaluated
+        // (`check_type_compatibility` returns `Err`: ts_check_dir absent, results
+        // file missing, or type checking failed). This `None` is load-bearing:
+        // the scorer must never read absent compat data as "compatible".
+        self.overlay_compat_verdicts(&mut cross_repo_matches);
 
         let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
         let graphql_operations_indexed = self
@@ -1436,6 +1632,64 @@ impl Analyzer {
             verified_endpoints,
             detected_graphql_libraries,
             graphql_operations_indexed,
+            cross_repo_matches,
+        }
+    }
+
+    /// Overlay the type-compatibility verdict onto each captured cross-repo
+    /// edge, keyed by the producer's `(METHOD, full_path)`.
+    ///
+    /// If `check_type_compatibility` returns `Err`, type checking did not run
+    /// (or failed) for this scan: every edge keeps `type_compatible: None`
+    /// (load-bearing — see [`CrossRepoMatch`]). On `Ok`, an edge whose producer
+    /// appears in the mismatch set gets `Some(false)` + the reason; otherwise
+    /// `Some(true)` (compat evaluated, no mismatch for that producer).
+    fn overlay_compat_verdicts(&self, matches: &mut [CrossRepoMatch]) {
+        let result = match self.check_type_compatibility() {
+            Ok(result) => result,
+            // Compat was not evaluated for this run — leave every edge `None`.
+            Err(_) => return,
+        };
+
+        // Map producer `(METHOD, path)` → mismatch reason, parsed from each
+        // mismatch's `endpoint` string (`"<METHOD> <path> (<request|response>)"`,
+        // built by ts_check's type-checker). Multiple type_kinds per producer
+        // collapse to the first reason seen — the edge only records that the
+        // producer is incompatible.
+        let mut incompatible: HashMap<(String, String), String> = HashMap::new();
+        if let Some(mismatch_list) = result.get("mismatches").and_then(|m| m.as_array()) {
+            for mismatch in mismatch_list {
+                let Some(endpoint) = mismatch.get("endpoint").and_then(|e| e.as_str()) else {
+                    continue;
+                };
+                let Some((method, path)) = parse_compat_endpoint(endpoint) else {
+                    continue;
+                };
+                let reason = mismatch
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("producer and consumer types are incompatible")
+                    .to_string();
+                incompatible.entry((method, path)).or_insert(reason);
+            }
+        }
+
+        for edge in matches.iter_mut() {
+            // producer_key is `http|METHOD|path`; recover (METHOD, path).
+            let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
+                edge.type_compatible = Some(true);
+                continue;
+            };
+            match incompatible.get(&(method, path)) {
+                Some(reason) => {
+                    edge.type_compatible = Some(false);
+                    edge.mismatch_reason = Some(reason.clone());
+                }
+                None => {
+                    edge.type_compatible = Some(true);
+                }
+            }
         }
     }
 
@@ -2150,7 +2404,7 @@ mod tests {
         ));
 
         let mount_graph = MountGraph::new();
-        let (call_issues, endpoint_issues, env_var_calls, verified) =
+        let (call_issues, endpoint_issues, env_var_calls, verified, _cross_repo_matches) =
             analyzer.analyze_matches_with_mount_graph(&mount_graph);
         assert!(call_issues.is_empty());
         assert!(endpoint_issues.is_empty());
@@ -2227,7 +2481,7 @@ mod tests {
         let mount_graph = MountGraph::new(); // Empty graph
 
         // Run analysis
-        let (call_issues, _, env_var_calls, _verified) =
+        let (call_issues, _, env_var_calls, _verified, _cross_repo_matches) =
             analyzer.analyze_matches_with_mount_graph(&mount_graph);
 
         // Check results

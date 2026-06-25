@@ -9,7 +9,13 @@
       "request_type": null,
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/routes/users.ts",
-      "line": 6
+      "line": 6,
+      "type_alias": "Endpoint_a9cce7d0d8d0d9e6_Response",
+      "type_state": "Explicit",
+      "resolved_definition": "export interface Endpoint_a9cce7d0d8d0d9e6_Response {\n  id: number;\n  name: string;\n  email: string;\n}",
+      "expanded_definition": "Endpoint_a9cce7d0d8d0d9e6_Response",
+      "is_explicit": true,
+      "primary_type_symbol": "Endpoint_a9cce7d0d8d0d9e6_Response"
     },
     {
       "key": "http|GET|/export",
@@ -20,7 +26,11 @@
       "request_type": null,
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/reports.ts",
-      "line": 9
+      "line": 9,
+      "type_alias": "Endpoint_1732d2237f37ec97_Response",
+      "type_state": "Unknown",
+      "is_explicit": false,
+      "primary_type_symbol": "Endpoint_1732d2237f37ec97_Response"
     },
     {
       "key": "http|GET|/health",
@@ -31,7 +41,13 @@
       "request_type": null,
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/index.ts",
-      "line": 8
+      "line": 8,
+      "type_alias": "Endpoint_2a10f0dfd8c3cde7_Response",
+      "type_state": "Implicit",
+      "resolved_definition": "export type Endpoint_2a10f0dfd8c3cde7_Response = { status: string; };",
+      "expanded_definition": "{ status: string; }",
+      "is_explicit": false,
+      "primary_type_symbol": "Endpoint_2a10f0dfd8c3cde7_Response"
     },
     {
       "key": "http|GET|/summary",
@@ -42,7 +58,13 @@
       "request_type": null,
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/reports.ts",
-      "line": 5
+      "line": 5,
+      "type_alias": "Endpoint_97b757a2c4112fad_Response",
+      "type_state": "Implicit",
+      "resolved_definition": "export type Endpoint_97b757a2c4112fad_Response = { total: number; };",
+      "expanded_definition": "{ total: number; }",
+      "is_explicit": false,
+      "primary_type_symbol": "Endpoint_97b757a2c4112fad_Response"
     },
     {
       "key": "http|POST|/api/users",
@@ -53,7 +75,13 @@
       "request_type": null,
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/routes/users.ts",
-      "line": 11
+      "line": 11,
+      "type_alias": "Endpoint_7624e36e7268b452_Request",
+      "type_state": "Implicit",
+      "resolved_definition": "export type Endpoint_7624e36e7268b452_Request = { name: string; email: string; };",
+      "expanded_definition": "{ name: string; email: string; }",
+      "is_explicit": false,
+      "primary_type_symbol": "Endpoint_7624e36e7268b452_Request"
     }
   ],
   "calls": [
@@ -67,6 +95,33 @@
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/client.ts",
       "line": 4
+    }
+  ],
+  "cross_repo_matches": [],
+  "dependency_conflicts": [
+    {
+      "package": "express",
+      "versions": [
+        "4.18.0",
+        "5.0.0"
+      ],
+      "severity": "critical"
+    },
+    {
+      "package": "lodash",
+      "versions": [
+        "4.17.21",
+        "4.17.22"
+      ],
+      "severity": "info"
+    },
+    {
+      "package": "react",
+      "versions": [
+        "18.2.0",
+        "18.3.0"
+      ],
+      "severity": "warning"
     }
   ]
 }
