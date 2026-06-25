@@ -89,6 +89,30 @@ fn cassette_dir(repo: &Path) -> PathBuf {
     repo.join("__llm__")
 }
 
+/// Strip the ambient CI / GitHub-Actions context so the eval subprocess runs
+/// deterministically wherever the harness is invoked. In CI these are set on
+/// the runner and would otherwise leak in: `GITHUB_REPOSITORY` makes repo
+/// identity resolve to the outer repo ("carrick") instead of the scanned corpus
+/// dir — clobbering every cached repo down to one file — and the PR/branch vars
+/// flip `should_upload_data()` off.
+fn strip_ci_env(cmd: &mut Command) -> &mut Command {
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_REF",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_SHA",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "GITHUB_WORKSPACE",
+        "CI",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Phase A: scan one repo in isolation and persist its `CloudRepoData` to the
 /// shared cache dir. `CARRICK_LOCAL_STORAGE_ISOLATE=1` forces
 /// `download_all_repo_data` to return empty, so neither the real cloud nor a
@@ -104,8 +128,8 @@ fn phase_a(bin: &Path, repo: &Path, cache_dir: &Path) {
         repo.display()
     );
 
-    let output = Command::new(bin)
-        .arg(repo)
+    let mut cmd = Command::new(bin);
+    cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_MOCK_ALL", "1")
@@ -113,11 +137,12 @@ fn phase_a(bin: &Path, repo: &Path, cache_dir: &Path) {
             "CARRICK_MOCK_FIXTURE_DIR",
             format!("{}/", cassettes.display()),
         )
-        // Keep upload enabled: no GITHUB_* context + no CARRICK_OUTPUT_JSON means
-        // should_upload_data() defaults to true (local mode).
-        .env_remove("GITHUB_REF")
-        .env_remove("GITHUB_EVENT_NAME")
-        .env_remove("CARRICK_OUTPUT_JSON")
+        // CARRICK_OUTPUT_JSON unset so should_upload_data() keeps the upload on;
+        // strip_ci_env (below) ties repo identity to the scanned dir, not the
+        // runner's GITHUB_REPOSITORY (which would name every corpus repo "carrick").
+        .env_remove("CARRICK_OUTPUT_JSON");
+    strip_ci_env(&mut cmd);
+    let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn carrick for {}: {e}", repo.display()));
 
@@ -151,8 +176,8 @@ fn phase_a(bin: &Path, repo: &Path, cache_dir: &Path) {
 /// data). The harness asserts type checking was not silently skipped.
 fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path) -> (EvalProjection, String) {
     let cassettes = cassette_dir(repo);
-    let output = Command::new(bin)
-        .arg(repo)
+    let mut cmd = Command::new(bin);
+    cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
         // No CARRICK_LOCAL_STORAGE_ISOLATE: download returns all cached repos.
         .env("CARRICK_MOCK_ALL", "1")
@@ -161,9 +186,9 @@ fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path) -> (EvalProjection, String
             format!("{}/", cassettes.display()),
         )
         .env("CARRICK_OUTPUT_JSON", "1")
-        .env_remove("GITHUB_REF")
-        .env_remove("GITHUB_EVENT_NAME")
-        .env_remove("CARRICK_LOCAL_STORAGE_ISOLATE")
+        .env_remove("CARRICK_LOCAL_STORAGE_ISOLATE");
+    strip_ci_env(&mut cmd);
+    let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn carrick (Phase B): {e}"));
 
