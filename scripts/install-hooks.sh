@@ -37,6 +37,13 @@ cat > "$HOOKS_DIR/pre-commit" << 'EOF'
 
 set -euo pipefail  # Exit on error and fail pipelines
 
+# Isolate child processes (notably Rust tests that `git init` throwaway repos in
+# tempdirs) from the ambient GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE that git
+# sets for this hook. Without this a test's `git add .` targets THIS repo's
+# index, and inside a linked worktree it corrupts the worktree index mid-commit
+# (it produced bogus "delete the whole repo" trees during the eval work).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 echo "🪢 Carrick Pre-Commit Hook"
@@ -119,6 +126,7 @@ else
     # Clean up
     rm -f /tmp/carrick-test-output.txt
 
+    exit 1
 fi
 
 # Run ts_check tests
