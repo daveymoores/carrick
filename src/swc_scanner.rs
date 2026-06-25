@@ -112,6 +112,30 @@ pub struct ExportedHandler {
     pub span_end: u32,
 }
 
+/// A route declared as data in a registry array
+/// (`{ method: 'GET', path: '/health', handler: healthCheckHandler }`). The
+/// HTTP method, path, and handler owner are all structural facts — no call site
+/// the candidate scanner can see — so they are emitted as a deterministic
+/// endpoint instead of being routed through the LLM (#234). Only descriptors
+/// whose method *and* path are string literals are reported; dynamic-handler
+/// cases stay on the recall-boost candidate path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDescriptorEndpoint {
+    /// The HTTP method literal (`GET`, `POST`, …), verbatim from the object.
+    pub method: String,
+    /// The route path literal (`/gateway/health`), verbatim from the object.
+    pub path: String,
+    /// The handler identifier (`healthCheckHandler`) — the route's real owner.
+    /// `None` when the handler is absent or not a bare identifier.
+    pub handler: Option<String>,
+    /// 1-based line number of the descriptor object literal.
+    pub line_number: usize,
+    /// Start byte offset of the descriptor object literal.
+    pub span_start: u32,
+    /// End byte offset of the descriptor object literal.
+    pub span_end: u32,
+}
+
 /// Lightweight SWC-based scanner for detecting potential API patterns.
 ///
 /// This scanner looks for method call expressions that match common
@@ -361,12 +385,103 @@ impl SwcScanner {
 
         out
     }
+
+    /// Extract route-descriptor endpoints declared as data in a registry array
+    /// (`{ method: 'GET', path: '/health', handler: healthCheckHandler }`).
+    ///
+    /// This powers deterministic route-descriptor extraction (#234): the method,
+    /// path, and handler owner are all structural facts with no call site the
+    /// candidate scanner can see, and the file-analyzer prompt only matches
+    /// framework-call patterns — so the orchestrator builds the endpoint from
+    /// these facts directly, bypassing the LLM. Only descriptors whose method
+    /// *and* path are string literals are returned; the rest stay on the
+    /// recall-boost candidate path.
+    pub fn route_descriptor_endpoints(
+        &self,
+        file_path: &Path,
+        content: &str,
+    ) -> Vec<RouteDescriptorEndpoint> {
+        use swc_common::FileName;
+        use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
+
+        let syntax = match file_path.extension().and_then(|e| e.to_str()) {
+            Some("ts") => Syntax::Typescript(TsSyntax {
+                decorators: true,
+                ..Default::default()
+            }),
+            Some("tsx") => Syntax::Typescript(TsSyntax {
+                tsx: true,
+                decorators: true,
+                ..Default::default()
+            }),
+            Some("jsx") => Syntax::Es(EsSyntax {
+                jsx: true,
+                ..Default::default()
+            }),
+            _ => Syntax::Es(Default::default()),
+        };
+
+        let sm: Lrc<SourceMap> = Default::default();
+        let source_file = sm.new_source_file(
+            Lrc::new(FileName::Real(file_path.to_path_buf())),
+            content.to_string(),
+        );
+        let lexer = Lexer::new(
+            syntax,
+            Default::default(),
+            StringInput::from(&*source_file),
+            None,
+        );
+        let mut parser = Parser::new_from(lexer);
+        let module = match parser.parse_module() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut visitor = RouteDescriptorVisitor {
+            source_map: sm,
+            endpoints: Vec::new(),
+        };
+        module.visit_with(&mut visitor);
+        visitor.endpoints
+    }
+}
+
+/// Walks every object literal collecting deterministic route descriptors
+/// (`{ method, path, handler }` with literal method + path). Shares the shape
+/// guard with the recall-boost candidate via [`CandidateVisitor::route_descriptor`].
+struct RouteDescriptorVisitor {
+    source_map: Lrc<SourceMap>,
+    endpoints: Vec<RouteDescriptorEndpoint>,
+}
+
+impl Visit for RouteDescriptorVisitor {
+    fn visit_object_lit(&mut self, node: &ObjectLit) {
+        if let Some(descriptor) = CandidateVisitor::route_descriptor(node) {
+            // The deterministic path requires literal method *and* path; a
+            // descriptor missing either keeps only its recall-boost candidate.
+            if let (Some(method), Some(path)) = (descriptor.method, descriptor.path) {
+                let span = node.span;
+                self.endpoints.push(RouteDescriptorEndpoint {
+                    method,
+                    path,
+                    handler: descriptor.handler,
+                    line_number: self.source_map.lookup_char_pos(span.lo).line,
+                    span_start: span.lo.0,
+                    span_end: span.hi.0,
+                });
+            }
+        }
+        node.visit_children_with(self);
+    }
 }
 
 /// The salient parts of a route-descriptor object literal
-/// (`{ method, path, handler }`): the path literal snippet (when present) and
-/// the handler identifier (when it is a bare identifier reference).
+/// (`{ method, path, handler }`): the HTTP method literal (when it is a string
+/// literal), the path literal snippet (when present) and the handler identifier
+/// (when it is a bare identifier reference).
 struct RouteDescriptor {
+    method: Option<String>,
     path: Option<String>,
     handler: Option<String>,
 }
@@ -689,6 +804,7 @@ impl CandidateVisitor {
 
         let mut has_method = false;
         let mut has_path = false;
+        let mut method = None;
         let mut path = None;
         let mut handler = None;
 
@@ -703,11 +819,20 @@ impl CandidateVisitor {
                 continue;
             };
             match name.as_str() {
-                "method" => has_method = true,
+                "method" => {
+                    has_method = true;
+                    // Keep the method literal so the route can be emitted
+                    // deterministically (#234). A non-literal method (computed
+                    // expr) still satisfies the shape guard but yields no
+                    // deterministic emission — only the recall-boost candidate.
+                    if let Expr::Lit(Lit::Str(s)) = &*kv.value {
+                        method = Some(s.value.to_string());
+                    }
+                }
                 "path" => {
                     has_path = true;
                     if let Expr::Lit(Lit::Str(s)) = &*kv.value {
-                        path = Some(format!("'{}'", s.value));
+                        path = Some(s.value.to_string());
                     }
                 }
                 "handler" => {
@@ -719,7 +844,11 @@ impl CandidateVisitor {
             }
         }
 
-        (has_method && has_path).then_some(RouteDescriptor { path, handler })
+        (has_method && has_path).then_some(RouteDescriptor {
+            method,
+            path,
+            handler,
+        })
     }
 
     /// Extract callee object name from expression
@@ -859,9 +988,16 @@ impl Visit for CandidateVisitor {
         // avoid flagging ordinary config objects. The candidate is keyed on the
         // `handler` identifier when present so the hint points the LLM at the
         // real owner (the handler fn), not the HTTP method string — the
-        // owner-fabrication trap. The LLM still classifies and extracts; this is
-        // a recall booster for the gate, not an authoritative route emission.
+        // owner-fabrication trap.
+        //
+        // When the method and path are both string literals the route is now
+        // emitted deterministically by the orchestrator (`route_descriptor_endpoints`,
+        // #234), bypassing the LLM. This candidate stays as a recall booster for
+        // the dynamic-handler cases the deterministic path can't own (e.g. a
+        // computed method/path, or a handler that isn't a bare identifier): the
+        // gate still keeps the file and the LLM classifies it.
         if let Some(descriptor) = Self::route_descriptor(node) {
+            let path_snippet = descriptor.path.map(|p| format!("'{}'", p));
             self.push_span_candidate(
                 node.span,
                 Protocol::Http,
@@ -869,7 +1005,7 @@ impl Visit for CandidateVisitor {
                     .handler
                     .unwrap_or_else(|| "<route-descriptor>".to_string()),
                 None,
-                descriptor.path,
+                path_snippet,
             );
         }
         node.visit_children_with(self);
@@ -1284,6 +1420,72 @@ export { routes };
         assert!(only_method.candidates.is_empty());
         assert!(only_path.candidates.is_empty());
         assert!(neither.candidates.is_empty());
+    }
+
+    #[test]
+    fn route_descriptor_endpoints_extracts_method_path_handler() {
+        // #234: the route declared as data carries the full method/path/handler
+        // structurally, so it is emitted deterministically (no LLM). The owner is
+        // the handler identifier `healthCheckHandler`, never the method literal
+        // "GET" (the owner-fabrication trap).
+        let content = r#"
+export const healthCheckHandler = async (_req: unknown, _res: unknown) => {
+  return { ok: true, ts: Date.now() };
+};
+
+const routeRegistry = [
+  { method: 'GET', path: '/gateway/health', handler: healthCheckHandler },
+];
+
+export { routeRegistry };
+"#;
+        let scanner = SwcScanner::new();
+        let endpoints =
+            scanner.route_descriptor_endpoints(&PathBuf::from("health.handler.ts"), content);
+        assert_eq!(endpoints.len(), 1, "expected one route descriptor endpoint");
+        let ep = &endpoints[0];
+        assert_eq!(ep.method, "GET");
+        assert_eq!(ep.path, "/gateway/health");
+        assert_eq!(ep.handler.as_deref(), Some("healthCheckHandler"));
+        assert_ne!(ep.handler.as_deref(), Some("GET"));
+        assert!(ep.span_end > ep.span_start);
+    }
+
+    #[test]
+    fn route_descriptor_endpoints_skips_dynamic_method_or_path() {
+        // A computed method/path can't be emitted deterministically — it stays on
+        // the recall-boost candidate path, so no deterministic endpoint is built.
+        let dynamic = r#"
+const verb = 'GET';
+const routes = [
+  { method: verb, path: '/widgets', handler: listWidgets },
+];
+export { routes };
+"#;
+        let scanner = SwcScanner::new();
+        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), dynamic);
+        assert!(
+            endpoints.is_empty(),
+            "non-literal method must not yield a deterministic endpoint, got {endpoints:?}"
+        );
+    }
+
+    #[test]
+    fn route_descriptor_endpoints_allows_missing_handler() {
+        // Literal method + path with no (or non-identifier) handler still emits a
+        // deterministic endpoint; the owner is left unresolved for the caller.
+        let content = r#"
+const routes = [
+  { method: 'POST', path: '/widgets' },
+];
+export { routes };
+"#;
+        let scanner = SwcScanner::new();
+        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), content);
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].method, "POST");
+        assert_eq!(endpoints[0].path, "/widgets");
+        assert_eq!(endpoints[0].handler, None);
     }
 
     #[test]
