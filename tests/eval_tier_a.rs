@@ -316,6 +316,49 @@ struct EvalRunRecord {
     /// F1; cleared once a real workflow run re-pins the baseline. Informational.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    // --- cross-repo metrics (Option; populated by S4/eval_xrepo, None for Tier-A) ---
+    /// Eval tier: "A" for Tier-A fixtures, "xrepo" for the cross-repo corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tier: Option<String>,
+    /// Corpus identifier (e.g. "xrepo-corpus-1"). None for Tier-A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    corpus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_precision_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_precision_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_recall_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_recall_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_f1_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_f1_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_anchor_accuracy_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_anchor_accuracy_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_resolution_accuracy_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_resolution_accuracy_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compat_verdict_accuracy_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compat_verdict_accuracy_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_accuracy_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_accuracy_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decoy_leak_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decoy_leak_sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dep_f1_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dep_f1_sd: Option<f64>,
 }
 
 fn now_unix() -> u64 {
@@ -648,6 +691,26 @@ fn tier_a_extraction_quality() {
             call_pass_at_k: cl_at,
             call_pass_pow_k: cl_pow,
             note: None,
+            tier: None,
+            corpus: None,
+            match_precision_mean: None,
+            match_precision_sd: None,
+            match_recall_mean: None,
+            match_recall_sd: None,
+            match_f1_mean: None,
+            match_f1_sd: None,
+            type_anchor_accuracy_mean: None,
+            type_anchor_accuracy_sd: None,
+            type_resolution_accuracy_mean: None,
+            type_resolution_accuracy_sd: None,
+            compat_verdict_accuracy_mean: None,
+            compat_verdict_accuracy_sd: None,
+            owner_accuracy_mean: None,
+            owner_accuracy_sd: None,
+            decoy_leak_mean: None,
+            decoy_leak_sd: None,
+            dep_f1_mean: None,
+            dep_f1_sd: None,
         });
 
         // Non-flaky floor: at least one expected endpoint found in at least one run.
@@ -711,6 +774,26 @@ fn baseline_store_and_comparison_smoke() {
         call_pass_at_k: 1.0,
         call_pass_pow_k: 1.0,
         note: None,
+        tier: None,
+        corpus: None,
+        match_precision_mean: None,
+        match_precision_sd: None,
+        match_recall_mean: None,
+        match_recall_sd: None,
+        match_f1_mean: None,
+        match_f1_sd: None,
+        type_anchor_accuracy_mean: None,
+        type_anchor_accuracy_sd: None,
+        type_resolution_accuracy_mean: None,
+        type_resolution_accuracy_sd: None,
+        compat_verdict_accuracy_mean: None,
+        compat_verdict_accuracy_sd: None,
+        owner_accuracy_mean: None,
+        owner_accuracy_sd: None,
+        decoy_leak_mean: None,
+        decoy_leak_sd: None,
+        dep_f1_mean: None,
+        dep_f1_sd: None,
     };
 
     // Round-trips through JSON, and the loader tolerates blank/comment/garbage lines.
