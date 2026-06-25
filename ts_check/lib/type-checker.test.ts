@@ -340,6 +340,131 @@ describe('TypeCompatibilityChecker', () => {
       assert.strictEqual(result.unknownPairs.length, 0);
     });
 
+    it('should treat an unknown-resolving side as unverifiable, not compatible', async () => {
+      // Regression for #235: when the consumer alias is missing from the bundle
+      // it is injected as `= unknown` by append_missing_aliases. Everything is
+      // assignable to `unknown`, so without an isUnknown() guard this edge read
+      // compatible and masked a real shape mismatch. It must be unverifiable.
+      const typesProject = new Project({
+        compilerOptions: {
+          strict: true,
+          skipLibCheck: true,
+        },
+      });
+
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type Order = { id: number; amountCents: number; currency: string };
+        export type OrderView = unknown;
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-api',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/orders/:id',
+            'Order',
+            'producer',
+            'routes.ts',
+            10
+          ),
+        ],
+      };
+
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/orders/:id',
+            'OrderView',
+            'consumer',
+            'api.ts',
+            5
+          ),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.unknownPairs.length, 1);
+      assert.strictEqual(result.compatiblePairs, 0);
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.ok(result.unknownPairs[0].reason.includes('unknown'));
+    });
+
+    it('should report a string-vs-number field mismatch as incompatible', async () => {
+      // The genuine orders→web defect (#235): producer Order.id is number,
+      // consumer OrderView.id is string. With the real shapes in the bundle the
+      // edge must read incompatible.
+      const typesProject = new Project({
+        compilerOptions: {
+          strict: true,
+          skipLibCheck: true,
+        },
+      });
+
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type Order = { id: number; amountCents: number; currency: string };
+        export type OrderView = { id: string; currency: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-api',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/orders/:id',
+            'Order',
+            'producer',
+            'routes.ts',
+            10
+          ),
+        ],
+      };
+
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/orders/:id',
+            'OrderView',
+            'consumer',
+            'api.ts',
+            5
+          ),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.incompatiblePairs, 1);
+      assert.strictEqual(result.compatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+      assert.strictEqual(result.mismatches.length, 1);
+    });
+
     it('should match with path parameter normalization', async () => {
       const producers: TypeManifest = {
         repo_name: 'producer-api',
