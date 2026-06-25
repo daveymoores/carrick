@@ -720,8 +720,11 @@ fn score_type_anchor_accuracy(
 
 /// Type-resolution correctness (contract §6 row 6): over ops in both sets that
 /// carry an expected resolved type, the fraction where `type_state` is exactly
-/// equal AND the whitespace-collapsed resolved type is equal. The actual
-/// resolved type is `resolved_definition`, falling back to `expanded_definition`.
+/// equal AND the whitespace-collapsed resolved type is equal. The corpus
+/// `resolved_type` labels are the fully-inlined structural form (ts-morph
+/// `getText()` with NoTruncation), so the actual is `expanded_definition`,
+/// falling back to `resolved_definition` (the name-preserving DefinitionResolver
+/// form) only when no inlined definition was emitted.
 fn score_type_resolution_accuracy(
     repo_expected: &[(String, ExpectedRepo)],
     proj: &EvalProjection,
@@ -739,9 +742,9 @@ fn score_type_resolution_accuracy(
         if let Some(actual) = idx.get(&key) {
             total += 1;
             let actual_rt = actual
-                .resolved_definition
+                .expanded_definition
                 .as_deref()
-                .or(actual.expanded_definition.as_deref());
+                .or(actual.resolved_definition.as_deref());
             let state_ok = ts == actual.type_state.as_deref();
             let rt_ok = actual_rt.map(collapse_ws) == Some(collapse_ws(expected_rt));
             if state_ok && rt_ok {

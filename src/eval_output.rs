@@ -67,13 +67,11 @@ pub struct EvalOp {
     pub is_explicit: Option<bool>,
     /// The LLM-emitted type anchor (contract §3, §5 row 5).
     ///
-    /// The raw anchor (`primary_type_symbol` on the file-analyzer result) is not
-    /// keyed by `OperationKey` at projection time — it lives in the per-file LLM
-    /// results, not the type manifest. Per contract §3 ("if the join makes this
-    /// expensive, S1 may fall back to scoring the anchor metric against
-    /// `type_alias` and note the substitution"), this is populated from the
-    /// manifest `type_alias`. The scorer treats it as the anchor surrogate until
-    /// the raw anchor is threaded into the manifest (follow-up).
+    /// The real anchor (`primary_type_symbol` on the file-analyzer result) is
+    /// threaded onto the type manifest at build time, joined by `(file_path,
+    /// line_number)`, so this carries the real source symbol (`StatusResponse`)
+    /// rather than the hashed `type_alias`. Falls back to `type_alias` only when
+    /// no real anchor was extracted for the op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol: Option<String>,
 }
@@ -166,6 +164,10 @@ struct ManifestFields {
     resolved_definition: Option<String>,
     expanded_definition: Option<String>,
     is_explicit: Option<bool>,
+    /// Real LLM type-anchor symbol, threaded onto the manifest entry at build
+    /// time. Distinct from `type_alias` (the synthetic hashed
+    /// `Endpoint_<hash>_Response` name); the anchor metric scores against this.
+    primary_type_symbol: Option<String>,
 }
 
 /// Lookup from canonical operation key → manifest fields. The manifest carries
@@ -193,6 +195,13 @@ impl ManifestIndex {
                 slot.resolved_definition = entry.resolved_definition.clone();
                 slot.expanded_definition = entry.expanded_definition.clone();
                 slot.is_explicit = Some(entry.is_explicit);
+            }
+            // The anchor symbol is independent of the definition-richness race
+            // above: keep the first non-None symbol seen for this op so a
+            // response entry that wins on definition but carries no symbol does
+            // not erase a request entry's symbol.
+            if slot.primary_type_symbol.is_none() {
+                slot.primary_type_symbol = entry.primary_type_symbol.clone();
             }
         }
         Self { by_key }
@@ -242,8 +251,14 @@ impl EvalOp {
             resolved_definition: fields.and_then(|f| f.resolved_definition.clone()),
             expanded_definition: fields.and_then(|f| f.expanded_definition.clone()),
             is_explicit: fields.and_then(|f| f.is_explicit),
-            // Anchor surrogate: see field doc. Falls back to `type_alias`.
-            primary_type_symbol: fields.and_then(|f| f.type_alias.clone()),
+            // The real LLM type anchor (#233): the symbol threaded onto the
+            // manifest entry, falling back to the hashed `type_alias` only when
+            // no real symbol was extracted for this op.
+            primary_type_symbol: fields.and_then(|f| {
+                f.primary_type_symbol
+                    .clone()
+                    .or_else(|| f.type_alias.clone())
+            }),
         }
     }
 }
@@ -331,6 +346,7 @@ mod tests {
         type_state: ManifestTypeState,
         is_explicit: bool,
         resolved: Option<&str>,
+        primary_type_symbol: Option<&str>,
     ) -> TypeManifestEntry {
         TypeManifestEntry {
             key,
@@ -352,6 +368,7 @@ mod tests {
             },
             resolved_definition: resolved.map(String::from),
             expanded_definition: None,
+            primary_type_symbol: primary_type_symbol.map(String::from),
         }
     }
 
@@ -377,6 +394,8 @@ mod tests {
             request_type: None,
             response_type: None,
             file_path: PathBuf::from(file_line),
+            repo_name: None,
+            service_name: None,
         }
     }
 
@@ -453,6 +472,7 @@ mod tests {
             ManifestTypeState::Explicit,
             true,
             Some("{ id: number; amountCents: number }"),
+            Some("OrderResponse"),
         )];
 
         let projection = EvalProjection::from_results(&result, &manifest);
@@ -499,8 +519,8 @@ mod tests {
             "{ id: number; amountCents: number }"
         );
         assert_eq!(op["type_alias"], "Endpoint_abc_Response");
-        // primary_type_symbol falls back to type_alias (documented substitution).
-        assert_eq!(op["primary_type_symbol"], "Endpoint_abc_Response");
+        // The real LLM anchor surfaces — NOT the hashed type_alias (#233).
+        assert_eq!(op["primary_type_symbol"], "OrderResponse");
         // expanded_definition was None → omitted.
         assert!(op.get("expanded_definition").is_none());
 

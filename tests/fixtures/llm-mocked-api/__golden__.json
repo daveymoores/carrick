@@ -15,7 +15,7 @@
       "resolved_definition": "export interface Endpoint_a9cce7d0d8d0d9e6_Response {\n  id: number;\n  name: string;\n  email: string;\n}",
       "expanded_definition": "Endpoint_a9cce7d0d8d0d9e6_Response",
       "is_explicit": true,
-      "primary_type_symbol": "Endpoint_a9cce7d0d8d0d9e6_Response"
+      "primary_type_symbol": "User"
     },
     {
       "key": "http|GET|/export",

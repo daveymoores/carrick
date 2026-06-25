@@ -36,8 +36,27 @@ impl AnalyzerBuilder {
 
         // Populate analyzer with data from all repos
         for repo_data in all_repo_data {
-            analyzer.endpoints.extend(repo_data.endpoints);
-            analyzer.calls.extend(repo_data.calls);
+            // Stamp repo identity onto every endpoint/call so the non-HTTP
+            // matcher (`analyze_exact_key_matches`) can attribute a matched
+            // GraphQL/socket producer↔consumer pair to its repos. HTTP ops also
+            // resolve identity from the repo-tagged mount graph, so stamping is
+            // redundant-but-harmless there; the non-HTTP path has no other source.
+            let repo_name = repo_data.repo_name.clone();
+            let service_name = repo_data.service_name.clone();
+            analyzer
+                .endpoints
+                .extend(repo_data.endpoints.into_iter().map(|mut e| {
+                    e.repo_name = Some(repo_name.clone());
+                    e.service_name = service_name.clone();
+                    e
+                }));
+            analyzer
+                .calls
+                .extend(repo_data.calls.into_iter().map(|mut c| {
+                    c.repo_name = Some(repo_name.clone());
+                    c.service_name = service_name.clone();
+                    c
+                }));
             analyzer.mounts.extend(repo_data.mounts);
             analyzer.apps.extend(repo_data.apps);
             analyzer

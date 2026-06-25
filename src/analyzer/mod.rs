@@ -42,6 +42,16 @@ type MountGraphMatches = (
     Vec<(String, String)>,
     Vec<CrossRepoMatch>,
 );
+/// Result of `analyze_exact_key_matches` (the non-HTTP, exact-operation-key
+/// matcher): `(call_issues, endpoint_issues, verified_endpoints,
+/// cross_repo_matches)`. No `env_var_calls` slot — GraphQL/socket keys carry no
+/// URL to classify.
+type ExactKeyMatches = (
+    Vec<String>,
+    Vec<OrphanedEndpoint>,
+    Vec<(String, String)>,
+    Vec<CrossRepoMatch>,
+);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
@@ -140,6 +150,20 @@ pub struct ApiEndpointDetails {
     pub request_type: Option<TypeReference>,
     pub response_type: Option<TypeReference>,
     pub file_path: PathBuf,
+    /// Owning repo, stamped during the cross-repo merge from
+    /// `CloudRepoData::repo_name`. `None` outside cross-repo mode (single-repo
+    /// data is not repo-tagged). Non-HTTP (GraphQL/socket) matching reads this to
+    /// attribute a matched producer/consumer pair to its repos for a
+    /// `CrossRepoMatch` edge — HTTP ops get repo identity from the repo-tagged
+    /// mount graph instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    /// Owning service (monorepo `serviceName`), stamped during the cross-repo
+    /// merge. Preferred over `repo_name` for the edge repo id (matches the
+    /// cloud's `service_name ?? repo_name` convention). `None` when no
+    /// `serviceName`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 pub struct ApiAnalysisResult {
@@ -216,6 +240,35 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
         }
         _ => None,
     }
+}
+
+/// Sort cross-repo edges into a deterministic order and drop exact duplicates,
+/// keyed on the `(producer_repo, producer_key, consumer_repo, consumer_key)`
+/// identity tuple. The HTTP matcher and the non-HTTP matcher capture edges in
+/// non-deterministic iteration order, and `get_results` re-runs this over the
+/// combined set so every consumer (PR comment, dashboard, eval projection,
+/// cassette gate) sees a stable order.
+fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
+    matches.sort_by(|a, b| {
+        (
+            &a.producer_repo,
+            &a.producer_key,
+            &a.consumer_repo,
+            &a.consumer_key,
+        )
+            .cmp(&(
+                &b.producer_repo,
+                &b.producer_key,
+                &b.consumer_repo,
+                &b.consumer_key,
+            ))
+    });
+    matches.dedup_by(|a, b| {
+        a.producer_repo == b.producer_repo
+            && a.producer_key == b.producer_key
+            && a.consumer_repo == b.consumer_repo
+            && a.consumer_key == b.consumer_key
+    });
 }
 
 /// Accept only values whose *shape* is an extractable outgoing-call route, as
@@ -474,6 +527,8 @@ impl Analyzer {
                 request_type: call.request_type.clone(),
                 response_type: call.response_type.clone(),
                 file_path: call.call_file.clone(),
+                repo_name: None,
+                service_name: None,
             });
         }
     }
@@ -1217,27 +1272,10 @@ impl Analyzer {
 
         // Deterministic order for the projection (mirrors verified.sort()): the
         // matcher iterates calls/endpoints in a non-deterministic order, so sort
-        // and dedup the captured edges on their identity tuple.
-        cross_repo_matches.sort_by(|a, b| {
-            (
-                &a.producer_repo,
-                &a.producer_key,
-                &a.consumer_repo,
-                &a.consumer_key,
-            )
-                .cmp(&(
-                    &b.producer_repo,
-                    &b.producer_key,
-                    &b.consumer_repo,
-                    &b.consumer_key,
-                ))
-        });
-        cross_repo_matches.dedup_by(|a, b| {
-            a.producer_repo == b.producer_repo
-                && a.producer_key == b.producer_key
-                && a.consumer_repo == b.consumer_repo
-                && a.consumer_key == b.consumer_key
-        });
+        // and dedup the captured edges on their identity tuple. The non-HTTP
+        // edges added later in `get_results` are re-sorted there over the
+        // combined set, so this is the HTTP-only first pass.
+        sort_dedup_cross_repo_matches(&mut cross_repo_matches);
 
         (
             call_issues,
@@ -1304,7 +1342,7 @@ impl Analyzer {
         &self,
         protocol: crate::operation::Protocol,
         protocol_label: &str,
-    ) -> (Vec<String>, Vec<OrphanedEndpoint>, Vec<(String, String)>) {
+    ) -> ExactKeyMatches {
         let producer_keys: HashSet<&OperationKey> = self
             .endpoints
             .iter()
@@ -1312,10 +1350,31 @@ impl Analyzer {
             .map(|endpoint| &endpoint.key)
             .collect();
         if producer_keys.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+
+        // Producer repo id (service_name ?? repo_name) per canonical key, so a
+        // matched consumer can be attributed to the producer's repo for a
+        // `CrossRepoMatch`. First producer for a key wins; a key with no repo
+        // identity simply yields no edge (the same guard the HTTP path applies).
+        let mut producer_repo_by_key: HashMap<String, String> = HashMap::new();
+        for endpoint in &self.endpoints {
+            if endpoint.key.protocol() != protocol {
+                continue;
+            }
+            if let Some(repo) = endpoint
+                .service_name
+                .clone()
+                .or_else(|| endpoint.repo_name.clone())
+            {
+                producer_repo_by_key
+                    .entry(endpoint.key.canonical())
+                    .or_insert(repo);
+            }
         }
 
         let mut call_issues = Vec::new();
+        let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
         let mut matched: HashSet<&OperationKey> = HashSet::new();
         let mut seen_calls = HashSet::new();
         for call in &self.calls {
@@ -1328,6 +1387,27 @@ impl Analyzer {
             }
             if producer_keys.contains(&call.key) {
                 matched.insert(&call.key);
+                // Emit the cross-repo edge. Exact-key protocols share one key on
+                // both sides, so producer_key == consumer_key. For sockets the
+                // producer is the listener (an endpoint) and the consumer is the
+                // emitter (a call); this attribution follows directly from which
+                // side the op sits on. `type_compatible` is left `None` —
+                // `overlay_compat_verdicts` fills it in if compat ran.
+                let consumer_repo = call.service_name.clone().or_else(|| call.repo_name.clone());
+                let canonical = call.key.canonical();
+                if let (Some(producer_repo), Some(consumer_repo)) =
+                    (producer_repo_by_key.get(&canonical).cloned(), consumer_repo)
+                {
+                    cross_repo_matches.push(CrossRepoMatch {
+                        producer_repo,
+                        producer_key: canonical.clone(),
+                        consumer_repo,
+                        consumer_key: canonical,
+                        match_score: 1.0,
+                        type_compatible: None,
+                        mismatch_reason: None,
+                    });
+                }
             } else {
                 let (label, name) = call.key.display_labels();
                 call_issues.push(format!(
@@ -1366,7 +1446,7 @@ impl Analyzer {
         verified.sort();
         verified.dedup();
 
-        (call_issues, endpoint_issues, verified)
+        (call_issues, endpoint_issues, verified, cross_repo_matches)
     }
 
     pub fn compute_full_paths_for_endpoint(
@@ -1583,14 +1663,22 @@ impl Analyzer {
             (crate::operation::Protocol::Graphql, "GraphQL"),
             (crate::operation::Protocol::Websocket, "Socket.IO"),
         ] {
-            let (protocol_call_issues, protocol_endpoint_issues, protocol_verified) =
-                self.analyze_exact_key_matches(protocol, label);
+            let (
+                protocol_call_issues,
+                protocol_endpoint_issues,
+                protocol_verified,
+                protocol_cross_repo_matches,
+            ) = self.analyze_exact_key_matches(protocol, label);
             call_issues.extend(protocol_call_issues);
             endpoint_issues.extend(protocol_endpoint_issues);
             verified_endpoints.extend(protocol_verified);
+            cross_repo_matches.extend(protocol_cross_repo_matches);
         }
         verified_endpoints.sort();
         verified_endpoints.dedup();
+        // Re-sort/dedup over the combined HTTP + non-HTTP edge set so the final
+        // ordering is stable regardless of which matcher produced an edge.
+        sort_dedup_cross_repo_matches(&mut cross_repo_matches);
         // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
         let mismatches = Vec::new();
         let type_mismatches = self.get_type_mismatches();
@@ -2337,6 +2425,17 @@ mod tests {
             request_type: None,
             response_type: None,
             file_path: PathBuf::from(file),
+            repo_name: None,
+            service_name: None,
+        }
+    }
+
+    /// Like [`graphql_details`] but stamps repo identity (as the cross-repo
+    /// merge does), so the exact-key matcher can attribute an edge to repos.
+    fn graphql_details_in_repo(key: OperationKey, file: &str, repo: &str) -> ApiEndpointDetails {
+        ApiEndpointDetails {
+            repo_name: Some(repo.to_string()),
+            ..graphql_details(key, file)
         }
     }
 
@@ -2363,7 +2462,7 @@ mod tests {
             "client.ts:20",
         ));
 
-        let (call_issues, endpoint_issues, verified) =
+        let (call_issues, endpoint_issues, verified, _edges) =
             analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
 
         assert_eq!(verified, vec![("QUERY".to_string(), "user".to_string())]);
@@ -2393,11 +2492,12 @@ mod tests {
             "client.ts:12",
         ));
 
-        let (call_issues, endpoint_issues, verified) =
+        let (call_issues, endpoint_issues, verified, edges) =
             analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
         assert!(call_issues.is_empty());
         assert!(endpoint_issues.is_empty());
         assert!(verified.is_empty());
+        assert!(edges.is_empty());
     }
 
     #[test]
@@ -2430,7 +2530,7 @@ mod tests {
             "client.ts:9",
         ));
 
-        let (call_issues, endpoint_issues, verified) =
+        let (call_issues, endpoint_issues, verified, _edges) =
             analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket, "Socket.IO");
 
         assert_eq!(
@@ -2447,6 +2547,61 @@ mod tests {
             call_issues[0]
         );
         assert!(endpoint_issues.is_empty());
+    }
+
+    #[test]
+    fn test_exact_key_matches_emit_cross_repo_edges() {
+        use crate::operation::{GraphqlOperationKind, SocketDirection};
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // GraphQL: producer schema field in `gateway`, consumer document field
+        // in `web-frontend`. Same operation key on both sides.
+        analyzer.endpoints.push(graphql_details_in_repo(
+            OperationKey::graphql(GraphqlOperationKind::Query, "order"),
+            "schema.graphql:3",
+            "gateway",
+        ));
+        analyzer.calls.push(graphql_details_in_repo(
+            OperationKey::graphql(GraphqlOperationKind::Query, "order"),
+            "web/lib/graphql.ts:5",
+            "web-frontend",
+        ));
+        // Socket: the producer is the LISTENER (an endpoint) in `web-frontend`;
+        // the consumer is the EMITTER (a call) in `payments-svc`. The event flows
+        // payments-svc → web-frontend, but the contract producer is the listener.
+        analyzer.endpoints.push(graphql_details_in_repo(
+            OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
+            "web/lib/realtime.ts:8",
+            "web-frontend",
+        ));
+        analyzer.calls.push(graphql_details_in_repo(
+            OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
+            "payments/realtime/server.ts:9",
+            "payments-svc",
+        ));
+
+        let (_, _, _, gql_edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
+        assert_eq!(gql_edges.len(), 1, "one graphql edge expected");
+        let e = &gql_edges[0];
+        assert_eq!(e.producer_repo, "gateway");
+        assert_eq!(e.consumer_repo, "web-frontend");
+        assert_eq!(e.producer_key, "graphql|query|order");
+        assert_eq!(e.consumer_key, "graphql|query|order");
+        assert_eq!(e.match_score, 1.0);
+        // Compat is filled in later by overlay_compat_verdicts, not here.
+        assert_eq!(e.type_compatible, None);
+
+        let (_, _, _, socket_edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket, "Socket.IO");
+        assert_eq!(socket_edges.len(), 1, "one socket edge expected");
+        let s = &socket_edges[0];
+        // Direction-aware: listener repo is the producer, emitter repo the consumer.
+        assert_eq!(s.producer_repo, "web-frontend");
+        assert_eq!(s.consumer_repo, "payments-svc");
+        assert_eq!(s.producer_key, "socket|SERVER->CLIENT|payment:settled");
+        assert_eq!(s.consumer_key, "socket|SERVER->CLIENT|payment:settled");
     }
 
     #[test]
@@ -2493,6 +2648,8 @@ mod tests {
             request_type: None,
             response_type: None,
             file_path: PathBuf::from("test.ts"),
+            repo_name: None,
+            service_name: None,
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -2506,6 +2663,8 @@ mod tests {
             request_type: None,
             response_type: None,
             file_path: PathBuf::from("test.ts"),
+            repo_name: None,
+            service_name: None,
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -2519,6 +2678,8 @@ mod tests {
             request_type: None,
             response_type: None,
             file_path: PathBuf::from("test.ts"),
+            repo_name: None,
+            service_name: None,
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -2533,6 +2694,8 @@ mod tests {
             request_type: None,
             response_type: None,
             file_path: PathBuf::from("test.ts"),
+            repo_name: None,
+            service_name: None,
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
