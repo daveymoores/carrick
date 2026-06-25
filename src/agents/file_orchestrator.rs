@@ -1024,6 +1024,73 @@ impl FileOrchestrator {
         (explicit_requests, infer_requests, inline_aliases)
     }
 
+    /// Build `SymbolRequest`s for Socket.IO payload anchors (#245 Phase 1).
+    ///
+    /// Sibling to `collect_type_requests`: it routes the deterministically
+    /// captured socket payload type through the *same* sidecar bundle path the
+    /// HTTP explicit-symbol case uses. Listeners are producers, emitters are
+    /// consumers; each resolves to the Response-kind alias.
+    ///
+    /// The alias MUST be `build_manifest_type_alias(&op.key, role, Response)` —
+    /// byte-identical to the alias `append_protocol_manifest_entry` stamped on
+    /// the manifest entry — or the resolved `.d.ts` never joins back and the
+    /// entry stays `Unknown`. This contract is guarded by a unit test.
+    ///
+    /// Only ops whose extractor captured a `payload_type_symbol` produce a
+    /// request; an absent source means the symbol is declared in the emitting
+    /// file, so it is resolved against that file's absolute path.
+    pub fn collect_socket_type_requests(
+        &self,
+        sockets: &crate::socket_io::SocketExtraction,
+        repo_path: &str,
+    ) -> Vec<SymbolRequest> {
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let mut requests: Vec<SymbolRequest> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut push = |op: &crate::socket_io::SocketOp, role: ManifestRole| {
+            let Some(symbol) = op.payload_type_symbol.as_ref() else {
+                return;
+            };
+            let file_abs =
+                Self::to_absolute_path(&op.file_path.to_string_lossy(), &repo_root_absolute);
+            let source_file = match op.payload_type_source.as_ref() {
+                Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                // No import → same-file declaration: resolve against the file.
+                None => file_abs,
+            };
+            let alias = build_manifest_type_alias(&op.key, role, ManifestTypeKind::Response);
+            let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
+            if seen.insert(dedup_key) {
+                requests.push(SymbolRequest {
+                    symbol_name: symbol.clone(),
+                    source_file,
+                    alias: Some(alias),
+                });
+            }
+        };
+        for op in &sockets.listeners {
+            push(op, ManifestRole::Producer);
+        }
+        for op in &sockets.emitters {
+            push(op, ManifestRole::Consumer);
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} socket payload type requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Parse a file once and extract both the symbol table and the env-var
     /// alias map (`local const -> process.env name`). Sharing the parse keeps
     /// the per-file CPU cost flat — both passes are cheap AST walks.
@@ -1413,6 +1480,9 @@ impl FileOrchestrator {
     /// * `extraction_config` - Agent-generated machinery-unwrap rules
     /// * `mount_graph` - Resolved mount graph for canonical method/path aliases
     /// * `config` - Config used for URL normalization
+    /// * `extra_explicit` - Deterministically-collected explicit symbol
+    ///   requests for non-HTTP protocols (socket payload anchors, #245)
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_types_with_sidecar(
         &self,
         sidecar: &TypeSidecar,
@@ -1421,13 +1491,21 @@ impl FileOrchestrator {
         extraction_config: Option<&ExtractionConfig>,
         mount_graph: &MountGraph,
         config: &Config,
+        extra_explicit: &[SymbolRequest],
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (explicit, infer, inline_aliases) =
+        let (mut explicit, infer, inline_aliases) =
             self.collect_type_requests(file_results, repo_path, mount_graph, config);
 
+        // Deterministically-collected explicit requests for non-HTTP protocols
+        // (today: Socket.IO payload anchors, #245). They use the same
+        // `SymbolRequest` shape and bundle path as the HTTP explicit case; the
+        // alias each carries matches its manifest entry so the enrich-join lands.
+        explicit.extend_from_slice(extra_explicit);
+
         debug!(
-            "[FileOrchestrator] Resolving types: {} explicit, {} inferred",
+            "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred",
             explicit.len(),
+            extra_explicit.len(),
             infer.len()
         );
 

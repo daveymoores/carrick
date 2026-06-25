@@ -24,22 +24,38 @@
 
 use crate::operation::{OperationKey, SocketDirection};
 use crate::parser::parse_file;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::{GLOBALS, Globals, SourceMap, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    Callee, Expr, ImportDecl, ImportSpecifier, Lit, ModuleExportName, NewExpr, Pat, VarDeclarator,
+    Callee, Expr, ImportDecl, ImportSpecifier, Lit, ModuleExportName, NewExpr, Pat, TsEntityName,
+    TsType, TsTypeAnn, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
 
 /// A socket listener or emitter with its source location.
+///
+/// `payload_type_symbol`/`payload_type_source` carry the message payload's TS
+/// type so the op can be anchored and resolved through the existing
+/// SymbolRequest/sidecar bundle path (#245 Phase 1). They are populated only
+/// when the payload is an explicitly-typed named reference whose declaration is
+/// `import`ed (precision over recall): inline object types, generics, unions,
+/// and untyped payloads stay `None` so they degrade to an honest `Unknown`
+/// rather than a phantom anchor.
 #[derive(Debug, Clone)]
 pub struct SocketOp {
     pub key: OperationKey,
     pub file_path: PathBuf,
     pub line: u32,
+    /// Bare symbol name of the payload type (e.g. `Payment`), when explicitly
+    /// annotated as a named reference. `None` for inline/generic/untyped payloads.
+    pub payload_type_symbol: Option<String>,
+    /// Module specifier the payload type is imported from (e.g.
+    /// `./types/payment`), paired with `payload_type_symbol`. `None` when the
+    /// symbol is not imported (same-file or untyped).
+    pub payload_type_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,6 +176,19 @@ struct SocketRoots {
     /// Bindings holding server roots (`const io = new Server(...)`) or
     /// per-connection sockets (`io.on("connection", (socket) => ...)`).
     server_sockets: HashSet<String>,
+    /// Imported type symbols → their module specifier. Drives payload-anchor
+    /// resolution (#245): an emitted/received payload typed as an imported
+    /// named reference gets a `(symbol, source)` pair the SymbolRequest path
+    /// can bundle. Same-file types are absent here and resolve with `None`
+    /// source.
+    type_imports: HashMap<String, String>,
+    /// Binding name → payload type symbol, from `const x: T = …` declarators
+    /// and typed function parameters. Lets `socket.emit("e", payment)` recover
+    /// `Payment` from the `payment` binding's annotation. File-level and flat
+    /// (binding shadowing is ignored — a precision tradeoff consistent with the
+    /// module's other guardrails); only simple named references are recorded,
+    /// so generics/unions/inline object types never produce an anchor.
+    binding_types: HashMap<String, String>,
 }
 
 impl SocketRoots {
@@ -168,6 +197,8 @@ impl SocketRoots {
             + self.server_classes.len()
             + self.client_sockets.len()
             + self.server_sockets.len()
+            + self.type_imports.len()
+            + self.binding_types.len()
     }
 
     fn direction_for(&self, root: &str, is_listener: bool) -> Option<SocketDirection> {
@@ -198,6 +229,18 @@ struct RootCollector<'a> {
 impl Visit for RootCollector<'_> {
     fn visit_import_decl(&mut self, node: &ImportDecl) {
         let source = node.src.value.as_ref();
+        // Record every named import's local name → module specifier so a
+        // socket payload typed as an imported symbol (`import type { Payment }
+        // from "./types"`) can be anchored. Default/namespace imports are
+        // skipped: payload type references are named, and a default import's
+        // local name is not the exported declaration the bundler resolves by.
+        for specifier in &node.specifiers {
+            if let ImportSpecifier::Named(named) = specifier {
+                self.roots
+                    .type_imports
+                    .insert(named.local.sym.to_string(), source.to_string());
+            }
+        }
         if source != "socket.io" && source != "socket.io-client" {
             return;
         }
@@ -288,6 +331,87 @@ impl Visit for RootCollector<'_> {
         }
         node.visit_children_with(self);
     }
+
+    fn visit_pat(&mut self, node: &Pat) {
+        // Record `const payment: Payment` / `(payment: Payment) => …` style
+        // typed bindings so an emitted payload identifier can recover its
+        // type symbol. Only simple named references count (see
+        // `named_type_symbol`); anything else leaves the binding unanchored.
+        if let Pat::Ident(ident) = node
+            && let Some(type_ann) = ident.type_ann.as_ref()
+            && let Some(symbol) = named_type_symbol(type_ann)
+        {
+            self.roots
+                .binding_types
+                .insert(ident.id.sym.to_string(), symbol);
+        }
+        node.visit_children_with(self);
+    }
+}
+
+/// Bare symbol name of a simple named type annotation (`Payment` from
+/// `: Payment`), or `None` for anything that is not a single unqualified type
+/// reference. Precision over recall: generics (`Foo<T>`), unions, intersections,
+/// inline object types, qualified names (`ns.Type`), and primitives are all
+/// rejected so the socket anchor only fires when there is one resolvable symbol.
+fn named_type_symbol(type_ann: &TsTypeAnn) -> Option<String> {
+    match &*type_ann.type_ann {
+        TsType::TsTypeRef(type_ref) if type_ref.type_params.is_none() => {
+            match &type_ref.type_name {
+                TsEntityName::Ident(ident) => {
+                    let name = ident.sym.to_string();
+                    // Reject TS built-in/primitive references that happen to parse
+                    // as a type ref so they never become a bundle target.
+                    if is_builtin_type(&name) {
+                        None
+                    } else {
+                        Some(name)
+                    }
+                }
+                TsEntityName::TsQualifiedName(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Lowercase/well-known TS types that must never be treated as a resolvable
+/// payload anchor.
+fn is_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "unknown"
+            | "never"
+            | "void"
+            | "object"
+            | "string"
+            | "number"
+            | "boolean"
+            | "bigint"
+            | "symbol"
+            | "undefined"
+            | "null"
+            | "Array"
+            | "Promise"
+            | "Record"
+            | "Map"
+            | "Set"
+            | "Date"
+            // Capitalized global wrapper / utility types: a payload annotated
+            // with one of these is a TS/lib global, not a user type, so it must
+            // not become a SymbolRequest (the sidecar would try to bundle the
+            // global declaration — noisy and useless).
+            | "Object"
+            | "String"
+            | "Number"
+            | "Boolean"
+            | "Symbol"
+            | "BigInt"
+            | "Function"
+            | "RegExp"
+            | "Error"
+    )
 }
 
 struct OpCollector<'a> {
@@ -339,10 +463,28 @@ impl Visit for OpCollector<'_> {
             {
                 let direction = self.roots.direction_for(root_name, is_listener);
                 if let Some(direction) = direction {
+                    let payload_symbol = if is_listener {
+                        // Listener: the handler's first parameter is the
+                        // received payload; read its type annotation directly.
+                        self.listener_payload_symbol(node)
+                    } else {
+                        // Emitter: the second argument is the sent payload;
+                        // recover its symbol from the binding's annotation.
+                        self.emitter_payload_symbol(node)
+                    };
+                    let (payload_type_symbol, payload_type_source) = match payload_symbol {
+                        Some(symbol) => {
+                            let source = self.roots.type_imports.get(&symbol).cloned();
+                            (Some(symbol), source)
+                        }
+                        None => (None, None),
+                    };
                     let op = SocketOp {
                         key: OperationKey::socket(event.value.to_string(), direction),
                         file_path: self.file_path.to_path_buf(),
                         line: self.cm.lookup_char_pos(node.span().lo).line as u32,
+                        payload_type_symbol,
+                        payload_type_source,
                     };
                     if is_listener {
                         self.extraction.listeners.push(op);
@@ -353,6 +495,35 @@ impl Visit for OpCollector<'_> {
             }
         }
         node.visit_children_with(self);
+    }
+}
+
+impl OpCollector<'_> {
+    /// Payload type symbol of a listener call's handler — the type annotation
+    /// on the handler's first parameter (`socket.on("e", (p: Payment) => …)`).
+    fn listener_payload_symbol(&self, node: &swc_ecma_ast::CallExpr) -> Option<String> {
+        let handler = node.args.get(1)?;
+        let first_param: Option<&Pat> = match &*handler.expr {
+            Expr::Arrow(arrow) => arrow.params.first(),
+            Expr::Fn(func) => func.function.params.first().map(|p| &p.pat),
+            _ => None,
+        };
+        match first_param? {
+            Pat::Ident(ident) => ident.type_ann.as_deref().and_then(named_type_symbol),
+            _ => None,
+        }
+    }
+
+    /// Payload type symbol of an emitter call — the second argument's binding
+    /// type (`socket.emit("e", payment)` where `payment: Payment`). Only a bare
+    /// identifier argument resolves; inline literals/expressions stay
+    /// unanchored.
+    fn emitter_payload_symbol(&self, node: &swc_ecma_ast::CallExpr) -> Option<String> {
+        let payload = node.args.get(1)?;
+        match &*payload.expr {
+            Expr::Ident(ident) => self.roots.binding_types.get(ident.sym.as_ref()).cloned(),
+            _ => None,
+        }
     }
 }
 
@@ -496,5 +667,127 @@ socket.emit("chat:message", "hi");
 "#,
         );
         assert!(result.is_empty());
+    }
+
+    fn find(ops: &[SocketOp], canonical: &str) -> SocketOp {
+        ops.iter()
+            .find(|op| op.key.canonical() == canonical)
+            .unwrap_or_else(|| panic!("missing op {canonical} in {ops:?}"))
+            .clone()
+    }
+
+    #[test]
+    fn typed_emitter_payload_captures_symbol_and_source() {
+        // `socket.emit("payment:settled", payment)` where `payment: Payment`
+        // and `Payment` is imported — the corpus's resolvable case.
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+import type { Payment } from "./types/payment";
+const socket = io("https://payments.internal");
+const settle = (payment: Payment) => {
+  socket.emit("payment:settled", payment);
+};
+"#,
+        );
+        let op = find(&result.emitters, "socket|CLIENT->SERVER|payment:settled");
+        assert_eq!(op.payload_type_symbol.as_deref(), Some("Payment"));
+        assert_eq!(op.payload_type_source.as_deref(), Some("./types/payment"));
+    }
+
+    #[test]
+    fn typed_listener_payload_captures_handler_param_type() {
+        // server `io.on("connection", socket => socket.on("event", (p: Payment) => …))`
+        let result = extract(
+            r#"
+import { Server } from "socket.io";
+import type { Payment } from "./types/payment";
+const io = new Server(httpServer);
+io.on("connection", (socket) => {
+  socket.on("payment:received", (payment: Payment) => { void payment; });
+});
+"#,
+        );
+        let op = find(&result.listeners, "socket|CLIENT->SERVER|payment:received");
+        assert_eq!(op.payload_type_symbol.as_deref(), Some("Payment"));
+        assert_eq!(op.payload_type_source.as_deref(), Some("./types/payment"));
+    }
+
+    #[test]
+    fn same_file_typed_payload_has_symbol_but_no_source() {
+        // Payload type declared in the same file — symbol resolves, but there is
+        // no import source (the SymbolRequest path resolves it against the
+        // emitting file).
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+interface Payment { id: string }
+const socket = io("https://payments.internal");
+const settle = (payment: Payment) => {
+  socket.emit("payment:settled", payment);
+};
+"#,
+        );
+        let op = find(&result.emitters, "socket|CLIENT->SERVER|payment:settled");
+        assert_eq!(op.payload_type_symbol.as_deref(), Some("Payment"));
+        assert_eq!(op.payload_type_source, None);
+    }
+
+    #[test]
+    fn untyped_and_inline_payloads_have_no_symbol() {
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+import type { Payment } from "./types/payment";
+const socket = io("https://chat.internal");
+socket.emit("chat:message", "hello");
+socket.emit("chat:object", { ok: true });
+socket.on("chat:broadcast", (msg) => console.log(msg));
+const settle = (payment: Payment[]) => { socket.emit("chat:array", payment); };
+"#,
+        );
+        for canonical in [
+            "socket|CLIENT->SERVER|chat:message",
+            "socket|CLIENT->SERVER|chat:object",
+            "socket|CLIENT->SERVER|chat:array",
+        ] {
+            let op = find(&result.emitters, canonical);
+            assert_eq!(
+                op.payload_type_symbol, None,
+                "{canonical} should be unanchored"
+            );
+            assert_eq!(op.payload_type_source, None);
+        }
+        let listener = find(&result.listeners, "socket|SERVER->CLIENT|chat:broadcast");
+        assert_eq!(listener.payload_type_symbol, None);
+    }
+
+    #[test]
+    fn capitalized_global_payload_types_are_not_anchored() {
+        // Global wrapper/utility types (Object, String, Function, …) are TS/lib
+        // globals, not user types — annotating a payload with one must NOT create
+        // a SymbolRequest (the sidecar would try to bundle the global). Copilot
+        // review of #245 Phase 1.
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+const socket = io("https://chat.internal");
+const a = (p: Object) => { socket.emit("e:object", p); };
+const b = (p: String) => { socket.emit("e:string", p); };
+socket.on("e:fn", (p: Function) => p());
+"#,
+        );
+        for canonical in [
+            "socket|CLIENT->SERVER|e:object",
+            "socket|CLIENT->SERVER|e:string",
+        ] {
+            let op = find(&result.emitters, canonical);
+            assert_eq!(
+                op.payload_type_symbol, None,
+                "{canonical} (global type) must not be anchored"
+            );
+        }
+        let listener = find(&result.listeners, "socket|SERVER->CLIENT|e:fn");
+        assert_eq!(listener.payload_type_symbol, None);
     }
 }
