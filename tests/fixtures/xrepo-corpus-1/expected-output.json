@@ -1,0 +1,57 @@
+{
+  "matches": [
+    {
+      "producer_repo": "orders-monorepo",
+      "producer_key": "http|GET|/orders/:param",
+      "consumer_repo": "payments-svc",
+      "consumer_key": "http|GET|/orders/:param",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "orders-monorepo",
+      "producer_key": "http|GET|/orders/:param",
+      "consumer_repo": "web-frontend",
+      "consumer_key": "http|GET|/orders/:param",
+      "type_compatible": false,
+      "mismatch_reason": "consumer OrderView.id is string but producer Order.id is number",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "payments-svc",
+      "producer_key": "http|POST|/payments",
+      "consumer_repo": "web-frontend",
+      "consumer_key": "http|POST|/payments",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "tier": "capability"
+    }
+  ],
+  "orphans": [
+    { "repo": "orders-monorepo", "side": "producer", "key": "http|GET|/api/v1/status", "tier": "capability" },
+    { "repo": "orders-monorepo", "side": "producer", "key": "http|GET|/users/:param", "tier": "capability" },
+    { "repo": "orders-monorepo", "side": "producer", "key": "http|GET|/gateway/health", "tier": "capability" },
+    { "repo": "payments-svc", "side": "producer", "key": "http|GET|/payments/:param", "tier": "capability" },
+    { "repo": "payments-svc", "side": "consumer", "key": "http|POST|/billing/charge", "tier": "capability" },
+    { "repo": "payments-svc", "side": "consumer", "key": "http|POST|/metrics/ingest", "tier": "capability" }
+  ],
+  "dependency_conflicts": [
+    {
+      "package": "zod",
+      "versions": ["3.22.0", "4.0.0"],
+      "severity": "critical",
+      "tier": "capability"
+    }
+  ],
+  "summary": {
+    "total_repos": 3,
+    "producers": 6,
+    "consumers": 5,
+    "matched_edges": 3,
+    "incompatible_edges": 1,
+    "orphan_producers": 4,
+    "orphan_consumers": 2,
+    "decoys_must_not_emit": 4
+  }
+}

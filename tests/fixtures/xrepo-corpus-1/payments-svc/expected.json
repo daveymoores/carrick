@@ -1,0 +1,71 @@
+{
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/payments",
+      "owner": "createPayment",
+      "primary_type_symbol": "Payment",
+      "resolved_type": "{ id: string; orderId: number; amountCents: number; status: \"pending\" | \"settled\"; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/payments/:paymentId",
+      "owner": "getPayment",
+      "primary_type_symbol": "Payment",
+      "resolved_type": "{ id: string; orderId: number; amountCents: number; status: \"pending\" | \"settled\"; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/orders/:param",
+      "host_contains": "ORDERS_SERVICE_URL",
+      "path_contains": "/orders/",
+      "import_source": "axios",
+      "primary_type_symbol": "OrderResponse",
+      "resolved_type": "{ id: number; amountCents: number; currency: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/billing/charge",
+      "host_contains": "BILLING_URL",
+      "path_contains": "/billing/charge",
+      "import_source": "axios",
+      "primary_type_symbol": null,
+      "resolved_type": null,
+      "type_state": "Unknown",
+      "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/metrics/ingest",
+      "host_contains": null,
+      "path_contains": "/metrics/ingest",
+      "import_source": null,
+      "primary_type_symbol": null,
+      "resolved_type": null,
+      "type_state": "Unknown",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": [
+    {
+      "kind": "call",
+      "method": "*",
+      "path": "/__sdk__/PutItemCommand",
+      "evidence": "lib/audit.ts: dynamo.send(new PutItemCommand(...)) is an AWS SDK call using the SDK's internal HTTP transport — not a direct HTTP data call. Must not be extracted as a consumer endpoint."
+    },
+    {
+      "kind": "endpoint",
+      "method": "POST",
+      "path": "/__lambda__/settle",
+      "evidence": "handlers/settle.ts: `export const handler = async (event: SQSEvent)` is an AWS Lambda SQS handler, not an HTTP route registration. Must not be extracted as a producer endpoint."
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "orders-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/orders-pkg",
+    "packages/gateway"
+  ],
+  "dependencies": {
+    "zod": "^3.22.0"
+  }
+}

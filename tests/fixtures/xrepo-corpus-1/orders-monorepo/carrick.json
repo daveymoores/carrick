@@ -1,0 +1,14 @@
+{
+  "services": [
+    {
+      "name": "orders-pkg",
+      "directory": "packages/orders-pkg",
+      "tsconfig": "tsconfig.json"
+    },
+    {
+      "name": "gateway",
+      "directory": "packages/gateway",
+      "tsconfig": "tsconfig.json"
+    }
+  ]
+}
