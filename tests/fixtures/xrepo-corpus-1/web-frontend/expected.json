@@ -23,5 +23,46 @@
       "type_state": "Explicit",
       "tier": "capability"
     }
+  ],
+  "graphql_operations": [
+    {
+      "role": "consumer",
+      "service": "web-frontend",
+      "key": "graphql|query|order",
+      "kind": "query",
+      "field": "order",
+      "source": "lib/graphql.ts",
+      "primary_type_symbol": "OrderView",
+      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; note?: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "consumer",
+      "service": "web-frontend",
+      "key": "graphql|subscription|orderUpdated",
+      "kind": "subscription",
+      "field": "orderUpdated",
+      "source": "lib/graphql.ts",
+      "primary_type_symbol": "OrderUpdate",
+      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; note: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "socket_events": [
+    {
+      "role": "producer",
+      "service": "web-frontend",
+      "key": "socket|SERVER->CLIENT|payment:settled",
+      "event": "payment:settled",
+      "direction": "SERVER->CLIENT",
+      "side": "listener",
+      "source": "lib/realtime.ts",
+      "primary_type_symbol": "SettledPayment",
+      "resolved_type": "{ id: string; orderId: number; amountCents: number; status: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
   ]
 }

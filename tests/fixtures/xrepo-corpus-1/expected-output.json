@@ -7,6 +7,7 @@
       "consumer_key": "http|GET|/orders/:param",
       "type_compatible": true,
       "mismatch_reason": null,
+      "protocol": "http",
       "tier": "capability"
     },
     {
@@ -16,6 +17,7 @@
       "consumer_key": "http|GET|/orders/:param",
       "type_compatible": false,
       "mismatch_reason": "consumer OrderView.id is string but producer Order.id is number",
+      "protocol": "http",
       "tier": "capability"
     },
     {
@@ -25,13 +27,46 @@
       "consumer_key": "http|POST|/payments",
       "type_compatible": true,
       "mismatch_reason": null,
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "gateway",
+      "producer_key": "graphql|query|order",
+      "consumer_repo": "web-frontend",
+      "consumer_key": "graphql|query|order",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "graphql",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "gateway",
+      "producer_key": "graphql|subscription|orderUpdated",
+      "consumer_repo": "web-frontend",
+      "consumer_key": "graphql|subscription|orderUpdated",
+      "type_compatible": false,
+      "mismatch_reason": "consumer OrderUpdate.note is required but producer Order.note is optional (optional-field widening)",
+      "protocol": "graphql",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "web-frontend",
+      "producer_key": "socket|SERVER->CLIENT|payment:settled",
+      "consumer_repo": "payments-svc",
+      "consumer_key": "socket|SERVER->CLIENT|payment:settled",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "socket",
       "tier": "capability"
     }
   ],
   "orphans": [
     { "repo": "orders-pkg", "side": "producer", "key": "http|GET|/api/v1/status", "tier": "capability" },
     { "repo": "gateway", "side": "producer", "key": "http|GET|/users/:param", "tier": "capability" },
+    { "repo": "gateway", "side": "producer", "key": "http|GET|/users/recent", "tier": "capability" },
     { "repo": "gateway", "side": "producer", "key": "http|GET|/gateway/health", "tier": "capability" },
+    { "repo": "gateway", "side": "producer", "key": "graphql|mutation|refundOrder", "tier": "capability" },
     { "repo": "payments-svc", "side": "producer", "key": "http|GET|/payments/:param", "tier": "capability" },
     { "repo": "payments-svc", "side": "consumer", "key": "http|POST|/billing/charge", "tier": "capability" },
     { "repo": "payments-svc", "side": "consumer", "key": "http|POST|/metrics/ingest", "tier": "capability" }
@@ -46,12 +81,13 @@
   ],
   "summary": {
     "total_repos": 3,
-    "producers": 6,
-    "consumers": 5,
-    "matched_edges": 3,
-    "incompatible_edges": 1,
-    "orphan_producers": 4,
+    "producers": 11,
+    "consumers": 8,
+    "matched_edges": 6,
+    "incompatible_edges": 2,
+    "orphan_producers": 5,
     "orphan_consumers": 2,
-    "decoys_must_not_emit": 4
+    "decoys_must_not_emit": 4,
+    "matched_edges_by_protocol": { "http": 3, "graphql": 2, "socket": 1 }
   }
 }

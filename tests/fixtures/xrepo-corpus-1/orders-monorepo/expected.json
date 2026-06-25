@@ -29,6 +29,15 @@
     },
     {
       "method": "GET",
+      "path": "/users/recent",
+      "owner": "recent",
+      "primary_type_symbol": null,
+      "resolved_type": "{ count: number; ids: string[]; }",
+      "type_state": "Implicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
       "path": "/gateway/health",
       "owner": "healthCheckHandler",
       "primary_type_symbol": "HealthResponse",
@@ -38,6 +47,44 @@
     }
   ],
   "calls": [],
+  "graphql_operations": [
+    {
+      "role": "producer",
+      "service": "gateway",
+      "key": "graphql|query|order",
+      "kind": "query",
+      "field": "order",
+      "source": "packages/gateway/src/schema.graphql",
+      "primary_type_symbol": "ApiResponse<Order>",
+      "resolved_type": "{ data: { id: string; total: { amountCents: number; currency: string; }; status: { kind: \"placed\"; placedAt: string; } | { kind: \"refunded\"; refundedAt: string; reason?: string; }; note?: string; }; errors: string[]; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "producer",
+      "service": "gateway",
+      "key": "graphql|mutation|refundOrder",
+      "kind": "mutation",
+      "field": "refundOrder",
+      "source": "packages/gateway/src/schema.graphql",
+      "primary_type_symbol": "ApiResponse<Order>",
+      "resolved_type": "{ data: { id: string; total: { amountCents: number; currency: string; }; status: { kind: \"placed\"; placedAt: string; } | { kind: \"refunded\"; refundedAt: string; reason?: string; }; note?: string; }; errors: string[]; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "producer",
+      "service": "gateway",
+      "key": "graphql|subscription|orderUpdated",
+      "kind": "subscription",
+      "field": "orderUpdated",
+      "source": "packages/gateway/src/schema.graphql",
+      "primary_type_symbol": "Order",
+      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; status: { kind: \"placed\"; placedAt: string; } | { kind: \"refunded\"; refundedAt: string; reason?: string; }; note?: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
   "_must_not_emit": [
     {
       "kind": "endpoint",
