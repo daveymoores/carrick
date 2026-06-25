@@ -54,6 +54,21 @@
       "tier": "capability"
     }
   ],
+  "socket_events": [
+    {
+      "role": "consumer",
+      "service": "payments-svc",
+      "key": "socket|SERVER->CLIENT|payment:settled",
+      "event": "payment:settled",
+      "direction": "SERVER->CLIENT",
+      "side": "emitter",
+      "source": "realtime/server.ts",
+      "primary_type_symbol": "Payment",
+      "resolved_type": "{ id: string; orderId: number; amountCents: number; status: \"pending\" | \"settled\"; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
   "_must_not_emit": [
     {
       "kind": "call",

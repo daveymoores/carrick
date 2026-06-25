@@ -1,0 +1,53 @@
+# GraphQL schema (schema-first) for the orders gateway.
+#
+# This is the PRODUCER side of the cross-repo GraphQL edge (#220). The scanner
+# walks the repo for `.graphql`/`.gql` files (src/graphql.rs::scan_repo) and
+# indexes the root-operation fields below as producers, keyed by
+# OperationKey::Graphql { kind, field }:
+#   Query.order           -> graphql|query|order
+#   Mutation.refundOrder  -> graphql|mutation|refundOrder
+#   Subscription.orderUpdated -> graphql|subscription|orderUpdated
+#
+# The TS resolver shapes in src/orders.resolver.ts carry the corresponding
+# request/response types the sidecar resolves (richer-types work, #222):
+# a nested object (Money), an optional field (note), and a union field (status).
+
+type Money {
+  amountCents: Int!
+  currency: String!
+}
+
+# Discriminated-union-style status, modelled as a GraphQL union of object types.
+type OrderPlaced {
+  placedAt: String!
+}
+
+type OrderRefunded {
+  refundedAt: String!
+  reason: String
+}
+
+union OrderStatus = OrderPlaced | OrderRefunded
+
+type Order {
+  id: ID!
+  total: Money!
+  status: OrderStatus!
+  # Optional field — present on the producer, absent on some consumers.
+  note: String
+}
+
+type Query {
+  # Producer for the web-frontend `query order` consumer.
+  order(id: ID!): Order
+  orders: [Order!]!
+}
+
+type Mutation {
+  refundOrder(id: ID!, reason: String): Order!
+}
+
+type Subscription {
+  # Producer for the web-frontend `subscription orderUpdated` consumer.
+  orderUpdated: Order!
+}

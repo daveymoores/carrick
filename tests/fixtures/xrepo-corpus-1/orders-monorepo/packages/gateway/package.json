@@ -5,6 +5,8 @@
   "dependencies": {
     "@nestjs/common": "^10.0.0",
     "@nestjs/core": "^10.0.0",
+    "graphql": "^16.8.0",
+    "graphql-tag": "^2.12.6",
     "zod": "^3.22.0"
   },
   "scripts": {
