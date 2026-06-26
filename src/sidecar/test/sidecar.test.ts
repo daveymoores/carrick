@@ -329,6 +329,10 @@ describe('Type Sidecar Integration Tests', () => {
     // not the surrounding call (`res.json(users)`). The sidecar resolves the
     // node by text and returns its type, working identically across
     // res.json(...), ctx.body = ..., h.response(...), and bare return.
+    //
+    // #257/#240: the resolved named payload is now expanded STRUCTURALLY (so the
+    // cross-repo bundle carries the real members, not a dangling name). The
+    // assertions check the inlined member shape rather than the bare type name.
     it('should resolve response payload via text locator — Express res.json(x)', async () => {
       const response = await client.send<{
         inferred_types?: Array<{ type_string: string; infer_kind: string }>;
@@ -349,7 +353,12 @@ describe('Type Sidecar Integration Tests', () => {
       if (response.inferred_types && response.inferred_types.length > 0) {
         const inferred = response.inferred_types[0];
         assert.strictEqual(inferred.infer_kind, 'response_body');
-        assert.ok(inferred.type_string.includes('User'), `expected User[], got ${inferred.type_string}`);
+        // Structural, not the dangling bare `User[]`.
+        assert.strictEqual(
+          inferred.type_string,
+          '{ id: number; name: string; }[]',
+          `expected structural User[], got ${inferred.type_string}`
+        );
       } else {
         assert.fail('expected inferred_types for Express payload');
       }
@@ -374,7 +383,12 @@ describe('Type Sidecar Integration Tests', () => {
 
       if (response.inferred_types && response.inferred_types.length > 0) {
         const inferred = response.inferred_types[0];
-        assert.ok(inferred.type_string.includes('User'), `expected User[], got ${inferred.type_string}`);
+        // Structural, not the dangling bare `User[]`.
+        assert.strictEqual(
+          inferred.type_string,
+          '{ id: number; name: string; }[]',
+          `expected structural User[], got ${inferred.type_string}`
+        );
       } else {
         assert.fail('expected inferred_types for Koa payload');
       }
@@ -399,7 +413,12 @@ describe('Type Sidecar Integration Tests', () => {
 
       if (response.inferred_types && response.inferred_types.length > 0) {
         const inferred = response.inferred_types[0];
-        assert.ok(inferred.type_string.includes('Order'), `expected Order, got ${inferred.type_string}`);
+        // Structural, not the dangling bare `Order`.
+        assert.strictEqual(
+          inferred.type_string,
+          '{ id: number; total: number; }',
+          `expected structural Order, got ${inferred.type_string}`
+        );
       } else {
         assert.fail('expected inferred_types for Hapi payload');
       }
@@ -424,7 +443,12 @@ describe('Type Sidecar Integration Tests', () => {
 
       if (response.inferred_types && response.inferred_types.length > 0) {
         const inferred = response.inferred_types[0];
-        assert.ok(inferred.type_string.includes('User'), `expected User, got ${inferred.type_string}`);
+        // Structural, not the dangling bare `User`.
+        assert.strictEqual(
+          inferred.type_string,
+          '{ id: number; name: string; }',
+          `expected structural User, got ${inferred.type_string}`
+        );
       } else {
         assert.fail('expected inferred_types for bare-return payload');
       }

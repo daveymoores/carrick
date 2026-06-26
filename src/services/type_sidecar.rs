@@ -239,6 +239,12 @@ pub struct InferredType {
     pub source_location: SourceLocation,
     /// The kind of inference that was performed
     pub infer_kind: InferKind,
+    /// Deterministic source symbol of the resolved type (`Payment`), from the
+    /// sidecar's `getSymbol() || getAliasSymbol()` name with TS/lib globals
+    /// filtered out. Fills the manifest anchor (`primary_type_symbol`) when the
+    /// LLM emitted none, removing the anchor's sole dependency on the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_type_symbol: Option<String>,
 }
 
 /// Information about a symbol that failed to resolve
