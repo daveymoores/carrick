@@ -81,7 +81,7 @@
       "resolved_definition": "export type Endpoint_7624e36e7268b452_Request = { name: string; email: string; };",
       "expanded_definition": "{ name: string; email: string; }",
       "is_explicit": false,
-      "primary_type_symbol": "Endpoint_7624e36e7268b452_Request"
+      "primary_type_symbol": "User"
     }
   ],
   "calls": [

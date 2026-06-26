@@ -1958,18 +1958,17 @@ fn enrich_manifest_with_type_resolution(
     // Deterministic anchor source (#240): the sidecar resolves each inferred
     // type's real source symbol (`Payment`) off the ts-morph `Type`, so a
     // manifest entry whose anchor the LLM left unset can be filled from it.
-    // Join by `(file_path, start_line)` — the same coordinates
-    // `stamp_manifest_anchor_symbols` uses — so the symbol lands on the right
-    // op. First non-None wins per location, so a later inferred entry can't
+    // Join by `alias` — the same key the resolved-type lookup below uses to
+    // marry an `InferredType` to its manifest entry. A `(file_path, line)` join
+    // would be fragile: the sidecar's `source_location` is an absolute ts-morph
+    // path while `entry.file_path` is repo-relative, so the coordinates need not
+    // line up. First non-None wins per alias, so a later inferred entry can't
     // clobber an earlier real symbol.
-    let mut inferred_symbols: HashMap<(String, u32), String> = HashMap::new();
+    let mut inferred_symbols: HashMap<String, String> = HashMap::new();
     for inferred in &type_resolution.inferred_types {
         if let Some(symbol) = inferred.primary_type_symbol.as_ref() {
             inferred_symbols
-                .entry((
-                    inferred.source_location.file_path.clone(),
-                    inferred.source_location.start_line,
-                ))
+                .entry(inferred.alias.clone())
                 .or_insert_with(|| symbol.clone());
         }
     }
@@ -2009,8 +2008,7 @@ fn enrich_manifest_with_type_resolution(
         // socket) are never regressed. Stamping runs before enrichment, so any
         // entry still `None` here had no LLM anchor.
         if entry.primary_type_symbol.is_none()
-            && let Some(symbol) =
-                inferred_symbols.get(&(entry.file_path.clone(), entry.line_number))
+            && let Some(symbol) = inferred_symbols.get(&entry.type_alias)
         {
             entry.primary_type_symbol = Some(symbol.clone());
         }
@@ -3681,14 +3679,15 @@ mod tests {
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
     }
 
-    /// An inferred type carrying a deterministic symbol at the entry's location
-    /// (`lib/api.ts:5`), with a hashed alias that doesn't match `type_alias`.
-    /// `consumer_entry` sits at `lib/api.ts:5`, so the location join fires.
+    /// An inferred type carrying a deterministic symbol, keyed by the same
+    /// `alias` as the manifest entry it enriches — the join the anchor fill
+    /// uses. `type_string` is a resolved object, so only the anchor (not the
+    /// type-state path) is under test here.
     fn inferred_with_symbol(symbol: &str) -> InferredType {
         InferredType {
-            // A hashed alias that deliberately does NOT equal the manifest
-            // `type_alias` — the anchor join is by location, not alias.
-            alias: "Endpoint_abc123_Response".to_string(),
+            // Matches `consumer_entry("OrderView").type_alias`, so the anchor
+            // join (by alias) fires.
+            alias: "OrderView".to_string(),
             type_string: "{ id: string; currency: string }".to_string(),
             is_explicit: false,
             source_location: SourceLocation {
@@ -3704,7 +3703,7 @@ mod tests {
     }
 
     /// #240: the deterministic anchor fills `primary_type_symbol` from the
-    /// inferred symbol, joined by `(file_path, line)`, when the LLM left it None.
+    /// inferred symbol, joined by `alias`, when the LLM left it None.
     #[test]
     fn enrich_fills_anchor_from_inferred_symbol_when_llm_none() {
         let mut manifest = vec![consumer_entry("OrderView")];

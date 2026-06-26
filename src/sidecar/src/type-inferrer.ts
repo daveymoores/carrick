@@ -1334,7 +1334,13 @@ export class TypeInferrer {
   private expandResolvedTypeStructural(type: Type, fallback: string): string {
     try {
       const expanded = expandTypeStructural(type);
-      return expanded.startsWith('{') ? expanded : fallback;
+      // Prefer the expanded form whenever an object got inlined, not only when
+      // it leads with `{`. `expandTypeStructural` wraps arrays and unions, so a
+      // resolved `Payment[]` or `(Payment | null)[]` renders as `{…}[]` or
+      // `({…} | null)[]`; a `startsWith('{')` test would miss those and fall
+      // back to the bare, dangling name. Any `{` means real members reached the
+      // bundle.
+      return expanded.includes('{') ? expanded : fallback;
     } catch {
       return fallback;
     }
@@ -1351,7 +1357,10 @@ export class TypeInferrer {
    */
   private primaryTypeSymbol(type: Type): string | undefined {
     const name = (type.getSymbol() || type.getAliasSymbol())?.getName();
-    if (!name || name === '__type' || BUILTIN_ANCHOR_SYMBOLS.has(name)) {
+    // Reject the compiler's synthetic names for anonymous shapes (`__type`,
+    // `__object`, `__function`, …). They are not user-facing type names, so
+    // they would be a meaningless — and non-resolvable — anchor.
+    if (!name || name.startsWith('__') || BUILTIN_ANCHOR_SYMBOLS.has(name)) {
       return undefined;
     }
     return name;
