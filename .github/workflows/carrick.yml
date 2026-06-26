@@ -1,12 +1,14 @@
 name: Carrick
 
+# DISABLED 2026-06-26 (manual-only): the dogfooding self-scan runs the real
+# Carrick Action (Vertex/Gemini inference) on every push/PR. During heavy
+# iteration that's pure wasted inference cost, so it's reduced to on-demand.
+# Re-enable real dogfooding by restoring the triggers below:
+#   push: { branches: [main] }
+#   pull_request: { branches: [main] }
+#   repository_dispatch: { types: [carrick-sibling-updated] }
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  repository_dispatch:
-    types: [carrick-sibling-updated]
+  workflow_dispatch:
 
 permissions:
   id-token: write
