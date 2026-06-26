@@ -109,9 +109,12 @@ pub struct CrossRepoMatch {
     /// smearing one producer's first verdict across all its consumers (#260). It
     /// shares the consumer manifest entry's source — both derive from the same
     /// call `file_location` — so after `parse_file_location` normalization the
-    /// edge and the ts_check `consumerLocation` agree on `(path, line)`. `None`
-    /// when the consumer location is unavailable (exact-key protocol edges, where
-    /// the verdict overlay does not run anyway).
+    /// edge and the ts_check `consumerLocation` agree on `(path, line)`. Set for
+    /// every edge a consumer call backs, HTTP and exact-key protocol edges
+    /// alike: both constructors fill it from the call's `file_path`, and the
+    /// overlay iterates all of them. A non-HTTP producer key simply leaves
+    /// `type_compatible` `None` (ts_check is HTTP-only); the location is still
+    /// recorded. `Option` only to leave room for an edge source with no call.
     pub consumer_location: Option<String>,
     /// Matcher confidence in `[0, 1]`. `1.0` for an exact normalized-key match
     /// (the only kind captured today; there is no finer score yet).
