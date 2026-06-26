@@ -10,6 +10,7 @@ use crate::{
     mount_graph::MountGraph,
     operation::OperationKey,
     packages::Packages,
+    type_manifest::parse_file_location,
     url_normalizer::UrlNormalizer,
     utils::join_prefix_and_path,
     visitor::{Call, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
@@ -103,6 +104,18 @@ pub struct CrossRepoMatch {
     pub consumer_repo: String,
     /// `OperationKey::canonical()` of the consumer call (URL-normalized path).
     pub consumer_key: String,
+    /// Source location of the consumer call (`"<file>:<line>[:<col>]"`), the join
+    /// key that attributes a per-pair compat verdict to THIS consumer rather than
+    /// smearing one producer's first verdict across all its consumers (#260). It
+    /// shares the consumer manifest entry's source — both derive from the same
+    /// call `file_location` — so after `parse_file_location` normalization the
+    /// edge and the ts_check `consumerLocation` agree on `(path, line)`. Set for
+    /// every edge a consumer call backs, HTTP and exact-key protocol edges
+    /// alike: both constructors fill it from the call's `file_path`, and the
+    /// overlay iterates all of them. A non-HTTP producer key simply leaves
+    /// `type_compatible` `None` (ts_check is HTTP-only); the location is still
+    /// recorded. `Option` only to leave room for an edge source with no call.
+    pub consumer_location: Option<String>,
     /// Matcher confidence in `[0, 1]`. `1.0` for an exact normalized-key match
     /// (the only kind captured today; there is no finer score yet).
     pub match_score: f64,
@@ -242,12 +255,27 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
     }
 }
 
+/// Canonicalize a consumer source location (`"<file>:<line>[:<col>]"`) to the
+/// `(path, line)` pair that joins a `CrossRepoMatch` edge to its ts_check
+/// per-pair verdict (#260). Both sides feed the same `call.file_location` here:
+/// the edge stores it verbatim (`path:line:col`), while ts_check reassembles
+/// `consumerLocation` as `parse_file_location(...).path : line`. Reducing both
+/// through `parse_file_location` strips the divergent column/format suffix so
+/// the verdict for one consumer can no longer smear onto another consumer of the
+/// same producer endpoint.
+fn consumer_identity(location: &str) -> (String, u32) {
+    parse_file_location(location)
+}
+
 /// Sort cross-repo edges into a deterministic order and drop exact duplicates,
-/// keyed on the `(producer_repo, producer_key, consumer_repo, consumer_key)`
+/// keyed on the
+/// `(producer_repo, producer_key, consumer_repo, consumer_key, consumer_location)`
 /// identity tuple. The HTTP matcher and the non-HTTP matcher capture edges in
 /// non-deterministic iteration order, and `get_results` re-runs this over the
 /// combined set so every consumer (PR comment, dashboard, eval projection,
-/// cassette gate) sees a stable order.
+/// cassette gate) sees a stable order. `consumer_location` is part of the
+/// identity so two distinct call sites in one consumer repo against the same
+/// producer endpoint stay separate edges (each carries its own verdict).
 fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
     matches.sort_by(|a, b| {
         (
@@ -255,12 +283,14 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
             &a.producer_key,
             &a.consumer_repo,
             &a.consumer_key,
+            &a.consumer_location,
         )
             .cmp(&(
                 &b.producer_repo,
                 &b.producer_key,
                 &b.consumer_repo,
                 &b.consumer_key,
+                &b.consumer_location,
             ))
     });
     matches.dedup_by(|a, b| {
@@ -268,6 +298,7 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
             && a.producer_key == b.producer_key
             && a.consumer_repo == b.consumer_repo
             && a.consumer_key == b.consumer_key
+            && a.consumer_location == b.consumer_location
     });
 }
 
@@ -1322,6 +1353,11 @@ impl Analyzer {
             producer_key: producer_key.canonical(),
             consumer_repo,
             consumer_key: consumer_key.canonical(),
+            // The consumer call's source location — the per-pair join key for the
+            // compat verdict (#260). Shares the consumer manifest entry's source
+            // (both come from this call's `file_location`), so the overlay can
+            // attribute ts_check's `consumerLocation` to THIS edge.
+            consumer_location: Some(call.file_path.display().to_string()),
             match_score: 1.0,
             type_compatible: None,
             mismatch_reason: None,
@@ -1411,6 +1447,11 @@ impl Analyzer {
                             producer_key: canonical.clone(),
                             consumer_repo: consumer_repo.clone(),
                             consumer_key: canonical.clone(),
+                            // Exact-key protocols (GraphQL/socket) are not checked
+                            // by ts_check (HTTP-only), so this never feeds the
+                            // compat overlay — but recording the consumer call site
+                            // keeps the dedup identity precise.
+                            consumer_location: Some(call.file_path.display().to_string()),
                             match_score: 1.0,
                             type_compatible: None,
                             mismatch_reason: None,
@@ -1621,10 +1662,16 @@ impl Analyzer {
             .unwrap_or(&vec![])
             .iter()
             .map(|mismatch| {
+                // `consumerLocation` is the per-consumer join key the overlay
+                // needs to attribute this verdict to a single (producer, consumer)
+                // edge rather than smearing it across all consumers (#260) — it
+                // must survive this transform.
                 serde_json::json!({
                     "endpoint": mismatch.get("endpoint").unwrap_or(&serde_json::Value::Null),
                     "producerType": mismatch.get("producerType").unwrap_or(&serde_json::Value::Null),
                     "consumerType": mismatch.get("consumerType").unwrap_or(&serde_json::Value::Null),
+                    "producerLocation": mismatch.get("producerLocation").unwrap_or(&serde_json::Value::Null),
+                    "consumerLocation": mismatch.get("consumerLocation").unwrap_or(&serde_json::Value::Null),
                     "error": mismatch.get("error").unwrap_or(&serde_json::Value::Null)
                 })
             })
@@ -1640,8 +1687,11 @@ impl Analyzer {
             .unwrap_or(&vec![])
             .iter()
             .map(|pair| {
+                // Carry `consumerLocation` for the same per-consumer keying (#260).
                 serde_json::json!({
                     "endpoint": pair.get("endpoint").unwrap_or(&serde_json::Value::Null),
+                    "producerLocation": pair.get("producerLocation").unwrap_or(&serde_json::Value::Null),
+                    "consumerLocation": pair.get("consumerLocation").unwrap_or(&serde_json::Value::Null),
                     "reason": pair.get("reason").unwrap_or(&serde_json::Value::Null)
                 })
             })
@@ -1693,10 +1743,11 @@ impl Analyzer {
         let type_mismatches = self.get_type_mismatches();
         let dependency_conflicts = self.analyze_dependencies();
 
-        // Overlay the per-producer-endpoint type-compat verdict onto the captured
-        // edges. The verdict is keyed by the producer's (METHOD, full_path) — the
-        // ts_check output collapses all consumers of a producer into one verdict,
-        // so every edge into a given producer shares that producer's verdict.
+        // Overlay the per-pair type-compat verdict onto the captured edges. The
+        // verdict is keyed by the producer's (METHOD, full_path) AND the consumer's
+        // source location, so each (producer, consumer) edge gets its own verdict
+        // rather than sharing the producer's first verdict across all consumers
+        // (#260).
         //
         // `type_compatible` stays `None` when compat was not evaluated
         // (`check_type_compatibility` returns `Err`: ts_check_dir absent, results
@@ -1752,16 +1803,27 @@ impl Analyzer {
     }
 
     /// Overlay the type-compatibility verdict onto each captured cross-repo
-    /// edge, keyed by the producer's `(METHOD, full_path)`.
+    /// edge, keyed by the producer's `(METHOD, full_path)` AND the consumer's
+    /// source location — so each `(producer, consumer)` pair gets ITS OWN
+    /// verdict.
+    ///
+    /// ts_check emits one mismatch/unknownPair entry per matched producer↔
+    /// consumer pair, each carrying `consumerLocation` (`"<file>:<line>"`). Keying
+    /// only on the producer `(METHOD, path)` collapsed all consumers of a producer
+    /// into one verdict: when one producer had ≥2 consumers of differing
+    /// compatibility, the first verdict smeared onto every edge (#260 — the
+    /// flagship false-negative). The key now includes the consumer identity
+    /// (`parse_file_location(consumerLocation)`), which the edge mirrors in
+    /// `consumer_location` (both derive from the same call `file_location`).
     ///
     /// If `check_type_compatibility` returns `Err`, type checking did not run
     /// (or failed) for this scan: every edge keeps `type_compatible: None`
-    /// (load-bearing — see [`CrossRepoMatch`]). On `Ok`, an edge whose producer
-    /// appears in the mismatch set gets `Some(false)` + the reason; an edge
-    /// whose producer ts_check matched but could NOT verify (a side resolved to
-    /// `any`/`unknown`, e.g. the type never reached the bundled `.d.ts`) keeps
-    /// `None` — unverifiable, not compatible; everything else (genuinely checked
-    /// and compatible) gets `Some(true)`.
+    /// (load-bearing — see [`CrossRepoMatch`]). On `Ok`, an edge whose
+    /// `(producer, consumer)` pair appears in the mismatch set gets `Some(false)`
+    /// with the reason. A pair ts_check matched but could NOT verify (a side
+    /// resolved to `any`/`unknown`, e.g. the type never reached the bundled
+    /// `.d.ts`) keeps `None` — unverifiable, not compatible. Everything else
+    /// (genuinely checked and compatible) gets `Some(true)`.
     fn overlay_compat_verdicts(&self, matches: &mut [CrossRepoMatch]) {
         let result = match self.check_type_compatibility() {
             Ok(result) => result,
@@ -1769,12 +1831,15 @@ impl Analyzer {
             Err(_) => return,
         };
 
-        // Map producer `(METHOD, path)` → mismatch reason, parsed from each
-        // mismatch's `endpoint` string (`"<METHOD> <path> (<request|response>)"`,
-        // built by ts_check's type-checker). Multiple type_kinds per producer
-        // collapse to the first reason seen — the edge only records that the
-        // producer is incompatible.
-        let mut incompatible: HashMap<(String, String), String> = HashMap::new();
+        // The per-pair verdict key: producer `(METHOD, path)` (from the mismatch
+        // `endpoint` string `"<METHOD> <path> (<request|response>)"`) plus the
+        // consumer identity `(path, line)` recovered from `consumerLocation`.
+        type VerdictKey = (String, String, (String, u32));
+
+        // Map verdict key → mismatch reason. Multiple type_kinds for one pair
+        // collapse to the first reason seen — the edge only records that the pair
+        // is incompatible.
+        let mut incompatible: HashMap<VerdictKey, String> = HashMap::new();
         if let Some(mismatch_list) = result.get("mismatches").and_then(|m| m.as_array()) {
             for mismatch in mismatch_list {
                 let Some(endpoint) = mismatch.get("endpoint").and_then(|e| e.as_str()) else {
@@ -1783,42 +1848,70 @@ impl Analyzer {
                 let Some((method, path)) = parse_compat_endpoint(endpoint) else {
                     continue;
                 };
+                let Some(consumer) = mismatch
+                    .get("consumerLocation")
+                    .and_then(|c| c.as_str())
+                    .map(consumer_identity)
+                else {
+                    continue;
+                };
                 let reason = mismatch
                     .get("error")
                     .and_then(|e| e.as_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("producer and consumer types are incompatible")
                     .to_string();
-                incompatible.entry((method, path)).or_insert(reason);
+                incompatible
+                    .entry((method, path, consumer))
+                    .or_insert(reason);
             }
         }
 
-        // Producers ts_check matched but could not verify (a side resolved to
+        // Pairs ts_check matched but could not verify (a side resolved to
         // `any`/`unknown`). The compat verdict is genuinely unknown for these
         // edges — leaving the optimistic `Some(true)` default would assert a
         // compatibility ts_check never established.
-        let mut unverifiable: HashSet<(String, String)> = HashSet::new();
+        let mut unverifiable: HashSet<VerdictKey> = HashSet::new();
         if let Some(unknown_list) = result.get("unknownPairs").and_then(|u| u.as_array()) {
             for pair in unknown_list {
                 let Some(endpoint) = pair.get("endpoint").and_then(|e| e.as_str()) else {
                     continue;
                 };
-                if let Some(key) = parse_compat_endpoint(endpoint) {
-                    unverifiable.insert(key);
-                }
+                let Some((method, path)) = parse_compat_endpoint(endpoint) else {
+                    continue;
+                };
+                let Some(consumer) = pair
+                    .get("consumerLocation")
+                    .and_then(|c| c.as_str())
+                    .map(consumer_identity)
+                else {
+                    continue;
+                };
+                unverifiable.insert((method, path, consumer));
             }
         }
 
         for edge in matches.iter_mut() {
-            // producer_key is `http|METHOD|path`; recover (METHOD, path).
+            // producer_key is `http|METHOD|path`; recover (METHOD, path). A
+            // non-HTTP key (GraphQL/socket edge) is not type-checked by ts_check
+            // (HTTP-only), so its verdict is genuinely unknown — leave it `None`
+            // rather than fabricate `Some(true)` (#260, part 2).
             let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
-                edge.type_compatible = Some(true);
+                edge.type_compatible = None;
                 continue;
             };
-            if let Some(reason) = incompatible.get(&(method.clone(), path.clone())) {
+            // Without a consumer identity the pair can't be matched to its own
+            // verdict, and asserting `Some(true)` would risk re-smearing — leave
+            // it `None` (compat undetermined for this edge).
+            let Some(consumer) = edge.consumer_location.as_deref().map(consumer_identity) else {
+                edge.type_compatible = None;
+                continue;
+            };
+            let key = (method, path, consumer);
+            if let Some(reason) = incompatible.get(&key) {
                 edge.type_compatible = Some(false);
                 edge.mismatch_reason = Some(reason.clone());
-            } else if unverifiable.contains(&(method, path)) {
+            } else if unverifiable.contains(&key) {
                 // Matched but unverifiable — compat undetermined, NOT compatible.
                 edge.type_compatible = None;
             } else {
@@ -2802,12 +2895,24 @@ mod tests {
         analyzer
     }
 
+    /// A `payments-svc` consumer edge against `producer_key`, with a default
+    /// consumer call site. The overlay now keys per-consumer, so the verdict
+    /// fixtures must carry a `consumerLocation` matching this location.
+    const PAYMENTS_CONSUMER_LOC: &str = "payments-svc/src/client.ts:12:1";
+
     fn edge(producer_key: &str) -> CrossRepoMatch {
+        edge_at(producer_key, "payments-svc", PAYMENTS_CONSUMER_LOC)
+    }
+
+    /// Build an edge with an explicit consumer repo + source location, so a test
+    /// can model two consumers of one producer with distinct call sites.
+    fn edge_at(producer_key: &str, consumer_repo: &str, consumer_location: &str) -> CrossRepoMatch {
         CrossRepoMatch {
             producer_repo: "orders-monorepo".to_string(),
             producer_key: producer_key.to_string(),
-            consumer_repo: "payments-svc".to_string(),
+            consumer_repo: consumer_repo.to_string(),
             consumer_key: producer_key.to_string(),
+            consumer_location: Some(consumer_location.to_string()),
             match_score: 1.0,
             type_compatible: None,
             mismatch_reason: None,
@@ -2826,6 +2931,7 @@ mod tests {
         let results = r#"{
             "mismatches": [
                 { "endpoint": "GET /orders/:id (response)",
+                  "consumerLocation": "payments-svc/src/client.ts:12",
                   "error": "id: number is not assignable to string" }
             ],
             "totalChecked": 2,
@@ -2887,6 +2993,7 @@ mod tests {
             "mismatches": [],
             "unknownPairs": [
                 { "endpoint": "GET /orders/:id (response)",
+                  "consumerLocation": "payments-svc/src/client.ts:12",
                   "reason": "consumer type resolves to unknown (type missing from bundled types?)" }
             ],
             "totalChecked": 1,
@@ -2906,6 +3013,111 @@ mod tests {
             matches[1].type_compatible,
             Some(true),
             "a genuinely-checked edge absent from both lists is compatible"
+        );
+    }
+
+    /// THE #260 regression. One producer endpoint (`GET /orders/:id`) with TWO
+    /// consumers of differing compatibility: `payments-svc` (compatible) and
+    /// `web-frontend` (incompatible — `Order.id:number` vs `OrderView.id:string`).
+    /// ts_check emits one entry per pair, each carrying its own `consumerLocation`.
+    /// Before the fix the overlay keyed verdicts on the producer `(METHOD, path)`
+    /// alone, so whichever verdict landed first smeared onto BOTH edges — the
+    /// `payments` `compatible` verdict masked the real `web-frontend` mismatch as
+    /// `Some(true)` (the flagship false-negative). The verdicts must now be
+    /// distinct and correctly attributed to each consumer's edge.
+    #[test]
+    fn overlay_compat_verdicts_keys_per_consumer_no_smear() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Only the web-frontend pair mismatches; the payments pair is genuinely
+        // checked-and-compatible (absent from both lists). Both pairs share the
+        // SAME producer endpoint — the exact collapse the old keying caused.
+        let results = r#"{
+            "mismatches": [
+                { "endpoint": "GET /orders/:id (response)",
+                  "consumerLocation": "web-frontend/src/orders.ts:42:3",
+                  "error": "Order.id: number is not assignable to OrderView.id: string" }
+            ],
+            "unknownPairs": [],
+            "totalChecked": 2,
+            "compatibleCount": 1
+        }"#;
+        let analyzer = analyzer_with_results(dir.path(), Some(results));
+
+        // Two edges into the SAME producer endpoint, distinguished only by their
+        // consumer identity (repo + call-site location).
+        let payments = edge_at(
+            "http|GET|/orders/:id",
+            "payments-svc",
+            "payments-svc/src/orders-client.ts:18:5",
+        );
+        let web = edge_at(
+            "http|GET|/orders/:id",
+            "web-frontend",
+            "web-frontend/src/orders.ts:42",
+        );
+        let mut matches = vec![payments, web];
+        analyzer.overlay_compat_verdicts(&mut matches);
+
+        // payments-svc: compatible (its pair is in neither list).
+        assert_eq!(
+            matches[0].consumer_repo, "payments-svc",
+            "fixture ordering sanity"
+        );
+        assert_eq!(
+            matches[0].type_compatible,
+            Some(true),
+            "the compatible consumer keeps its true verdict"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+
+        // web-frontend: incompatible — and crucially NOT smeared with payments'
+        // compatible verdict (the #260 false-negative).
+        assert_eq!(matches[1].consumer_repo, "web-frontend");
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(false),
+            "the incompatible consumer's edge must read Some(false), not the \
+             smeared Some(true) — this is the #260 collapse"
+        );
+        assert_eq!(
+            matches[1].mismatch_reason.as_deref(),
+            Some("Order.id: number is not assignable to OrderView.id: string"),
+        );
+    }
+
+    /// A GraphQL/socket edge has a non-HTTP `producer_key`, so `parse_producer_key`
+    /// returns `None`. ts_check is HTTP-only and never produced a verdict for it,
+    /// so the verdict is genuinely unknown: the edge must stay `None`, NOT the
+    /// fabricated `Some(true)` the old default returned (#260, part 2 — the worst
+    /// direction for a drift detector).
+    #[test]
+    fn overlay_compat_verdicts_non_http_producer_key_stays_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let results = r#"{ "mismatches": [], "unknownPairs": [],
+                           "totalChecked": 0, "compatibleCount": 0 }"#;
+        let analyzer = analyzer_with_results(dir.path(), Some(results));
+
+        let mut matches = vec![
+            edge_at(
+                "graphql|query|order",
+                "web-frontend",
+                "web-frontend/src/query.ts:7",
+            ),
+            edge_at(
+                "socket|SERVER->CLIENT|payment:settled",
+                "payments-svc",
+                "payments-svc/src/socket.ts:9",
+            ),
+        ];
+        analyzer.overlay_compat_verdicts(&mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "a GraphQL edge ts_check never checked must stay None, not fake true"
+        );
+        assert_eq!(
+            matches[1].type_compatible, None,
+            "a socket edge ts_check never checked must stay None, not fake true"
         );
     }
 
