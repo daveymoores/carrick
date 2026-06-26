@@ -324,12 +324,12 @@ impl AgentSchemas {
                             "primary_type_symbol": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "The primary type symbol name without wrappers (e.g., 'User' from 'Response<User[]>'). Extract just the identifier, not the full type."
+                                "description": "The named type of the response payload, as a bare identifier. ALWAYS extract it when the payload value has a determinable named type; do not skip it. Trace the sent or returned payload value (the same value as `response_expression_text`) to its declared type: a local variable annotation (`const u: User = ...; res.json(u)` gives `User`), a function return annotation (`(): Promise<User>` gives `User`), a cast on the payload (`res.json(u as User)` gives `User`), or a generic type argument (`get<User>(...)` gives `User`). An imperative send like `res.json(u)` does not suppress this; extract it the same as a returned value. Unwrap `Promise<...>`, arrays (`User[]`), and response wrappers (`Response<User>`) down to the core identifier. Null only for untyped or inline-object-literal payloads with no named type."
                             },
                             "type_import_source": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
+                                "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Read the import statements at the top of the file."
                             }
                         },
                         "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched", "emission_style"]
@@ -390,12 +390,12 @@ impl AgentSchemas {
                             "primary_type_symbol": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "The primary type symbol name without wrappers (e.g., 'User' from 'Promise<User>'). Extract just the identifier, not the full type."
+                                "description": "The named type the call expects back, as a bare identifier. ALWAYS extract it when the result has a determinable named type; do not skip it. Trace the call result to its declared type: an `as` cast on the returned promise (`res.json() as Promise<User>` gives `User`), an annotation on the awaited value (`const u: User = await res.json()` gives `User`), or a generic type argument on the call. Unwrap `Promise<...>`, arrays (`User[]`), and response wrappers (`Response<User>`) down to the core identifier. Null only for untyped results with no named type."
                             },
                             "type_import_source": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "Import path where the type is defined (e.g., './types/user'), null if inline or defined in the same file. Look at import statements at the top of the file."
+                                "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Read the import statements at the top of the file."
                             }
                         },
                         "required": ["candidate_id", "line_number", "target", "pattern_matched"]
