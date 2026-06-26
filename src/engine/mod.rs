@@ -978,8 +978,12 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
-            let protocol_extractions =
-                append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
+            let protocol_extractions = append_deterministic_protocol_operations(
+                &mut cloud_data,
+                repo_path,
+                service,
+                &files,
+            );
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -1120,9 +1124,27 @@ struct ProtocolExtractions {
     sockets: crate::socket_io::SocketExtraction,
 }
 
+/// The directories to walk for a service's own GraphQL SDL files: its
+/// `directory` (or the repo root for a flat single-service config) plus any
+/// `include` roots. Mirrors `find_service_files`' scoping so a monorepo
+/// package's schema is attributed only to the package that declares it, not its
+/// siblings (#242).
+fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
+    let root = Path::new(repo_path);
+    let mut roots = vec![match &service.directory {
+        Some(dir) => root.join(dir),
+        None => root.to_path_buf(),
+    }];
+    for inc in &service.include {
+        roots.push(root.join(inc));
+    }
+    roots
+}
+
 fn append_deterministic_protocol_operations(
     cloud_data: &mut CloudRepoData,
     repo_path: &str,
+    service: &Config,
     files: &[PathBuf],
 ) -> ProtocolExtractions {
     // Same "{file}:{line}" convention the mount-graph conversions use
@@ -1140,7 +1162,8 @@ fn append_deterministic_protocol_operations(
         service_name: None,
     };
 
-    let graphql = crate::graphql::scan_repo(Path::new(repo_path), files);
+    let scan_roots = service_graphql_roots(repo_path, service);
+    let graphql = crate::graphql::scan_repo(&scan_roots, files);
     if !graphql.is_empty() {
         debug!(
             producers = graphql.producers.len(),
@@ -2091,7 +2114,7 @@ async fn analyze_current_repo(
         function_definitions.clone(),
     );
     let protocol_extractions =
-        append_deterministic_protocol_operations(&mut cloud_data, repo_path, &files);
+        append_deterministic_protocol_operations(&mut cloud_data, repo_path, service, &files);
 
     let mut manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
