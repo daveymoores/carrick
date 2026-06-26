@@ -90,9 +90,11 @@ export function expandTypeStructural(
     const element = type.getArrayElementType();
     if (!element) return namedText(type);
     const inner = expandTypeStructural(element, seen, depth + 1);
-    // Parenthesise unions/intersections so `(A | B)[]` doesn't read as
-    // `A | B[]`; object literals already self-delimit with braces.
-    const needsParens = /[|&]/.test(inner) && !inner.startsWith('{');
+    // Parenthesise a union/intersection element so `(A | B)[]` doesn't misparse
+    // as `A | B[]`. Decide from the TYPE, not the string: a single object
+    // literal like `{ a: A | B }` is NOT a union and must not be parenthesised,
+    // and a union led by an object literal (`{ a: string } | null`) MUST be.
+    const needsParens = element.isUnion() || element.isIntersection();
     return needsParens ? `(${inner})[]` : `${inner}[]`;
   }
 
