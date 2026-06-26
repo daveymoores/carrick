@@ -16,7 +16,7 @@ use crate::analyzer::{
     ApiAnalysisResult, ApiEndpointDetails, ConflictSeverity,
     CrossRepoMatch as AnalyzerCrossRepoMatch, DependencyConflict,
 };
-use crate::cloud_storage::TypeManifestEntry;
+use crate::cloud_storage::{ManifestRole, TypeManifestEntry};
 use crate::operation::OperationKey;
 
 /// The full eval projection of a single scan: the producer endpoints, the
@@ -139,15 +139,22 @@ impl EvalProjection {
             .collect();
         dependency_conflicts.sort_by(|a, b| a.package.cmp(&b.package));
         Self {
+            // `endpoints` are producers and `calls` are consumers; the role
+            // selects which manifest slot each op joins to. A shared canonical
+            // key (e.g. an HTTP path produced in one repo and consumed in
+            // another) carries one entry per role, so without this split the two
+            // ops would collapse into a single slot and clobber each other's
+            // anchor / resolved-definition / type-state (the projection-collapse
+            // finding, #207).
             endpoints: result
                 .endpoints
                 .iter()
-                .map(|d| EvalOp::from_details(d, &manifest_index))
+                .map(|d| EvalOp::from_details(d, &manifest_index, ManifestRole::Producer))
                 .collect(),
             calls: result
                 .calls
                 .iter()
-                .map(|d| EvalOp::from_details(d, &manifest_index))
+                .map(|d| EvalOp::from_details(d, &manifest_index, ManifestRole::Consumer))
                 .collect(),
             cross_repo_matches,
             dependency_conflicts,
@@ -170,18 +177,27 @@ struct ManifestFields {
     primary_type_symbol: Option<String>,
 }
 
-/// Lookup from canonical operation key → manifest fields. The manifest carries
-/// up to two entries per op (request + response); we prefer the entry that has
-/// resolved-type detail so the projection surfaces the richest available type.
+/// Lookup from `(canonical operation key, role)` → manifest fields. The manifest
+/// carries up to two entries per op-and-role (request + response); we prefer the
+/// entry that has resolved-type detail so the projection surfaces the richest
+/// available type.
+///
+/// Keying on role as well as the canonical key is load-bearing (#207): a single
+/// canonical key (e.g. `http|GET|/orders/:param`) can be both a producer in one
+/// repo and a consumer in another. Keying by canonical alone collapsed the two
+/// roles' entries into one slot, so the last writer's anchor /
+/// resolved-definition / type-state clobbered the other role's — surfacing, for
+/// instance, the consumer's `OrderView` against the producer's op. Splitting by
+/// role keeps each side's manifest fields distinct.
 struct ManifestIndex {
-    by_key: HashMap<String, ManifestFields>,
+    by_key: HashMap<(String, ManifestRole), ManifestFields>,
 }
 
 impl ManifestIndex {
     fn build(entries: &[TypeManifestEntry]) -> Self {
-        let mut by_key: HashMap<String, ManifestFields> = HashMap::new();
+        let mut by_key: HashMap<(String, ManifestRole), ManifestFields> = HashMap::new();
         for entry in entries {
-            let key = entry.key.canonical();
+            let key = (entry.key.canonical(), entry.role);
             let slot = by_key.entry(key).or_default();
             // Prefer an entry that resolved a concrete definition; otherwise
             // keep the first-seen alias/state so the field is at least present.
@@ -207,8 +223,12 @@ impl ManifestIndex {
         Self { by_key }
     }
 
-    fn get(&self, key: &str) -> Option<&ManifestFields> {
-        self.by_key.get(key)
+    /// Look up the manifest fields for an op's canonical `key` in the given
+    /// `role`. A producer EvalOp (endpoint) joins the Producer slot, a consumer
+    /// EvalOp (call) the Consumer slot, so a shared canonical key never crosses
+    /// the two roles' manifest fields (#207).
+    fn get(&self, key: &str, role: ManifestRole) -> Option<&ManifestFields> {
+        self.by_key.get(&(key.to_string(), role))
     }
 }
 
@@ -225,11 +245,15 @@ fn manifest_type_state_string(state: crate::cloud_storage::ManifestTypeState) ->
 }
 
 impl EvalOp {
-    fn from_details(d: &ApiEndpointDetails, manifest: &ManifestIndex) -> Self {
+    /// `role` selects the manifest slot this op joins to: a producer (endpoint)
+    /// reads the Producer slot, a consumer (call) the Consumer slot, so a shared
+    /// canonical key keeps each side's anchor / resolved-definition / type-state
+    /// distinct (#207).
+    fn from_details(d: &ApiEndpointDetails, manifest: &ManifestIndex, role: ManifestRole) -> Self {
         let (protocol, method, path) = project_key(&d.key);
         let (file, line) = split_location(&d.file_path);
         let canonical = d.key.canonical();
-        let fields = manifest.get(&canonical);
+        let fields = manifest.get(&canonical, role);
         EvalOp {
             key: canonical,
             protocol,
@@ -343,6 +367,7 @@ mod tests {
 
     fn manifest_entry(
         key: OperationKey,
+        role: ManifestRole,
         type_state: ManifestTypeState,
         is_explicit: bool,
         resolved: Option<&str>,
@@ -350,7 +375,7 @@ mod tests {
     ) -> TypeManifestEntry {
         TypeManifestEntry {
             key,
-            role: ManifestRole::Producer,
+            role,
             type_kind: ManifestTypeKind::Response,
             type_alias: "Endpoint_abc_Response".to_string(),
             file_path: "src/orders.ts".to_string(),
@@ -469,6 +494,7 @@ mod tests {
 
         let manifest = vec![manifest_entry(
             producer_key,
+            ManifestRole::Producer,
             ManifestTypeState::Explicit,
             true,
             Some("{ id: number; amountCents: number }"),
@@ -606,8 +632,12 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
+        // A socket emitter is a consumer, so its manifest entry carries the
+        // Consumer role and the consumer EvalOp (on `calls`) must join the
+        // Consumer slot (#207).
         let manifest = vec![manifest_entry(
             socket_key,
+            ManifestRole::Consumer,
             ManifestTypeState::Explicit,
             true,
             Some("{ id: string; amountCents: number }"),
@@ -631,5 +661,89 @@ mod tests {
             op["resolved_definition"],
             "{ id: string; amountCents: number }"
         );
+    }
+
+    /// #207 de-collapse: when a producer endpoint and a consumer call share ONE
+    /// canonical key (e.g. `http|GET|/orders/:param` produced by an orders pkg
+    /// AND consumed by a web frontend), each must surface ITS OWN manifest
+    /// fields — the producer's expected `Order` anchor on the endpoint, the
+    /// consumer's `OrderView` anchor on the call — not a single collapsed value.
+    /// Keying the manifest index by `(canonical, role)` is what keeps them apart;
+    /// before the fix the second-written entry clobbered the first's slot.
+    #[test]
+    fn shared_key_producer_and_consumer_keep_own_manifest_fields() {
+        let shared_key = OperationKey::http("GET", "/orders/:param");
+
+        let result = ApiAnalysisResult {
+            // The endpoint (producer side) and the call (consumer side) carry the
+            // SAME canonical key, the collapse trap.
+            endpoints: vec![endpoint("GET", "/orders/:param", "src/orders.ts:12")],
+            calls: vec![ApiEndpointDetails {
+                owner: None,
+                key: shared_key.clone(),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: Some("fetchOrder".to_string()),
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from("web/src/orders.ts:7"),
+                repo_name: None,
+                service_name: None,
+            }],
+            issues: empty_issues_with_deps(vec![]),
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+
+        // Two manifest entries on the SAME canonical key, distinguished only by
+        // role, each with a distinct anchor + resolved definition + type_state.
+        let manifest = vec![
+            manifest_entry(
+                shared_key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeState::Explicit,
+                true,
+                Some("{ id: number; amountCents: number }"),
+                Some("Order"),
+            ),
+            manifest_entry(
+                shared_key,
+                ManifestRole::Consumer,
+                ManifestTypeState::Implicit,
+                false,
+                Some("{ id: number }"),
+                Some("OrderView"),
+            ),
+        ];
+
+        let projection = EvalProjection::from_results(&result, &manifest);
+        let json: Value =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+
+        let endpoint_op = &json["endpoints"].as_array().unwrap()[0];
+        let call_op = &json["calls"].as_array().unwrap()[0];
+
+        // Same canonical key on both sides — the collapse trap.
+        assert_eq!(endpoint_op["key"], "http|GET|/orders/:param");
+        assert_eq!(call_op["key"], "http|GET|/orders/:param");
+
+        // The producer endpoint surfaces the PRODUCER slot's fields.
+        assert_eq!(endpoint_op["primary_type_symbol"], "Order");
+        assert_eq!(
+            endpoint_op["resolved_definition"],
+            "{ id: number; amountCents: number }"
+        );
+        assert_eq!(endpoint_op["type_state"], "Explicit");
+        assert_eq!(endpoint_op["is_explicit"], true);
+
+        // The consumer call surfaces the CONSUMER slot's fields — proving the two
+        // roles did NOT collapse into one slot and clobber each other.
+        assert_eq!(call_op["primary_type_symbol"], "OrderView");
+        assert_eq!(call_op["resolved_definition"], "{ id: number }");
+        assert_eq!(call_op["type_state"], "Implicit");
+        assert_eq!(call_op["is_explicit"], false);
     }
 }
