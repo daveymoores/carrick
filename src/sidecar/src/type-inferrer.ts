@@ -43,6 +43,7 @@ import type {
   ExtractionRule,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
+import { expandTypeStructural } from './type-structural-expander.js';
 
 /**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
@@ -1197,29 +1198,67 @@ export class TypeInferrer {
     if (varDecl) {
       const typeNode = varDecl.getTypeNode();
       if (typeNode) {
-        return typeNode.getText();
+        return this.expandAnnotationTypeNode(typeNode);
       }
     }
 
-    const asExpr = node.getFirstAncestorByKind(SyntaxKind.AsExpression);
+    // Consider the node ITSELF as well as its ancestors: the `call_result`
+    // path's terminal node for `return res.json() as Promise<T>` IS the
+    // `as` cast (an ancestor walk from it would miss it), so the #257 consumer
+    // shape would never be recovered. `as T` and `<T>x` assertions both apply.
+    const asExpr = Node.isAsExpression(node)
+      ? node
+      : node.getFirstAncestorByKind(SyntaxKind.AsExpression);
     if (asExpr) {
       const typeNode = asExpr.getTypeNode();
       if (typeNode) {
-        return typeNode.getText();
+        return this.expandAnnotationTypeNode(typeNode);
       }
     }
 
-    const typeAssertion = node.getFirstAncestorByKind(
-      SyntaxKind.TypeAssertionExpression
-    );
+    const typeAssertion = Node.isTypeAssertion(node)
+      ? node
+      : node.getFirstAncestorByKind(SyntaxKind.TypeAssertionExpression);
     if (typeAssertion) {
       const typeNode = typeAssertion.getTypeNode();
       if (typeNode) {
-        return typeNode.getText();
+        return this.expandAnnotationTypeNode(typeNode);
       }
     }
 
     return null;
+  }
+
+  /**
+   * Render an explicit annotation (`as T`, `<T>`, or a typed binding) as
+   * fully-structural text.
+   *
+   * `typeNode.getText()` keeps a named type as its bare identifier
+   * (`OrderView`, `Promise<Payment>`). A bare name is fine inside the source
+   * project but becomes a dangling reference in the cross-repo `.d.ts` bundle,
+   * which carries only alias lines and no source declarations — it resolves to
+   * `any` and the comparison reads `unverifiable`. Resolving the annotation to
+   * its `Type`, stripping `Promise<…>` at the type level, and expanding the
+   * object structurally (shared with `definition-resolver.ts`) lands the real
+   * shape (`{ id: string; currency: string }`) in the bundle so the consumer
+   * can actually be compared.
+   *
+   * Falls back to the bare annotation text when the resolved type can't be
+   * expanded to a structural form (primitives, library types, unresolvable
+   * references), so a non-object annotation behaves exactly as before.
+   */
+  private expandAnnotationTypeNode(typeNode: Node): string {
+    const fallback = typeNode.getText();
+    try {
+      const annotationType = this.unwrapPromiseType(typeNode.getType());
+      const expanded = expandTypeStructural(annotationType);
+      // Only prefer the structural form when expansion actually inlined an
+      // object shape; otherwise keep the annotation text (e.g. a bare
+      // primitive or a library type the expander leaves by name).
+      return expanded.startsWith('{') ? expanded : fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   // ===========================================================================
