@@ -1319,8 +1319,13 @@ describe('Type Sidecar Integration Tests', () => {
       // definition should contain the original interface text
       assert.ok(def.definition.includes('interface User'), 'definition should have original interface');
       assert.ok(def.definition.includes('name'), 'definition should include name field');
-      // expanded for interfaces returns the type name (nominal) — that's expected
+      // expanded is the structural form: members inlined, not the nominal name (#246)
       assert.ok(def.expanded, 'expanded should be present');
+      assert.ok(def.expanded.startsWith('{'), 'expanded should be a structural object literal');
+      assert.ok(def.expanded.includes('id: string'), 'expanded should inline id member');
+      assert.ok(def.expanded.includes('name: string'), 'expanded should inline name member');
+      // Date is a library type — it stays by name, not inlined to its members.
+      assert.ok(def.expanded.includes('createdAt: Date'), 'expanded should keep Date by name');
     });
 
     it('should resolve a type alias with union', async () => {
@@ -1373,8 +1378,20 @@ describe('Type Sidecar Integration Tests', () => {
       assert.ok(def.definition.includes('UserSettings'), 'definition should reference UserSettings');
       // definition should show the extends clause
       assert.ok(def.definition.includes('extends User'), 'definition should show extends User');
-      // expanded for interfaces returns the nominal name — definition has the full text
-      assert.ok(def.expanded, 'expanded should be present');
+      // expanded inlines the transitive members: the named `settings: UserSettings`
+      // becomes its structural shape, and the inherited `User` members are flattened in (#246).
+      assert.ok(def.expanded.startsWith('{'), 'expanded should be a structural object literal');
+      assert.ok(
+        !/settings: UserSettings/.test(def.expanded),
+        'expanded must NOT leave the named member ref `settings: UserSettings`',
+      );
+      assert.ok(
+        /settings: \{[^}]*theme:/.test(def.expanded),
+        'expanded should inline UserSettings into the settings member structure',
+      );
+      assert.ok(def.expanded.includes('notifications: boolean'), 'expanded should inline a nested member');
+      // Inherited (extends User) members are present structurally.
+      assert.ok(def.expanded.includes('id: string'), 'expanded should flatten inherited User members');
     });
 
     it('should resolve multiple aliases in one call', async () => {
@@ -1429,6 +1446,106 @@ describe('Type Sidecar Integration Tests', () => {
       // Should only resolve the one that exists
       assert.strictEqual(response.definitions.length, 1);
       assert.strictEqual(response.definitions[0].type_alias, 'User');
+    });
+
+    // #246: expanded_definition must be the fully-inlined STRUCTURAL form —
+    // named member types expanded to their structure, recursively. These shapes
+    // mirror the xrepo-corpus-1 gateway resolver (Money / ApiResponse<T> /
+    // OrderStatus / optional note) and pin the exact strings the eval scores.
+    describe('expanded inlines named member types (#246)', () => {
+      // Self-contained .d.ts equivalent to the corpus gateway shapes.
+      const corpusDts = [
+        'export interface Money { amountCents: number; currency: string }',
+        'export type OrderStatus =',
+        '  | { kind: "placed"; placedAt: string }',
+        '  | { kind: "refunded"; refundedAt: string; reason?: string };',
+        'export interface Order { id: string; total: Money; status: OrderStatus; note?: string }',
+        'export interface ApiResponse<T> { data: T; errors: string[] }',
+        'export type Endpoint_OrderResp = ApiResponse<Order>;',
+        'export type Endpoint_OrdersResp = Order[];',
+        'export type Endpoint_OrderUpdated = Order;',
+        'export type WithDate = { id: string; created: Date };',
+        'export type Pair = [number, string];',
+      ].join('\n');
+
+      async function resolveOne(
+        requestId: string,
+        alias: string,
+      ): Promise<string> {
+        const response = await client.send<{
+          status: string;
+          definitions?: Array<{
+            type_alias: string;
+            definition: string;
+            expanded: string;
+          }>;
+        }>({
+          action: 'resolve_definitions',
+          request_id: requestId,
+          bundled_dts: corpusDts,
+          aliases: [alias],
+        });
+        assert.strictEqual(response.status, 'success');
+        const def = response.definitions?.find((d) => d.type_alias === alias);
+        assert.ok(def, `expected a definition for ${alias}`);
+        return def.expanded;
+      }
+
+      it('inlines a nested named object (Money -> { amountCents; currency })', async () => {
+        const expanded = await resolveOne('resolve-money', 'Endpoint_OrderUpdated');
+        assert.ok(
+          !/total: Money/.test(expanded),
+          'must NOT leave the named member ref `total: Money`',
+        );
+        assert.ok(
+          expanded.includes('total: { amountCents: number; currency: string; }'),
+          `nested Money should inline structurally; got: ${expanded}`,
+        );
+      });
+
+      it('inlines a generic wrapper (ApiResponse<Order>) fully', async () => {
+        const expanded = await resolveOne('resolve-generic', 'Endpoint_OrderResp');
+        assert.strictEqual(
+          expanded,
+          '{ data: { id: string; total: { amountCents: number; currency: string; }; status: { kind: "placed"; placedAt: string; } | { kind: "refunded"; refundedAt: string; reason?: string; }; note?: string; }; errors: string[]; }',
+        );
+      });
+
+      it('inlines a discriminated union field (OrderStatus)', async () => {
+        const expanded = await resolveOne('resolve-union', 'OrderStatus');
+        assert.strictEqual(
+          expanded,
+          '{ kind: "placed"; placedAt: string; } | { kind: "refunded"; refundedAt: string; reason?: string; }',
+        );
+      });
+
+      it('renders an optional field as `note?: string` (strips undefined)', async () => {
+        const expanded = await resolveOne('resolve-optional', 'Endpoint_OrderUpdated');
+        assert.ok(
+          expanded.includes('note?: string'),
+          `optional note should render as note?: string; got: ${expanded}`,
+        );
+        assert.ok(
+          !expanded.includes('note?: string | undefined'),
+          'optional field must not carry an explicit `| undefined`',
+        );
+      });
+
+      it('inlines an array element while keeping the [] suffix', async () => {
+        const expanded = await resolveOne('resolve-array', 'Endpoint_OrdersResp');
+        assert.ok(expanded.endsWith('}[]'), `should be a structural object array; got: ${expanded}`);
+        assert.ok(expanded.includes('total: { amountCents: number; currency: string; }'));
+      });
+
+      it('keeps library types by name (Date is not inlined)', async () => {
+        const expanded = await resolveOne('resolve-date', 'WithDate');
+        assert.strictEqual(expanded, '{ id: string; created: Date; }');
+      });
+
+      it('keeps tuple types as `[a, b]` without exploding into Array.prototype', async () => {
+        const expanded = await resolveOne('resolve-tuple', 'Pair');
+        assert.strictEqual(expanded, '[number, string]');
+      });
     });
 
     it('should fail before init', async () => {
