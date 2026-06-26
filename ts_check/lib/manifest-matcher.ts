@@ -269,13 +269,12 @@ export class ManifestMatcher {
    * a single summary line is logged so the drop is never silent. A stray
    * non-HTTP entry can thus never zero out the entire verdict set again (#253).
    */
-  private retainHttpEntries(entries: ManifestEntry[], source: string): ManifestEntry[] {
+  private retainHttpEntries(entries: unknown[], source: string): ManifestEntry[] {
     const retained: ManifestEntry[] = [];
     let skipped = 0;
 
     for (const entry of entries) {
-      const isHttp = entry.protocol === 'http' && !!entry.method && !!entry.path;
-      if (isHttp) {
+      if (this.isHttpManifestEntry(entry)) {
         retained.push(entry);
       } else {
         skipped++;
@@ -284,12 +283,34 @@ export class ManifestMatcher {
 
     if (skipped > 0) {
       console.warn(
-        `[manifest] Skipped ${skipped} non-HTTP entr${skipped === 1 ? 'y' : 'ies'} in ${source} ` +
-          `(ts_check is HTTP-only; other protocols are checked by their own pipelines)`
+        `[manifest] Skipped ${skipped} non-checkable entr${skipped === 1 ? 'y' : 'ies'} in ${source} ` +
+          `(not HTTP, or missing method/path; ts_check is HTTP-only — other protocols are checked by their own pipelines)`
       );
     }
 
     return retained;
+  }
+
+  /**
+   * Shape guard for raw, possibly-malformed manifest JSON: an entry ts_check can
+   * check is an object whose `protocol` is "http" with non-empty string `method`
+   * and `path`. GraphQL/socket keys serialise without method/path and are
+   * filtered out here (#253). Full structural validation of the surviving HTTP
+   * entries is `validateEntry`'s job — a genuinely-malformed HTTP entry still
+   * throws there.
+   */
+  private isHttpManifestEntry(entry: unknown): entry is ManifestEntry {
+    if (typeof entry !== 'object' || entry === null) {
+      return false;
+    }
+    const e = entry as Record<string, unknown>;
+    return (
+      e.protocol === 'http' &&
+      typeof e.method === 'string' &&
+      e.method.length > 0 &&
+      typeof e.path === 'string' &&
+      e.path.length > 0
+    );
   }
 
   /**
