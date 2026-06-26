@@ -81,6 +81,21 @@ jobs:
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture
 
+      # Archive the cross-repo type-check artifacts so compat verdicts are
+      # inspectable post-run. The release binary auto-discovers ts_check/ via
+      # CARGO_MANIFEST_DIR and `recreate_type_files_and_check` writes the bundled
+      # `<repo>_types.d.ts` files, producer-/consumer-manifest.json, and
+      # type-check-results.json under the repo's ts_check/output/. `if: always()`
+      # captures even when the eval's §7 compat-absence guard reds the run — that
+      # is exactly when these artifacts are needed to diagnose the false-negative.
+      - name: Upload ts_check output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts_check-output
+          path: ts_check/output/
+          if-no-files-found: warn
+
       # Push the run's record to the durable Axiom history (carrick-cloud
       # eval-ingest). The scanner mints its own OIDC token internally and can't
       # share it, so this step mints one for the same audience the cloud expects.
