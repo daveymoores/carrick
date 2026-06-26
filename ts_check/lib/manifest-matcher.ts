@@ -237,7 +237,16 @@ export class ManifestMatcher {
         throw new Error('Manifest missing required field: entries (must be an array)');
       }
 
-      // Validate entries
+      // ts_check is the HTTP TS-assignability checker; non-HTTP entries
+      // (GraphQL/socket OperationKeys, which serialise without method/path)
+      // are scored by their own pipelines and must be skipped here. The
+      // scanner already filters them out of the manifest files it writes
+      // (write_manifest_files), but a stray non-HTTP entry must never crash
+      // the whole verdict run again (#253), so we drop them defensively and
+      // leave a trace rather than throwing.
+      manifest.entries = this.retainHttpEntries(manifest.entries, absolutePath);
+
+      // Validate the surviving HTTP entries.
       for (const entry of manifest.entries) {
         this.validateEntry(entry);
       }
@@ -249,6 +258,59 @@ export class ManifestMatcher {
       }
       throw err;
     }
+  }
+
+  /**
+   * Filter a manifest entry list down to the HTTP entries ts_check can check.
+   *
+   * An entry is non-HTTP when its `protocol` is not "http" or it lacks the
+   * `method`/`path` an HTTP key carries (GraphQL/socket keys serialise without
+   * them). Those are skipped — they belong to other pipelines (#236/#248) — and
+   * a single summary line is logged so the drop is never silent. A stray
+   * non-HTTP entry can thus never zero out the entire verdict set again (#253).
+   */
+  private retainHttpEntries(entries: unknown[], source: string): ManifestEntry[] {
+    const retained: ManifestEntry[] = [];
+    let skipped = 0;
+
+    for (const entry of entries) {
+      if (this.isHttpManifestEntry(entry)) {
+        retained.push(entry);
+      } else {
+        skipped++;
+      }
+    }
+
+    if (skipped > 0) {
+      console.warn(
+        `[manifest] Skipped ${skipped} non-checkable entr${skipped === 1 ? 'y' : 'ies'} in ${source} ` +
+          `(not HTTP, or missing method/path; ts_check is HTTP-only — other protocols are checked by their own pipelines)`
+      );
+    }
+
+    return retained;
+  }
+
+  /**
+   * Shape guard for raw, possibly-malformed manifest JSON: an entry ts_check can
+   * check is an object whose `protocol` is "http" with non-empty string `method`
+   * and `path`. GraphQL/socket keys serialise without method/path and are
+   * filtered out here (#253). Full structural validation of the surviving HTTP
+   * entries is `validateEntry`'s job — a genuinely-malformed HTTP entry still
+   * throws there.
+   */
+  private isHttpManifestEntry(entry: unknown): entry is ManifestEntry {
+    if (typeof entry !== 'object' || entry === null) {
+      return false;
+    }
+    const e = entry as Record<string, unknown>;
+    return (
+      e.protocol === 'http' &&
+      typeof e.method === 'string' &&
+      e.method.length > 0 &&
+      typeof e.path === 'string' &&
+      e.path.length > 0
+    );
   }
 
   /**
@@ -271,6 +333,9 @@ export class ManifestMatcher {
       throw new Error('Manifest missing required field: entries (must be an array)');
     }
 
+    // Skip non-HTTP entries before validating (see loadManifest / #253).
+    manifest.entries = this.retainHttpEntries(manifest.entries, '<string>');
+
     for (const entry of manifest.entries) {
       this.validateEntry(entry);
     }
@@ -279,7 +344,11 @@ export class ManifestMatcher {
   }
 
   /**
-   * Validate a manifest entry has all required fields
+   * Validate a manifest entry has all required fields.
+   *
+   * Callers must drop non-HTTP entries via `retainHttpEntries` first; by the
+   * time an entry reaches here it is expected to be HTTP, so a missing
+   * `method`/`path`/`protocol` is a genuine data bug and still throws.
    */
   private validateEntry(entry: ManifestEntry): void {
     if (!entry.method) {

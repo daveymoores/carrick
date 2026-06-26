@@ -219,18 +219,151 @@ describe('ManifestMatcher', () => {
       );
     });
 
-    it('should throw error for invalid entry', () => {
+    it('should throw error for a structurally-invalid HTTP entry', () => {
       const filePath = path.join(tempDir, 'invalid-entry.json');
+      // An HTTP entry (protocol/method/path present) missing other required
+      // fields is a genuine data bug and must still throw — it is not a
+      // skippable non-HTTP entry.
       fs.writeFileSync(
         filePath,
         JSON.stringify({
           repo_name: 'test',
           commit_hash: 'abc123',
-          entries: [{ method: 'GET' }], // Missing required fields
+          entries: [{ protocol: 'http', method: 'GET', path: '/api/users' }],
         })
       );
 
       assert.throws(() => matcher.loadManifest(filePath), /missing required field/);
+    });
+
+    // --- #253 regression: non-HTTP entries must be skipped, not fatal ---
+
+    it('should skip non-HTTP entries and still load the HTTP ones', () => {
+      const httpEntry = createManifestEntry(
+        'GET',
+        '/orders/:id',
+        'OrderResponse',
+        'producer',
+        'src/routes.ts',
+        10
+      );
+      // GraphQL/socket OperationKeys serialise without method/path; previously
+      // these threw in validateEntry and zeroed out every verdict (#253).
+      const graphqlEntry = {
+        protocol: 'graphql',
+        kind: 'query',
+        field: 'order',
+        type_alias: 'OrderQueryResult',
+        role: 'producer',
+        type_kind: 'response',
+        file_path: 'src/schema.ts',
+        line_number: 5,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: 'src/schema.ts',
+          span_start: null,
+          span_end: null,
+          line_number: 5,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      };
+      const socketEntry = {
+        protocol: 'socket',
+        event: 'order.created',
+        direction: 'server_to_client',
+        type_alias: 'OrderCreatedEvent',
+        role: 'producer',
+        type_kind: 'response',
+        file_path: 'src/sockets.ts',
+        line_number: 7,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: 'src/sockets.ts',
+          span_start: null,
+          span_end: null,
+          line_number: 7,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      };
+
+      const filePath = path.join(tempDir, 'mixed-protocol.json');
+      fs.writeFileSync(
+        filePath,
+        JSON.stringify({
+          repo_name: 'orders-svc',
+          commit_hash: 'abc123',
+          entries: [graphqlEntry, httpEntry, socketEntry],
+        })
+      );
+
+      // Must NOT throw, and must keep only the HTTP entry.
+      const loaded = matcher.loadManifest(filePath);
+      assert.strictEqual(loaded.entries.length, 1);
+      assert.strictEqual(loaded.entries[0].protocol, 'http');
+      assert.strictEqual(loaded.entries[0].path, '/orders/:id');
+    });
+
+    it('should still match HTTP edges when a non-HTTP entry is present', () => {
+      const producerPath = path.join(tempDir, 'producer.json');
+      const consumerPath = path.join(tempDir, 'consumer.json');
+
+      const graphqlEntry = {
+        protocol: 'graphql',
+        kind: 'query',
+        field: 'order',
+        type_alias: 'OrderQueryResult',
+        role: 'producer',
+        type_kind: 'response',
+        file_path: 'src/schema.ts',
+        line_number: 5,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: 'src/schema.ts',
+          span_start: null,
+          span_end: null,
+          line_number: 5,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      };
+
+      fs.writeFileSync(
+        producerPath,
+        JSON.stringify({
+          repo_name: 'orders-svc',
+          commit_hash: 'abc123',
+          entries: [
+            graphqlEntry,
+            createManifestEntry('GET', '/orders/:id', 'OrderResponse', 'producer', 'src/routes.ts', 10),
+          ],
+        })
+      );
+      fs.writeFileSync(
+        consumerPath,
+        JSON.stringify({
+          repo_name: 'web-frontend',
+          commit_hash: 'def456',
+          entries: [
+            createManifestEntry('GET', '/orders/:id', 'OrderData', 'consumer', 'src/api.ts', 20),
+          ],
+        })
+      );
+
+      const producers = matcher.loadManifest(producerPath);
+      const consumers = matcher.loadManifest(consumerPath);
+
+      const result = matcher.matchEndpoints(producers, consumers);
+      assert.strictEqual(result.matches.length, 1);
+      assert.strictEqual(result.matches[0].producer.path, '/orders/:id');
+      assert.strictEqual(result.matches[0].consumer.path, '/orders/:id');
     });
   });
 
