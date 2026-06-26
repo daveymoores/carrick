@@ -63,34 +63,47 @@ const SKIP_DIRS: &[&str] = &[
     "__generated__", // Relay artifacts — out of scope
 ];
 
-/// Extract GraphQL operations from a repository: `.graphql`/`.gql` files
-/// under `repo_root` plus tagged template literals in the given service
-/// files (the same TS/JS set the rest of the pipeline analyzes).
-pub fn scan_repo(repo_root: &Path, service_files: &[PathBuf]) -> GraphqlExtraction {
+/// Extract GraphQL operations for a single service: `.graphql`/`.gql` SDL files
+/// under the service's own `scan_roots` plus tagged template literals in the
+/// given service files (the same TS/JS set the rest of the pipeline analyzes).
+///
+/// `scan_roots` are the service's own directories (its `directory` plus any
+/// `include` roots), NOT the whole monorepo. Walking the repo root here would
+/// attribute a sibling package's schema to every service in the monorepo (#242):
+/// `orders-pkg` would be credited with `gateway`'s `query order` producer.
+pub fn scan_repo(scan_roots: &[PathBuf], service_files: &[PathBuf]) -> GraphqlExtraction {
     let mut extraction = GraphqlExtraction::default();
 
-    for entry in WalkDir::new(repo_root)
-        .into_iter()
-        .filter_entry(|e| {
-            !e.file_name()
-                .to_str()
-                .map(|name| SKIP_DIRS.contains(&name))
-                .unwrap_or(false)
-        })
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        let is_graphql_file = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| ext == "graphql" || ext == "gql");
-        if !is_graphql_file {
-            continue;
+    // Overlapping roots (a service `include` that overlaps its `directory`) must
+    // not extract the same schema twice, so dedup SDL paths across roots.
+    let mut seen_sdl: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for root in scan_roots {
+        for entry in WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| {
+                !e.file_name()
+                    .to_str()
+                    .map(|name| SKIP_DIRS.contains(&name))
+                    .unwrap_or(false)
+            })
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            let is_graphql_file = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext == "graphql" || ext == "gql");
+            if !is_graphql_file {
+                continue;
+            }
+            if !seen_sdl.insert(path.to_path_buf()) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            extraction.merge(extract_from_document_text(&content, path, 1));
         }
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        extraction.merge(extract_from_document_text(&content, path, 1));
     }
 
     for file in service_files {
@@ -432,5 +445,40 @@ export const typeDefs = gql`
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(keys(&result.producers), vec!["graphql|query|orders"]);
+    }
+
+    #[test]
+    fn sdl_walk_is_scoped_to_service_roots() {
+        // #242: a monorepo package's SDL must be attributed only to that
+        // package's own roots, never to a sibling. Walking the repo root (as the
+        // old signature did) would credit package `b` with package `a`'s schema.
+        let base = std::env::temp_dir().join(format!("carrick-gql-scope-{}", std::process::id()));
+        let pkg_a = base.join("packages/a/src");
+        let pkg_b = base.join("packages/b/src");
+        std::fs::create_dir_all(&pkg_a).unwrap();
+        std::fs::create_dir_all(&pkg_b).unwrap();
+        std::fs::write(
+            pkg_a.join("schema.graphql"),
+            "type Query { order(id: ID!): String }",
+        )
+        .unwrap();
+
+        let a_root = base.join("packages/a");
+        let b_root = base.join("packages/b");
+        let no_files: &[PathBuf] = &[];
+        let scoped_a = scan_repo(std::slice::from_ref(&a_root), no_files);
+        let scoped_b = scan_repo(std::slice::from_ref(&b_root), no_files);
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(
+            keys(&scoped_a.producers),
+            vec!["graphql|query|order"],
+            "package a's own root must find its schema"
+        );
+        assert!(
+            scoped_b.producers.is_empty(),
+            "package b must NOT be credited with sibling a's schema, got {:?}",
+            keys(&scoped_b.producers)
+        );
     }
 }
