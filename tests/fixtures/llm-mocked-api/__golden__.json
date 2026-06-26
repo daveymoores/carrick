@@ -13,7 +13,7 @@
       "type_alias": "Endpoint_a9cce7d0d8d0d9e6_Response",
       "type_state": "Explicit",
       "resolved_definition": "export interface Endpoint_a9cce7d0d8d0d9e6_Response {\n  id: number;\n  name: string;\n  email: string;\n}",
-      "expanded_definition": "Endpoint_a9cce7d0d8d0d9e6_Response",
+      "expanded_definition": "{ id: number; name: string; email: string; }",
       "is_explicit": true,
       "primary_type_symbol": "User"
     },
