@@ -8,11 +8,21 @@
  * `await`/`as`/paren/`!` wrappers and let an explicit `as T` cast or typed
  * binding/annotation on an ancestor win over the call's raw type.
  *
+ * Per #257 the recovered annotation is now emitted STRUCTURALLY (the object's
+ * member shape), not as the bare type name. A bare name is fine inside the
+ * source project but becomes a dangling reference in the cross-repo `.d.ts`
+ * bundle (alias lines only, no source declarations) → resolves to `any` →
+ * `unverifiable`. So `RegisterRequest` is recovered as
+ * `{ username: string; password: string; }`.
+ *
  * The control case proves the genuinely-untyped path is preserved: an
  * untyped `await request.formData()` must stay `FormData`/`any` (faithful,
  * not a bug — #133 lists it as NOT-a-bug), never "recovered" into a
  * declared type that was never written.
  */
+
+/** Structural form of `interface RegisterRequest { username; password }`. */
+const REGISTER_REQUEST_STRUCTURAL = '{ username: string; password: string; }';
 
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
@@ -68,7 +78,8 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
   it('follows an `as T` cast on an awaited request.json()', async () => {
     // Locator covers the `request.json()` call inside
     // `(await request.json()) as RegisterRequest`. The raw type is
-    // `Promise<any>`; the `as RegisterRequest` cast must win.
+    // `Promise<any>`; the `as RegisterRequest` cast must win — recovered as
+    // the structural member shape (#257), not the dangling name.
     const call = spanOf('(await request.json()) as RegisterRequest');
     const innerStart = call.start + '(await '.length;
     const response = await client.send<InferResponseShape>({
@@ -95,8 +106,8 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
     );
     assert.strictEqual(
       inferred.type_string,
-      'RegisterRequest',
-      `expected the cast type to win, got ${inferred.type_string}`
+      REGISTER_REQUEST_STRUCTURAL,
+      `expected the cast type to win (structural), got ${inferred.type_string}`
     );
     assert.strictEqual(
       inferred.is_explicit,
@@ -137,8 +148,8 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
     );
     assert.strictEqual(
       inferred.type_string,
-      'RegisterRequest',
-      `expected the cast type to win when located ON the cast, got ${inferred.type_string}`
+      REGISTER_REQUEST_STRUCTURAL,
+      `expected the cast type to win when located ON the cast (structural), got ${inferred.type_string}`
     );
     assert.strictEqual(
       inferred.is_explicit,
@@ -176,8 +187,8 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
     );
     assert.strictEqual(
       inferred.type_string,
-      'RegisterRequest',
-      `expected the typed binding to win, got ${inferred.type_string}`
+      REGISTER_REQUEST_STRUCTURAL,
+      `expected the typed binding to win (structural), got ${inferred.type_string}`
     );
     assert.strictEqual(
       inferred.is_explicit,
@@ -218,7 +229,7 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
     );
     assert.notStrictEqual(
       inferred.type_string,
-      'RegisterRequest',
+      REGISTER_REQUEST_STRUCTURAL,
       'must not invent a declared type that was never written'
     );
   });

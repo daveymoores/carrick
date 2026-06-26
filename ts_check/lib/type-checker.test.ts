@@ -465,6 +465,98 @@ describe('TypeCompatibilityChecker', () => {
       assert.strictEqual(result.mismatches.length, 1);
     });
 
+    it('reads a dangling consumer name as unverifiable but its structural shape as incompatible (#257)', async () => {
+      // The #257 inference bug: a consumer like `res.json() as Promise<OrderView>`
+      // wrote the bare NAME `= OrderView` into the cross-repo bundle. The bundle
+      // carries only alias lines and no source declaration for `OrderView`, so
+      // the name dangles → resolves to `any` → the edge reads unverifiable and
+      // the genuine string-vs-number mismatch is masked.
+      //
+      // Producer `Order.id` is number; consumer `OrderView.id` is string. The two
+      // halves of this test pin both ends of the fix:
+      //  - bundling the bare dangling name reproduces the masked `unverifiable`;
+      //  - bundling the STRUCTURAL shape the fixed inferrer now emits surfaces the
+      //    real `incompatible`.
+      const danglingProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      // `= MissingShape` referencing a type with no declaration in the bundle —
+      // exactly the dangling alias the old inference path produced. It resolves
+      // to `any`, so the comparison is unverifiable.
+      danglingProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type Order = { id: number; amountCents: number; currency: string };
+        export type OrderView = MissingShape;
+        `,
+        { overwrite: true }
+      );
+
+      const structuralProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      // The member shape the fixed inferrer now emits for the same consumer.
+      structuralProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type Order = { id: number; amountCents: number; currency: string };
+        export type OrderView = { id: string; currency: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-api',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/orders/:id',
+            'Order',
+            'producer',
+            'routes.ts',
+            10
+          ),
+        ],
+      };
+
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry(
+            'GET',
+            '/orders/:id',
+            'OrderView',
+            'consumer',
+            'api.ts',
+            5
+          ),
+        ],
+      };
+
+      const dangling = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        danglingProject
+      );
+      // Before the fix: the dangling name masks the mismatch as unverifiable.
+      assert.strictEqual(dangling.incompatiblePairs, 0);
+      assert.strictEqual(dangling.compatiblePairs, 0);
+      assert.strictEqual(dangling.unknownPairs.length, 1);
+
+      const structural = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        structuralProject
+      );
+      // After the fix: the real shape surfaces the genuine string-vs-number mismatch.
+      assert.strictEqual(structural.incompatiblePairs, 1);
+      assert.strictEqual(structural.compatiblePairs, 0);
+      assert.strictEqual(structural.unknownPairs.length, 0);
+      assert.strictEqual(structural.mismatches.length, 1);
+    });
+
     it('flags only the Carrick-marked `= unknown` as the injected placeholder (#244)', async () => {
       // The marked alias is the injected placeholder: it short-circuits on the
       // type_state=unknown path. The unmarked, developer-authored `= unknown`
