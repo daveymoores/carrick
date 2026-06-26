@@ -46,6 +46,43 @@ import { validateInferRequestItem } from './validators.js';
 import { expandTypeStructural } from './type-structural-expander.js';
 
 /**
+ * TS/lib globals and primitives that must never be emitted as a deterministic
+ * type anchor (`primary_type_symbol`). A payload whose resolved symbol is one of
+ * these is library machinery, not a user contract — mirror of the Rust-side
+ * `is_builtin_type` filter in `socket_io.rs` so the HTTP-inference anchor and the
+ * socket anchor reject the same set.
+ */
+const BUILTIN_ANCHOR_SYMBOLS = new Set<string>([
+  'any',
+  'unknown',
+  'never',
+  'void',
+  'object',
+  'string',
+  'number',
+  'boolean',
+  'bigint',
+  'symbol',
+  'undefined',
+  'null',
+  'Array',
+  'Promise',
+  'Record',
+  'Map',
+  'Set',
+  'Date',
+  'Object',
+  'String',
+  'Number',
+  'Boolean',
+  'Symbol',
+  'BigInt',
+  'Function',
+  'RegExp',
+  'Error',
+]);
+
+/**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
  *
  * `Type.getText()` truncates large/anonymous object types to ~160 chars and inserts
@@ -253,6 +290,13 @@ export class TypeInferrer {
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
+    } else {
+      // No wrapper rule fired: the (awaited) return resolved to its own type.
+      // A named object return (`async (): Promise<Payment> => …`) renders as the
+      // bare name `Payment`, which dangles in the source-less cross-repo bundle.
+      // Expand the resolved object structurally so the real members reach the
+      // bundle. `unwrapPromise` below is then a no-op on the structural form.
+      typeString = this.expandResolvedTypeStructural(awaitedType, typeString);
     }
 
     typeString = this.unwrapPromise(typeString, returnType);
@@ -262,7 +306,8 @@ export class TypeInferrer {
       typeString,
       isExplicit,
       this.getNodeLocation(func),
-      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
+      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
+      this.primaryTypeSymbol(awaitedType)
     );
   }
 
@@ -391,6 +436,14 @@ export class TypeInferrer {
     );
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
+    } else {
+      // No wrapper rule fired: the payload resolved straight to its own type.
+      // If that's a named object (`res.json(payment)` with `payment: Payment`),
+      // `typeText` keeps the bare name `Payment`, which dangles in the
+      // source-less cross-repo bundle → `any` → unverifiable. Expand the
+      // resolved object structurally so the real members land in the bundle.
+      const resolved = this.unwrapPromiseType(payloadType);
+      typeString = this.expandResolvedTypeStructural(resolved, typeString);
     }
 
     return this.createInferredType(
@@ -398,7 +451,8 @@ export class TypeInferrer {
       typeString,
       false,
       this.getNodeLocation(payloadNode),
-      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
+      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
+      this.primaryTypeSymbol(this.unwrapPromiseType(payloadType))
     );
   }
 
@@ -1261,6 +1315,48 @@ export class TypeInferrer {
     }
   }
 
+  /**
+   * Producer-side analogue of `expandAnnotationTypeNode` that works from a
+   * resolved `Type` rather than a syntactic annotation node.
+   *
+   * `inferResponseBody`/`inferFunctionReturn` resolve a payload to a named
+   * object type (e.g. `Payment`), then render it with `typeText`, which keeps
+   * the bare name. In the source-less cross-repo `.d.ts` bundle that name is a
+   * dangling `export type <alias> = Payment;` → resolves to `any` →
+   * `unverifiable` → `compat = None`. Expanding the resolved object structurally
+   * lands the real members (`{ id: string; … }`) in the bundle so the producer
+   * can be compared. Mirror of #257's consumer-side fix; keeps the bare text for
+   * primitives, library types, and anything the expander leaves by name.
+   *
+   * `fallback` is the already-computed type text (post Promise/wrapper unwrap),
+   * preserved verbatim when expansion does not inline an object.
+   */
+  private expandResolvedTypeStructural(type: Type, fallback: string): string {
+    try {
+      const expanded = expandTypeStructural(type);
+      return expanded.startsWith('{') ? expanded : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /**
+   * The deterministic source symbol of a resolved type (`Payment` for a payload
+   * typed `Payment`), or `undefined` when there is no single user-defined
+   * symbol to anchor on. This is the same `getSymbol() || getAliasSymbol()` name
+   * the socket anchor already derives (`socket_io.rs`), filtered through
+   * `BUILTIN_ANCHOR_SYMBOLS` so TS/lib globals (`Promise`, `Array`, `Date`,
+   * primitives, …) never become an anchor. Used to populate
+   * `primary_type_symbol` so the manifest anchor no longer depends on the LLM.
+   */
+  private primaryTypeSymbol(type: Type): string | undefined {
+    const name = (type.getSymbol() || type.getAliasSymbol())?.getName();
+    if (!name || name === '__type' || BUILTIN_ANCHOR_SYMBOLS.has(name)) {
+      return undefined;
+    }
+    return name;
+  }
+
   // ===========================================================================
   // Node Finding
   // ===========================================================================
@@ -1709,7 +1805,8 @@ export class TypeInferrer {
     typeString: string,
     isExplicit: boolean,
     sourceLocation: SourceLocation,
-    payloadTypeString?: string
+    payloadTypeString?: string,
+    primaryTypeSymbol?: string
   ): InferredType {
     const alias =
       request.alias ||
@@ -1722,6 +1819,7 @@ export class TypeInferrer {
       source_location: sourceLocation,
       infer_kind: request.infer_kind,
       payload_type_string: payloadTypeString,
+      primary_type_symbol: primaryTypeSymbol,
     };
   }
 

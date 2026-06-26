@@ -1955,6 +1955,25 @@ fn enrich_manifest_with_type_resolution(
         }
     }
 
+    // Deterministic anchor source (#240): the sidecar resolves each inferred
+    // type's real source symbol (`Payment`) off the ts-morph `Type`, so a
+    // manifest entry whose anchor the LLM left unset can be filled from it.
+    // Join by `(file_path, start_line)` — the same coordinates
+    // `stamp_manifest_anchor_symbols` uses — so the symbol lands on the right
+    // op. First non-None wins per location, so a later inferred entry can't
+    // clobber an earlier real symbol.
+    let mut inferred_symbols: HashMap<(String, u32), String> = HashMap::new();
+    for inferred in &type_resolution.inferred_types {
+        if let Some(symbol) = inferred.primary_type_symbol.as_ref() {
+            inferred_symbols
+                .entry((
+                    inferred.source_location.file_path.clone(),
+                    inferred.source_location.start_line,
+                ))
+                .or_insert_with(|| symbol.clone());
+        }
+    }
+
     // Also check the bundled .d.ts content for defined types
     // This catches types that were successfully bundled but not in the manifest.
     // Exclude aliases defined as `= unknown` — those are placeholders for failed
@@ -1985,6 +2004,17 @@ fn enrich_manifest_with_type_resolution(
 
     // Update manifest entries
     for entry in manifest.iter_mut() {
+        // Fill the deterministic anchor ONLY when the LLM left it unset, so the
+        // ops where the model already emitted a correct symbol (POST /payments,
+        // socket) are never regressed. Stamping runs before enrichment, so any
+        // entry still `None` here had no LLM anchor.
+        if entry.primary_type_symbol.is_none()
+            && let Some(symbol) =
+                inferred_symbols.get(&(entry.file_path.clone(), entry.line_number))
+        {
+            entry.primary_type_symbol = Some(symbol.clone());
+        }
+
         if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
             // Check if the type is actually resolved (not "unknown")
             let is_unknown_type = type_string.trim() == "unknown"
@@ -3616,6 +3646,7 @@ mod tests {
                 end_column: None,
             },
             infer_kind: InferKind::CallResult,
+            primary_type_symbol: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -3642,11 +3673,80 @@ mod tests {
                 end_column: None,
             },
             infer_kind: InferKind::CallResult,
+            primary_type_symbol: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+    }
+
+    /// An inferred type carrying a deterministic symbol at the entry's location
+    /// (`lib/api.ts:5`), with a hashed alias that doesn't match `type_alias`.
+    /// `consumer_entry` sits at `lib/api.ts:5`, so the location join fires.
+    fn inferred_with_symbol(symbol: &str) -> InferredType {
+        InferredType {
+            // A hashed alias that deliberately does NOT equal the manifest
+            // `type_alias` — the anchor join is by location, not alias.
+            alias: "Endpoint_abc123_Response".to_string(),
+            type_string: "{ id: string; currency: string }".to_string(),
+            is_explicit: false,
+            source_location: SourceLocation {
+                file_path: "lib/api.ts".to_string(),
+                start_line: 5,
+                end_line: 5,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::ResponseBody,
+            primary_type_symbol: Some(symbol.to_string()),
+        }
+    }
+
+    /// #240: the deterministic anchor fills `primary_type_symbol` from the
+    /// inferred symbol, joined by `(file_path, line)`, when the LLM left it None.
+    #[test]
+    fn enrich_fills_anchor_from_inferred_symbol_when_llm_none() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        // The LLM stamped nothing onto this op.
+        assert_eq!(manifest[0].primary_type_symbol, None);
+
+        let mut resolution = empty_resolution();
+        resolution
+            .inferred_types
+            .push(inferred_with_symbol("OrderView"));
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(
+            manifest[0].primary_type_symbol.as_deref(),
+            Some("OrderView"),
+            "anchor must be filled from the inferred symbol when the LLM left it None"
+        );
+    }
+
+    /// #240: an op the LLM already anchored correctly must NOT be overwritten by
+    /// the inferred symbol — the deterministic fill is None-only so POST
+    /// /payments and socket ops keep their model-emitted symbol.
+    #[test]
+    fn enrich_does_not_override_existing_llm_anchor() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        // The LLM already stamped the real symbol for this op.
+        manifest[0].primary_type_symbol = Some("Payment".to_string());
+
+        let mut resolution = empty_resolution();
+        // The sidecar inferred a DIFFERENT symbol at the same location.
+        resolution
+            .inferred_types
+            .push(inferred_with_symbol("OrderView"));
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(
+            manifest[0].primary_type_symbol.as_deref(),
+            Some("Payment"),
+            "an existing LLM anchor must never be regressed by the inferred symbol"
+        );
     }
 
     /// The Carrick-injected `= unknown` placeholder (carrying the marker) in the

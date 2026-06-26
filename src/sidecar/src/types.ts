@@ -543,6 +543,14 @@ export interface InferredType {
   infer_kind: InferKind;
   /** The unwrapped/extracted payload type (if different from type_string) */
   payload_type_string?: string;
+  /**
+   * The deterministic source symbol of the resolved type (`Payment`), derived
+   * from the ts-morph `Type`'s `getSymbol() || getAliasSymbol()` name with
+   * TS/lib globals filtered out. Lets the manifest anchor (`primary_type_symbol`)
+   * be filled without depending on the LLM. `undefined` when the resolved type
+   * has no single user-defined symbol to anchor on.
+   */
+  primary_type_symbol?: string;
 }
 
 /**

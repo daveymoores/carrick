@@ -133,9 +133,12 @@ describe('Type inferrer gap regressions', () => {
       (t) => t.alias === 'GapSubstringControl'
     );
     assert.ok(inferred, 'expected inferred type for accurate locator');
-    assert.ok(
-      inferred.type_string.includes('User'),
-      `expected User[], got ${inferred.type_string}`
+    // #257/#240: the named payload is now expanded structurally, not the
+    // dangling bare `User[]`.
+    assert.strictEqual(
+      inferred.type_string,
+      '{ id: number; name: string; }[]',
+      `expected structural User[], got ${inferred.type_string}`
     );
   });
 
@@ -195,9 +198,11 @@ describe('Type inferrer gap regressions', () => {
       (t) => t.alias === 'GapPayloadSpanControl'
     );
     assert.ok(inferred, 'expected inferred type for payload-emission span');
-    assert.ok(
-      inferred.type_string.includes('User'),
-      `expected User[], got ${inferred.type_string}`
+    // #257/#240: structural members, not the dangling bare `User[]`.
+    assert.strictEqual(
+      inferred.type_string,
+      '{ id: number; name: string; }[]',
+      `expected structural User[], got ${inferred.type_string}`
     );
   });
 
@@ -224,7 +229,9 @@ describe('Type inferrer gap regressions', () => {
       inferred,
       `expected line-anchored function_return to resolve, got errors: ${JSON.stringify(response.errors)}`
     );
-    assert.strictEqual(inferred.type_string, 'User');
+    // #257/#240: a named object return is expanded structurally, not the
+    // dangling bare `User`.
+    assert.strictEqual(inferred.type_string, '{ id: number; name: string; }');
   });
 
   it('unwraps a union of Promises per member', async () => {
