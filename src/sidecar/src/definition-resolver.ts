@@ -207,10 +207,13 @@ export class DefinitionResolver {
     seen: Set<number>,
     depth: number,
   ): string {
-    const name = prop.getName();
     const optional = (prop.getFlags() & ts.SymbolFlags.Optional) !== 0;
 
     const propDecl = prop.getDeclarations()[0];
+    // Render the key from the declaration's name node so quoted/computed keys
+    // ('x-y', "x y", [Symbol.iterator]) survive as valid TS text rather than
+    // being unquoted into invalid output; fall back to the bare symbol name.
+    const name = this.renderPropertyName(prop, propDecl);
     let propType = propDecl
       ? prop.getTypeAtLocation(propDecl)
       : prop.getDeclaredType();
@@ -233,6 +236,20 @@ export class DefinitionResolver {
 
     const inner = this.expandType(propType, seen, depth + 1);
     return `${name}${optional ? '?' : ''}: ${inner}`;
+  }
+
+  /**
+   * The property key as valid TS text. Uses the declaration's name node so a
+   * quoted (`'x-y'`) or computed (`[Symbol.iterator]`) key keeps its syntax;
+   * `Symbol.getName()` would drop the quoting and emit invalid output. Falls
+   * back to the bare symbol name when there's no usable name node.
+   */
+  private renderPropertyName(prop: Symbol, decl: unknown): string {
+    const node = decl as
+      | { getNameNode?: () => { getText(): string } | undefined }
+      | undefined;
+    const text = node?.getNameNode?.()?.getText();
+    return text && text.length > 0 ? text : prop.getName();
   }
 
   /** True for tuple types (`[a, b]`), which must not be walked as objects. */
@@ -258,7 +275,9 @@ export class DefinitionResolver {
       const sf = decl.getSourceFile();
       if (sf.isInNodeModules()) return true;
       return (
-        sf.isDeclarationFile() && /(^|\/)lib\.[^/]*\.d\.ts$/.test(sf.getFilePath())
+        sf.isDeclarationFile() &&
+        // Normalize separators so a Windows `\\` path still matches lib.*.d.ts.
+        /(^|\/)lib\.[^/]*\.d\.ts$/.test(sf.getFilePath().replace(/\\/g, '/'))
       );
     });
   }
