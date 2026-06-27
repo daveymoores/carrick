@@ -31,6 +31,13 @@ pub struct GraphqlOp {
     pub key: OperationKey,
     pub file_path: PathBuf,
     pub line: u32,
+    /// Deterministic type anchor (`primary_type_symbol`), mirroring the
+    /// HTTP/socket anchors (#248). For SDL producers this is the root field's
+    /// SDL type expression rendered to its canonical form (`Order`, `Order!`,
+    /// `[Order!]!`) — the only anchor source available without a
+    /// framework-specific SDL-field → TS-resolver mapping (that mapping is
+    /// follow-up #268). Document consumers carry no SDL type, so this stays `None`.
+    pub primary_type_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,6 +201,9 @@ pub fn extract_from_document_text(
                     key: OperationKey::graphql(*kind, field.name.clone()),
                     file_path: file_path.to_path_buf(),
                     line: to_line(field.position.line),
+                    // Deterministic anchor: the root field's SDL type
+                    // expression (e.g. `Order`, `Order!`, `[Order!]!`).
+                    primary_type_symbol: Some(render_sdl_type(&field.field_type)),
                 });
             }
         }
@@ -238,12 +248,29 @@ pub fn extract_from_document_text(
                     key: OperationKey::graphql(kind, field.name.clone()),
                     file_path: file_path.to_path_buf(),
                     line: to_line(field.position.line),
+                    // Executable documents carry no SDL type — the consumer's
+                    // TS result-type anchor needs a framework-specific mapping
+                    // (follow-up #268), so leave the anchor unset.
+                    primary_type_symbol: None,
                 });
             }
         }
     }
 
     extraction
+}
+
+/// Render an SDL field type to its canonical GraphQL type expression
+/// (`Order`, `Order!`, `[Order!]!`). This is the deterministic producer anchor
+/// (#248): it travels straight from the parsed schema with no resolver mapping,
+/// so it works for any schema-first SDL regardless of the server framework.
+fn render_sdl_type(ty: &graphql_parser::schema::Type<'_, String>) -> String {
+    use graphql_parser::schema::Type;
+    match ty {
+        Type::NamedType(name) => name.clone(),
+        Type::ListType(inner) => format!("[{}]", render_sdl_type(inner)),
+        Type::NonNullType(inner) => format!("{}!", render_sdl_type(inner)),
+    }
 }
 
 /// Extract operations from `gql`/`graphql` tagged template literals in a
@@ -313,6 +340,107 @@ mod tests {
         let mut keys: Vec<String> = ops.iter().map(|op| op.key.canonical()).collect();
         keys.sort();
         keys
+    }
+
+    /// `(canonical_key, primary_type_symbol)` pairs, sorted, for asserting the
+    /// deterministic anchor derived for each producer.
+    fn anchors(ops: &[GraphqlOp]) -> Vec<(String, Option<String>)> {
+        let mut pairs: Vec<(String, Option<String>)> = ops
+            .iter()
+            .map(|op| (op.key.canonical(), op.primary_type_symbol.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// #248: an SDL producer's deterministic anchor is the root field's SDL type
+    /// expression — bare (`Order`), non-null (`Order!`), and list
+    /// (`[Order!]!`) forms all render canonically, with no resolver mapping.
+    #[test]
+    fn sdl_producers_anchor_on_their_field_type_expression() {
+        let sdl = r#"
+            type Order { id: ID! }
+            type Query {
+                order(id: ID!): Order
+                orders: [Order!]!
+            }
+            type Mutation {
+                refundOrder(id: ID!): Order!
+            }
+            type Subscription {
+                orderUpdated: Order!
+            }
+        "#;
+        let result = extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
+        assert_eq!(
+            anchors(&result.producers),
+            vec![
+                (
+                    "graphql|mutation|refundOrder".to_string(),
+                    Some("Order!".to_string())
+                ),
+                ("graphql|query|order".to_string(), Some("Order".to_string())),
+                (
+                    "graphql|query|orders".to_string(),
+                    Some("[Order!]!".to_string())
+                ),
+                (
+                    "graphql|subscription|orderUpdated".to_string(),
+                    Some("Order!".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// Document consumers carry no SDL type, so their anchor is left unset (the
+    /// TS result-type anchor is the follow-up #268).
+    #[test]
+    fn document_consumers_have_no_sdl_anchor() {
+        let doc = r#"
+            query GetOrder($id: ID!) { order(id: $id) { id } }
+        "#;
+        let result = extract_from_document_text(doc, Path::new("queries.graphql"), 1);
+        assert_eq!(
+            anchors(&result.consumers),
+            vec![("graphql|query|order".to_string(), None)]
+        );
+    }
+
+    /// #248 corpus binding: the anchors derived from the REAL corpus-1 gateway
+    /// schema must equal the `primary_type_symbol` values committed in that
+    /// repo's `expected.json` (the cross-repo eval's anchor ground truth). This
+    /// fails if the extractor drifts OR the ground truth is edited away from the
+    /// deterministic SDL form, keeping the live anchor metric honest without
+    /// Vertex credentials.
+    #[test]
+    fn corpus_gateway_producer_anchors_match_ground_truth() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/xrepo-corpus-1/orders-monorepo/packages/gateway/src");
+        let schema = root.join("schema.graphql");
+        let sdl = std::fs::read_to_string(&schema)
+            .unwrap_or_else(|e| panic!("read corpus schema {}: {e}", schema.display()));
+        let result = extract_from_document_text(&sdl, &schema, 1);
+
+        // The exact ground-truth anchors from
+        // orders-monorepo/expected.json::graphql_operations (producers).
+        assert_eq!(
+            anchors(&result.producers),
+            vec![
+                (
+                    "graphql|mutation|refundOrder".to_string(),
+                    Some("Order!".to_string())
+                ),
+                ("graphql|query|order".to_string(), Some("Order".to_string())),
+                (
+                    "graphql|query|orders".to_string(),
+                    Some("[Order!]!".to_string())
+                ),
+                (
+                    "graphql|subscription|orderUpdated".to_string(),
+                    Some("Order!".to_string())
+                ),
+            ]
+        );
     }
 
     #[test]

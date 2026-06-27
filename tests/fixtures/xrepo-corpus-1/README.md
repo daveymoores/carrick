@@ -111,6 +111,25 @@ and only flat named interfaces. Threaded through the new edges:
   optional producer `note` into a required consumer `OrderUpdate.note`, a quieter
   mismatch than the blunt `id: number` vs `string` REST trap.
 
+### GraphQL type-anchor convention (#248)
+**SDL producers** anchor on the root field's SDL type expression (`Order`,
+`Order!`, `[Order!]!`), derived deterministically straight from the parsed
+schema with no resolver mapping — mirroring how the HTTP/socket producers anchor
+on their ts-morph type symbol. That canonical SDL contract type is the stable
+cross-repo join key (the consumer's SDL field resolves to the same `Order`),
+which is why the producer ground truth here is the SDL type, not the
+framework-specific TS wrapper (`ApiResponse<Order>`).
+
+**Document consumers** keep their real TS result-type anchor in the ground truth
+(`OrderView`, `OrderUpdate`) because that *is* the correct anchor — but an
+executable `gql` document carries no SDL type, and recovering the consumer's TS
+result type means following the document variable into its framework-specific
+client call (`client.request<{ order: OrderView }>(…)`). That derivation is the
+follow-up (#268), so today the consumer anchor still falls back to the hashed
+`type_alias` and the consumer-side anchor metric continues to miss. The
+resolver/consumer TS types above still drive each edge's `resolved_type`
+regardless.
+
 ## Protocol detectability (what the scanner keys on)
 - **GraphQL producer**: `gateway/src/schema.graphql` (SDL). `scan_repo`
   (`src/graphql.rs`) walks the repo for `.graphql`/`.gql` files and indexes
