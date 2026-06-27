@@ -50,18 +50,25 @@ export interface TypeEvidence {
   type_state: ManifestTypeState;
 }
 
+/** Socket message-flow direction, serialised snake_case by the Rust scanner. */
+export type SocketDirection = 'server_to_client' | 'client_to_server';
+
 export interface ManifestEntry {
   /**
-   * Protocol tag carried by the operation key. ts_check is the
-   * TS-assignability checker for HTTP contracts, so only "http" entries are
-   * valid here; other protocols are checked by their own pipelines and must
-   * not be written into these manifests.
+   * Protocol tag carried by the operation key. ts_check runs the same
+   * `TypeCompatibilityChecker` assignability for every protocol it understands:
+   * "http" (matched by method/path) and "socket" (matched by event+direction).
+   * Other protocols are checked by their own pipelines and are dropped here.
    */
-  protocol: 'http';
-  /** HTTP method (GET, POST, PUT, DELETE, etc.) */
-  method: string;
-  /** API path (e.g., /api/users/:id) */
-  path: string;
+  protocol: 'http' | 'socket';
+  /** HTTP method (GET, POST, …). Present on HTTP entries; absent on socket. */
+  method?: string;
+  /** API path (e.g., /api/users/:id). Present on HTTP entries; absent on socket. */
+  path?: string;
+  /** Socket event name (e.g. `payment:settled`). Present on socket entries only. */
+  event?: string;
+  /** Socket message-flow direction. Present on socket entries only. */
+  direction?: SocketDirection;
   /** The type alias for this endpoint */
   type_alias: string;
   /** Whether this is a producer or consumer */
@@ -84,9 +91,18 @@ export interface ManifestEntry {
  * Result of matching a producer-consumer pair
  */
 export interface MatchResult {
-  /** The HTTP method */
+  /**
+   * The pseudo-method this match is keyed on: the HTTP method for HTTP edges,
+   * or the literal `SOCKET` for socket edges. Combined with `path` it forms the
+   * `endpoint` label the Rust verdict-join parses back (`parse_compat_endpoint`).
+   */
   method: string;
-  /** The normalized API path */
+  /**
+   * The identity this match is keyed on: the normalized API path for HTTP, or
+   * the socket canonical `<DIRECTION>|<event>` tail for socket edges (so the
+   * full label `SOCKET <DIRECTION>|<event>` parses back into the same join key
+   * as the Rust `socket|<DIRECTION>|<event>` producer key).
+   */
   path: string;
   /** The type kind being matched */
   type_kind: ManifestTypeKind;
@@ -192,6 +208,51 @@ export function normalizeMethod(method: string): string {
 }
 
 // ============================================================================
+// Socket Identity
+// ============================================================================
+
+/** The pseudo-method socket matches are keyed on, mirroring HTTP's method. */
+export const SOCKET_PSEUDO_METHOD = 'SOCKET';
+
+/**
+ * ASCII direction label used in the canonical socket key, byte-identical to the
+ * Rust `SocketDirection::label()` (`SERVER->CLIENT` / `CLIENT->SERVER`). The
+ * Rust scanner serialises the direction snake_case (`server_to_client`); the
+ * canonical key it builds with `OperationKey::canonical()` uses these labels, so
+ * ts_check must reconstruct the same label to join a socket edge to its verdict.
+ */
+export function socketDirectionLabel(direction: SocketDirection): string {
+  return direction === 'server_to_client' ? 'SERVER->CLIENT' : 'CLIENT->SERVER';
+}
+
+/**
+ * Stable identity for a socket entry: `<DIRECTION>|<event>`. Two socket entries
+ * match iff this string is equal (same event flowing the same direction), the
+ * exact-key semantics the Rust `analyze_exact_key_matches` uses. The full
+ * canonical key on the Rust side is `socket|<DIRECTION>|<event>`; this is its
+ * `<DIRECTION>|<event>` tail, which becomes the `path` of the socket
+ * `MatchResult` so the assembled `endpoint` label round-trips through the
+ * verdict-join.
+ */
+export function socketKey(entry: ManifestEntry): string | null {
+  if (entry.protocol !== 'socket' || !entry.event || !entry.direction) {
+    return null;
+  }
+  return `${socketDirectionLabel(entry.direction)}|${entry.event}`;
+}
+
+/**
+ * Human label for an entry in orphan/diagnostic strings: `<METHOD> <path>` for
+ * HTTP, `socket <DIRECTION>|<event>` for socket.
+ */
+export function entryLabel(entry: ManifestEntry): string {
+  if (entry.protocol === 'socket') {
+    return `socket ${socketKey(entry) ?? entry.event ?? '<unknown>'}`;
+  }
+  return `${entry.method} ${entry.path}`;
+}
+
+// ============================================================================
 // ManifestMatcher Class
 // ============================================================================
 
@@ -237,16 +298,16 @@ export class ManifestMatcher {
         throw new Error('Manifest missing required field: entries (must be an array)');
       }
 
-      // ts_check is the HTTP TS-assignability checker; non-HTTP entries
-      // (GraphQL/socket OperationKeys, which serialise without method/path)
-      // are scored by their own pipelines and must be skipped here. The
-      // scanner already filters them out of the manifest files it writes
-      // (write_manifest_files), but a stray non-HTTP entry must never crash
-      // the whole verdict run again (#253), so we drop them defensively and
-      // leave a trace rather than throwing.
-      manifest.entries = this.retainHttpEntries(manifest.entries, absolutePath);
+      // ts_check checks HTTP (by method/path) and socket (by event+direction)
+      // entries with the same assignability checker. Any other protocol
+      // (GraphQL, which serialises without a checkable identity) is scored by
+      // its own pipeline and skipped here. The scanner already filters those out
+      // of the manifest files it writes (write_manifest_files), but a stray
+      // non-checkable entry must never crash the whole verdict run (#253), so we
+      // drop them defensively and leave a trace rather than throwing.
+      manifest.entries = this.retainCheckableEntries(manifest.entries, absolutePath);
 
-      // Validate the surviving HTTP entries.
+      // Validate the surviving (HTTP + socket) entries.
       for (const entry of manifest.entries) {
         this.validateEntry(entry);
       }
@@ -261,20 +322,20 @@ export class ManifestMatcher {
   }
 
   /**
-   * Filter a manifest entry list down to the HTTP entries ts_check can check.
+   * Filter a manifest entry list down to the entries ts_check can check: HTTP
+   * (keyed by method/path) and socket (keyed by event+direction).
    *
-   * An entry is non-HTTP when its `protocol` is not "http" or it lacks the
-   * `method`/`path` an HTTP key carries (GraphQL/socket keys serialise without
-   * them). Those are skipped — they belong to other pipelines (#236/#248) — and
-   * a single summary line is logged so the drop is never silent. A stray
-   * non-HTTP entry can thus never zero out the entire verdict set again (#253).
+   * Any other protocol — or a malformed entry missing the identity its protocol
+   * needs — is skipped: it belongs to another pipeline (e.g. GraphQL, #268) or
+   * is junk. A single summary line is logged so the drop is never silent. A
+   * stray non-checkable entry can thus never zero out the verdict set (#253).
    */
-  private retainHttpEntries(entries: unknown[], source: string): ManifestEntry[] {
+  private retainCheckableEntries(entries: unknown[], source: string): ManifestEntry[] {
     const retained: ManifestEntry[] = [];
     let skipped = 0;
 
     for (const entry of entries) {
-      if (this.isHttpManifestEntry(entry)) {
+      if (this.isCheckableManifestEntry(entry)) {
         retained.push(entry);
       } else {
         skipped++;
@@ -284,7 +345,7 @@ export class ManifestMatcher {
     if (skipped > 0) {
       console.warn(
         `[manifest] Skipped ${skipped} non-checkable entr${skipped === 1 ? 'y' : 'ies'} in ${source} ` +
-          `(not HTTP, or missing method/path; ts_check is HTTP-only — other protocols are checked by their own pipelines)`
+          `(not HTTP/socket, or missing its identity fields; other protocols are checked by their own pipelines)`
       );
     }
 
@@ -292,25 +353,34 @@ export class ManifestMatcher {
   }
 
   /**
-   * Shape guard for raw, possibly-malformed manifest JSON: an entry ts_check can
-   * check is an object whose `protocol` is "http" with non-empty string `method`
-   * and `path`. GraphQL/socket keys serialise without method/path and are
-   * filtered out here (#253). Full structural validation of the surviving HTTP
-   * entries is `validateEntry`'s job — a genuinely-malformed HTTP entry still
-   * throws there.
+   * Shape guard for raw, possibly-malformed manifest JSON. A checkable entry is
+   * either an HTTP key (`protocol: "http"` with non-empty `method`+`path`) or a
+   * socket key (`protocol: "socket"` with non-empty `event`+`direction`).
+   * Everything else (GraphQL keys, junk) is filtered out here (#253). Full
+   * structural validation of the survivors is `validateEntry`'s job — a
+   * genuinely-malformed HTTP/socket entry still throws there.
    */
-  private isHttpManifestEntry(entry: unknown): entry is ManifestEntry {
+  private isCheckableManifestEntry(entry: unknown): entry is ManifestEntry {
     if (typeof entry !== 'object' || entry === null) {
       return false;
     }
     const e = entry as Record<string, unknown>;
-    return (
-      e.protocol === 'http' &&
-      typeof e.method === 'string' &&
-      e.method.length > 0 &&
-      typeof e.path === 'string' &&
-      e.path.length > 0
-    );
+    if (e.protocol === 'http') {
+      return (
+        typeof e.method === 'string' &&
+        e.method.length > 0 &&
+        typeof e.path === 'string' &&
+        e.path.length > 0
+      );
+    }
+    if (e.protocol === 'socket') {
+      return (
+        typeof e.event === 'string' &&
+        e.event.length > 0 &&
+        (e.direction === 'server_to_client' || e.direction === 'client_to_server')
+      );
+    }
+    return false;
   }
 
   /**
@@ -333,8 +403,8 @@ export class ManifestMatcher {
       throw new Error('Manifest missing required field: entries (must be an array)');
     }
 
-    // Skip non-HTTP entries before validating (see loadManifest / #253).
-    manifest.entries = this.retainHttpEntries(manifest.entries, '<string>');
+    // Skip non-checkable entries before validating (see loadManifest / #253).
+    manifest.entries = this.retainCheckableEntries(manifest.entries, '<string>');
 
     for (const entry of manifest.entries) {
       this.validateEntry(entry);
@@ -346,19 +416,31 @@ export class ManifestMatcher {
   /**
    * Validate a manifest entry has all required fields.
    *
-   * Callers must drop non-HTTP entries via `retainHttpEntries` first; by the
-   * time an entry reaches here it is expected to be HTTP, so a missing
-   * `method`/`path`/`protocol` is a genuine data bug and still throws.
+   * Callers must drop non-checkable entries via `retainCheckableEntries` first;
+   * by the time an entry reaches here it is expected to be HTTP or socket. An
+   * HTTP entry missing `method`/`path`, or a socket entry missing
+   * `event`/`direction`, is a genuine data bug and still throws (the #253
+   * guard — a malformed entry must fail loud, not silently pass).
    */
   private validateEntry(entry: ManifestEntry): void {
-    if (!entry.method) {
-      throw new Error('ManifestEntry missing required field: method');
-    }
-    if (!entry.path) {
-      throw new Error('ManifestEntry missing required field: path');
-    }
-    if (entry.protocol !== 'http') {
-      throw new Error('ManifestEntry missing or invalid field: protocol (must be "http")');
+    if (entry.protocol === 'http') {
+      if (!entry.method) {
+        throw new Error('ManifestEntry missing required field: method');
+      }
+      if (!entry.path) {
+        throw new Error('ManifestEntry missing required field: path');
+      }
+    } else if (entry.protocol === 'socket') {
+      if (!entry.event) {
+        throw new Error('ManifestEntry missing required field: event');
+      }
+      if (entry.direction !== 'server_to_client' && entry.direction !== 'client_to_server') {
+        throw new Error(
+          'ManifestEntry missing or invalid field: direction (must be "server_to_client" or "client_to_server")'
+        );
+      }
+    } else {
+      throw new Error('ManifestEntry missing or invalid field: protocol (must be "http" or "socket")');
     }
     if (!entry.type_alias) {
       throw new Error('ManifestEntry missing required field: type_alias');
@@ -431,11 +513,12 @@ export class ManifestMatcher {
 
     return manifest.entries.filter((entry) => {
       if (entry.role !== 'producer') return false;
+      if (entry.protocol !== 'http') return false;
       if (typeKind && entry.type_kind !== typeKind) return false;
 
-      const entryMethod = normalizeMethod(entry.method);
+      const entryMethod = normalizeMethod(entry.method!);
 
-      return entryMethod === normalizedMethod && pathsMatch(entry.path, inputPath);
+      return entryMethod === normalizedMethod && pathsMatch(entry.path!, inputPath);
     });
   }
 
@@ -457,11 +540,12 @@ export class ManifestMatcher {
 
     return manifest.entries.filter((entry) => {
       if (entry.role !== 'consumer') return false;
+      if (entry.protocol !== 'http') return false;
       if (typeKind && entry.type_kind !== typeKind) return false;
 
-      const entryMethod = normalizeMethod(entry.method);
+      const entryMethod = normalizeMethod(entry.method!);
 
-      return entryMethod === normalizedMethod && pathsMatch(entry.path, inputPath);
+      return entryMethod === normalizedMethod && pathsMatch(entry.path!, inputPath);
     });
   }
 
@@ -478,8 +562,9 @@ export class ManifestMatcher {
     const endpoints: Array<{ method: string; path: string; type_kind: ManifestTypeKind }> = [];
 
     for (const entry of manifest.entries) {
-      const normalizedMethod = normalizeMethod(entry.method);
-      const normalizedPath = normalizePath(entry.path);
+      if (entry.protocol !== 'http') continue;
+      const normalizedMethod = normalizeMethod(entry.method!);
+      const normalizedPath = normalizePath(entry.path!);
       const key = `${normalizedMethod} ${normalizedPath} ${entry.type_kind}`;
 
       if (!seen.has(key)) {
@@ -522,27 +607,28 @@ export class ManifestMatcher {
     const producerEntries = producers.entries.filter((e) => e.role === 'producer');
     const consumerEntries = consumers.entries.filter((e) => e.role === 'consumer');
 
-    // For each consumer, find candidate producers, then keep only the most
-    // specific ones. This mirrors routing semantics: a request to /users/me
-    // is served by a literal /users/me route when one exists, not by
+    // HTTP edges: for each consumer, find candidate producers, then keep only
+    // the most specific ones. This mirrors routing semantics: a request to
+    // /users/me is served by a literal /users/me route when one exists, not by
     // /users/:id — matching both would produce duplicate or contradictory
     // verdicts. Equally specific candidates (e.g. the same route registered
     // by two service versions) are all kept.
     for (let ci = 0; ci < consumerEntries.length; ci++) {
       const consumer = consumerEntries[ci];
-      const consumerMethod = normalizeMethod(consumer.method);
-      const consumerPath = normalizePath(consumer.path);
+      if (consumer.protocol !== 'http') continue;
+      const consumerMethod = normalizeMethod(consumer.method!);
+      const consumerPath = normalizePath(consumer.path!);
 
       const candidates: Array<{ pi: number; score: number }> = [];
 
       for (let pi = 0; pi < producerEntries.length; pi++) {
         const producer = producerEntries[pi];
-        const producerMethod = normalizeMethod(producer.method);
+        if (producer.protocol !== 'http') continue;
+        const producerMethod = normalizeMethod(producer.method!);
 
         if (
-          consumer.protocol === producer.protocol &&
           consumerMethod === producerMethod &&
-          pathsMatch(consumer.path, producer.path) &&
+          pathsMatch(consumer.path!, producer.path!) &&
           consumer.type_kind === producer.type_kind
         ) {
           candidates.push({
@@ -577,13 +663,53 @@ export class ManifestMatcher {
       }
     }
 
+    // Socket edges: exact-key match on `<DIRECTION>|<event>`, the same identity
+    // the Rust `analyze_exact_key_matches` uses (no path/route to resolve, so no
+    // specificity ranking — a socket consumer matches every producer carrying
+    // the same key). The assembled label `SOCKET <DIRECTION>|<event>` round-trips
+    // through the Rust verdict-join (`parse_compat_endpoint`/`parse_producer_key`).
+    for (let ci = 0; ci < consumerEntries.length; ci++) {
+      const consumer = consumerEntries[ci];
+      if (consumer.protocol !== 'socket') continue;
+      const consumerKey = socketKey(consumer);
+      if (consumerKey === null) continue;
+
+      let matched = false;
+      for (let pi = 0; pi < producerEntries.length; pi++) {
+        const producer = producerEntries[pi];
+        if (producer.protocol !== 'socket') continue;
+        if (socketKey(producer) !== consumerKey) continue;
+        if (producer.type_kind !== consumer.type_kind) continue;
+
+        matches.push({
+          method: SOCKET_PSEUDO_METHOD,
+          path: consumerKey,
+          type_kind: consumer.type_kind,
+          producer,
+          consumer,
+          match_score: 1.0,
+        });
+        matchedProducerIndices.add(pi);
+        matched = true;
+      }
+
+      if (matched) {
+        matchedConsumerIndices.add(ci);
+      } else {
+        orphanedConsumers.push({
+          entry: consumer,
+          reason: `No producer found for socket ${consumerKey} (${consumer.type_kind})`,
+        });
+      }
+    }
+
     // Find orphaned producers (producers with no matching consumers)
     for (let pi = 0; pi < producerEntries.length; pi++) {
       if (!matchedProducerIndices.has(pi)) {
         const producer = producerEntries[pi];
         orphanedProducers.push({
           entry: producer,
-          reason: `No consumer found for ${producer.method} ${producer.path} (${producer.type_kind})`,
+          reason: `No consumer found for ${this.entryLabel(producer)} (${producer.type_kind})`,
         });
       }
     }
@@ -596,6 +722,15 @@ export class ManifestMatcher {
   }
 
   /**
+   * Human label for an entry in orphan/diagnostic strings. Delegates to the
+   * module-level `entryLabel` so the matcher and the type-checker format
+   * orphans identically.
+   */
+  private entryLabel(entry: ManifestEntry): string {
+    return entryLabel(entry);
+  }
+
+  /**
    * Calculate a match score between producer and consumer
    *
    * Currently returns 1.0 for all matches, but could be extended
@@ -605,8 +740,9 @@ export class ManifestMatcher {
    * - Version compatibility
    */
   private calculateMatchScore(producer: ManifestEntry, consumer: ManifestEntry): number {
-    const norm1 = normalizePath(producer.path);
-    const norm2 = normalizePath(consumer.path);
+    // Only ever called from the HTTP matching loop, so both paths are present.
+    const norm1 = normalizePath(producer.path!);
+    const norm2 = normalizePath(consumer.path!);
 
     // Exact normalized match (both parameterized or both identical)
     if (norm1 === norm2) {

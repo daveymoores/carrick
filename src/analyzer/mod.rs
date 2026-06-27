@@ -226,10 +226,14 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Parse a ts_check compat `endpoint` string back into `(METHOD, path)`. The
-/// string is built as `"<METHOD> <path> (<request|response>)"` by ts_check's
-/// type-checker, so split off the leading method and the trailing
-/// `" (type_kind)"` suffix. Returns `None` for an unrecognized shape.
+/// Parse a ts_check compat `endpoint` string back into the verdict-join
+/// `(pseudo-method, identity)` pair. ts_check builds the string as
+/// `"<METHOD> <path> (<request|response>)"` for HTTP and
+/// `"SOCKET <DIRECTION>|<event> (response)"` for socket, so the same split —
+/// leading token off the front, trailing `" (type_kind)"` off the back — yields
+/// `("METHOD", "path")` or `("SOCKET", "DIRECTION|event")`, matching what
+/// `parse_producer_key` recovers from the edge's `producer_key`. Returns `None`
+/// for an unrecognized shape.
 fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
     let (method, rest) = endpoint.split_once(' ')?;
     // Drop the trailing " (request)" / " (response)" annotation if present.
@@ -243,13 +247,27 @@ fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
     Some((method.to_uppercase(), path.to_string()))
 }
 
-/// Recover `(METHOD, path)` from a canonical HTTP producer key
-/// (`"http|METHOD|path"`). Returns `None` for non-HTTP keys.
+/// Recover the verdict-join `(pseudo-method, identity)` from a canonical
+/// producer key, for the protocols ts_check type-checks (HTTP + socket):
+///
+/// - HTTP (`"http|METHOD|path"`) → `("METHOD", "path")`, the HTTP join key.
+/// - Socket (`"socket|DIRECTION|event"`) → `("SOCKET", "DIRECTION|event")`. The
+///   matching ts_check endpoint label is `"SOCKET DIRECTION|event (response)"`,
+///   which `parse_compat_endpoint` reduces to the SAME pair, so a socket edge
+///   joins its ts_check verdict exactly like an HTTP one.
+///
+/// Returns `None` for any other protocol (e.g. GraphQL): ts_check produced no
+/// verdict for it, so its edge stays `None` rather than fabricating one.
 fn parse_producer_key(key: &str) -> Option<(String, String)> {
     let mut parts = key.splitn(3, '|');
     match (parts.next(), parts.next(), parts.next()) {
         (Some("http"), Some(method), Some(path)) if !method.is_empty() && !path.is_empty() => {
             Some((method.to_uppercase(), path.to_string()))
+        }
+        (Some("socket"), Some(direction), Some(event))
+            if !direction.is_empty() && !event.is_empty() =>
+        {
+            Some(("SOCKET".to_string(), format!("{}|{}", direction, event)))
         }
         _ => None,
     }
@@ -350,10 +368,11 @@ fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMat
     }
 
     for edge in matches.iter_mut() {
-        // producer_key is `http|METHOD|path`; recover (METHOD, path). A non-HTTP
-        // key (GraphQL/socket edge) is not type-checked by ts_check (HTTP-only),
-        // so its verdict is genuinely unknown — leave it `None` rather than
-        // fabricate `Some(true)` (#260, part 2).
+        // Recover the join key from the producer_key. ts_check type-checks HTTP
+        // (`http|METHOD|path`) and socket (`socket|DIRECTION|event`), so both
+        // join here. A key for any other protocol (e.g. GraphQL) is not checked
+        // by ts_check, so its verdict is genuinely unknown — leave it `None`
+        // rather than fabricate `Some(true)` (#260, part 2).
         let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
             edge.type_compatible = None;
             continue;
@@ -3183,39 +3202,85 @@ mod tests {
         );
     }
 
-    /// A GraphQL/socket edge has a non-HTTP `producer_key`, so `parse_producer_key`
-    /// returns `None`. ts_check is HTTP-only and never produced a verdict for it,
-    /// so the verdict is genuinely unknown: the edge must stay `None`, NOT the
-    /// fabricated `Some(true)` the old default returned (#260, part 2 — the worst
-    /// direction for a drift detector).
+    /// A GraphQL edge has a `producer_key` ts_check does not type-check, so
+    /// `parse_producer_key` returns `None` and the verdict is genuinely unknown:
+    /// the edge must stay `None`, NOT the fabricated `Some(true)` the old default
+    /// returned (#260, part 2 — the worst direction for a drift detector).
+    /// Socket edges, by contrast, ARE type-checked and join their verdict (see
+    /// `apply_compat_verdicts_joins_socket_edge`).
     #[test]
-    fn overlay_compat_verdicts_non_http_producer_key_stays_none() {
+    fn overlay_compat_verdicts_graphql_producer_key_stays_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let results = r#"{ "mismatches": [], "unknownPairs": [],
                            "totalChecked": 0, "compatibleCount": 0 }"#;
         let analyzer = analyzer_with_results(dir.path(), Some(results));
 
-        let mut matches = vec![
-            edge_at(
-                "graphql|query|order",
-                "web-frontend",
-                "web-frontend/src/query.ts:7",
-            ),
-            edge_at(
-                "socket|SERVER->CLIENT|payment:settled",
-                "payments-svc",
-                "payments-svc/src/socket.ts:9",
-            ),
-        ];
+        let mut matches = vec![edge_at(
+            "graphql|query|order",
+            "web-frontend",
+            "web-frontend/src/query.ts:7",
+        )];
         analyzer.overlay_compat_verdicts(&mut matches);
 
         assert_eq!(
             matches[0].type_compatible, None,
             "a GraphQL edge ts_check never checked must stay None, not fake true"
         );
+    }
+
+    /// The socket cross-repo join (this PR). A `socket|DIRECTION|event` edge is
+    /// now type-checked by ts_check, which emits its verdict under the endpoint
+    /// label `"SOCKET <DIRECTION>|<event> (response)"`. `parse_producer_key`
+    /// recovers `("SOCKET", "<DIRECTION>|<event>")` from the edge and
+    /// `parse_compat_endpoint` recovers the SAME pair from the label, so the
+    /// verdict lands on the socket edge — `Some(false)` + reason when ts_check
+    /// reports a mismatch, `Some(true)` when it doesn't.
+    #[test]
+    fn apply_compat_verdicts_joins_socket_edge() {
+        // The xrepo-corpus-1 `payment:settled` edge: producer (listener) is
+        // web-frontend, consumer (emitter) is payments-svc. The compatible case
+        // is absent from both lists, so it reads Some(true). The mismatch case
+        // (a second event) lands on its edge with the reason.
+        let result = serde_json::json!({
+            "mismatches": [{
+                "endpoint": "SOCKET CLIENT->SERVER|chat:bad (response)",
+                "consumerLocation": "client/src/chat.ts:20",
+                "error": "Sent type is not assignable to listener type"
+            }],
+            "unknownPairs": [],
+            "totalChecked": 2,
+            "compatibleCount": 1
+        });
+
+        let mut matches = vec![
+            edge_at(
+                "socket|SERVER->CLIENT|payment:settled",
+                "payments-svc",
+                "payments-svc/realtime/server.ts:27",
+            ),
+            edge_at(
+                "socket|CLIENT->SERVER|chat:bad",
+                "chat-svc",
+                "client/src/chat.ts:20:5",
+            ),
+        ];
+        apply_compat_verdicts(&result, &mut matches);
+
         assert_eq!(
-            matches[1].type_compatible, None,
-            "a socket edge ts_check never checked must stay None, not fake true"
+            matches[0].type_compatible,
+            Some(true),
+            "the compatible socket edge (absent from both lists) reads Some(true)"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(false),
+            "the socket edge in the mismatch list reads Some(false)"
+        );
+        assert_eq!(
+            matches[1].mismatch_reason.as_deref(),
+            Some("Sent type is not assignable to listener type"),
         );
     }
 

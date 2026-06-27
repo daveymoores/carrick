@@ -20,6 +20,7 @@ import {
   ManifestEntry,
   MatchResult,
   TypeEvidence,
+  entryLabel,
 } from "./manifest-matcher";
 
 /**
@@ -161,11 +162,11 @@ export class TypeCompatibilityChecker {
       mismatches: [],
       orphanedProducers: orphanedProducers.map(
         (o) =>
-          `${o.entry.method} ${o.entry.path} (${o.entry.type_kind}, ${o.entry.type_alias})`
+          `${entryLabel(o.entry)} (${o.entry.type_kind}, ${o.entry.type_alias})`
       ),
       orphanedConsumers: orphanedConsumers.map(
         (o) =>
-          `${o.entry.method} ${o.entry.path} (${o.entry.type_kind}, ${o.entry.type_alias})`
+          `${entryLabel(o.entry)} (${o.entry.type_kind}, ${o.entry.type_alias})`
       ),
       unknownPairs: [],
       matchDetails: matches,
@@ -344,22 +345,41 @@ export class TypeCompatibilityChecker {
       };
     }
 
-    // Producer payload must satisfy what the consumer expects.
-    if (producerType.isAssignableTo(consumerType)) {
+    // Assignability runs in the DATA-flow direction: the value that is sent
+    // must satisfy the type the receiver expects.
+    //
+    // HTTP: the manifest producer (endpoint) emits the response and the manifest
+    // consumer (call) receives it, so the producer payload must satisfy the
+    // consumer — `producer ⊑ consumer`.
+    //
+    // Socket: the role mapping is inverted relative to data flow. Carrick keys a
+    // *listener* (`socket.on`) as the producer (endpoint) and an *emitter*
+    // (`socket.emit`) as the consumer (call). The bytes flow emitter → listener,
+    // so the *emitter's* payload (manifest consumer) must satisfy what the
+    // *listener* expects (manifest producer) — `consumer ⊑ producer`. Checking
+    // the HTTP direction here would read a widening listener type (e.g.
+    // `status: string` accepting a producer `"pending" | "settled"`) as
+    // incompatible, the opposite of the truth. (See xrepo-corpus-1 README,
+    // "Socket producer/consumer direction".) The same `isAssignableTo` relation
+    // and the same resolved Type objects are used either way.
+    const socket = producer.protocol === "socket";
+    const sentType = socket ? consumerType : producerType;
+    const expectedType = socket ? producerType : consumerType;
+    if (sentType.isAssignableTo(expectedType)) {
       return { kind: "compatible" };
     }
 
-    const producerText = this.typeText(producerType);
-    const consumerText = this.typeText(consumerType);
+    const sentText = this.typeText(sentType);
+    const expectedText = this.typeText(expectedType);
     return {
       kind: "incompatible",
       mismatch: {
         endpoint,
-        producerType: producerText,
+        producerType: sentText,
         consumerCall: consumer.type_alias,
-        consumerType: consumerText,
+        consumerType: expectedText,
         isAssignable: false,
-        errorDetails: `Type '${producerText}' is not assignable to type '${consumerText}'`,
+        errorDetails: `Type '${sentText}' is not assignable to type '${expectedText}'`,
         producerLocation: this.formatEntryLocation(producer),
         consumerLocation: this.formatEntryLocation(consumer),
         producerEvidence: producer.evidence,

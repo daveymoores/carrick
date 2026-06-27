@@ -238,7 +238,7 @@ describe('ManifestMatcher', () => {
 
     // --- #253 regression: non-HTTP entries must be skipped, not fatal ---
 
-    it('should skip non-HTTP entries and still load the HTTP ones', () => {
+    it('should keep HTTP and socket entries and drop GraphQL', () => {
       const httpEntry = createManifestEntry(
         'GET',
         '/orders/:id',
@@ -247,8 +247,9 @@ describe('ManifestMatcher', () => {
         'src/routes.ts',
         10
       );
-      // GraphQL/socket OperationKeys serialise without method/path; previously
-      // these threw in validateEntry and zeroed out every verdict (#253).
+      // GraphQL serialises without a checkable identity for the matcher and is
+      // dropped; socket (event+direction) is now checked alongside HTTP. A
+      // non-checkable entry must never throw in validateEntry (#253).
       const graphqlEntry = {
         protocol: 'graphql',
         kind: 'query',
@@ -302,11 +303,26 @@ describe('ManifestMatcher', () => {
         })
       );
 
-      // Must NOT throw, and must keep only the HTTP entry.
+      // Must NOT throw. Keeps the HTTP + socket entries, drops GraphQL.
       const loaded = matcher.loadManifest(filePath);
-      assert.strictEqual(loaded.entries.length, 1);
-      assert.strictEqual(loaded.entries[0].protocol, 'http');
-      assert.strictEqual(loaded.entries[0].path, '/orders/:id');
+      assert.strictEqual(loaded.entries.length, 2);
+      assert.ok(
+        loaded.entries.some((e) => e.protocol === 'http' && e.path === '/orders/:id'),
+        'HTTP entry must survive'
+      );
+      assert.ok(
+        loaded.entries.some(
+          (e) => e.protocol === 'socket' && e.event === 'order.created'
+        ),
+        'socket entry must survive'
+      );
+      // Length 2 (from 3 inputs) with the http + socket survivors above proves
+      // the GraphQL entry was dropped. Assert the surviving protocols are only
+      // the two checkable ones.
+      assert.deepStrictEqual(
+        loaded.entries.map((e) => e.protocol).sort(),
+        ['http', 'socket']
+      );
     });
 
     it('should still match HTTP edges when a non-HTTP entry is present', () => {
@@ -635,6 +651,98 @@ describe('ManifestMatcher', () => {
       assert.strictEqual(result.matches.length, 0);
       assert.strictEqual(result.orphanedProducers.length, 0);
       assert.strictEqual(result.orphanedConsumers.length, 0);
+    });
+
+    it('should match a socket producer and consumer on the canonical key', () => {
+      const socketEntry = (
+        typeAlias: string,
+        role: 'producer' | 'consumer'
+      ): ManifestEntry => ({
+        protocol: 'socket',
+        event: 'payment:settled',
+        direction: 'server_to_client',
+        type_alias: typeAlias,
+        role,
+        type_kind: 'response',
+        file_path: role === 'producer' ? 'lib/realtime.ts' : 'realtime/server.ts',
+        line_number: 31,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: role === 'producer' ? 'lib/realtime.ts' : 'realtime/server.ts',
+          span_start: null,
+          span_end: null,
+          line_number: 31,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      });
+
+      const producers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'abc123',
+        entries: [socketEntry('SettledPayment', 'producer')],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'payments-svc',
+        commit_hash: 'def456',
+        entries: [socketEntry('Payment', 'consumer')],
+      };
+
+      const result = matcher.matchEndpoints(producers, consumers);
+
+      assert.strictEqual(result.matches.length, 1);
+      assert.strictEqual(result.matches[0].method, 'SOCKET');
+      assert.strictEqual(result.matches[0].path, 'SERVER->CLIENT|payment:settled');
+      assert.strictEqual(result.matches[0].producer.type_alias, 'SettledPayment');
+      assert.strictEqual(result.matches[0].consumer.type_alias, 'Payment');
+      assert.strictEqual(result.orphanedProducers.length, 0);
+      assert.strictEqual(result.orphanedConsumers.length, 0);
+    });
+
+    it('should not match socket entries flowing in different directions', () => {
+      const entry = (
+        direction: 'server_to_client' | 'client_to_server',
+        role: 'producer' | 'consumer'
+      ): ManifestEntry => ({
+        protocol: 'socket',
+        event: 'payment:settled',
+        direction,
+        type_alias: 'Payment',
+        role,
+        type_kind: 'response',
+        file_path: 'f.ts',
+        line_number: 1,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: 'f.ts',
+          span_start: null,
+          span_end: null,
+          line_number: 1,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      });
+
+      const producers: TypeManifest = {
+        repo_name: 'a',
+        commit_hash: 'x',
+        entries: [entry('server_to_client', 'producer')],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'b',
+        commit_hash: 'y',
+        entries: [entry('client_to_server', 'consumer')],
+      };
+
+      const result = matcher.matchEndpoints(producers, consumers);
+
+      assert.strictEqual(result.matches.length, 0);
+      assert.strictEqual(result.orphanedProducers.length, 1);
+      assert.strictEqual(result.orphanedConsumers.length, 1);
     });
   });
 

@@ -2376,15 +2376,17 @@ fn write_manifest_files(
     for repo_data in all_repo_data {
         if let Some(entries) = &repo_data.type_manifest {
             for entry in entries {
-                // ts_check manifests are HTTP-only by contract: `ManifestEntry`
-                // (ts_check/lib/manifest-matcher.ts) requires `method`/`path`,
-                // which GraphQL/socket OperationKeys never serialise. Those
-                // protocols are scored by their own pipelines (#236/#248), so
-                // they stay in `cloud_data.type_manifest` (cloud index + eval
-                // projection) but must not reach the producer/consumer manifest
-                // files. Without this filter a single non-HTTP entry makes
-                // `validateEntry` throw, zeroing out every cross-repo verdict (#253).
-                if entry.key.protocol() != crate::operation::Protocol::Http {
+                // HTTP and socket entries reach the ts_check manifest; GraphQL
+                // does not. ts_check checks HTTP by `method`/`path` and socket by
+                // the canonical `OperationKey` (event+direction), reusing the same
+                // `TypeCompatibilityChecker` assignability for both. GraphQL is
+                // still filtered here: its cross-repo resolution is blocked on
+                // separate work (#268), and its OperationKey serialises without a
+                // checkable identity for the matcher, so a GraphQL entry would
+                // only ever orphan. Those entries stay in `cloud_data.type_manifest`
+                // (cloud index + eval projection). The matcher drops any stray
+                // non-checkable entry defensively rather than throwing (#253).
+                if entry.key.protocol() == crate::operation::Protocol::Graphql {
                     continue;
                 }
                 match entry.role {
@@ -4050,14 +4052,15 @@ mod tests {
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
     }
 
-    /// #253 regression: `write_manifest_files` feeds the HTTP-only ts_check
-    /// matcher, so it must emit ONLY HTTP entries. GraphQL/socket entries are
-    /// kept in `cloud_data.type_manifest` (cloud index + eval projection) but
-    /// must never reach producer/consumer manifest files — a single non-HTTP
-    /// entry there makes ts_check's `validateEntry` throw and zeros out every
-    /// cross-repo verdict.
+    /// `write_manifest_files` feeds the ts_check matcher, which now checks HTTP
+    /// and socket. So HTTP + socket entries pass through; GraphQL is still
+    /// filtered (its cross-repo resolution is blocked on #268 and its key
+    /// carries no checkable identity for the matcher). GraphQL entries stay in
+    /// `cloud_data.type_manifest` (cloud index + eval projection). The #253
+    /// throw-guard now lives in the matcher, which drops any stray non-checkable
+    /// entry defensively rather than crashing the verdict run.
     #[test]
-    fn write_manifest_files_emits_only_http_entries() {
+    fn write_manifest_files_emits_http_and_socket_not_graphql() {
         use crate::cloud_storage::TypeEvidence;
         use crate::operation::{GraphqlOperationKind, OperationKey, SocketDirection};
         use crate::services::type_sidecar::InferKind;
@@ -4141,22 +4144,32 @@ mod tests {
         )
         .unwrap();
 
-        // Only the HTTP producer survives into the ts_check manifest.
+        // HTTP and socket producers survive; GraphQL is filtered out.
         assert_eq!(
             producer.entries.len(),
-            1,
-            "non-HTTP entries must be filtered out of the ts_check manifest"
-        );
-        assert_eq!(
-            producer.entries[0].key.protocol(),
-            crate::operation::Protocol::Http
+            2,
+            "HTTP + socket entries reach the ts_check manifest; GraphQL is filtered"
         );
         assert!(
             producer
                 .entries
                 .iter()
-                .all(|e| e.key.protocol() == crate::operation::Protocol::Http),
-            "producer manifest must contain only HTTP entries"
+                .any(|e| e.key.protocol() == crate::operation::Protocol::Http),
+            "the HTTP producer must reach the manifest"
+        );
+        assert!(
+            producer
+                .entries
+                .iter()
+                .any(|e| e.key.protocol() == crate::operation::Protocol::Websocket),
+            "the socket producer must now reach the manifest"
+        );
+        assert!(
+            producer
+                .entries
+                .iter()
+                .all(|e| e.key.protocol() != crate::operation::Protocol::Graphql),
+            "GraphQL entries must not reach the ts_check manifest (#268)"
         );
     }
 

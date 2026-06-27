@@ -15,7 +15,40 @@ import * as path from 'path';
 import * as os from 'os';
 import { Project } from 'ts-morph';
 import { TypeCompatibilityChecker } from './type-checker';
-import { TypeManifest, createManifestEntry } from './manifest-matcher';
+import { TypeManifest, ManifestEntry, createManifestEntry } from './manifest-matcher';
+
+/**
+ * Build a socket `payment:settled` SERVER->CLIENT manifest entry. Socket entries
+ * carry `protocol: 'socket'` + `event` + `direction` instead of HTTP method/path.
+ */
+function socketEntry(
+  typeAlias: string,
+  role: 'producer' | 'consumer',
+  filePath: string,
+  lineNumber: number
+): ManifestEntry {
+  return {
+    protocol: 'socket',
+    event: 'payment:settled',
+    direction: 'server_to_client',
+    type_alias: typeAlias,
+    role,
+    type_kind: 'response',
+    file_path: filePath,
+    line_number: lineNumber,
+    is_explicit: true,
+    type_state: 'explicit',
+    evidence: {
+      file_path: filePath,
+      span_start: null,
+      span_end: null,
+      line_number: lineNumber,
+      infer_kind: 'response_body',
+      is_explicit: true,
+      type_state: 'explicit',
+    },
+  };
+}
 
 // ============================================================================
 // TypeCompatibilityChecker Tests
@@ -463,6 +496,108 @@ describe('TypeCompatibilityChecker', () => {
       assert.strictEqual(result.compatiblePairs, 0);
       assert.strictEqual(result.unknownPairs.length, 0);
       assert.strictEqual(result.mismatches.length, 1);
+    });
+
+    it('type-checks a socket SERVER->CLIENT edge end-to-end as compatible', async () => {
+      // The xrepo-corpus-1 `payment:settled` edge. Carrick keys the *listener*
+      // (web-frontend, `SettledPayment`) as the producer and the *emitter*
+      // (payments-svc, `Payment`) as the consumer. The bytes flow emitter →
+      // listener, so the emitter payload must satisfy what the listener expects:
+      // `Payment.status: "pending" | "settled"` ⊑ `SettledPayment.status: string`
+      // → compatible. (Reusing the HTTP direction would wrongly read this as
+      // incompatible.)
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type SettledPayment = { id: string; orderId: number; amountCents: number; status: string };
+        export type Payment = { id: string; orderId: number; amountCents: number; status: "pending" | "settled" };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'abc',
+        entries: [
+          socketEntry('SettledPayment', 'producer', 'lib/realtime.ts', 31),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'payments-svc',
+        commit_hash: 'def',
+        entries: [
+          socketEntry('Payment', 'consumer', 'realtime/server.ts', 27),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.matchDetails?.length, 1, 'the socket pair must match');
+      assert.strictEqual(
+        result.matchDetails?.[0].method,
+        'SOCKET',
+        'the match is keyed on the SOCKET pseudo-method'
+      );
+      assert.strictEqual(
+        result.matchDetails?.[0].path,
+        'SERVER->CLIENT|payment:settled',
+        'the match path is the canonical socket key tail'
+      );
+      assert.strictEqual(result.compatiblePairs, 1);
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+    });
+
+    it('reads a socket edge whose emitted payload widens the listener type as incompatible', async () => {
+      // Direction proof: if the emitter sends a *wider* type than the listener
+      // accepts, the edge is incompatible. Here the emitter sends
+      // `status: string` but the listener only accepts `"pending" | "settled"`,
+      // so `string` is NOT assignable → incompatible. This is the mirror of the
+      // compatible case and fails if the assignability direction is not flipped
+      // for sockets.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type StrictPayment = { id: string; status: "pending" | "settled" };
+        export type LoosePayment = { id: string; status: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'listener-repo',
+        commit_hash: 'abc',
+        entries: [socketEntry('StrictPayment', 'producer', 'lib/realtime.ts', 31)],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'emitter-repo',
+        commit_hash: 'def',
+        entries: [socketEntry('LoosePayment', 'consumer', 'realtime/server.ts', 27)],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.incompatiblePairs, 1);
+      assert.strictEqual(result.compatiblePairs, 0);
+      assert.strictEqual(result.mismatches.length, 1);
+      assert.ok(
+        result.mismatches[0].endpoint.startsWith('SOCKET '),
+        'the mismatch endpoint must carry the SOCKET label'
+      );
     });
 
     it('reads a dangling consumer name as unverifiable but its structural shape as incompatible (#257)', async () => {
