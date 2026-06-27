@@ -197,6 +197,52 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
     );
   });
 
+  it('drills through JSON.stringify(payload) to the serialized argument type (B)', async () => {
+    // Consumer `fetch` POST body is `JSON.stringify(payload)`. The call's own
+    // type is `string`; the request shape must be the argument's type
+    // (`RegisterRequest`), so the cross-repo edge resolves to the real payload
+    // shape and not the useless `string`.
+    const bodyLine = spanOf('body: JSON.stringify(payload),');
+    const callStart = bodyLine.start + 'body: '.length;
+    const callEnd = callStart + 'JSON.stringify(payload)'.length;
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'reqbody-stringify',
+      requests: [
+        {
+          file_path: FIXTURE,
+          line_number: bodyLine.line,
+          span_start: callStart,
+          span_end: callEnd,
+          infer_kind: 'request_body',
+          alias: 'StringifyBody',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'StringifyBody'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.notStrictEqual(
+      inferred.type_string,
+      'string',
+      'must drill into JSON.stringify(arg), not surface its `string` result'
+    );
+    // The serialized argument is a plain identifier typed `RegisterRequest`,
+    // so its own type name is read directly (no cast/binding to trigger the
+    // #257 structural recovery). The lever is "not `string`"; the argument's
+    // declared type, which resolves in the consumer's own bundle, is correct.
+    assert.strictEqual(
+      inferred.type_string,
+      'RegisterRequest',
+      `expected the serialized argument's payload type, got ${inferred.type_string}`
+    );
+  });
+
   it('leaves an untyped request.formData() as FormData/any (NOT-a-bug control)', async () => {
     // No cast, no typed binding → nothing to recover. Must stay faithful.
     const stmt = spanOf('const form = await request.formData();');

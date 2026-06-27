@@ -45,3 +45,13 @@ export async function uploadUntyped(request: globalThis.Request) {
   const form = await request.formData();
   return form;
 }
+
+// B: consumer-side `fetch` POST whose `body` is `JSON.stringify(payload)`. The
+// call's own type is the useless `string`; the inferred request body must be
+// the SERIALIZED ARGUMENT's type (`RegisterRequest`), not `string`.
+export async function postViaStringify(payload: RegisterRequest) {
+  return fetch('/api/register', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}

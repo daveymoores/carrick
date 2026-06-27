@@ -591,7 +591,13 @@ export class TypeInferrer {
 
     // Mirror inferCallResult: strip `await`/`as`/parens/`!` so the inner
     // expression's type (not the surrounding `Promise<any>`) is read.
-    const node = this.unwrapExpressionNode(located);
+    const unwrapped = this.unwrapExpressionNode(located);
+
+    // A `fetch` body is almost always `JSON.stringify(payload)`, whose own type
+    // is the useless `string`. Drill to the serialized argument so the consumer
+    // request shape is the payload's type, not `string`. General: any
+    // `JSON.stringify(x)` resolves to the type of `x`.
+    const node = this.unwrapJsonStringifyArg(unwrapped);
 
     const payloadType = node.getType();
     let typeString = typeText(payloadType, node);
@@ -1245,6 +1251,35 @@ export class TypeInferrer {
       break;
     }
     return current ?? node!;
+  }
+
+  /**
+   * If `node` is a `JSON.stringify(arg)` call, return the (expression-unwrapped)
+   * first argument so its type is read instead of the call's `string` result.
+   * Otherwise return `node` unchanged. Any non-`JSON.stringify` call, or a
+   * `JSON.stringify()` with no argument, is left alone.
+   */
+  private unwrapJsonStringifyArg(node: Node): Node {
+    if (!Node.isCallExpression(node)) {
+      return node;
+    }
+    const callee = node.getExpression();
+    if (!Node.isPropertyAccessExpression(callee)) {
+      return node;
+    }
+    const obj = callee.getExpression();
+    if (
+      !Node.isIdentifier(obj) ||
+      obj.getText() !== "JSON" ||
+      callee.getName() !== "stringify"
+    ) {
+      return node;
+    }
+    const args = node.getArguments();
+    if (args.length === 0) {
+      return node;
+    }
+    return this.unwrapExpressionNode(args[0]);
   }
 
   private extractExplicitTypeFromAncestor(node: Node): string | null {
