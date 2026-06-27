@@ -2262,6 +2262,80 @@ async fn build_cross_repo_analyzer(
     Ok(analyzer)
 }
 
+/// Compute the cross-repo bundle file stem (`<stem>_types.d.ts`) for each
+/// `CloudRepoData`, parallel to `all_repo_data`.
+///
+/// A monorepo `carrick.json` declares N services under one git repo, so N
+/// `CloudRepoData` share the same `repo_name` and differ only by `service_name`.
+/// Keying the bundle file by `repo_name` alone made every service in the repo
+/// write to the same `<repo>_types.d.ts`, so the last service silently clobbered
+/// the earlier ones — and a producer whose type lived in a clobbered service
+/// (e.g. orders-pkg `GET /orders/:id` → `Order`) vanished from the bundle
+/// entirely, not even leaving the `= unknown` placeholder. ts_check then
+/// reported "Producer type not found in project" and the edge's compat verdict
+/// collapsed to unverifiable.
+///
+/// Key the stem by `service_name ?? repo_name` (the same attribution convention
+/// `build_cross_repo_analyzer` uses for packages) so each service gets its own
+/// bundle. The type aliases inside are globally unique (`Endpoint_<hash>` keyed
+/// on the operation) and ts_check loads every `*.d.ts` in the output dir, so one
+/// file per service is exactly what it needs. Collisions (two services resolving
+/// to the same base stem, e.g. both missing a `service_name`) are suffixed so no
+/// write clobbers a prior one.
+fn bundle_file_stems(all_repo_data: &[CloudRepoData]) -> Vec<String> {
+    let mut used_stems: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    all_repo_data
+        .iter()
+        .map(|repo_data| {
+            let base_stem = repo_data
+                .service_name
+                .as_deref()
+                .unwrap_or(&repo_data.repo_name)
+                .replace(['/', '\\'], "_");
+            match used_stems.entry(base_stem.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let n = e.get_mut();
+                    *n += 1;
+                    format!("{base_stem}_{n}")
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(0);
+                    base_stem
+                }
+            }
+        })
+        .collect()
+}
+
+/// Write each repo/service's bundled `.d.ts` into `output_dir`, one file per
+/// service (see `bundle_file_stems`). The per-service split is what stops a
+/// monorepo's services from clobbering each other down to a single bundle file
+/// and silently dropping a whole service's producer types. ts_check loads every
+/// `*.d.ts` in `output_dir`, so the cross-file `Endpoint_<hash>` aliases still
+/// resolve regardless of which service-file each lives in.
+fn write_bundle_files(all_repo_data: &[CloudRepoData], output_dir: &std::path::Path) {
+    let stems = bundle_file_stems(all_repo_data);
+    for (repo_data, stem) in all_repo_data.iter().zip(stems) {
+        if let Some(bundled_types) = &repo_data.bundled_types {
+            let file_name = format!("{stem}_types.d.ts");
+            let file_path = output_dir.join(&file_name);
+            let content =
+                append_missing_aliases(bundled_types.clone(), repo_data.type_manifest.as_ref());
+
+            if let Err(e) = std::fs::write(&file_path, content) {
+                warn!("Failed to write type file {}: {}", file_name, e);
+            } else {
+                debug!("Created bundled type file: {}", file_path.display());
+            }
+        } else {
+            debug!(
+                "No bundled types available for repo: {}",
+                repo_data.repo_name
+            );
+        }
+    }
+}
+
 fn recreate_type_files_and_check(
     all_repo_data: &[CloudRepoData],
     packages: &Packages,
@@ -2282,26 +2356,7 @@ fn recreate_type_files_and_check(
         debug!("Created clean output directory: {}", output_dir.display());
     }
 
-    for repo_data in all_repo_data {
-        if let Some(bundled_types) = &repo_data.bundled_types {
-            let safe_repo_name = repo_data.repo_name.replace("/", "_");
-            let file_name = format!("{}_types.d.ts", safe_repo_name);
-            let file_path = output_dir.join(&file_name);
-            let content =
-                append_missing_aliases(bundled_types.clone(), repo_data.type_manifest.as_ref());
-
-            if let Err(e) = std::fs::write(&file_path, content) {
-                warn!("Failed to write type file {}: {}", file_name, e);
-            } else {
-                debug!("Created bundled type file: {}", file_path.display());
-            }
-        } else {
-            debug!(
-                "No bundled types available for repo: {}",
-                repo_data.repo_name
-            );
-        }
-    }
+    write_bundle_files(all_repo_data, output_dir);
 
     write_manifest_files(all_repo_data, output_dir)?;
 
@@ -4102,6 +4157,149 @@ mod tests {
                 .iter()
                 .all(|e| e.key.protocol() == crate::operation::Protocol::Http),
             "producer manifest must contain only HTTP entries"
+        );
+    }
+
+    /// Minimal `CloudRepoData` carrying just a repo/service identity and a
+    /// bundled `.d.ts`, for the bundle-file-emission tests below.
+    fn repo_with_bundle(
+        repo_name: &str,
+        service_name: Option<&str>,
+        bundled_types: &str,
+    ) -> CloudRepoData {
+        CloudRepoData {
+            repo_name: repo_name.to_string(),
+            service_name: service_name.map(str::to_string),
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+            mount_graph: None,
+            bundled_types: Some(bundled_types.to_string()),
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+        }
+    }
+
+    /// `bundle_file_stems` must give every `(repo, service)` a distinct stem so
+    /// the per-service `.d.ts` files don't collide. The clobbering bug was that
+    /// a monorepo's services share a `repo_name`, so a `repo_name`-only stem made
+    /// them all map to one file.
+    #[test]
+    fn bundle_file_stems_are_unique_per_service_in_a_monorepo() {
+        let repos = vec![
+            repo_with_bundle("orders-monorepo", Some("orders-pkg"), "// a"),
+            repo_with_bundle("orders-monorepo", Some("gateway"), "// b"),
+            // A service id containing a path separator must be sanitised, not
+            // allowed to escape the output dir.
+            repo_with_bundle("orders-monorepo", Some("scope/pkg"), "// c"),
+            // Two services with no service_name fall back to the shared repo_name
+            // and would still collide — the collision suffix must separate them.
+            repo_with_bundle("other-repo", None, "// d"),
+            repo_with_bundle("other-repo", None, "// e"),
+        ];
+
+        let stems = bundle_file_stems(&repos);
+
+        assert_eq!(
+            stems,
+            vec![
+                "orders-pkg".to_string(),
+                "gateway".to_string(),
+                "scope_pkg".to_string(),
+                "other-repo".to_string(),
+                "other-repo_1".to_string(),
+            ]
+        );
+        let unique: std::collections::HashSet<&String> = stems.iter().collect();
+        assert_eq!(
+            unique.len(),
+            stems.len(),
+            "every service must get a distinct bundle stem so no write clobbers another"
+        );
+    }
+
+    /// A-producer-bundle-gap regression: in a monorepo, the producer service's
+    /// explicit response type (orders-pkg `GET /orders/:id` → `Order`) must land
+    /// in the cross-repo bundle, resolvable — not get clobbered out by a sibling
+    /// service (gateway) sharing the repo name. Before the per-service split,
+    /// both wrote `orders-monorepo_types.d.ts` and the gateway write erased the
+    /// `Order` shape entirely (not even a `= unknown` placeholder), so ts_check
+    /// reported "Producer type not found in project" and the compat verdict
+    /// collapsed to unverifiable.
+    #[test]
+    fn monorepo_producer_explicit_type_survives_into_bundle() {
+        // orders-pkg's bundle: the explicit `Order` shape under its manifest
+        // alias. This is the producer type both consumers (payments-svc,
+        // web-frontend) need to resolve.
+        let orders_alias = "Endpoint_5d19c4207b67a294_Response";
+        let orders_bundle = format!(
+            "export type {orders_alias} = {{ id: number; amountCents: number; currency: string }};\n"
+        );
+        // gateway's bundle: a different alias. Under the old repo_name-only
+        // naming this write would clobber orders-pkg's file.
+        let gateway_alias = "Endpoint_aaaaaaaaaaaaaaaa_Response";
+        let gateway_bundle = format!("export type {gateway_alias} = {{ status: string }};\n");
+
+        let repos = vec![
+            repo_with_bundle("orders-monorepo", Some("orders-pkg"), &orders_bundle),
+            repo_with_bundle("orders-monorepo", Some("gateway"), &gateway_bundle),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bundle_files(&repos, dir.path());
+
+        // ts_check loads every *.d.ts in the dir; concatenate them the same way
+        // and assert BOTH services' producer aliases resolve to a real shape.
+        let mut combined = String::new();
+        let mut dts_files = 0usize;
+        for entry in std::fs::read_dir(dir.path()).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|s| s.to_str()) == Some("ts")
+                && path.to_string_lossy().ends_with(".d.ts")
+            {
+                dts_files += 1;
+                combined.push_str(&std::fs::read_to_string(&path).expect("read d.ts"));
+                combined.push('\n');
+            }
+        }
+
+        assert_eq!(
+            dts_files, 2,
+            "each service must get its own bundle file, not share one (got {dts_files})"
+        );
+
+        // The producer's `Order` shape is present, resolvable, and NOT a dangling
+        // `= unknown` placeholder — proving the type reaches ts_check.
+        assert!(
+            combined.contains(&format!(
+                "export type {orders_alias} = {{ id: number; amountCents: number; currency: string }}"
+            )),
+            "the orders-pkg producer's explicit Order shape must survive into the bundle, got:\n{combined}"
+        );
+        assert!(
+            !combined.contains(&format!("export type {orders_alias} = unknown")),
+            "the producer alias must resolve to its real members, not a dangling = unknown placeholder"
+        );
+        // The sibling service's types must coexist, not have been clobbered.
+        assert!(
+            combined.contains(&format!(
+                "export type {gateway_alias} = {{ status: string }}"
+            )),
+            "the gateway sibling's types must coexist in its own bundle file"
         );
     }
 }
