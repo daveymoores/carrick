@@ -612,6 +612,19 @@ export class TypeInferrer {
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
       isExplicit = unwrapResult.isExplicit;
+    } else {
+      // No wrapper rule fired: the payload resolved straight to its own type.
+      // For a consumer `fetch(url, { body: JSON.stringify(payload) })` with
+      // `payload: CreatePaymentRequest`, `node` is the unwrapped `payload`
+      // identifier and `payloadType` is the named object — `typeText` keeps the
+      // bare name `CreatePaymentRequest`, which dangles in the source-less
+      // cross-repo `.d.ts` bundle → resolves to `any` → unverifiable. Expand the
+      // resolved object structurally so the real members reach the bundle,
+      // mirroring `inferResponseBody`/`inferFunctionReturn`. A declared cast or
+      // typed binding (handled below) still wins and renders its own structural
+      // form via `extractExplicitTypeFromAncestor`.
+      const resolved = this.unwrapPromiseType(payloadType);
+      typeString = this.expandResolvedTypeStructural(resolved, typeString);
     }
 
     // A declared type — an `as T` cast or a typed variable binding/annotation
