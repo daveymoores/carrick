@@ -1222,11 +1222,12 @@ fn append_deterministic_protocol_operations(
 ///
 /// Socket entries carry `primary_type_symbol` directly (the payload type the
 /// extractor captured), which the sidecar then resolves through the existing
-/// SymbolRequest path. GraphQL entries deliberately leave `primary_type_symbol`
-/// as `None`: mapping an SDL field to its TS resolver return type (or the raw
-/// SDL type expression) is deferred to #248, so Phase 1 only gives GraphQL ops
-/// a stable `type_alias` + projection entry (an honest `Unknown` instead of
-/// `(none)`).
+/// SymbolRequest path. GraphQL SDL producers carry their deterministic anchor
+/// too (#248): the root field's SDL type expression (`Order`, `[Order!]!`),
+/// the only anchor available without a framework-specific SDL-field → TS-resolver
+/// mapping (follow-up #268). GraphQL document consumers have no SDL type, so
+/// their `primary_type_symbol` stays `None` (their TS result-type anchor is part
+/// of the same #268 mapping work).
 fn append_protocol_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     extractions: &ProtocolExtractions,
@@ -1238,7 +1239,7 @@ fn append_protocol_manifest_entries(
             ManifestRole::Producer,
             &op.file_path.to_string_lossy(),
             op.line,
-            None,
+            op.primary_type_symbol.clone(),
         );
     }
     for op in &extractions.graphql.consumers {
@@ -1248,7 +1249,7 @@ fn append_protocol_manifest_entries(
             ManifestRole::Consumer,
             &op.file_path.to_string_lossy(),
             op.line,
-            None,
+            op.primary_type_symbol.clone(),
         );
     }
     for op in &extractions.sockets.listeners {
@@ -3853,25 +3854,33 @@ mod tests {
     fn graphql_op(
         kind: crate::operation::GraphqlOperationKind,
         field: &str,
+        anchor: Option<&str>,
     ) -> crate::graphql::GraphqlOp {
         crate::graphql::GraphqlOp {
             key: OperationKey::graphql(kind, field),
             file_path: PathBuf::from("src/schema.graphql"),
             line: 3,
+            primary_type_symbol: anchor.map(String::from),
         }
     }
 
     /// A typed socket emitter produces a Response-kind manifest entry keyed by
     /// the socket OperationKey, carrying the captured payload symbol as the
-    /// anchor. GraphQL ops get an entry but no anchor (deferred to #248).
+    /// anchor. A GraphQL SDL producer carries its deterministic SDL type
+    /// expression as the anchor (#248); a document consumer has no SDL type so
+    /// its anchor stays `None`.
     #[test]
-    fn protocol_manifest_entries_anchor_sockets_not_graphql() {
+    fn protocol_manifest_entries_anchor_sockets_and_graphql_producers() {
         use crate::operation::{GraphqlOperationKind, SocketDirection};
 
         let extractions = ProtocolExtractions {
             graphql: crate::graphql::GraphqlExtraction {
-                producers: vec![graphql_op(GraphqlOperationKind::Query, "order")],
-                consumers: vec![],
+                producers: vec![graphql_op(
+                    GraphqlOperationKind::Query,
+                    "order",
+                    Some("Order"),
+                )],
+                consumers: vec![graphql_op(GraphqlOperationKind::Query, "order", None)],
             },
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![],
@@ -3903,19 +3912,32 @@ mod tests {
             1
         );
 
-        let graphql_entry = entries
+        // The SDL producer carries its deterministic SDL-type anchor (#248).
+        let graphql_producer = entries
             .iter()
-            .find(|e| e.key.canonical() == "graphql|query|order")
-            .expect("graphql manifest entry");
-        assert_eq!(graphql_entry.role, ManifestRole::Producer);
-        // Plumbing only: the entry exists (stable alias + projection), but the
-        // anchor is deferred to #248.
-        assert_eq!(graphql_entry.primary_type_symbol, None);
+            .find(|e| {
+                e.key.canonical() == "graphql|query|order" && e.role == ManifestRole::Producer
+            })
+            .expect("graphql producer manifest entry");
+        assert_eq!(
+            graphql_producer.primary_type_symbol.as_deref(),
+            Some("Order"),
+            "the SDL producer anchor must be the field's SDL type expression"
+        );
         assert!(
-            !graphql_entry.type_alias.is_empty(),
+            !graphql_producer.type_alias.is_empty(),
             "graphql op must get a stable type_alias"
         );
-        assert_eq!(graphql_entry.type_state, ManifestTypeState::Unknown);
+        assert_eq!(graphql_producer.type_state, ManifestTypeState::Unknown);
+
+        // The document consumer has no SDL type, so its anchor stays unset.
+        let graphql_consumer = entries
+            .iter()
+            .find(|e| {
+                e.key.canonical() == "graphql|query|order" && e.role == ManifestRole::Consumer
+            })
+            .expect("graphql consumer manifest entry");
+        assert_eq!(graphql_consumer.primary_type_symbol, None);
     }
 
     /// The fragile contract the whole anchor join hinges on: the alias on the
