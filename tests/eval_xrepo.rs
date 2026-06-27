@@ -1387,6 +1387,13 @@ fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path, mock: bool) -> EvalProject
         "ts_check/ was not found, so cross-repo type checking was silently skipped. \
          Ensure ts_check/ ships at the repo root.\n{stderr}"
     );
+    // TEMP diagnostic (compat overlay plumbing): surface the binary's DBGOV lines
+    // so the live-eval workflow log shows both sides of the verdict join.
+    for line in stderr.lines() {
+        if line.starts_with("DBGOV") {
+            eprintln!("{line}");
+        }
+    }
     let stdout = String::from_utf8(output.stdout).expect("Phase B stdout was not UTF-8");
     parse_projection(&stdout).unwrap_or_else(|| {
         panic!("Phase B stdout was not a valid EvalProjection:\n{stdout}");

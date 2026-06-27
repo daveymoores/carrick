@@ -1891,7 +1891,15 @@ impl Analyzer {
             }
         }
 
+        eprintln!("DBGOV incompatible_keys={:?}", incompatible.keys().collect::<Vec<_>>());
+        eprintln!("DBGOV unverifiable_keys={:?}", unverifiable.iter().collect::<Vec<_>>());
         for edge in matches.iter_mut() {
+            eprintln!(
+                "DBGOV edge producer_key={:?} consumer_location={:?} -> consumer_identity={:?}",
+                edge.producer_key,
+                edge.consumer_location,
+                edge.consumer_location.as_deref().map(consumer_identity)
+            );
             // producer_key is `http|METHOD|path`; recover (METHOD, path). A
             // non-HTTP key (GraphQL/socket edge) is not type-checked by ts_check
             // (HTTP-only), so its verdict is genuinely unknown — leave it `None`
@@ -1917,6 +1925,10 @@ impl Analyzer {
             } else {
                 edge.type_compatible = Some(true);
             }
+            eprintln!(
+                "DBGOV verdict pk={:?} consumer={:?} -> {:?}",
+                edge.producer_key, edge.consumer_location, edge.type_compatible
+            );
         }
     }
 
