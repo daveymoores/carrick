@@ -232,14 +232,17 @@ describe('Request body cast/binding regressions (#133 A1)', () => {
       'string',
       'must drill into JSON.stringify(arg), not surface its `string` result'
     );
-    // The serialized argument is a plain identifier typed `RegisterRequest`,
-    // so its own type name is read directly (no cast/binding to trigger the
-    // #257 structural recovery). The lever is "not `string`"; the argument's
-    // declared type, which resolves in the consumer's own bundle, is correct.
+    // The serialized argument is a plain identifier typed `RegisterRequest`.
+    // Its own type resolves to the named interface; the bare name `RegisterRequest`
+    // would dangle in the source-less cross-repo `.d.ts` bundle (alias lines only)
+    // → resolve to `any` → `unverifiable`. So the resolved payload is expanded
+    // STRUCTURALLY (shared `type-structural-expander.ts`), the same recovery
+    // `inferResponseBody`/`inferFunctionReturn` apply, landing the real members
+    // in the bundle so the consumer request shape can actually be compared.
     assert.strictEqual(
       inferred.type_string,
-      'RegisterRequest',
-      `expected the serialized argument's payload type, got ${inferred.type_string}`
+      REGISTER_REQUEST_STRUCTURAL,
+      `expected the serialized argument's payload type (structural), got ${inferred.type_string}`
     );
   });
 

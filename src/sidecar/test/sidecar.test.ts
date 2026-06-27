@@ -522,7 +522,14 @@ describe('Type Sidecar Integration Tests', () => {
       if (response.inferred_types && response.inferred_types.length > 0) {
         const inferred = response.inferred_types[0];
         assert.strictEqual(inferred.infer_kind, 'request_body');
-        assert.ok(inferred.type_string.includes('RequestBody'));
+        // The body resolves to the named `RequestBody`, now expanded
+        // structurally so the real members reach the cross-repo bundle instead
+        // of a dangling bare name. Assert the members, not the name.
+        assert.ok(
+          inferred.type_string.includes('name') &&
+            inferred.type_string.includes('email'),
+          `expected the structural RequestBody shape, got ${inferred.type_string}`
+        );
       }
     });
 
@@ -553,7 +560,14 @@ describe('Type Sidecar Integration Tests', () => {
       if (response.inferred_types && response.inferred_types.length > 0) {
         const inferred = response.inferred_types[0];
         assert.strictEqual(inferred.infer_kind, 'request_body');
-        assert.ok(inferred.type_string.includes('RequestBody'));
+        // The serialized payload resolves to the named `RequestBody`, now
+        // expanded structurally so the real members reach the cross-repo bundle
+        // instead of a dangling bare name. Assert the members, not the name.
+        assert.ok(
+          inferred.type_string.includes('name') &&
+            inferred.type_string.includes('email'),
+          `expected the structural RequestBody shape, got ${inferred.type_string}`
+        );
       }
     });
 
