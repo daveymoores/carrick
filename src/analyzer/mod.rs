@@ -267,6 +267,117 @@ fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
 }
 
+/// Collapse any dynamic path segment (`:id`, `{id}`, `[id]`) to `:param` so the
+/// compat verdict join is param-NAME-agnostic. The cross-repo edge's
+/// `producer_key` keeps the source param name (`/orders/:id`), while ts_check's
+/// `endpoint` is built from the normalized manifest (`/orders/:param`). Without
+/// collapsing BOTH sides, the join misses on every parameterized route and the
+/// edge falls back to the optimistic `Some(true)` default — the live cause of
+/// compat being pinned regardless of the actual ts_check verdicts.
+fn normalize_compat_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            let is_param = seg.starts_with(':')
+                || (seg.starts_with('{') && seg.ends_with('}'))
+                || (seg.starts_with('[') && seg.ends_with(']'));
+            if is_param { ":param" } else { seg }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Map ts_check's compatibility `result` onto each cross-repo edge's
+/// `type_compatible`, keyed per consumer (#260) and param-name-agnostic on the
+/// path ([`normalize_compat_path`]). Pure over `(result, matches)` so the
+/// verdict join is unit-testable without spawning ts_check.
+fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMatch]) {
+    // The per-pair verdict key: producer `(METHOD, normalized path)` plus the
+    // consumer identity `(path, line)` recovered from `consumerLocation`.
+    type VerdictKey = (String, String, (String, u32));
+
+    // Map verdict key → mismatch reason. Multiple type_kinds for one pair
+    // collapse to the first reason seen — the edge only records incompatibility.
+    let mut incompatible: HashMap<VerdictKey, String> = HashMap::new();
+    if let Some(mismatch_list) = result.get("mismatches").and_then(|m| m.as_array()) {
+        for mismatch in mismatch_list {
+            let Some(endpoint) = mismatch.get("endpoint").and_then(|e| e.as_str()) else {
+                continue;
+            };
+            let Some((method, path)) = parse_compat_endpoint(endpoint) else {
+                continue;
+            };
+            let Some(consumer) = mismatch
+                .get("consumerLocation")
+                .and_then(|c| c.as_str())
+                .map(consumer_identity)
+            else {
+                continue;
+            };
+            let reason = mismatch
+                .get("error")
+                .and_then(|e| e.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("producer and consumer types are incompatible")
+                .to_string();
+            incompatible
+                .entry((method, normalize_compat_path(&path), consumer))
+                .or_insert(reason);
+        }
+    }
+
+    // Pairs ts_check matched but could not verify (a side resolved to
+    // `any`/`unknown`). The compat verdict is genuinely unknown for these edges —
+    // leaving the optimistic `Some(true)` default would assert a compatibility
+    // ts_check never established.
+    let mut unverifiable: HashSet<VerdictKey> = HashSet::new();
+    if let Some(unknown_list) = result.get("unknownPairs").and_then(|u| u.as_array()) {
+        for pair in unknown_list {
+            let Some(endpoint) = pair.get("endpoint").and_then(|e| e.as_str()) else {
+                continue;
+            };
+            let Some((method, path)) = parse_compat_endpoint(endpoint) else {
+                continue;
+            };
+            let Some(consumer) = pair
+                .get("consumerLocation")
+                .and_then(|c| c.as_str())
+                .map(consumer_identity)
+            else {
+                continue;
+            };
+            unverifiable.insert((method, normalize_compat_path(&path), consumer));
+        }
+    }
+
+    for edge in matches.iter_mut() {
+        // producer_key is `http|METHOD|path`; recover (METHOD, path). A non-HTTP
+        // key (GraphQL/socket edge) is not type-checked by ts_check (HTTP-only),
+        // so its verdict is genuinely unknown — leave it `None` rather than
+        // fabricate `Some(true)` (#260, part 2).
+        let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
+            edge.type_compatible = None;
+            continue;
+        };
+        // Without a consumer identity the pair can't be matched to its own
+        // verdict, and asserting `Some(true)` would risk re-smearing — leave it
+        // `None` (compat undetermined for this edge).
+        let Some(consumer) = edge.consumer_location.as_deref().map(consumer_identity) else {
+            edge.type_compatible = None;
+            continue;
+        };
+        let key = (method, normalize_compat_path(&path), consumer);
+        if let Some(reason) = incompatible.get(&key) {
+            edge.type_compatible = Some(false);
+            edge.mismatch_reason = Some(reason.clone());
+        } else if unverifiable.contains(&key) {
+            // Matched but unverifiable — compat undetermined, NOT compatible.
+            edge.type_compatible = None;
+        } else {
+            edge.type_compatible = Some(true);
+        }
+    }
+}
+
 /// Sort cross-repo edges into a deterministic order and drop exact duplicates,
 /// keyed on the
 /// `(producer_repo, producer_key, consumer_repo, consumer_key, consumer_location)`
@@ -1830,94 +1941,7 @@ impl Analyzer {
             // Compat was not evaluated for this run — leave every edge `None`.
             Err(_) => return,
         };
-
-        // The per-pair verdict key: producer `(METHOD, path)` (from the mismatch
-        // `endpoint` string `"<METHOD> <path> (<request|response>)"`) plus the
-        // consumer identity `(path, line)` recovered from `consumerLocation`.
-        type VerdictKey = (String, String, (String, u32));
-
-        // Map verdict key → mismatch reason. Multiple type_kinds for one pair
-        // collapse to the first reason seen — the edge only records that the pair
-        // is incompatible.
-        let mut incompatible: HashMap<VerdictKey, String> = HashMap::new();
-        if let Some(mismatch_list) = result.get("mismatches").and_then(|m| m.as_array()) {
-            for mismatch in mismatch_list {
-                let Some(endpoint) = mismatch.get("endpoint").and_then(|e| e.as_str()) else {
-                    continue;
-                };
-                let Some((method, path)) = parse_compat_endpoint(endpoint) else {
-                    continue;
-                };
-                let Some(consumer) = mismatch
-                    .get("consumerLocation")
-                    .and_then(|c| c.as_str())
-                    .map(consumer_identity)
-                else {
-                    continue;
-                };
-                let reason = mismatch
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("producer and consumer types are incompatible")
-                    .to_string();
-                incompatible
-                    .entry((method, path, consumer))
-                    .or_insert(reason);
-            }
-        }
-
-        // Pairs ts_check matched but could not verify (a side resolved to
-        // `any`/`unknown`). The compat verdict is genuinely unknown for these
-        // edges — leaving the optimistic `Some(true)` default would assert a
-        // compatibility ts_check never established.
-        let mut unverifiable: HashSet<VerdictKey> = HashSet::new();
-        if let Some(unknown_list) = result.get("unknownPairs").and_then(|u| u.as_array()) {
-            for pair in unknown_list {
-                let Some(endpoint) = pair.get("endpoint").and_then(|e| e.as_str()) else {
-                    continue;
-                };
-                let Some((method, path)) = parse_compat_endpoint(endpoint) else {
-                    continue;
-                };
-                let Some(consumer) = pair
-                    .get("consumerLocation")
-                    .and_then(|c| c.as_str())
-                    .map(consumer_identity)
-                else {
-                    continue;
-                };
-                unverifiable.insert((method, path, consumer));
-            }
-        }
-
-        for edge in matches.iter_mut() {
-            // producer_key is `http|METHOD|path`; recover (METHOD, path). A
-            // non-HTTP key (GraphQL/socket edge) is not type-checked by ts_check
-            // (HTTP-only), so its verdict is genuinely unknown — leave it `None`
-            // rather than fabricate `Some(true)` (#260, part 2).
-            let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
-                edge.type_compatible = None;
-                continue;
-            };
-            // Without a consumer identity the pair can't be matched to its own
-            // verdict, and asserting `Some(true)` would risk re-smearing — leave
-            // it `None` (compat undetermined for this edge).
-            let Some(consumer) = edge.consumer_location.as_deref().map(consumer_identity) else {
-                edge.type_compatible = None;
-                continue;
-            };
-            let key = (method, path, consumer);
-            if let Some(reason) = incompatible.get(&key) {
-                edge.type_compatible = Some(false);
-                edge.mismatch_reason = Some(reason.clone());
-            } else if unverifiable.contains(&key) {
-                // Matched but unverifiable — compat undetermined, NOT compatible.
-                edge.type_compatible = None;
-            } else {
-                edge.type_compatible = Some(true);
-            }
-        }
+        apply_compat_verdicts(&result, matches);
     }
 
     pub fn run_final_type_checking(&self) -> Result<(), String> {
@@ -3014,6 +3038,80 @@ mod tests {
             Some(true),
             "a genuinely-checked edge absent from both lists is compatible"
         );
+    }
+
+    /// THE live compat=1/6 regression. ts_check builds its `endpoint` from the
+    /// normalized manifest (`/orders/:param`), while the cross-repo edge's
+    /// `producer_key` keeps the SOURCE param name (`/orders/:id`). The verdict
+    /// join must collapse both to `:param`; otherwise the incompatible verdict
+    /// misses the edge and it falls back to a fake `Some(true)`. With both sides
+    /// using the same param name (as the older tests do), this asymmetry is
+    /// invisible — which is exactly why it survived to the live eval.
+    #[test]
+    fn apply_compat_verdicts_joins_across_param_name_normalization() {
+        let result = serde_json::json!({
+            "mismatches": [{
+                "endpoint": "GET /orders/:param (response)",
+                "consumerLocation": "web-frontend/lib/api.ts:36",
+                "error": "Order is not assignable to OrderView"
+            }],
+            "unknownPairs": [{
+                "endpoint": "POST /payments (request)",
+                "consumerLocation": "web-frontend/lib/api.ts:48"
+            }]
+        });
+        let mut matches = vec![
+            edge_at(
+                "http|GET|/orders/:id",
+                "web-frontend",
+                "web-frontend/lib/api.ts:36",
+            ),
+            edge_at(
+                "http|GET|/orders/:id",
+                "payments-svc",
+                "payments-svc/clients/orders.client.ts:13",
+            ),
+            edge_at(
+                "http|POST|/payments",
+                "web-frontend",
+                "web-frontend/lib/api.ts:48",
+            ),
+            edge_at(
+                "graphql|query|order",
+                "web-frontend",
+                "web-frontend/lib/graphql.ts:50",
+            ),
+        ];
+
+        apply_compat_verdicts(&result, &mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible,
+            Some(false),
+            "the web consumer's incompatible verdict must attach despite :id vs :param"
+        );
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(true),
+            "the payments consumer of the same producer keeps its own compatible verdict"
+        );
+        assert_eq!(
+            matches[2].type_compatible, None,
+            "POST /payments is unverifiable → None, never a fake compatible"
+        );
+        assert_eq!(
+            matches[3].type_compatible, None,
+            "a non-HTTP edge is not ts_check-verifiable → None"
+        );
+    }
+
+    #[test]
+    fn normalize_compat_path_collapses_param_syntaxes() {
+        assert_eq!(normalize_compat_path("/orders/:id"), "/orders/:param");
+        assert_eq!(normalize_compat_path("/orders/{id}"), "/orders/:param");
+        assert_eq!(normalize_compat_path("/orders/[id]"), "/orders/:param");
+        assert_eq!(normalize_compat_path("/payments"), "/payments");
+        assert_eq!(normalize_compat_path("/"), "/");
     }
 
     /// THE #260 regression. One producer endpoint (`GET /orders/:id`) with TWO
