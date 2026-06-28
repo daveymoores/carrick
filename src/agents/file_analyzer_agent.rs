@@ -586,6 +586,7 @@ impl FileAnalyzerAgent {
     }
 
     /// Build the dynamic user message with patterns, file content, and candidate targets.
+    #[allow(clippy::too_many_arguments)]
     fn build_user_message_with_candidates(
         &self,
         file_path: &str,
