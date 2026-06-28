@@ -175,12 +175,42 @@ pub struct DataCallResult {
     pub type_import_source: Option<String>,
 }
 
+/// A GraphQL resolver the file-analyzer found: the schema field it answers and
+/// the resolver function's declared return type (resolved downstream into the
+/// producer-side response contract). Mirrors the `graphql_operations` array in
+/// `AgentSchemas::file_analysis_schema`. The `kind` wire values (query /
+/// mutation / subscription) come from `crate::operation::GraphqlOperationKind`,
+/// the single source of truth shared with the operation graph; the schema enum
+/// is kept in lockstep by `graphql_operations_schema_enum_matches_serde_wire_values`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphqlOperation {
+    /// The GraphQL root operation this resolver implements.
+    pub kind: crate::operation::GraphqlOperationKind,
+    /// The schema field name this resolver answers (e.g., "order").
+    pub field: String,
+    /// Name of the resolver function (e.g., "resolveOrder").
+    pub resolver_function: String,
+    /// Line number where the resolver function is defined.
+    pub resolver_line: i32,
+    /// The primary return type symbol without wrappers (e.g., "ApiResponse" from
+    /// "Promise<ApiResponse>"). `None` for untyped or inline-object returns.
+    pub primary_type_symbol: Option<String>,
+    /// Import path where the type is defined (e.g., "./types/order"), null if
+    /// inline or same file. Null whenever `primary_type_symbol` is null.
+    pub type_import_source: Option<String>,
+}
+
 /// Complete analysis result for a single file
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileAnalysisResult {
     pub mounts: Vec<MountResult>,
     pub endpoints: Vec<EndpointResult>,
     pub data_calls: Vec<DataCallResult>,
+    /// GraphQL resolvers found in the file. Optional on the wire (a model may
+    /// omit it for non-GraphQL files), so default to empty rather than failing
+    /// the whole file's parse.
+    #[serde(default)]
+    pub graphql_operations: Vec<GraphqlOperation>,
 }
 
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
@@ -224,6 +254,7 @@ impl FileAnalyzerAgent {
             &[],
             &[],
             &HashMap::new(),
+            &[],
         )
         .await
     }
@@ -270,6 +301,7 @@ impl FileAnalyzerAgent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn analyze_file_with_candidates(
         &self,
         file_path: &str,
@@ -278,6 +310,7 @@ impl FileAnalyzerAgent {
         candidate_hints: &[String],
         candidate_contexts: &[String],
         imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -291,6 +324,7 @@ impl FileAnalyzerAgent {
             candidate_hints,
             candidate_contexts,
             imported_symbols,
+            graphql_producer_hints,
         );
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
@@ -547,10 +581,12 @@ impl FileAnalyzerAgent {
             &[],
             &[],
             &HashMap::new(),
+            &[],
         )
     }
 
     /// Build the dynamic user message with patterns, file content, and candidate targets.
+    #[allow(clippy::too_many_arguments)]
     fn build_user_message_with_candidates(
         &self,
         file_path: &str,
@@ -559,6 +595,7 @@ impl FileAnalyzerAgent {
         candidate_hints: &[String],
         candidate_contexts: &[String],
         imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
@@ -584,6 +621,34 @@ impl FileAnalyzerAgent {
         };
 
         let imports_section = Self::format_import_table(imported_symbols);
+
+        // GraphQL producer context (Stage B2): the SDL root fields this service
+        // exposes. Repo-global (one list per scan, identical across files), so it
+        // sits in the cacheable front block alongside the guidance. When the
+        // service has no SDL producers this is empty and the section is omitted,
+        // leaving every non-GraphQL prompt byte-identical to before.
+        //
+        // The section string carries its OWN leading `\n` (the blank line that
+        // separates it from the triage hints above) and its own trailing `\n`. The
+        // template therefore interpolates it ADJACENT to the triage-hints
+        // placeholder with no surrounding newline of its own — so an empty section
+        // contributes exactly zero bytes and the non-GraphQL message is byte-for-byte
+        // the pre-feature prompt, preserving the Vertex implicit prefix-cache hit.
+        let graphql_producers_section = if graphql_producer_hints.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)\n\
+                 The fields below are this service's GraphQL schema root fields. If a function in \
+                 this file resolves one of them, emit a `graphql_operations` entry linking the \
+                 resolver function to its `kind`/`field` and its return type.\n{}\n",
+                graphql_producer_hints
+                    .iter()
+                    .map(|line| format!("- {}", line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
 
         // Add line-number prefixes to file content so Gemini can read line numbers directly
         let mut numbered_content =
@@ -611,8 +676,7 @@ impl FileAnalyzerAgent {
 }}
 
 ### FRAMEWORK-SPECIFIC HINTS
-{}
-
+{}{}
 ### FRAMEWORK-SPECIFIC PARSING NOTES
 These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
 {}
@@ -670,6 +734,7 @@ Return ONLY the JSON object, no explanations."#,
             endpoint_patterns,
             data_patterns,
             guidance.triage_hints,
+            graphql_producers_section,
             guidance.parsing_notes,
             candidates_section,
             candidate_contexts_section,
@@ -901,6 +966,7 @@ mod tests {
             mounts: vec![],
             endpoints: vec![endpoint],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
 
         FileAnalyzerAgent::sanitize_result(&mut result);
@@ -918,6 +984,7 @@ mod tests {
             mounts: vec![],
             endpoints: vec![endpoint],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
         FileAnalyzerAgent::sanitize_result(&mut result);
         assert_eq!(
@@ -1099,6 +1166,7 @@ mod tests {
                 primary_type_symbol: Some("NULL".to_string()),
                 type_import_source: Some("bad import (oops)".to_string()),
             }],
+            graphql_operations: vec![],
         };
 
         let needs_retry = FileAnalyzerAgent::sanitize_result(&mut result);
@@ -1144,6 +1212,7 @@ mod tests {
                 type_import_source: None,
             }],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1155,6 +1224,63 @@ mod tests {
         assert_eq!(deserialized.mounts.len(), 1);
         assert_eq!(deserialized.endpoints.len(), 1);
         assert!(deserialized.data_calls.is_empty());
+    }
+
+    #[test]
+    fn graphql_operations_deserialize_from_model_shape() {
+        // The exact wire shape the file-analyzer emits for a GraphQL resolver.
+        let json = r#"{
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [],
+            "graphql_operations": [
+                {
+                    "kind": "query",
+                    "field": "order",
+                    "resolver_function": "resolveOrder",
+                    "resolver_line": 38,
+                    "primary_type_symbol": "ApiResponse",
+                    "type_import_source": null
+                }
+            ]
+        }"#;
+
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.graphql_operations.len(), 1);
+        let op = &result.graphql_operations[0];
+        assert_eq!(op.kind, crate::operation::GraphqlOperationKind::Query);
+        assert_eq!(op.field, "order");
+        assert_eq!(op.resolver_function, "resolveOrder");
+        assert_eq!(op.resolver_line, 38);
+        assert_eq!(op.primary_type_symbol.as_deref(), Some("ApiResponse"));
+        assert_eq!(op.type_import_source, None);
+    }
+
+    #[test]
+    fn graphql_operations_default_empty_when_omitted() {
+        // A non-GraphQL file omits graphql_operations entirely; #[serde(default)]
+        // must yield an empty vec rather than failing the whole file's parse.
+        let json = r#"{ "mounts": [], "endpoints": [], "data_calls": [] }"#;
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert!(result.graphql_operations.is_empty());
+
+        // mutation / subscription wire values round-trip too.
+        let json = r#"{
+            "mounts": [], "endpoints": [], "data_calls": [],
+            "graphql_operations": [
+                { "kind": "mutation", "field": "createOrder", "resolver_function": "createOrder", "resolver_line": 7, "primary_type_symbol": null, "type_import_source": null },
+                { "kind": "subscription", "field": "orderUpdated", "resolver_function": "orderUpdated", "resolver_line": 9, "primary_type_symbol": null, "type_import_source": null }
+            ]
+        }"#;
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.graphql_operations[0].kind,
+            crate::operation::GraphqlOperationKind::Mutation
+        );
+        assert_eq!(
+            result.graphql_operations[1].kind,
+            crate::operation::GraphqlOperationKind::Subscription
+        );
     }
 
     #[test]
@@ -1202,12 +1328,14 @@ mod tests {
                 primary_type_symbol: None,
                 type_import_source: None,
             }],
+            graphql_operations: vec![],
         };
 
         let retry = FileAnalysisResult {
             mounts: vec![],
             endpoints: vec![],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
 
         let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry);
@@ -1316,6 +1444,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &candidates,
             &candidate_contexts,
             &imported,
+            &[],
         );
 
         assert!(message.contains("IMPORT TABLE"));
@@ -1354,6 +1483,101 @@ const data = await fetch('/api/users').then(resp => resp.json());
                 "stable guidance must precede per-file `{per_file}` for prefix caching"
             );
         }
+    }
+
+    #[test]
+    fn build_user_message_includes_graphql_producers_when_hints_present() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = "export function resolveOrder() { return {}; }\n";
+        let hints = vec![
+            "query order: Order".to_string(),
+            "mutation refundOrder: Order!".to_string(),
+        ];
+
+        let message = agent.build_user_message_with_candidates(
+            "resolvers.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &hints,
+        );
+
+        assert!(
+            message.contains("### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)"),
+            "expected GraphQL producers section, got:\n{message}"
+        );
+        assert!(
+            message.contains("- query order: Order"),
+            "expected formatted producer field line, got:\n{message}"
+        );
+        assert!(
+            message.contains("- mutation refundOrder: Order!"),
+            "expected second producer field line, got:\n{message}"
+        );
+        assert!(
+            message.contains("graphql_operations"),
+            "expected pointer to the graphql_operations output channel, got:\n{message}"
+        );
+
+        // The producer block is repo-global (stable across files), so it must sit
+        // in the cacheable front block, before any per-file section.
+        let pos = |needle: &str| {
+            message
+                .find(needle)
+                .unwrap_or_else(|| panic!("section `{needle}` missing:\n{message}"))
+        };
+        assert!(
+            pos("### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)") < pos("### FILE CONTENT"),
+            "stable GraphQL producer block must precede per-file content for prefix caching"
+        );
+    }
+
+    #[test]
+    fn build_user_message_omits_graphql_producers_when_hints_empty() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = "const x = 1;\n";
+
+        let message = agent.build_user_message_with_candidates(
+            "plain.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+        );
+
+        assert!(
+            !message.contains("GRAPHQL SCHEMA PRODUCERS"),
+            "GraphQL producers section must be absent when no hints are passed, got:\n{message}"
+        );
+
+        // Byte-identity guard (Vertex implicit prefix caching): an empty hint list
+        // must contribute ZERO bytes to the assembled message — i.e. the prompt is
+        // byte-for-byte what the pre-feature template produced. The pre-feature form
+        // joined the triage hints directly to the PARSING NOTES header with a SINGLE
+        // newline. A stray blank line here (the `{}\n{}` template bug Copilot flagged)
+        // would shift the cacheable prefix and tank the within-scan cache hit rate.
+        let triage_hints = &guidance.triage_hints;
+        let pre_feature_join = format!(
+            "### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n### FRAMEWORK-SPECIFIC PARSING NOTES"
+        );
+        assert!(
+            message.contains(&pre_feature_join),
+            "empty hints must render the pre-feature single-newline join, got:\n{message}"
+        );
+        // And explicitly: no doubled blank line where the section would have gone.
+        let doubled_join = format!(
+            "### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n\n### FRAMEWORK-SPECIFIC PARSING NOTES"
+        );
+        assert!(
+            !message.contains(&doubled_join),
+            "empty hints must NOT leave a doubled blank line before PARSING NOTES, got:\n{message}"
+        );
     }
 
     #[test]

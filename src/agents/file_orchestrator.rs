@@ -163,6 +163,7 @@ impl FileOrchestrator {
         guidance: &ProtocolGuidance,
         framework_detection: &DetectionResult,
         repo_root: &Path,
+        graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
@@ -208,6 +209,12 @@ impl FileOrchestrator {
             /// LLM ignores route-as-data, so these are the authoritative source
             /// for such endpoints. Empty for files with no route descriptors.
             descriptor_endpoints: Vec<EndpointResult>,
+            /// Repo-global GraphQL producer hint lines (Stage B2), injected into
+            /// the user message so the model can link resolver functions in this
+            /// file to schema fields. Identical for every file; cloned per-pending
+            /// so the concurrent dispatch closure owns its copy. Empty for repos
+            /// with no SDL producers.
+            graphql_producer_hints: Vec<String>,
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -310,6 +317,33 @@ impl FileOrchestrator {
                 .filter(|c| !descriptor_spans.contains(&(c.span_start, c.span_end)))
                 .collect();
 
+            // GraphQL resolver routing (Stage B2): a resolver file is loose
+            // exported functions with no HTTP route candidate, so the
+            // candidate-less skip below would drop it before the file-analyzer
+            // ever sees it — and without the SDL producer context it couldn't
+            // link a resolver to its field anyway. Rescue it from the skip when
+            // ALL of: this repo has SDL producers, the file is co-located with
+            // the schema (under an SDL scan root), and it has at least one
+            // exported binding (resolver-shaped). Scoped this tightly so only
+            // schema-adjacent resolver files reach the LLM, not every
+            // exported-function file in the repo. The injected GRAPHQL SCHEMA
+            // PRODUCERS section gives the model the field list to link against.
+            let is_graphql_resolver_file = !graphql_producer_hints.is_empty()
+                && graphql_producer_hints.file_within_scan_roots(file_path)
+                // Cheap `export` substring pre-check before the expensive
+                // `exported_handlers` SWC reparse: `scan_content` (Step 1) already
+                // parsed this file, and a resolver file must contain at least one
+                // `export`. `&&` short-circuits, so the reparse runs only when the
+                // keyword is present — the common no-exports file avoids a second
+                // parse entirely. (Reusing the Step-1 parse directly would mean
+                // threading exported-handler data through `ScanResult`, which it
+                // does not currently carry; the substring guard is the cheap win.)
+                && content.contains("export")
+                && !self
+                    .swc_scanner
+                    .exported_handlers(file_path, &content)
+                    .is_empty();
+
             // STEP 2: Check Relevance - if there are no candidates for a routed
             // protocol, SKIP the (expensive) LLM call. File-based route and
             // route-descriptor endpoints are still recorded: they're derived
@@ -337,12 +371,22 @@ impl FileOrchestrator {
                             ..Default::default()
                         },
                     );
+                    continue;
+                } else if is_graphql_resolver_file {
+                    // Fall through to the LLM pass with empty HTTP candidates:
+                    // the file-analyzer reads the producer-field context and the
+                    // file content to emit `graphql_operations`.
+                    debug!(
+                        "Routed GraphQL resolver file (no HTTP candidates): {}",
+                        path_str
+                    );
                 } else if unrouted_candidates.is_empty() {
                     debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
                     stats.files_skipped += 1;
                     stats.files_skipped_no_candidates += 1;
                     // Store empty result so incremental cache knows this file was processed
                     file_results.insert(path_str, FileAnalysisResult::default());
+                    continue;
                 } else {
                     debug!(
                         "Skipped (only unrouted-protocol candidates): {} [{} candidate(s)]",
@@ -352,8 +396,8 @@ impl FileOrchestrator {
                     stats.files_skipped += 1;
                     stats.files_skipped_unrouted_protocol += 1;
                     file_results.insert(path_str, FileAnalysisResult::default());
+                    continue;
                 }
-                continue;
             }
 
             debug!(
@@ -388,6 +432,7 @@ impl FileOrchestrator {
                 env_alias_map,
                 route_endpoints,
                 descriptor_endpoints,
+                graphql_producer_hints: graphql_producer_hints.lines.clone(),
             });
         }
 
@@ -415,6 +460,7 @@ impl FileOrchestrator {
                         &pf.candidate_hints,
                         &pf.candidate_contexts,
                         &pf.symbol_table.imported_symbols,
+                        &pf.graphql_producer_hints,
                     )
                     .await
                     .map_err(|e| e.to_string());
@@ -1159,6 +1205,81 @@ impl FileOrchestrator {
         requests
     }
 
+    /// Build `FunctionReturn` infer requests for GraphQL SDL producers whose
+    /// resolver location was joined in from the file-analyzer (`graphql_operations`,
+    /// Stage B1).
+    ///
+    /// Producers do NOT use the `SymbolRequest`/bundle path the consumer/socket
+    /// anchors use: bundling the SDL anchor symbol (`ApiResponse`) would emit the
+    /// still-generic wrapper, not the producer's real response contract. The
+    /// producer's contract is the resolver function's RETURN type expanded
+    /// (`Promise<ApiResponse<Order>>` → `{ data: …, errors }`), so this points an
+    /// `InferKind::FunctionReturn` at the resolver's file/line — exactly the
+    /// file-based-route handler path. The sidecar resolves the fn return,
+    /// Promise/async-iterator-unwraps it, and structurally expands it.
+    ///
+    /// The alias MUST be `build_manifest_type_alias(&op.key, Producer, Response)`
+    /// — byte-identical to the alias `add_protocol_manifest_entry` stamped on the
+    /// producer manifest entry — or the inferred type never joins back and the
+    /// entry stays `Unknown`. This is the load-bearing join, guarded by a unit
+    /// test exactly as the consumer side is.
+    ///
+    /// Only producers with BOTH `resolver_file` and `resolver_line` set produce a
+    /// request; an SDL producer with no matched LLM op stays inferred-from-nothing
+    /// (it keeps its SDL anchor, but no expanded response contract).
+    pub fn collect_graphql_producer_infer_requests(
+        &self,
+        graphql: &crate::graphql::GraphqlExtraction,
+        repo_path: &str,
+    ) -> Vec<InferRequestItem> {
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let mut requests: Vec<InferRequestItem> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for op in &graphql.producers {
+            let (Some(resolver_file), Some(resolver_line)) =
+                (op.resolver_file.as_ref(), op.resolver_line)
+            else {
+                continue;
+            };
+            let file_abs =
+                Self::to_absolute_path(&resolver_file.to_string_lossy(), &repo_root_absolute);
+            let alias = build_manifest_type_alias(
+                &op.key,
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            );
+            let dedup_key = format!("{}|{}|{}", file_abs, resolver_line, alias);
+            if seen.insert(dedup_key) {
+                requests.push(InferRequestItem {
+                    file_path: file_abs,
+                    line_number: resolver_line,
+                    span_start: None,
+                    span_end: None,
+                    expression_text: None,
+                    expression_line: None,
+                    infer_kind: InferKind::FunctionReturn,
+                    alias: Some(alias),
+                    param_name: None,
+                });
+            }
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} graphql producer infer requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Parse a file once and extract both the symbol table and the env-var
     /// alias map (`local const -> process.env name`). Sharing the parse keeps
     /// the per-file CPU cost flat — both passes are cheap AST walks.
@@ -1550,6 +1671,10 @@ impl FileOrchestrator {
     /// * `config` - Config used for URL normalization
     /// * `extra_explicit` - Deterministically-collected explicit symbol
     ///   requests for non-HTTP protocols (socket payload anchors, #245)
+    /// * `extra_infer` - Deterministically-collected `FunctionReturn` infer
+    ///   requests for non-HTTP protocols (GraphQL producer resolver returns,
+    ///   Stage B1). Unlike `extra_explicit`, these go through the infer path so
+    ///   the resolver return is expanded, not bundled as the generic SDL anchor.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve_types_with_sidecar(
         &self,
@@ -1560,8 +1685,9 @@ impl FileOrchestrator {
         mount_graph: &MountGraph,
         config: &Config,
         extra_explicit: &[SymbolRequest],
+        extra_infer: &[InferRequestItem],
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (mut explicit, infer, inline_aliases) =
+        let (mut explicit, mut infer, inline_aliases) =
             self.collect_type_requests(file_results, repo_path, mount_graph, config);
 
         // Deterministically-collected explicit requests for non-HTTP protocols
@@ -1570,11 +1696,20 @@ impl FileOrchestrator {
         // alias each carries matches its manifest entry so the enrich-join lands.
         explicit.extend_from_slice(extra_explicit);
 
+        // Deterministically-collected infer requests for non-HTTP protocols
+        // (today: GraphQL producer resolver returns, Stage B1). A producer's real
+        // response contract is the resolver's RETURN type expanded, so it takes
+        // the `FunctionReturn` infer path (mirroring file-based routes), NOT the
+        // bundle path — bundling the SDL anchor would emit the generic wrapper.
+        // The alias each carries matches its manifest entry so the join lands.
+        infer.extend_from_slice(extra_infer);
+
         debug!(
-            "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred",
+            "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred ({} from non-HTTP protocols)",
             explicit.len(),
             extra_explicit.len(),
-            infer.len()
+            infer.len(),
+            extra_infer.len()
         );
 
         let result = sidecar
@@ -2405,6 +2540,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 
@@ -2456,6 +2592,7 @@ mod tests {
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
+                graphql_operations: vec![],
             },
         );
 
@@ -2514,6 +2651,7 @@ mod tests {
                         type_import_source: None,
                     },
                 ],
+                graphql_operations: vec![],
             },
         );
 
@@ -2552,6 +2690,7 @@ mod tests {
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
+                graphql_operations: vec![],
             },
         );
 
@@ -2610,6 +2749,7 @@ mod tests {
                         type_import_source: None,
                     },
                 ],
+                graphql_operations: vec![],
             },
         );
 
@@ -2662,6 +2802,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 
@@ -2728,6 +2869,7 @@ mod tests {
                 mounts: vec![],
                 endpoints: vec![endpoint],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
         let graph = orchestrator.build_mount_graph(&file_results);
@@ -2924,6 +3066,7 @@ mod tests {
                 primary_type_symbol: Some("LocalType".to_string()),
                 type_import_source: None,
             }],
+            graphql_operations: vec![],
         };
 
         let mut imported_symbols = HashMap::new();
@@ -2993,6 +3136,7 @@ mod tests {
                 }],
                 endpoints: vec![],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 
@@ -3040,6 +3184,7 @@ mod tests {
                     },
                 ],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 

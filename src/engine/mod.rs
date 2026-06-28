@@ -902,6 +902,16 @@ async fn analyze_current_repo_incremental(
             let agent_service = AgentService::new();
             let file_orchestrator = FileOrchestrator::new(agent_service.clone());
 
+            // Stage B2: GraphQL producer field-list from the service's SDL,
+            // derived deterministically so the file-analyzer can emit
+            // `graphql_operations` linking resolvers to schema fields. Scanned
+            // over the full service `files` (not just `files_to_analyze`) so the
+            // producer list is complete; empty for non-GraphQL services.
+            let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
+                service_graphql_roots(repo_path, service),
+                &files,
+            );
+
             let new_file_results = if !files_to_analyze.is_empty() {
                 let result = file_orchestrator
                     .analyze_files(
@@ -909,6 +919,7 @@ async fn analyze_current_repo_incremental(
                         &guidance,
                         &detection,
                         Path::new(repo_path),
+                        &graphql_producer_hints,
                     )
                     .await?;
                 result.file_results
@@ -983,6 +994,7 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 service,
                 &files,
+                &merged_results,
             );
 
             // Populate cache fields
@@ -1013,6 +1025,12 @@ async fn analyze_current_repo_incremental(
                     .collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
             );
 
+            // GraphQL producers take the infer path, not the bundle path: their
+            // response contract is the resolver's expanded RETURN type, so they
+            // become `FunctionReturn` infer requests (Stage B1).
+            let graphql_producer_infer = file_orchestrator
+                .collect_graphql_producer_infer_requests(&protocol_extractions.graphql, repo_path);
+
             // Type resolution via sidecar
             resolve_types_if_available(
                 sidecar,
@@ -1023,6 +1041,7 @@ async fn analyze_current_repo_incremental(
                 &mount_graph,
                 config,
                 &protocol_requests,
+                &graphql_producer_infer,
                 &mut cloud_data,
             );
 
@@ -1150,6 +1169,7 @@ fn append_deterministic_protocol_operations(
     repo_path: &str,
     service: &Config,
     files: &[PathBuf],
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) -> ProtocolExtractions {
     // Same "{file}:{line}" convention the mount-graph conversions use
     let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
@@ -1167,7 +1187,8 @@ fn append_deterministic_protocol_operations(
     };
 
     let scan_roots = service_graphql_roots(repo_path, service);
-    let graphql = crate::graphql::scan_repo(&scan_roots, files);
+    let mut graphql = crate::graphql::scan_repo(&scan_roots, files);
+    merge_graphql_resolver_locations(&mut graphql, file_results);
     if !graphql.is_empty() {
         debug!(
             producers = graphql.producers.len(),
@@ -1210,6 +1231,56 @@ fn append_deterministic_protocol_operations(
     }
 
     ProtocolExtractions { graphql, sockets }
+}
+
+/// Fold the file-analyzer's `graphql_operations` into the SDL-derived producers
+/// (Stage B1). The SDL `scan_repo` gives the producer's canonical
+/// `OperationKey` and its SDL anchor, but NOT where the resolver lives — and the
+/// producer's real response contract is the resolver function's RETURN type
+/// expanded (`Promise<ApiResponse<Order>>` → `{ data: …, errors }`), which only
+/// a `FunctionReturn` infer at the resolver's file/line can give.
+///
+/// For each LLM `graphql_operation`, build its canonical `OperationKey` and match
+/// it to the SDL producer with the same key; populate that producer's
+/// `resolver_file` (the file the op came from — `file_results` is keyed by path)
+/// and `resolver_line`. An LLM op with no matching SDL producer is ignored
+/// (logged at debug): without an SDL producer there is no manifest entry to join
+/// back to, so a resolver location alone is inert.
+///
+/// Consumers are never touched — they anchor on `payload_type_symbol`.
+fn merge_graphql_resolver_locations(
+    graphql: &mut crate::graphql::GraphqlExtraction,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    // Canonical producer key -> index, so each LLM op joins in O(1) without an
+    // N×M scan. A schema field has at most one root producer, so the last write
+    // wins is moot (keys are unique across producers).
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    for (idx, op) in graphql.producers.iter().enumerate() {
+        by_key.insert(op.key.canonical(), idx);
+    }
+
+    for (path, result) in file_results {
+        for llm_op in &result.graphql_operations {
+            let key = OperationKey::graphql(llm_op.kind, llm_op.field.clone());
+            let Some(&idx) = by_key.get(&key.canonical()) else {
+                debug!(
+                    op = %key.canonical(),
+                    file = %path,
+                    "graphql_operation has no matching SDL producer; ignoring resolver location"
+                );
+                continue;
+            };
+            let producer = &mut graphql.producers[idx];
+            producer.resolver_file = Some(PathBuf::from(path));
+            // The LLM line is a 1-based source line; clamp non-positive values to
+            // None rather than wrapping into a bogus u32 (the infer request's
+            // line_number is u32, and a 0/negative line can't anchor a function).
+            producer.resolver_line = u32::try_from(llm_op.resolver_line)
+                .ok()
+                .filter(|&line| line > 0);
+        }
+    }
 }
 
 /// Emit type-manifest entries for the deterministically-extracted GraphQL and
@@ -1476,6 +1547,7 @@ fn resolve_types_if_available(
     mount_graph: &MountGraph,
     config: &Config,
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
+    extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     cloud_data: &mut CloudRepoData,
 ) {
     let Some(sidecar) = sidecar else {
@@ -1498,6 +1570,7 @@ fn resolve_types_if_available(
                 mount_graph,
                 config,
                 extra_explicit,
+                extra_infer,
             ) {
                 Ok(type_resolution) => {
                     debug!(
@@ -2116,9 +2189,25 @@ async fn analyze_current_repo(
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
 
+    // Stage B2: derive the GraphQL producer field-list from the service's SDL
+    // (deterministic, cheap) so the file-analyzer can link resolver functions to
+    // schema fields and emit `graphql_operations`. Empty (a no-op) for non-GraphQL
+    // services. `append_deterministic_protocol_operations` scans the SDL again
+    // later for the operation index; the duplicate parse is acceptable.
+    let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
+        service_graphql_roots(repo_path, service),
+        &files,
+    );
+
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files.clone(), packages, &all_imported_symbols, repo_path)
+        .run_complete_analysis(
+            files.clone(),
+            packages,
+            &all_imported_symbols,
+            repo_path,
+            &graphql_producer_hints,
+        )
         .await?;
 
     // 4b. Generate function intents using LLM
@@ -2149,8 +2238,13 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
-    let protocol_extractions =
-        append_deterministic_protocol_operations(&mut cloud_data, repo_path, service, &files);
+    let protocol_extractions = append_deterministic_protocol_operations(
+        &mut cloud_data,
+        repo_path,
+        service,
+        &files,
+        &analysis_result.file_results,
+    );
 
     let mut manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
@@ -2181,6 +2275,12 @@ async fn analyze_current_repo(
         file_orchestrator.collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
     );
 
+    // GraphQL producers take the infer path, not the bundle path: their response
+    // contract is the resolver's expanded RETURN type, so they become
+    // `FunctionReturn` infer requests (Stage B1).
+    let graphql_producer_infer = file_orchestrator
+        .collect_graphql_producer_infer_requests(&protocol_extractions.graphql, repo_path);
+
     resolve_types_if_available(
         sidecar,
         &file_orchestrator,
@@ -2190,6 +2290,7 @@ async fn analyze_current_repo(
         &analysis_result.mount_graph,
         config,
         &protocol_requests,
+        &graphql_producer_infer,
         &mut cloud_data,
     );
 
@@ -2866,6 +2967,7 @@ mod tests {
                     type_import_source: None,
                 })
                 .collect(),
+            graphql_operations: vec![],
         }
     }
 
@@ -3233,6 +3335,7 @@ mod tests {
                         type_import_source: None,
                     }],
                     data_calls: vec![],
+                    graphql_operations: vec![],
                 },
             );
         }
@@ -3930,6 +4033,8 @@ mod tests {
             primary_type_symbol: anchor.map(String::from),
             payload_type_symbol: None,
             payload_type_source: None,
+            resolver_file: None,
+            resolver_line: None,
         }
     }
 
@@ -3947,7 +4052,96 @@ mod tests {
             primary_type_symbol: None,
             payload_type_symbol: payload_symbol.map(String::from),
             payload_type_source: payload_source.map(String::from),
+            resolver_file: None,
+            resolver_line: None,
         }
+    }
+
+    /// Stage B1 merge: the file-analyzer's `graphql_operations` join their
+    /// resolver location onto the SDL producer sharing the same canonical key.
+    /// The SDL producer alone has no resolver location; after the merge it points
+    /// at the resolver file/line so the producer can take the `FunctionReturn`
+    /// infer path (its real response contract is the resolver's expanded return).
+    #[test]
+    fn merge_graphql_resolver_locations_joins_llm_op_onto_sdl_producer() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        // SDL producer `graphql|query|order` with no resolver location yet.
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![
+                graphql_op(GraphqlOperationKind::Query, "order", Some("Order")),
+                // A second producer the LLM never reports a resolver for: it must
+                // stay `None` (no spurious join).
+                graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
+            ],
+            consumers: vec![],
+        };
+
+        // file_results keyed by path, carrying the matching LLM graphql_operation
+        // plus one op (`createOrder`) with NO SDL producer (must be ignored).
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "packages/gateway/src/orders.resolver.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![],
+                graphql_operations: vec![
+                    GraphqlOperation {
+                        kind: GraphqlOperationKind::Query,
+                        field: "order".to_string(),
+                        resolver_function: "resolveOrder".to_string(),
+                        resolver_line: 38,
+                        primary_type_symbol: Some("ApiResponse".to_string()),
+                        type_import_source: None,
+                    },
+                    GraphqlOperation {
+                        kind: GraphqlOperationKind::Mutation,
+                        field: "createOrder".to_string(),
+                        resolver_function: "createOrder".to_string(),
+                        resolver_line: 7,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    },
+                ],
+            },
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let order = graphql
+            .producers
+            .iter()
+            .find(|op| op.key.canonical() == "graphql|query|order")
+            .expect("order producer");
+        assert_eq!(
+            order.resolver_file,
+            Some(PathBuf::from("packages/gateway/src/orders.resolver.ts")),
+            "the resolver file must come from the file_results key"
+        );
+        assert_eq!(order.resolver_line, Some(38));
+        // The SDL anchor is untouched by the merge.
+        assert_eq!(order.primary_type_symbol.as_deref(), Some("Order"));
+
+        // The producer with no matching LLM op keeps both resolver fields None.
+        let orders = graphql
+            .producers
+            .iter()
+            .find(|op| op.key.canonical() == "graphql|query|orders")
+            .expect("orders producer");
+        assert_eq!(orders.resolver_file, None);
+        assert_eq!(orders.resolver_line, None);
+
+        // The LLM op with no SDL producer (`mutation createOrder`) created no
+        // new producer — it was ignored.
+        assert!(
+            !graphql
+                .producers
+                .iter()
+                .any(|op| op.key.canonical() == "graphql|mutation|createOrder"),
+            "an LLM op with no matching SDL producer must not create a producer"
+        );
     }
 
     /// A typed socket emitter produces a Response-kind manifest entry keyed by
@@ -4135,6 +4329,96 @@ mod tests {
         );
         assert_eq!(manifest_alias, expected);
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// Stage B1 producer infer join: a GraphQL PRODUCER whose resolver location
+    /// was merged in (`resolver_file`/`resolver_line`) becomes a `FunctionReturn`
+    /// infer request whose alias byte-matches the PRODUCER manifest entry's
+    /// `type_alias` — both `build_manifest_type_alias(key, Producer, Response)`.
+    /// This is the load-bearing join: if they diverge, the inferred expanded
+    /// resolver-return `.d.ts` never lands on the producer entry and it stays
+    /// `Unknown`. Mirrors `graphql_symbol_request_alias_matches_manifest_alias`,
+    /// but on the producer/infer side.
+    #[test]
+    fn graphql_producer_infer_request_alias_matches_manifest_alias() {
+        use crate::operation::GraphqlOperationKind;
+
+        // A producer with its SDL anchor AND a resolver location (post-merge).
+        let mut producer = graphql_op(GraphqlOperationKind::Query, "order", Some("Order"));
+        producer.resolver_file = Some(PathBuf::from("packages/gateway/src/orders.resolver.ts"));
+        producer.resolver_line = Some(38);
+
+        let extractions = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction {
+                producers: vec![producer.clone()],
+                consumers: vec![],
+            },
+            sockets: crate::socket_io::SocketExtraction::default(),
+        };
+
+        // The producer manifest entry's alias (Producer, Response).
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions);
+        let manifest_entry = entries
+            .iter()
+            .find(|e| {
+                e.key.canonical() == "graphql|query|order" && e.role == ManifestRole::Producer
+            })
+            .expect("graphql producer manifest entry");
+        let manifest_alias = manifest_entry.type_alias.clone();
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let infer = orchestrator.collect_graphql_producer_infer_requests(&extractions.graphql, ".");
+        assert_eq!(infer.len(), 1, "exactly one producer infer request");
+        let request = &infer[0];
+
+        // The load-bearing alias join.
+        assert_eq!(
+            request.alias.as_deref(),
+            Some(manifest_alias.as_str()),
+            "InferRequestItem.alias must byte-match the producer manifest entry's \
+             alias (both build_manifest_type_alias(key, Producer, Response)) or the \
+             expanded resolver-return type never joins back and the entry stays Unknown"
+        );
+        // Independently confirm both equal the canonical builder output.
+        let expected = crate::type_manifest::build_manifest_type_alias(
+            &producer.key,
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+        );
+        assert_eq!(manifest_alias, expected);
+        assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+
+        // The producer takes the INFER path (FunctionReturn at the resolver), not
+        // the bundle path: file/line come from the merged resolver location.
+        assert_eq!(request.infer_kind, InferKind::FunctionReturn);
+        assert_eq!(request.line_number, 38);
+        assert!(
+            request
+                .file_path
+                .ends_with("packages/gateway/src/orders.resolver.ts"),
+            "infer file must be the resolver file, got: {}",
+            request.file_path
+        );
+
+        // A producer without a merged resolver location yields no infer request.
+        let bare = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction {
+                producers: vec![graphql_op(
+                    GraphqlOperationKind::Query,
+                    "order",
+                    Some("Order"),
+                )],
+                consumers: vec![],
+            },
+            sockets: crate::socket_io::SocketExtraction::default(),
+        };
+        assert!(
+            orchestrator
+                .collect_graphql_producer_infer_requests(&bare.graphql, ".")
+                .is_empty(),
+            "an SDL producer with no merged resolver location produces no infer request"
+        );
     }
 
     /// `write_manifest_files` feeds the ts_check matcher, which now checks HTTP

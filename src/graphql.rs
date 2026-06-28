@@ -54,6 +54,18 @@ pub struct GraphqlOp {
     /// `payload_type_symbol`. `None` when the symbol is declared in the same file
     /// or no call site was matched.
     pub payload_type_source: Option<String>,
+    /// PRODUCER-only: the file whose resolver implements this schema field,
+    /// joined in from the file-analyzer's `graphql_operations` (Stage B1). The
+    /// producer's real response contract is the resolver function's RETURN type
+    /// expanded (`Promise<ApiResponse<Order>>` → `{ data: …, errors }`), which
+    /// the SDL alone can't give, so this points the `FunctionReturn` infer
+    /// request at the resolver. `None` for SDL producers with no matched LLM op,
+    /// and always `None` for consumers (they anchor on `payload_type_symbol`).
+    pub resolver_file: Option<PathBuf>,
+    /// PRODUCER-only: 1-based line where the resolver function is defined,
+    /// paired with `resolver_file`. Anchors the `FunctionReturn` infer request.
+    /// `None` whenever `resolver_file` is `None`.
+    pub resolver_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +84,67 @@ impl GraphqlExtraction {
     fn merge(&mut self, other: GraphqlExtraction) {
         self.producers.extend(other.producers);
         self.consumers.extend(other.consumers);
+    }
+}
+
+/// Repo-global GraphQL producer context for the file-analyzer (Stage B2).
+///
+/// The file-analyzer needs two things to link a resolver function to a schema
+/// field and emit a `graphql_operations` entry: (1) the list of SDL producer
+/// fields this service exposes (so it knows which functions are resolvers), and
+/// (2) the SDL scan roots (so the orchestrator can route an otherwise-skipped,
+/// candidate-less resolver file co-located with the schema into analysis). Both
+/// are derived deterministically from the SDL — no LLM, no per-file cost.
+///
+/// `lines` is one formatted string per producer field (`"query order: Order"`),
+/// stable across every file in a scan, so it lives in the cacheable front block
+/// of the user message. Empty `lines` means the service has no SDL producers and
+/// nothing changes.
+#[derive(Debug, Clone, Default)]
+pub struct GraphqlProducerHints {
+    /// One `"{kind} {field}: {sdl_type}"` line per SDL root field.
+    pub lines: Vec<String>,
+    /// The service's SDL scan roots (its `directory` + `include` roots),
+    /// used to gate the don't-skip routing to schema-co-located files.
+    pub scan_roots: Vec<PathBuf>,
+}
+
+impl GraphqlProducerHints {
+    /// Build the producer hint context for a service: run the (cheap,
+    /// deterministic) SDL scan over `scan_roots` + `service_files` and format
+    /// each producer field as a hint line. `scan_roots` are retained for the
+    /// co-location check in the don't-skip routing.
+    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf]) -> Self {
+        let extraction = scan_repo(&scan_roots, service_files);
+        let lines = extraction
+            .producers
+            .iter()
+            .filter_map(Self::format_producer)
+            .collect();
+        Self { lines, scan_roots }
+    }
+
+    /// Format a single producer op as `"{kind} {field}: {sdl_type}"`
+    /// (e.g. `"query order: Order"`). `None` if the op is not a GraphQL
+    /// producer key (should never happen for `.producers`) or has no SDL type.
+    fn format_producer(op: &GraphqlOp) -> Option<String> {
+        let OperationKey::Graphql { kind, field } = &op.key else {
+            return None;
+        };
+        let sdl_type = op.primary_type_symbol.as_deref()?;
+        Some(format!("{} {}: {}", kind.as_str(), field, sdl_type))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Whether `file` lives under one of the SDL scan roots — i.e. it is
+    /// co-located with this service's schema. Used to scope the don't-skip
+    /// routing tightly: only schema-co-located resolver files are rescued from
+    /// the zero-candidate skip, never every exported-function file in the repo.
+    pub fn file_within_scan_roots(&self, file: &Path) -> bool {
+        self.scan_roots.iter().any(|root| file.starts_with(root))
     }
 }
 
@@ -223,6 +296,10 @@ pub fn extract_from_document_text(
                     // Producers carry no consumer-side bound type.
                     payload_type_symbol: None,
                     payload_type_source: None,
+                    // SDL alone has no resolver location; the file-analyzer's
+                    // graphql_operations fill these in the engine merge (Stage B1).
+                    resolver_file: None,
+                    resolver_line: None,
                 });
             }
         }
@@ -276,6 +353,9 @@ pub fn extract_from_document_text(
                     primary_type_symbol: None,
                     payload_type_symbol: None,
                     payload_type_source: None,
+                    // Consumers never carry a resolver location.
+                    resolver_file: None,
+                    resolver_line: None,
                 });
             }
         }
@@ -679,6 +759,87 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Stage B2: a producer op formats as `"{kind} {field}: {sdl_type}"`, the
+    /// exact line shape injected into the file-analyzer's GRAPHQL SCHEMA
+    /// PRODUCERS context block.
+    #[test]
+    fn producer_hint_lines_format_kind_field_and_sdl_type() {
+        let sdl = r#"
+            type Order { id: ID! }
+            type Query {
+                order(id: ID!): Order
+                orders: [Order!]!
+            }
+            type Mutation { refundOrder(id: ID!): Order! }
+        "#;
+        let extraction = extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
+        let mut lines: Vec<String> = extraction
+            .producers
+            .iter()
+            .filter_map(GraphqlProducerHints::format_producer)
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                "mutation refundOrder: Order!".to_string(),
+                "query order: Order".to_string(),
+                "query orders: [Order!]!".to_string(),
+            ]
+        );
+    }
+
+    /// `file_within_scan_roots` gates the don't-skip routing: only files under an
+    /// SDL scan root (schema-co-located) are eligible, so a resolver in the
+    /// schema package is routed while an unrelated exported-function file is not.
+    #[test]
+    fn file_within_scan_roots_matches_only_co_located_files() {
+        let hints = GraphqlProducerHints {
+            lines: vec!["query order: Order".to_string()],
+            scan_roots: vec![PathBuf::from("/repo/services/orders")],
+        };
+        assert!(hints.file_within_scan_roots(Path::new("/repo/services/orders/src/resolvers.ts")));
+        assert!(!hints.file_within_scan_roots(Path::new("/repo/services/billing/src/handlers.ts")));
+        assert!(
+            !GraphqlProducerHints::default()
+                .file_within_scan_roots(Path::new("/repo/services/orders/src/resolvers.ts"))
+        );
+    }
+
+    /// End-to-end of the deterministic hint builder: a real SDL file under the
+    /// scan root yields formatted producer lines, and a co-located file is
+    /// recognised by the routing gate. A root with no SDL yields empty hints.
+    #[test]
+    fn collect_builds_hints_from_sdl_under_scan_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "carrick-gql-hints-{}-{:016x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("schema.graphql"),
+            "type Order { id: ID! }\ntype Query { order(id: ID!): Order }\n",
+        )
+        .unwrap();
+
+        let hints = GraphqlProducerHints::collect(vec![dir.clone()], &[]);
+        assert_eq!(hints.lines, vec!["query order: Order".to_string()]);
+        assert!(!hints.is_empty());
+        assert!(hints.file_within_scan_roots(&dir.join("resolvers.ts")));
+
+        // A scan root with no SDL produces no hints (the no-op path).
+        let empty_root = dir.join("nested-empty");
+        std::fs::create_dir_all(&empty_root).unwrap();
+        let empty = GraphqlProducerHints::collect(vec![empty_root], &[]);
+        assert!(empty.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Document consumers carry no SDL type, so their anchor is left unset (the

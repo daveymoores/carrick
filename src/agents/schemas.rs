@@ -400,6 +400,42 @@ impl AgentSchemas {
                         },
                         "required": ["candidate_id", "line_number", "target", "pattern_matched"]
                     }
+                },
+                "graphql_operations": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "kind": {
+                                "type": "STRING",
+                                "enum": ["query", "mutation", "subscription"],
+                                "description": "The GraphQL root operation this resolver implements: query, mutation, or subscription."
+                            },
+                            "field": {
+                                "type": "STRING",
+                                "description": "The schema field name this resolver answers (e.g., 'order', 'createUser')."
+                            },
+                            "resolver_function": {
+                                "type": "STRING",
+                                "description": "Name of the resolver function implementing this field (e.g., 'resolveOrder')."
+                            },
+                            "resolver_line": {
+                                "type": "INTEGER",
+                                "description": "Line number where the resolver function is defined (read from the line-number prefix in the source code)."
+                            },
+                            "primary_type_symbol": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The named return type of the resolver as a bare identifier (e.g., 'ApiResponse'). Unwrap Promise<...>, arrays, and async-iterator wrappers down to the core identifier. Null for untyped, inline-object-literal, or otherwise un-annotated resolver returns."
+                            },
+                            "type_import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/order'), or null if it is declared in the same file. Null whenever `primary_type_symbol` is null."
+                            }
+                        },
+                        "required": ["kind", "field", "resolver_function", "resolver_line"]
+                    }
                 }
             },
             "required": ["mounts", "endpoints", "data_calls"]
@@ -684,6 +720,57 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(!required.iter().any(|v| v == "call_kind"));
+    }
+
+    #[test]
+    fn graphql_operations_schema_enum_matches_serde_wire_values() {
+        // The graphql_operations `kind` enum and GraphqlOperationKind's serde
+        // output must stay in lockstep, or a value the schema advertises but the
+        // enum can't parse is silently lost when the file-analyzer response is
+        // deserialized (mirrors call_kind / emission_style).
+        use crate::operation::GraphqlOperationKind;
+
+        let schema = AgentSchemas::file_analysis_schema();
+        let schema_values: Vec<String> =
+            schema["properties"]["graphql_operations"]["items"]["properties"]["kind"]["enum"]
+                .as_array()
+                .expect("graphql_operations kind enum must exist")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+
+        let serde_values: Vec<String> = [
+            GraphqlOperationKind::Query,
+            GraphqlOperationKind::Mutation,
+            GraphqlOperationKind::Subscription,
+        ]
+        .iter()
+        .map(|k| {
+            serde_json::to_value(k)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+
+        assert_eq!(schema_values, serde_values);
+
+        // The four locating fields must always be present; the type slots
+        // (primary_type_symbol / type_import_source) stay optional/nullable.
+        let required = schema["properties"]["graphql_operations"]["items"]["required"]
+            .as_array()
+            .expect("graphql_operations item required array must exist");
+        for field in ["kind", "field", "resolver_function", "resolver_line"] {
+            assert!(
+                required.iter().any(|v| v == field),
+                "graphql_operations item required must contain {field}"
+            );
+        }
+
+        // graphql_operations is optional at the top level: a model may omit it.
+        let top_required = schema["required"].as_array().unwrap();
+        assert!(!top_required.iter().any(|v| v == "graphql_operations"));
     }
 
     #[test]
