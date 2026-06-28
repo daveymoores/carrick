@@ -2487,17 +2487,23 @@ fn write_manifest_files(
     for repo_data in all_repo_data {
         if let Some(entries) = &repo_data.type_manifest {
             for entry in entries {
-                // HTTP and socket entries reach the ts_check manifest; GraphQL
-                // does not. ts_check checks HTTP by `method`/`path` and socket by
-                // the canonical `OperationKey` (event+direction), reusing the same
-                // `TypeCompatibilityChecker` assignability for both. GraphQL is
-                // still filtered here: its cross-repo resolution is blocked on
-                // separate work (#268), and its OperationKey serialises without a
-                // checkable identity for the matcher, so a GraphQL entry would
-                // only ever orphan. Those entries stay in `cloud_data.type_manifest`
-                // (cloud index + eval projection). The matcher drops any stray
-                // non-checkable entry defensively rather than throwing (#253).
-                if entry.key.protocol() == crate::operation::Protocol::Graphql {
+                // HTTP, socket, and graphql entries reach the ts_check manifest.
+                // ts_check checks HTTP by `method`/`path`, socket by the canonical
+                // `OperationKey` (event+direction), and graphql by (kind+field),
+                // reusing the same `TypeCompatibilityChecker` assignability for all
+                // three. The matcher drops any stray non-checkable entry
+                // defensively rather than throwing (#253).
+                //
+                // GraphQL is gated on a RESOLVED anchor: only a graphql entry whose
+                // type actually reached the bundle (`type_state != Unknown`) is
+                // emitted. An unresolved graphql consumer (e.g. a `subscription`
+                // with no `request<T>` call site, so no captured payload symbol)
+                // stays `Unknown` and would only ever orphan-noise the verdict run,
+                // so it is dropped here. HTTP/socket carry no such gate: their
+                // Unknown entries are handled downstream as `unknownPairs`.
+                if entry.key.protocol() == crate::operation::Protocol::Graphql
+                    && entry.type_state == ManifestTypeState::Unknown
+                {
                     continue;
                 }
                 match entry.role {
@@ -4421,20 +4427,25 @@ mod tests {
         );
     }
 
-    /// `write_manifest_files` feeds the ts_check matcher, which now checks HTTP
-    /// and socket. So HTTP + socket entries pass through; GraphQL is still
-    /// filtered (its cross-repo resolution is blocked on #268 and its key
-    /// carries no checkable identity for the matcher). GraphQL entries stay in
-    /// `cloud_data.type_manifest` (cloud index + eval projection). The #253
-    /// throw-guard now lives in the matcher, which drops any stray non-checkable
-    /// entry defensively rather than crashing the verdict run.
+    /// `write_manifest_files` feeds the ts_check matcher, which now checks HTTP,
+    /// socket, AND graphql. HTTP + socket entries always pass through. A graphql
+    /// entry passes through ONLY when its anchor resolved (`type_state !=
+    /// Unknown`) — an unresolved graphql entry (e.g. a subscription consumer with
+    /// no `request<T>` call site) would only orphan-noise the verdict run, so it
+    /// is dropped here. The #253 throw-guard lives in the matcher, which drops any
+    /// stray non-checkable entry defensively rather than crashing the run.
     #[test]
-    fn write_manifest_files_emits_http_and_socket_not_graphql() {
+    fn write_manifest_files_emits_http_socket_and_resolved_graphql() {
         use crate::cloud_storage::TypeEvidence;
         use crate::operation::{GraphqlOperationKind, OperationKey, SocketDirection};
         use crate::services::type_sidecar::InferKind;
 
-        fn entry(key: OperationKey, alias: &str) -> TypeManifestEntry {
+        fn entry_with_state(
+            key: OperationKey,
+            alias: &str,
+            type_state: ManifestTypeState,
+        ) -> TypeManifestEntry {
+            let is_explicit = type_state == ManifestTypeState::Explicit;
             TypeManifestEntry {
                 key,
                 role: ManifestRole::Producer,
@@ -4442,16 +4453,16 @@ mod tests {
                 type_alias: alias.to_string(),
                 file_path: "src/x.ts".to_string(),
                 line_number: 1,
-                is_explicit: true,
-                type_state: ManifestTypeState::Explicit,
+                is_explicit,
+                type_state,
                 evidence: TypeEvidence {
                     file_path: "src/x.ts".to_string(),
                     span_start: None,
                     span_end: None,
                     line_number: 1,
                     infer_kind: InferKind::ResponseBody,
-                    is_explicit: true,
-                    type_state: ManifestTypeState::Explicit,
+                    is_explicit,
+                    type_state,
                 },
                 resolved_definition: None,
                 expanded_definition: None,
@@ -4459,11 +4470,23 @@ mod tests {
             }
         }
 
+        fn entry(key: OperationKey, alias: &str) -> TypeManifestEntry {
+            entry_with_state(key, alias, ManifestTypeState::Explicit)
+        }
+
         let manifest = vec![
             entry(OperationKey::http("GET", "/orders/:id"), "OrderResponse"),
+            // Resolved graphql producer (anchor reached the bundle) → KEPT.
             entry(
                 OperationKey::graphql(GraphqlOperationKind::Query, "order"),
                 "OrderQueryResult",
+            ),
+            // Unresolved graphql producer (Unknown anchor) → DROPPED so it can't
+            // orphan-noise the verdict run (the subscription-consumer case).
+            entry_with_state(
+                OperationKey::graphql(GraphqlOperationKind::Subscription, "orderUpdated"),
+                "OrderUpdatedUnknown",
+                ManifestTypeState::Unknown,
             ),
             entry(
                 OperationKey::socket("order.created", SocketDirection::ServerToClient),
@@ -4513,11 +4536,13 @@ mod tests {
         )
         .unwrap();
 
-        // HTTP and socket producers survive; GraphQL is filtered out.
+        // HTTP, socket, and the RESOLVED graphql producer survive; the Unknown
+        // graphql producer is filtered out.
         assert_eq!(
             producer.entries.len(),
-            2,
-            "HTTP + socket entries reach the ts_check manifest; GraphQL is filtered"
+            3,
+            "HTTP + socket + resolved graphql reach the manifest; the Unknown \
+             graphql entry is dropped"
         );
         assert!(
             producer
@@ -4531,14 +4556,29 @@ mod tests {
                 .entries
                 .iter()
                 .any(|e| e.key.protocol() == crate::operation::Protocol::Websocket),
-            "the socket producer must now reach the manifest"
+            "the socket producer must reach the manifest"
+        );
+        let graphql_entries: Vec<_> = producer
+            .entries
+            .iter()
+            .filter(|e| e.key.protocol() == crate::operation::Protocol::Graphql)
+            .collect();
+        assert_eq!(
+            graphql_entries.len(),
+            1,
+            "exactly the resolved graphql producer reaches the manifest"
+        );
+        assert_eq!(
+            graphql_entries[0].type_alias, "OrderQueryResult",
+            "the kept graphql entry is the resolved one, not the Unknown one"
         );
         assert!(
             producer
                 .entries
                 .iter()
-                .all(|e| e.key.protocol() != crate::operation::Protocol::Graphql),
-            "GraphQL entries must not reach the ts_check manifest (#268)"
+                .all(|e| e.type_state != ManifestTypeState::Unknown
+                    || e.key.protocol() != crate::operation::Protocol::Graphql),
+            "no Unknown graphql entry may reach the ts_check manifest"
         );
     }
 

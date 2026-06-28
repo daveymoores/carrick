@@ -50,6 +50,41 @@ function socketEntry(
   };
 }
 
+/**
+ * Build a graphql `<kind> <field>` manifest entry. GraphQL entries carry
+ * `protocol: 'graphql'` + `kind` + `field` instead of HTTP method/path.
+ */
+function graphqlEntry(
+  typeAlias: string,
+  role: 'producer' | 'consumer',
+  filePath: string,
+  lineNumber: number,
+  kind: string = 'query',
+  field: string = 'order'
+): ManifestEntry {
+  return {
+    protocol: 'graphql',
+    kind,
+    field,
+    type_alias: typeAlias,
+    role,
+    type_kind: 'response',
+    file_path: filePath,
+    line_number: lineNumber,
+    is_explicit: true,
+    type_state: 'explicit',
+    evidence: {
+      file_path: filePath,
+      span_start: null,
+      span_end: null,
+      line_number: lineNumber,
+      infer_kind: 'response_body',
+      is_explicit: true,
+      type_state: 'explicit',
+    },
+  };
+}
+
 // ============================================================================
 // TypeCompatibilityChecker Tests
 // ============================================================================
@@ -597,6 +632,137 @@ describe('TypeCompatibilityChecker', () => {
       assert.ok(
         result.mismatches[0].endpoint.startsWith('SOCKET '),
         'the mismatch endpoint must carry the SOCKET label'
+      );
+    });
+
+    it('type-checks a graphql query|order edge end-to-end as compatible (consumer selects a subset of the producer payload)', async () => {
+      // The xrepo-corpus-1 `graphql|query|order` edge. The producer (gateway
+      // resolver) resolves to the return ENVELOPE `{ data: Order; errors }`; the
+      // SDL field payload is `Order`. The consumer document binds `OrderView`,
+      // which SELECTS a subset of the producer fields (`id`, `total`, optional
+      // `note`) and DROPS the producer's required `status` field — valid GraphQL
+      // field selection, so the edge is COMPATIBLE.
+      //
+      // PRE-FIX-FAILING: before the graphql arm in compareTypes, a graphql
+      // producer was never compared (entries were dropped), so this pair could
+      // not be checked at all. With a naive socket-style direction
+      // (`consumer ⊑ producer`) it would read INCOMPATIBLE (OrderView lacks the
+      // producer's required `status`). It only reads compatible once the producer
+      // envelope is structurally unwrapped to `Order` AND the data-flow direction
+      // `producer ⊑ consumer` (HTTP-like) is used.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type Money = { amountCents: number; currency: string };
+        export type OrderStatus =
+          | { kind: "placed"; placedAt: string }
+          | { kind: "refunded"; refundedAt: string; reason?: string };
+        // Producer resolved type: the resolver RETURN ENVELOPE, not the payload.
+        export type ProducerEnvelope = {
+          data: { id: string; total: Money; status: OrderStatus; note?: string };
+          errors: string[];
+        };
+        export type MoneyView = { amountCents: number; currency: string };
+        // Consumer bound type: selects a subset, drops \`status\`.
+        export type OrderView = { id: string; total: MoneyView; note?: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-monorepo',
+        commit_hash: 'abc',
+        entries: [
+          graphqlEntry('ProducerEnvelope', 'producer', 'gateway/src/orders.resolver.ts', 40),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          graphqlEntry('OrderView', 'consumer', 'lib/graphql.ts', 76),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.matchDetails?.length, 1, 'the graphql pair must match');
+      assert.strictEqual(
+        result.matchDetails?.[0].method,
+        'GRAPHQL',
+        'the match is keyed on the GRAPHQL pseudo-method'
+      );
+      assert.strictEqual(
+        result.matchDetails?.[0].path,
+        'query|order',
+        'the match path is the canonical graphql key tail'
+      );
+      assert.strictEqual(result.compatiblePairs, 1);
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+    });
+
+    it('reads a graphql edge whose consumer requires a field the producer makes optional as incompatible (direction proof)', async () => {
+      // Direction/anchor proof, mirroring the corpus `subscription orderUpdated`
+      // trap: the producer payload makes `note` OPTIONAL, but the consumer makes
+      // it REQUIRED. Under `producer ⊑ consumer`, the producer payload
+      // `{ id; note?: string }` is NOT assignable to the consumer
+      // `{ id; note: string }` (optional can't satisfy required) → INCOMPATIBLE.
+      // This fails if the envelope is not unwrapped (the whole envelope is never
+      // assignable, but for the wrong reason) or if the direction is flipped
+      // (the consumer requiring more than the producer guarantees would wrongly
+      // read compatible).
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type ProducerEnvelope = {
+          data: { id: string; note?: string };
+          errors: string[];
+        };
+        // Consumer requires \`note\`; producer only optionally provides it.
+        export type OrderUpdate = { id: string; note: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-monorepo',
+        commit_hash: 'abc',
+        entries: [
+          graphqlEntry('ProducerEnvelope', 'producer', 'gateway/src/orders.resolver.ts', 75, 'subscription', 'orderUpdated'),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          graphqlEntry('OrderUpdate', 'consumer', 'lib/graphql.ts', 80, 'subscription', 'orderUpdated'),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.incompatiblePairs, 1);
+      assert.strictEqual(result.compatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+      assert.strictEqual(result.mismatches.length, 1);
+      assert.ok(
+        result.mismatches[0].endpoint.startsWith('GRAPHQL '),
+        'the mismatch endpoint must carry the GRAPHQL label'
       );
     });
 

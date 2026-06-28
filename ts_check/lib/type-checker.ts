@@ -352,6 +352,17 @@ export class TypeCompatibilityChecker {
     // consumer (call) receives it, so the producer payload must satisfy the
     // consumer — `producer ⊑ consumer`.
     //
+    // GraphQL: same data-flow direction as HTTP. The producer (schema resolver,
+    // server) RETURNS the full object; the consumer (document, client) SELECTS a
+    // subset of its fields, so the producer payload must satisfy what the
+    // consumer reads — `producer ⊑ consumer`. (NOT the socket inversion: GraphQL
+    // is request/response server→client like HTTP, and a consumer that selects
+    // fewer fields than the producer provides is compatible — `OrderView`
+    // dropping the producer's `status` field is fine, whereas the socket
+    // direction would wrongly read it as incompatible because `Order` requires
+    // `status`.) The producer type is the SDL field PAYLOAD, structurally
+    // unwrapped from the resolver's return ENVELOPE below.
+    //
     // Socket: the role mapping is inverted relative to data flow. Carrick keys a
     // *listener* (`socket.on`) as the producer (endpoint) and an *emitter*
     // (`socket.emit`) as the consumer (call). The bytes flow emitter → listener,
@@ -363,8 +374,22 @@ export class TypeCompatibilityChecker {
     // "Socket producer/consumer direction".) The same `isAssignableTo` relation
     // and the same resolved Type objects are used either way.
     const socket = producer.protocol === "socket";
-    const sentType = socket ? consumerType : producerType;
-    const expectedType = socket ? producerType : consumerType;
+    const graphql = producer.protocol === "graphql";
+
+    // For GraphQL the producer's resolved type is the resolver's return ENVELOPE
+    // (e.g. `{ data: Order; errors: string[] }`), kept verbatim for the
+    // resolution metric. Compat must compare against the SDL field PAYLOAD
+    // (`Order`), so unwrap the envelope structurally — pick the single
+    // object/array-of-objects property among otherwise scalar/`string[]`
+    // siblings. Framework-agnostic: never matches the literal name `data`. If the
+    // shape is not a single-payload envelope (already bare, or ambiguous), the
+    // unwrap returns the type unchanged and logs a warning.
+    const producerComparand = graphql
+      ? this.unwrapGraphqlPayload(producerType, endpoint)
+      : producerType;
+
+    const sentType = socket ? consumerType : producerComparand;
+    const expectedType = socket ? producerComparand : consumerType;
     if (sentType.isAssignableTo(expectedType)) {
       return { kind: "compatible" };
     }
@@ -386,6 +411,82 @@ export class TypeCompatibilityChecker {
         consumerEvidence: consumer.evidence,
       },
     };
+  }
+
+  /**
+   * Unwrap a GraphQL resolver's return ENVELOPE to its SDL field PAYLOAD type.
+   *
+   * A GraphQL producer's resolved type is the resolver function's return type
+   * (e.g. `Promise<ApiResponse<Order>>` → `{ data: Order; errors: string[] }`),
+   * kept verbatim on the manifest entry for the resolution metric. For compat we
+   * must compare the consumer against the SDL field's payload (`Order`), not the
+   * transport envelope.
+   *
+   * The unwrap is STRUCTURAL and framework-agnostic — it never matches the
+   * literal property name `data`/`errors` or a wrapper symbol like `ApiResponse`.
+   * Among the envelope's own properties it keeps exactly those whose type is an
+   * object or an array-of-objects (the candidate payload), discarding scalar and
+   * scalar-array siblings (`errors: string[]`, status codes, flags). If exactly
+   * one payload candidate remains, that property's type is the payload. In every
+   * other case — the type is already a bare object that is not a single-payload
+   * envelope, has no payload candidate, or has several (ambiguous) — the original
+   * type is returned unchanged and a warning is logged, so an unrecognised
+   * envelope shape degrades to comparing the whole type rather than guessing.
+   */
+  private unwrapGraphqlPayload(producerType: Type, endpoint: string): Type {
+    // Only object-like types can be envelopes; a bare scalar/union is returned
+    // as-is (the producer already resolved to its payload, e.g. SDL `String`).
+    if (!producerType.isObject() || producerType.isArray()) {
+      return producerType;
+    }
+
+    const props = producerType.getProperties();
+    // A single-property wrapper whose property is itself the payload is the most
+    // common envelope shape, but we classify generally rather than assume arity.
+    const payloadCandidates: Type[] = [];
+    for (const prop of props) {
+      const decl = prop.getDeclarations()[0];
+      if (!decl) {
+        // No declaration to anchor the property type — can't classify, so this
+        // isn't a clean single-payload envelope. Bail out to whole-type compare.
+        return producerType;
+      }
+      const propType = prop.getTypeAtLocation(decl);
+      if (this.isPayloadShape(propType)) {
+        payloadCandidates.push(propType);
+      }
+    }
+
+    if (payloadCandidates.length === 1) {
+      return payloadCandidates[0];
+    }
+
+    // Zero candidates → the type may already BE the bare payload object (its own
+    // properties are scalars, e.g. `{ id; total }`); comparing it whole is
+    // correct, so this is the silent expected path, not a warning. More than one
+    // candidate → a genuinely ambiguous envelope; warn and compare whole.
+    if (payloadCandidates.length > 1) {
+      console.warn(
+        `[type-checker] GraphQL producer envelope for ${endpoint} has ${payloadCandidates.length} ` +
+          `object-typed properties; cannot pick a single SDL payload, comparing the whole type`
+      );
+    }
+    return producerType;
+  }
+
+  /**
+   * Whether a property type looks like a GraphQL SDL payload: an object, or an
+   * array whose element is an object (`Order` / `Order[]`). Scalars, unions of
+   * scalars, and scalar arrays (`string[]`, `number[]`) are NOT payloads — they
+   * are envelope metadata (`errors`, status flags). Kept deliberately structural
+   * so no property NAME is ever consulted.
+   */
+  private isPayloadShape(t: Type): boolean {
+    if (t.isArray()) {
+      const element = t.getArrayElementType();
+      return !!element && element.isObject() && !element.isArray();
+    }
+    return t.isObject();
   }
 
   /**
