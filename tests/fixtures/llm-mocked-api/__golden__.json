@@ -12,7 +12,7 @@
       "line": 6,
       "type_alias": "Endpoint_a9cce7d0d8d0d9e6_Response",
       "type_state": "Explicit",
-      "resolved_definition": "export interface Endpoint_a9cce7d0d8d0d9e6_Response {\n  id: number;\n  name: string;\n  email: string;\n}",
+      "resolved_definition": "export interface Endpoint_a9cce7d0d8d0d9e6_Response { id: number; name: string; email: string; }",
       "expanded_definition": "{ id: number; name: string; email: string; }",
       "is_explicit": true,
       "primary_type_symbol": "User"
