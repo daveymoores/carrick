@@ -625,6 +625,13 @@ impl FileAnalyzerAgent {
         // sits in the cacheable front block alongside the guidance. When the
         // service has no SDL producers this is empty and the section is omitted,
         // leaving every non-GraphQL prompt byte-identical to before.
+        //
+        // The section string carries its OWN leading `\n` (the blank line that
+        // separates it from the triage hints above) and its own trailing `\n`. The
+        // template therefore interpolates it ADJACENT to the triage-hints
+        // placeholder with no surrounding newline of its own — so an empty section
+        // contributes exactly zero bytes and the non-GraphQL message is byte-for-byte
+        // the pre-feature prompt, preserving the Vertex implicit prefix-cache hit.
         let graphql_producers_section = if graphql_producer_hints.is_empty() {
             String::new()
         } else {
@@ -667,8 +674,7 @@ impl FileAnalyzerAgent {
 }}
 
 ### FRAMEWORK-SPECIFIC HINTS
-{}
-{}
+{}{}
 ### FRAMEWORK-SPECIFIC PARSING NOTES
 These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
 {}
@@ -1546,6 +1552,25 @@ const data = await fetch('/api/users').then(resp => resp.json());
         assert!(
             !message.contains("GRAPHQL SCHEMA PRODUCERS"),
             "GraphQL producers section must be absent when no hints are passed, got:\n{message}"
+        );
+
+        // Byte-identity guard (Vertex implicit prefix caching): an empty hint list
+        // must contribute ZERO bytes to the assembled message — i.e. the prompt is
+        // byte-for-byte what the pre-feature template produced. The pre-feature form
+        // joined the triage hints directly to the PARSING NOTES header with a SINGLE
+        // newline. A stray blank line here (the `{}\n{}` template bug Copilot flagged)
+        // would shift the cacheable prefix and tank the within-scan cache hit rate.
+        let triage_hints = &guidance.triage_hints;
+        let pre_feature_join = format!("### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n### FRAMEWORK-SPECIFIC PARSING NOTES");
+        assert!(
+            message.contains(&pre_feature_join),
+            "empty hints must render the pre-feature single-newline join, got:\n{message}"
+        );
+        // And explicitly: no doubled blank line where the section would have gone.
+        let doubled_join = format!("### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n\n### FRAMEWORK-SPECIFIC PARSING NOTES");
+        assert!(
+            !message.contains(&doubled_join),
+            "empty hints must NOT leave a doubled blank line before PARSING NOTES, got:\n{message}"
         );
     }
 

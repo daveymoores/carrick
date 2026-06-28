@@ -330,6 +330,15 @@ impl FileOrchestrator {
             // PRODUCERS section gives the model the field list to link against.
             let is_graphql_resolver_file = !graphql_producer_hints.is_empty()
                 && graphql_producer_hints.file_within_scan_roots(file_path)
+                // Cheap `export` substring pre-check before the expensive
+                // `exported_handlers` SWC reparse: `scan_content` (Step 1) already
+                // parsed this file, and a resolver file must contain at least one
+                // `export`. `&&` short-circuits, so the reparse runs only when the
+                // keyword is present — the common no-exports file avoids a second
+                // parse entirely. (Reusing the Step-1 parse directly would mean
+                // threading exported-handler data through `ScanResult`, which it
+                // does not currently carry; the substring guard is the cheap win.)
+                && content.contains("export")
                 && !self
                     .swc_scanner
                     .exported_handlers(file_path, &content)
