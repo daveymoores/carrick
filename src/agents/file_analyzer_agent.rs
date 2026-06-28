@@ -301,6 +301,7 @@ impl FileAnalyzerAgent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn analyze_file_with_candidates(
         &self,
         file_path: &str,
@@ -1561,13 +1562,17 @@ const data = await fetch('/api/users').then(resp => resp.json());
         // newline. A stray blank line here (the `{}\n{}` template bug Copilot flagged)
         // would shift the cacheable prefix and tank the within-scan cache hit rate.
         let triage_hints = &guidance.triage_hints;
-        let pre_feature_join = format!("### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n### FRAMEWORK-SPECIFIC PARSING NOTES");
+        let pre_feature_join = format!(
+            "### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n### FRAMEWORK-SPECIFIC PARSING NOTES"
+        );
         assert!(
             message.contains(&pre_feature_join),
             "empty hints must render the pre-feature single-newline join, got:\n{message}"
         );
         // And explicitly: no doubled blank line where the section would have gone.
-        let doubled_join = format!("### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n\n### FRAMEWORK-SPECIFIC PARSING NOTES");
+        let doubled_join = format!(
+            "### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n\n### FRAMEWORK-SPECIFIC PARSING NOTES"
+        );
         assert!(
             !message.contains(&doubled_join),
             "empty hints must NOT leave a doubled blank line before PARSING NOTES, got:\n{message}"
