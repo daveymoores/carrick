@@ -3312,7 +3312,10 @@ mod tests {
         );
         assert_eq!(
             parse_producer_key("graphql|subscription|orderUpdated"),
-            Some(("GRAPHQL".to_string(), "subscription|orderUpdated".to_string())),
+            Some((
+                "GRAPHQL".to_string(),
+                "subscription|orderUpdated".to_string()
+            )),
         );
         // A round-trip through the ts_check endpoint label must yield the SAME
         // pair, so a graphql verdict joins its edge.
