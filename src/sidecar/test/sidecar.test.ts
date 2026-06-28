@@ -1412,10 +1412,18 @@ describe('Type Sidecar Integration Tests', () => {
       assert.ok(response.definitions);
       const def = response.definitions[0];
       assert.strictEqual(def.type_alias, 'UserProfile');
-      // definition should reference UserSettings by name
-      assert.ok(def.definition.includes('UserSettings'), 'definition should reference UserSettings');
-      // definition should show the extends clause
-      assert.ok(def.definition.includes('extends User'), 'definition should show extends User');
+      // The bundler now inlines nested named members at bundle time (the bundle
+      // carries no `UserSettings` declaration, so a bare ref would dangle), so
+      // the emitted declaration — and hence this re-parsed `definition` — is the
+      // flattened structural form: no `UserSettings` name, no `extends` clause.
+      assert.ok(
+        !def.definition.includes('UserSettings'),
+        'definition should inline UserSettings, not reference it by name',
+      );
+      assert.ok(
+        /settings: \{[^}]*theme:/.test(def.definition),
+        'definition should inline the UserSettings structure',
+      );
       // expanded inlines the transitive members: the named `settings: UserSettings`
       // becomes its structural shape, and the inherited `User` members are flattened in (#246).
       assert.ok(def.expanded.startsWith('{'), 'expanded should be a structural object literal');

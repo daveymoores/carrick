@@ -177,6 +177,16 @@ impl OperationKey {
         }
     }
 
+    /// The top-level field name when this is a GraphQL operation, else `None`.
+    /// GraphQL consumer anchoring joins a `request<T>(DOC)` call site to its op
+    /// by this field name.
+    pub fn graphql_field(&self) -> Option<&str> {
+        match self {
+            OperationKey::Graphql { field, .. } => Some(field.as_str()),
+            OperationKey::Http { .. } | OperationKey::Socket { .. } => None,
+        }
+    }
+
     pub fn socket(event: impl Into<String>, direction: SocketDirection) -> Self {
         OperationKey::Socket {
             event: event.into(),

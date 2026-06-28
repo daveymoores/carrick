@@ -21,6 +21,7 @@ import {
   type ExportDeclaration,
   type ImportTypeNode,
   type StringLiteral,
+  type Type,
 } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
@@ -33,6 +34,7 @@ import type {
   ManifestEntry,
   SymbolFailure,
 } from './types.js';
+import { expandTypeStructural } from './type-structural-expander.js';
 
 /**
  * Options for SurfaceEmitter construction
@@ -562,6 +564,23 @@ export class TypeBundler {
     };
   }
 
+  /**
+   * Structural body (`{ ... }`) for an interface/object type, with every nested
+   * named member inlined recursively. Returns null when the expansion is not a
+   * usable object body (e.g. the expander fell back to a bare name), so the
+   * caller can keep the verbatim declaration instead of emitting an invalid
+   * interface. The expander already guards recursion (depth + per-branch cycle
+   * set) and keeps builtins/`node_modules` types by name.
+   */
+  private expandObjectBody(type: Type): string | null {
+    try {
+      const expanded = expandTypeStructural(type);
+      return expanded.startsWith('{') ? expanded : null;
+    } catch {
+      return null;
+    }
+  }
+
   private extractTypeDefinition(
     symbol: SymbolRequest
   ): { definition: string; typeString: string } | null {
@@ -580,7 +599,19 @@ export class TypeBundler {
     // Try interface
     const iface = sourceFile.getInterface(symbolName);
     if (iface) {
+      // Inline nested named members structurally (`total: { amountCents: number;
+      // currency: string; }`, not `total: MoneyView`). The bundle carries only
+      // the alias declaration — never the source decls of nested types — so a
+      // bare named reference is dangling and resolves to `any` downstream. The
+      // expansion happens here, in the real source project, where the nested
+      // symbol still resolves. Falls back to the verbatim rename if the type
+      // can't be safely rendered as an object body.
+      const expanded = this.expandObjectBody(iface.getType());
       const text = iface.getText();
+      if (expanded) {
+        const definition = `export interface ${alias} ${expanded}`;
+        return { definition, typeString: expanded };
+      }
       const typeString = text;
       const alreadyExported = text.trimStart().startsWith('export');
       const definition = alias !== symbolName
@@ -596,7 +627,16 @@ export class TypeBundler {
     // Try type alias
     const typeAlias = sourceFile.getTypeAlias(symbolName);
     if (typeAlias) {
+      // Same nested-member inlining as the interface branch above. A type alias
+      // can resolve to any shape (object, union, array, primitive); the
+      // structural expander renders each correctly and keeps builtins/library
+      // types by name, so the alias RHS is always emittable.
       const text = typeAlias.getText();
+      const expanded = expandTypeStructural(typeAlias.getType());
+      if (expanded && expanded !== 'unknown') {
+        const definition = `export type ${alias} = ${expanded};`;
+        return { definition, typeString: expanded };
+      }
       const typeString = typeAlias.getType().getText();
       const alreadyExported = text.trimStart().startsWith('export');
       const definition = alias !== symbolName
