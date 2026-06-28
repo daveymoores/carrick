@@ -163,6 +163,7 @@ impl FileOrchestrator {
         guidance: &ProtocolGuidance,
         framework_detection: &DetectionResult,
         repo_root: &Path,
+        graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
@@ -208,6 +209,12 @@ impl FileOrchestrator {
             /// LLM ignores route-as-data, so these are the authoritative source
             /// for such endpoints. Empty for files with no route descriptors.
             descriptor_endpoints: Vec<EndpointResult>,
+            /// Repo-global GraphQL producer hint lines (Stage B2), injected into
+            /// the user message so the model can link resolver functions in this
+            /// file to schema fields. Identical for every file; cloned per-pending
+            /// so the concurrent dispatch closure owns its copy. Empty for repos
+            /// with no SDL producers.
+            graphql_producer_hints: Vec<String>,
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -310,6 +317,24 @@ impl FileOrchestrator {
                 .filter(|c| !descriptor_spans.contains(&(c.span_start, c.span_end)))
                 .collect();
 
+            // GraphQL resolver routing (Stage B2): a resolver file is loose
+            // exported functions with no HTTP route candidate, so the
+            // candidate-less skip below would drop it before the file-analyzer
+            // ever sees it — and without the SDL producer context it couldn't
+            // link a resolver to its field anyway. Rescue it from the skip when
+            // ALL of: this repo has SDL producers, the file is co-located with
+            // the schema (under an SDL scan root), and it has at least one
+            // exported binding (resolver-shaped). Scoped this tightly so only
+            // schema-adjacent resolver files reach the LLM, not every
+            // exported-function file in the repo. The injected GRAPHQL SCHEMA
+            // PRODUCERS section gives the model the field list to link against.
+            let is_graphql_resolver_file = !graphql_producer_hints.is_empty()
+                && graphql_producer_hints.file_within_scan_roots(file_path)
+                && !self
+                    .swc_scanner
+                    .exported_handlers(file_path, &content)
+                    .is_empty();
+
             // STEP 2: Check Relevance - if there are no candidates for a routed
             // protocol, SKIP the (expensive) LLM call. File-based route and
             // route-descriptor endpoints are still recorded: they're derived
@@ -337,12 +362,22 @@ impl FileOrchestrator {
                             ..Default::default()
                         },
                     );
+                    continue;
+                } else if is_graphql_resolver_file {
+                    // Fall through to the LLM pass with empty HTTP candidates:
+                    // the file-analyzer reads the producer-field context and the
+                    // file content to emit `graphql_operations`.
+                    debug!(
+                        "Routed GraphQL resolver file (no HTTP candidates): {}",
+                        path_str
+                    );
                 } else if unrouted_candidates.is_empty() {
                     debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
                     stats.files_skipped += 1;
                     stats.files_skipped_no_candidates += 1;
                     // Store empty result so incremental cache knows this file was processed
                     file_results.insert(path_str, FileAnalysisResult::default());
+                    continue;
                 } else {
                     debug!(
                         "Skipped (only unrouted-protocol candidates): {} [{} candidate(s)]",
@@ -352,8 +387,8 @@ impl FileOrchestrator {
                     stats.files_skipped += 1;
                     stats.files_skipped_unrouted_protocol += 1;
                     file_results.insert(path_str, FileAnalysisResult::default());
+                    continue;
                 }
-                continue;
             }
 
             debug!(
@@ -388,6 +423,7 @@ impl FileOrchestrator {
                 env_alias_map,
                 route_endpoints,
                 descriptor_endpoints,
+                graphql_producer_hints: graphql_producer_hints.lines.clone(),
             });
         }
 
@@ -415,6 +451,7 @@ impl FileOrchestrator {
                         &pf.candidate_hints,
                         &pf.candidate_contexts,
                         &pf.symbol_table.imported_symbols,
+                        &pf.graphql_producer_hints,
                     )
                     .await
                     .map_err(|e| e.to_string());

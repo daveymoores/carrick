@@ -80,6 +80,7 @@ impl MultiAgentOrchestrator {
         packages: &Packages,
         imported_symbols: &HashMap<String, ImportedSymbol>,
         repo_path: &str,
+        graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
@@ -122,6 +123,7 @@ impl MultiAgentOrchestrator {
                 &framework_guidance,
                 &framework_detection,
                 std::path::Path::new(repo_path),
+                graphql_producer_hints,
             )
             .await?;
 

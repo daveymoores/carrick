@@ -93,6 +93,7 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
             &ProtocolGuidance::from([(Protocol::Http, express_guidance())]),
             &express_detection(),
             &root,
+            &Default::default(),
         )
         .await
         .expect("analysis should succeed");

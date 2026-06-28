@@ -902,6 +902,16 @@ async fn analyze_current_repo_incremental(
             let agent_service = AgentService::new();
             let file_orchestrator = FileOrchestrator::new(agent_service.clone());
 
+            // Stage B2: GraphQL producer field-list from the service's SDL,
+            // derived deterministically so the file-analyzer can emit
+            // `graphql_operations` linking resolvers to schema fields. Scanned
+            // over the full service `files` (not just `files_to_analyze`) so the
+            // producer list is complete; empty for non-GraphQL services.
+            let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
+                service_graphql_roots(repo_path, service),
+                &files,
+            );
+
             let new_file_results = if !files_to_analyze.is_empty() {
                 let result = file_orchestrator
                     .analyze_files(
@@ -909,6 +919,7 @@ async fn analyze_current_repo_incremental(
                         &guidance,
                         &detection,
                         Path::new(repo_path),
+                        &graphql_producer_hints,
                     )
                     .await?;
                 result.file_results
@@ -2178,9 +2189,25 @@ async fn analyze_current_repo(
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
 
+    // Stage B2: derive the GraphQL producer field-list from the service's SDL
+    // (deterministic, cheap) so the file-analyzer can link resolver functions to
+    // schema fields and emit `graphql_operations`. Empty (a no-op) for non-GraphQL
+    // services. `append_deterministic_protocol_operations` scans the SDL again
+    // later for the operation index; the duplicate parse is acceptable.
+    let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
+        service_graphql_roots(repo_path, service),
+        &files,
+    );
+
     // 4. Run the complete multi-agent analysis
     let analysis_result = orchestrator
-        .run_complete_analysis(files.clone(), packages, &all_imported_symbols, repo_path)
+        .run_complete_analysis(
+            files.clone(),
+            packages,
+            &all_imported_symbols,
+            repo_path,
+            &graphql_producer_hints,
+        )
         .await?;
 
     // 4b. Generate function intents using LLM

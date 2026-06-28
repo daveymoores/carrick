@@ -787,6 +787,7 @@ app.post('/users', (req, res) => res.json({ created: true }));
             &http_guidance(&guidance),
             &detection,
             temp_dir.path(),
+            &Default::default(),
         )
         .await;
 
@@ -825,6 +826,7 @@ async fn test_file_orchestrator_handles_empty_files() {
             &http_guidance(&guidance),
             &detection,
             temp_dir.path(),
+            &Default::default(),
         )
         .await;
 
@@ -858,6 +860,7 @@ async fn test_file_orchestrator_handles_missing_files() {
             &http_guidance(&guidance),
             &detection,
             PathBuf::from("/").as_path(),
+            &Default::default(),
         )
         .await;
 

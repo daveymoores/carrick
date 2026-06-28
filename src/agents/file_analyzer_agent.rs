@@ -254,6 +254,7 @@ impl FileAnalyzerAgent {
             &[],
             &[],
             &HashMap::new(),
+            &[],
         )
         .await
     }
@@ -308,6 +309,7 @@ impl FileAnalyzerAgent {
         candidate_hints: &[String],
         candidate_contexts: &[String],
         imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -321,6 +323,7 @@ impl FileAnalyzerAgent {
             candidate_hints,
             candidate_contexts,
             imported_symbols,
+            graphql_producer_hints,
         );
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
@@ -577,6 +580,7 @@ impl FileAnalyzerAgent {
             &[],
             &[],
             &HashMap::new(),
+            &[],
         )
     }
 
@@ -589,6 +593,7 @@ impl FileAnalyzerAgent {
         candidate_hints: &[String],
         candidate_contexts: &[String],
         imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
@@ -614,6 +619,27 @@ impl FileAnalyzerAgent {
         };
 
         let imports_section = Self::format_import_table(imported_symbols);
+
+        // GraphQL producer context (Stage B2): the SDL root fields this service
+        // exposes. Repo-global (one list per scan, identical across files), so it
+        // sits in the cacheable front block alongside the guidance. When the
+        // service has no SDL producers this is empty and the section is omitted,
+        // leaving every non-GraphQL prompt byte-identical to before.
+        let graphql_producers_section = if graphql_producer_hints.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)\n\
+                 The fields below are this service's GraphQL schema root fields. If a function in \
+                 this file resolves one of them, emit a `graphql_operations` entry linking the \
+                 resolver function to its `kind`/`field` and its return type.\n{}\n",
+                graphql_producer_hints
+                    .iter()
+                    .map(|line| format!("- {}", line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
 
         // Add line-number prefixes to file content so Gemini can read line numbers directly
         let mut numbered_content =
@@ -642,7 +668,7 @@ impl FileAnalyzerAgent {
 
 ### FRAMEWORK-SPECIFIC HINTS
 {}
-
+{}
 ### FRAMEWORK-SPECIFIC PARSING NOTES
 These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
 {}
@@ -700,6 +726,7 @@ Return ONLY the JSON object, no explanations."#,
             endpoint_patterns,
             data_patterns,
             guidance.triage_hints,
+            graphql_producers_section,
             guidance.parsing_notes,
             candidates_section,
             candidate_contexts_section,
@@ -1409,6 +1436,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &candidates,
             &candidate_contexts,
             &imported,
+            &[],
         );
 
         assert!(message.contains("IMPORT TABLE"));
@@ -1447,6 +1475,78 @@ const data = await fetch('/api/users').then(resp => resp.json());
                 "stable guidance must precede per-file `{per_file}` for prefix caching"
             );
         }
+    }
+
+    #[test]
+    fn build_user_message_includes_graphql_producers_when_hints_present() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = "export function resolveOrder() { return {}; }\n";
+        let hints = vec![
+            "query order: Order".to_string(),
+            "mutation refundOrder: Order!".to_string(),
+        ];
+
+        let message = agent.build_user_message_with_candidates(
+            "resolvers.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &hints,
+        );
+
+        assert!(
+            message.contains("### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)"),
+            "expected GraphQL producers section, got:\n{message}"
+        );
+        assert!(
+            message.contains("- query order: Order"),
+            "expected formatted producer field line, got:\n{message}"
+        );
+        assert!(
+            message.contains("- mutation refundOrder: Order!"),
+            "expected second producer field line, got:\n{message}"
+        );
+        assert!(
+            message.contains("graphql_operations"),
+            "expected pointer to the graphql_operations output channel, got:\n{message}"
+        );
+
+        // The producer block is repo-global (stable across files), so it must sit
+        // in the cacheable front block, before any per-file section.
+        let pos = |needle: &str| {
+            message
+                .find(needle)
+                .unwrap_or_else(|| panic!("section `{needle}` missing:\n{message}"))
+        };
+        assert!(
+            pos("### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)") < pos("### FILE CONTENT"),
+            "stable GraphQL producer block must precede per-file content for prefix caching"
+        );
+    }
+
+    #[test]
+    fn build_user_message_omits_graphql_producers_when_hints_empty() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = "const x = 1;\n";
+
+        let message = agent.build_user_message_with_candidates(
+            "plain.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+        );
+
+        assert!(
+            !message.contains("GRAPHQL SCHEMA PRODUCERS"),
+            "GraphQL producers section must be absent when no hints are passed, got:\n{message}"
+        );
     }
 
     #[test]
