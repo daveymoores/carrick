@@ -2495,14 +2495,40 @@ fn write_manifest_files(
                 // defensively rather than throwing (#253).
                 //
                 // GraphQL is gated on a RESOLVED anchor: only a graphql entry whose
-                // type actually reached the bundle (`type_state != Unknown`) is
-                // emitted. An unresolved graphql consumer (e.g. a `subscription`
-                // with no `request<T>` call site, so no captured payload symbol)
-                // stays `Unknown` and would only ever orphan-noise the verdict run,
-                // so it is dropped here. HTTP/socket carry no such gate: their
-                // Unknown entries are handled downstream as `unknownPairs`.
-                if entry.key.protocol() == crate::operation::Protocol::Graphql
-                    && entry.type_state == ManifestTypeState::Unknown
+                // type actually reached the bundle is emitted. Two ways an
+                // unresolved graphql entry can sneak past, both dropped here:
+                //
+                //  1. `type_state == Unknown` — the type never resolved (the
+                //     `subscription` with no `request<T>` call site, so no captured
+                //     payload symbol). The clean case.
+                //
+                //  2. A graphql CONSUMER with no resolved anchor symbol
+                //     (`primary_type_symbol == None`). This closes the
+                //     subscription-orderUpdated false-positive: that consumer's only
+                //     candidate alias is the synthetic `Endpoint_<hash>` fallback,
+                //     which `enrich_manifest_with_type_resolution` can wrongly
+                //     PROMOTE to `Implicit` when the bundle textually defines the
+                //     synthetic alias as a non-`= unknown` but top-ish form (e.g. an
+                //     index-any record `Record<string, any>`) — not caught by the
+                //     trivially-unknown filter, so `type_state` lies and check (1)
+                //     misses it. Such a consumer resolves to `any`/`unknown` in the
+                //     bundle and would read `producer ⊑ any` = compatible (a FALSE
+                //     POSITIVE). A consumer that genuinely resolved carries a real
+                //     anchor symbol (threaded at creation from the `request<T>`
+                //     payload, or filled from the deterministic inferred anchor
+                //     during enrichment), so a still-`None` symbol means no real
+                //     resolved type. Producers are unaffected: an SDL producer
+                //     always carries its deterministic SDL-field anchor.
+                //
+                // HTTP/socket carry no such gate: their Unknown entries are handled
+                // downstream as `unknownPairs`.
+                let is_graphql = entry.key.protocol() == crate::operation::Protocol::Graphql;
+                if is_graphql && entry.type_state == ManifestTypeState::Unknown {
+                    continue;
+                }
+                if is_graphql
+                    && entry.role == ManifestRole::Consumer
+                    && entry.primary_type_symbol.is_none()
                 {
                     continue;
                 }
@@ -4579,6 +4605,143 @@ mod tests {
                 .all(|e| e.type_state != ManifestTypeState::Unknown
                     || e.key.protocol() != crate::operation::Protocol::Graphql),
             "no Unknown graphql entry may reach the ts_check manifest"
+        );
+    }
+
+    /// The `graphql|subscription|orderUpdated` false-positive: an UNRESOLVED
+    /// graphql CONSUMER must never reach the consumer manifest, or it forms a
+    /// match whose synthetic dangling anchor resolves to `any`/`unknown` and reads
+    /// `producer ⊑ any` = compatible.
+    ///
+    /// Two shapes are dropped:
+    ///  - `type_state == Unknown` (the clean unresolved case);
+    ///  - a consumer wrongly PROMOTED to `Implicit` (the enrichment bug where the
+    ///    bundle defines the synthetic `Endpoint_<hash>` alias as a top-ish form),
+    ///    recognised by its still-`None` resolved anchor symbol.
+    ///
+    /// A genuinely resolved consumer (real `primary_type_symbol`) is KEPT, so the
+    /// `query|order` compatible edge is not regressed.
+    #[test]
+    fn write_manifest_files_drops_unresolved_graphql_consumer() {
+        use crate::cloud_storage::TypeEvidence;
+        use crate::operation::{GraphqlOperationKind, OperationKey};
+        use crate::services::type_sidecar::InferKind;
+
+        fn consumer(
+            field: &str,
+            alias: &str,
+            type_state: ManifestTypeState,
+            primary_type_symbol: Option<&str>,
+        ) -> TypeManifestEntry {
+            let is_explicit = type_state == ManifestTypeState::Explicit;
+            let key = OperationKey::graphql(GraphqlOperationKind::Subscription, field);
+            TypeManifestEntry {
+                key,
+                role: ManifestRole::Consumer,
+                type_kind: ManifestTypeKind::Response,
+                type_alias: alias.to_string(),
+                file_path: "lib/graphql.ts".to_string(),
+                line_number: 1,
+                is_explicit,
+                type_state,
+                evidence: TypeEvidence {
+                    file_path: "lib/graphql.ts".to_string(),
+                    span_start: None,
+                    span_end: None,
+                    line_number: 1,
+                    infer_kind: InferKind::CallResult,
+                    is_explicit,
+                    type_state,
+                },
+                resolved_definition: None,
+                expanded_definition: None,
+                primary_type_symbol: primary_type_symbol.map(str::to_string),
+            }
+        }
+
+        let manifest = vec![
+            // Clean unresolved consumer (type_state Unknown) → DROPPED.
+            consumer(
+                "orderUpdated",
+                "Endpoint_unknown_Response",
+                ManifestTypeState::Unknown,
+                None,
+            ),
+            // The false-positive shape: enrichment wrongly promoted the synthetic
+            // alias to Implicit, but no real anchor was ever resolved
+            // (primary_type_symbol still None) → DROPPED.
+            consumer(
+                "orderPromoted",
+                "Endpoint_promoted_Response",
+                ManifestTypeState::Implicit,
+                None,
+            ),
+            // Genuinely resolved consumer (real anchor symbol) → KEPT.
+            consumer(
+                "orderResolved",
+                "Endpoint_resolved_Response",
+                ManifestTypeState::Implicit,
+                Some("OrderView"),
+            ),
+        ];
+
+        let repo_data = CloudRepoData {
+            repo_name: "web-frontend".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: Some(manifest),
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+        };
+
+        #[derive(serde::Deserialize)]
+        struct ManifestFileForTest {
+            entries: Vec<TypeManifestEntry>,
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_manifest_files(std::slice::from_ref(&repo_data), dir.path())
+            .expect("write_manifest_files");
+
+        let consumers: ManifestFileForTest = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("consumer-manifest.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            consumers.entries.len(),
+            1,
+            "only the genuinely-resolved graphql consumer reaches the manifest; \
+             the Unknown one and the wrongly-promoted anchorless one are dropped"
+        );
+        assert_eq!(
+            consumers.entries[0].type_alias, "Endpoint_resolved_Response",
+            "the kept consumer is the one with a real resolved anchor symbol"
+        );
+        assert!(
+            consumers
+                .entries
+                .iter()
+                .all(|e| e.primary_type_symbol.is_some()
+                    || e.key.protocol() != crate::operation::Protocol::Graphql),
+            "no anchorless graphql consumer may reach the ts_check manifest"
         );
     }
 

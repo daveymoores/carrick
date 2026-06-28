@@ -390,6 +390,52 @@ export class TypeCompatibilityChecker {
 
     const sentType = socket ? consumerType : producerComparand;
     const expectedType = socket ? producerComparand : consumerType;
+
+    // Re-run the `any`/`unknown` → unverifiable guard on the COMPARANDS, not just
+    // the raw `producerType`/`consumerType` checked at the top. The GraphQL
+    // envelope unwrap (`unwrapGraphqlPayload`) can select a payload property that
+    // resolves to `any`/`unknown` even though the envelope object around it does
+    // not — e.g. `{ data: <unresolved>; errors }` whose `data` member dangles to
+    // `any`. Comparing a real producer against such a payload (or the inverse)
+    // would hit `isAssignableTo` with a top-ish side and read compatible: the
+    // exact `graphql|subscription|orderUpdated` false-positive. The raw-type
+    // guard never sees the unwrapped payload, so the comparands must be guarded
+    // again here, before `isAssignableTo`. (For HTTP/socket the comparands equal
+    // the raw types, so this is a redundant no-op that preserves their behavior.)
+    if (
+      sentType.isAny() ||
+      expectedType.isAny() ||
+      sentType.isUnknown() ||
+      expectedType.isUnknown()
+    ) {
+      const producerComparandIsTop = producerComparand.isAny() || producerComparand.isUnknown();
+      const consumerComparandIsTop = consumerType.isAny() || consumerType.isUnknown();
+      const reasonParts = [];
+      if (producerComparandIsTop) {
+        reasonParts.push(
+          `producer payload resolves to ${producerComparand.isAny() ? "any" : "unknown"} (type missing from bundled types?)`
+        );
+      }
+      if (consumerComparandIsTop) {
+        reasonParts.push(
+          `consumer type resolves to ${consumerType.isAny() ? "any" : "unknown"} (type missing from bundled types?)`
+        );
+      }
+      return {
+        kind: "unverifiable",
+        unknown: {
+          endpoint,
+          reason: reasonParts.join(", "),
+          producerTypeAlias: producer.type_alias,
+          consumerTypeAlias: consumer.type_alias,
+          producerLocation: this.formatEntryLocation(producer),
+          consumerLocation: this.formatEntryLocation(consumer),
+          producerEvidence: producer.evidence,
+          consumerEvidence: consumer.evidence,
+        },
+      };
+    }
+
     if (sentType.isAssignableTo(expectedType)) {
       return { kind: "compatible" };
     }

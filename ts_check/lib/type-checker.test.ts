@@ -766,6 +766,109 @@ describe('TypeCompatibilityChecker', () => {
       );
     });
 
+    it('reads a graphql edge whose consumer resolves to `any` as unverifiable, NOT compatible (subscription-orderUpdated false-positive)', async () => {
+      // The live `graphql|subscription|orderUpdated` false-positive: the PRODUCER
+      // resolves to a real `Order` envelope (Explicit), but the CONSUMER's
+      // synthetic dangling alias resolves to `any` in the bundle. The graphql
+      // direction is `producer ⊑ consumer`, so `Order ⊑ any` is trivially TRUE —
+      // the edge would read COMPATIBLE without the any/unknown guard, masking that
+      // the consumer type never reached the bundle. It MUST read unverifiable.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        // Producer: real resolver return envelope unwrapping to a concrete Order.
+        export type ProducerEnvelope = {
+          data: { id: string; total: number; note?: string };
+          errors: string[];
+        };
+        // Consumer: synthetic alias referencing a type with no declaration in the
+        // bundle → resolves to \`any\` (the dangling-anchor shape).
+        export type OrderUpdateView = MissingShape;
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-monorepo',
+        commit_hash: 'abc',
+        entries: [
+          graphqlEntry('ProducerEnvelope', 'producer', 'gateway/src/orders.resolver.ts', 75, 'subscription', 'orderUpdated'),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          graphqlEntry('OrderUpdateView', 'consumer', 'lib/graphql.ts', 80, 'subscription', 'orderUpdated'),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.compatiblePairs, 0, 'must NOT read compatible');
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(
+        result.unknownPairs.length,
+        1,
+        'a graphql consumer resolving to `any` must read unverifiable'
+      );
+      assert.ok(
+        result.unknownPairs[0].reason.includes('any'),
+        `the unverifiable reason must name the resolved \`any\`, got: ${result.unknownPairs[0].reason}`
+      );
+    });
+
+    it('reads a graphql edge whose consumer resolves to `unknown` as unverifiable, NOT compatible', async () => {
+      // The `unknown` twin of the subscription-orderUpdated trap: `Order ⊑ unknown`
+      // is also trivially TRUE, so an unguarded edge would read compatible.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type ProducerEnvelope = {
+          data: { id: string; total: number };
+          errors: string[];
+        };
+        export type OrderUpdateView = unknown;
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-monorepo',
+        commit_hash: 'abc',
+        entries: [
+          graphqlEntry('ProducerEnvelope', 'producer', 'gateway/src/orders.resolver.ts', 75, 'subscription', 'orderUpdated'),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          graphqlEntry('OrderUpdateView', 'consumer', 'lib/graphql.ts', 80, 'subscription', 'orderUpdated'),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.compatiblePairs, 0, 'must NOT read compatible');
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 1);
+    });
+
     it('reads a dangling consumer name as unverifiable but its structural shape as incompatible (#257)', async () => {
       // The #257 inference bug: a consumer like `res.json() as Promise<OrderView>`
       // wrote the bare NAME `= OrderView` into the cross-repo bundle. The bundle
