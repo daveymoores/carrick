@@ -870,16 +870,52 @@ export class TypeInferrer {
   // Extraction Config-based Payload Unwrapping (NEW)
   // ===========================================================================
 
-  /** `Promise<T>` → `T` at the type level; any other type passes through. */
+  /**
+   * Resolve the awaited type: `Promise<X>` / `PromiseLike<X>` / `Awaited<X>` →
+   * `X` at the type level (recursively, so `Awaited<Promise<X>>` → `X`); any
+   * non-thenable type passes through UNCHANGED.
+   *
+   * ts-morph 25.0.1 does not expose the compiler's `getAwaitedType` on its
+   * `Type` wrapper (only `AwaitableNode.isAwaited()` on AST nodes, which is
+   * unrelated), so we resolve structurally on the symbol/alias name instead of
+   * gating on the literal `'Promise'` symbol. This generalizes past `Promise<T>`
+   * to `PromiseLike<T>` and the `Awaited<T>` utility type without over-unwrapping:
+   * a non-thenable like `AsyncGenerator<T>` is NOT awaitable and is returned
+   * unchanged, so the `unwrapAsyncIterableType` step that runs right after still
+   * sees (and peels) the iterator wrapper as before.
+   */
   private unwrapPromiseType(type: Type): Type {
-    const symbolName = (type.getSymbol() || type.getAliasSymbol())?.getName();
-    if (symbolName === 'Promise') {
-      const args = type.getTypeArguments();
-      if (args.length === 1) {
-        return args[0];
+    // Bounded recursion guard: a pathological self-referential alias must not
+    // loop. Real promise nesting is shallow; 16 is far more than enough.
+    let current = type;
+    for (let depth = 0; depth < 16; depth++) {
+      const symbolName = current.getSymbol()?.getName();
+      const aliasName = current.getAliasSymbol()?.getName();
+
+      // `Promise<X>` / `PromiseLike<X>` — single type argument is the value.
+      if (symbolName === 'Promise' || symbolName === 'PromiseLike') {
+        const args = current.getTypeArguments();
+        if (args.length === 1) {
+          current = args[0];
+          continue;
+        }
+        return current;
       }
+
+      // `Awaited<X>` utility type — unwrap its alias argument and keep resolving
+      // (TS usually eager-resolves this, but handle the surfaced-alias form too).
+      if (aliasName === 'Awaited') {
+        const aliasArgs = current.getAliasTypeArguments();
+        if (aliasArgs.length === 1) {
+          current = aliasArgs[0];
+          continue;
+        }
+        return current;
+      }
+
+      return current;
     }
-    return type;
+    return current;
   }
 
   /**
@@ -1830,7 +1866,10 @@ export class TypeInferrer {
 
     // Handle nested Promise via type arguments
     const typeArguments = type.getTypeArguments();
-    if (typeArguments.length > 0 && typeString.startsWith('Promise<')) {
+    if (
+      typeArguments.length > 0 &&
+      (typeString.startsWith('Promise<') || typeString.startsWith('PromiseLike<'))
+    ) {
       return typeText(typeArguments[0]);
     }
 
@@ -1838,15 +1877,20 @@ export class TypeInferrer {
   }
 
   /**
-   * Unwrap a single `Promise<...>` type string, only when the inner text is
-   * bracket-balanced (so `Promise<A> | B` is left alone for the caller's
-   * union handling rather than mangled).
+   * Unwrap a single `Promise<...>` / `PromiseLike<...>` type string, only when
+   * the inner text is bracket-balanced (so `Promise<A> | B` is left alone for
+   * the caller's union handling rather than mangled).
    */
   private unwrapPromiseText(part: string): string {
-    if (!part.startsWith('Promise<') || !part.endsWith('>')) {
+    const prefix = part.startsWith('Promise<')
+      ? 'Promise<'
+      : part.startsWith('PromiseLike<')
+        ? 'PromiseLike<'
+        : null;
+    if (prefix === null || !part.endsWith('>')) {
       return part;
     }
-    const inner = part.slice('Promise<'.length, -1);
+    const inner = part.slice(prefix.length, -1);
     return this.isBracketBalanced(inner) ? inner : part;
   }
 

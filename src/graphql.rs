@@ -483,11 +483,18 @@ struct TaggedTplVisitor<'a> {
 }
 
 impl TaggedTplVisitor<'_> {
-    /// Capture a `request<T>(DOC)`-style call: a member call whose method is one
-    /// of the GraphQL execution methods, with a TS type argument and a first
-    /// argument that is an ident bound to a `gql` document. Keyed entirely on the
-    /// structural shape (gql-const first arg + generic + method name), never a
-    /// client-identifier allowlist, so it is framework-agnostic.
+    /// Capture a `receiver.method<T>(DOC)`-style GraphQL execution call. The
+    /// capture is keyed entirely on a structural triad, with NO method-name
+    /// allowlist and NO client-identifier allowlist, so it is framework-agnostic:
+    ///   (a) it is a member call (`obj.method(...)`);
+    ///   (b) it carries an explicit TS type generic (`method<OrderView>(...)`);
+    ///   (c) its first positional argument is an ident bound to a tracked `gql`
+    ///       document const (looked up in `gql_const_key`).
+    /// Those three together identify a GraphQL execution by construction — the
+    /// method name (`request`/`query`/`exec`/…) adds nothing over "first arg is a
+    /// known gql document", so it is not inspected. The generic + known-gql-const
+    /// requirements keep precision: a plain `foo.map<T>(x)` is never captured
+    /// because `x` is not a tracked gql document.
     fn capture_request_call(&mut self, node: &CallExpr) {
         let Callee::Expr(callee) = &node.callee else {
             return;
@@ -495,13 +502,9 @@ impl TaggedTplVisitor<'_> {
         let Expr::Member(member) = &**callee else {
             return;
         };
-        let Some(method) = member.prop.as_ident() else {
-            return;
-        };
-        if !matches!(
-            method.sym.as_ref(),
-            "request" | "query" | "mutate" | "subscribe"
-        ) {
+        // The call must be a member call (`obj.method(...)`) — but the method
+        // name itself is intentionally NOT inspected (no allowlist).
+        if member.prop.as_ident().is_none() {
             return;
         }
         // Must carry an explicit TS type argument (`request<OrderView>(...)`).
@@ -928,6 +931,86 @@ async function fetchOrder(id) {
             .find(|op| op.key.canonical() == "graphql|query|order")
             .unwrap();
         assert_eq!(order.payload_type_source.as_deref(), Some("./types"));
+    }
+
+    /// Generalization: the capture is NOT gated on a method-name allowlist, so a
+    /// non-`request` execution method (`gqlClient.exec<T>(DOC)`, Apollo-style
+    /// `useQuery<T>(DOC)`) anchors exactly like `request<T>(DOC)`. Under the old
+    /// `matches!(method.sym, "request" | "query" | "mutate" | "subscribe")` gate
+    /// these returned early and were never captured. The structural triad
+    /// (member call + TS generic + tracked gql-const first arg) is all that's
+    /// required.
+    #[test]
+    fn consumer_anchors_on_non_request_method_name() {
+        // `exec` — not in the old allowlist.
+        let exec_result = extract_ts(
+            r#"
+import { gql } from "graphql-tag";
+import { OrderView } from "./types";
+const gqlClient = makeClient();
+const GET_ORDER = gql`
+  query GetOrder($id: ID!) { order(id: $id) { id } }
+`;
+async function fetchOrder(id) {
+  return gqlClient.exec<OrderView>(GET_ORDER, { id });
+}
+"#,
+        );
+        assert_eq!(
+            payload_anchors(&exec_result.consumers),
+            vec![(
+                "graphql|query|order".to_string(),
+                Some("OrderView".to_string())
+            )]
+        );
+
+        // Apollo-style `useQuery<T>(DOC)` as a member call, single-property
+        // wrapper matching the field — also not in the old allowlist.
+        let use_query_result = extract_ts(
+            r#"
+import { gql } from "graphql-tag";
+import { OrderView } from "./types";
+const apollo = makeClient();
+const GET_ORDER = gql`
+  query GetOrder($id: ID!) { order(id: $id) { id } }
+`;
+function OrderComponent(id) {
+  return apollo.useQuery<{ order: OrderView }>(GET_ORDER, { id });
+}
+"#,
+        );
+        assert_eq!(
+            payload_anchors(&use_query_result.consumers),
+            vec![(
+                "graphql|query|order".to_string(),
+                Some("OrderView".to_string())
+            )]
+        );
+    }
+
+    /// Precision guard survives the method-allowlist removal: a generic member
+    /// call whose first arg is NOT a tracked gql document (`foo.map<T>(x)`) is
+    /// never captured, even though it is a member call with a TS generic.
+    #[test]
+    fn non_gql_generic_member_call_is_not_captured() {
+        let result = extract_ts(
+            r#"
+import { gql } from "graphql-tag";
+import { OrderView } from "./types";
+const GET_ORDER = gql`
+  query GetOrder($id: ID!) { order(id: $id) { id } }
+`;
+function compute(items, x) {
+  return items.map<OrderView>(x);
+}
+"#,
+        );
+        // The gql document is still parsed into a consumer op, but it carries no
+        // payload anchor because no qualifying execution call referenced it.
+        assert_eq!(
+            payload_anchors(&result.consumers),
+            vec![("graphql|query|order".to_string(), None)]
+        );
     }
 
     /// A `request<{ order: OrderView }>(GET_ORDER)` call site — the single
