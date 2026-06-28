@@ -731,13 +731,13 @@ mod tests {
         use crate::operation::GraphqlOperationKind;
 
         let schema = AgentSchemas::file_analysis_schema();
-        let schema_values: Vec<String> = schema["properties"]["graphql_operations"]["items"]
-            ["properties"]["kind"]["enum"]
-            .as_array()
-            .expect("graphql_operations kind enum must exist")
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
+        let schema_values: Vec<String> =
+            schema["properties"]["graphql_operations"]["items"]["properties"]["kind"]["enum"]
+                .as_array()
+                .expect("graphql_operations kind enum must exist")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
 
         let serde_values: Vec<String> = [
             GraphqlOperationKind::Query,
