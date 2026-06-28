@@ -324,15 +324,15 @@ impl AgentSchemas {
                             "primary_type_symbol": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "The named type of the response payload, as a bare identifier. ALWAYS extract it when the payload value has a determinable named type; do not skip it. Trace the sent or returned payload value (the same value as `response_expression_text`) to its declared type: a local variable annotation (`const u: User = ...; res.json(u)` gives `User`), a function return annotation (`(): Promise<User>` gives `User`), a cast on the payload (`res.json(u as User)` gives `User`), or a generic type argument (`get<User>(...)` gives `User`). An imperative send like `res.json(u)` does not suppress this; extract it the same as a returned value. Unwrap `Promise<...>`, arrays (`User[]`), and response wrappers (`Response<User>`) down to the core identifier. Null only for untyped or inline-object-literal payloads with no named type."
+                                "description": "The named type of the RESPONSE payload value ONLY — the exact value emitted as `response_expression_text` — as a bare identifier. ALWAYS extract it when that response value has a determinable named type; do not skip it. Trace ONLY that sent or returned value to its declared type: a local variable annotation (`const u: User = ...; res.json(u)` gives `User`), a function return annotation (`(): Promise<User>` gives `User`), a cast on the payload (`res.json(u as User)` gives `User`), or a generic type argument (`get<User>(...)` gives `User`). An imperative send like `res.json(u)` does not suppress this; extract it the same as a returned value. Unwrap `Promise<...>`, arrays (`User[]`), and response wrappers (`Response<User>`) down to the core identifier. NEVER borrow a named type from elsewhere in the handler — in particular, do NOT put the REQUEST body's type here (the `T` in `req.body as T`); the request type is carried only by `payload_expression_text` and resolved downstream. Null for untyped, inline-object-literal, or otherwise un-annotated response payloads."
                             },
                             "type_import_source": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Read the import statements at the top of the file."
+                                "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Null whenever `primary_type_symbol` is null. Read the import statements at the top of the file."
                             }
                         },
-                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched", "emission_style"]
+                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched", "emission_style", "payload_expression_text", "payload_expression_line"]
                     }
                 },
                 "data_calls": {
