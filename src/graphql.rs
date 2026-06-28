@@ -54,6 +54,18 @@ pub struct GraphqlOp {
     /// `payload_type_symbol`. `None` when the symbol is declared in the same file
     /// or no call site was matched.
     pub payload_type_source: Option<String>,
+    /// PRODUCER-only: the file whose resolver implements this schema field,
+    /// joined in from the file-analyzer's `graphql_operations` (Stage B1). The
+    /// producer's real response contract is the resolver function's RETURN type
+    /// expanded (`Promise<ApiResponse<Order>>` → `{ data: …, errors }`), which
+    /// the SDL alone can't give, so this points the `FunctionReturn` infer
+    /// request at the resolver. `None` for SDL producers with no matched LLM op,
+    /// and always `None` for consumers (they anchor on `payload_type_symbol`).
+    pub resolver_file: Option<PathBuf>,
+    /// PRODUCER-only: 1-based line where the resolver function is defined,
+    /// paired with `resolver_file`. Anchors the `FunctionReturn` infer request.
+    /// `None` whenever `resolver_file` is `None`.
+    pub resolver_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -223,6 +235,10 @@ pub fn extract_from_document_text(
                     // Producers carry no consumer-side bound type.
                     payload_type_symbol: None,
                     payload_type_source: None,
+                    // SDL alone has no resolver location; the file-analyzer's
+                    // graphql_operations fill these in the engine merge (Stage B1).
+                    resolver_file: None,
+                    resolver_line: None,
                 });
             }
         }
@@ -276,6 +292,9 @@ pub fn extract_from_document_text(
                     primary_type_symbol: None,
                     payload_type_symbol: None,
                     payload_type_source: None,
+                    // Consumers never carry a resolver location.
+                    resolver_file: None,
+                    resolver_line: None,
                 });
             }
         }

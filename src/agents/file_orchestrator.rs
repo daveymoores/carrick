@@ -1159,6 +1159,81 @@ impl FileOrchestrator {
         requests
     }
 
+    /// Build `FunctionReturn` infer requests for GraphQL SDL producers whose
+    /// resolver location was joined in from the file-analyzer (`graphql_operations`,
+    /// Stage B1).
+    ///
+    /// Producers do NOT use the `SymbolRequest`/bundle path the consumer/socket
+    /// anchors use: bundling the SDL anchor symbol (`ApiResponse`) would emit the
+    /// still-generic wrapper, not the producer's real response contract. The
+    /// producer's contract is the resolver function's RETURN type expanded
+    /// (`Promise<ApiResponse<Order>>` → `{ data: …, errors }`), so this points an
+    /// `InferKind::FunctionReturn` at the resolver's file/line — exactly the
+    /// file-based-route handler path. The sidecar resolves the fn return,
+    /// Promise/async-iterator-unwraps it, and structurally expands it.
+    ///
+    /// The alias MUST be `build_manifest_type_alias(&op.key, Producer, Response)`
+    /// — byte-identical to the alias `add_protocol_manifest_entry` stamped on the
+    /// producer manifest entry — or the inferred type never joins back and the
+    /// entry stays `Unknown`. This is the load-bearing join, guarded by a unit
+    /// test exactly as the consumer side is.
+    ///
+    /// Only producers with BOTH `resolver_file` and `resolver_line` set produce a
+    /// request; an SDL producer with no matched LLM op stays inferred-from-nothing
+    /// (it keeps its SDL anchor, but no expanded response contract).
+    pub fn collect_graphql_producer_infer_requests(
+        &self,
+        graphql: &crate::graphql::GraphqlExtraction,
+        repo_path: &str,
+    ) -> Vec<InferRequestItem> {
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let mut requests: Vec<InferRequestItem> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for op in &graphql.producers {
+            let (Some(resolver_file), Some(resolver_line)) =
+                (op.resolver_file.as_ref(), op.resolver_line)
+            else {
+                continue;
+            };
+            let file_abs =
+                Self::to_absolute_path(&resolver_file.to_string_lossy(), &repo_root_absolute);
+            let alias = build_manifest_type_alias(
+                &op.key,
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            );
+            let dedup_key = format!("{}|{}|{}", file_abs, resolver_line, alias);
+            if seen.insert(dedup_key) {
+                requests.push(InferRequestItem {
+                    file_path: file_abs,
+                    line_number: resolver_line,
+                    span_start: None,
+                    span_end: None,
+                    expression_text: None,
+                    expression_line: None,
+                    infer_kind: InferKind::FunctionReturn,
+                    alias: Some(alias),
+                    param_name: None,
+                });
+            }
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} graphql producer infer requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Parse a file once and extract both the symbol table and the env-var
     /// alias map (`local const -> process.env name`). Sharing the parse keeps
     /// the per-file CPU cost flat — both passes are cheap AST walks.
@@ -1550,6 +1625,10 @@ impl FileOrchestrator {
     /// * `config` - Config used for URL normalization
     /// * `extra_explicit` - Deterministically-collected explicit symbol
     ///   requests for non-HTTP protocols (socket payload anchors, #245)
+    /// * `extra_infer` - Deterministically-collected `FunctionReturn` infer
+    ///   requests for non-HTTP protocols (GraphQL producer resolver returns,
+    ///   Stage B1). Unlike `extra_explicit`, these go through the infer path so
+    ///   the resolver return is expanded, not bundled as the generic SDL anchor.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve_types_with_sidecar(
         &self,
@@ -1560,8 +1639,9 @@ impl FileOrchestrator {
         mount_graph: &MountGraph,
         config: &Config,
         extra_explicit: &[SymbolRequest],
+        extra_infer: &[InferRequestItem],
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (mut explicit, infer, inline_aliases) =
+        let (mut explicit, mut infer, inline_aliases) =
             self.collect_type_requests(file_results, repo_path, mount_graph, config);
 
         // Deterministically-collected explicit requests for non-HTTP protocols
@@ -1570,11 +1650,20 @@ impl FileOrchestrator {
         // alias each carries matches its manifest entry so the enrich-join lands.
         explicit.extend_from_slice(extra_explicit);
 
+        // Deterministically-collected infer requests for non-HTTP protocols
+        // (today: GraphQL producer resolver returns, Stage B1). A producer's real
+        // response contract is the resolver's RETURN type expanded, so it takes
+        // the `FunctionReturn` infer path (mirroring file-based routes), NOT the
+        // bundle path — bundling the SDL anchor would emit the generic wrapper.
+        // The alias each carries matches its manifest entry so the join lands.
+        infer.extend_from_slice(extra_infer);
+
         debug!(
-            "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred",
+            "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred ({} from non-HTTP protocols)",
             explicit.len(),
             extra_explicit.len(),
-            infer.len()
+            infer.len(),
+            extra_infer.len()
         );
 
         let result = sidecar
