@@ -1003,11 +1003,15 @@ async fn analyze_current_repo_incremental(
                 cloud_data.type_manifest = Some(manifest_entries);
             }
 
-            // Socket payload anchors resolve through the same sidecar bundle
-            // path as HTTP explicit symbols (#245); GraphQL anchors are deferred
-            // to #248.
-            let socket_requests = file_orchestrator
+            // Socket payload anchors and GraphQL consumer result-type anchors
+            // both resolve through the same sidecar bundle path as HTTP explicit
+            // symbols (#245/#248). Concatenate both into the extra-explicit slice.
+            let mut protocol_requests = file_orchestrator
                 .collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
+            protocol_requests.extend(
+                file_orchestrator
+                    .collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
+            );
 
             // Type resolution via sidecar
             resolve_types_if_available(
@@ -1018,7 +1022,7 @@ async fn analyze_current_repo_incremental(
                 extraction_config.as_ref(),
                 &mount_graph,
                 config,
-                &socket_requests,
+                &protocol_requests,
                 &mut cloud_data,
             );
 
@@ -1249,7 +1253,10 @@ fn append_protocol_manifest_entries(
             ManifestRole::Consumer,
             &op.file_path.to_string_lossy(),
             op.line,
-            op.primary_type_symbol.clone(),
+            // The consumer's real anchor is the bound TS result type captured at
+            // the `request<T>(DOC)` call site (#248 consumer side), not the
+            // SDL-derived `primary_type_symbol` (always `None` for documents).
+            op.payload_type_symbol.clone(),
         );
     }
     for op in &extractions.sockets.listeners {
@@ -2165,11 +2172,14 @@ async fn analyze_current_repo(
     .await;
     cloud_data.cached_extraction_config = extraction_config.clone();
 
-    // Socket payload anchors resolve through the same sidecar bundle path as
-    // HTTP explicit symbols (#245). GraphQL anchors are deferred to #248, so no
-    // GraphQL SymbolRequests are produced here.
-    let socket_requests =
+    // Socket payload anchors and GraphQL consumer result-type anchors both
+    // resolve through the same sidecar bundle path as HTTP explicit symbols
+    // (#245/#248). Concatenate both into the extra-explicit slice.
+    let mut protocol_requests =
         file_orchestrator.collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
+    protocol_requests.extend(
+        file_orchestrator.collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
+    );
 
     resolve_types_if_available(
         sidecar,
@@ -2179,7 +2189,7 @@ async fn analyze_current_repo(
         extraction_config.as_ref(),
         &analysis_result.mount_graph,
         config,
-        &socket_requests,
+        &protocol_requests,
         &mut cloud_data,
     );
 
@@ -3918,6 +3928,25 @@ mod tests {
             file_path: PathBuf::from("src/schema.graphql"),
             line: 3,
             primary_type_symbol: anchor.map(String::from),
+            payload_type_symbol: None,
+            payload_type_source: None,
+        }
+    }
+
+    /// A GraphQL consumer op carrying a `request<T>` call-site anchor in
+    /// `payload_type_symbol` (the field SDL producers can't provide).
+    fn graphql_consumer_op(
+        field: &str,
+        payload_symbol: Option<&str>,
+        payload_source: Option<&str>,
+    ) -> crate::graphql::GraphqlOp {
+        crate::graphql::GraphqlOp {
+            key: OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, field),
+            file_path: PathBuf::from("web-frontend/lib/graphql.ts"),
+            line: 76,
+            primary_type_symbol: None,
+            payload_type_symbol: payload_symbol.map(String::from),
+            payload_type_source: payload_source.map(String::from),
         }
     }
 
@@ -4045,6 +4074,62 @@ mod tests {
         // Independently confirm both equal the canonical builder output.
         let expected = crate::type_manifest::build_manifest_type_alias(
             &emitter.key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+        );
+        assert_eq!(manifest_alias, expected);
+        assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// Same fragile contract for GraphQL consumers: the alias on the consumer
+    /// manifest entry (EDIT 2, `append_protocol_manifest_entries`) MUST byte-match
+    /// the alias on the `collect_graphql_type_requests` SymbolRequest (EDIT 3),
+    /// both `build_manifest_type_alias(key, Consumer, Response)`. If they diverge
+    /// the resolved `.d.ts` never joins back and the entry stays `Unknown`.
+    #[test]
+    fn graphql_symbol_request_alias_matches_manifest_alias() {
+        let consumer = graphql_consumer_op("order", Some("OrderView"), Some("./types"));
+        let extractions = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction {
+                producers: vec![],
+                consumers: vec![consumer.clone()],
+            },
+            sockets: crate::socket_io::SocketExtraction::default(),
+        };
+
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions);
+        let manifest_entry = entries
+            .iter()
+            .find(|e| {
+                e.key.canonical() == "graphql|query|order" && e.role == ManifestRole::Consumer
+            })
+            .expect("graphql consumer manifest entry");
+        // EDIT 2: the consumer entry's anchor is the call-site payload symbol.
+        assert_eq!(
+            manifest_entry.primary_type_symbol.as_deref(),
+            Some("OrderView"),
+            "consumer entry must carry the request<T> anchor, not the SDL None"
+        );
+        let manifest_alias = manifest_entry.type_alias.clone();
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_graphql_type_requests(&extractions.graphql, ".");
+        let request = requests
+            .iter()
+            .find(|r| r.symbol_name == "OrderView")
+            .expect("graphql SymbolRequest");
+
+        assert_eq!(
+            request.alias.as_deref(),
+            Some(manifest_alias.as_str()),
+            "SymbolRequest.alias must byte-match the manifest entry's alias \
+             (both build_manifest_type_alias(key, Consumer, Response)) or the \
+             enrich-join silently breaks"
+        );
+        // Independently confirm both equal the canonical builder output.
+        let expected = crate::type_manifest::build_manifest_type_alias(
+            &consumer.key,
             ManifestRole::Consumer,
             ManifestTypeKind::Response,
         );

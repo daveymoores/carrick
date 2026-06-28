@@ -1091,6 +1091,74 @@ impl FileOrchestrator {
         requests
     }
 
+    /// Build `SymbolRequest`s for GraphQL consumer result-type anchors (#248
+    /// consumer side).
+    ///
+    /// Near-copy of `collect_socket_type_requests`: it routes the deterministic
+    /// consumer anchor — the TS result type bound at the `client.request<T>(DOC)`
+    /// call site (`GraphqlOp::payload_type_symbol`) — through the *same* sidecar
+    /// bundle path the HTTP explicit-symbol and socket cases use. Only consumers
+    /// carry a `payload_type_symbol` (SDL producers anchor on their SDL type
+    /// expression, not a bundled TS symbol), so this is consumer-only.
+    ///
+    /// The alias MUST be `build_manifest_type_alias(&op.key, Consumer, Response)`
+    /// — byte-identical to the alias `add_protocol_manifest_entry` stamped on the
+    /// manifest entry in `append_protocol_manifest_entries` — or the resolved
+    /// `.d.ts` never joins back and the entry stays `Unknown`. This contract is
+    /// guarded by a unit test.
+    ///
+    /// An absent source means the symbol is declared in the consuming file, so it
+    /// is resolved against that file's absolute path (same-file fallback).
+    pub fn collect_graphql_type_requests(
+        &self,
+        graphql: &crate::graphql::GraphqlExtraction,
+        repo_path: &str,
+    ) -> Vec<SymbolRequest> {
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let mut requests: Vec<SymbolRequest> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for op in &graphql.consumers {
+            let Some(symbol) = op.payload_type_symbol.as_ref() else {
+                continue;
+            };
+            let file_abs =
+                Self::to_absolute_path(&op.file_path.to_string_lossy(), &repo_root_absolute);
+            let source_file = match op.payload_type_source.as_ref() {
+                Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                // No import → same-file declaration: resolve against the file.
+                None => file_abs,
+            };
+            let alias = build_manifest_type_alias(
+                &op.key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            );
+            let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
+            if seen.insert(dedup_key) {
+                requests.push(SymbolRequest {
+                    symbol_name: symbol.clone(),
+                    source_file,
+                    alias: Some(alias),
+                });
+            }
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} graphql consumer type requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Parse a file once and extract both the symbol table and the env-var
     /// alias map (`local const -> process.env name`). Sharing the parse keeps
     /// the per-file CPU cost flat — both passes are cheap AST walks.
