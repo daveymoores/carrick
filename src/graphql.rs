@@ -316,19 +316,17 @@ fn tagged_tpl_text(node: &TaggedTpl) -> String {
         .join("\n")
 }
 
-/// The top-level operation field of a `gql` document text, when it has exactly
-/// one operation-field consumer (the `const NAME = gql\`...\`` shape the request
-/// call site binds by ident). Returns `None` for SDL, multi-field, or
-/// unparseable documents — those don't map cleanly to one request binding.
-fn single_operation_field(text: &str, file_path: &Path) -> Option<String> {
-    let extraction = extract_from_document_text(text, file_path, 1);
+/// The single operation key of an already-extracted `gql` document, when it has
+/// exactly one operation-field consumer (the `const NAME = gql\`...\`` shape the
+/// request call site binds by ident). Returns `None` for SDL, multi-field, or
+/// empty extractions — those don't map cleanly to one request binding. Operates
+/// on the merged extraction the tagged-template handler already produced, so the
+/// document text is parsed only once.
+fn single_operation_key(extraction: &GraphqlExtraction) -> Option<&OperationKey> {
     if !extraction.producers.is_empty() || extraction.consumers.len() != 1 {
         return None;
     }
-    extraction
-        .consumers
-        .first()
-        .and_then(|op| op.key.graphql_field().map(String::from))
+    extraction.consumers.first().map(|op| &op.key)
 }
 
 /// Extract operations from `gql`/`graphql` tagged template literals in a
@@ -350,21 +348,24 @@ fn extract_from_ts_file(file_path: &Path) -> GraphqlExtraction {
             file_path,
             extraction: GraphqlExtraction::default(),
             type_imports: HashMap::new(),
-            gql_const_field: HashMap::new(),
-            request_field_types: HashMap::new(),
+            gql_const_key: HashMap::new(),
+            request_key_types: HashMap::new(),
+            pending_gql_binding: None,
         };
         module.visit_with(&mut visitor);
 
-        // Backfill consumer anchors: for each consumer op whose operation field
-        // had a typed `request<T>(DOC)` call site, set the captured symbol.
+        // Backfill consumer anchors: for each consumer op whose operation key had
+        // a typed `request<T>(DOC)` call site, set the captured symbol. Matching on
+        // the full canonical key (kind + field) keeps a query and a mutation that
+        // share a field name from cross-anchoring.
         let TaggedTplVisitor {
             mut extraction,
-            request_field_types,
+            request_key_types,
             ..
         } = visitor;
         for op in &mut extraction.consumers {
-            if let Some(field) = op.key.graphql_field()
-                && let Some((symbol, source)) = request_field_types.get(field)
+            if op.key.graphql_field().is_some()
+                && let Some((symbol, source)) = request_key_types.get(&op.key.canonical())
             {
                 op.payload_type_symbol = Some(symbol.clone());
                 op.payload_type_source = source.clone();
@@ -383,13 +384,22 @@ struct TaggedTplVisitor<'a> {
     /// `type_imports` pattern).
     type_imports: HashMap<String, String>,
     /// `gql`/`graphql` const binding ident → the document's single operation
-    /// field (`GET_ORDER` → `order`). The request call site binds the document
-    /// by this ident, so this joins the call site's type to the consumer op.
-    gql_const_field: HashMap<String, String>,
-    /// Operation field name → `(bound type symbol, import source)` recovered from
-    /// a `request<T>(DOC)` call site. Filled in `visit_call_expr` once both the
-    /// gql-const binding and the call site are known.
-    request_field_types: HashMap<String, (String, Option<String>)>,
+    /// key in canonical form (`GET_ORDER` → `graphql|query|order`). Keying by the
+    /// canonical key (kind + field), not the bare field, keeps a `query` and a
+    /// `mutation` that share one field name in the same file from colliding. The
+    /// request call site binds the document by this ident, so this joins the call
+    /// site's type to the consumer op.
+    gql_const_key: HashMap<String, String>,
+    /// Canonical operation key → `(bound type symbol, import source)` recovered
+    /// from a `request<T>(DOC)` call site. Filled in `visit_call_expr` once both
+    /// the gql-const binding and the call site are known. Keyed by canonical key
+    /// (not bare field) so it matches the consumer op's `key.canonical()` exactly.
+    request_key_types: HashMap<String, (String, Option<String>)>,
+    /// Binding ident of the `const NAME = gql\`...\`` declarator currently being
+    /// visited, so the `visit_tagged_tpl` handler — which already parses the
+    /// document to build the consumer op — can record `NAME → operation key` from
+    /// that single parse instead of parsing the text a second time.
+    pending_gql_binding: Option<String>,
 }
 
 impl TaggedTplVisitor<'_> {
@@ -428,19 +438,24 @@ impl TaggedTplVisitor<'_> {
         let Expr::Ident(doc_ident) = &*first.expr else {
             return;
         };
-        let Some(field) = self.gql_const_field.get(doc_ident.sym.as_ref()) else {
+        let Some(canonical_key) = self.gql_const_key.get(doc_ident.sym.as_ref()) else {
             return;
         };
-        let field = field.clone();
+        let canonical_key = canonical_key.clone();
+        // The canonical key is `graphql|<kind>|<field>`; the wrapper-unwrap rule
+        // matches the single property name against the operation field, so pull
+        // the field back out of the key (last `|`-segment).
+        let field = canonical_key.rsplit('|').next().unwrap_or("").to_string();
 
         // Unwrap `{ <field>: T }` to T when the single property name matches the
         // operation field (`{ order: OrderView }` for the `order` op); otherwise
-        // take the bound type as-is. Keyed on the parsed gql field name, never a
-        // hardcoded list.
+        // the result is `None` (see `resolve_request_type_arg`). Keyed on the
+        // parsed gql field name, never a hardcoded list.
         let resolved = resolve_request_type_arg(type_arg, &field);
         if let Some(symbol) = resolved {
             let source = self.type_imports.get(&symbol).cloned();
-            self.request_field_types.insert(field, (symbol, source));
+            self.request_key_types
+                .insert(canonical_key, (symbol, source));
         }
     }
 }
@@ -459,20 +474,24 @@ impl Visit for TaggedTplVisitor<'_> {
     }
 
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
-        // `const NAME = gql\`...\`` — record NAME → the document's operation
-        // field, threading the binding ident to the enclosing declarator.
+        // `const NAME = gql\`...\`` — stash the binding ident so the child
+        // `TaggedTpl` (which parses the document anyway) records `NAME → key`
+        // from that one parse, rather than parsing the text a second time here.
+        let mut stashed = false;
         if let (swc_ecma_ast::Pat::Ident(binding), Some(init)) = (&node.name, node.init.as_deref())
             && let Expr::TaggedTpl(tpl) = init
             && let Expr::Ident(tag) = &*tpl.tag
             && matches!(tag.sym.as_ref(), "gql" | "graphql")
         {
-            let text = tagged_tpl_text(tpl);
-            if let Some(field) = single_operation_field(&text, self.file_path) {
-                self.gql_const_field
-                    .insert(binding.id.sym.to_string(), field);
-            }
+            self.pending_gql_binding = Some(binding.id.sym.to_string());
+            stashed = true;
         }
         node.visit_children_with(self);
+        if stashed {
+            // Clear in case the document had no single operation key (multi-field
+            // or SDL): the binding must not leak onto a later tagged template.
+            self.pending_gql_binding = None;
+        }
     }
 
     fn visit_tagged_tpl(&mut self, node: &TaggedTpl) {
@@ -481,8 +500,16 @@ impl Visit for TaggedTplVisitor<'_> {
         {
             let text = tagged_tpl_text(node);
             let base_line = self.cm.lookup_char_pos(node.span().lo).line as u32;
-            self.extraction
-                .merge(extract_from_document_text(&text, self.file_path, base_line));
+            let parsed = extract_from_document_text(&text, self.file_path, base_line);
+            // Reuse this single parse to record the const→key association for the
+            // enclosing `const NAME = gql\`...\`` declarator (set in
+            // `visit_var_declarator`), so the document is parsed only once.
+            if let Some(binding) = self.pending_gql_binding.take()
+                && let Some(key) = single_operation_key(&parsed)
+            {
+                self.gql_const_key.insert(binding, key.canonical());
+            }
+            self.extraction.merge(parsed);
         }
         node.visit_children_with(self);
     }
@@ -495,10 +522,13 @@ impl Visit for TaggedTplVisitor<'_> {
 
 /// Resolve the TS type argument of a `request<T>(DOC)` call to a single anchor
 /// symbol. `request<OrderView>` → `OrderView`; `request<{ order: OrderView }>`
-/// with `field == "order"` unwraps to `OrderView`. A single-property wrapper
-/// whose key does NOT match the operation field is taken as-is (the property is
-/// not the operation envelope). Built-in/primitive references and any
-/// non-single-symbol shape return `None` (precision over recall).
+/// with `field == "order"` unwraps to `OrderView`. Anything we can't anchor to a
+/// single named symbol returns `None` and the consumer stays unanchored — we do
+/// not guess. That includes: a single-property wrapper whose key does NOT match
+/// the operation field (the whole literal would be the bound type, but a literal
+/// has no single symbol name); type args that aren't a bare named reference or a
+/// matching single-field envelope; and built-in/primitive references. Precision
+/// over recall.
 fn resolve_request_type_arg(type_arg: &TsType, field: &str) -> Option<String> {
     match type_arg {
         // `request<OrderView>` — a bare named reference.
@@ -794,6 +824,60 @@ async function fetchOrder(id) {
             payload_anchors(&result.consumers),
             vec![("graphql|query|order".to_string(), None)]
         );
+    }
+
+    /// Two documents in one file sharing a field name but differing in operation
+    /// kind (`query order` vs `mutation order`) must anchor independently to their
+    /// own bound type. Keying the gql-const/request joins by the canonical key
+    /// (kind + field), not the bare field, prevents the mutation's type from
+    /// clobbering the query's (or vice versa).
+    #[test]
+    fn same_field_name_different_kinds_anchor_independently() {
+        let result = extract_ts(
+            r#"
+import { gql } from "graphql-tag";
+import { OrderView, RefundReceipt } from "./types";
+const client = makeClient();
+const GET_ORDER = gql`
+  query GetOrder($id: ID!) { order(id: $id) { id } }
+`;
+const REFUND_ORDER = gql`
+  mutation RefundOrder($id: ID!) { order(id: $id) { id } }
+`;
+async function run(id) {
+  const a = await client.request<OrderView>(GET_ORDER, { id });
+  const b = await client.mutate<RefundReceipt>(REFUND_ORDER, { id });
+  return [a, b];
+}
+"#,
+        );
+        // Each canonical key carries its OWN bound type — no cross-anchoring.
+        assert_eq!(
+            payload_anchors(&result.consumers),
+            vec![
+                (
+                    "graphql|mutation|order".to_string(),
+                    Some("RefundReceipt".to_string())
+                ),
+                (
+                    "graphql|query|order".to_string(),
+                    Some("OrderView".to_string())
+                ),
+            ]
+        );
+        // Each anchored symbol carries the correct import source.
+        let query_op = result
+            .consumers
+            .iter()
+            .find(|op| op.key.canonical() == "graphql|query|order")
+            .unwrap();
+        assert_eq!(query_op.payload_type_source.as_deref(), Some("./types"));
+        let mutation_op = result
+            .consumers
+            .iter()
+            .find(|op| op.key.canonical() == "graphql|mutation|order")
+            .unwrap();
+        assert_eq!(mutation_op.payload_type_source.as_deref(), Some("./types"));
     }
 
     /// No type argument on the request call → no anchor (the document still
