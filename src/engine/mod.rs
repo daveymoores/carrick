@@ -2866,6 +2866,7 @@ mod tests {
                     type_import_source: None,
                 })
                 .collect(),
+            graphql_operations: vec![],
         }
     }
 
@@ -3233,6 +3234,7 @@ mod tests {
                         type_import_source: None,
                     }],
                     data_calls: vec![],
+                    graphql_operations: vec![],
                 },
             );
         }

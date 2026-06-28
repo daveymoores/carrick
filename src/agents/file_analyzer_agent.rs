@@ -175,12 +175,42 @@ pub struct DataCallResult {
     pub type_import_source: Option<String>,
 }
 
+/// A GraphQL resolver the file-analyzer found: the schema field it answers and
+/// the resolver function's declared return type (resolved downstream into the
+/// producer-side response contract). Mirrors the `graphql_operations` array in
+/// `AgentSchemas::file_analysis_schema`. The `kind` wire values (query /
+/// mutation / subscription) come from `crate::operation::GraphqlOperationKind`,
+/// the single source of truth shared with the operation graph; the schema enum
+/// is kept in lockstep by `graphql_operations_schema_enum_matches_serde_wire_values`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphqlOperation {
+    /// The GraphQL root operation this resolver implements.
+    pub kind: crate::operation::GraphqlOperationKind,
+    /// The schema field name this resolver answers (e.g., "order").
+    pub field: String,
+    /// Name of the resolver function (e.g., "resolveOrder").
+    pub resolver_function: String,
+    /// Line number where the resolver function is defined.
+    pub resolver_line: i32,
+    /// The primary return type symbol without wrappers (e.g., "ApiResponse" from
+    /// "Promise<ApiResponse>"). `None` for untyped or inline-object returns.
+    pub primary_type_symbol: Option<String>,
+    /// Import path where the type is defined (e.g., "./types/order"), null if
+    /// inline or same file. Null whenever `primary_type_symbol` is null.
+    pub type_import_source: Option<String>,
+}
+
 /// Complete analysis result for a single file
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileAnalysisResult {
     pub mounts: Vec<MountResult>,
     pub endpoints: Vec<EndpointResult>,
     pub data_calls: Vec<DataCallResult>,
+    /// GraphQL resolvers found in the file. Optional on the wire (a model may
+    /// omit it for non-GraphQL files), so default to empty rather than failing
+    /// the whole file's parse.
+    #[serde(default)]
+    pub graphql_operations: Vec<GraphqlOperation>,
 }
 
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
@@ -901,6 +931,7 @@ mod tests {
             mounts: vec![],
             endpoints: vec![endpoint],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
 
         FileAnalyzerAgent::sanitize_result(&mut result);
@@ -918,6 +949,7 @@ mod tests {
             mounts: vec![],
             endpoints: vec![endpoint],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
         FileAnalyzerAgent::sanitize_result(&mut result);
         assert_eq!(
@@ -1099,6 +1131,7 @@ mod tests {
                 primary_type_symbol: Some("NULL".to_string()),
                 type_import_source: Some("bad import (oops)".to_string()),
             }],
+            graphql_operations: vec![],
         };
 
         let needs_retry = FileAnalyzerAgent::sanitize_result(&mut result);
@@ -1144,6 +1177,7 @@ mod tests {
                 type_import_source: None,
             }],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1155,6 +1189,63 @@ mod tests {
         assert_eq!(deserialized.mounts.len(), 1);
         assert_eq!(deserialized.endpoints.len(), 1);
         assert!(deserialized.data_calls.is_empty());
+    }
+
+    #[test]
+    fn graphql_operations_deserialize_from_model_shape() {
+        // The exact wire shape the file-analyzer emits for a GraphQL resolver.
+        let json = r#"{
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [],
+            "graphql_operations": [
+                {
+                    "kind": "query",
+                    "field": "order",
+                    "resolver_function": "resolveOrder",
+                    "resolver_line": 38,
+                    "primary_type_symbol": "ApiResponse",
+                    "type_import_source": null
+                }
+            ]
+        }"#;
+
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.graphql_operations.len(), 1);
+        let op = &result.graphql_operations[0];
+        assert_eq!(op.kind, crate::operation::GraphqlOperationKind::Query);
+        assert_eq!(op.field, "order");
+        assert_eq!(op.resolver_function, "resolveOrder");
+        assert_eq!(op.resolver_line, 38);
+        assert_eq!(op.primary_type_symbol.as_deref(), Some("ApiResponse"));
+        assert_eq!(op.type_import_source, None);
+    }
+
+    #[test]
+    fn graphql_operations_default_empty_when_omitted() {
+        // A non-GraphQL file omits graphql_operations entirely; #[serde(default)]
+        // must yield an empty vec rather than failing the whole file's parse.
+        let json = r#"{ "mounts": [], "endpoints": [], "data_calls": [] }"#;
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert!(result.graphql_operations.is_empty());
+
+        // mutation / subscription wire values round-trip too.
+        let json = r#"{
+            "mounts": [], "endpoints": [], "data_calls": [],
+            "graphql_operations": [
+                { "kind": "mutation", "field": "createOrder", "resolver_function": "createOrder", "resolver_line": 7, "primary_type_symbol": null, "type_import_source": null },
+                { "kind": "subscription", "field": "orderUpdated", "resolver_function": "orderUpdated", "resolver_line": 9, "primary_type_symbol": null, "type_import_source": null }
+            ]
+        }"#;
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.graphql_operations[0].kind,
+            crate::operation::GraphqlOperationKind::Mutation
+        );
+        assert_eq!(
+            result.graphql_operations[1].kind,
+            crate::operation::GraphqlOperationKind::Subscription
+        );
     }
 
     #[test]
@@ -1202,12 +1293,14 @@ mod tests {
                 primary_type_symbol: None,
                 type_import_source: None,
             }],
+            graphql_operations: vec![],
         };
 
         let retry = FileAnalysisResult {
             mounts: vec![],
             endpoints: vec![],
             data_calls: vec![],
+            graphql_operations: vec![],
         };
 
         let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry);

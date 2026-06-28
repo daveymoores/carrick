@@ -52,7 +52,24 @@ import { expandTypeStructural } from './type-structural-expander.js';
  * `is_builtin_type` filter in `socket_io.rs` so the HTTP-inference anchor and the
  * socket anchor reject the same set.
  */
+/**
+ * Async-iterator / generator transport wrappers. A resolver written as an async
+ * generator (`async function* x(): AsyncGenerator<Order>`) carries its contract
+ * in the yield position; these symbol names gate `unwrapAsyncIterableType`, which
+ * peels them down to the yield type before structural expansion. They are also
+ * folded into `BUILTIN_ANCHOR_SYMBOLS` so the wrapper itself can never become a
+ * `primary_type_symbol` anchor.
+ */
+const ASYNC_ITERABLE_SYMBOLS = new Set<string>([
+  'AsyncGenerator',
+  'AsyncIterableIterator',
+  'AsyncIterator',
+  'Generator',
+  'IterableIterator',
+]);
+
 const BUILTIN_ANCHOR_SYMBOLS = new Set<string>([
+  ...ASYNC_ITERABLE_SYMBOLS,
   'any',
   'unknown',
   'never',
@@ -286,7 +303,14 @@ export class TypeInferrer {
     // async handler's return is Promise<Wrapper<T>>, whose symbol is
     // `Promise` — a rule naming the wrapper could never match it, and the
     // textual unwrapPromise below runs too late for the rules to see T.
-    const awaitedType = this.unwrapPromiseType(returnType);
+    //
+    // Then peel any async-iterator transport: an async generator resolver
+    // resolves to `AsyncGenerator<Order>` (or `Promise<AsyncGenerator<Order>>`),
+    // whose contract lives in the yield position. Unwrap it to the yield type so
+    // both forms reduce to `Order` before structural expansion / rule matching.
+    const awaitedType = this.unwrapAsyncIterableType(
+      this.unwrapPromiseType(returnType)
+    );
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
@@ -852,6 +876,26 @@ export class TypeInferrer {
     if (symbolName === 'Promise') {
       const args = type.getTypeArguments();
       if (args.length === 1) {
+        return args[0];
+      }
+    }
+    return type;
+  }
+
+  /**
+   * `AsyncGenerator<T, …>` / `AsyncIterableIterator<T>` / `AsyncIterator<T>` /
+   * `Generator<T, …>` / `IterableIterator<T>` → `T` (the yield type) at the type
+   * level; any other type passes through. A GraphQL subscription resolver written
+   * as `async function* x(): AsyncGenerator<Order>` carries its contract in the
+   * yield position, so the iterator wrapper must be peeled the same way Promise is
+   * before structural expansion — otherwise the response contract resolves to the
+   * library `AsyncGenerator<…>` machinery instead of the bare `Order`.
+   */
+  private unwrapAsyncIterableType(type: Type): Type {
+    const symbolName = (type.getSymbol() || type.getAliasSymbol())?.getName();
+    if (symbolName && ASYNC_ITERABLE_SYMBOLS.has(symbolName)) {
+      const args = type.getTypeArguments();
+      if (args.length >= 1) {
         return args[0];
       }
     }

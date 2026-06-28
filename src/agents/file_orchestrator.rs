@@ -2405,6 +2405,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 
@@ -2456,6 +2457,7 @@ mod tests {
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
+                graphql_operations: vec![],
             },
         );
 
@@ -2514,6 +2516,7 @@ mod tests {
                         type_import_source: None,
                     },
                 ],
+                graphql_operations: vec![],
             },
         );
 
@@ -2552,6 +2555,7 @@ mod tests {
                     primary_type_symbol: None,
                     type_import_source: None,
                 }],
+                graphql_operations: vec![],
             },
         );
 
@@ -2610,6 +2614,7 @@ mod tests {
                         type_import_source: None,
                     },
                 ],
+                graphql_operations: vec![],
             },
         );
 
@@ -2662,6 +2667,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 
@@ -2728,6 +2734,7 @@ mod tests {
                 mounts: vec![],
                 endpoints: vec![endpoint],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
         let graph = orchestrator.build_mount_graph(&file_results);
@@ -2924,6 +2931,7 @@ mod tests {
                 primary_type_symbol: Some("LocalType".to_string()),
                 type_import_source: None,
             }],
+            graphql_operations: vec![],
         };
 
         let mut imported_symbols = HashMap::new();
@@ -2993,6 +3001,7 @@ mod tests {
                 }],
                 endpoints: vec![],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 
@@ -3040,6 +3049,7 @@ mod tests {
                     },
                 ],
                 data_calls: vec![],
+                graphql_operations: vec![],
             },
         );
 
