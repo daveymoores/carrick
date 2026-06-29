@@ -2541,6 +2541,7 @@ mod tests {
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2593,6 +2594,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2652,6 +2654,7 @@ mod tests {
                     },
                 ],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2691,6 +2694,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2750,6 +2754,7 @@ mod tests {
                     },
                 ],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2803,6 +2808,7 @@ mod tests {
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2870,6 +2876,7 @@ mod tests {
                 endpoints: vec![endpoint],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
         let graph = orchestrator.build_mount_graph(&file_results);
@@ -3067,6 +3074,7 @@ mod tests {
                 type_import_source: None,
             }],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
 
         let mut imported_symbols = HashMap::new();
@@ -3137,6 +3145,7 @@ mod tests {
                 endpoints: vec![],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -3185,6 +3194,7 @@ mod tests {
                 ],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 

@@ -335,6 +335,7 @@ fn project_key(key: &OperationKey) -> (String, Option<String>, Option<String>) {
         }
         OperationKey::Graphql { field, .. } => ("graphql".to_string(), None, Some(field.clone())),
         OperationKey::Socket { event, .. } => ("socket".to_string(), None, Some(event.clone())),
+        OperationKey::Pubsub { topic } => ("pubsub".to_string(), None, Some(topic.clone())),
     }
 }
 

@@ -436,6 +436,43 @@ impl AgentSchemas {
                         },
                         "required": ["kind", "field", "resolver_function", "resolver_line"]
                     }
+                },
+                "pubsub_operations": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "topic": {
+                                "type": "STRING",
+                                "description": "The exact topic or channel name the operation targets, as a literal string (e.g., 'metrics.page_view'). Copy it verbatim from the source; skip operations whose topic is a runtime variable with no literal value."
+                            },
+                            "role": {
+                                "type": "STRING",
+                                "enum": ["subscriber", "publisher"],
+                                "description": "subscriber when the code registers a handler that receives messages on the topic; publisher when the code sends a message to the topic."
+                            },
+                            "line_number": {
+                                "type": "INTEGER",
+                                "description": "Line number where the operation appears (read from the line-number prefix in the source code)."
+                            },
+                            "primary_type_symbol": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "The named type of the message payload as a bare identifier (e.g., 'PageViewEvent'). Unwrap arrays and promise wrappers down to the core identifier. Null for untyped or inline-object payloads."
+                            },
+                            "type_import_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/events'), or null if it is declared in the same file. Null whenever `primary_type_symbol` is null."
+                            },
+                            "broker": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Diagnostic only: the pub/sub library or transport the call uses if evident (e.g., 'redis'), or null. Not part of the operation's identity."
+                            }
+                        },
+                        "required": ["topic", "role", "line_number"]
+                    }
                 }
             },
             "required": ["mounts", "endpoints", "data_calls"]
@@ -771,6 +808,53 @@ mod tests {
         // graphql_operations is optional at the top level: a model may omit it.
         let top_required = schema["required"].as_array().unwrap();
         assert!(!top_required.iter().any(|v| v == "graphql_operations"));
+    }
+
+    #[test]
+    fn pubsub_operations_schema_enum_matches_serde_wire_values() {
+        // The pubsub_operations `role` enum and PubsubRole's serde output must
+        // stay in lockstep, or a value the schema advertises but the enum can't
+        // parse is silently lost when the file-analyzer response is deserialized
+        // (mirrors graphql_operations / call_kind / emission_style).
+        use crate::operation::PubsubRole;
+
+        let schema = AgentSchemas::file_analysis_schema();
+        let schema_values: Vec<String> =
+            schema["properties"]["pubsub_operations"]["items"]["properties"]["role"]["enum"]
+                .as_array()
+                .expect("pubsub_operations role enum must exist")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+
+        let serde_values: Vec<String> = [PubsubRole::Subscriber, PubsubRole::Publisher]
+            .iter()
+            .map(|r| {
+                serde_json::to_value(r)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(schema_values, serde_values);
+
+        // The three locating fields are always present; the type slots and the
+        // diagnostic broker stay optional/nullable.
+        let required = schema["properties"]["pubsub_operations"]["items"]["required"]
+            .as_array()
+            .expect("pubsub_operations item required array must exist");
+        for field in ["topic", "role", "line_number"] {
+            assert!(
+                required.iter().any(|v| v == field),
+                "pubsub_operations item required must contain {field}"
+            );
+        }
+
+        // pubsub_operations is optional at the top level: a model may omit it.
+        let top_required = schema["required"].as_array().unwrap();
+        assert!(!top_required.iter().any(|v| v == "pubsub_operations"));
     }
 
     #[test]

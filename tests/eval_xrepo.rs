@@ -2023,6 +2023,10 @@ mod scoring_tests {
         // Pub/sub keys are 2-segment (`pubsub|<topic>`) → the splitn(3,'|')
         // never matches the 3-tuple HTTP arm, so they fall through unchanged.
         assert_eq!(norm_key("pubsub|order.placed"), "pubsub|order.placed");
+        assert_eq!(
+            norm_key("pubsub|metrics.page_view"),
+            "pubsub|metrics.page_view"
+        );
         assert_eq!(norm_key("not-a-key"), "not-a-key");
     }
 
