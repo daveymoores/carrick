@@ -43,6 +43,7 @@ jobs:
             tests/fixtures/fastify-api/package.json
             tests/fixtures/koa-api/package.json
             src/sidecar/package-lock.json
+            ts_check/package-lock.json
 
       - name: Install test dependencies
         run: |
@@ -90,6 +91,9 @@ jobs:
 
       - name: Run sidecar unit tests
         run: cd src/sidecar && npm test
+
+      - name: Run ts_check unit tests
+        run: cd ts_check && npm ci && npm test
 
       - name: Run library tests
         run: cargo test --lib --verbose
