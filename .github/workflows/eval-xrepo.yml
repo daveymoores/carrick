@@ -25,6 +25,10 @@ on:
         description: "N repeated cross-repo scans (variance / mean±sd sample size)"
         required: false
         default: "5"
+      corpus:
+        description: "corpus fixture dir name under tests/fixtures/"
+        required: false
+        default: "xrepo-corpus-1"
 
 permissions:
   id-token: write
@@ -61,10 +65,8 @@ jobs:
 
       - name: Install corpus dependencies
         run: |
-          for repo in orders-monorepo payments-svc web-frontend; do
-            if [ -f "tests/fixtures/xrepo-corpus-1/$repo/package.json" ]; then
-              (cd "tests/fixtures/xrepo-corpus-1/$repo" && npm install)
-            fi
+          for dir in tests/fixtures/${{ inputs.corpus }}/*/; do
+            if [ -f "${dir}package.json" ]; then (cd "$dir" && npm install); fi
           done
 
       - name: Build scanner (release)
@@ -77,6 +79,7 @@ jobs:
           CARRICK_API_ENDPOINT: https://api.carrick.tools
           CARRICK_EVAL_LIVE: "1"
           CARRICK_EVAL_RUNS: ${{ inputs.runs }}
+          CARRICK_EVAL_CORPUS: ${{ inputs.corpus }}
         run: |
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture

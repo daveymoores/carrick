@@ -65,7 +65,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CORPUS: &str = "xrepo-corpus-1";
+/// The corpus fixture directory name. Defaults to `xrepo-corpus-1` so the
+/// original corpus runs unchanged; set `CARRICK_EVAL_CORPUS` to point the
+/// harness at a different authored corpus under `tests/fixtures/`.
+fn corpus_name() -> String {
+    std::env::var("CARRICK_EVAL_CORPUS").unwrap_or_else(|_| "xrepo-corpus-1".to_string())
+}
 const DEFAULT_RUNS: usize = 5;
 
 // ---------------------------------------------------------------------------
@@ -1208,7 +1213,7 @@ fn manifest_dir() -> PathBuf {
 }
 
 fn corpus_dir() -> PathBuf {
-    manifest_dir().join("tests/fixtures").join(CORPUS)
+    manifest_dir().join("tests/fixtures").join(corpus_name())
 }
 
 /// The corpus repos: every immediate subdirectory of the corpus dir that holds a
@@ -1429,11 +1434,10 @@ fn load_expected_output(corpus: &Path) -> ExpectedOutput {
 /// the offline plumbing-smoke path (heuristic LLM, no OIDC) vs the live path.
 fn run_two_phase(bin: &Path, corpus: &Path, mock: bool) -> EvalProjection {
     let repos = discover_repos(corpus);
-    assert_eq!(
-        repos.len(),
-        3,
-        "expected the 3 top-level corpus repos, found {} in {} — discover_repos must \
-         NOT descend into orders-monorepo/packages/*",
+    assert!(
+        !repos.is_empty(),
+        "expected at least one top-level corpus repo, found {} in {} — discover_repos must \
+         NOT descend into nested workspace packages (e.g. orders-monorepo/packages/*)",
         repos.len(),
         corpus.display()
     );
@@ -1530,7 +1534,7 @@ fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_
     }
     let overall = dim_means.iter().sum::<f64>() / dim_means.len() as f64;
 
-    println!("\n{CORPUS} — tier={tier} (n={n}/{runs_n})");
+    println!("\n{} — tier={tier} (n={n}/{runs_n})", corpus_name());
     println!(
         "  OVERALL correctness   {:.0}%  (unweighted mean of {} dims; decoy_leak excluded)",
         overall * 100.0,
@@ -1594,7 +1598,10 @@ fn xrepo_live_scorer() {
     let repo_expected = load_repo_expected(&repos);
     let expected_output = load_expected_output(&corpus);
 
-    println!("\n=== Cross-repo live scorer ({CORPUS}, N={runs_n}) — full S4 vector ===");
+    println!(
+        "\n=== Cross-repo live scorer ({}, N={runs_n}) — full S4 vector ===",
+        corpus_name()
+    );
     println!("(report-only monitor; the only fail-loud is the §7 compat-absence guard)\n");
 
     let mut scores: Vec<RunScore> = Vec::new();
@@ -1805,7 +1812,7 @@ fn xrepo_live_scorer() {
         scanner_version: env!("CARGO_PKG_VERSION").to_string(),
         carrick_sha: std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_string()),
         github_run_id: std::env::var("GITHUB_RUN_ID").ok(),
-        fixture: CORPUS.to_string(),
+        fixture: corpus_name(),
         runs_requested: runs_n,
         runs_effective: n,
         model_id: None,
@@ -1832,7 +1839,7 @@ fn xrepo_live_scorer() {
                 .to_string(),
         ),
         tier: Some("xrepo".to_string()),
-        corpus: Some(CORPUS.to_string()),
+        corpus: Some(corpus_name()),
         match_precision_mean: Some(m_p),
         match_precision_sd: Some(m_p_sd),
         match_recall_mean: Some(m_r),
@@ -2419,6 +2426,10 @@ mod scoring_tests {
 
     #[test]
     fn perfect_synthetic_projection_against_real_corpus() {
+        // Pins corpus-1's exact 3-repo structure; skip for any other corpus.
+        if corpus_name() != "xrepo-corpus-1" {
+            return;
+        }
         let corpus = corpus_dir();
         let repos = discover_repos(&corpus);
         assert_eq!(repos.len(), 3, "the 3 top-level corpus repos");
@@ -2526,7 +2537,11 @@ mod scoring_tests {
     #[test]
     fn corpus_has_the_expected_protocol_and_edge_shape() {
         // Pins the corpus invariants the scorer relies on, so a label edit that
-        // drifts the shape fails here (answer-key-drift discipline).
+        // drifts the shape fails here (answer-key-drift discipline). These edge
+        // counts are corpus-1 specific; skip for any other corpus.
+        if corpus_name() != "xrepo-corpus-1" {
+            return;
+        }
         let corpus = corpus_dir();
         let repos = discover_repos(&corpus);
         let repo_expected = load_repo_expected(&repos);
@@ -2638,7 +2653,7 @@ mod scoring_tests {
             scanner_version: "0.1.40".into(),
             carrick_sha: "local".into(),
             github_run_id: None,
-            fixture: CORPUS.into(),
+            fixture: corpus_name(),
             runs_requested: 5,
             runs_effective: 5,
             model_id: None,
@@ -2661,7 +2676,7 @@ mod scoring_tests {
             call_pass_pow_k: 0.0,
             note: Some("S4 full vector".into()),
             tier: Some("xrepo".into()),
-            corpus: Some(CORPUS.into()),
+            corpus: Some(corpus_name()),
             match_precision_mean: Some(0.6),
             match_precision_sd: Some(0.2),
             match_recall_mean: Some(0.5),
@@ -2684,7 +2699,7 @@ mod scoring_tests {
         let line = serde_json::to_string(&rec).unwrap();
         let back: EvalRunRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back.tier.as_deref(), Some("xrepo"));
-        assert_eq!(back.corpus.as_deref(), Some(CORPUS));
+        assert_eq!(back.corpus.as_deref(), Some(corpus_name().as_str()));
         assert_eq!(back.match_f1_mean, Some(0.55));
         // The full vector now serializes (it is no longer None/omitted).
         assert_eq!(back.compat_verdict_accuracy_mean, Some(1.0));
