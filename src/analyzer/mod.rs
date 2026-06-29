@@ -228,12 +228,15 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
 
 /// Parse a ts_check compat `endpoint` string back into the verdict-join
 /// `(pseudo-method, identity)` pair. ts_check builds the string as
-/// `"<METHOD> <path> (<request|response>)"` for HTTP and
-/// `"SOCKET <DIRECTION>|<event> (response)"` for socket, so the same split —
-/// leading token off the front, trailing `" (type_kind)"` off the back — yields
-/// `("METHOD", "path")` or `("SOCKET", "DIRECTION|event")`, matching what
-/// `parse_producer_key` recovers from the edge's `producer_key`. Returns `None`
-/// for an unrecognized shape.
+/// `"<METHOD> <path> (<request|response>)"` for HTTP,
+/// `"SOCKET <DIRECTION>|<event> (response)"` for socket, and
+/// `"PUBSUB <topic> (response)"` for pub/sub, so the same split — leading token
+/// off the front, trailing `" (type_kind)"` off the back — yields
+/// `("METHOD", "path")`, `("SOCKET", "DIRECTION|event")`, or
+/// `("PUBSUB", "topic")`, matching what `parse_producer_key` recovers from the
+/// edge's `producer_key`. The pub/sub topic carries no path params (and no
+/// nested `|`), so the generic split needs no protocol-specific arm. Returns
+/// `None` for an unrecognized shape.
 fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
     let (method, rest) = endpoint.split_once(' ')?;
     // Drop the trailing " (request)" / " (response)" annotation if present.
@@ -248,7 +251,8 @@ fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
 }
 
 /// Recover the verdict-join `(pseudo-method, identity)` from a canonical
-/// producer key, for the protocols ts_check type-checks (HTTP + socket + graphql):
+/// producer key, for the protocols ts_check type-checks
+/// (HTTP + socket + graphql + pub/sub):
 ///
 /// - HTTP (`"http|METHOD|path"`) → `("METHOD", "path")`, the HTTP join key.
 /// - Socket (`"socket|DIRECTION|event"`) → `("SOCKET", "DIRECTION|event")`. The
@@ -261,6 +265,14 @@ fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
 ///   joins its verdict exactly like socket. The `KIND` (`query`/`mutation`/
 ///   `subscription`) stays lowercase here AND in the ts_check label, so the two
 ///   sides agree without any case folding.
+/// - Pub/Sub (`"pubsub|topic"`) → `("PUBSUB", "topic")`. Unlike the other three
+///   this canonical is 2-segment (topic-only; the broker is not part of
+///   identity), so the third `splitn(3, '|')` field is `None`. The matching
+///   ts_check endpoint label is `"PUBSUB topic (response)"`, which
+///   `parse_compat_endpoint` reduces to the SAME pair, so a pub/sub edge joins
+///   its verdict exactly like socket. (A topic literally containing `|` would
+///   mis-split, but both sides split identically so the exact-topic match still
+///   holds; topics with `|` are pathological and left unguarded.)
 ///
 /// Returns `None` for any other protocol: ts_check produced no verdict for it,
 /// so its edge stays `None` rather than fabricating one.
@@ -277,6 +289,9 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
         }
         (Some("graphql"), Some(kind), Some(field)) if !kind.is_empty() && !field.is_empty() => {
             Some(("GRAPHQL".to_string(), format!("{}|{}", kind, field)))
+        }
+        (Some("pubsub"), Some(topic), None) if !topic.is_empty() => {
+            Some(("PUBSUB".to_string(), topic.to_string()))
         }
         _ => None,
     }
@@ -3540,6 +3555,85 @@ mod tests {
         assert_eq!(
             matches[1].mismatch_reason.as_deref(),
             Some("note?: optional producer field is not assignable to required consumer field"),
+        );
+    }
+
+    /// Pub/sub canonical keys are 2-segment (`pubsub|<topic>`, broker excluded
+    /// from identity), so the third `splitn(3, '|')` field is `None`.
+    /// `parse_producer_key` must still recover `("PUBSUB", "<topic>")`, and a
+    /// round-trip through the ts_check endpoint label (`PUBSUB <topic>
+    /// (response)`) must yield the SAME pair so a pub/sub verdict joins its edge.
+    /// A topic carries no path params, so `normalize_compat_path` leaves it
+    /// unchanged — guarding a future param-collapse refactor from silently
+    /// breaking the pub/sub join.
+    #[test]
+    fn parse_producer_key_recovers_pubsub_pair() {
+        assert_eq!(
+            parse_producer_key("pubsub|order.placed"),
+            Some(("PUBSUB".to_string(), "order.placed".to_string())),
+        );
+        // Round-trip through the ts_check endpoint label yields the same pair.
+        assert_eq!(
+            parse_compat_endpoint("PUBSUB order.placed (response)"),
+            parse_producer_key("pubsub|order.placed"),
+        );
+        // Empty topic → no join key, edge stays None.
+        assert_eq!(parse_producer_key("pubsub|"), None);
+        // A topic with dots/no slashes is unaffected by the HTTP path-param
+        // collapse, so the two sides of the join still agree.
+        assert_eq!(normalize_compat_path("order.placed"), "order.placed");
+    }
+
+    /// The pub/sub cross-repo join. A `pubsub|<topic>` edge is type-checked by
+    /// ts_check on the Socket.IO inverted direction (subscriber=producer accepts
+    /// what publisher=consumer sends); ts_check emits its verdict under the
+    /// endpoint label `"PUBSUB <topic> (response)"`. `parse_producer_key`
+    /// recovers `("PUBSUB", "<topic>")` from the edge and `parse_compat_endpoint`
+    /// recovers the SAME pair from the label, so the verdict lands on the
+    /// pub/sub edge — `Some(true)` when compatible, `Some(false)` + reason on a
+    /// reported mismatch (the incompatible Kafka `order.placed` edge).
+    #[test]
+    fn apply_compat_verdicts_joins_pubsub_edge() {
+        let result = serde_json::json!({
+            "mismatches": [{
+                "endpoint": "PUBSUB order.placed (response)",
+                "consumerLocation": "orders-svc/src/publisher.ts:42",
+                "error": "Type 'WideOrder' is not assignable to type 'StrictOrder'"
+            }],
+            "unknownPairs": [],
+            "totalChecked": 2,
+            "compatibleCount": 1
+        });
+
+        let mut matches = vec![
+            edge_at(
+                "pubsub|metrics.page_view",
+                "analytics-svc",
+                "analytics-svc/src/track.ts:10",
+            ),
+            edge_at(
+                "pubsub|order.placed",
+                "orders-svc",
+                "orders-svc/src/publisher.ts:42",
+            ),
+        ];
+        apply_compat_verdicts(&result, &mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible,
+            Some(true),
+            "the compatible pub/sub edge (absent from the mismatch list) reads Some(true)"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(false),
+            "the pub/sub edge in the mismatch list reads Some(false)"
+        );
+        assert_eq!(
+            matches[1].mismatch_reason.as_deref(),
+            Some("Type 'WideOrder' is not assignable to type 'StrictOrder'"),
         );
     }
 

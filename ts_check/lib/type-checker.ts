@@ -373,8 +373,20 @@ export class TypeCompatibilityChecker {
     // incompatible, the opposite of the truth. (See xrepo-corpus-1 README,
     // "Socket producer/consumer direction".) The same `isAssignableTo` relation
     // and the same resolved Type objects are used either way.
+    //
+    // Pub/Sub: shares the SAME inverted direction as socket. Carrick keys a
+    // *subscriber* (the handler registration) as the producer (endpoint) and a
+    // *publisher* (the send) as the consumer (call). The bytes flow publisher →
+    // subscriber, so the *publisher's* payload (manifest consumer) must satisfy
+    // what the *subscriber* accepts (manifest producer) — `consumer ⊑ producer`.
+    // A subscriber declaring a WIDER accepted payload than the publisher sends is
+    // compatible, identical to socket. Pub/sub payload types are already DECODED
+    // application types (the LLM emits `Order`, not the wire `Buffer`/`string`),
+    // so there is NO envelope/codec unwrap — pub/sub stays on the non-graphql
+    // `producerComparand` branch below.
     const socket = producer.protocol === "socket";
     const graphql = producer.protocol === "graphql";
+    const pubsub = producer.protocol === "pubsub";
 
     // For GraphQL the producer's resolved type is the resolver's return ENVELOPE
     // (e.g. `{ data: Order; errors: string[] }`), kept verbatim for the
@@ -388,8 +400,12 @@ export class TypeCompatibilityChecker {
       ? this.unwrapGraphqlPayload(producerType, endpoint)
       : producerType;
 
-    const sentType = socket ? consumerType : producerComparand;
-    const expectedType = socket ? producerComparand : consumerType;
+    // Socket AND pub/sub share the inverted direction: the consumer (emitter /
+    // publisher) sends, the producer (listener / subscriber) accepts. Pub/sub
+    // does NOT unwrap an envelope (its payload type is already decoded), so it
+    // rides the non-graphql `producerComparand` above.
+    const sentType = (socket || pubsub) ? consumerType : producerComparand;
+    const expectedType = (socket || pubsub) ? producerComparand : consumerType;
 
     // Re-run the `any`/`unknown` → unverifiable guard on the COMPARANDS, not just
     // the raw `producerType`/`consumerType` checked at the top. The GraphQL
@@ -400,8 +416,9 @@ export class TypeCompatibilityChecker {
     // would hit `isAssignableTo` with a top-ish side and read compatible: the
     // exact `graphql|subscription|orderUpdated` false-positive. The raw-type
     // guard never sees the unwrapped payload, so the comparands must be guarded
-    // again here, before `isAssignableTo`. (For HTTP/socket the comparands equal
-    // the raw types, so this is a redundant no-op that preserves their behavior.)
+    // again here, before `isAssignableTo`. (For HTTP/socket/pubsub the comparands
+    // equal the raw types, so this is a redundant no-op that preserves their
+    // behavior.)
     if (
       sentType.isAny() ||
       expectedType.isAny() ||
