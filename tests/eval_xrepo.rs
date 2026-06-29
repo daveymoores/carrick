@@ -67,9 +67,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The corpus fixture directory name. Defaults to `xrepo-corpus-1` so the
 /// original corpus runs unchanged; set `CARRICK_EVAL_CORPUS` to point the
-/// harness at a different authored corpus under `tests/fixtures/`.
+/// harness at a different authored corpus under `tests/fixtures/`. The value is
+/// run-wide config, so it is read from the environment exactly once per process
+/// (a later mutation — e.g. a parallel test setting the var — cannot change it).
 fn corpus_name() -> String {
-    std::env::var("CARRICK_EVAL_CORPUS").unwrap_or_else(|_| "xrepo-corpus-1".to_string())
+    static CORPUS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CORPUS
+        .get_or_init(|| {
+            std::env::var("CARRICK_EVAL_CORPUS").unwrap_or_else(|_| "xrepo-corpus-1".to_string())
+        })
+        .clone()
 }
 const DEFAULT_RUNS: usize = 5;
 

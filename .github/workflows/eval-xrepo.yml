@@ -64,8 +64,16 @@ jobs:
         run: cd ts_check && npm ci
 
       - name: Install corpus dependencies
+        env:
+          CORPUS_INPUT: ${{ inputs.corpus }}
         run: |
-          for dir in tests/fixtures/${{ inputs.corpus }}/*/; do
+          # Validate before the name touches a shell glob: only the fixture-dir
+          # basename charset — no path separators, `..`, or glob metacharacters.
+          if ! printf '%s' "$CORPUS_INPUT" | grep -qE '^[A-Za-z0-9._-]+$'; then
+            echo "::error::CARRICK_EVAL_CORPUS '$CORPUS_INPUT' must match ^[A-Za-z0-9._-]+$"
+            exit 1
+          fi
+          for dir in tests/fixtures/"$CORPUS_INPUT"/*/; do
             if [ -f "${dir}package.json" ]; then (cd "$dir" && npm install); fi
           done
 
