@@ -346,7 +346,7 @@ export class ManifestMatcher {
       // leave a trace rather than throwing.
       manifest.entries = this.retainCheckableEntries(manifest.entries, absolutePath);
 
-      // Validate the surviving (HTTP + socket) entries.
+      // Validate the surviving (HTTP + socket + graphql) entries.
       for (const entry of manifest.entries) {
         this.validateEntry(entry);
       }

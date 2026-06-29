@@ -3069,6 +3069,54 @@ mod tests {
         );
     }
 
+    /// The `graphql|subscription|orderUpdated` false-positive at the verdict-join
+    /// layer. Its consumer alias dangles to `unknown` in the bundle, so ts_check
+    /// reports the pair in `unknownPairs` with the graphql endpoint label
+    /// `"GRAPHQL subscription|orderUpdated (response)"`. That must join the edge
+    /// whose `producer_key` is `"graphql|subscription|orderUpdated"` and pin the
+    /// verdict to `None` — NOT the optimistic `Some(true)` the edge would default
+    /// to if the unresolved consumer had been dropped from the manifest (so the
+    /// pair never reached ts_check at all). This is the join the live eval's
+    /// resolved graphql edges never exercise (they are compatible by default).
+    #[test]
+    fn apply_compat_verdicts_graphql_unverifiable_edge_none() {
+        let result = serde_json::json!({
+            "mismatches": [],
+            "unknownPairs": [{
+                "endpoint": "GRAPHQL subscription|orderUpdated (response)",
+                "consumerLocation": "web-frontend/lib/graphql.ts:84",
+                "reason": "consumer type resolves to unknown (type missing from bundled types?)"
+            }],
+            "totalChecked": 1,
+            "compatibleCount": 0
+        });
+        let mut matches = vec![
+            edge_at(
+                "graphql|subscription|orderUpdated",
+                "web-frontend",
+                "web-frontend/lib/graphql.ts:84",
+            ),
+            edge_at(
+                "graphql|query|order",
+                "web-frontend",
+                "web-frontend/lib/graphql.ts:76",
+            ),
+        ];
+        apply_compat_verdicts(&result, &mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "an unresolved graphql consumer makes the edge unverifiable (None), \
+             never a fake Some(true) from being dropped + absent"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(true),
+            "the resolved graphql edge, absent from both lists, stays compatible"
+        );
+    }
+
     /// THE live compat=1/6 regression. ts_check builds its `endpoint` from the
     /// normalized manifest (`/orders/:param`), while the cross-repo edge's
     /// `producer_key` keeps the SOURCE param name (`/orders/:id`). The verdict
