@@ -1137,6 +1137,90 @@ impl FileOrchestrator {
         requests
     }
 
+    /// Build `SymbolRequest`s for pub/sub decoded-payload anchors (#corpus-2
+    /// resolution dim).
+    ///
+    /// Sibling of `collect_socket_type_requests`, but reads the LLM-sourced
+    /// `pubsub_operations` out of `file_results` rather than the deterministic
+    /// `ProtocolExtractions` struct — pub/sub ops never go through the
+    /// deterministic protocol extractors, so this walks the exact same source
+    /// `append_pubsub_manifest_entries` walks. Each op carrying a
+    /// `primary_type_symbol` routes that decoded-payload type through the *same*
+    /// sidecar bundle path the Socket.IO and HTTP explicit-symbol cases use, so
+    /// the sidecar expands it into the entry's `resolved_type`. Subscribers are
+    /// producers, publishers are consumers; each resolves to the Response-kind
+    /// alias.
+    ///
+    /// The alias MUST be `build_manifest_type_alias(&key, role, Response)` —
+    /// byte-identical to the alias `add_protocol_manifest_entry` stamps on the
+    /// manifest entry in `append_pubsub_manifest_entries` (same `OperationKey`,
+    /// same role mapping, same kind) — or the resolved `.d.ts` never joins back
+    /// and the entry stays `Unknown`. This contract is guarded by a unit test.
+    ///
+    /// Only ops whose extractor captured a `primary_type_symbol` produce a
+    /// request; a `None` symbol (untyped or inline-object payload) emits nothing,
+    /// exactly like socket. A roleless op anchors nothing and is skipped (it was
+    /// already dropped from `cloud_data` and has no manifest entry to join to).
+    /// An absent `type_import_source` means the symbol is declared in the op's
+    /// own file, so it resolves against that file's absolute path.
+    pub fn collect_pubsub_type_requests(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        repo_path: &str,
+    ) -> Vec<SymbolRequest> {
+        use crate::operation::{OperationKey, PubsubRole};
+
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let mut requests: Vec<SymbolRequest> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (path, result) in file_results {
+            for op in &result.pubsub_operations {
+                // Mirror the manifest-side role mapping in
+                // `append_pubsub_manifest_entries`: subscriber = producer,
+                // publisher = consumer; a roleless op anchors nothing.
+                let role = match op.role {
+                    Some(PubsubRole::Subscriber) => ManifestRole::Producer,
+                    Some(PubsubRole::Publisher) => ManifestRole::Consumer,
+                    None => continue,
+                };
+                let Some(symbol) = op.primary_type_symbol.as_ref() else {
+                    continue;
+                };
+                let file_abs = Self::to_absolute_path(path, &repo_root_absolute);
+                let source_file = match op.type_import_source.as_ref() {
+                    Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                    // No import → same-file declaration: resolve against the file.
+                    None => file_abs,
+                };
+                let key = OperationKey::pubsub(op.topic.clone());
+                let alias = build_manifest_type_alias(&key, role, ManifestTypeKind::Response);
+                let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
+                if seen.insert(dedup_key) {
+                    requests.push(SymbolRequest {
+                        symbol_name: symbol.clone(),
+                        source_file,
+                        alias: Some(alias),
+                    });
+                }
+            }
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} pub/sub payload type requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Build `SymbolRequest`s for GraphQL consumer result-type anchors (#248
     /// consumer side).
     ///

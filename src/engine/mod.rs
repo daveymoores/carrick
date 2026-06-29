@@ -1025,6 +1025,12 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator
                     .collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
             );
+            // Pub/sub ops are LLM-sourced in `merged_results`, not in the
+            // deterministic `protocol_extractions`, so their payload anchors
+            // bundle through the same path (#corpus-2 resolution dim).
+            protocol_requests.extend(
+                file_orchestrator.collect_pubsub_type_requests(&merged_results, repo_path),
+            );
 
             // GraphQL producers take the infer path, not the bundle path: their
             // response contract is the resolver's expanded RETURN type, so they
@@ -2393,6 +2399,13 @@ async fn analyze_current_repo(
         file_orchestrator.collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
     protocol_requests.extend(
         file_orchestrator.collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
+    );
+    // Pub/sub ops are LLM-sourced in `analysis_result.file_results`, not in the
+    // deterministic `protocol_extractions`, so their payload anchors bundle
+    // through the same path (#corpus-2 resolution dim).
+    protocol_requests.extend(
+        file_orchestrator
+            .collect_pubsub_type_requests(&analysis_result.file_results, repo_path),
     );
 
     // GraphQL producers take the infer path, not the bundle path: their response
@@ -4420,6 +4433,61 @@ mod tests {
         let expected = crate::type_manifest::build_manifest_type_alias(
             &emitter.key,
             ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+        );
+        assert_eq!(manifest_alias, expected);
+        assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// The same fragile alias contract for pub/sub (PR-6, corpus-2 resolution dim):
+    /// the SymbolRequest alias produced by `collect_pubsub_type_requests` MUST
+    /// byte-match the manifest entry's alias from `append_pubsub_manifest_entries`,
+    /// or the resolved payload `.d.ts` never joins back and the op stays
+    /// `Unknown` — silently. A subscriber is the producer side.
+    #[test]
+    fn pubsub_symbol_request_alias_matches_manifest_alias() {
+        use crate::operation::PubsubRole;
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "web-dashboard/lib/realtime.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "metrics.page_view",
+                    PubsubRole::Subscriber,
+                    Some("PageView"),
+                    Some("./types/metrics"),
+                )],
+                ..Default::default()
+            },
+        );
+
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(&mut entries, &file_results);
+        let manifest_alias = entries
+            .iter()
+            .find(|e| e.key.canonical() == "pubsub|metrics.page_view")
+            .map(|e| e.type_alias.clone())
+            .expect("pubsub manifest entry");
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let request = requests
+            .iter()
+            .find(|r| r.symbol_name == "PageView")
+            .expect("pubsub SymbolRequest");
+
+        assert_eq!(
+            request.alias.as_deref(),
+            Some(manifest_alias.as_str()),
+            "pubsub SymbolRequest.alias must byte-match the manifest entry's alias \
+             or the resolution enrich-join silently breaks"
+        );
+        // Independently confirm both equal the canonical builder output
+        // (subscriber = producer side).
+        let expected = crate::type_manifest::build_manifest_type_alias(
+            &OperationKey::pubsub("metrics.page_view"),
+            ManifestRole::Producer,
             ManifestTypeKind::Response,
         );
         assert_eq!(manifest_alias, expected);
