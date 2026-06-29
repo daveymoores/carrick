@@ -85,6 +85,41 @@ function graphqlEntry(
   };
 }
 
+/**
+ * Build a pub/sub `order.placed` manifest entry. Pub/sub entries carry
+ * `protocol: 'pubsub'` + `topic` instead of HTTP method/path (the broker is NOT
+ * part of identity). The subscriber is keyed as the producer and the publisher
+ * as the consumer, so pub/sub shares the socket inverted direction.
+ */
+function pubsubEntry(
+  typeAlias: string,
+  role: 'producer' | 'consumer',
+  filePath: string,
+  lineNumber: number,
+  topic: string = 'order.placed'
+): ManifestEntry {
+  return {
+    protocol: 'pubsub',
+    topic,
+    type_alias: typeAlias,
+    role,
+    type_kind: 'response',
+    file_path: filePath,
+    line_number: lineNumber,
+    is_explicit: true,
+    type_state: 'explicit',
+    evidence: {
+      file_path: filePath,
+      span_start: null,
+      span_end: null,
+      line_number: lineNumber,
+      infer_kind: 'response_body',
+      is_explicit: true,
+      type_state: 'explicit',
+    },
+  };
+}
+
 // ============================================================================
 // TypeCompatibilityChecker Tests
 // ============================================================================
@@ -867,6 +902,105 @@ describe('TypeCompatibilityChecker', () => {
       assert.strictEqual(result.compatiblePairs, 0, 'must NOT read compatible');
       assert.strictEqual(result.incompatiblePairs, 0);
       assert.strictEqual(result.unknownPairs.length, 1);
+    });
+
+    it('type-checks a pub/sub edge end-to-end as compatible (subscriber accepts a wider payload than the publisher sends)', async () => {
+      // The corpus-2 `order.placed` edge. Carrick keys the *subscriber*
+      // (orders-svc handler, `WideOrder`) as the producer and the *publisher*
+      // (checkout-svc send, `StrictOrder`) as the consumer. The bytes flow
+      // publisher → subscriber, so the publisher payload must satisfy what the
+      // subscriber accepts: `StrictOrder.status: "placed" | "paid"` ⊑
+      // `WideOrder.status: string` → compatible. (Reusing the HTTP direction
+      // would wrongly read this as incompatible; this is the socket inversion.)
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type WideOrder = { id: string; totalCents: number; status: string };
+        export type StrictOrder = { id: string; totalCents: number; status: "placed" | "paid" };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-svc',
+        commit_hash: 'abc',
+        entries: [pubsubEntry('WideOrder', 'producer', 'src/consumer.ts', 14)],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'checkout-svc',
+        commit_hash: 'def',
+        entries: [pubsubEntry('StrictOrder', 'consumer', 'src/publisher.ts', 22)],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.matchDetails?.length, 1, 'the pub/sub pair must match');
+      assert.strictEqual(
+        result.matchDetails?.[0].method,
+        'PUBSUB',
+        'the match is keyed on the PUBSUB pseudo-method'
+      );
+      assert.strictEqual(
+        result.matchDetails?.[0].path,
+        'order.placed',
+        'the match path is the bare topic'
+      );
+      assert.strictEqual(result.compatiblePairs, 1);
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+    });
+
+    it('reads a pub/sub edge whose published payload widens the subscriber type as incompatible (inverted-direction proof)', async () => {
+      // Direction proof (mirrors the socket widening test): if the publisher
+      // sends a *wider* type than the subscriber accepts, the edge is
+      // incompatible. Here the publisher sends `status: string` but the
+      // subscriber only accepts `"placed" | "paid"`, so `string` is NOT
+      // assignable → incompatible. This is the incompatible Kafka `order.placed`
+      // edge, and it fails if the assignability direction is not flipped for
+      // pub/sub (the same flip as socket).
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type StrictOrder = { id: string; status: "placed" | "paid" };
+        export type WideOrder = { id: string; status: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'subscriber-repo',
+        commit_hash: 'abc',
+        entries: [pubsubEntry('StrictOrder', 'producer', 'src/consumer.ts', 14)],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'publisher-repo',
+        commit_hash: 'def',
+        entries: [pubsubEntry('WideOrder', 'consumer', 'src/publisher.ts', 22)],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.incompatiblePairs, 1);
+      assert.strictEqual(result.compatiblePairs, 0);
+      assert.strictEqual(result.mismatches.length, 1);
+      assert.ok(
+        result.mismatches[0].endpoint.startsWith('PUBSUB '),
+        'the mismatch endpoint must carry the PUBSUB label'
+      );
     });
 
     it('reads a dangling consumer name as unverifiable but its structural shape as incompatible (#257)', async () => {

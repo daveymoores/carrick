@@ -57,14 +57,15 @@ export interface ManifestEntry {
   /**
    * Protocol tag carried by the operation key. ts_check runs the same
    * `TypeCompatibilityChecker` assignability for every protocol it understands:
-   * "http" (matched by method/path), "socket" (matched by event+direction), and
-   * "graphql" (matched by operation kind+field). Other protocols are checked by
-   * their own pipelines and are dropped here.
+   * "http" (matched by method/path), "socket" (matched by event+direction),
+   * "graphql" (matched by operation kind+field), and "pubsub" (matched by
+   * topic). Other protocols are checked by their own pipelines and are dropped
+   * here.
    */
-  protocol: 'http' | 'socket' | 'graphql';
-  /** HTTP method (GET, POST, …). Present on HTTP entries; absent on socket/graphql. */
+  protocol: 'http' | 'socket' | 'graphql' | 'pubsub';
+  /** HTTP method (GET, POST, …). Present on HTTP entries; absent on socket/graphql/pubsub. */
   method?: string;
-  /** API path (e.g., /api/users/:id). Present on HTTP entries; absent on socket/graphql. */
+  /** API path (e.g., /api/users/:id). Present on HTTP entries; absent on socket/graphql/pubsub. */
   path?: string;
   /** Socket event name (e.g. `payment:settled`). Present on socket entries only. */
   event?: string;
@@ -81,6 +82,12 @@ export interface ManifestEntry {
    * only; the field that, with `kind`, identifies the operation.
    */
   field?: string;
+  /**
+   * Pub/sub topic/channel/subject (e.g. `order.placed`). Present on pubsub
+   * entries only; the sole cross-repo identity (the broker is intentionally NOT
+   * part of identity). The Rust canonical key is `pubsub|<topic>`.
+   */
+  topic?: string;
   /** The type alias for this endpoint */
   type_alias: string;
   /** Whether this is a producer or consumer */
@@ -105,15 +112,17 @@ export interface ManifestEntry {
 export interface MatchResult {
   /**
    * The pseudo-method this match is keyed on: the HTTP method for HTTP edges,
-   * or the literal `SOCKET` for socket edges. Combined with `path` it forms the
-   * `endpoint` label the Rust verdict-join parses back (`parse_compat_endpoint`).
+   * the literal `SOCKET` for socket edges, `GRAPHQL` for graphql edges, or
+   * `PUBSUB` for pub/sub edges. Combined with `path` it forms the `endpoint`
+   * label the Rust verdict-join parses back (`parse_compat_endpoint`).
    */
   method: string;
   /**
-   * The identity this match is keyed on: the normalized API path for HTTP, or
-   * the socket canonical `<DIRECTION>|<event>` tail for socket edges (so the
-   * full label `SOCKET <DIRECTION>|<event>` parses back into the same join key
-   * as the Rust `socket|<DIRECTION>|<event>` producer key).
+   * The identity this match is keyed on: the normalized API path for HTTP, the
+   * socket canonical `<DIRECTION>|<event>` tail for socket edges, the graphql
+   * `<kind>|<field>` tail for graphql edges, or the bare `<topic>` for pub/sub
+   * edges (so the full label `PUBSUB <topic>` parses back into the same join key
+   * as the Rust `pubsub|<topic>` producer key).
    */
   path: string;
   /** The type kind being matched */
@@ -276,10 +285,34 @@ export function graphqlKey(entry: ManifestEntry): string | null {
   return `${entry.kind}|${entry.field}`;
 }
 
+// ============================================================================
+// Pub/Sub Identity
+// ============================================================================
+
+/** The pseudo-method pub/sub matches are keyed on, mirroring HTTP's method. */
+export const PUBSUB_PSEUDO_METHOD = 'PUBSUB';
+
+/**
+ * Stable identity for a pub/sub entry: the bare `<topic>` string (e.g.
+ * `order.placed`). Two pub/sub entries match iff this string is equal (the same
+ * topic), the exact-key semantics the Rust side uses — the broker is NOT part
+ * of identity. The Rust canonical key is `pubsub|<topic>` (2-segment, unlike
+ * the 3-segment socket/graphql keys); this is its `<topic>` tail, which becomes
+ * the `path` of the pub/sub `MatchResult` so the assembled label
+ * `PUBSUB <topic>` round-trips through the Rust verdict-join
+ * (`parse_compat_endpoint` / `parse_producer_key`).
+ */
+export function pubsubKey(entry: ManifestEntry): string | null {
+  if (entry.protocol !== 'pubsub' || !entry.topic) {
+    return null;
+  }
+  return entry.topic;
+}
+
 /**
  * Human label for an entry in orphan/diagnostic strings: `<METHOD> <path>` for
  * HTTP, `socket <DIRECTION>|<event>` for socket, `graphql <kind>|<field>` for
- * graphql.
+ * graphql, `pubsub <topic>` for pub/sub.
  */
 export function entryLabel(entry: ManifestEntry): string {
   if (entry.protocol === 'socket') {
@@ -287,6 +320,9 @@ export function entryLabel(entry: ManifestEntry): string {
   }
   if (entry.protocol === 'graphql') {
     return `graphql ${graphqlKey(entry) ?? entry.field ?? '<unknown>'}`;
+  }
+  if (entry.protocol === 'pubsub') {
+    return `pubsub ${pubsubKey(entry) ?? entry.topic ?? '<unknown>'}`;
   }
   return `${entry.method} ${entry.path}`;
 }
@@ -337,16 +373,16 @@ export class ManifestMatcher {
         throw new Error('Manifest missing required field: entries (must be an array)');
       }
 
-      // ts_check checks HTTP (by method/path), socket (by event+direction), and
-      // graphql (by kind+field) entries with the same assignability checker. Any
-      // other protocol is scored by its own pipeline and skipped here. The
-      // scanner already filters non-checkable entries out of the manifest files
-      // it writes (write_manifest_files), but a stray non-checkable entry must
-      // never crash the whole verdict run (#253), so we drop them defensively and
-      // leave a trace rather than throwing.
+      // ts_check checks HTTP (by method/path), socket (by event+direction),
+      // graphql (by kind+field), and pubsub (by topic) entries with the same
+      // assignability checker. Any other protocol is scored by its own pipeline
+      // and skipped here. The scanner already filters non-checkable entries out
+      // of the manifest files it writes (write_manifest_files), but a stray
+      // non-checkable entry must never crash the whole verdict run (#253), so we
+      // drop them defensively and leave a trace rather than throwing.
       manifest.entries = this.retainCheckableEntries(manifest.entries, absolutePath);
 
-      // Validate the surviving (HTTP + socket + graphql) entries.
+      // Validate the surviving (HTTP + socket + graphql + pubsub) entries.
       for (const entry of manifest.entries) {
         this.validateEntry(entry);
       }
@@ -362,8 +398,8 @@ export class ManifestMatcher {
 
   /**
    * Filter a manifest entry list down to the entries ts_check can check: HTTP
-   * (keyed by method/path), socket (keyed by event+direction), and graphql
-   * (keyed by kind+field).
+   * (keyed by method/path), socket (keyed by event+direction), graphql (keyed
+   * by kind+field), and pubsub (keyed by topic).
    *
    * Any other protocol — or a malformed entry missing the identity its protocol
    * needs — is skipped: it belongs to another pipeline or is junk. A single
@@ -385,7 +421,7 @@ export class ManifestMatcher {
     if (skipped > 0) {
       console.warn(
         `[manifest] Skipped ${skipped} non-checkable entr${skipped === 1 ? 'y' : 'ies'} in ${source} ` +
-          `(not HTTP/socket, or missing its identity fields; other protocols are checked by their own pipelines)`
+          `(not HTTP/socket/graphql/pubsub, or missing its identity fields; other protocols are checked by their own pipelines)`
       );
     }
 
@@ -395,10 +431,11 @@ export class ManifestMatcher {
   /**
    * Shape guard for raw, possibly-malformed manifest JSON. A checkable entry is
    * an HTTP key (`protocol: "http"` with non-empty `method`+`path`), a socket
-   * key (`protocol: "socket"` with non-empty `event`+`direction`), or a graphql
-   * key (`protocol: "graphql"` with non-empty `kind`+`field`). Everything else
-   * (junk) is filtered out here (#253). Full structural validation of the
-   * survivors is `validateEntry`'s job — a genuinely-malformed entry still throws.
+   * key (`protocol: "socket"` with non-empty `event`+`direction`), a graphql
+   * key (`protocol: "graphql"` with non-empty `kind`+`field`), or a pubsub key
+   * (`protocol: "pubsub"` with non-empty `topic`). Everything else (junk) is
+   * filtered out here (#253). Full structural validation of the survivors is
+   * `validateEntry`'s job — a genuinely-malformed entry still throws.
    */
   private isCheckableManifestEntry(entry: unknown): entry is ManifestEntry {
     if (typeof entry !== 'object' || entry === null) {
@@ -427,6 +464,9 @@ export class ManifestMatcher {
         typeof e.field === 'string' &&
         e.field.length > 0
       );
+    }
+    if (e.protocol === 'pubsub') {
+      return typeof e.topic === 'string' && e.topic.length > 0;
     }
     return false;
   }
@@ -465,10 +505,11 @@ export class ManifestMatcher {
    * Validate a manifest entry has all required fields.
    *
    * Callers must drop non-checkable entries via `retainCheckableEntries` first;
-   * by the time an entry reaches here it is expected to be HTTP or socket. An
-   * HTTP entry missing `method`/`path`, or a socket entry missing
-   * `event`/`direction`, is a genuine data bug and still throws (the #253
-   * guard — a malformed entry must fail loud, not silently pass).
+   * by the time an entry reaches here it is expected to be HTTP, socket,
+   * graphql, or pubsub. An HTTP entry missing `method`/`path`, a socket entry
+   * missing `event`/`direction`, a graphql entry missing `kind`/`field`, or a
+   * pubsub entry missing `topic`, is a genuine data bug and still throws (the
+   * #253 guard — a malformed entry must fail loud, not silently pass).
    */
   private validateEntry(entry: ManifestEntry): void {
     if (entry.protocol === 'http') {
@@ -494,8 +535,12 @@ export class ManifestMatcher {
       if (!entry.field) {
         throw new Error('ManifestEntry missing required field: field');
       }
+    } else if (entry.protocol === 'pubsub') {
+      if (!entry.topic) {
+        throw new Error('ManifestEntry missing required field: topic');
+      }
     } else {
-      throw new Error('ManifestEntry missing or invalid field: protocol (must be "http", "socket", or "graphql")');
+      throw new Error('ManifestEntry missing or invalid field: protocol (must be "http", "socket", "graphql", or "pubsub")');
     }
     if (!entry.type_alias) {
       throw new Error('ManifestEntry missing required field: type_alias');
@@ -800,6 +845,53 @@ export class ManifestMatcher {
         orphanedConsumers.push({
           entry: consumer,
           reason: `No producer found for graphql ${consumerKey} (${consumer.type_kind})`,
+        });
+      }
+    }
+
+    // Pub/Sub edges: exact-key match on the bare `<topic>`, the same identity the
+    // Rust canonical key carries (`pubsub|<topic>`; the broker is NOT part of
+    // identity). Like sockets there is no path/route to resolve, so a pub/sub
+    // consumer matches every producer carrying the same topic. The assembled
+    // label `PUBSUB <topic>` round-trips through the Rust verdict-join
+    // (`parse_compat_endpoint` / `parse_producer_key`). The producer/consumer
+    // type direction is handled in the type checker (`compareTypes`): pub/sub
+    // shares the Socket.IO INVERTED direction — the subscriber (producer,
+    // endpoint) accepts the payload the publisher (consumer, call) sends, so the
+    // emitted payload must satisfy what the subscriber accepts —
+    // `consumer ⊑ producer`. A subscriber declaring a wider accepted type than
+    // the publisher sends is compatible.
+    for (let ci = 0; ci < consumerEntries.length; ci++) {
+      const consumer = consumerEntries[ci];
+      if (consumer.protocol !== 'pubsub') continue;
+      const consumerKey = pubsubKey(consumer);
+      if (consumerKey === null) continue;
+
+      let matched = false;
+      for (let pi = 0; pi < producerEntries.length; pi++) {
+        const producer = producerEntries[pi];
+        if (producer.protocol !== 'pubsub') continue;
+        if (pubsubKey(producer) !== consumerKey) continue;
+        if (producer.type_kind !== consumer.type_kind) continue;
+
+        matches.push({
+          method: PUBSUB_PSEUDO_METHOD,
+          path: consumerKey,
+          type_kind: consumer.type_kind,
+          producer,
+          consumer,
+          match_score: 1.0,
+        });
+        matchedProducerIndices.add(pi);
+        matched = true;
+      }
+
+      if (matched) {
+        matchedConsumerIndices.add(ci);
+      } else {
+        orphanedConsumers.push({
+          entry: consumer,
+          reason: `No producer found for pubsub ${consumerKey} (${consumer.type_kind})`,
         });
       }
     }
