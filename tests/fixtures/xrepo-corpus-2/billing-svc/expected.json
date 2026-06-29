@@ -1,0 +1,52 @@
+{
+  "endpoints": [],
+  "calls": [
+    {
+      "method": "POST",
+      "path": "/ledger/append",
+      "host_contains": "LEDGER_URL",
+      "path_contains": "/ledger/append",
+      "import_source": "axios",
+      "primary_type_symbol": "LedgerEntry",
+      "resolved_type": "{ orderId: string; amountCents: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "pubsub_operations": [
+    {
+      "role": "consumer",
+      "service": "billing-svc",
+      "key": "pubsub|order.placed",
+      "topic": "order.placed",
+      "broker": "kafka",
+      "side": "publisher",
+      "source": "src/kafka/producer.ts",
+      "primary_type_symbol": "OrderPlaced",
+      "resolved_type": "{ id: string; total: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "consumer",
+      "service": "billing-svc",
+      "key": "pubsub|payment.captured",
+      "topic": "payment.captured",
+      "broker": "nats",
+      "side": "publisher",
+      "source": "src/nats/publisher.ts",
+      "primary_type_symbol": "PaymentCaptured",
+      "resolved_type": "{ orderId: string; amountCents: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": [
+    {
+      "kind": "call",
+      "method": "*",
+      "path": "pubsub|order.placed",
+      "evidence": "src/http/client.ts: kafka.admin().createTopics({ topics: [{ topic: 'order.placed' }] }) is topic MANAGEMENT (admin API), not a publish or subscribe. It must not be extracted as a pub/sub producer or consumer op despite naming the same topic literal."
+    }
+  ]
+}

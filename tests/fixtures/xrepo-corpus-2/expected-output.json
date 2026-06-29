@@ -1,0 +1,109 @@
+{
+  "matches": [
+    {
+      "producer_repo": "notifications-svc",
+      "producer_key": "pubsub|order.placed",
+      "consumer_repo": "orders-engine",
+      "consumer_key": "pubsub|order.placed",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "notifications-svc",
+      "producer_key": "pubsub|order.placed",
+      "consumer_repo": "billing-svc",
+      "consumer_key": "pubsub|order.placed",
+      "type_compatible": false,
+      "mismatch_reason": "publisher billing OrderPlaced.total is number but subscriber OrderPlacedEvent.total is { amountCents: number; currency: string } (payload-shape mismatch)",
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "notifications-svc",
+      "producer_key": "pubsub|user.registered",
+      "consumer_repo": "analytics-worker",
+      "consumer_key": "pubsub|user.registered",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "web-dashboard",
+      "producer_key": "pubsub|metrics.page_view",
+      "consumer_repo": "analytics-worker",
+      "consumer_key": "pubsub|metrics.page_view",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "orders-engine",
+      "producer_key": "graphql|query|order",
+      "consumer_repo": "web-dashboard",
+      "consumer_key": "graphql|query|order",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "graphql",
+      "tier": "roadmap"
+    },
+    {
+      "producer_repo": "orders-engine",
+      "producer_key": "graphql|subscription|orderEvents",
+      "consumer_repo": "web-dashboard",
+      "consumer_key": "graphql|subscription|orderEvents",
+      "type_compatible": false,
+      "mismatch_reason": "consumer OrderEvent.kind allows \"cancelled\" but producer only emits \"placed\" | \"shipped\" (missing union member)",
+      "protocol": "graphql",
+      "tier": "roadmap"
+    },
+    {
+      "producer_repo": "notifications-svc",
+      "producer_key": "http|GET|/notifications/:param",
+      "consumer_repo": "web-dashboard",
+      "consumer_key": "http|GET|/notifications/:param",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "analytics-worker",
+      "producer_key": "http|POST|/track",
+      "consumer_repo": "web-dashboard",
+      "consumer_key": "http|POST|/track",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "http",
+      "tier": "capability"
+    }
+  ],
+  "orphans": [
+    { "repo": "orders-engine", "side": "producer", "key": "graphql|mutation|cancelOrder", "tier": "roadmap" },
+    { "repo": "notifications-svc", "side": "producer", "key": "http|GET|/health", "tier": "capability" },
+    { "repo": "billing-svc", "side": "consumer", "key": "pubsub|payment.captured", "tier": "capability" },
+    { "repo": "billing-svc", "side": "consumer", "key": "http|POST|/ledger/append", "tier": "capability" }
+  ],
+  "dependency_conflicts": [
+    {
+      "package": "ioredis",
+      "versions": ["4.28.0", "5.3.0"],
+      "severity": "critical",
+      "tier": "capability"
+    }
+  ],
+  "summary": {
+    "total_repos": 5,
+    "producers": 9,
+    "consumers": 10,
+    "matched_edges": 8,
+    "incompatible_edges": 2,
+    "orphan_producers": 2,
+    "orphan_consumers": 2,
+    "decoys_must_not_emit": 3,
+    "matched_edges_by_protocol": { "pubsub": 4, "graphql": 2, "http": 2 }
+  }
+}
