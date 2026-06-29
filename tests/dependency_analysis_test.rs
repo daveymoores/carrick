@@ -193,13 +193,17 @@ async fn test_no_conflicts_for_unique_packages() {
 }
 
 #[tokio::test]
-async fn test_severity_levels() {
+async fn test_only_major_incompatible_conflicts_reported() {
     // Create analyzer
     let config = Config::default();
     let cm: Lrc<SourceMap> = Default::default();
     let mut analyzer = Analyzer::new(config, cm);
 
-    // Create packages with different severity conflicts
+    // Create packages spanning a major (critical), minor (warning), and patch
+    // (info) difference. Only the semver-INCOMPATIBLE major spread is reported as
+    // a cross-service conflict; the same-major minor/patch drifts are compatible
+    // and suppressed (they were the false-positive noise that pinned dependency
+    // F1 on xrepo-corpus-1).
     let mut deps_a = HashMap::new();
     deps_a.insert("critical_pkg".to_string(), "2.0.0".to_string()); // Major diff
     deps_a.insert("warning_pkg".to_string(), "1.2.0".to_string()); // Minor diff
@@ -247,16 +251,20 @@ async fn test_severity_levels() {
     // Run dependency analysis
     let conflicts = analyzer.analyze_dependencies();
 
-    // Should find 3 conflicts with different severities
-    assert_eq!(conflicts.len(), 3);
-
-    // Check severities
-    for conflict in &conflicts {
-        match conflict.package_name.as_str() {
-            "critical_pkg" => assert!(matches!(conflict.severity, ConflictSeverity::Critical)),
-            "warning_pkg" => assert!(matches!(conflict.severity, ConflictSeverity::Warning)),
-            "info_pkg" => assert!(matches!(conflict.severity, ConflictSeverity::Info)),
-            _ => panic!("Unexpected package: {}", conflict.package_name),
-        }
-    }
+    // Only the major-incompatible conflict is reported; the minor and patch
+    // drifts are compatible and suppressed.
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "only the major-version (semver-incompatible) conflict is reported"
+    );
+    let conflict = &conflicts[0];
+    assert_eq!(conflict.package_name, "critical_pkg");
+    assert!(matches!(conflict.severity, ConflictSeverity::Critical));
+    assert!(
+        !conflicts
+            .iter()
+            .any(|c| matches!(c.package_name.as_str(), "warning_pkg" | "info_pkg")),
+        "same-major minor/patch drift must not be reported as a conflict"
+    );
 }

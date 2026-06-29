@@ -2319,9 +2319,13 @@ mod tests {
         ));
 
         // typescript 5.3 vs 5.4 — same-major minor drift → suppressed.
-        assert!(!Analyzer::is_reportable_conflict(&infos(&["5.3.0", "5.4.0"])));
+        assert!(!Analyzer::is_reportable_conflict(&infos(&[
+            "5.3.0", "5.4.0"
+        ])));
         // patch-only drift → also suppressed.
-        assert!(!Analyzer::is_reportable_conflict(&infos(&["1.1.1", "1.1.2"])));
+        assert!(!Analyzer::is_reportable_conflict(&infos(&[
+            "1.1.1", "1.1.2"
+        ])));
         // three same-major versions → suppressed.
         assert!(!Analyzer::is_reportable_conflict(&infos(&[
             "18.2.0", "18.3.0", "18.3.1"

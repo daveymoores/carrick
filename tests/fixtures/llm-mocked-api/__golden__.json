@@ -29,8 +29,7 @@
       "line": 9,
       "type_alias": "Endpoint_1732d2237f37ec97_Response",
       "type_state": "Unknown",
-      "is_explicit": false,
-      "primary_type_symbol": "Endpoint_1732d2237f37ec97_Response"
+      "is_explicit": false
     },
     {
       "key": "http|GET|/health",
@@ -46,8 +45,7 @@
       "type_state": "Implicit",
       "resolved_definition": "export type Endpoint_2a10f0dfd8c3cde7_Response = { status: string; };",
       "expanded_definition": "{ status: string; }",
-      "is_explicit": false,
-      "primary_type_symbol": "Endpoint_2a10f0dfd8c3cde7_Response"
+      "is_explicit": false
     },
     {
       "key": "http|GET|/summary",
@@ -63,8 +61,7 @@
       "type_state": "Implicit",
       "resolved_definition": "export type Endpoint_97b757a2c4112fad_Response = { total: number; };",
       "expanded_definition": "{ total: number; }",
-      "is_explicit": false,
-      "primary_type_symbol": "Endpoint_97b757a2c4112fad_Response"
+      "is_explicit": false
     },
     {
       "key": "http|POST|/api/users",
@@ -106,22 +103,6 @@
         "5.0.0"
       ],
       "severity": "critical"
-    },
-    {
-      "package": "lodash",
-      "versions": [
-        "4.17.21",
-        "4.17.22"
-      ],
-      "severity": "info"
-    },
-    {
-      "package": "react",
-      "versions": [
-        "18.2.0",
-        "18.3.0"
-      ],
-      "severity": "warning"
     }
   ]
 }
