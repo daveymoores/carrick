@@ -609,6 +609,25 @@ impl FileAnalyzerAgent {
             }
         }
 
+        // Sanitize pub/sub operations (#283): trim/normalize the topic, payload
+        // type symbol, and its import source the same way data_calls are handled.
+        for op in &mut result.pubsub_operations {
+            let trimmed_topic = op.topic.trim();
+            if trimmed_topic != op.topic.as_str() {
+                op.topic = trimmed_topic.to_string();
+            }
+            normalize_optional_string(&mut op.primary_type_symbol);
+            if normalize_import_source(&mut op.type_import_source) {
+                needs_retry = true;
+            }
+            if let Some(ref symbol) = op.primary_type_symbol
+                && !is_valid_identifier(symbol)
+            {
+                op.primary_type_symbol = None;
+            }
+            normalize_optional_string(&mut op.broker);
+        }
+
         needs_retry
     }
 

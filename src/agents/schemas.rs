@@ -444,12 +444,12 @@ impl AgentSchemas {
                         "properties": {
                             "topic": {
                                 "type": "STRING",
-                                "description": "The exact topic or channel name the operation targets, as a literal string (e.g., 'metrics.page_view'). Copy it verbatim from the source; skip operations whose topic is a runtime variable with no literal value."
+                                "description": "The named topic, channel, or subject the message flows over, as a literal string (e.g., 'metrics.page_view'). This is the first string argument to a publish/subscribe call or the `topic` property in its options object. Copy it verbatim from the source; skip operations whose topic is a runtime variable with no literal value."
                             },
                             "role": {
                                 "type": "STRING",
                                 "enum": ["subscriber", "publisher"],
-                                "description": "subscriber when the code registers a handler that receives messages on the topic; publisher when the code sends a message to the topic."
+                                "description": "A pub/sub operation moves a payload over a named topic/channel/subject. Use `publisher` when the code SENDS a payload to a named topic — for example `producer.send({ topic, messages: [{ value }] })`, `redis.publish(channel, payload)`, or `nc.publish(subject, data)`. Use `subscriber` when the code REGISTERS a handler for (or iterates messages on) a named topic — for example `consumer.subscribe({ topic })` paired with `consumer.run({ eachMessage })`, `sub.subscribe(channel)` paired with `sub.on('message', ...)`, or `nc.subscribe(subject)` consumed with `for await`. These three libraries are only examples of the shape; recognize the same send-to-topic / handle-from-topic shape for any messaging client. Ignore non-pub/sub calls on the same libraries (a key-value `get`/`set`, an admin `createTopics`, or a `request`/reply round-trip are not publish or subscribe)."
                             },
                             "line_number": {
                                 "type": "INTEGER",
@@ -458,7 +458,7 @@ impl AgentSchemas {
                             "primary_type_symbol": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "The named type of the message payload as a bare identifier (e.g., 'PageViewEvent'). Unwrap arrays and promise wrappers down to the core identifier. Null for untyped or inline-object payloads."
+                                "description": "The named type of the DECODED application payload as a bare identifier (e.g., 'PageViewEvent') — the `T` the subscriber parses each message into, or the type of the value handed to a publish call. Use the decoded application type, NOT the wire type (`Buffer`, `string`, `Uint8Array`) and NOT an envelope/wrapper around it. Unwrap arrays and promise wrappers down to the core identifier. Null for untyped or inline-object payloads."
                             },
                             "type_import_source": {
                                 "type": "STRING",
