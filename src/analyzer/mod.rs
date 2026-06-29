@@ -248,16 +248,22 @@ fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
 }
 
 /// Recover the verdict-join `(pseudo-method, identity)` from a canonical
-/// producer key, for the protocols ts_check type-checks (HTTP + socket):
+/// producer key, for the protocols ts_check type-checks (HTTP + socket + graphql):
 ///
 /// - HTTP (`"http|METHOD|path"`) → `("METHOD", "path")`, the HTTP join key.
 /// - Socket (`"socket|DIRECTION|event"`) → `("SOCKET", "DIRECTION|event")`. The
 ///   matching ts_check endpoint label is `"SOCKET DIRECTION|event (response)"`,
 ///   which `parse_compat_endpoint` reduces to the SAME pair, so a socket edge
 ///   joins its ts_check verdict exactly like an HTTP one.
+/// - GraphQL (`"graphql|KIND|field"`) → `("GRAPHQL", "KIND|field")`. The
+///   matching ts_check endpoint label is `"GRAPHQL KIND|field (response)"`,
+///   which `parse_compat_endpoint` reduces to the SAME pair, so a graphql edge
+///   joins its verdict exactly like socket. The `KIND` (`query`/`mutation`/
+///   `subscription`) stays lowercase here AND in the ts_check label, so the two
+///   sides agree without any case folding.
 ///
-/// Returns `None` for any other protocol (e.g. GraphQL): ts_check produced no
-/// verdict for it, so its edge stays `None` rather than fabricating one.
+/// Returns `None` for any other protocol: ts_check produced no verdict for it,
+/// so its edge stays `None` rather than fabricating one.
 fn parse_producer_key(key: &str) -> Option<(String, String)> {
     let mut parts = key.splitn(3, '|');
     match (parts.next(), parts.next(), parts.next()) {
@@ -268,6 +274,9 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
             if !direction.is_empty() && !event.is_empty() =>
         {
             Some(("SOCKET".to_string(), format!("{}|{}", direction, event)))
+        }
+        (Some("graphql"), Some(kind), Some(field)) if !kind.is_empty() && !field.is_empty() => {
+            Some(("GRAPHQL".to_string(), format!("{}|{}", kind, field)))
         }
         _ => None,
     }
@@ -369,10 +378,11 @@ fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMat
 
     for edge in matches.iter_mut() {
         // Recover the join key from the producer_key. ts_check type-checks HTTP
-        // (`http|METHOD|path`) and socket (`socket|DIRECTION|event`), so both
-        // join here. A key for any other protocol (e.g. GraphQL) is not checked
-        // by ts_check, so its verdict is genuinely unknown — leave it `None`
-        // rather than fabricate `Some(true)` (#260, part 2).
+        // (`http|METHOD|path`), socket (`socket|DIRECTION|event`), and graphql
+        // (`graphql|KIND|field`), so all three join here. A key for any other
+        // protocol is not checked by ts_check, so its verdict is genuinely
+        // unknown — leave it `None` rather than fabricate `Some(true)`
+        // (#260, part 2).
         let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
             edge.type_compatible = None;
             continue;
@@ -1577,10 +1587,10 @@ impl Analyzer {
                             producer_key: canonical.clone(),
                             consumer_repo: consumer_repo.clone(),
                             consumer_key: canonical.clone(),
-                            // Exact-key protocols (GraphQL/socket) are not checked
-                            // by ts_check (HTTP-only), so this never feeds the
-                            // compat overlay — but recording the consumer call site
-                            // keeps the dedup identity precise.
+                            // Exact-key protocols (GraphQL/socket) ARE type-checked
+                            // by ts_check now, so this consumer location feeds the
+                            // compat overlay (`apply_compat_verdicts`) and also keeps
+                            // the dedup identity precise.
                             consumer_location: Some(call.file_path.display().to_string()),
                             match_score: 1.0,
                             type_compatible: None,
@@ -3059,6 +3069,54 @@ mod tests {
         );
     }
 
+    /// The `graphql|subscription|orderUpdated` false-positive at the verdict-join
+    /// layer. Its consumer alias dangles to `unknown` in the bundle, so ts_check
+    /// reports the pair in `unknownPairs` with the graphql endpoint label
+    /// `"GRAPHQL subscription|orderUpdated (response)"`. That must join the edge
+    /// whose `producer_key` is `"graphql|subscription|orderUpdated"` and pin the
+    /// verdict to `None` — NOT the optimistic `Some(true)` the edge would default
+    /// to if the unresolved consumer had been dropped from the manifest (so the
+    /// pair never reached ts_check at all). This is the join the live eval's
+    /// resolved graphql edges never exercise (they are compatible by default).
+    #[test]
+    fn apply_compat_verdicts_graphql_unverifiable_edge_none() {
+        let result = serde_json::json!({
+            "mismatches": [],
+            "unknownPairs": [{
+                "endpoint": "GRAPHQL subscription|orderUpdated (response)",
+                "consumerLocation": "web-frontend/lib/graphql.ts:84",
+                "reason": "consumer type resolves to unknown (type missing from bundled types?)"
+            }],
+            "totalChecked": 1,
+            "compatibleCount": 0
+        });
+        let mut matches = vec![
+            edge_at(
+                "graphql|subscription|orderUpdated",
+                "web-frontend",
+                "web-frontend/lib/graphql.ts:84",
+            ),
+            edge_at(
+                "graphql|query|order",
+                "web-frontend",
+                "web-frontend/lib/graphql.ts:76",
+            ),
+        ];
+        apply_compat_verdicts(&result, &mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "an unresolved graphql consumer makes the edge unverifiable (None), \
+             never a fake Some(true) from being dropped + absent"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(true),
+            "the resolved graphql edge, absent from both lists, stays compatible"
+        );
+    }
+
     /// THE live compat=1/6 regression. ts_check builds its `endpoint` from the
     /// normalized manifest (`/orders/:param`), while the cross-repo edge's
     /// `producer_key` keeps the SOURCE param name (`/orders/:id`). The verdict
@@ -3119,8 +3177,10 @@ mod tests {
             "POST /payments is unverifiable → None, never a fake compatible"
         );
         assert_eq!(
-            matches[3].type_compatible, None,
-            "a non-HTTP edge is not ts_check-verifiable → None"
+            matches[3].type_compatible,
+            Some(true),
+            "a graphql edge is now ts_check-verifiable and is absent from both \
+             lists → genuinely-checked compatible (Some(true)), not None"
         );
     }
 
@@ -3202,17 +3262,18 @@ mod tests {
         );
     }
 
-    /// A GraphQL edge has a `producer_key` ts_check does not type-check, so
-    /// `parse_producer_key` returns `None` and the verdict is genuinely unknown:
-    /// the edge must stay `None`, NOT the fabricated `Some(true)` the old default
-    /// returned (#260, part 2 — the worst direction for a drift detector).
-    /// Socket edges, by contrast, ARE type-checked and join their verdict (see
-    /// `apply_compat_verdicts_joins_socket_edge`).
+    /// A GraphQL edge is now type-checked by ts_check (the graphql-compat
+    /// machinery), so its `producer_key` joins a verdict just like socket. With
+    /// the edge absent from both the mismatch and unknown lists, ts_check
+    /// genuinely checked it and found it compatible, so the overlay reads
+    /// `Some(true)` — NOT the old `None` (which meant "never checked") and NOT a
+    /// fabricated true. The incompatible direction is pinned by
+    /// `apply_compat_verdicts_joins_graphql_edge`.
     #[test]
-    fn overlay_compat_verdicts_graphql_producer_key_stays_none() {
+    fn overlay_compat_verdicts_graphql_edge_joins_compatible() {
         let dir = tempfile::tempdir().expect("tempdir");
         let results = r#"{ "mismatches": [], "unknownPairs": [],
-                           "totalChecked": 0, "compatibleCount": 0 }"#;
+                           "totalChecked": 1, "compatibleCount": 1 }"#;
         let analyzer = analyzer_with_results(dir.path(), Some(results));
 
         let mut matches = vec![edge_at(
@@ -3223,9 +3284,12 @@ mod tests {
         analyzer.overlay_compat_verdicts(&mut matches);
 
         assert_eq!(
-            matches[0].type_compatible, None,
-            "a GraphQL edge ts_check never checked must stay None, not fake true"
+            matches[0].type_compatible,
+            Some(true),
+            "a GraphQL edge genuinely checked and absent from both lists is \
+             compatible (Some(true)), now that graphql joins its verdict"
         );
+        assert!(matches[0].mismatch_reason.is_none());
     }
 
     /// The socket cross-repo join (this PR). A `socket|DIRECTION|event` edge is
@@ -3281,6 +3345,89 @@ mod tests {
         assert_eq!(
             matches[1].mismatch_reason.as_deref(),
             Some("Sent type is not assignable to listener type"),
+        );
+    }
+
+    /// `parse_producer_key` recovers the `(pseudo-method, identity)` join pair
+    /// from a graphql canonical key. The KIND stays lowercase on BOTH the key and
+    /// the ts_check endpoint label (`GRAPHQL query|order (response)`), so the two
+    /// sides agree with no case folding on the identity tail.
+    #[test]
+    fn parse_producer_key_recovers_graphql_pair() {
+        assert_eq!(
+            parse_producer_key("graphql|query|order"),
+            Some(("GRAPHQL".to_string(), "query|order".to_string())),
+        );
+        assert_eq!(
+            parse_producer_key("graphql|subscription|orderUpdated"),
+            Some((
+                "GRAPHQL".to_string(),
+                "subscription|orderUpdated".to_string()
+            )),
+        );
+        // A round-trip through the ts_check endpoint label must yield the SAME
+        // pair, so a graphql verdict joins its edge.
+        assert_eq!(
+            parse_compat_endpoint("GRAPHQL query|order (response)"),
+            parse_producer_key("graphql|query|order"),
+        );
+        // Malformed (missing field) → no join key, edge stays None.
+        assert_eq!(parse_producer_key("graphql|query|"), None);
+        assert_eq!(parse_producer_key("graphql|query"), None);
+    }
+
+    /// The graphql cross-repo join (the graphql-compat machinery). A
+    /// `graphql|KIND|field` edge is type-checked by ts_check, which emits its
+    /// verdict under the endpoint label `"GRAPHQL <KIND>|<field> (response)"`.
+    /// `parse_producer_key` recovers `("GRAPHQL", "<KIND>|<field>")` from the edge
+    /// and `parse_compat_endpoint` recovers the SAME pair from the label, so the
+    /// verdict lands on the graphql edge — `Some(true)` when ts_check finds it
+    /// compatible, `Some(false)` + reason when it reports a mismatch.
+    #[test]
+    fn apply_compat_verdicts_joins_graphql_edge() {
+        // The xrepo-corpus-1 graphql edges: `query|order` is compatible (absent
+        // from both lists → Some(true)); a second field is in the mismatch list
+        // and lands on its edge with the reason.
+        let result = serde_json::json!({
+            "mismatches": [{
+                "endpoint": "GRAPHQL subscription|orderUpdated (response)",
+                "consumerLocation": "web-frontend/lib/graphql.ts:80",
+                "error": "note?: optional producer field is not assignable to required consumer field"
+            }],
+            "unknownPairs": [],
+            "totalChecked": 2,
+            "compatibleCount": 1
+        });
+
+        let mut matches = vec![
+            edge_at(
+                "graphql|query|order",
+                "web-frontend",
+                "web-frontend/lib/graphql.ts:76",
+            ),
+            edge_at(
+                "graphql|subscription|orderUpdated",
+                "web-frontend",
+                "web-frontend/lib/graphql.ts:80:5",
+            ),
+        ];
+        apply_compat_verdicts(&result, &mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible,
+            Some(true),
+            "the compatible graphql edge (absent from both lists) reads Some(true)"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(false),
+            "the graphql edge in the mismatch list reads Some(false)"
+        );
+        assert_eq!(
+            matches[1].mismatch_reason.as_deref(),
+            Some("note?: optional producer field is not assignable to required consumer field"),
         );
     }
 

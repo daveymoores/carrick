@@ -2487,19 +2487,28 @@ fn write_manifest_files(
     for repo_data in all_repo_data {
         if let Some(entries) = &repo_data.type_manifest {
             for entry in entries {
-                // HTTP and socket entries reach the ts_check manifest; GraphQL
-                // does not. ts_check checks HTTP by `method`/`path` and socket by
-                // the canonical `OperationKey` (event+direction), reusing the same
-                // `TypeCompatibilityChecker` assignability for both. GraphQL is
-                // still filtered here: its cross-repo resolution is blocked on
-                // separate work (#268), and its OperationKey serialises without a
-                // checkable identity for the matcher, so a GraphQL entry would
-                // only ever orphan. Those entries stay in `cloud_data.type_manifest`
-                // (cloud index + eval projection). The matcher drops any stray
+                // HTTP, socket, and graphql entries all reach the ts_check manifest
+                // unfiltered. ts_check checks HTTP by `method`/`path`, socket by the
+                // canonical `OperationKey` (event+direction), and graphql by
+                // (kind+field), reusing the same `TypeCompatibilityChecker`
+                // assignability for all three. The matcher drops any stray
                 // non-checkable entry defensively rather than throwing (#253).
-                if entry.key.protocol() == crate::operation::Protocol::Graphql {
-                    continue;
-                }
+                //
+                // An UNRESOLVED entry — `type_state == Unknown`, or an alias that
+                // dangles to `any`/`unknown` in the bundle — is NOT dropped here.
+                // ts_check still matches its pair and reports it as an `unknownPair`
+                // (unverifiable), which `apply_compat_verdicts` maps to a `None`
+                // verdict. Dropping it instead removes the pair from ts_check's
+                // output entirely, and `apply_compat_verdicts` treats an edge absent
+                // from BOTH `mismatches` and `unknownPairs` as compatible — a FALSE
+                // `Some(true)`. That was the `graphql|subscription|orderUpdated`
+                // false-positive: the consumer's only alias is the synthetic
+                // `Endpoint_<hash> = unknown` missing-alias fallback, so the entry
+                // was dropped, the edge went absent, and the verdict defaulted to
+                // compatible. Keeping it lets the `any`/`unknown` comparand guard in
+                // `type-checker.ts` route the pair to `unknownPairs` → `None`. This
+                // is exactly how HTTP/socket Unknown entries have always been
+                // handled; graphql is no longer a special case.
                 match entry.role {
                     ManifestRole::Producer => producer_entries.push(entry.clone()),
                     ManifestRole::Consumer => consumer_entries.push(entry.clone()),
@@ -4421,20 +4430,26 @@ mod tests {
         );
     }
 
-    /// `write_manifest_files` feeds the ts_check matcher, which now checks HTTP
-    /// and socket. So HTTP + socket entries pass through; GraphQL is still
-    /// filtered (its cross-repo resolution is blocked on #268 and its key
-    /// carries no checkable identity for the matcher). GraphQL entries stay in
-    /// `cloud_data.type_manifest` (cloud index + eval projection). The #253
-    /// throw-guard now lives in the matcher, which drops any stray non-checkable
-    /// entry defensively rather than crashing the verdict run.
+    /// `write_manifest_files` feeds the ts_check matcher, which checks HTTP,
+    /// socket, AND graphql. Every entry passes through unfiltered, including an
+    /// UNRESOLVED graphql entry (`type_state == Unknown`, e.g. a subscription
+    /// consumer with no `request<T>` call site). Such an entry must reach ts_check
+    /// so its pair is reported as an `unknownPair` (→ `None`); dropping it would
+    /// make the edge absent and `apply_compat_verdicts` would default it to a
+    /// false `Some(true)`. The #253 throw-guard lives in the matcher, which drops
+    /// any stray non-checkable entry defensively rather than crashing the run.
     #[test]
-    fn write_manifest_files_emits_http_and_socket_not_graphql() {
+    fn write_manifest_files_emits_http_socket_and_all_graphql() {
         use crate::cloud_storage::TypeEvidence;
         use crate::operation::{GraphqlOperationKind, OperationKey, SocketDirection};
         use crate::services::type_sidecar::InferKind;
 
-        fn entry(key: OperationKey, alias: &str) -> TypeManifestEntry {
+        fn entry_with_state(
+            key: OperationKey,
+            alias: &str,
+            type_state: ManifestTypeState,
+        ) -> TypeManifestEntry {
+            let is_explicit = type_state == ManifestTypeState::Explicit;
             TypeManifestEntry {
                 key,
                 role: ManifestRole::Producer,
@@ -4442,16 +4457,16 @@ mod tests {
                 type_alias: alias.to_string(),
                 file_path: "src/x.ts".to_string(),
                 line_number: 1,
-                is_explicit: true,
-                type_state: ManifestTypeState::Explicit,
+                is_explicit,
+                type_state,
                 evidence: TypeEvidence {
                     file_path: "src/x.ts".to_string(),
                     span_start: None,
                     span_end: None,
                     line_number: 1,
                     infer_kind: InferKind::ResponseBody,
-                    is_explicit: true,
-                    type_state: ManifestTypeState::Explicit,
+                    is_explicit,
+                    type_state,
                 },
                 resolved_definition: None,
                 expanded_definition: None,
@@ -4459,11 +4474,24 @@ mod tests {
             }
         }
 
+        fn entry(key: OperationKey, alias: &str) -> TypeManifestEntry {
+            entry_with_state(key, alias, ManifestTypeState::Explicit)
+        }
+
         let manifest = vec![
             entry(OperationKey::http("GET", "/orders/:id"), "OrderResponse"),
+            // Resolved graphql producer (anchor reached the bundle) → KEPT.
             entry(
                 OperationKey::graphql(GraphqlOperationKind::Query, "order"),
                 "OrderQueryResult",
+            ),
+            // Unresolved graphql producer (Unknown anchor) → KEPT so ts_check can
+            // report its pair as an unknownPair (→ None); dropping it would make
+            // the edge absent and default the verdict to a false Some(true).
+            entry_with_state(
+                OperationKey::graphql(GraphqlOperationKind::Subscription, "orderUpdated"),
+                "OrderUpdatedUnknown",
+                ManifestTypeState::Unknown,
             ),
             entry(
                 OperationKey::socket("order.created", SocketDirection::ServerToClient),
@@ -4513,11 +4541,13 @@ mod tests {
         )
         .unwrap();
 
-        // HTTP and socket producers survive; GraphQL is filtered out.
+        // HTTP, socket, and BOTH graphql producers (resolved and Unknown) survive:
+        // the Unknown one must reach ts_check to be reported as an unknownPair.
         assert_eq!(
             producer.entries.len(),
-            2,
-            "HTTP + socket entries reach the ts_check manifest; GraphQL is filtered"
+            4,
+            "HTTP + socket + both graphql producers reach the manifest; the \
+             Unknown graphql entry is kept, not dropped"
         );
         assert!(
             producer
@@ -4531,14 +4561,179 @@ mod tests {
                 .entries
                 .iter()
                 .any(|e| e.key.protocol() == crate::operation::Protocol::Websocket),
-            "the socket producer must now reach the manifest"
+            "the socket producer must reach the manifest"
+        );
+        let graphql_entries: Vec<_> = producer
+            .entries
+            .iter()
+            .filter(|e| e.key.protocol() == crate::operation::Protocol::Graphql)
+            .collect();
+        assert_eq!(
+            graphql_entries.len(),
+            2,
+            "both graphql producers reach the manifest (resolved + Unknown)"
         );
         assert!(
-            producer
+            graphql_entries
+                .iter()
+                .any(|e| e.type_alias == "OrderQueryResult"),
+            "the resolved graphql producer is kept"
+        );
+        assert!(
+            graphql_entries
+                .iter()
+                .any(|e| e.type_state == ManifestTypeState::Unknown),
+            "the Unknown graphql producer is kept so ts_check can mark it \
+             unverifiable rather than the edge defaulting to compatible"
+        );
+    }
+
+    /// The `graphql|subscription|orderUpdated` false-positive fix: an UNRESOLVED
+    /// graphql CONSUMER must REACH the consumer manifest, so ts_check reports its
+    /// pair as an `unknownPair` (→ `None`). Dropping it instead removed the pair
+    /// from ts_check's output, and `apply_compat_verdicts` defaulted the absent
+    /// edge to a false `Some(true)` (`producer ⊑ any` was never actually run — the
+    /// edge just looked compatible because nothing contradicted it).
+    ///
+    /// All three consumer shapes are KEPT — `type_state == Unknown`, an `Implicit`
+    /// consumer with no resolved anchor symbol (the synthetic missing-alias case),
+    /// and a genuinely resolved consumer. ts_check's `any`/`unknown` comparand
+    /// guard distinguishes the unverifiable ones at verdict time, not here.
+    #[test]
+    fn write_manifest_files_keeps_unresolved_graphql_consumer() {
+        use crate::cloud_storage::TypeEvidence;
+        use crate::operation::{GraphqlOperationKind, OperationKey};
+        use crate::services::type_sidecar::InferKind;
+
+        fn consumer(
+            field: &str,
+            alias: &str,
+            type_state: ManifestTypeState,
+            primary_type_symbol: Option<&str>,
+        ) -> TypeManifestEntry {
+            let is_explicit = type_state == ManifestTypeState::Explicit;
+            let key = OperationKey::graphql(GraphqlOperationKind::Subscription, field);
+            TypeManifestEntry {
+                key,
+                role: ManifestRole::Consumer,
+                type_kind: ManifestTypeKind::Response,
+                type_alias: alias.to_string(),
+                file_path: "lib/graphql.ts".to_string(),
+                line_number: 1,
+                is_explicit,
+                type_state,
+                evidence: TypeEvidence {
+                    file_path: "lib/graphql.ts".to_string(),
+                    span_start: None,
+                    span_end: None,
+                    line_number: 1,
+                    infer_kind: InferKind::CallResult,
+                    is_explicit,
+                    type_state,
+                },
+                resolved_definition: None,
+                expanded_definition: None,
+                primary_type_symbol: primary_type_symbol.map(str::to_string),
+            }
+        }
+
+        let manifest = vec![
+            // Clean unresolved consumer (type_state Unknown) → KEPT (ts_check
+            // reports its pair as an unknownPair → None).
+            consumer(
+                "orderUpdated",
+                "Endpoint_unknown_Response",
+                ManifestTypeState::Unknown,
+                None,
+            ),
+            // Enrichment wrongly promoted the synthetic alias to Implicit, but no
+            // real anchor was ever resolved (primary_type_symbol still None) →
+            // KEPT; its alias dangles to `any`/`unknown` in the bundle so the
+            // ts_check comparand guard marks the pair unverifiable.
+            consumer(
+                "orderPromoted",
+                "Endpoint_promoted_Response",
+                ManifestTypeState::Implicit,
+                None,
+            ),
+            // Genuinely resolved consumer (real anchor symbol) → KEPT.
+            consumer(
+                "orderResolved",
+                "Endpoint_resolved_Response",
+                ManifestTypeState::Implicit,
+                Some("OrderView"),
+            ),
+        ];
+
+        let repo_data = CloudRepoData {
+            repo_name: "web-frontend".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: Some(manifest),
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+        };
+
+        #[derive(serde::Deserialize)]
+        struct ManifestFileForTest {
+            entries: Vec<TypeManifestEntry>,
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_manifest_files(std::slice::from_ref(&repo_data), dir.path())
+            .expect("write_manifest_files");
+
+        let consumers: ManifestFileForTest = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("consumer-manifest.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            consumers.entries.len(),
+            3,
+            "all graphql consumers reach the manifest — the Unknown one and the \
+             anchorless wrongly-promoted one are KEPT so ts_check can mark their \
+             pairs unverifiable (→ None) instead of the edge defaulting to a \
+             false Some(true)"
+        );
+        assert!(
+            consumers
                 .entries
                 .iter()
-                .all(|e| e.key.protocol() != crate::operation::Protocol::Graphql),
-            "GraphQL entries must not reach the ts_check manifest (#268)"
+                .any(|e| e.type_alias == "Endpoint_resolved_Response"),
+            "the genuinely-resolved consumer is kept"
+        );
+        assert!(
+            consumers
+                .entries
+                .iter()
+                .any(|e| e.type_state == ManifestTypeState::Unknown),
+            "the Unknown consumer is kept (unverifiable, not dropped)"
+        );
+        assert!(
+            consumers
+                .entries
+                .iter()
+                .any(|e| e.primary_type_symbol.is_none()),
+            "the anchorless wrongly-promoted consumer is kept (unverifiable, not \
+             dropped)"
         );
     }
 

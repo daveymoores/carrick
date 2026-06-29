@@ -238,7 +238,7 @@ describe('ManifestMatcher', () => {
 
     // --- #253 regression: non-HTTP entries must be skipped, not fatal ---
 
-    it('should keep HTTP and socket entries and drop GraphQL', () => {
+    it('should keep HTTP, socket, and graphql entries and drop a non-checkable protocol', () => {
       const httpEntry = createManifestEntry(
         'GET',
         '/orders/:id',
@@ -247,9 +247,9 @@ describe('ManifestMatcher', () => {
         'src/routes.ts',
         10
       );
-      // GraphQL serialises without a checkable identity for the matcher and is
-      // dropped; socket (event+direction) is now checked alongside HTTP. A
-      // non-checkable entry must never throw in validateEntry (#253).
+      // GraphQL (kind+field) is now checked alongside HTTP and socket. A truly
+      // non-checkable entry (an unrecognised protocol) is still dropped, and must
+      // never throw in validateEntry (#253).
       const graphqlEntry = {
         protocol: 'graphql',
         kind: 'query',
@@ -292,6 +292,26 @@ describe('ManifestMatcher', () => {
           type_state: 'explicit',
         },
       };
+      // Unrecognised protocol — not HTTP/socket/graphql — must be dropped (#253).
+      const nonCheckableEntry = {
+        protocol: 'grpc',
+        type_alias: 'SomeGrpcResult',
+        role: 'producer',
+        type_kind: 'response',
+        file_path: 'src/grpc.ts',
+        line_number: 9,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: 'src/grpc.ts',
+          span_start: null,
+          span_end: null,
+          line_number: 9,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      };
 
       const filePath = path.join(tempDir, 'mixed-protocol.json');
       fs.writeFileSync(
@@ -299,13 +319,13 @@ describe('ManifestMatcher', () => {
         JSON.stringify({
           repo_name: 'orders-svc',
           commit_hash: 'abc123',
-          entries: [graphqlEntry, httpEntry, socketEntry],
+          entries: [graphqlEntry, httpEntry, socketEntry, nonCheckableEntry],
         })
       );
 
-      // Must NOT throw. Keeps the HTTP + socket entries, drops GraphQL.
+      // Must NOT throw. Keeps the HTTP + socket + graphql entries, drops grpc.
       const loaded = matcher.loadManifest(filePath);
-      assert.strictEqual(loaded.entries.length, 2);
+      assert.strictEqual(loaded.entries.length, 3);
       assert.ok(
         loaded.entries.some((e) => e.protocol === 'http' && e.path === '/orders/:id'),
         'HTTP entry must survive'
@@ -316,12 +336,17 @@ describe('ManifestMatcher', () => {
         ),
         'socket entry must survive'
       );
-      // Length 2 (from 3 inputs) with the http + socket survivors above proves
-      // the GraphQL entry was dropped. Assert the surviving protocols are only
-      // the two checkable ones.
+      assert.ok(
+        loaded.entries.some(
+          (e) => e.protocol === 'graphql' && e.kind === 'query' && e.field === 'order'
+        ),
+        'graphql entry must survive'
+      );
+      // Length 3 (from 4 inputs) with the survivors above proves the grpc entry
+      // was dropped. Assert the surviving protocols are exactly the checkable ones.
       assert.deepStrictEqual(
         loaded.entries.map((e) => e.protocol).sort(),
-        ['http', 'socket']
+        ['graphql', 'http', 'socket']
       );
     });
 
@@ -736,6 +761,98 @@ describe('ManifestMatcher', () => {
         repo_name: 'b',
         commit_hash: 'y',
         entries: [entry('client_to_server', 'consumer')],
+      };
+
+      const result = matcher.matchEndpoints(producers, consumers);
+
+      assert.strictEqual(result.matches.length, 0);
+      assert.strictEqual(result.orphanedProducers.length, 1);
+      assert.strictEqual(result.orphanedConsumers.length, 1);
+    });
+
+    it('should match a graphql producer and consumer on the canonical kind|field key', () => {
+      const graphqlEntry = (
+        typeAlias: string,
+        role: 'producer' | 'consumer'
+      ): ManifestEntry => ({
+        protocol: 'graphql',
+        kind: 'query',
+        field: 'order',
+        type_alias: typeAlias,
+        role,
+        type_kind: 'response',
+        file_path: role === 'producer' ? 'gateway/src/orders.resolver.ts' : 'lib/graphql.ts',
+        line_number: role === 'producer' ? 40 : 76,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: role === 'producer' ? 'gateway/src/orders.resolver.ts' : 'lib/graphql.ts',
+          span_start: null,
+          span_end: null,
+          line_number: role === 'producer' ? 40 : 76,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      });
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-monorepo',
+        commit_hash: 'abc123',
+        entries: [graphqlEntry('ProducerEnvelope', 'producer')],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def456',
+        entries: [graphqlEntry('OrderView', 'consumer')],
+      };
+
+      const result = matcher.matchEndpoints(producers, consumers);
+
+      assert.strictEqual(result.matches.length, 1);
+      assert.strictEqual(result.matches[0].method, 'GRAPHQL');
+      assert.strictEqual(result.matches[0].path, 'query|order');
+      assert.strictEqual(result.matches[0].producer.type_alias, 'ProducerEnvelope');
+      assert.strictEqual(result.matches[0].consumer.type_alias, 'OrderView');
+      assert.strictEqual(result.orphanedProducers.length, 0);
+      assert.strictEqual(result.orphanedConsumers.length, 0);
+    });
+
+    it('should not match graphql entries with different fields', () => {
+      const entry = (
+        field: string,
+        role: 'producer' | 'consumer'
+      ): ManifestEntry => ({
+        protocol: 'graphql',
+        kind: 'query',
+        field,
+        type_alias: 'OrderView',
+        role,
+        type_kind: 'response',
+        file_path: 'f.ts',
+        line_number: 1,
+        is_explicit: true,
+        type_state: 'explicit',
+        evidence: {
+          file_path: 'f.ts',
+          span_start: null,
+          span_end: null,
+          line_number: 1,
+          infer_kind: 'response_body',
+          is_explicit: true,
+          type_state: 'explicit',
+        },
+      });
+
+      const producers: TypeManifest = {
+        repo_name: 'a',
+        commit_hash: 'x',
+        entries: [entry('orders', 'producer')],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'b',
+        commit_hash: 'y',
+        entries: [entry('order', 'consumer')],
       };
 
       const result = matcher.matchEndpoints(producers, consumers);

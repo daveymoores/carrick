@@ -57,18 +57,30 @@ export interface ManifestEntry {
   /**
    * Protocol tag carried by the operation key. ts_check runs the same
    * `TypeCompatibilityChecker` assignability for every protocol it understands:
-   * "http" (matched by method/path) and "socket" (matched by event+direction).
-   * Other protocols are checked by their own pipelines and are dropped here.
+   * "http" (matched by method/path), "socket" (matched by event+direction), and
+   * "graphql" (matched by operation kind+field). Other protocols are checked by
+   * their own pipelines and are dropped here.
    */
-  protocol: 'http' | 'socket';
-  /** HTTP method (GET, POST, …). Present on HTTP entries; absent on socket. */
+  protocol: 'http' | 'socket' | 'graphql';
+  /** HTTP method (GET, POST, …). Present on HTTP entries; absent on socket/graphql. */
   method?: string;
-  /** API path (e.g., /api/users/:id). Present on HTTP entries; absent on socket. */
+  /** API path (e.g., /api/users/:id). Present on HTTP entries; absent on socket/graphql. */
   path?: string;
   /** Socket event name (e.g. `payment:settled`). Present on socket entries only. */
   event?: string;
   /** Socket message-flow direction. Present on socket entries only. */
   direction?: SocketDirection;
+  /**
+   * GraphQL root-operation kind (`query`/`mutation`/`subscription`). Present on
+   * graphql entries only; serialised lowercase by the Rust scanner
+   * (`GraphqlOperationKind::as_str`).
+   */
+  kind?: string;
+  /**
+   * GraphQL top-level field name (e.g. `order`). Present on graphql entries
+   * only; the field that, with `kind`, identifies the operation.
+   */
+  field?: string;
   /** The type alias for this endpoint */
   type_alias: string;
   /** Whether this is a producer or consumer */
@@ -241,13 +253,40 @@ export function socketKey(entry: ManifestEntry): string | null {
   return `${socketDirectionLabel(entry.direction)}|${entry.event}`;
 }
 
+// ============================================================================
+// GraphQL Identity
+// ============================================================================
+
+/** The pseudo-method graphql matches are keyed on, mirroring HTTP's method. */
+export const GRAPHQL_PSEUDO_METHOD = 'GRAPHQL';
+
+/**
+ * Stable identity for a graphql entry: `<kind>|<field>` (e.g. `query|order`).
+ * Two graphql entries match iff this string is equal (same root field of the
+ * same operation kind), the exact-key semantics the Rust side uses. The full
+ * canonical key on the Rust side is `graphql|<kind>|<field>`; this is its
+ * `<kind>|<field>` tail, which becomes the `path` of the graphql `MatchResult`
+ * so the assembled label `GRAPHQL <kind>|<field>` round-trips through the
+ * verdict-join (`parse_compat_endpoint` / `parse_producer_key`).
+ */
+export function graphqlKey(entry: ManifestEntry): string | null {
+  if (entry.protocol !== 'graphql' || !entry.kind || !entry.field) {
+    return null;
+  }
+  return `${entry.kind}|${entry.field}`;
+}
+
 /**
  * Human label for an entry in orphan/diagnostic strings: `<METHOD> <path>` for
- * HTTP, `socket <DIRECTION>|<event>` for socket.
+ * HTTP, `socket <DIRECTION>|<event>` for socket, `graphql <kind>|<field>` for
+ * graphql.
  */
 export function entryLabel(entry: ManifestEntry): string {
   if (entry.protocol === 'socket') {
     return `socket ${socketKey(entry) ?? entry.event ?? '<unknown>'}`;
+  }
+  if (entry.protocol === 'graphql') {
+    return `graphql ${graphqlKey(entry) ?? entry.field ?? '<unknown>'}`;
   }
   return `${entry.method} ${entry.path}`;
 }
@@ -298,16 +337,16 @@ export class ManifestMatcher {
         throw new Error('Manifest missing required field: entries (must be an array)');
       }
 
-      // ts_check checks HTTP (by method/path) and socket (by event+direction)
-      // entries with the same assignability checker. Any other protocol
-      // (GraphQL, which serialises without a checkable identity) is scored by
-      // its own pipeline and skipped here. The scanner already filters those out
-      // of the manifest files it writes (write_manifest_files), but a stray
-      // non-checkable entry must never crash the whole verdict run (#253), so we
-      // drop them defensively and leave a trace rather than throwing.
+      // ts_check checks HTTP (by method/path), socket (by event+direction), and
+      // graphql (by kind+field) entries with the same assignability checker. Any
+      // other protocol is scored by its own pipeline and skipped here. The
+      // scanner already filters non-checkable entries out of the manifest files
+      // it writes (write_manifest_files), but a stray non-checkable entry must
+      // never crash the whole verdict run (#253), so we drop them defensively and
+      // leave a trace rather than throwing.
       manifest.entries = this.retainCheckableEntries(manifest.entries, absolutePath);
 
-      // Validate the surviving (HTTP + socket) entries.
+      // Validate the surviving (HTTP + socket + graphql) entries.
       for (const entry of manifest.entries) {
         this.validateEntry(entry);
       }
@@ -323,12 +362,13 @@ export class ManifestMatcher {
 
   /**
    * Filter a manifest entry list down to the entries ts_check can check: HTTP
-   * (keyed by method/path) and socket (keyed by event+direction).
+   * (keyed by method/path), socket (keyed by event+direction), and graphql
+   * (keyed by kind+field).
    *
    * Any other protocol — or a malformed entry missing the identity its protocol
-   * needs — is skipped: it belongs to another pipeline (e.g. GraphQL, #268) or
-   * is junk. A single summary line is logged so the drop is never silent. A
-   * stray non-checkable entry can thus never zero out the verdict set (#253).
+   * needs — is skipped: it belongs to another pipeline or is junk. A single
+   * summary line is logged so the drop is never silent. A stray non-checkable
+   * entry can thus never zero out the verdict set (#253).
    */
   private retainCheckableEntries(entries: unknown[], source: string): ManifestEntry[] {
     const retained: ManifestEntry[] = [];
@@ -354,11 +394,11 @@ export class ManifestMatcher {
 
   /**
    * Shape guard for raw, possibly-malformed manifest JSON. A checkable entry is
-   * either an HTTP key (`protocol: "http"` with non-empty `method`+`path`) or a
-   * socket key (`protocol: "socket"` with non-empty `event`+`direction`).
-   * Everything else (GraphQL keys, junk) is filtered out here (#253). Full
-   * structural validation of the survivors is `validateEntry`'s job — a
-   * genuinely-malformed HTTP/socket entry still throws there.
+   * an HTTP key (`protocol: "http"` with non-empty `method`+`path`), a socket
+   * key (`protocol: "socket"` with non-empty `event`+`direction`), or a graphql
+   * key (`protocol: "graphql"` with non-empty `kind`+`field`). Everything else
+   * (junk) is filtered out here (#253). Full structural validation of the
+   * survivors is `validateEntry`'s job — a genuinely-malformed entry still throws.
    */
   private isCheckableManifestEntry(entry: unknown): entry is ManifestEntry {
     if (typeof entry !== 'object' || entry === null) {
@@ -378,6 +418,14 @@ export class ManifestMatcher {
         typeof e.event === 'string' &&
         e.event.length > 0 &&
         (e.direction === 'server_to_client' || e.direction === 'client_to_server')
+      );
+    }
+    if (e.protocol === 'graphql') {
+      return (
+        typeof e.kind === 'string' &&
+        e.kind.length > 0 &&
+        typeof e.field === 'string' &&
+        e.field.length > 0
       );
     }
     return false;
@@ -439,8 +487,15 @@ export class ManifestMatcher {
           'ManifestEntry missing or invalid field: direction (must be "server_to_client" or "client_to_server")'
         );
       }
+    } else if (entry.protocol === 'graphql') {
+      if (!entry.kind) {
+        throw new Error('ManifestEntry missing required field: kind');
+      }
+      if (!entry.field) {
+        throw new Error('ManifestEntry missing required field: field');
+      }
     } else {
-      throw new Error('ManifestEntry missing or invalid field: protocol (must be "http" or "socket")');
+      throw new Error('ManifestEntry missing or invalid field: protocol (must be "http", "socket", or "graphql")');
     }
     if (!entry.type_alias) {
       throw new Error('ManifestEntry missing required field: type_alias');
@@ -699,6 +754,52 @@ export class ManifestMatcher {
         orphanedConsumers.push({
           entry: consumer,
           reason: `No producer found for socket ${consumerKey} (${consumer.type_kind})`,
+        });
+      }
+    }
+
+    // GraphQL edges: exact-key match on `<kind>|<field>`, the same identity the
+    // Rust canonical key carries (`graphql|<kind>|<field>`). Like sockets there
+    // is no path/route to resolve, so a graphql consumer matches every producer
+    // carrying the same key. The assembled label `GRAPHQL <kind>|<field>`
+    // round-trips through the Rust verdict-join
+    // (`parse_compat_endpoint` / `parse_producer_key`). The producer/consumer
+    // type direction is handled in the type checker (`compareTypes`): the
+    // producer payload (SDL field type, structurally unwrapped from the resolver
+    // envelope) must satisfy what the consumer reads — `producer ⊑ consumer`,
+    // the same data-flow direction as HTTP (server → client), NOT the socket
+    // inversion.
+    for (let ci = 0; ci < consumerEntries.length; ci++) {
+      const consumer = consumerEntries[ci];
+      if (consumer.protocol !== 'graphql') continue;
+      const consumerKey = graphqlKey(consumer);
+      if (consumerKey === null) continue;
+
+      let matched = false;
+      for (let pi = 0; pi < producerEntries.length; pi++) {
+        const producer = producerEntries[pi];
+        if (producer.protocol !== 'graphql') continue;
+        if (graphqlKey(producer) !== consumerKey) continue;
+        if (producer.type_kind !== consumer.type_kind) continue;
+
+        matches.push({
+          method: GRAPHQL_PSEUDO_METHOD,
+          path: consumerKey,
+          type_kind: consumer.type_kind,
+          producer,
+          consumer,
+          match_score: 1.0,
+        });
+        matchedProducerIndices.add(pi);
+        matched = true;
+      }
+
+      if (matched) {
+        matchedConsumerIndices.add(ci);
+      } else {
+        orphanedConsumers.push({
+          entry: consumer,
+          reason: `No producer found for graphql ${consumerKey} (${consumer.type_kind})`,
         });
       }
     }
