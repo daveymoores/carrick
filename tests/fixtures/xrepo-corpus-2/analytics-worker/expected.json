@@ -1,0 +1,50 @@
+{
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/track",
+      "owner": "app.post",
+      "primary_type_symbol": "TrackResult",
+      "resolved_type": "{ ok: boolean; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "calls": [],
+  "pubsub_operations": [
+    {
+      "role": "consumer",
+      "service": "analytics-worker",
+      "key": "pubsub|metrics.page_view",
+      "topic": "metrics.page_view",
+      "broker": "redis",
+      "side": "publisher",
+      "source": "src/redis/publisher.ts",
+      "primary_type_symbol": "PageView",
+      "resolved_type": "{ path: string; userId: string; ts: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "consumer",
+      "service": "analytics-worker",
+      "key": "pubsub|user.registered",
+      "topic": "user.registered",
+      "broker": "nats",
+      "side": "publisher",
+      "source": "src/nats/publisher.ts",
+      "primary_type_symbol": "UserRegisteredEvent",
+      "resolved_type": "{ userId: string; email: string; registeredAt: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": [
+    {
+      "kind": "pubsub",
+      "method": "*",
+      "path": "pubsub|metrics.page_view",
+      "evidence": "src/redis/publisher.ts: redis.set('metrics.page_view', ...) and redis.get('metrics.page_view') are ioredis KEY-VALUE cache ops, not publish/subscribe. The shared string is a cache key, not a topic. Must not be extracted as a second pub/sub consumer (the genuine publish on the same string is the only metrics.page_view op)."
+    }
+  ]
+}

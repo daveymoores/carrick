@@ -1,0 +1,52 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/notifications/:id",
+      "owner": "routes",
+      "primary_type_symbol": "Notification",
+      "resolved_type": "{ id: string; message: string; read: boolean; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "owner": "routes",
+      "primary_type_symbol": null,
+      "resolved_type": "{ status: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "calls": [],
+  "pubsub_operations": [
+    {
+      "role": "producer",
+      "service": "notifications-svc",
+      "key": "pubsub|order.placed",
+      "topic": "order.placed",
+      "broker": "kafka",
+      "side": "subscriber",
+      "source": "src/kafka/consumer.ts",
+      "primary_type_symbol": "OrderPlacedEvent",
+      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; note?: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "producer",
+      "service": "notifications-svc",
+      "key": "pubsub|user.registered",
+      "topic": "user.registered",
+      "broker": "nats",
+      "side": "subscriber",
+      "source": "src/nats/subscriber.ts",
+      "primary_type_symbol": "UserRegisteredEvent",
+      "resolved_type": "{ userId: string; email: string; registeredAt: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": []
+}

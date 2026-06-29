@@ -1,0 +1,68 @@
+{
+  "endpoints": [],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/notifications/:param",
+      "host_contains": "NOTIFICATIONS_URL",
+      "path_contains": "/notifications/",
+      "import_source": null,
+      "primary_type_symbol": "Notification",
+      "resolved_type": "{ id: string; message: string; read: boolean; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/track",
+      "host_contains": "ANALYTICS_URL",
+      "path_contains": "/track",
+      "import_source": null,
+      "primary_type_symbol": "TrackResult",
+      "resolved_type": "{ ok: boolean; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "pubsub_operations": [
+    {
+      "role": "producer",
+      "service": "web-dashboard",
+      "key": "pubsub|metrics.page_view",
+      "topic": "metrics.page_view",
+      "broker": "redis",
+      "side": "subscriber",
+      "source": "lib/realtime.ts",
+      "primary_type_symbol": "PageView",
+      "resolved_type": "{ path: string; userId: string; ts: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "graphql_operations": [
+    {
+      "role": "consumer",
+      "service": "web-dashboard",
+      "key": "graphql|query|order",
+      "kind": "query",
+      "field": "order",
+      "source": "graphql/generated.ts",
+      "primary_type_symbol": "OrderView",
+      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; }",
+      "type_state": "Explicit",
+      "tier": "roadmap"
+    },
+    {
+      "role": "consumer",
+      "service": "web-dashboard",
+      "key": "graphql|subscription|orderEvents",
+      "kind": "subscription",
+      "field": "orderEvents",
+      "source": "graphql/generated.ts",
+      "primary_type_symbol": "OrderEvent",
+      "resolved_type": "{ orderId: string; kind: \"placed\" | \"shipped\" | \"cancelled\"; }",
+      "type_state": "Explicit",
+      "tier": "roadmap"
+    }
+  ]
+}
