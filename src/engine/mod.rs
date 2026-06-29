@@ -1230,7 +1230,70 @@ fn append_deterministic_protocol_operations(
         );
     }
 
+    append_pubsub_operations(cloud_data, file_results, &to_details);
+
     ProtocolExtractions { graphql, sockets }
+}
+
+/// Fold the file-analyzer's `pubsub_operations` into `cloud_data` so they reach
+/// the exact-key matcher (#corpus-2 edge #4). A subscriber registers a handler
+/// and is the contract producer → `cloud_data.endpoints`; a publisher sends and
+/// is the consumer → `cloud_data.calls`. Identity is the topic alone
+/// (`OperationKey::pubsub`), so a subscriber and a publisher on the same topic in
+/// two repos share one key and match.
+///
+/// Unlike GraphQL there is no SDL backstop, so we push every LLM op directly
+/// (the deterministic append path), NOT through `merge_graphql_resolver_locations`
+/// which would discard ops with no schema producer. Repo identity is back-filled
+/// later by `AnalyzerBuilder::build_from_repo_data`; the only requirement is that
+/// these ops sit in `cloud_data` before serialization.
+///
+/// An op whose `role` is `None` (model omitted it or emitted an off-enum value,
+/// absorbed leniently) can't be placed on either side and is dropped with a debug
+/// log. Only literal topics are extracted today (env-template collapse is deferred).
+fn append_pubsub_operations(
+    cloud_data: &mut CloudRepoData,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+) {
+    use crate::operation::PubsubRole;
+
+    let mut subscribers = 0usize;
+    let mut publishers = 0usize;
+    let mut dropped = 0usize;
+    for (path, result) in file_results {
+        for op in &result.pubsub_operations {
+            let line = u32::try_from(op.line_number).unwrap_or(0);
+            let file_path = PathBuf::from(path);
+            let key = OperationKey::pubsub(op.topic.clone());
+            match op.role {
+                Some(PubsubRole::Subscriber) => {
+                    cloud_data
+                        .endpoints
+                        .push(to_details(key, &file_path, line));
+                    subscribers += 1;
+                }
+                Some(PubsubRole::Publisher) => {
+                    cloud_data.calls.push(to_details(key, &file_path, line));
+                    publishers += 1;
+                }
+                None => {
+                    debug!(
+                        topic = %op.topic,
+                        file = %path,
+                        "pubsub_operation has no role; dropping"
+                    );
+                    dropped += 1;
+                }
+            }
+        }
+    }
+    if subscribers + publishers + dropped > 0 {
+        debug!(
+            subscribers,
+            publishers, dropped, "Indexing pub/sub operations"
+        );
+    }
 }
 
 /// Fold the file-analyzer's `graphql_operations` into the SDL-derived producers
@@ -2977,6 +3040,7 @@ mod tests {
                 })
                 .collect(),
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         }
     }
 
@@ -3345,6 +3409,7 @@ mod tests {
                     }],
                     data_calls: vec![],
                     graphql_operations: vec![],
+                    pubsub_operations: vec![],
                 },
             );
         }
@@ -4114,6 +4179,7 @@ mod tests {
                         type_import_source: None,
                     },
                 ],
+                pubsub_operations: vec![],
             },
         );
 

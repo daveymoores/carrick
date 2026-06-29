@@ -1889,6 +1889,7 @@ impl Analyzer {
         for (protocol, label) in [
             (crate::operation::Protocol::Graphql, "GraphQL"),
             (crate::operation::Protocol::Websocket, "Socket.IO"),
+            (crate::operation::Protocol::Pubsub, "Pub/Sub"),
         ] {
             let (
                 protocol_call_issues,
@@ -2834,6 +2835,40 @@ mod tests {
         assert_eq!(s.consumer_repo, "payments-svc");
         assert_eq!(s.producer_key, "socket|SERVER->CLIENT|payment:settled");
         assert_eq!(s.consumer_key, "socket|SERVER->CLIENT|payment:settled");
+    }
+
+    #[test]
+    fn pubsub_redis_exact_topic_emits_cross_repo_edge() {
+        // Corpus-2 edge #4: web-dashboard SUBSCRIBES Redis `metrics.page_view`
+        // (the contract producer / endpoint) while analytics-worker PUBLISHES it
+        // (the consumer / call). Identity is the topic alone, so the subscriber
+        // and publisher keys are equal and match exactly across the two repos.
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.endpoints.push(graphql_details_in_repo(
+            OperationKey::pubsub("metrics.page_view"),
+            "web/lib/realtime.ts:5",
+            "web-dashboard",
+        ));
+        analyzer.calls.push(graphql_details_in_repo(
+            OperationKey::pubsub("metrics.page_view"),
+            "analytics/redis/publisher.ts:7",
+            "analytics-worker",
+        ));
+
+        let (_, _, _, edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Pubsub, "Pub/Sub");
+        assert_eq!(edges.len(), 1, "one pub/sub edge expected");
+        let e = &edges[0];
+        assert_eq!(e.producer_repo, "web-dashboard");
+        assert_eq!(e.consumer_repo, "analytics-worker");
+        assert_eq!(e.producer_key, "pubsub|metrics.page_view");
+        assert_eq!(e.consumer_key, "pubsub|metrics.page_view");
+        assert_eq!(e.match_score, 1.0);
+        // Compat is filled in later by overlay_compat_verdicts, not here; pub/sub
+        // compat machinery is deferred, so it stays None.
+        assert_eq!(e.type_compatible, None);
     }
 
     #[test]
