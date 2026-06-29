@@ -276,13 +276,13 @@ impl EvalOp {
             expanded_definition: fields.and_then(|f| f.expanded_definition.clone()),
             is_explicit: fields.and_then(|f| f.is_explicit),
             // The real LLM type anchor (#233): the symbol threaded onto the
-            // manifest entry, falling back to the hashed `type_alias` only when
-            // no real symbol was extracted for this op.
-            primary_type_symbol: fields.and_then(|f| {
-                f.primary_type_symbol
-                    .clone()
-                    .or_else(|| f.type_alias.clone())
-            }),
+            // manifest entry. NO fallback to the hashed `type_alias` — an op whose
+            // response is an inline/anonymous type (e.g. `GET /users/recent`
+            // returning a bare `{ count; ids }`) has no named symbol, so its anchor
+            // is genuinely `None`. Substituting the synthetic `Endpoint_<hash>`
+            // alias there fabricates an anchor the source never declared and mis-
+            // scores against an expected `None`.
+            primary_type_symbol: fields.and_then(|f| f.primary_type_symbol.clone()),
         }
     }
 }

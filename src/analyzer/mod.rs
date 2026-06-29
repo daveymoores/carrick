@@ -603,7 +603,7 @@ impl Analyzer {
                 let first_version = &repo_infos[0].version;
                 let has_conflicts = repo_infos.iter().any(|info| info.version != *first_version);
 
-                if has_conflicts {
+                if has_conflicts && Self::is_reportable_conflict(&repo_infos) {
                     let severity = Self::determine_conflict_severity(&repo_infos);
                     conflicts.push(DependencyConflict {
                         package_name,
@@ -615,6 +615,34 @@ impl Analyzer {
         }
 
         conflicts
+    }
+
+    /// A cross-service version difference is only worth reporting when the
+    /// versions are semver-INCOMPATIBLE — i.e. they span more than one MAJOR
+    /// version (`zod` 3.x vs 4.x). Differences confined to minor/patch within a
+    /// single major (`typescript` 5.3 vs 5.4) are semver-compatible by
+    /// construction and would be false positives: they don't cause the
+    /// cross-service type/runtime breakage this report exists to surface, and on
+    /// real org-wide installs they are pervasive noise that buries the genuine
+    /// major-version conflicts. Versions that don't parse as semver fall back to
+    /// "report it" — `has_conflicts` already established the raw strings differ,
+    /// and a genuinely divergent non-semver pin (`workspace:*` vs a tag, a git
+    /// URL) must never be silently dropped.
+    fn is_reportable_conflict(repo_infos: &[RepoPackageInfo]) -> bool {
+        use semver::Version;
+
+        let parsed: Vec<Version> = repo_infos
+            .iter()
+            .filter_map(|info| Version::parse(&info.version).ok())
+            .collect();
+
+        // At least one version is not valid semver: report conservatively.
+        if parsed.len() != repo_infos.len() {
+            return true;
+        }
+
+        let first_major = parsed[0].major;
+        parsed.iter().any(|v| v.major != first_major)
     }
 
     fn determine_conflict_severity(repo_infos: &[RepoPackageInfo]) -> ConflictSeverity {
@@ -2261,6 +2289,55 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-service dependency conflicts are reported only when semver-
+    /// INCOMPATIBLE (a major-version spread). `zod` 3.22.0 vs 4.0.0 is a real
+    /// conflict (Critical); `typescript` 5.3.0 vs 5.4.0 is a compatible same-major
+    /// drift and must be suppressed — it was the false positive that pinned the
+    /// xrepo-corpus-1 dependency F1 to 0.667 (precision 0.5). Non-semver pins that
+    /// differ as raw strings are reported conservatively.
+    #[test]
+    fn dependency_conflict_reported_only_when_major_incompatible() {
+        fn infos(versions: &[&str]) -> Vec<RepoPackageInfo> {
+            versions
+                .iter()
+                .enumerate()
+                .map(|(i, v)| RepoPackageInfo {
+                    repo_name: format!("repo-{i}"),
+                    version: (*v).to_string(),
+                    source_path: PathBuf::from("package.json"),
+                })
+                .collect()
+        }
+
+        // zod 3.x vs 4.x — major spread → reported, Critical.
+        let zod = infos(&["3.22.0", "4.0.0"]);
+        assert!(Analyzer::is_reportable_conflict(&zod));
+        assert!(matches!(
+            Analyzer::determine_conflict_severity(&zod),
+            ConflictSeverity::Critical
+        ));
+
+        // typescript 5.3 vs 5.4 — same-major minor drift → suppressed.
+        assert!(!Analyzer::is_reportable_conflict(&infos(&[
+            "5.3.0", "5.4.0"
+        ])));
+        // patch-only drift → also suppressed.
+        assert!(!Analyzer::is_reportable_conflict(&infos(&[
+            "1.1.1", "1.1.2"
+        ])));
+        // three same-major versions → suppressed.
+        assert!(!Analyzer::is_reportable_conflict(&infos(&[
+            "18.2.0", "18.3.0", "18.3.1"
+        ])));
+
+        // A non-semver pin that differs as a raw string → reported conservatively
+        // (has_conflicts upstream already established the strings differ).
+        assert!(Analyzer::is_reportable_conflict(&infos(&[
+            "workspace:*",
+            "1.0.0"
+        ])));
+    }
 
     #[test]
     fn route_shape_drops_non_route_values() {
