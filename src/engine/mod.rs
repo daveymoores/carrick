@@ -1011,6 +1011,7 @@ async fn analyze_current_repo_incremental(
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config);
             stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
             append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+            append_pubsub_manifest_entries(&mut manifest_entries, &merged_results);
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -1024,6 +1025,11 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator
                     .collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
             );
+            // Pub/sub ops are LLM-sourced in `merged_results`, not in the
+            // deterministic `protocol_extractions`, so their payload anchors
+            // bundle through the same path (#corpus-2 resolution dim).
+            protocol_requests
+                .extend(file_orchestrator.collect_pubsub_type_requests(&merged_results, repo_path));
 
             // GraphQL producers take the infer path, not the bundle path: their
             // response contract is the resolver's expanded RETURN type, so they
@@ -1230,7 +1236,132 @@ fn append_deterministic_protocol_operations(
         );
     }
 
+    append_pubsub_operations(cloud_data, file_results, &to_details);
+
     ProtocolExtractions { graphql, sockets }
+}
+
+/// Fold the file-analyzer's `pubsub_operations` into `cloud_data` so they reach
+/// the exact-key matcher (#corpus-2 edge #4). A subscriber registers a handler
+/// and is the contract producer → `cloud_data.endpoints`; a publisher sends and
+/// is the consumer → `cloud_data.calls`. Identity is the topic alone
+/// (`OperationKey::pubsub`), so a subscriber and a publisher on the same topic in
+/// two repos share one key and match.
+///
+/// Unlike GraphQL there is no SDL backstop, so we push every LLM op directly
+/// (the deterministic append path), NOT through `merge_graphql_resolver_locations`
+/// which would discard ops with no schema producer. Repo identity is back-filled
+/// later by `AnalyzerBuilder::build_from_repo_data`; the only requirement is that
+/// these ops sit in `cloud_data` before serialization.
+///
+/// An op whose `role` is `None` (model omitted it or emitted an off-enum value,
+/// absorbed leniently) can't be placed on either side and is dropped with a debug
+/// log. Only literal topics are extracted today (env-template collapse is deferred).
+fn append_pubsub_operations(
+    cloud_data: &mut CloudRepoData,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+) {
+    use crate::operation::PubsubRole;
+
+    let mut subscribers = 0usize;
+    let mut publishers = 0usize;
+    let mut dropped = 0usize;
+    // Deterministic order: HashMap iteration is unordered, so sort by path
+    // before pushing endpoints/calls (keeps scanner output stable).
+    let mut paths: Vec<&String> = file_results.keys().collect();
+    paths.sort();
+    for path in paths {
+        let result = &file_results[path];
+        for op in &result.pubsub_operations {
+            let line = u32::try_from(op.line_number).unwrap_or(0);
+            let file_path = PathBuf::from(path);
+            let key = OperationKey::pubsub(op.topic.clone());
+            match op.role {
+                Some(PubsubRole::Subscriber) => {
+                    cloud_data.endpoints.push(to_details(key, &file_path, line));
+                    subscribers += 1;
+                }
+                Some(PubsubRole::Publisher) => {
+                    cloud_data.calls.push(to_details(key, &file_path, line));
+                    publishers += 1;
+                }
+                None => {
+                    debug!(
+                        topic = %op.topic,
+                        file = %path,
+                        "pubsub_operation has no role; dropping"
+                    );
+                    dropped += 1;
+                }
+            }
+        }
+    }
+    if subscribers + publishers + dropped > 0 {
+        debug!(
+            subscribers,
+            publishers, dropped, "Indexing pub/sub operations"
+        );
+    }
+}
+
+/// Emit type-manifest entries for the LLM-extracted pub/sub operations so they
+/// carry a type anchor, mirroring the Socket.IO manifest path exactly (#PR-4).
+///
+/// `append_pubsub_operations` already places pub/sub ops in
+/// `cloud_data.endpoints/calls`, which is enough for the exact-key matcher to
+/// MATCH a subscriber against a publisher — but without a manifest entry the op
+/// has no `primary_type_symbol` anchor, so the anchor + resolution dimensions
+/// treat every extracted pub/sub op as an untyped miss. This re-walks the same
+/// `file_results` and, for each op carrying a decoded-payload
+/// `primary_type_symbol`, emits one Response-kind manifest entry: a subscriber
+/// (the contract producer) → `ManifestRole::Producer`; a publisher (the
+/// consumer) → `ManifestRole::Consumer`. The `primary_type_symbol` is threaded
+/// straight onto the entry so the sidecar resolves it through the same
+/// SymbolRequest bundle path Socket.IO payloads use.
+///
+/// Pub/sub ops live in `file_results` (LLM-sourced), not the deterministic
+/// `ProtocolExtractions` struct, so this is a sibling of
+/// `append_protocol_manifest_entries` rather than a branch inside it. It is
+/// called at both manifest call sites (incremental + full) right after the
+/// deterministic protocols are folded in.
+///
+/// Mirroring socket's null handling: an op with `primary_type_symbol: None`
+/// (untyped or inline-object payload) still gets a manifest entry, just with a
+/// `None` symbol — the entry stays `Unknown`, exactly as a socket emitter whose
+/// payload type the extractor couldn't capture. An op with no role is skipped
+/// (it was already dropped from `cloud_data` and has nothing to anchor).
+fn append_pubsub_manifest_entries(
+    entries: &mut Vec<TypeManifestEntry>,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    use crate::operation::PubsubRole;
+
+    // Deterministic order: sort paths before emitting manifest entries.
+    let mut paths: Vec<&String> = file_results.keys().collect();
+    paths.sort();
+    for path in paths {
+        let result = &file_results[path];
+        for op in &result.pubsub_operations {
+            let role = match op.role {
+                Some(PubsubRole::Subscriber) => ManifestRole::Producer,
+                Some(PubsubRole::Publisher) => ManifestRole::Consumer,
+                // No role → not placed on either side of `cloud_data`; nothing
+                // to anchor, so emit no manifest entry.
+                None => continue,
+            };
+            let key = OperationKey::pubsub(op.topic.clone());
+            let line = u32::try_from(op.line_number).unwrap_or(0);
+            add_protocol_manifest_entry(
+                entries,
+                &key,
+                role,
+                path,
+                line,
+                op.primary_type_symbol.clone(),
+            );
+        }
+    }
 }
 
 /// Fold the file-analyzer's `graphql_operations` into the SDL-derived producers
@@ -2249,6 +2380,7 @@ async fn analyze_current_repo(
     let mut manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
     append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+    append_pubsub_manifest_entries(&mut manifest_entries, &analysis_result.file_results);
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -2273,6 +2405,12 @@ async fn analyze_current_repo(
         file_orchestrator.collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
     protocol_requests.extend(
         file_orchestrator.collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
+    );
+    // Pub/sub ops are LLM-sourced in `analysis_result.file_results`, not in the
+    // deterministic `protocol_extractions`, so their payload anchors bundle
+    // through the same path (#corpus-2 resolution dim).
+    protocol_requests.extend(
+        file_orchestrator.collect_pubsub_type_requests(&analysis_result.file_results, repo_path),
     );
 
     // GraphQL producers take the infer path, not the bundle path: their response
@@ -2977,6 +3115,7 @@ mod tests {
                 })
                 .collect(),
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         }
     }
 
@@ -3345,6 +3484,7 @@ mod tests {
                     }],
                     data_calls: vec![],
                     graphql_operations: vec![],
+                    pubsub_operations: vec![],
                 },
             );
         }
@@ -3543,6 +3683,7 @@ mod tests {
             cached_detection: Some(DetectionResult {
                 frameworks: vec!["express".to_string()],
                 data_fetchers: vec!["fetch".to_string()],
+                messaging_clients: vec![],
                 notes: "test".to_string(),
             }),
             cached_guidance: None,
@@ -4066,6 +4207,25 @@ mod tests {
         }
     }
 
+    /// A pub/sub op the file-analyzer would emit: topic + side + decoded-payload
+    /// `primary_type_symbol`. Mirrors `socket_op`/`graphql_op` for the manifest
+    /// tests.
+    fn pubsub_op(
+        topic: &str,
+        role: crate::operation::PubsubRole,
+        symbol: Option<&str>,
+        source: Option<&str>,
+    ) -> crate::agents::file_analyzer_agent::PubsubOperation {
+        crate::agents::file_analyzer_agent::PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(role),
+            line_number: 14,
+            primary_type_symbol: symbol.map(String::from),
+            type_import_source: source.map(String::from),
+            broker: Some("redis".to_string()),
+        }
+    }
+
     /// Stage B1 merge: the file-analyzer's `graphql_operations` join their
     /// resolver location onto the SDL producer sharing the same canonical key.
     /// The SDL producer alone has no resolver location; after the merge it points
@@ -4114,6 +4274,7 @@ mod tests {
                         type_import_source: None,
                     },
                 ],
+                pubsub_operations: vec![],
             },
         );
 
@@ -4282,6 +4443,217 @@ mod tests {
         );
         assert_eq!(manifest_alias, expected);
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// The same fragile alias contract for pub/sub (PR-6, corpus-2 resolution dim):
+    /// the SymbolRequest alias produced by `collect_pubsub_type_requests` MUST
+    /// byte-match the manifest entry's alias from `append_pubsub_manifest_entries`,
+    /// or the resolved payload `.d.ts` never joins back and the op stays
+    /// `Unknown` — silently. A subscriber is the producer side.
+    #[test]
+    fn pubsub_symbol_request_alias_matches_manifest_alias() {
+        use crate::operation::PubsubRole;
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "web-dashboard/lib/realtime.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "metrics.page_view",
+                    PubsubRole::Subscriber,
+                    Some("PageView"),
+                    Some("./types/metrics"),
+                )],
+                ..Default::default()
+            },
+        );
+
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(&mut entries, &file_results);
+        let manifest_alias = entries
+            .iter()
+            .find(|e| e.key.canonical() == "pubsub|metrics.page_view")
+            .map(|e| e.type_alias.clone())
+            .expect("pubsub manifest entry");
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let request = requests
+            .iter()
+            .find(|r| r.symbol_name == "PageView")
+            .expect("pubsub SymbolRequest");
+
+        assert_eq!(
+            request.alias.as_deref(),
+            Some(manifest_alias.as_str()),
+            "pubsub SymbolRequest.alias must byte-match the manifest entry's alias \
+             or the resolution enrich-join silently breaks"
+        );
+        // Independently confirm both equal the canonical builder output
+        // (subscriber = producer side).
+        let expected = crate::type_manifest::build_manifest_type_alias(
+            &OperationKey::pubsub("metrics.page_view"),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+        );
+        assert_eq!(manifest_alias, expected);
+        assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// PR-4: a subscriber pub/sub op carrying a decoded-payload
+    /// `primary_type_symbol` reaches BOTH `cloud_data.endpoints` (via
+    /// `append_pubsub_operations`, PR-3) AND the type manifest as a
+    /// `ManifestRole::Producer` entry anchored on that symbol (via
+    /// `append_pubsub_manifest_entries`, PR-4); a publisher op becomes a
+    /// `ManifestRole::Consumer` manifest entry. This is the Socket.IO manifest
+    /// path mirrored for pub/sub, so the anchor + resolution dimensions stop
+    /// treating extracted pub/sub ops as untyped misses.
+    #[test]
+    fn pubsub_ops_reach_cloud_data_and_manifest_with_payload_anchor() {
+        use crate::operation::PubsubRole;
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "metrics-service/src/consumer.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "metrics.page_view",
+                    PubsubRole::Subscriber,
+                    Some("PageView"),
+                    Some("./types/page-view"),
+                )],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "web-frontend/src/track.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "metrics.page_view",
+                    PubsubRole::Publisher,
+                    Some("PageView"),
+                    Some("./types/page-view"),
+                )],
+                ..Default::default()
+            },
+        );
+
+        // PR-3 side: the subscriber lands in endpoints (producer), the publisher
+        // in calls (consumer), keyed identically so they match cross-repo.
+        let mut cloud_data = repo_with_bundle("metrics-monorepo", None, "");
+        let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+            owner: None,
+            key,
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
+            repo_name: None,
+            service_name: None,
+        };
+        append_pubsub_operations(&mut cloud_data, &file_results, &to_details);
+        assert_eq!(
+            cloud_data
+                .endpoints
+                .iter()
+                .filter(|e| e.key.canonical() == "pubsub|metrics.page_view")
+                .count(),
+            1,
+            "the subscriber must register as a producer endpoint"
+        );
+        assert_eq!(
+            cloud_data
+                .calls
+                .iter()
+                .filter(|c| c.key.canonical() == "pubsub|metrics.page_view")
+                .count(),
+            1,
+            "the publisher must register as a consumer call"
+        );
+
+        // PR-4 side: both ops emit a manifest entry anchored on the payload type.
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(&mut entries, &file_results);
+
+        let producer = entries
+            .iter()
+            .find(|e| {
+                e.key.canonical() == "pubsub|metrics.page_view" && e.role == ManifestRole::Producer
+            })
+            .expect("subscriber pub/sub op must emit a Producer manifest entry");
+        assert_eq!(producer.type_kind, ManifestTypeKind::Response);
+        assert_eq!(producer.primary_type_symbol.as_deref(), Some("PageView"));
+        assert_eq!(producer.type_state, ManifestTypeState::Unknown);
+        assert!(
+            !producer.type_alias.is_empty(),
+            "pub/sub op must get a stable type_alias"
+        );
+
+        let consumer = entries
+            .iter()
+            .find(|e| {
+                e.key.canonical() == "pubsub|metrics.page_view" && e.role == ManifestRole::Consumer
+            })
+            .expect("publisher pub/sub op must emit a Consumer manifest entry");
+        assert_eq!(consumer.primary_type_symbol.as_deref(), Some("PageView"));
+
+        // Exactly one entry per op — no phantom Request alias, mirroring socket.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.key.canonical() == "pubsub|metrics.page_view")
+                .count(),
+            2
+        );
+    }
+
+    /// A pub/sub op with no decoded payload type (`primary_type_symbol: None`)
+    /// still gets a manifest entry, just with a `None` symbol — exactly how a
+    /// socket emitter whose payload the extractor couldn't capture is handled.
+    /// An op with no role anchors nothing and emits no entry.
+    #[test]
+    fn pubsub_op_without_payload_symbol_still_anchors_and_no_role_skips() {
+        use crate::operation::PubsubRole;
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/handlers.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![
+                    pubsub_op("orders.created", PubsubRole::Subscriber, None, None),
+                    crate::agents::file_analyzer_agent::PubsubOperation {
+                        topic: "orders.shipped".to_string(),
+                        role: None,
+                        line_number: 9,
+                        primary_type_symbol: Some("Shipment".to_string()),
+                        type_import_source: None,
+                        broker: None,
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(&mut entries, &file_results);
+
+        let untyped = entries
+            .iter()
+            .find(|e| e.key.canonical() == "pubsub|orders.created")
+            .expect("untyped subscriber still emits a manifest entry");
+        assert_eq!(untyped.role, ManifestRole::Producer);
+        assert_eq!(untyped.primary_type_symbol, None);
+
+        // The roleless op was dropped — no entry, regardless of its symbol.
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.key.canonical() == "pubsub|orders.shipped"),
+            "a pub/sub op with no role must emit no manifest entry"
+        );
     }
 
     /// Same fragile contract for GraphQL consumers: the alias on the consumer

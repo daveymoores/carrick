@@ -24,6 +24,11 @@ pub enum Protocol {
     /// the scanner today so they stop reaching the HTTP prompt; the
     /// socket-specific prompt arrives with the Phase 2 work.
     Websocket,
+    /// Topic-keyed publish/subscribe (Redis pub/sub today; Kafka/NATS are
+    /// future adapters under the same family). A subscriber is the producer
+    /// (endpoint); a publisher is the consumer (call). Identity is the topic
+    /// alone — the broker is diagnostic, not part of the key.
+    Pubsub,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -67,6 +72,36 @@ impl CallKind {
             "external_http" => Some(CallKind::ExternalHttp),
             "sdk" => Some(CallKind::Sdk),
             "unresolved" => Some(CallKind::Unresolved),
+            _ => None,
+        }
+    }
+}
+
+/// Which side of a pub/sub topic an operation sits on. A subscriber registers a
+/// handler for a topic and is the contract producer (endpoint); a publisher
+/// sends to a topic and is the contract consumer (call). Assigned by the
+/// file-analyzer LLM and parsed leniently (mirrors [`CallKind::parse_lenient`])
+/// so one off-enum value can't fail the whole file's deserialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PubsubRole {
+    Subscriber,
+    Publisher,
+}
+
+impl PubsubRole {
+    /// Parse a model-emitted role string leniently (case-insensitive; `-`/space
+    /// separators tolerated). Returns `None` for anything off-enum so one junk
+    /// value can't fail the whole file's parse (mirrors [`CallKind::parse_lenient`]).
+    pub fn parse_lenient(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
+            "subscriber" => Some(PubsubRole::Subscriber),
+            "publisher" => Some(PubsubRole::Publisher),
             _ => None,
         }
     }
@@ -133,6 +168,12 @@ pub enum OperationKey {
         event: String,
         direction: SocketDirection,
     },
+    /// A publish/subscribe topic, identified by topic name alone. Subscribers
+    /// (handler registrations) are producers; publishers (sends) are consumers.
+    /// Carries no direction: the role lives on which side (endpoint vs call) the
+    /// op sits, and the broker is diagnostic, not part of identity — so a
+    /// subscriber and a publisher on the same topic share one key and match.
+    Pubsub { topic: String },
 }
 
 impl OperationKey {
@@ -141,6 +182,7 @@ impl OperationKey {
             OperationKey::Http { .. } => Protocol::Http,
             OperationKey::Graphql { .. } => Protocol::Graphql,
             OperationKey::Socket { .. } => Protocol::Websocket,
+            OperationKey::Pubsub { .. } => Protocol::Pubsub,
         }
     }
 
@@ -167,13 +209,24 @@ impl OperationKey {
         }
     }
 
+    /// Build a pub/sub key. Identity is the topic alone (no direction, no
+    /// broker), so a subscriber and a publisher on the same topic produce
+    /// equal keys and match exactly.
+    pub fn pubsub(topic: impl Into<String>) -> Self {
+        OperationKey::Pubsub {
+            topic: topic.into(),
+        }
+    }
+
     /// `(method, path)` when this is an HTTP operation. HTTP-only code paths
     /// (mount-graph matching, REST manifest building, alias generation)
     /// filter through this — it is the protocol dispatch point.
     pub fn as_http(&self) -> Option<(&str, &str)> {
         match self {
             OperationKey::Http { method, path } => Some((method, path)),
-            OperationKey::Graphql { .. } | OperationKey::Socket { .. } => None,
+            OperationKey::Graphql { .. }
+            | OperationKey::Socket { .. }
+            | OperationKey::Pubsub { .. } => None,
         }
     }
 
@@ -183,7 +236,9 @@ impl OperationKey {
     pub fn graphql_field(&self) -> Option<&str> {
         match self {
             OperationKey::Graphql { field, .. } => Some(field.as_str()),
-            OperationKey::Http { .. } | OperationKey::Socket { .. } => None,
+            OperationKey::Http { .. }
+            | OperationKey::Socket { .. }
+            | OperationKey::Pubsub { .. } => None,
         }
     }
 
@@ -204,6 +259,7 @@ impl OperationKey {
             OperationKey::Socket { event, direction } => {
                 (direction.label().to_string(), event.clone())
             }
+            OperationKey::Pubsub { topic } => ("PUBSUB".to_string(), topic.clone()),
         }
     }
 
@@ -217,6 +273,8 @@ impl OperationKey {
             OperationKey::Socket { event, direction } => {
                 format!("socket|{}|{}", direction.label(), event)
             }
+            // 2-segment: pub/sub identity is the topic alone, no direction.
+            OperationKey::Pubsub { topic } => format!("pubsub|{}", topic),
         }
     }
 }
@@ -229,6 +287,7 @@ impl fmt::Display for OperationKey {
             OperationKey::Socket { event, direction } => {
                 write!(f, "{} ({})", event, direction.as_str())
             }
+            OperationKey::Pubsub { topic } => write!(f, "{} (pub/sub)", topic),
         }
     }
 }
@@ -296,6 +355,44 @@ mod tests {
 
         let other_direction = OperationKey::socket("chat:message", SocketDirection::ServerToClient);
         assert_ne!(key, other_direction);
+    }
+
+    #[test]
+    fn pubsub_key_identity_and_dispatch() {
+        let key = OperationKey::pubsub("metrics.page_view");
+        assert_eq!(key.as_http(), None);
+        assert_eq!(key.graphql_field(), None);
+        assert_eq!(key.protocol(), Protocol::Pubsub);
+        // 2-segment canonical: topic only, no direction or broker.
+        assert_eq!(key.canonical(), "pubsub|metrics.page_view");
+        assert_eq!(
+            key.display_labels(),
+            ("PUBSUB".to_string(), "metrics.page_view".to_string())
+        );
+        assert_eq!(key.to_string(), "metrics.page_view (pub/sub)");
+
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(json.contains("\"protocol\":\"pubsub\""), "got {}", json);
+        let back: OperationKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, key);
+
+        // A subscriber and a publisher on the same topic share one key (no
+        // direction field), so they match exactly.
+        let same_topic = OperationKey::pubsub("metrics.page_view");
+        assert_eq!(key, same_topic);
+        let other_topic = OperationKey::pubsub("orders.placed");
+        assert_ne!(key, other_topic);
+
+        // Lenient role parsing mirrors CallKind.
+        assert_eq!(
+            PubsubRole::parse_lenient("subscriber"),
+            Some(PubsubRole::Subscriber)
+        );
+        assert_eq!(
+            PubsubRole::parse_lenient("Publisher"),
+            Some(PubsubRole::Publisher)
+        );
+        assert_eq!(PubsubRole::parse_lenient("??"), None);
     }
 
     #[test]

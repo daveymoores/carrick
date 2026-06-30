@@ -99,6 +99,22 @@ where
         .and_then(crate::operation::CallKind::parse_lenient))
 }
 
+fn deserialize_pubsub_role<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::operation::PubsubRole>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Absorb off-enum / non-string role values to None instead of failing the
+    // whole file's parse (mirrors call_kind). A role of None means the op can't
+    // be placed on either side, so engine ingestion drops it with a debug log.
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::operation::PubsubRole::parse_lenient))
+}
+
 /// Result of analyzing a single endpoint definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResult {
@@ -200,6 +216,37 @@ pub struct GraphqlOperation {
     pub type_import_source: Option<String>,
 }
 
+/// A pub/sub operation the file-analyzer found: the topic it targets and which
+/// side (subscriber = producer, publisher = consumer) the code sits on. Mirrors
+/// the `pubsub_operations` array in `AgentSchemas::file_analysis_schema`. The
+/// `role` wire values (subscriber / publisher) come from
+/// `crate::operation::PubsubRole`, the single source of truth; the schema enum
+/// is kept in lockstep by `pubsub_operations_schema_enum_matches_serde_wire_values`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubsubOperation {
+    /// The exact topic/channel name (literal string).
+    pub topic: String,
+    /// Which side of the topic this op sits on. `None` when the model omitted it
+    /// or emitted an off-enum value (lenient, like call_kind); such an op can't
+    /// be placed on either side and is dropped during engine ingestion.
+    #[serde(default, deserialize_with = "deserialize_pubsub_role")]
+    pub role: Option<crate::operation::PubsubRole>,
+    /// Line number where the operation appears.
+    pub line_number: i32,
+    /// The primary payload type symbol without wrappers (e.g., "PageViewEvent").
+    /// `None` for untyped or inline-object payloads.
+    #[serde(default)]
+    pub primary_type_symbol: Option<String>,
+    /// Import path where the type is defined, null if inline or same file. Null
+    /// whenever `primary_type_symbol` is null.
+    #[serde(default)]
+    pub type_import_source: Option<String>,
+    /// Diagnostic only: the pub/sub library/transport if evident (e.g., "redis").
+    /// Not part of the operation's identity.
+    #[serde(default)]
+    pub broker: Option<String>,
+}
+
 /// Complete analysis result for a single file
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileAnalysisResult {
@@ -211,6 +258,11 @@ pub struct FileAnalysisResult {
     /// the whole file's parse.
     #[serde(default)]
     pub graphql_operations: Vec<GraphqlOperation>,
+    /// Pub/sub operations found in the file. Optional on the wire (a model may
+    /// omit it for files with no pub/sub), so default to empty rather than
+    /// failing the whole file's parse.
+    #[serde(default)]
+    pub pubsub_operations: Vec<PubsubOperation>,
 }
 
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
@@ -430,9 +482,17 @@ impl FileAnalyzerAgent {
 
     /// Sanitize the LLM response to fix common issues like "+null" strings
     fn sanitize_result(result: &mut FileAnalysisResult) -> bool {
-        // Helper to check if a string represents null
+        // Helper to check if a string represents null. Covers the placeholder /
+        // null-like literals the model intermittently emits ("null", "+null",
+        // "-null", "NULL", "undefined", "-", "").
         fn is_null_string(s: &str) -> bool {
-            s == "+null" || s == "null" || s == "NULL" || s == "-" || s.is_empty()
+            s == "+null"
+                || s == "-null"
+                || s == "null"
+                || s == "NULL"
+                || s == "undefined"
+                || s == "-"
+                || s.is_empty()
         }
 
         fn normalize_optional_string(value: &mut Option<String>) {
@@ -556,6 +616,33 @@ impl FileAnalyzerAgent {
                 data_call.primary_type_symbol = None;
             }
         }
+
+        // Sanitize pub/sub operations (#283): trim/normalize the topic, payload
+        // type symbol, and its import source the same way data_calls are handled.
+        result.pubsub_operations.retain_mut(|op| {
+            let trimmed_topic = op.topic.trim();
+            // Drop the op when the topic is a null-like placeholder the model
+            // sometimes emits ("null", "+null", "-null", "undefined", "", "-"):
+            // a topicless pub/sub op has no identity and can't be placed on
+            // either side, so it must not survive into the engine.
+            if is_null_string(trimmed_topic) {
+                return false;
+            }
+            if trimmed_topic != op.topic.as_str() {
+                op.topic = trimmed_topic.to_string();
+            }
+            normalize_optional_string(&mut op.primary_type_symbol);
+            if normalize_import_source(&mut op.type_import_source) {
+                needs_retry = true;
+            }
+            if let Some(ref symbol) = op.primary_type_symbol
+                && !is_valid_identifier(symbol)
+            {
+                op.primary_type_symbol = None;
+            }
+            normalize_optional_string(&mut op.broker);
+            true
+        });
 
         needs_retry
     }
@@ -967,6 +1054,7 @@ mod tests {
             endpoints: vec![endpoint],
             data_calls: vec![],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
 
         FileAnalyzerAgent::sanitize_result(&mut result);
@@ -985,6 +1073,7 @@ mod tests {
             endpoints: vec![endpoint],
             data_calls: vec![],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
         FileAnalyzerAgent::sanitize_result(&mut result);
         assert_eq!(
@@ -1167,6 +1256,7 @@ mod tests {
                 type_import_source: Some("bad import (oops)".to_string()),
             }],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
 
         let needs_retry = FileAnalyzerAgent::sanitize_result(&mut result);
@@ -1180,6 +1270,37 @@ mod tests {
         assert_eq!(data_call.method, Some("POST".to_string()));
         assert!(data_call.primary_type_symbol.is_none());
         assert!(data_call.type_import_source.is_none());
+    }
+
+    #[test]
+    fn sanitize_drops_pubsub_ops_with_null_like_topic() {
+        let pubsub_op = |topic: &str| PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(crate::operation::PubsubRole::Publisher),
+            line_number: 1,
+            primary_type_symbol: None,
+            type_import_source: None,
+            broker: None,
+        };
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![
+                pubsub_op("null"),
+                pubsub_op("+null"),
+                pubsub_op("-null"),
+                pubsub_op("undefined"),
+                pubsub_op(""),
+                pubsub_op("  -  "),
+                pubsub_op("  orders.created  "),
+            ],
+            ..Default::default()
+        };
+
+        FileAnalyzerAgent::sanitize_result(&mut result);
+
+        // Only the real topic survives, and it is trimmed.
+        assert_eq!(result.pubsub_operations.len(), 1);
+        assert_eq!(result.pubsub_operations[0].topic, "orders.created");
     }
 
     #[test]
@@ -1213,6 +1334,7 @@ mod tests {
             }],
             data_calls: vec![],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1284,6 +1406,81 @@ mod tests {
     }
 
     #[test]
+    fn pubsub_operations_deserialize_from_model_shape() {
+        // The exact wire shape the file-analyzer emits for a pub/sub operation.
+        let json = r#"{
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [],
+            "pubsub_operations": [
+                {
+                    "topic": "metrics.page_view",
+                    "role": "subscriber",
+                    "line_number": 5,
+                    "primary_type_symbol": "PageViewEvent",
+                    "type_import_source": "./types/events",
+                    "broker": "redis"
+                },
+                {
+                    "topic": "metrics.page_view",
+                    "role": "publisher",
+                    "line_number": 7,
+                    "primary_type_symbol": null,
+                    "type_import_source": null,
+                    "broker": null
+                }
+            ]
+        }"#;
+
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.pubsub_operations.len(), 2);
+        let sub = &result.pubsub_operations[0];
+        assert_eq!(sub.topic, "metrics.page_view");
+        assert_eq!(sub.role, Some(crate::operation::PubsubRole::Subscriber));
+        assert_eq!(sub.line_number, 5);
+        assert_eq!(sub.primary_type_symbol.as_deref(), Some("PageViewEvent"));
+        assert_eq!(sub.type_import_source.as_deref(), Some("./types/events"));
+        assert_eq!(sub.broker.as_deref(), Some("redis"));
+        assert_eq!(
+            result.pubsub_operations[1].role,
+            Some(crate::operation::PubsubRole::Publisher)
+        );
+    }
+
+    #[test]
+    fn pubsub_operations_default_empty_and_role_absorbs_junk() {
+        // A file with no pub/sub omits the array entirely; #[serde(default)]
+        // yields an empty vec rather than failing the whole file's parse.
+        let json = r#"{ "mounts": [], "endpoints": [], "data_calls": [] }"#;
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        assert!(result.pubsub_operations.is_empty());
+
+        // An off-enum / non-string role degrades to None (lenient, like call_kind)
+        // instead of failing the parse; the optional type/broker slots default.
+        for junk in [
+            r#""SUBSCRIBE""#,
+            r#""listener""#,
+            r#""""#,
+            "0",
+            "false",
+            "{}",
+        ] {
+            let json = format!(
+                r#"{{ "mounts": [], "endpoints": [], "data_calls": [],
+                    "pubsub_operations": [
+                        {{ "topic": "t", "role": {}, "line_number": 1 }}
+                    ] }}"#,
+                junk
+            );
+            let result: FileAnalysisResult = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("junk role {:?} failed the parse: {}", junk, e));
+            assert_eq!(result.pubsub_operations[0].role, None, "junk {:?}", junk);
+            assert_eq!(result.pubsub_operations[0].primary_type_symbol, None);
+            assert_eq!(result.pubsub_operations[0].broker, None);
+        }
+    }
+
+    #[test]
     fn test_choose_best_result_prefers_richer_output() {
         let initial = FileAnalysisResult {
             mounts: vec![MountResult {
@@ -1329,6 +1526,7 @@ mod tests {
                 type_import_source: None,
             }],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
 
         let retry = FileAnalysisResult {
@@ -1336,6 +1534,7 @@ mod tests {
             endpoints: vec![],
             data_calls: vec![],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
 
         let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry);

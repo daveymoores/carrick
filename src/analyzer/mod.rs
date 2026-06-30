@@ -228,12 +228,15 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
 
 /// Parse a ts_check compat `endpoint` string back into the verdict-join
 /// `(pseudo-method, identity)` pair. ts_check builds the string as
-/// `"<METHOD> <path> (<request|response>)"` for HTTP and
-/// `"SOCKET <DIRECTION>|<event> (response)"` for socket, so the same split —
-/// leading token off the front, trailing `" (type_kind)"` off the back — yields
-/// `("METHOD", "path")` or `("SOCKET", "DIRECTION|event")`, matching what
-/// `parse_producer_key` recovers from the edge's `producer_key`. Returns `None`
-/// for an unrecognized shape.
+/// `"<METHOD> <path> (<request|response>)"` for HTTP,
+/// `"SOCKET <DIRECTION>|<event> (response)"` for socket, and
+/// `"PUBSUB <topic> (response)"` for pub/sub, so the same split — leading token
+/// off the front, trailing `" (type_kind)"` off the back — yields
+/// `("METHOD", "path")`, `("SOCKET", "DIRECTION|event")`, or
+/// `("PUBSUB", "topic")`, matching what `parse_producer_key` recovers from the
+/// edge's `producer_key`. The pub/sub topic carries no path params (and no
+/// nested `|`), so the generic split needs no protocol-specific arm. Returns
+/// `None` for an unrecognized shape.
 fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
     let (method, rest) = endpoint.split_once(' ')?;
     // Drop the trailing " (request)" / " (response)" annotation if present.
@@ -248,7 +251,8 @@ fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
 }
 
 /// Recover the verdict-join `(pseudo-method, identity)` from a canonical
-/// producer key, for the protocols ts_check type-checks (HTTP + socket + graphql):
+/// producer key, for the protocols ts_check type-checks
+/// (HTTP + socket + graphql + pub/sub):
 ///
 /// - HTTP (`"http|METHOD|path"`) → `("METHOD", "path")`, the HTTP join key.
 /// - Socket (`"socket|DIRECTION|event"`) → `("SOCKET", "DIRECTION|event")`. The
@@ -261,6 +265,14 @@ fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
 ///   joins its verdict exactly like socket. The `KIND` (`query`/`mutation`/
 ///   `subscription`) stays lowercase here AND in the ts_check label, so the two
 ///   sides agree without any case folding.
+/// - Pub/Sub (`"pubsub|topic"`) → `("PUBSUB", "topic")`. Unlike the other three
+///   this canonical is 2-segment (topic-only; the broker is not part of
+///   identity), so the third `splitn(3, '|')` field is `None`. The matching
+///   ts_check endpoint label is `"PUBSUB topic (response)"`, which
+///   `parse_compat_endpoint` reduces to the SAME pair, so a pub/sub edge joins
+///   its verdict exactly like socket. (A topic literally containing `|` would
+///   mis-split, but both sides split identically so the exact-topic match still
+///   holds; topics with `|` are pathological and left unguarded.)
 ///
 /// Returns `None` for any other protocol: ts_check produced no verdict for it,
 /// so its edge stays `None` rather than fabricating one.
@@ -277,6 +289,9 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
         }
         (Some("graphql"), Some(kind), Some(field)) if !kind.is_empty() && !field.is_empty() => {
             Some(("GRAPHQL".to_string(), format!("{}|{}", kind, field)))
+        }
+        (Some("pubsub"), Some(topic), None) if !topic.is_empty() => {
+            Some(("PUBSUB".to_string(), topic.to_string()))
         }
         _ => None,
     }
@@ -1889,6 +1904,7 @@ impl Analyzer {
         for (protocol, label) in [
             (crate::operation::Protocol::Graphql, "GraphQL"),
             (crate::operation::Protocol::Websocket, "Socket.IO"),
+            (crate::operation::Protocol::Pubsub, "Pub/Sub"),
         ] {
             let (
                 protocol_call_issues,
@@ -2664,7 +2680,7 @@ mod tests {
 
     /// Like [`graphql_details`] but stamps repo identity (as the cross-repo
     /// merge does), so the exact-key matcher can attribute an edge to repos.
-    fn graphql_details_in_repo(key: OperationKey, file: &str, repo: &str) -> ApiEndpointDetails {
+    fn op_details_in_repo(key: OperationKey, file: &str, repo: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
             repo_name: Some(repo.to_string()),
             ..graphql_details(key, file)
@@ -2789,12 +2805,12 @@ mod tests {
 
         // GraphQL: producer schema field in `gateway`, consumer document field
         // in `web-frontend`. Same operation key on both sides.
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "schema.graphql:3",
             "gateway",
         ));
-        analyzer.calls.push(graphql_details_in_repo(
+        analyzer.calls.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "web/lib/graphql.ts:5",
             "web-frontend",
@@ -2802,12 +2818,12 @@ mod tests {
         // Socket: the producer is the LISTENER (an endpoint) in `web-frontend`;
         // the consumer is the EMITTER (a call) in `payments-svc`. The event flows
         // payments-svc → web-frontend, but the contract producer is the listener.
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
             "web/lib/realtime.ts:8",
             "web-frontend",
         ));
-        analyzer.calls.push(graphql_details_in_repo(
+        analyzer.calls.push(op_details_in_repo(
             OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
             "payments/realtime/server.ts:9",
             "payments-svc",
@@ -2837,6 +2853,40 @@ mod tests {
     }
 
     #[test]
+    fn pubsub_redis_exact_topic_emits_cross_repo_edge() {
+        // Corpus-2 edge #4: web-dashboard SUBSCRIBES Redis `metrics.page_view`
+        // (the contract producer / endpoint) while analytics-worker PUBLISHES it
+        // (the consumer / call). Identity is the topic alone, so the subscriber
+        // and publisher keys are equal and match exactly across the two repos.
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.endpoints.push(op_details_in_repo(
+            OperationKey::pubsub("metrics.page_view"),
+            "web/lib/realtime.ts:5",
+            "web-dashboard",
+        ));
+        analyzer.calls.push(op_details_in_repo(
+            OperationKey::pubsub("metrics.page_view"),
+            "analytics/redis/publisher.ts:7",
+            "analytics-worker",
+        ));
+
+        let (_, _, _, edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Pubsub, "Pub/Sub");
+        assert_eq!(edges.len(), 1, "one pub/sub edge expected");
+        let e = &edges[0];
+        assert_eq!(e.producer_repo, "web-dashboard");
+        assert_eq!(e.consumer_repo, "analytics-worker");
+        assert_eq!(e.producer_key, "pubsub|metrics.page_view");
+        assert_eq!(e.consumer_key, "pubsub|metrics.page_view");
+        assert_eq!(e.match_score, 1.0);
+        // Compat is filled in later by overlay_compat_verdicts, not here; pub/sub
+        // compat machinery is deferred, so it stays None.
+        assert_eq!(e.type_compatible, None);
+    }
+
+    #[test]
     fn test_exact_key_matches_emit_edge_per_producer_repo() {
         use crate::operation::GraphqlOperationKind;
         let cm = Lrc::new(SourceMap::default());
@@ -2844,17 +2894,17 @@ mod tests {
 
         // Two services expose the same GraphQL field; exact-key matching cannot
         // disambiguate by URL, so a consumer of `order` gets an edge to each.
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "gateway/schema.graphql:3",
             "gateway",
         ));
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "legacy/schema.graphql:3",
             "legacy-gateway",
         ));
-        analyzer.calls.push(graphql_details_in_repo(
+        analyzer.calls.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "web/lib/graphql.ts:5",
             "web-frontend",
@@ -3505,6 +3555,85 @@ mod tests {
         assert_eq!(
             matches[1].mismatch_reason.as_deref(),
             Some("note?: optional producer field is not assignable to required consumer field"),
+        );
+    }
+
+    /// Pub/sub canonical keys are 2-segment (`pubsub|<topic>`, broker excluded
+    /// from identity), so the third `splitn(3, '|')` field is `None`.
+    /// `parse_producer_key` must still recover `("PUBSUB", "<topic>")`, and a
+    /// round-trip through the ts_check endpoint label (`PUBSUB <topic>
+    /// (response)`) must yield the SAME pair so a pub/sub verdict joins its edge.
+    /// A topic carries no path params, so `normalize_compat_path` leaves it
+    /// unchanged — guarding a future param-collapse refactor from silently
+    /// breaking the pub/sub join.
+    #[test]
+    fn parse_producer_key_recovers_pubsub_pair() {
+        assert_eq!(
+            parse_producer_key("pubsub|order.placed"),
+            Some(("PUBSUB".to_string(), "order.placed".to_string())),
+        );
+        // Round-trip through the ts_check endpoint label yields the same pair.
+        assert_eq!(
+            parse_compat_endpoint("PUBSUB order.placed (response)"),
+            parse_producer_key("pubsub|order.placed"),
+        );
+        // Empty topic → no join key, edge stays None.
+        assert_eq!(parse_producer_key("pubsub|"), None);
+        // A topic with dots/no slashes is unaffected by the HTTP path-param
+        // collapse, so the two sides of the join still agree.
+        assert_eq!(normalize_compat_path("order.placed"), "order.placed");
+    }
+
+    /// The pub/sub cross-repo join. A `pubsub|<topic>` edge is type-checked by
+    /// ts_check on the Socket.IO inverted direction (subscriber=producer accepts
+    /// what publisher=consumer sends); ts_check emits its verdict under the
+    /// endpoint label `"PUBSUB <topic> (response)"`. `parse_producer_key`
+    /// recovers `("PUBSUB", "<topic>")` from the edge and `parse_compat_endpoint`
+    /// recovers the SAME pair from the label, so the verdict lands on the
+    /// pub/sub edge — `Some(true)` when compatible, `Some(false)` + reason on a
+    /// reported mismatch (the incompatible Kafka `order.placed` edge).
+    #[test]
+    fn apply_compat_verdicts_joins_pubsub_edge() {
+        let result = serde_json::json!({
+            "mismatches": [{
+                "endpoint": "PUBSUB order.placed (response)",
+                "consumerLocation": "orders-svc/src/publisher.ts:42",
+                "error": "Type 'WideOrder' is not assignable to type 'StrictOrder'"
+            }],
+            "unknownPairs": [],
+            "totalChecked": 2,
+            "compatibleCount": 1
+        });
+
+        let mut matches = vec![
+            edge_at(
+                "pubsub|metrics.page_view",
+                "analytics-svc",
+                "analytics-svc/src/track.ts:10",
+            ),
+            edge_at(
+                "pubsub|order.placed",
+                "orders-svc",
+                "orders-svc/src/publisher.ts:42",
+            ),
+        ];
+        apply_compat_verdicts(&result, &mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible,
+            Some(true),
+            "the compatible pub/sub edge (absent from the mismatch list) reads Some(true)"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(false),
+            "the pub/sub edge in the mismatch list reads Some(false)"
+        );
+        assert_eq!(
+            matches[1].mismatch_reason.as_deref(),
+            Some("Type 'WideOrder' is not assignable to type 'StrictOrder'"),
         );
     }
 

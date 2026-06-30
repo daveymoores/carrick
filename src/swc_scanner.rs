@@ -94,6 +94,12 @@ pub struct ScanResult {
     /// this: a parse failure excludes the whole file from the index, which is
     /// very different from a healthy file with no API candidates.
     pub parse_failed: bool,
+    /// Module-specifier strings of every `import ... from '<source>'` in the
+    /// file (e.g. `"nats"`, `"@nats-io/nats-core"`, `"./local"`). Collected from
+    /// the same parse that produces candidates so the orchestrator can decide,
+    /// without re-parsing, whether a zero-candidate file imports a recognized
+    /// messaging-client package and should be force-analyzed (pub/sub Part B).
+    pub import_sources: Vec<String>,
 }
 
 /// A value exported from a module. Used by file-based routing to recover the
@@ -177,10 +183,12 @@ impl SwcScanner {
                 return ScanResult {
                     candidates: Vec::new(),
                     parse_failed: true,
+                    import_sources: Vec::new(),
                 };
             }
         };
 
+        let import_sources = collect_import_sources(&module);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
             network_import_locals(&module, data_fetchers),
@@ -190,6 +198,7 @@ impl SwcScanner {
         ScanResult {
             candidates: visitor.candidates,
             parse_failed: false,
+            import_sources,
         }
     }
 
@@ -266,6 +275,7 @@ impl SwcScanner {
                 return ScanResult {
                     candidates: Vec::new(),
                     parse_failed: true,
+                    import_sources: Vec::new(),
                 };
             }
         };
@@ -278,6 +288,7 @@ impl SwcScanner {
             module.visit_mut_with(&mut pass);
         });
 
+        let import_sources = collect_import_sources(&module);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
             network_import_locals(&module, data_fetchers),
@@ -287,6 +298,7 @@ impl SwcScanner {
         ScanResult {
             candidates: visitor.candidates,
             parse_failed: false,
+            import_sources,
         }
     }
 
@@ -1149,6 +1161,23 @@ impl Visit for CandidateVisitor {
         // Continue visiting child nodes
         call.visit_children_with(self);
     }
+}
+
+/// Collect the module-specifier string of every `import ... from '<source>'`
+/// declaration in the module (e.g. `"nats"`, `"@nats-io/nats-core"`). Used by
+/// the file-orchestrator to force-analyze zero-candidate files that import a
+/// recognized messaging-client package (pub/sub Part B).
+fn collect_import_sources(module: &Module) -> Vec<String> {
+    module
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+                Some(import.src.value.to_string())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Collect the local binding names introduced by imports from any of the

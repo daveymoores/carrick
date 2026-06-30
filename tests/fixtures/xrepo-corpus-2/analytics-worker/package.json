@@ -1,0 +1,18 @@
+{
+  "name": "analytics-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "hono": "^4.4.0",
+    "ioredis": "5.3.0",
+    "nats": "^2.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}

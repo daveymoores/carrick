@@ -192,6 +192,12 @@ struct ExpectedRepo {
     /// is the producer (endpoint) and an *emitter* the consumer (call).
     #[serde(default)]
     socket_events: Vec<ExpNonHttpOp>,
+    /// Non-HTTP pub/sub ops (Kafka/Redis/NATS). Same role/key convention as
+    /// graphql/socket: a *subscriber* is the producer (endpoint), a *publisher*
+    /// the consumer (call); `key` is `pubsub|<topic>`. The topic/broker/side/source
+    /// fields in the JSON are diagnostic and ignored by serde (unknown-field drop).
+    #[serde(default)]
+    pubsub_operations: Vec<ExpNonHttpOp>,
     #[serde(default, rename = "_must_not_emit")]
     must_not_emit: Vec<ExpMustNotEmit>,
 }
@@ -408,6 +414,7 @@ fn expected_endpoint_set(
             .graphql_operations
             .iter()
             .chain(exp.socket_events.iter())
+            .chain(exp.pubsub_operations.iter())
         {
             if op.role == "producer" && op.tier == tier {
                 set.insert(nonhttp_op_key(&op.key));
@@ -534,7 +541,12 @@ fn score_call_set(
     let nonhttp_expected = |t: &str| -> HashSet<OpSetKey> {
         repo_expected
             .iter()
-            .flat_map(|(_r, e)| e.graphql_operations.iter().chain(e.socket_events.iter()))
+            .flat_map(|(_r, e)| {
+                e.graphql_operations
+                    .iter()
+                    .chain(e.socket_events.iter())
+                    .chain(e.pubsub_operations.iter())
+            })
             .filter(|op| op.role == "consumer" && op.tier == t)
             .map(|op| nonhttp_op_key(&op.key))
             .collect()
@@ -792,6 +804,7 @@ fn for_each_expected_typed_op(
             .graphql_operations
             .iter()
             .chain(exp.socket_events.iter())
+            .chain(exp.pubsub_operations.iter())
         {
             if op.tier == tier {
                 let is_producer = op.role == "producer";
@@ -2007,7 +2020,56 @@ mod scoring_tests {
             norm_key("socket|SERVER->CLIENT|payment:settled"),
             "socket|SERVER->CLIENT|payment:settled"
         );
+        // Pub/sub keys are 2-segment (`pubsub|<topic>`) → the splitn(3,'|')
+        // never matches the 3-tuple HTTP arm, so they fall through unchanged.
+        assert_eq!(norm_key("pubsub|order.placed"), "pubsub|order.placed");
+        assert_eq!(
+            norm_key("pubsub|metrics.page_view"),
+            "pubsub|metrics.page_view"
+        );
         assert_eq!(norm_key("not-a-key"), "not-a-key");
+    }
+
+    /// Ungated parse smoke for whatever corpus is selected (`CARRICK_EVAL_CORPUS`).
+    /// Verifies every `<repo>/expected.json` deserializes to `ExpectedRepo` and the
+    /// corpus `expected-output.json` to `ExpectedOutput`, with a message naming the
+    /// offending file on failure. Runs for ANY corpus (not gated on the default),
+    /// so it offline-validates corpus-2's additive `pubsub_operations` arrays.
+    #[test]
+    fn corpus_expected_files_parse() {
+        let corpus = corpus_dir();
+        // The default corpus dir always exists, so a missing dir here means a
+        // genuinely-typo'd `CARRICK_EVAL_CORPUS`. Skipping would let that typo
+        // pass silently, so fail loudly instead.
+        assert!(
+            corpus.is_dir(),
+            "corpus dir {} not found — CARRICK_EVAL_CORPUS may be mistyped",
+            corpus.display()
+        );
+        let repos = discover_repos(&corpus);
+        for repo in &repos {
+            let path = repo.join("expected.json");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let parsed: Result<ExpectedRepo, _> = serde_json::from_str(&text);
+            assert!(
+                parsed.is_ok(),
+                "parse {} into ExpectedRepo failed: {}",
+                path.display(),
+                parsed.unwrap_err()
+            );
+        }
+
+        let out_path = corpus.join("expected-output.json");
+        let out_text = std::fs::read_to_string(&out_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", out_path.display()));
+        let out_parsed: Result<ExpectedOutput, _> = serde_json::from_str(&out_text);
+        assert!(
+            out_parsed.is_ok(),
+            "parse {} into ExpectedOutput failed: {}",
+            out_path.display(),
+            out_parsed.unwrap_err()
+        );
     }
 
     #[test]
@@ -2471,6 +2533,7 @@ mod scoring_tests {
                 .graphql_operations
                 .iter()
                 .chain(exp.socket_events.iter())
+                .chain(exp.pubsub_operations.iter())
             {
                 let proto = op.key.split('|').next().unwrap_or("");
                 let mut eo = nonhttp_op(proto, &op.key);

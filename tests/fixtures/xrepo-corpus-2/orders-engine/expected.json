@@ -1,0 +1,65 @@
+{
+  "endpoints": [],
+  "calls": [],
+  "pubsub_operations": [
+    {
+      "role": "consumer",
+      "service": "orders-engine",
+      "key": "pubsub|order.placed",
+      "topic": "order.placed",
+      "broker": "kafka",
+      "side": "publisher",
+      "source": "src/kafka/producer.ts",
+      "primary_type_symbol": "OrderPlaced",
+      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; note?: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "graphql_operations": [
+    {
+      "role": "producer",
+      "service": "orders-engine",
+      "key": "graphql|query|order",
+      "kind": "query",
+      "field": "order",
+      "source": "src/schema.builder.ts",
+      "primary_type_symbol": "OrderView",
+      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; }",
+      "type_state": "Explicit",
+      "tier": "roadmap"
+    },
+    {
+      "role": "producer",
+      "service": "orders-engine",
+      "key": "graphql|mutation|cancelOrder",
+      "kind": "mutation",
+      "field": "cancelOrder",
+      "source": "src/schema.builder.ts",
+      "primary_type_symbol": "CancelResult",
+      "resolved_type": "{ id: string; cancelled: boolean; }",
+      "type_state": "Explicit",
+      "tier": "roadmap"
+    },
+    {
+      "role": "producer",
+      "service": "orders-engine",
+      "key": "graphql|subscription|orderEvents",
+      "kind": "subscription",
+      "field": "orderEvents",
+      "source": "src/schema.builder.ts",
+      "primary_type_symbol": "OrderEvent",
+      "resolved_type": "{ orderId: string; kind: \"placed\" | \"shipped\"; }",
+      "type_state": "Explicit",
+      "tier": "roadmap"
+    }
+  ],
+  "_must_not_emit": [
+    {
+      "kind": "pubsub",
+      "method": "*",
+      "path": "pubsub|__dlq.retry",
+      "evidence": "src/kafka/dlq.ts: `__dlq.retry` is published AND subscribed within orders-engine (intra-repo dead-letter self-loop). It must not surface as a cross-repo match — no other repo is on this topic and an intra-repo publisher↔subscriber pair is a self-edge, not a contract edge."
+    }
+  ]
+}

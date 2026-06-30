@@ -87,6 +87,7 @@ fn create_express_detection() -> DetectionResult {
     DetectionResult {
         frameworks: vec!["express".to_string()],
         data_fetchers: vec!["axios".to_string()],
+        messaging_clients: vec![],
         notes: "Test detection result".to_string(),
     }
 }
@@ -161,6 +162,7 @@ fn test_file_analysis_result_default() {
 fn test_file_analysis_result_serialization() {
     let result = FileAnalysisResult {
         graphql_operations: vec![],
+        pubsub_operations: vec![],
         mounts: vec![MountResult {
             line_number: 5,
             parent_node: "app".to_string(),
@@ -333,6 +335,7 @@ fn test_cross_file_import_resolution() {
         "src/app.ts".to_string(),
         FileAnalysisResult {
             graphql_operations: vec![],
+            pubsub_operations: vec![],
             mounts: vec![
                 MountResult {
                     line_number: 10,
@@ -361,6 +364,7 @@ fn test_cross_file_import_resolution() {
         "src/routes/users.ts".to_string(),
         FileAnalysisResult {
             graphql_operations: vec![],
+            pubsub_operations: vec![],
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
@@ -427,6 +431,7 @@ fn test_cross_file_import_resolution() {
         "src/routes/api.ts".to_string(),
         FileAnalysisResult {
             graphql_operations: vec![],
+            pubsub_operations: vec![],
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
@@ -494,6 +499,7 @@ fn test_cross_file_import_resolution() {
 fn test_data_call_extraction() {
     let result = FileAnalysisResult {
         graphql_operations: vec![],
+        pubsub_operations: vec![],
         mounts: vec![],
         endpoints: vec![],
         data_calls: vec![
@@ -574,6 +580,7 @@ fn test_nested_router_mounts() {
         "src/app.ts".to_string(),
         FileAnalysisResult {
             graphql_operations: vec![],
+            pubsub_operations: vec![],
             mounts: vec![MountResult {
                 line_number: 5,
                 parent_node: "app".to_string(),
@@ -591,6 +598,7 @@ fn test_nested_router_mounts() {
         "src/routes/api.ts".to_string(),
         FileAnalysisResult {
             graphql_operations: vec![],
+            pubsub_operations: vec![],
             mounts: vec![MountResult {
                 line_number: 5,
                 parent_node: "router".to_string(),
@@ -608,6 +616,7 @@ fn test_nested_router_mounts() {
         "src/routes/v1/index.ts".to_string(),
         FileAnalysisResult {
             graphql_operations: vec![],
+            pubsub_operations: vec![],
             mounts: vec![MountResult {
                 line_number: 5,
                 parent_node: "router".to_string(),
@@ -625,6 +634,7 @@ fn test_nested_router_mounts() {
         "src/routes/v1/users.ts".to_string(),
         FileAnalysisResult {
             graphql_operations: vec![],
+            pubsub_operations: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
                 candidate_id: "span:830-860".to_string(),
@@ -662,6 +672,7 @@ fn test_nested_router_mounts() {
 fn test_multiple_http_methods_on_same_path() {
     let result = FileAnalysisResult {
         graphql_operations: vec![],
+        pubsub_operations: vec![],
         mounts: vec![],
         endpoints: vec![
             EndpointResult {

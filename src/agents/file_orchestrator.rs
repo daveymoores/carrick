@@ -268,6 +268,19 @@ impl FileOrchestrator {
                 continue;
             }
 
+            // Pub/sub Part B: a pub/sub-only file (e.g. NATS `nc.publish(...)`)
+            // produces zero SWC candidates, so the zero-candidate skip below would
+            // drop it before the file-analyzer ever sees its publish/subscribe
+            // idioms. Force-analyze it when it imports a package the cloud
+            // /framework-detect step flagged as a messaging client. INERT today:
+            // `messaging_clients` is empty until that cloud prompt+schema deploys,
+            // so this never fires and current behavior is unchanged. socket.io is
+            // not a messaging client, so socket files are never caught here.
+            let imports_messaging_client = Self::imports_messaging_client(
+                &scan_result.import_sources,
+                &framework_detection.messaging_clients,
+            );
+
             // Protocol dispatch: the HTTP analyze-file prompt only ever sees
             // HTTP candidates. Candidates of protocols without a registered
             // prompt (raw WebSocket/EventSource constructors today) are set
@@ -378,6 +391,17 @@ impl FileOrchestrator {
                     // file content to emit `graphql_operations`.
                     debug!(
                         "Routed GraphQL resolver file (no HTTP candidates): {}",
+                        path_str
+                    );
+                } else if imports_messaging_client {
+                    // Pub/sub Part B: this file imports a cloud-detected
+                    // messaging-client package but raised no HTTP candidate (its
+                    // publish/subscribe calls are invisible to the call-site
+                    // scanner). Fall through to the file-analyzer so its pub/sub
+                    // idiom-teaching can extract the operations. INERT until the
+                    // cloud /framework-detect step populates `messaging_clients`.
+                    debug!(
+                        "Force-analyzing messaging-client file (no HTTP candidates): {}",
                         path_str
                     );
                 } else if unrouted_candidates.is_empty() {
@@ -1137,6 +1161,96 @@ impl FileOrchestrator {
         requests
     }
 
+    /// Build `SymbolRequest`s for pub/sub decoded-payload anchors (#corpus-2
+    /// resolution dim).
+    ///
+    /// Sibling of `collect_socket_type_requests`, but reads the LLM-sourced
+    /// `pubsub_operations` out of `file_results` rather than the deterministic
+    /// `ProtocolExtractions` struct — pub/sub ops never go through the
+    /// deterministic protocol extractors, so this walks the exact same source
+    /// `append_pubsub_manifest_entries` walks. Each op carrying a
+    /// `primary_type_symbol` routes that decoded-payload type through the *same*
+    /// sidecar bundle path the Socket.IO and HTTP explicit-symbol cases use, so
+    /// the sidecar expands it into the entry's `resolved_type`. Subscribers are
+    /// producers, publishers are consumers; each resolves to the Response-kind
+    /// alias.
+    ///
+    /// The alias MUST be `build_manifest_type_alias(&key, role, Response)` —
+    /// byte-identical to the alias `add_protocol_manifest_entry` stamps on the
+    /// manifest entry in `append_pubsub_manifest_entries` (same `OperationKey`,
+    /// same role mapping, same kind) — or the resolved `.d.ts` never joins back
+    /// and the entry stays `Unknown`. This contract is guarded by a unit test.
+    ///
+    /// Only ops whose extractor captured a `primary_type_symbol` produce a
+    /// request; a `None` symbol (untyped or inline-object payload) emits nothing,
+    /// exactly like socket. A roleless op anchors nothing and is skipped (it was
+    /// already dropped from `cloud_data` and has no manifest entry to join to).
+    /// An absent `type_import_source` means the symbol is declared in the op's
+    /// own file, so it resolves against that file's absolute path.
+    pub fn collect_pubsub_type_requests(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        repo_path: &str,
+    ) -> Vec<SymbolRequest> {
+        use crate::operation::{OperationKey, PubsubRole};
+
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let mut requests: Vec<SymbolRequest> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        // `file_results` is a HashMap, whose iteration order is non-deterministic.
+        // Walk the keys in sorted order so the emitted `SymbolRequest` sequence is
+        // stable across runs (the scanner's output determinism depends on it).
+        let mut paths: Vec<&String> = file_results.keys().collect();
+        paths.sort();
+        for path in paths {
+            let result = &file_results[path];
+            for op in &result.pubsub_operations {
+                // Mirror the manifest-side role mapping in
+                // `append_pubsub_manifest_entries`: subscriber = producer,
+                // publisher = consumer; a roleless op anchors nothing.
+                let role = match op.role {
+                    Some(PubsubRole::Subscriber) => ManifestRole::Producer,
+                    Some(PubsubRole::Publisher) => ManifestRole::Consumer,
+                    None => continue,
+                };
+                let Some(symbol) = op.primary_type_symbol.as_ref() else {
+                    continue;
+                };
+                let file_abs = Self::to_absolute_path(path, &repo_root_absolute);
+                let source_file = match op.type_import_source.as_ref() {
+                    Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                    // No import → same-file declaration: resolve against the file.
+                    None => file_abs,
+                };
+                let key = OperationKey::pubsub(op.topic.clone());
+                let alias = build_manifest_type_alias(&key, role, ManifestTypeKind::Response);
+                let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
+                if seen.insert(dedup_key) {
+                    requests.push(SymbolRequest {
+                        symbol_name: symbol.clone(),
+                        source_file,
+                        alias: Some(alias),
+                    });
+                }
+            }
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} pub/sub payload type requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Build `SymbolRequest`s for GraphQL consumer result-type anchors (#248
     /// consumer side).
     ///
@@ -1283,6 +1397,27 @@ impl FileOrchestrator {
     /// Parse a file once and extract both the symbol table and the env-var
     /// alias map (`local const -> process.env name`). Sharing the parse keeps
     /// the per-file CPU cost flat — both passes are cheap AST walks.
+    /// Pub/sub Part B: does this file import a package the cloud
+    /// /framework-detect step flagged as a messaging client?
+    ///
+    /// An import source matches a `messaging_clients` entry when it is exactly
+    /// the entry (`"nats"`) or a subpath/scoped specifier under it
+    /// (`"@nats-io/nats-core"` matches `"@nats-io/nats-core"`; `"nats/foo"`
+    /// matches `"nats"`). Same matching convention as the data-fetcher
+    /// import-recall check, so it generalizes to any package without a hardcoded
+    /// list. INERT today: `messaging_clients` is empty until the cloud deploys,
+    /// so this always returns `false` and skip behavior is unchanged.
+    fn imports_messaging_client(import_sources: &[String], messaging_clients: &[String]) -> bool {
+        if messaging_clients.is_empty() {
+            return false;
+        }
+        import_sources.iter().any(|src| {
+            messaging_clients
+                .iter()
+                .any(|pkg| src == pkg || src.starts_with(&format!("{}/", pkg)))
+        })
+    }
+
     fn extract_symbol_table(
         file_path: &Path,
         cm: &Lrc<SourceMap>,
@@ -2313,6 +2448,91 @@ mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
 
+    /// Pub/sub Part B: a NATS pub/sub-only file produces ZERO SWC candidates,
+    /// so the orchestrator's zero-candidate skip would drop it before the
+    /// file-analyzer. The skip is bypassed iff `imports_messaging_client` is
+    /// true. This test drives that exact decision through a real `scan_content`
+    /// to prove (a) the import sources ARE available at the skip point, and
+    /// (b) the force-analyze verdict, including inertness under the empty
+    /// (live default) `messaging_clients`.
+    #[test]
+    fn messaging_client_import_forces_analysis_of_zero_candidate_file() {
+        use crate::swc_scanner::SwcScanner;
+        use std::path::PathBuf;
+
+        let scanner = SwcScanner::new();
+
+        // A pub/sub-only NATS file: imports "nats", only calls publish/subscribe.
+        let nats_src = r#"
+            import { connect } from 'nats';
+            const SUBJECT = 'orders.created';
+            const nc = await connect();
+            nc.publish(SUBJECT, JSON.stringify({ id: 1 }));
+            nc.subscribe(SUBJECT);
+        "#;
+        let nats_scan = scanner.scan_content(&PathBuf::from("orders_pub.ts"), nats_src, &[]);
+        // Precondition for the whole fix: this file has NO HTTP/data candidates,
+        // so it would hit the zero-candidate skip without Part B.
+        assert!(
+            nats_scan.candidates.is_empty(),
+            "expected zero candidates for a pub/sub-only file, got {:?}",
+            nats_scan.candidates
+        );
+        // The import source must be visible at the skip point.
+        assert!(
+            nats_scan.import_sources.iter().any(|s| s == "nats"),
+            "import_sources should contain 'nats', got {:?}",
+            nats_scan.import_sources
+        );
+
+        // 1) With the cloud-detected messaging_clients=["nats"], the NATS file is
+        //    force-analyzed (NOT skipped).
+        assert!(
+            FileOrchestrator::imports_messaging_client(
+                &nats_scan.import_sources,
+                &["nats".to_string()],
+            ),
+            "a nats-importing file with messaging_clients=[nats] must be force-analyzed"
+        );
+
+        // 2) Inertness: with the LIVE default messaging_clients=[] (cloud not yet
+        //    deployed), the SAME file is NOT force-analyzed -> it is skipped,
+        //    exactly as today. This is the no-behavior-change guarantee.
+        assert!(
+            !FileOrchestrator::imports_messaging_client(&nats_scan.import_sources, &[]),
+            "empty messaging_clients (live default) must leave the file skippable (inert)"
+        );
+
+        // 3) No collateral: a file importing only an unrelated package is skipped
+        //    even when messaging_clients=["nats"].
+        let lodash_scan =
+            scanner.scan_content(&PathBuf::from("util.ts"), "import _ from 'lodash';\n", &[]);
+        assert!(
+            !FileOrchestrator::imports_messaging_client(
+                &lodash_scan.import_sources,
+                &["nats".to_string()],
+            ),
+            "a lodash-only file must not be force-analyzed by messaging_clients=[nats]"
+        );
+
+        // Scoped/subpath specifiers match their package entry (e.g. a NATS file
+        // importing the scoped client under a messaging_clients entry).
+        assert!(
+            FileOrchestrator::imports_messaging_client(
+                &["@nats-io/nats-core".to_string()],
+                &["@nats-io/nats-core".to_string()],
+            ),
+            "scoped messaging-client import must match its entry"
+        );
+        assert!(
+            FileOrchestrator::imports_messaging_client(
+                &["ioredis/built/Redis".to_string()],
+                &["ioredis".to_string()],
+            ),
+            "subpath import must match its package entry"
+        );
+    }
+
     #[test]
     fn join_paths_does_not_double_a_baked_prefix() {
         // The double-prefix bug: a constructor-carried prefix baked into the
@@ -2541,6 +2761,7 @@ mod tests {
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2593,6 +2814,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2652,6 +2874,7 @@ mod tests {
                     },
                 ],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2691,6 +2914,7 @@ mod tests {
                     type_import_source: None,
                 }],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2750,6 +2974,7 @@ mod tests {
                     },
                 ],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2803,6 +3028,7 @@ mod tests {
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -2870,6 +3096,7 @@ mod tests {
                 endpoints: vec![endpoint],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
         let graph = orchestrator.build_mount_graph(&file_results);
@@ -3067,6 +3294,7 @@ mod tests {
                 type_import_source: None,
             }],
             graphql_operations: vec![],
+            pubsub_operations: vec![],
         };
 
         let mut imported_symbols = HashMap::new();
@@ -3137,6 +3365,7 @@ mod tests {
                 endpoints: vec![],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -3185,6 +3414,7 @@ mod tests {
                 ],
                 data_calls: vec![],
                 graphql_operations: vec![],
+                pubsub_operations: vec![],
             },
         );
 
@@ -3564,5 +3794,94 @@ export { routes };
             "colon-form route should dedupe against the canonicalized LLM path"
         );
         assert_eq!(result.endpoints.len(), 1);
+    }
+
+    /// `collect_pubsub_type_requests` walks a `HashMap<String, _>`, whose
+    /// iteration order is non-deterministic. The scanner's output determinism
+    /// depends on the emitted `SymbolRequest` order being stable, so this asserts
+    /// that several ops spread across multiple files come back in the same order
+    /// every call (we walk the file keys sorted).
+    #[test]
+    fn collect_pubsub_type_requests_is_deterministic() {
+        use crate::agents::file_analyzer_agent::PubsubOperation;
+        use crate::operation::PubsubRole;
+
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let pubsub_op = |topic: &str, role: PubsubRole, symbol: &str| PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(role),
+            line_number: 1,
+            primary_type_symbol: Some(symbol.to_string()),
+            type_import_source: None,
+            broker: None,
+        };
+
+        // Three files, each contributing a typed op. The HashMap insertion order
+        // intentionally differs from the sorted key order.
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "src/zeta.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "orders.created",
+                    PubsubRole::Publisher,
+                    "OrderCreated",
+                )],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "src/alpha.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "users.signedup",
+                    PubsubRole::Subscriber,
+                    "UserSignedUp",
+                )],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "src/mid.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "page.viewed",
+                    PubsubRole::Subscriber,
+                    "PageViewEvent",
+                )],
+                ..Default::default()
+            },
+        );
+
+        // SymbolRequest has no PartialEq, so compare by its identifying fields.
+        let order = |reqs: &[SymbolRequest]| -> Vec<(String, String, Option<String>)> {
+            reqs.iter()
+                .map(|r| {
+                    (
+                        r.symbol_name.clone(),
+                        r.source_file.clone(),
+                        r.alias.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        let first = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let second = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+
+        assert_eq!(first.len(), 3, "every typed op should anchor a request");
+        assert_eq!(
+            order(&first),
+            order(&second),
+            "collect_pubsub_type_requests must emit a stable SymbolRequest order"
+        );
+        // Order follows the sorted file keys: alpha < mid < zeta.
+        let symbols: Vec<&str> = first.iter().map(|r| r.symbol_name.as_str()).collect();
+        assert_eq!(
+            symbols,
+            vec!["UserSignedUp", "PageViewEvent", "OrderCreated"]
+        );
     }
 }
