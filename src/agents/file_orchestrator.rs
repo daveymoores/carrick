@@ -249,6 +249,7 @@ impl FileOrchestrator {
                 file_path,
                 &content,
                 &framework_detection.data_fetchers,
+                &framework_detection.messaging_clients,
             );
 
             // A parse failure excludes the whole file (and any endpoints in
@@ -2470,7 +2471,7 @@ mod tests {
             nc.publish(SUBJECT, JSON.stringify({ id: 1 }));
             nc.subscribe(SUBJECT);
         "#;
-        let nats_scan = scanner.scan_content(&PathBuf::from("orders_pub.ts"), nats_src, &[]);
+        let nats_scan = scanner.scan_content(&PathBuf::from("orders_pub.ts"), nats_src, &[], &[]);
         // Precondition for the whole fix: this file has NO HTTP/data candidates,
         // so it would hit the zero-candidate skip without Part B.
         assert!(
@@ -2505,8 +2506,12 @@ mod tests {
 
         // 3) No collateral: a file importing only an unrelated package is skipped
         //    even when messaging_clients=["nats"].
-        let lodash_scan =
-            scanner.scan_content(&PathBuf::from("util.ts"), "import _ from 'lodash';\n", &[]);
+        let lodash_scan = scanner.scan_content(
+            &PathBuf::from("util.ts"),
+            "import _ from 'lodash';\n",
+            &[],
+            &["nats".to_string()],
+        );
         assert!(
             !FileOrchestrator::imports_messaging_client(
                 &lodash_scan.import_sources,
