@@ -2510,7 +2510,7 @@ mod tests {
             &PathBuf::from("util.ts"),
             "import _ from 'lodash';\n",
             &[],
-            &[],
+            &["nats".to_string()],
         );
         assert!(
             !FileOrchestrator::imports_messaging_client(

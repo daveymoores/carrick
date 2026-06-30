@@ -1316,8 +1316,12 @@ fn collect_import_sources(module: &Module) -> Vec<String> {
 /// Does any of this module's import specifiers match a `messaging_clients`
 /// entry? Gate for the pub/sub call-site Signal 7.
 ///
-/// An import source matches when it is exactly the entry (`"nats"`) or a
-/// subpath/scoped specifier under it (`"nats/foo"` / `"@nats-io/nats-core"`).
+/// An import source matches when it is exactly the entry (`"nats"` matches
+/// `"nats"`) or a subpath under it (`"nats"` matches `"nats/foo"`). Matching is
+/// strictly exact-or-`"<entry>/"`-prefix, so `"nats"` does NOT match
+/// `"@nats-io/nats-core"` — a scoped client gates only when that scoped name
+/// (e.g. `"@nats-io/nats-core"`, or `"@nats-io"` as a `"@nats-io/"` prefix) is
+/// itself a `messaging_clients` entry.
 /// This is the same matching convention as
 /// `FileOrchestrator::imports_messaging_client` and the data-fetcher
 /// import-recall check, kept in sync deliberately so a package gates the same
