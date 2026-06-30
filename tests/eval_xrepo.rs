@@ -2038,10 +2038,14 @@ mod scoring_tests {
     #[test]
     fn corpus_expected_files_parse() {
         let corpus = corpus_dir();
-        if !corpus.is_dir() {
-            eprintln!("[eval] corpus dir missing — skipping");
-            return;
-        }
+        // The default corpus dir always exists, so a missing dir here means a
+        // genuinely-typo'd `CARRICK_EVAL_CORPUS`. Skipping would let that typo
+        // pass silently, so fail loudly instead.
+        assert!(
+            corpus.is_dir(),
+            "corpus dir {} not found — CARRICK_EVAL_CORPUS may be mistyped",
+            corpus.display()
+        );
         let repos = discover_repos(&corpus);
         for repo in &repos {
             let path = repo.join("expected.json");

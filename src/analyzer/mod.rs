@@ -2680,7 +2680,7 @@ mod tests {
 
     /// Like [`graphql_details`] but stamps repo identity (as the cross-repo
     /// merge does), so the exact-key matcher can attribute an edge to repos.
-    fn graphql_details_in_repo(key: OperationKey, file: &str, repo: &str) -> ApiEndpointDetails {
+    fn op_details_in_repo(key: OperationKey, file: &str, repo: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
             repo_name: Some(repo.to_string()),
             ..graphql_details(key, file)
@@ -2805,12 +2805,12 @@ mod tests {
 
         // GraphQL: producer schema field in `gateway`, consumer document field
         // in `web-frontend`. Same operation key on both sides.
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "schema.graphql:3",
             "gateway",
         ));
-        analyzer.calls.push(graphql_details_in_repo(
+        analyzer.calls.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "web/lib/graphql.ts:5",
             "web-frontend",
@@ -2818,12 +2818,12 @@ mod tests {
         // Socket: the producer is the LISTENER (an endpoint) in `web-frontend`;
         // the consumer is the EMITTER (a call) in `payments-svc`. The event flows
         // payments-svc → web-frontend, but the contract producer is the listener.
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
             "web/lib/realtime.ts:8",
             "web-frontend",
         ));
-        analyzer.calls.push(graphql_details_in_repo(
+        analyzer.calls.push(op_details_in_repo(
             OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
             "payments/realtime/server.ts:9",
             "payments-svc",
@@ -2861,12 +2861,12 @@ mod tests {
         let cm = Lrc::new(SourceMap::default());
         let mut analyzer = Analyzer::new(Config::default(), cm);
 
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::pubsub("metrics.page_view"),
             "web/lib/realtime.ts:5",
             "web-dashboard",
         ));
-        analyzer.calls.push(graphql_details_in_repo(
+        analyzer.calls.push(op_details_in_repo(
             OperationKey::pubsub("metrics.page_view"),
             "analytics/redis/publisher.ts:7",
             "analytics-worker",
@@ -2894,17 +2894,17 @@ mod tests {
 
         // Two services expose the same GraphQL field; exact-key matching cannot
         // disambiguate by URL, so a consumer of `order` gets an edge to each.
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "gateway/schema.graphql:3",
             "gateway",
         ));
-        analyzer.endpoints.push(graphql_details_in_repo(
+        analyzer.endpoints.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "legacy/schema.graphql:3",
             "legacy-gateway",
         ));
-        analyzer.calls.push(graphql_details_in_repo(
+        analyzer.calls.push(op_details_in_repo(
             OperationKey::graphql(GraphqlOperationKind::Query, "order"),
             "web/lib/graphql.ts:5",
             "web-frontend",

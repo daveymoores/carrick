@@ -1207,7 +1207,13 @@ impl FileOrchestrator {
 
         let mut requests: Vec<SymbolRequest> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for (path, result) in file_results {
+        // `file_results` is a HashMap, whose iteration order is non-deterministic.
+        // Walk the keys in sorted order so the emitted `SymbolRequest` sequence is
+        // stable across runs (the scanner's output determinism depends on it).
+        let mut paths: Vec<&String> = file_results.keys().collect();
+        paths.sort();
+        for path in paths {
+            let result = &file_results[path];
             for op in &result.pubsub_operations {
                 // Mirror the manifest-side role mapping in
                 // `append_pubsub_manifest_entries`: subscriber = producer,
@@ -3788,5 +3794,91 @@ export { routes };
             "colon-form route should dedupe against the canonicalized LLM path"
         );
         assert_eq!(result.endpoints.len(), 1);
+    }
+
+    /// `collect_pubsub_type_requests` walks a `HashMap<String, _>`, whose
+    /// iteration order is non-deterministic. The scanner's output determinism
+    /// depends on the emitted `SymbolRequest` order being stable, so this asserts
+    /// that several ops spread across multiple files come back in the same order
+    /// every call (we walk the file keys sorted).
+    #[test]
+    fn collect_pubsub_type_requests_is_deterministic() {
+        use crate::agents::file_analyzer_agent::PubsubOperation;
+        use crate::operation::PubsubRole;
+
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let pubsub_op = |topic: &str, role: PubsubRole, symbol: &str| PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(role),
+            line_number: 1,
+            primary_type_symbol: Some(symbol.to_string()),
+            type_import_source: None,
+            broker: None,
+        };
+
+        // Three files, each contributing a typed op. The HashMap insertion order
+        // intentionally differs from the sorted key order.
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "src/zeta.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "orders.created",
+                    PubsubRole::Publisher,
+                    "OrderCreated",
+                )],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "src/alpha.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "users.signedup",
+                    PubsubRole::Subscriber,
+                    "UserSignedUp",
+                )],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "src/mid.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "page.viewed",
+                    PubsubRole::Subscriber,
+                    "PageViewEvent",
+                )],
+                ..Default::default()
+            },
+        );
+
+        // SymbolRequest has no PartialEq, so compare by its identifying fields.
+        let order = |reqs: &[SymbolRequest]| -> Vec<(String, String, Option<String>)> {
+            reqs.iter()
+                .map(|r| {
+                    (
+                        r.symbol_name.clone(),
+                        r.source_file.clone(),
+                        r.alias.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        let first = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let second = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+
+        assert_eq!(first.len(), 3, "every typed op should anchor a request");
+        assert_eq!(
+            order(&first),
+            order(&second),
+            "collect_pubsub_type_requests must emit a stable SymbolRequest order"
+        );
+        // Order follows the sorted file keys: alpha < mid < zeta.
+        let symbols: Vec<&str> = first.iter().map(|r| r.symbol_name.as_str()).collect();
+        assert_eq!(symbols, vec!["UserSignedUp", "PageViewEvent", "OrderCreated"]);
     }
 }

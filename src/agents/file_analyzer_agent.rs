@@ -482,9 +482,17 @@ impl FileAnalyzerAgent {
 
     /// Sanitize the LLM response to fix common issues like "+null" strings
     fn sanitize_result(result: &mut FileAnalysisResult) -> bool {
-        // Helper to check if a string represents null
+        // Helper to check if a string represents null. Covers the placeholder /
+        // null-like literals the model intermittently emits ("null", "+null",
+        // "-null", "NULL", "undefined", "-", "").
         fn is_null_string(s: &str) -> bool {
-            s == "+null" || s == "null" || s == "NULL" || s == "-" || s.is_empty()
+            s == "+null"
+                || s == "-null"
+                || s == "null"
+                || s == "NULL"
+                || s == "undefined"
+                || s == "-"
+                || s.is_empty()
         }
 
         fn normalize_optional_string(value: &mut Option<String>) {
@@ -611,8 +619,15 @@ impl FileAnalyzerAgent {
 
         // Sanitize pub/sub operations (#283): trim/normalize the topic, payload
         // type symbol, and its import source the same way data_calls are handled.
-        for op in &mut result.pubsub_operations {
+        result.pubsub_operations.retain_mut(|op| {
             let trimmed_topic = op.topic.trim();
+            // Drop the op when the topic is a null-like placeholder the model
+            // sometimes emits ("null", "+null", "-null", "undefined", "", "-"):
+            // a topicless pub/sub op has no identity and can't be placed on
+            // either side, so it must not survive into the engine.
+            if is_null_string(trimmed_topic) {
+                return false;
+            }
             if trimmed_topic != op.topic.as_str() {
                 op.topic = trimmed_topic.to_string();
             }
@@ -626,7 +641,8 @@ impl FileAnalyzerAgent {
                 op.primary_type_symbol = None;
             }
             normalize_optional_string(&mut op.broker);
-        }
+            true
+        });
 
         needs_retry
     }
@@ -1254,6 +1270,37 @@ mod tests {
         assert_eq!(data_call.method, Some("POST".to_string()));
         assert!(data_call.primary_type_symbol.is_none());
         assert!(data_call.type_import_source.is_none());
+    }
+
+    #[test]
+    fn sanitize_drops_pubsub_ops_with_null_like_topic() {
+        let pubsub_op = |topic: &str| PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(crate::operation::PubsubRole::Publisher),
+            line_number: 1,
+            primary_type_symbol: None,
+            type_import_source: None,
+            broker: None,
+        };
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![
+                pubsub_op("null"),
+                pubsub_op("+null"),
+                pubsub_op("-null"),
+                pubsub_op("undefined"),
+                pubsub_op(""),
+                pubsub_op("  -  "),
+                pubsub_op("  orders.created  "),
+            ],
+            ..Default::default()
+        };
+
+        FileAnalyzerAgent::sanitize_result(&mut result);
+
+        // Only the real topic survives, and it is trimmed.
+        assert_eq!(result.pubsub_operations.len(), 1);
+        assert_eq!(result.pubsub_operations[0].topic, "orders.created");
     }
 
     #[test]
