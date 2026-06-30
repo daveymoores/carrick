@@ -490,6 +490,43 @@ impl UrlNormalizer {
         self.normalize(url).path
     }
 
+    /// Path to key a CONSUMER data call on in the cloud_data projection.
+    ///
+    /// Like `extract_path`, but conservative about WHICH targets get their host
+    /// stripped: only a declared-internal env-var base (e.g. `internalEnvVars`
+    /// in `carrick.json`) or a plain relative path (no host at all) is reduced
+    /// to its bare route. A target whose host was stripped but is NOT internal —
+    /// an external or unknown base like `${process.env.STRIPE_URL}/charges` — is
+    /// returned verbatim, so a third-party call can never collide with an
+    /// internal producer's `/charges`.
+    ///
+    /// This exists because the LLM `data_calls` path stores the raw target on
+    /// the `DataFetchingCall` (`file_orchestrator.rs` fifth pass), and only the
+    /// cross-repo *matcher* normalized it; the per-op cloud_data CALL key stayed
+    /// un-normalized, so a consumer call like `${process.env.ANALYTICS_URL}/track`
+    /// never keyed as `/track` and so never matched its producer or got a compat
+    /// verdict.
+    pub fn consumer_call_path(&self, url: &str) -> String {
+        // A plain relative path (`/track`, `/users/${id}`) has no host to strip —
+        // always safe to clean. NOT protocol-relative (`//host/...`), which has a
+        // host. Checked on the raw target (minus literal quote/backtick wrappers).
+        let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
+        let is_relative_path = trimmed.starts_with('/') && !trimmed.starts_with("//");
+
+        let normalized = self.normalize(url);
+        if normalized.is_internal || is_relative_path {
+            normalized.path
+        } else {
+            // External / unknown / full-URL targets are kept VERBATIM. A
+            // declared-external or unknown env-var base must not collide with an
+            // internal producer's path; and a full URL with an interpolation in
+            // its query (`https://h/p?u=${id}`) dispatches to the template-literal
+            // branch, which would mangle the scheme — keep it raw rather than
+            // emit `/https:/h/p`.
+            url.to_string()
+        }
+    }
+
     /// Heuristic check for URL-like inputs to avoid matching variable names as paths.
     pub fn is_probable_url(&self, url: &str) -> bool {
         let trimmed = url.trim();
@@ -554,6 +591,50 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// The corpus-2 HTTP regression: a consumer call whose base is a declared-
+    /// internal env var must key on the BARE route (so it matches its producer),
+    /// while an unknown/external base must be kept VERBATIM (so a third-party
+    /// call can't collide with an internal producer's path). `consumer_call_path`
+    /// is what the cloud_data CALL projection uses; before it, the projection
+    /// keyed on the raw LLM `target_url` and these edges never matched.
+    #[test]
+    fn consumer_call_path_strips_internal_base_keeps_external_raw() {
+        let n = UrlNormalizer::new(&create_test_config());
+
+        // Internal env-var base (process.env form, and the const-resolved form) →
+        // bare route. This is the exact corpus-2 miss.
+        assert_eq!(
+            n.consumer_call_path("${process.env.API_URL}/users"),
+            "/users"
+        );
+        assert_eq!(n.consumer_call_path("${API_URL}/users"), "/users");
+
+        // Internal base + a path param: base stripped, param preserved.
+        let with_param = n.consumer_call_path("${process.env.API_URL}/users/${id}");
+        assert!(
+            with_param.starts_with("/users/:") && !with_param.contains("process.env"),
+            "expected /users/:param, got {with_param}"
+        );
+
+        // A relative path (no host) is returned cleaned, shape unchanged.
+        assert_eq!(n.consumer_call_path("/track"), "/track");
+
+        // An UNKNOWN base (NOT in internalEnvVars) is returned VERBATIM — never
+        // normalized into something that could match an internal producer.
+        assert_eq!(
+            n.consumer_call_path("${process.env.STRIPE_URL}/charges"),
+            "${process.env.STRIPE_URL}/charges"
+        );
+
+        // A full URL — even with an interpolation in its query string, which
+        // dispatches to the template-literal branch — is kept VERBATIM, never
+        // mangled to `/https:/orders.internal/...` by `clean_path`.
+        assert_eq!(
+            n.consumer_call_path("https://orders.internal/api/orders?user=${userId}"),
+            "https://orders.internal/api/orders?user=${userId}"
+        );
     }
 
     #[test]

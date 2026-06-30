@@ -8,6 +8,7 @@ use crate::{
     operation::OperationKey,
     packages::Packages,
     services::type_sidecar::InferKind,
+    url_normalizer::UrlNormalizer,
     visitor::{FunctionDefinition, Mount, OwnerType},
 };
 use async_trait::async_trait;
@@ -182,6 +183,16 @@ impl CloudRepoData {
         });
         let mount_graph = &analysis_result.mount_graph;
 
+        // Normalizer built from this repo's carrick.json (internalEnvVars etc.)
+        // so consumer call keys strip a declared-internal host base. Absent/
+        // unparseable config → empty Config (only relative paths normalize; env-
+        // var targets stay raw — matches the prior raw behavior, never over-strips).
+        let url_normalizer = config_json
+            .as_ref()
+            .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok())
+            .map(|cfg| UrlNormalizer::new(&cfg))
+            .unwrap_or_else(|| UrlNormalizer::new(&crate::config::Config::default()));
+
         // Convert ResolvedEndpoints to ApiEndpointDetails
         let endpoints: Vec<ApiEndpointDetails> = mount_graph
             .get_resolved_endpoints()
@@ -207,7 +218,10 @@ impl CloudRepoData {
             .iter()
             .map(|call| ApiEndpointDetails {
                 owner: None,
-                key: OperationKey::http(&call.method, call.target_url.clone()),
+                key: OperationKey::http(
+                    &call.method,
+                    url_normalizer.consumer_call_path(&call.target_url),
+                ),
                 params: vec![],
                 request_body: None,
                 response_body: None,

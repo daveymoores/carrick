@@ -1602,12 +1602,18 @@ fn build_cloud_data_from_mount_graph(
         })
         .collect();
 
+    // Strip a declared-internal host base from consumer call keys (see
+    // `UrlNormalizer::consumer_call_path`) so they match their producer endpoints.
+    let url_normalizer = UrlNormalizer::new(config);
     let calls: Vec<ApiEndpointDetails> = mount_graph
         .get_data_calls()
         .iter()
         .map(|call| ApiEndpointDetails {
             owner: None,
-            key: OperationKey::http(&call.method, call.target_url.clone()),
+            key: OperationKey::http(
+                &call.method,
+                url_normalizer.consumer_call_path(&call.target_url),
+            ),
             params: vec![],
             request_body: None,
             response_body: None,
