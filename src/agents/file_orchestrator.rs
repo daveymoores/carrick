@@ -1176,11 +1176,14 @@ impl FileOrchestrator {
     /// producers, publishers are consumers; each resolves to the Response-kind
     /// alias.
     ///
-    /// The alias MUST be `build_manifest_type_alias(&key, role, Response)` —
-    /// byte-identical to the alias `add_protocol_manifest_entry` stamps on the
-    /// manifest entry in `append_pubsub_manifest_entries` (same `OperationKey`,
-    /// same role mapping, same kind) — or the resolved `.d.ts` never joins back
-    /// and the entry stays `Unknown`. This contract is guarded by a unit test.
+    /// The alias MUST be byte-identical to the one `add_protocol_manifest_entry`
+    /// stamps on the manifest entry in `append_pubsub_manifest_entries` — or the
+    /// resolved `.d.ts` never joins back and the entry stays `Unknown`. Producers
+    /// (subscribers) use the plain `build_manifest_type_alias(&key, role,
+    /// Response)`; consumers (publishers) append a `build_call_site_id(path, line,
+    /// &key)` suffix so fan-in publishers on one topic don't collide on a single
+    /// alias (see `append_pubsub_manifest_entries`). Both contracts are guarded by
+    /// unit tests.
     ///
     /// Only ops whose extractor captured a `primary_type_symbol` produce a
     /// request; a `None` symbol (untyped or inline-object payload) emits nothing,
@@ -1234,7 +1237,30 @@ impl FileOrchestrator {
                     None => file_abs,
                 };
                 let key = OperationKey::pubsub(op.topic.clone());
-                let alias = build_manifest_type_alias(&key, role, ManifestTypeKind::Response);
+                // Mirror the manifest side (`append_pubsub_manifest_entries`):
+                // publishers (consumers) disambiguate by call site so fan-in
+                // publishers don't collide on one alias; subscribers (producers)
+                // stay plain. `build_call_site_id` MUST see the same (path, line,
+                // key) the manifest side passes — `path` is the raw `file_results`
+                // key on both sides — or the alias diverges and the resolution
+                // enrich-join silently drops the resolved payload type.
+                let alias = match role {
+                    ManifestRole::Consumer => {
+                        // Same >= 1 clamp as the manifest side (see
+                        // `append_pubsub_manifest_entries`) so the call_id matches.
+                        let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
+                        let call_id = build_call_site_id(path, line, &key);
+                        build_manifest_type_alias_with_call_id(
+                            &key,
+                            role,
+                            ManifestTypeKind::Response,
+                            Some(&call_id),
+                        )
+                    }
+                    ManifestRole::Producer => {
+                        build_manifest_type_alias(&key, role, ManifestTypeKind::Response)
+                    }
+                };
                 let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
                 if seen.insert(dedup_key) {
                     requests.push(SymbolRequest {
