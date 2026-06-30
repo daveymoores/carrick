@@ -3678,6 +3678,7 @@ mod tests {
             cached_detection: Some(DetectionResult {
                 frameworks: vec!["express".to_string()],
                 data_fetchers: vec!["fetch".to_string()],
+                messaging_clients: vec![],
                 notes: "test".to_string(),
             }),
             cached_guidance: None,

@@ -8,6 +8,13 @@ use tracing::{debug, trace};
 pub struct DetectionResult {
     pub frameworks: Vec<String>,
     pub data_fetchers: Vec<String>,
+    /// Packages used as pub/sub / message-queue clients (Kafka/NATS/Redis-pubsub/...),
+    /// enumerated by the framework-detect LLM. Populated only after the carrick-cloud
+    /// /framework-detect prompt+schema deploy; empty until then (see
+    /// corpus-2-pubsub-DEPLOY-SPEC-messaging-clients.md). Used to force-analyze pub/sub-only
+    /// files that produce no SWC candidates.
+    #[serde(default)]
+    pub messaging_clients: Vec<String>,
     pub notes: String,
 }
 

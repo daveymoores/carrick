@@ -268,6 +268,19 @@ impl FileOrchestrator {
                 continue;
             }
 
+            // Pub/sub Part B: a pub/sub-only file (e.g. NATS `nc.publish(...)`)
+            // produces zero SWC candidates, so the zero-candidate skip below would
+            // drop it before the file-analyzer ever sees its publish/subscribe
+            // idioms. Force-analyze it when it imports a package the cloud
+            // /framework-detect step flagged as a messaging client. INERT today:
+            // `messaging_clients` is empty until that cloud prompt+schema deploys,
+            // so this never fires and current behavior is unchanged. socket.io is
+            // not a messaging client, so socket files are never caught here.
+            let imports_messaging_client = Self::imports_messaging_client(
+                &scan_result.import_sources,
+                &framework_detection.messaging_clients,
+            );
+
             // Protocol dispatch: the HTTP analyze-file prompt only ever sees
             // HTTP candidates. Candidates of protocols without a registered
             // prompt (raw WebSocket/EventSource constructors today) are set
@@ -378,6 +391,17 @@ impl FileOrchestrator {
                     // file content to emit `graphql_operations`.
                     debug!(
                         "Routed GraphQL resolver file (no HTTP candidates): {}",
+                        path_str
+                    );
+                } else if imports_messaging_client {
+                    // Pub/sub Part B: this file imports a cloud-detected
+                    // messaging-client package but raised no HTTP candidate (its
+                    // publish/subscribe calls are invisible to the call-site
+                    // scanner). Fall through to the file-analyzer so its pub/sub
+                    // idiom-teaching can extract the operations. INERT until the
+                    // cloud /framework-detect step populates `messaging_clients`.
+                    debug!(
+                        "Force-analyzing messaging-client file (no HTTP candidates): {}",
                         path_str
                     );
                 } else if unrouted_candidates.is_empty() {
@@ -1367,6 +1391,27 @@ impl FileOrchestrator {
     /// Parse a file once and extract both the symbol table and the env-var
     /// alias map (`local const -> process.env name`). Sharing the parse keeps
     /// the per-file CPU cost flat — both passes are cheap AST walks.
+    /// Pub/sub Part B: does this file import a package the cloud
+    /// /framework-detect step flagged as a messaging client?
+    ///
+    /// An import source matches a `messaging_clients` entry when it is exactly
+    /// the entry (`"nats"`) or a subpath/scoped specifier under it
+    /// (`"@nats-io/nats-core"` matches `"@nats-io/nats-core"`; `"nats/foo"`
+    /// matches `"nats"`). Same matching convention as the data-fetcher
+    /// import-recall check, so it generalizes to any package without a hardcoded
+    /// list. INERT today: `messaging_clients` is empty until the cloud deploys,
+    /// so this always returns `false` and skip behavior is unchanged.
+    fn imports_messaging_client(import_sources: &[String], messaging_clients: &[String]) -> bool {
+        if messaging_clients.is_empty() {
+            return false;
+        }
+        import_sources.iter().any(|src| {
+            messaging_clients
+                .iter()
+                .any(|pkg| src == pkg || src.starts_with(&format!("{}/", pkg)))
+        })
+    }
+
     fn extract_symbol_table(
         file_path: &Path,
         cm: &Lrc<SourceMap>,
@@ -2396,6 +2441,91 @@ impl FileOrchestrator {
 mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
+
+    /// Pub/sub Part B: a NATS pub/sub-only file produces ZERO SWC candidates,
+    /// so the orchestrator's zero-candidate skip would drop it before the
+    /// file-analyzer. The skip is bypassed iff `imports_messaging_client` is
+    /// true. This test drives that exact decision through a real `scan_content`
+    /// to prove (a) the import sources ARE available at the skip point, and
+    /// (b) the force-analyze verdict, including inertness under the empty
+    /// (live default) `messaging_clients`.
+    #[test]
+    fn messaging_client_import_forces_analysis_of_zero_candidate_file() {
+        use crate::swc_scanner::SwcScanner;
+        use std::path::PathBuf;
+
+        let scanner = SwcScanner::new();
+
+        // A pub/sub-only NATS file: imports "nats", only calls publish/subscribe.
+        let nats_src = r#"
+            import { connect } from 'nats';
+            const SUBJECT = 'orders.created';
+            const nc = await connect();
+            nc.publish(SUBJECT, JSON.stringify({ id: 1 }));
+            nc.subscribe(SUBJECT);
+        "#;
+        let nats_scan = scanner.scan_content(&PathBuf::from("orders_pub.ts"), nats_src, &[]);
+        // Precondition for the whole fix: this file has NO HTTP/data candidates,
+        // so it would hit the zero-candidate skip without Part B.
+        assert!(
+            nats_scan.candidates.is_empty(),
+            "expected zero candidates for a pub/sub-only file, got {:?}",
+            nats_scan.candidates
+        );
+        // The import source must be visible at the skip point.
+        assert!(
+            nats_scan.import_sources.iter().any(|s| s == "nats"),
+            "import_sources should contain 'nats', got {:?}",
+            nats_scan.import_sources
+        );
+
+        // 1) With the cloud-detected messaging_clients=["nats"], the NATS file is
+        //    force-analyzed (NOT skipped).
+        assert!(
+            FileOrchestrator::imports_messaging_client(
+                &nats_scan.import_sources,
+                &["nats".to_string()],
+            ),
+            "a nats-importing file with messaging_clients=[nats] must be force-analyzed"
+        );
+
+        // 2) Inertness: with the LIVE default messaging_clients=[] (cloud not yet
+        //    deployed), the SAME file is NOT force-analyzed -> it is skipped,
+        //    exactly as today. This is the no-behavior-change guarantee.
+        assert!(
+            !FileOrchestrator::imports_messaging_client(&nats_scan.import_sources, &[]),
+            "empty messaging_clients (live default) must leave the file skippable (inert)"
+        );
+
+        // 3) No collateral: a file importing only an unrelated package is skipped
+        //    even when messaging_clients=["nats"].
+        let lodash_scan =
+            scanner.scan_content(&PathBuf::from("util.ts"), "import _ from 'lodash';\n", &[]);
+        assert!(
+            !FileOrchestrator::imports_messaging_client(
+                &lodash_scan.import_sources,
+                &["nats".to_string()],
+            ),
+            "a lodash-only file must not be force-analyzed by messaging_clients=[nats]"
+        );
+
+        // Scoped/subpath specifiers match their package entry (e.g. a NATS file
+        // importing the scoped client under a messaging_clients entry).
+        assert!(
+            FileOrchestrator::imports_messaging_client(
+                &["@nats-io/nats-core".to_string()],
+                &["@nats-io/nats-core".to_string()],
+            ),
+            "scoped messaging-client import must match its entry"
+        );
+        assert!(
+            FileOrchestrator::imports_messaging_client(
+                &["ioredis/built/Redis".to_string()],
+                &["ioredis".to_string()],
+            ),
+            "subpath import must match its package entry"
+        );
+    }
 
     #[test]
     fn join_paths_does_not_double_a_baked_prefix() {
