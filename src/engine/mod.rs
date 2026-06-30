@@ -1267,7 +1267,12 @@ fn append_pubsub_operations(
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut dropped = 0usize;
-    for (path, result) in file_results {
+    // Deterministic order: HashMap iteration is unordered, so sort by path
+    // before pushing endpoints/calls (keeps scanner output stable).
+    let mut paths: Vec<&String> = file_results.keys().collect();
+    paths.sort();
+    for path in paths {
+        let result = &file_results[path];
         for op in &result.pubsub_operations {
             let line = u32::try_from(op.line_number).unwrap_or(0);
             let file_path = PathBuf::from(path);
@@ -1332,7 +1337,11 @@ fn append_pubsub_manifest_entries(
 ) {
     use crate::operation::PubsubRole;
 
-    for (path, result) in file_results {
+    // Deterministic order: sort paths before emitting manifest entries.
+    let mut paths: Vec<&String> = file_results.keys().collect();
+    paths.sort();
+    for path in paths {
+        let result = &file_results[path];
         for op in &result.pubsub_operations {
             let role = match op.role {
                 Some(PubsubRole::Subscriber) => ManifestRole::Producer,

@@ -1163,15 +1163,6 @@ impl Visit for CandidateVisitor {
     }
 }
 
-/// Collect the local binding names introduced by imports from any of the
-/// `data_fetchers` packages, covering default, named (incl. aliases), and
-/// namespace imports. Matched exactly or as a scope/subpath prefix
-/// (`pkg`, `@scope/pkg`, `pkg/sub`).
-///
-/// `data_fetchers` comes from framework detection — the LLM decides which of the
-/// repo's dependencies are data-fetching libraries — so the scanner carries no
-/// hardcoded package list. This is a recall booster for the gatekeeper, not an
-/// authoritative classification: the LLM still decides what each call is.
 /// Collect the module-specifier string of every `import ... from '<source>'`
 /// declaration in the module (e.g. `"nats"`, `"@nats-io/nats-core"`). Used by
 /// the file-orchestrator to force-analyze zero-candidate files that import a
@@ -1189,6 +1180,15 @@ fn collect_import_sources(module: &Module) -> Vec<String> {
         .collect()
 }
 
+/// Collect the local binding names introduced by imports from any of the
+/// `data_fetchers` packages, covering default, named (incl. aliases), and
+/// namespace imports. Matched exactly or as a scope/subpath prefix
+/// (`pkg`, `@scope/pkg`, `pkg/sub`).
+///
+/// `data_fetchers` comes from framework detection — the LLM decides which of the
+/// repo's dependencies are data-fetching libraries — so the scanner carries no
+/// hardcoded package list. This is a recall booster for the gatekeeper, not an
+/// authoritative classification: the LLM still decides what each call is.
 fn network_import_locals(module: &Module, data_fetchers: &[String]) -> HashSet<String> {
     let is_data_fetcher = |src: &str| {
         data_fetchers
