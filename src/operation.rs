@@ -173,9 +173,7 @@ pub enum OperationKey {
     /// Carries no direction: the role lives on which side (endpoint vs call) the
     /// op sits, and the broker is diagnostic, not part of identity — so a
     /// subscriber and a publisher on the same topic share one key and match.
-    Pubsub {
-        topic: String,
-    },
+    Pubsub { topic: String },
 }
 
 impl OperationKey {
@@ -386,8 +384,14 @@ mod tests {
         assert_ne!(key, other_topic);
 
         // Lenient role parsing mirrors CallKind.
-        assert_eq!(PubsubRole::parse_lenient("subscriber"), Some(PubsubRole::Subscriber));
-        assert_eq!(PubsubRole::parse_lenient("Publisher"), Some(PubsubRole::Publisher));
+        assert_eq!(
+            PubsubRole::parse_lenient("subscriber"),
+            Some(PubsubRole::Subscriber)
+        );
+        assert_eq!(
+            PubsubRole::parse_lenient("Publisher"),
+            Some(PubsubRole::Publisher)
+        );
         assert_eq!(PubsubRole::parse_lenient("??"), None);
     }
 

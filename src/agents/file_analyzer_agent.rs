@@ -1457,7 +1457,14 @@ mod tests {
 
         // An off-enum / non-string role degrades to None (lenient, like call_kind)
         // instead of failing the parse; the optional type/broker slots default.
-        for junk in [r#""SUBSCRIBE""#, r#""listener""#, r#""""#, "0", "false", "{}"] {
+        for junk in [
+            r#""SUBSCRIBE""#,
+            r#""listener""#,
+            r#""""#,
+            "0",
+            "false",
+            "{}",
+        ] {
             let json = format!(
                 r#"{{ "mounts": [], "endpoints": [], "data_calls": [],
                     "pubsub_operations": [

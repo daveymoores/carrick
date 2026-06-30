@@ -1028,9 +1028,8 @@ async fn analyze_current_repo_incremental(
             // Pub/sub ops are LLM-sourced in `merged_results`, not in the
             // deterministic `protocol_extractions`, so their payload anchors
             // bundle through the same path (#corpus-2 resolution dim).
-            protocol_requests.extend(
-                file_orchestrator.collect_pubsub_type_requests(&merged_results, repo_path),
-            );
+            protocol_requests
+                .extend(file_orchestrator.collect_pubsub_type_requests(&merged_results, repo_path));
 
             // GraphQL producers take the infer path, not the bundle path: their
             // response contract is the resolver's expanded RETURN type, so they
@@ -1275,9 +1274,7 @@ fn append_pubsub_operations(
             let key = OperationKey::pubsub(op.topic.clone());
             match op.role {
                 Some(PubsubRole::Subscriber) => {
-                    cloud_data
-                        .endpoints
-                        .push(to_details(key, &file_path, line));
+                    cloud_data.endpoints.push(to_details(key, &file_path, line));
                     subscribers += 1;
                 }
                 Some(PubsubRole::Publisher) => {
@@ -2404,8 +2401,7 @@ async fn analyze_current_repo(
     // deterministic `protocol_extractions`, so their payload anchors bundle
     // through the same path (#corpus-2 resolution dim).
     protocol_requests.extend(
-        file_orchestrator
-            .collect_pubsub_type_requests(&analysis_result.file_results, repo_path),
+        file_orchestrator.collect_pubsub_type_requests(&analysis_result.file_results, repo_path),
     );
 
     // GraphQL producers take the infer path, not the bundle path: their response
@@ -4576,8 +4572,7 @@ mod tests {
         let producer = entries
             .iter()
             .find(|e| {
-                e.key.canonical() == "pubsub|metrics.page_view"
-                    && e.role == ManifestRole::Producer
+                e.key.canonical() == "pubsub|metrics.page_view" && e.role == ManifestRole::Producer
             })
             .expect("subscriber pub/sub op must emit a Producer manifest entry");
         assert_eq!(producer.type_kind, ManifestTypeKind::Response);
@@ -4591,8 +4586,7 @@ mod tests {
         let consumer = entries
             .iter()
             .find(|e| {
-                e.key.canonical() == "pubsub|metrics.page_view"
-                    && e.role == ManifestRole::Consumer
+                e.key.canonical() == "pubsub|metrics.page_view" && e.role == ManifestRole::Consumer
             })
             .expect("publisher pub/sub op must emit a Consumer manifest entry");
         assert_eq!(consumer.primary_type_symbol.as_deref(), Some("PageView"));

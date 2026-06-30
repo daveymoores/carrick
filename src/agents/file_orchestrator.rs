@@ -3879,6 +3879,9 @@ export { routes };
         );
         // Order follows the sorted file keys: alpha < mid < zeta.
         let symbols: Vec<&str> = first.iter().map(|r| r.symbol_name.as_str()).collect();
-        assert_eq!(symbols, vec!["UserSignedUp", "PageViewEvent", "OrderCreated"]);
+        assert_eq!(
+            symbols,
+            vec!["UserSignedUp", "PageViewEvent", "OrderCreated"]
+        );
     }
 }
