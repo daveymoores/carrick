@@ -1351,7 +1351,23 @@ fn append_pubsub_manifest_entries(
                 None => continue,
             };
             let key = OperationKey::pubsub(op.topic.clone());
-            let line = u32::try_from(op.line_number).unwrap_or(0);
+            // Clamp to a valid 1-based line. A degenerate (<= 0) line must still
+            // hash identically here and on the SymbolRequest side, and 0 is an
+            // invalid anchor everywhere else (`parse_file_location` et al.).
+            let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
+            // Publishers (consumers) disambiguate by call site. Two repos
+            // publishing to the same topic (fan-in — the common event-driven
+            // shape) otherwise hash to ONE consumer alias, and ts_check's bundled
+            // `cross-repo-consumers` types then declare that interface twice with
+            // different bodies — one publisher's payload masks the other's,
+            // yielding a spurious compat mismatch on whichever loses. Mirror the
+            // HTTP consumer path (`add_manifest_pair` + `build_call_site_id`).
+            // Subscribers (producers) keep the plain alias: one definition per
+            // topic per repo, exactly like an HTTP endpoint.
+            let call_id = match role {
+                ManifestRole::Consumer => Some(build_call_site_id(path, line, &key)),
+                ManifestRole::Producer => None,
+            };
             add_protocol_manifest_entry(
                 entries,
                 &key,
@@ -1359,6 +1375,7 @@ fn append_pubsub_manifest_entries(
                 path,
                 line,
                 op.primary_type_symbol.clone(),
+                call_id.as_deref(),
             );
         }
     }
@@ -1446,6 +1463,7 @@ fn append_protocol_manifest_entries(
             &op.file_path.to_string_lossy(),
             op.line,
             op.primary_type_symbol.clone(),
+            None,
         );
     }
     for op in &extractions.graphql.consumers {
@@ -1459,6 +1477,10 @@ fn append_protocol_manifest_entries(
             // the `request<T>(DOC)` call site (#248 consumer side), not the
             // SDL-derived `primary_type_symbol` (always `None` for documents).
             op.payload_type_symbol.clone(),
+            // Fan-in consumers (multiple repos reading the same field) carry the
+            // same latent alias-collision risk the pub/sub publisher path fixes,
+            // but neither corpus exercises it today; deferred to #291.
+            None,
         );
     }
     for op in &extractions.sockets.listeners {
@@ -1469,6 +1491,7 @@ fn append_protocol_manifest_entries(
             &op.file_path.to_string_lossy(),
             op.line,
             op.payload_type_symbol.clone(),
+            None,
         );
     }
     for op in &extractions.sockets.emitters {
@@ -1479,6 +1502,8 @@ fn append_protocol_manifest_entries(
             &op.file_path.to_string_lossy(),
             op.line,
             op.payload_type_symbol.clone(),
+            // Same deferred fan-in caveat as the graphql consumer above (#291).
+            None,
         );
     }
 }
@@ -1491,8 +1516,10 @@ fn append_protocol_manifest_entries(
 /// `primary_type_symbol` is threaded straight onto the entry at creation — the
 /// op carries its anchor deterministically, unlike HTTP where it is stamped
 /// later from the LLM result. The `type_alias` MUST be computed with the same
-/// `build_manifest_type_alias(key, role, Response)` the SymbolRequest side uses,
-/// or the enrich-join silently fails to flip `Unknown` → resolved.
+/// `build_manifest_type_alias_with_call_id(key, role, Response, call_id)` the
+/// SymbolRequest side uses — same key, same role, same kind, AND the same
+/// `call_id` (see the `call_id` param) — or the enrich-join silently fails to
+/// flip `Unknown` → resolved.
 fn add_protocol_manifest_entry(
     entries: &mut Vec<TypeManifestEntry>,
     key: &OperationKey,
@@ -1500,9 +1527,17 @@ fn add_protocol_manifest_entry(
     file_path: &str,
     line_number: u32,
     primary_type_symbol: Option<String>,
+    // Per-call-site disambiguator. `None` keeps the plain key-only alias (one
+    // definition per key per repo — correct for producers/endpoints). `Some`
+    // appends a `_Call<id>` suffix so multiple consumers of the same key in one
+    // bundle (fan-in) don't collide on a single alias; see the pub/sub publisher
+    // path in `append_pubsub_manifest_entries`. Must equal the `call_id` the
+    // SymbolRequest side computes for the same op, or the resolution join breaks.
+    call_id: Option<&str>,
 ) {
     let type_kind = ManifestTypeKind::Response;
-    let type_alias = crate::type_manifest::build_manifest_type_alias(key, role, type_kind);
+    let type_alias =
+        crate::type_manifest::build_manifest_type_alias_with_call_id(key, role, type_kind, call_id);
     let infer_kind = infer_kind_for_manifest(role, type_kind);
     let evidence = crate::cloud_storage::TypeEvidence {
         file_path: file_path.to_string(),
@@ -4498,6 +4533,74 @@ mod tests {
         );
         assert_eq!(manifest_alias, expected);
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// Fan-in regression (the corpus-2 compat false-negative): two publishers on
+    /// the SAME topic but in different repos/files must get DISTINCT consumer
+    /// aliases. They previously hashed to one alias (`build_manifest_type_alias`
+    /// keys only on `topic|consumer|Response`), so ts_check's bundled
+    /// `cross-repo-consumers` declared that interface twice with different bodies
+    /// — one publisher's payload type masked the other's and the masked edge
+    /// reported a spurious compat mismatch. The publisher alias now disambiguates
+    /// by call site, and each publisher's SymbolRequest alias still byte-matches
+    /// its own manifest entry so the resolution join holds.
+    #[test]
+    fn pubsub_fan_in_publishers_get_distinct_consumer_aliases() {
+        use crate::operation::PubsubRole;
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        // Two repos publishing `order.placed` with a same-named `OrderPlaced`
+        // symbol whose definition differs per repo — the exact corpus-2 shape.
+        file_results.insert(
+            "orders-engine/src/publish.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "order.placed",
+                    PubsubRole::Publisher,
+                    Some("OrderPlaced"),
+                    Some("./types/order"),
+                )],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "billing-svc/src/emit.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "order.placed",
+                    PubsubRole::Publisher,
+                    Some("OrderPlaced"),
+                    Some("./types/order"),
+                )],
+                ..Default::default()
+            },
+        );
+
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(&mut entries, &file_results);
+        let manifest_aliases: HashSet<String> = entries
+            .iter()
+            .filter(|e| e.key.canonical() == "pubsub|order.placed")
+            .map(|e| e.type_alias.clone())
+            .collect();
+        assert_eq!(
+            manifest_aliases.len(),
+            2,
+            "two fan-in publishers must yield two DISTINCT consumer aliases, not \
+             one collided alias (which masks one payload type in ts_check)"
+        );
+
+        // Each publisher's SymbolRequest alias must byte-match its manifest alias
+        // (same call site → same call_id), so the resolution enrich-join holds.
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let request_aliases: HashSet<String> =
+            requests.iter().filter_map(|r| r.alias.clone()).collect();
+        assert_eq!(
+            request_aliases, manifest_aliases,
+            "each publisher's SymbolRequest alias must byte-match its manifest \
+             entry's alias across the fan-in set"
+        );
     }
 
     /// PR-4: a subscriber pub/sub op carrying a decoded-payload
