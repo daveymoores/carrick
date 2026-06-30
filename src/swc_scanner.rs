@@ -169,7 +169,12 @@ impl SwcScanner {
     /// Returns a ScanResult with candidates and whether the file should be analyzed.
     /// If no candidates are found, the file can be skipped.
     #[allow(dead_code)]
-    pub fn scan_file(&self, file_path: &Path, data_fetchers: &[String]) -> ScanResult {
+    pub fn scan_file(
+        &self,
+        file_path: &Path,
+        data_fetchers: &[String],
+        messaging_clients: &[String],
+    ) -> ScanResult {
         let handler = Handler::with_tty_emitter(
             ColorConfig::Never,
             true,
@@ -189,9 +194,20 @@ impl SwcScanner {
         };
 
         let import_sources = collect_import_sources(&module);
+        let imports_messaging_client =
+            file_imports_messaging_client(&import_sources, messaging_clients);
+        // Const-string topic bindings are only needed for the gated Signal 7, so
+        // skip the pre-pass entirely when the gate is off.
+        let const_string_bindings = if imports_messaging_client {
+            collect_const_string_bindings(&module)
+        } else {
+            HashSet::new()
+        };
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
             network_import_locals(&module, data_fetchers),
+            imports_messaging_client,
+            const_string_bindings,
         );
         module.visit_with(&mut visitor);
 
@@ -212,6 +228,7 @@ impl SwcScanner {
         file_path: &Path,
         content: &str,
         data_fetchers: &[String],
+        messaging_clients: &[String],
     ) -> ScanResult {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
         use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
@@ -289,9 +306,20 @@ impl SwcScanner {
         });
 
         let import_sources = collect_import_sources(&module);
+        let imports_messaging_client =
+            file_imports_messaging_client(&import_sources, messaging_clients);
+        // Const-string topic bindings are only needed for the gated Signal 7, so
+        // skip the pre-pass entirely when the gate is off.
+        let const_string_bindings = if imports_messaging_client {
+            collect_const_string_bindings(&module)
+        } else {
+            HashSet::new()
+        };
         let mut visitor = CandidateVisitor::new(
             file_source_map,
             network_import_locals(&module, data_fetchers),
+            imports_messaging_client,
+            const_string_bindings,
         );
         module.visit_with(&mut visitor);
 
@@ -556,10 +584,36 @@ struct CandidateVisitor {
     /// argument is a strong network-call signal even when the callee name is
     /// unknown.
     await_depth: usize,
+    /// True when this file imports a package the cloud /framework-detect step
+    /// flagged as a messaging client (NATS, Redis, Kafka, …). This is the gate
+    /// for Signal 7 (pub/sub call-site surfacing): the publish/subscribe shape
+    /// (`obj.method("topic", payload)`) is indistinguishable from
+    /// `socket.emit('x')` / `logger.info('x')`, so surfacing it unconditionally
+    /// broke the socket-skip invariant and risked corpus-1. socket.io is *not* a
+    /// messaging client, so socket files never gate in and the signal stays inert
+    /// there. Empty `messaging_clients` → always false → Signal 7 never fires.
+    file_imports_messaging_client: bool,
+    /// Top-level `const <id> = "<literal>"` bindings, so a pub/sub call whose
+    /// topic is referenced by name (`const SUBJECT = "user.registered"; …
+    /// nc.publish(SUBJECT, …)`) still counts as having a string-literal topic
+    /// for the Signal 7 first-arg check. Only string-literal initializers are
+    /// recorded; this is a recall booster, not a full constant-folder.
+    const_string_bindings: HashSet<String>,
+    /// True while visiting a call expression that sits directly in a
+    /// statement-expression (`nc.publish(SUBJECT, payload);`) or a variable
+    /// initializer (`const sub = nc.subscribe("topic");`). Signal 7 only fires
+    /// in these two positions — the fire-and-forget publish/subscribe shapes —
+    /// so call sites nested inside other expressions are not surfaced.
+    in_pubsub_call_position: bool,
 }
 
 impl CandidateVisitor {
-    fn new(source_map: Lrc<SourceMap>, network_import_locals: HashSet<String>) -> Self {
+    fn new(
+        source_map: Lrc<SourceMap>,
+        network_import_locals: HashSet<String>,
+        file_imports_messaging_client: bool,
+        const_string_bindings: HashSet<String>,
+    ) -> Self {
         Self {
             candidates: Vec::new(),
             source_map,
@@ -567,6 +621,9 @@ impl CandidateVisitor {
             network_import_locals,
             seen_spans: HashSet::new(),
             await_depth: 0,
+            file_imports_messaging_client,
+            const_string_bindings,
+            in_pubsub_call_position: false,
         }
     }
 
@@ -735,6 +792,18 @@ impl CandidateVisitor {
             call.args.first().map(|a| &*a.expr),
             Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Tpl(_))
         )
+    }
+
+    /// Signal-7 topic check: is the first argument a string/template literal, or
+    /// a bare identifier bound to a top-level `const <id> = "<literal>"`? The
+    /// const-ref case (`const SUBJECT = "user.registered"; nc.publish(SUBJECT,
+    /// …)`) is the publisher idiom that an inline-literal-only check would miss.
+    fn first_arg_is_stringish_or_const_string(&self, call: &CallExpr) -> bool {
+        match call.args.first().map(|a| &*a.expr) {
+            Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Tpl(_)) => true,
+            Some(Expr::Ident(ident)) => self.const_string_bindings.contains(ident.sym.as_ref()),
+            _ => false,
+        }
     }
 
     /// Emit a candidate for `call`, deduplicating by span so the multiple
@@ -994,6 +1063,29 @@ impl Visit for CandidateVisitor {
         self.await_depth -= 1;
     }
 
+    fn visit_expr_stmt(&mut self, node: &ExprStmt) {
+        // A statement-expression that *is* a call (`nc.publish(SUBJECT, payload);`)
+        // is one of the two Signal-7 positions. Mark it so the call expr it wraps
+        // is eligible; `visit_call_expr` clears the flag before descending so
+        // nested calls don't inherit the position.
+        if matches!(&*node.expr, Expr::Call(_)) {
+            self.in_pubsub_call_position = true;
+        }
+        node.visit_children_with(self);
+        self.in_pubsub_call_position = false;
+    }
+
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        // A variable initializer that *is* a call (`const sub = nc.subscribe("topic");`)
+        // is the other Signal-7 position. Same flag-clearing discipline as
+        // `visit_expr_stmt`.
+        if matches!(node.init.as_deref(), Some(Expr::Call(_))) {
+            self.in_pubsub_call_position = true;
+        }
+        node.visit_children_with(self);
+        self.in_pubsub_call_position = false;
+    }
+
     fn visit_new_expr(&mut self, node: &NewExpr) {
         // Network primitives constructed with `new`: `new WebSocket(url)`,
         // `new EventSource(url)`, `new XMLHttpRequest()`. Emitting these as
@@ -1065,6 +1157,12 @@ impl Visit for CandidateVisitor {
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
+        // Snapshot the Signal-7 position flag set by the enclosing
+        // `visit_expr_stmt` / `visit_var_declarator`, then clear it so calls
+        // nested inside this call's arguments/callee don't inherit the position.
+        let in_pubsub_call_position = self.in_pubsub_call_position;
+        self.in_pubsub_call_position = false;
+
         // Signal 1: global fetch primitive.
         if self.is_global_network_call(&call.callee) {
             self.push_candidate(call, "fetch".to_string(), None);
@@ -1158,6 +1256,41 @@ impl Visit for CandidateVisitor {
             }
         }
 
+        // Signal 7 (GATED): fire-and-forget pub/sub call sites. The
+        // publish/subscribe shape (`nc.publish(SUBJECT, payload);`,
+        // `const sub = nc.subscribe("topic")`) is a member call with a
+        // string/const-string topic as its first argument, but unlike an HTTP
+        // call it is not awaited and the method name is library-specific
+        // (publish/subscribe/emit/produce/…), so the other signals miss it
+        // inconsistently. This surfaces it as a focused candidate — but ONLY
+        // when the file imports a messaging-client package
+        // (`file_imports_messaging_client`). The shape is identical to
+        // `socket.emit('x')` and `logger.info('x')`; the gate is what keeps this
+        // from firing on socket.io / logging files (socket.io is not a messaging
+        // client), so it has zero socket-skip / corpus-1 collateral. The gate
+        // being false (incl. empty `messaging_clients`) makes this branch inert.
+        if self.file_imports_messaging_client
+            && in_pubsub_call_position
+            && let Callee::Expr(callee_expr) = &call.callee
+            && let Expr::Member(member) = &**callee_expr
+            // Receiver must not be a string/number literal — that would be a
+            // `"str".method()` / `(123).method()` chain, not a pub/sub client.
+            && !matches!(&*member.obj, Expr::Lit(Lit::Str(_)) | Expr::Lit(Lit::Num(_)))
+            && self.first_arg_is_stringish_or_const_string(call)
+        {
+            let method = match &member.prop {
+                MemberProp::Ident(id) => Some(id.sym.to_string()),
+                MemberProp::Computed(c) => match &*c.expr {
+                    Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+                    _ => None,
+                },
+                MemberProp::PrivateName(_) => None,
+            };
+            let obj_name =
+                Self::extract_callee_object(&member.obj).unwrap_or_else(|| "<pubsub>".to_string());
+            self.push_candidate(call, obj_name, method);
+        }
+
         // Continue visiting child nodes
         call.visit_children_with(self);
     }
@@ -1178,6 +1311,61 @@ fn collect_import_sources(module: &Module) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Does any of this module's import specifiers match a `messaging_clients`
+/// entry? Gate for the pub/sub call-site Signal 7.
+///
+/// An import source matches when it is exactly the entry (`"nats"`) or a
+/// subpath/scoped specifier under it (`"nats/foo"` / `"@nats-io/nats-core"`).
+/// This is the same matching convention as
+/// `FileOrchestrator::imports_messaging_client` and the data-fetcher
+/// import-recall check, kept in sync deliberately so a package gates the same
+/// way everywhere without a hardcoded list. Empty `messaging_clients` → false.
+fn file_imports_messaging_client(import_sources: &[String], messaging_clients: &[String]) -> bool {
+    if messaging_clients.is_empty() {
+        return false;
+    }
+    import_sources.iter().any(|src| {
+        messaging_clients
+            .iter()
+            .any(|pkg| src == pkg || src.starts_with(&format!("{}/", pkg)))
+    })
+}
+
+/// Collect top-level `const <id> = "<string-literal>"` binding names so a
+/// pub/sub call whose topic is a const reference (`const SUBJECT =
+/// "user.registered"; nc.publish(SUBJECT, …)`) still counts as having a
+/// string-literal topic for Signal 7. Only module-body `const` declarators with
+/// an identifier pattern and a bare string-literal initializer are recorded —
+/// this is a targeted recall booster, not a general constant-folder, so
+/// template literals, member exprs, and nested scopes are intentionally ignored.
+fn collect_const_string_bindings(module: &Module) -> HashSet<String> {
+    let mut bindings = HashSet::new();
+    for item in &module.body {
+        let var = match item {
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => var,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+                Decl::Var(var) => var,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if var.kind != VarDeclKind::Const {
+            continue;
+        }
+        for decl in &var.decls {
+            let Pat::Ident(ident) = &decl.name else {
+                continue;
+            };
+            if let Some(init) = &decl.init
+                && let Expr::Lit(Lit::Str(_)) = &**init
+            {
+                bindings.insert(ident.id.sym.to_string());
+            }
+        }
+    }
+    bindings
 }
 
 /// Collect the local binding names introduced by imports from any of the
@@ -1232,7 +1420,7 @@ mod tests {
     fn scan_test_content_with_fetchers(content: &str, data_fetchers: &[String]) -> ScanResult {
         let scanner = SwcScanner::new();
         let path = PathBuf::from("test.ts");
-        scanner.scan_content(&path, content, data_fetchers)
+        scanner.scan_content(&path, content, data_fetchers, &[])
     }
 
     fn handler_names(content: &str) -> Vec<String> {
@@ -1820,8 +2008,8 @@ createRouter()
         let file_a_content = "fetch('/api/a');";
         let file_b_content = "fetch('/api/b');";
 
-        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content, &[]);
-        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content, &[]);
+        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content, &[], &[]);
+        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content, &[], &[]);
 
         assert!(
             !result_a.candidates.is_empty(),
@@ -1930,6 +2118,107 @@ apiHandler.route('/data', handleData);
         assert!(
             result.candidates.len() >= 3,
             "Should detect custom-named router calls"
+        );
+    }
+
+    /// Gating proof for the pub/sub call-site Signal 7. The critical property is
+    /// that the publish/subscribe shape is surfaced ONLY in files that import a
+    /// messaging-client package, and that the shape-identical `socket.emit(...)`
+    /// is never surfaced (socket.io is not a messaging client), so the gate has
+    /// zero socket-skip / corpus-1 collateral.
+    #[test]
+    fn pubsub_candidate_surfacing_is_gated_by_messaging_client_import() {
+        use std::fs;
+
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+
+        // --- Real NATS publisher fixture: `nc.publish(SUBJECT, ...)` with a
+        //     const-string topic (`const SUBJECT = "user.registered"`). ---
+        let publisher_path = fixtures.join("xrepo-corpus-2/analytics-worker/src/nats/publisher.ts");
+        let publisher_src = fs::read_to_string(&publisher_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", publisher_path.display(), e));
+        let publisher_scanner = SwcScanner::new();
+
+        // Gated in (messaging_clients=["nats"]): the publish call is surfaced,
+        // proving const-string topic resolution works (`SUBJECT` -> literal).
+        let gated_in = publisher_scanner.scan_content(
+            &publisher_path,
+            &publisher_src,
+            &[],
+            &["nats".to_string()],
+        );
+        assert!(
+            gated_in
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("publish")),
+            "gated in (messaging_clients=[nats]): nc.publish(SUBJECT,…) must be surfaced, got {:?}",
+            gated_in.candidates
+        );
+
+        // Gated out (messaging_clients=[]): the file is inert — zero candidates.
+        let gated_out = publisher_scanner.scan_content(&publisher_path, &publisher_src, &[], &[]);
+        assert!(
+            gated_out.candidates.is_empty(),
+            "gated out (messaging_clients=[]): publisher file must surface 0 candidates, got {:?}",
+            gated_out.candidates
+        );
+
+        // --- Real NATS subscriber fixture: `const sub = nc.subscribe("user.registered")`
+        //     (variable initializer position, inline string literal). ---
+        let subscriber_path =
+            fixtures.join("xrepo-corpus-2/notifications-svc/src/nats/subscriber.ts");
+        let subscriber_src = fs::read_to_string(&subscriber_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", subscriber_path.display(), e));
+        let subscriber_scanner = SwcScanner::new();
+
+        let sub_gated_in = subscriber_scanner.scan_content(
+            &subscriber_path,
+            &subscriber_src,
+            &[],
+            &["nats".to_string()],
+        );
+        assert!(
+            sub_gated_in
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("subscribe")),
+            "gated in: const sub = nc.subscribe(\"…\") must be surfaced, got {:?}",
+            sub_gated_in.candidates
+        );
+
+        let sub_gated_out =
+            subscriber_scanner.scan_content(&subscriber_path, &subscriber_src, &[], &[]);
+        assert!(
+            sub_gated_out.candidates.is_empty(),
+            "gated out: subscriber file must surface 0 candidates, got {:?}",
+            sub_gated_out.candidates
+        );
+
+        // --- Socket gate exclusion: socket.io is NOT a messaging client, so even
+        //     with messaging_clients=["nats"] set, `socket.emit('x', d)` (the
+        //     shape-identical publish look-alike) must NOT be surfaced by
+        //     Signal 7. This is the socket-skip invariant the ungated version
+        //     broke. ---
+        let socket_src = r#"
+import { Server } from 'socket.io';
+const io = new Server();
+io.on('connection', (socket) => {
+  socket.emit('payment:settled', { id: 1 });
+});
+"#;
+        let socket_path = PathBuf::from("realtime.ts");
+        let socket_scanner = SwcScanner::new();
+        let socket_scan =
+            socket_scanner.scan_content(&socket_path, socket_src, &[], &["nats".to_string()]);
+        assert!(
+            !socket_scan
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("emit")),
+            "socket.emit must NOT be surfaced — socket.io is not a messaging client, so the gate \
+             excludes socket files even when messaging_clients=[nats], got {:?}",
+            socket_scan.candidates
         );
     }
 }
