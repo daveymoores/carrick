@@ -294,6 +294,23 @@ export class TypeInferrer {
       return null;
     }
 
+    return this.buildFunctionReturnInferredType(request, func, extractionConfig);
+  }
+
+  /**
+   * Build a `function_return` inferred type from an already-resolved function
+   * node: unwrap `Promise<…>` / async-iterator transport, apply the extraction
+   * config to the awaited type, and expand a bare named return structurally.
+   * Extracted from `inferFunctionReturn` so the route-registration path
+   * (`inferResponseBody` following a handler) can reuse the exact same logic
+   * against the handler function instead of the containing function.
+   */
+  private buildFunctionReturnInferredType(
+    request: InferRequestItem,
+    func: FunctionLike,
+    extractionConfig?: ExtractionConfig,
+    treatVoidAsUnresolved = false
+  ): InferredType | null {
     const returnTypeNode = func.getReturnTypeNode();
     const isExplicit = returnTypeNode !== undefined;
     let returnType = func.getReturnType();
@@ -324,6 +341,22 @@ export class TypeInferrer {
     }
 
     typeString = this.unwrapPromise(typeString, returnType);
+
+    // Only the route-registration handler-following RESPONSE path treats a
+    // void/empty return as payload-less (null) — a redirect / 204 / streaming
+    // handler must stay unresolved, not become a spurious `void` type. The
+    // regular `function_return` infer keeps `void` (a function that genuinely
+    // returns void should report it, e.g. the signature-hint pass).
+    const trimmed = typeString.trim();
+    if (
+      treatVoidAsUnresolved &&
+      (trimmed === 'void' ||
+        trimmed === 'undefined' ||
+        trimmed === 'never' ||
+        trimmed === '')
+    ) {
+      return null;
+    }
 
     return this.createInferredType(
       request,
@@ -417,12 +450,49 @@ export class TypeInferrer {
     const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
+      // Line-only anchor (no span, no expression text) — the shape the scanner
+      // sends for a named-handler route registration whose handler is declared
+      // away from the registration line. Follow the handler at that line before
+      // the generic function-return fallback, which can't reach a handler more
+      // than a couple of lines from the registration.
+      const lineHandler = this.handlerAtLine(sourceFile, request.line_number);
+      if (lineHandler) {
+        this.log(
+          `Line ${request.line_number} is a route registration; following handler return`
+        );
+        return this.buildFunctionReturnInferredType(
+          request,
+          lineHandler,
+          extractionConfig,
+          true
+        );
+      }
       // No locator, or locator didn't resolve — likely a payload-less handler
       // (redirect, 204, streaming). Infer the containing function's return type.
       this.log(
         `No payload node found for request at ${request.file_path}:${request.line_number}; falling back to function return`
       );
       return this.inferFunctionReturn(sourceFile, request, extractionConfig);
+    }
+
+    // Route-registry object literal: the locator lands on the registry entry
+    // `{ method, path, handler: healthCheckHandler }`, whose response contract
+    // is the handler's RETURN type — one indirection away, NOT the object's own
+    // `{ method; path; handler }` shape. Follow the handler before treating the
+    // object as a payload. (A call-shaped registration is handled below.)
+    if (!Node.isCallExpression(node)) {
+      const registryHandler = this.resolveRegisteredHandler(node);
+      if (registryHandler) {
+        this.log(
+          `Span resolves to a route-registry object literal at ${request.file_path}:${request.line_number}; following handler return`
+        );
+        return this.buildFunctionReturnInferredType(
+          request,
+          registryHandler,
+          extractionConfig,
+          true
+        );
+      }
     }
 
     // The resolved node IS the payload subexpression in the MVP schema.
@@ -440,6 +510,21 @@ export class TypeInferrer {
         (arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)
       );
       if (registersCallback) {
+        // The locator lands on a route registration whose handler carries the
+        // response contract in its RETURN type — one indirection away. Follow
+        // the handler and infer its return instead of dropping the payload.
+        const handler = this.resolveRegisteredHandler(node);
+        if (handler) {
+          this.log(
+            `Span resolves to a callback-registration call at ${request.file_path}:${request.line_number}; following handler return`
+          );
+          return this.buildFunctionReturnInferredType(
+            request,
+            handler,
+            extractionConfig,
+            true
+          );
+        }
         this.log(
           `Span resolves to a callback-registration call at ${request.file_path}:${request.line_number}; no payload to infer`
         );
@@ -610,6 +695,55 @@ export class TypeInferrer {
     const located = this.resolveTargetNode(sourceFile, request);
 
     if (!located) {
+      // Line-only anchor: the scanner points a request infer at the route
+      // registration line with no span/text. Follow the handler at that line and
+      // read its first typed request expression (`c.req.json<T>()`, `req.body as
+      // T`) — one indirection into the handler body.
+      const lineHandler = this.handlerAtLine(sourceFile, request.line_number);
+      if (lineHandler) {
+        const requestType = this.inferRequestReadFromHandler(lineHandler);
+        if (requestType) {
+          return this.createInferredType(
+            request,
+            requestType,
+            true,
+            this.getNodeLocation(lineHandler),
+            undefined,
+            undefined
+          );
+        }
+      }
+      return null;
+    }
+
+    // Inline-handler registration (`app.post('/x', async (c) => { … })`) or a
+    // route-registry object literal: the locator lands on the registration, not
+    // on a request expression, so the request contract lives ONE indirection
+    // away — the first typed request-body read inside the handler body
+    // (`c.req.json<T>()`, `req.body as T`, `const b: T = …`). Follow the handler
+    // and scan its body before falling through to the direct-expression path
+    // (which would otherwise read the registration call's useless return type).
+    // Gated on the located node structurally BEING a registration, so the
+    // consumer `JSON.stringify(payload)` / `req.body as T` paths are untouched.
+    const registrationHandler = this.registrationHandlerAt(located);
+    if (registrationHandler) {
+      const requestType = this.inferRequestReadFromHandler(registrationHandler);
+      if (requestType) {
+        return this.createInferredType(
+          request,
+          requestType,
+          true,
+          this.getNodeLocation(registrationHandler),
+          undefined,
+          undefined
+        );
+      }
+      // A genuinely payload-less handler (no typed request read): do NOT fall
+      // through to read the registration call's return type, which would emit a
+      // spurious framework type. Report unresolved, as before this capability.
+      this.log(
+        `Route registration at ${request.file_path}:${request.line_number} has no typed request read; leaving unresolved`
+      );
       return null;
     }
 
@@ -1606,6 +1740,306 @@ export class TypeInferrer {
         Node.isFunctionExpression(n) ||
         Node.isMethodDeclaration(n)
     );
+  }
+
+  // ===========================================================================
+  // Route-Registration Handler Resolution
+  // ===========================================================================
+
+  /**
+   * Follow a LINE-ONLY route-registration anchor to its handler function. The
+   * scanner sends a bare line number (no span/text) for a named-handler
+   * registration whose handler is declared away from the registration line
+   * (`InferLocator::Line`). Find a registration node — a call or object literal
+   * — that STARTS on that line and whose handler resolves, and return it.
+   * Structural (call with a function-typed arg, or handler-shaped object-literal
+   * property), no framework name-lists. Used only when the primary locator did
+   * not resolve a node, so no existing path changes.
+   */
+  private handlerAtLine(
+    sourceFile: SourceFile,
+    line: number
+  ): FunctionLike | undefined {
+    for (const node of sourceFile.getDescendants()) {
+      if (
+        (Node.isCallExpression(node) ||
+          Node.isObjectLiteralExpression(node)) &&
+        node.getStartLineNumber() === line
+      ) {
+        const handler = this.resolveRegisteredHandler(node);
+        if (handler) {
+          return handler;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Follow a route-registration locator ONE indirection to the handler function.
+   *
+   * The scanner points the infer request at the registration site, but the
+   * type-bearing expression (the handler's return, or its first request read)
+   * lives inside the handler function, which the registration only *references*.
+   * This resolves that reference to the handler's `FunctionLike` node, purely
+   * structurally, in three shapes:
+   *
+   *  1. INLINE — the node is (or is inside) a call whose arguments include an
+   *     arrow/function expression: `app.post('/x', async (c) => { … })`. The
+   *     inline function IS the handler.
+   *  2. OBJECT-LITERAL HANDLER PROPERTY — the node is (or is inside) an object
+   *     literal with a `handler`-like property whose value is either an inline
+   *     function or an identifier bound to a function:
+   *     `{ method, path, handler: healthCheckHandler }`. Resolve that value.
+   *  3. IDENTIFIER ARGUMENT — the node is (or is inside) a call whose 2nd+
+   *     argument is an identifier bound to a function:
+   *     `app.get('/x', healthCheckHandler)`. Resolve that identifier.
+   *
+   * No framework name, method name, or property name beyond the generic
+   * `handler`-shaped key is hardcoded — the match is on node SHAPE (call with a
+   * function-typed arg / object literal with a function-valued property), which
+   * is what "route registration" structurally is across Express, Fastify, Hono,
+   * Koa, a hand-rolled registry array, etc. Returns undefined when the locator
+   * is not a registration shape, so every existing non-registration path is
+   * untouched.
+   */
+  private resolveRegisteredHandler(node: Node): FunctionLike | undefined {
+    // 1 & 3: the node is, or is inside, a route-registration CALL.
+    const call = Node.isCallExpression(node)
+      ? node
+      : node.getFirstAncestorByKind(SyntaxKind.CallExpression);
+    if (call) {
+      const fromCall = this.handlerFromRegistrationCall(call);
+      if (fromCall) {
+        return fromCall;
+      }
+    }
+
+    // 2: the node is, or is inside, an object literal carrying the handler.
+    const objectLiteral = Node.isObjectLiteralExpression(node)
+      ? node
+      : node.getFirstAncestorByKind(SyntaxKind.ObjectLiteralExpression);
+    if (objectLiteral) {
+      const fromObject = this.handlerFromObjectLiteral(objectLiteral);
+      if (fromObject) {
+        return fromObject;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Request-path gate for handler-following: return the handler function ONLY
+   * when the located node is ITSELF (after expression-unwrap) the registration
+   * — a call whose arguments include a handler function, or a route-registry
+   * object literal with a handler property. Unlike `resolveRegisteredHandler`,
+   * this does NOT walk up to an ancestor call, so a consumer's inner
+   * `JSON.stringify(payload)` (nested inside a `fetch(...)` that may carry other
+   * callbacks) is never mistaken for a registration and the existing consumer
+   * request paths stay exactly as they were.
+   */
+  private registrationHandlerAt(located: Node): FunctionLike | undefined {
+    const node = this.unwrapExpressionNode(located);
+
+    if (Node.isCallExpression(node)) {
+      return this.handlerFromRegistrationCall(node);
+    }
+
+    if (Node.isObjectLiteralExpression(node)) {
+      return this.handlerFromObjectLiteral(node);
+    }
+
+    return undefined;
+  }
+
+  /**
+   * The handler function referenced by a route-registration call: the first
+   * argument that is an inline function, or an identifier bound to a function
+   * (typically the 2nd+ arg — the path literal is not function-valued, so it is
+   * skipped naturally). No callee-name check: a call whose argument resolves to
+   * a function is structurally a registration regardless of the framework.
+   */
+  private handlerFromRegistrationCall(
+    call: CallExpression
+  ): FunctionLike | undefined {
+    for (const arg of call.getArguments()) {
+      const handler = this.asHandlerFunction(arg);
+      if (handler) {
+        return handler;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * The handler function carried by a route-registry object literal. Matches a
+   * property whose name is `handler`-shaped (case-insensitive `handler`) and
+   * whose value is an inline function or an identifier bound to a function.
+   */
+  private handlerFromObjectLiteral(
+    objectLiteral: Node
+  ): FunctionLike | undefined {
+    if (!Node.isObjectLiteralExpression(objectLiteral)) {
+      return undefined;
+    }
+    for (const prop of objectLiteral.getProperties()) {
+      if (!Node.isPropertyAssignment(prop)) {
+        continue;
+      }
+      const name = prop.getName().replace(/['"]/g, '').toLowerCase();
+      if (name !== 'handler') {
+        continue;
+      }
+      const initializer = prop.getInitializer();
+      const handler = initializer ? this.asHandlerFunction(initializer) : undefined;
+      if (handler) {
+        return handler;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolve a node to a handler `FunctionLike`: an inline arrow/function
+   * expression is returned directly; an identifier is followed to its binding
+   * declaration (via the compiler's definition nodes) and returned when that
+   * declaration is — or initializes to — a function. Anything else (a path
+   * literal, an object, a non-function binding) yields undefined.
+   */
+  private asHandlerFunction(node: Node): FunctionLike | undefined {
+    const expr = this.unwrapExpressionNode(node);
+
+    if (Node.isArrowFunction(expr) || Node.isFunctionExpression(expr)) {
+      return expr;
+    }
+
+    if (Node.isIdentifier(expr)) {
+      for (const def of expr.getDefinitionNodes()) {
+        const func = this.functionFromDeclaration(def);
+        if (func) {
+          return func;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Extract a `FunctionLike` from a declaration node the compiler resolved an
+   * identifier to: a function declaration is itself the function; a variable
+   * declaration / binding whose initializer is an inline function yields that
+   * function (`const h = async () => { … }`). Import/re-export shims are walked
+   * by ts-morph's `getDefinitionNodes`, so no manual import chasing is needed.
+   */
+  private functionFromDeclaration(decl: Node): FunctionLike | undefined {
+    if (Node.isFunctionDeclaration(decl)) {
+      return decl;
+    }
+
+    if (Node.isArrowFunction(decl) || Node.isFunctionExpression(decl)) {
+      return decl;
+    }
+
+    // `getDefinitionNodes()` may return the name identifier of a `const h = …`
+    // binding rather than the declaration; walk to the variable declaration.
+    const varDecl = Node.isVariableDeclaration(decl)
+      ? decl
+      : decl.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+    if (varDecl) {
+      const initializer = varDecl.getInitializer();
+      if (initializer) {
+        const inner = this.unwrapExpressionNode(initializer);
+        if (Node.isArrowFunction(inner) || Node.isFunctionExpression(inner)) {
+          return inner;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Scan a handler function body for the FIRST request-body read that carries a
+   * type, and return that type's structural text — or null when the body holds
+   * no typed request read.
+   *
+   * "Typed request read" is matched on SHAPE, never on a callee/method name:
+   *
+   *  A. a CALL that carries an explicit type argument — `c.req.json<T>()`,
+   *     `parseBody<T>(req)`; the first type argument is `T`; or
+   *  B. an expression with an explicit type annotation or cast in its immediate
+   *     binding context — `const b: T = …`, `req.body as T`.
+   *
+   * The body is walked in source order (`forEachDescendant` is a pre-order
+   * traversal), so the FIRST such read wins, mirroring "the request type lives
+   * at the first body read" without assuming which framework produced it.
+   * Returns null (not a spurious type) for a genuinely payload-less handler.
+   */
+  private inferRequestReadFromHandler(func: FunctionLike): string | null {
+    const body = func.getBody();
+    if (!body) {
+      return null;
+    }
+
+    let found: string | null = null;
+    body.forEachDescendant((descendant, traversal) => {
+      if (found !== null) {
+        traversal.stop();
+        return;
+      }
+
+      // A. call with an explicit type argument: `c.req.json<TrackRequest>()`.
+      if (Node.isCallExpression(descendant)) {
+        const typeArgs = descendant.getTypeArguments();
+        if (typeArgs.length > 0) {
+          const resolved = this.structuralTextFromTypeNode(typeArgs[0]);
+          if (resolved) {
+            found = resolved;
+            traversal.stop();
+            return;
+          }
+        }
+      }
+
+      // B. an `as T` cast (`req.body as TrackRequest`) or a typed binding
+      // (`const b: TrackRequest = …`). Read the annotation/cast target.
+      if (Node.isAsExpression(descendant)) {
+        const typeNode = descendant.getTypeNode();
+        const resolved = typeNode
+          ? this.structuralTextFromTypeNode(typeNode)
+          : null;
+        if (resolved) {
+          found = resolved;
+          traversal.stop();
+          return;
+        }
+      }
+    });
+
+    return found;
+  }
+
+  /**
+   * Resolve a type-annotation/type-argument node to fully-structural text,
+   * dropping any `Promise<…>` wrapper (`c.req.json<T>()` returns `Promise<T>`,
+   * but the annotation node is `T` directly; the guard is harmless either way).
+   * Returns null when the node resolves to a useless/library type that carries
+   * no member shape, so the caller keeps scanning rather than locking onto
+   * `any`/`unknown`.
+   */
+  private structuralTextFromTypeNode(typeNode: Node): string | null {
+    try {
+      const resolved = this.unwrapPromiseType(typeNode.getType());
+      const bare = typeText(resolved, typeNode);
+      if (this.isUselessType(bare)) {
+        return null;
+      }
+      return this.expandResolvedTypeStructural(resolved, bare);
+    } catch {
+      return null;
+    }
   }
 
   /**

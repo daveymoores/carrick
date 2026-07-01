@@ -301,4 +301,60 @@ describe('Type inferrer gap regressions', () => {
       'expected a per-item error for the invalid item'
     );
   });
+
+  it('follows a route-registry object-literal handler to its return type (response)', async () => {
+    // `{ method, path, handler: registryHealthHandler }` — the response contract
+    // is the handler's RETURN type, one indirection from the registry entry.
+    const entry = spanOf(
+      "{ method: 'GET', path: '/registry-health', handler: registryHealthHandler }"
+    );
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'gap-registry-response',
+      requests: [
+        {
+          // Line-only anchor — the real shape the scanner sends for a
+          // named-handler registration (no span, no expression text).
+          file_path: GAP_FIXTURE,
+          line_number: entry.line,
+          infer_kind: 'response_body',
+          alias: 'GapRegistryResponse',
+        },
+      ],
+    });
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'GapRegistryResponse'
+    );
+    assert.ok(inferred, 'expected the registry handler return to resolve');
+    assert.match(inferred!.type_string, /ok:\s*boolean/);
+    assert.match(inferred!.type_string, /ts:\s*number/);
+  });
+
+  it('follows an inline handler body to its typed request read (request)', async () => {
+    // The locator lands on the registration call; the request contract is the
+    // type argument of `c.req.json<RegistryTrackReq>()` inside the handler body.
+    const call = spanOf(
+      "gapHono.post('/registry-track', async (c) => { const body = await c.req.json<RegistryTrackReq>(); return body; })"
+    );
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'gap-registry-request',
+      requests: [
+        {
+          // Line-only anchor — the real shape the scanner sends for the
+          // request infer on an inline-handler registration.
+          file_path: GAP_FIXTURE,
+          line_number: call.line,
+          infer_kind: 'request_body',
+          alias: 'GapRegistryRequest',
+        },
+      ],
+    });
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'GapRegistryRequest'
+    );
+    assert.ok(inferred, 'expected the handler-body request read to resolve');
+    assert.match(inferred!.type_string, /path:\s*string/);
+    assert.match(inferred!.type_string, /userId:\s*string/);
+  });
 });
