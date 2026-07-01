@@ -332,7 +332,7 @@ impl AgentSchemas {
                                 "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Null whenever `primary_type_symbol` is null. Read the import statements at the top of the file."
                             }
                         },
-                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched", "emission_style", "payload_expression_text", "payload_expression_line"]
+                        "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched", "emission_style", "payload_expression_text", "payload_expression_line", "response_expression_text", "response_expression_line"]
                     }
                 },
                 "data_calls": {
