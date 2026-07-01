@@ -96,6 +96,8 @@ export const SymbolRequestSchema = z.object({
   symbol_name: z.string().min(1, 'Symbol name cannot be empty'),
   source_file: z.string().min(1, 'Source file cannot be empty'),
   alias: z.string().optional(),
+  // #248: SDL list depth to wrap the bundled element type in (`Order` → `Order[]`).
+  array_depth: z.number().int().nonnegative().optional(),
 });
 
 // ============================================================================

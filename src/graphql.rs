@@ -66,6 +66,21 @@ pub struct GraphqlOp {
     /// paired with `resolver_file`. Anchors the `FunctionReturn` infer request.
     /// `None` whenever `resolver_file` is `None`.
     pub resolver_line: Option<u32>,
+    /// PRODUCER-only fallback (#248): the co-located TS type that declares this
+    /// field's response shape when NO resolver function exists (e.g. an SDL
+    /// `orders: [Order!]!` field backed by `interface Order`, with no
+    /// `resolveOrders`). Located by the file-analyzer (`graphql_operations`
+    /// `primary_type_symbol`), it is bundled + structurally expanded + wrapped in
+    /// the SDL list depth by the type sidecar — the deterministic half of the
+    /// LLM-locate/scanner-expand split. `None` when a resolver was matched (the
+    /// `FunctionReturn` path wins) or nothing was located. Paired with
+    /// `resolver_file`, which is set to the analyzed file the entry came from.
+    pub response_type_symbol: Option<String>,
+    /// PRODUCER-only: import specifier the `response_type_symbol` is declared in
+    /// (`./types/order`), resolved against `resolver_file`. `None` when the type
+    /// is declared in `resolver_file` itself. Null whenever
+    /// `response_type_symbol` is null.
+    pub response_type_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,6 +315,10 @@ pub fn extract_from_document_text(
                     // graphql_operations fill these in the engine merge (Stage B1).
                     resolver_file: None,
                     resolver_line: None,
+                    // Populated in the engine merge only when the LLM located a
+                    // co-located backing type for a resolver-less field (#248).
+                    response_type_symbol: None,
+                    response_type_source: None,
                 });
             }
         }
@@ -356,6 +375,9 @@ pub fn extract_from_document_text(
                     // Consumers never carry a resolver location.
                     resolver_file: None,
                     resolver_line: None,
+                    // Producer-only fallback; never set on consumers.
+                    response_type_symbol: None,
+                    response_type_source: None,
                 });
             }
         }
@@ -375,6 +397,15 @@ fn render_sdl_type(ty: &graphql_parser::schema::Type<'_, String>) -> String {
         Type::ListType(inner) => format!("[{}]", render_sdl_type(inner)),
         Type::NonNullType(inner) => format!("{}!", render_sdl_type(inner)),
     }
+}
+
+/// List-nesting depth of a rendered SDL type expression (#248): `[Order!]!` → 1,
+/// `[[Order!]!]!` → 2, `Order`/`Order!` → 0. Non-null (`!`) markers do not add
+/// depth. Used to wrap a resolver-less field's bundled element type in the right
+/// number of TS array levels (`Order` → `Order[]` for `[Order!]!`) so the
+/// producer's response contract matches the SDL list shape.
+pub fn graphql_list_depth(rendered_sdl_type: &str) -> u32 {
+    rendered_sdl_type.chars().take_while(|c| *c == '[').count() as u32
 }
 
 /// Join a `gql`/`graphql` tagged template's literal parts, dropping

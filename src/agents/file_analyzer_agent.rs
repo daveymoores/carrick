@@ -204,12 +204,21 @@ pub struct GraphqlOperation {
     pub kind: crate::operation::GraphqlOperationKind,
     /// The schema field name this resolver answers (e.g., "order").
     pub field: String,
-    /// Name of the resolver function (e.g., "resolveOrder").
-    pub resolver_function: String,
-    /// Line number where the resolver function is defined.
-    pub resolver_line: i32,
-    /// The primary return type symbol without wrappers (e.g., "ApiResponse" from
-    /// "Promise<ApiResponse>"). `None` for untyped or inline-object returns.
+    /// Name of the resolver function (e.g., "resolveOrder"). `None` when no
+    /// function in this file resolves the field but a co-located type declares
+    /// its response shape (the #248 type-locate fallback), in which case
+    /// `primary_type_symbol` carries that type.
+    #[serde(default)]
+    pub resolver_function: Option<String>,
+    /// Line number where the resolver function is defined. `None` whenever
+    /// `resolver_function` is `None`.
+    #[serde(default)]
+    pub resolver_line: Option<i32>,
+    /// The primary return type symbol without wrappers. When a resolver exists,
+    /// its return type (e.g. "ApiResponse" from "Promise<ApiResponse>"). When no
+    /// resolver exists, the co-located type declaring the field's response shape
+    /// (e.g. "Order" for a field returning `[Order!]!` backed by `interface
+    /// Order`). `None` for untyped or inline-object returns.
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/order"), null if
     /// inline or same file. Null whenever `primary_type_symbol` is null.
@@ -728,7 +737,13 @@ impl FileAnalyzerAgent {
                 "\n### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)\n\
                  The fields below are this service's GraphQL schema root fields. If a function in \
                  this file resolves one of them, emit a `graphql_operations` entry linking the \
-                 resolver function to its `kind`/`field` and its return type.\n{}\n",
+                 resolver function (`resolver_function`/`resolver_line`) to its `kind`/`field` and \
+                 its return type (`primary_type_symbol`/`type_import_source`). If NO function in \
+                 this file resolves a listed field but a type declared or imported in this file \
+                 describes that field's response shape, still emit an entry with `kind`/`field`, \
+                 leave `resolver_function`/`resolver_line` null, and set \
+                 `primary_type_symbol`/`type_import_source` to that type (unwrap list/`[]` wrappers \
+                 to the bare element type, e.g. `Order` for `[Order!]!`).\n{}\n",
                 graphql_producer_hints
                     .iter()
                     .map(|line| format!("- {}", line))
@@ -1372,10 +1387,38 @@ mod tests {
         let op = &result.graphql_operations[0];
         assert_eq!(op.kind, crate::operation::GraphqlOperationKind::Query);
         assert_eq!(op.field, "order");
-        assert_eq!(op.resolver_function, "resolveOrder");
-        assert_eq!(op.resolver_line, 38);
+        assert_eq!(op.resolver_function.as_deref(), Some("resolveOrder"));
+        assert_eq!(op.resolver_line, Some(38));
         assert_eq!(op.primary_type_symbol.as_deref(), Some("ApiResponse"));
         assert_eq!(op.type_import_source, None);
+    }
+
+    #[test]
+    fn graphql_operations_deserialize_resolverless_type_locate() {
+        // #248: a resolver-less field the LLM locates by its backing type omits
+        // resolver_function/resolver_line entirely and carries the type in
+        // primary_type_symbol. #[serde(default)] must yield None for the missing
+        // resolver locators rather than failing the parse.
+        let json = r#"{
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [],
+            "graphql_operations": [
+                {
+                    "kind": "query",
+                    "field": "orders",
+                    "primary_type_symbol": "Order",
+                    "type_import_source": null
+                }
+            ]
+        }"#;
+
+        let result: FileAnalysisResult = serde_json::from_str(json).unwrap();
+        let op = &result.graphql_operations[0];
+        assert_eq!(op.field, "orders");
+        assert_eq!(op.resolver_function, None);
+        assert_eq!(op.resolver_line, None);
+        assert_eq!(op.primary_type_symbol.as_deref(), Some("Order"));
     }
 
     #[test]

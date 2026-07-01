@@ -584,6 +584,25 @@ export class TypeBundler {
   private extractTypeDefinition(
     symbol: SymbolRequest
   ): { definition: string; typeString: string } | null {
+    const base = this.extractTypeDefinitionBase(symbol);
+    if (!base) return null;
+
+    // #248: wrap the resolved element type in the SDL list depth. A GraphQL
+    // producer field `[Order!]!` backed by `interface Order` bundles `Order`
+    // with `array_depth: 1`; the alias becomes `Order[]` (arrays can't be
+    // interfaces, so it is always emitted as a type alias). The element's
+    // structurally-expanded body carries the shape, so downstream resolution
+    // and the eval's whitespace-collapsed `{...}[]` comparison both hold.
+    const depth = symbol.array_depth ?? 0;
+    if (depth <= 0) return base;
+    const alias = symbol.alias || symbol.symbol_name;
+    const typeString = `${base.typeString}${'[]'.repeat(depth)}`;
+    return { definition: `export type ${alias} = ${typeString};`, typeString };
+  }
+
+  private extractTypeDefinitionBase(
+    symbol: SymbolRequest
+  ): { definition: string; typeString: string } | null {
     const absolutePath = path.isAbsolute(symbol.source_file)
       ? symbol.source_file
       : path.resolve(this.repoRoot, symbol.source_file);

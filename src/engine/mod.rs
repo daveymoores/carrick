@@ -1423,12 +1423,28 @@ fn merge_graphql_resolver_locations(
             };
             let producer = &mut graphql.producers[idx];
             producer.resolver_file = Some(PathBuf::from(path));
-            // The LLM line is a 1-based source line; clamp non-positive values to
-            // None rather than wrapping into a bogus u32 (the infer request's
-            // line_number is u32, and a 0/negative line can't anchor a function).
-            producer.resolver_line = u32::try_from(llm_op.resolver_line)
-                .ok()
-                .filter(|&line| line > 0);
+            if llm_op
+                .resolver_function
+                .as_deref()
+                .is_some_and(|f| !f.is_empty())
+            {
+                // Resolver located: its concrete return type carries the
+                // wrappers (Promise / ApiResponse envelope / async-iterator) the
+                // bare SDL-backed type can't, so the FunctionReturn path wins. The
+                // LLM line is a 1-based source line; clamp non-positive values to
+                // None rather than wrapping into a bogus u32 (the infer request's
+                // line_number is u32, and a 0/negative line can't anchor a fn).
+                producer.resolver_line = llm_op
+                    .resolver_line
+                    .and_then(|line| u32::try_from(line).ok())
+                    .filter(|&line| line > 0);
+            } else if let Some(symbol) = llm_op.primary_type_symbol.clone() {
+                // No resolver function: fall back to the co-located backing type
+                // the LLM located (#248). The sidecar bundles + structurally
+                // expands it and wraps it in the SDL list depth.
+                producer.response_type_symbol = Some(symbol);
+                producer.response_type_source = llm_op.type_import_source.clone();
+            }
         }
     }
 }
@@ -4221,6 +4237,8 @@ mod tests {
             payload_type_source: None,
             resolver_file: None,
             resolver_line: None,
+            response_type_symbol: None,
+            response_type_source: None,
         }
     }
 
@@ -4240,6 +4258,8 @@ mod tests {
             payload_type_source: payload_source.map(String::from),
             resolver_file: None,
             resolver_line: None,
+            response_type_symbol: None,
+            response_type_source: None,
         }
     }
 
@@ -4296,16 +4316,16 @@ mod tests {
                     GraphqlOperation {
                         kind: GraphqlOperationKind::Query,
                         field: "order".to_string(),
-                        resolver_function: "resolveOrder".to_string(),
-                        resolver_line: 38,
+                        resolver_function: Some("resolveOrder".to_string()),
+                        resolver_line: Some(38),
                         primary_type_symbol: Some("ApiResponse".to_string()),
                         type_import_source: None,
                     },
                     GraphqlOperation {
                         kind: GraphqlOperationKind::Mutation,
                         field: "createOrder".to_string(),
-                        resolver_function: "createOrder".to_string(),
-                        resolver_line: 7,
+                        resolver_function: Some("createOrder".to_string()),
+                        resolver_line: Some(7),
                         primary_type_symbol: None,
                         type_import_source: None,
                     },
@@ -4329,8 +4349,13 @@ mod tests {
         assert_eq!(order.resolver_line, Some(38));
         // The SDL anchor is untouched by the merge.
         assert_eq!(order.primary_type_symbol.as_deref(), Some("Order"));
+        // A resolver was matched, so the FunctionReturn path wins: the LLM's
+        // `primary_type_symbol` ("ApiResponse") must NOT become a type-locate
+        // fallback (bundling the bare generic would drop the envelope).
+        assert_eq!(order.response_type_symbol, None);
 
-        // The producer with no matching LLM op keeps both resolver fields None.
+        // The producer with no matching LLM op keeps both resolver fields None
+        // and gains no type-locate fallback.
         let orders = graphql
             .producers
             .iter()
@@ -4338,6 +4363,7 @@ mod tests {
             .expect("orders producer");
         assert_eq!(orders.resolver_file, None);
         assert_eq!(orders.resolver_line, None);
+        assert_eq!(orders.response_type_symbol, None);
 
         // The LLM op with no SDL producer (`mutation createOrder`) created no
         // new producer — it was ignored.
@@ -4348,6 +4374,67 @@ mod tests {
                 .any(|op| op.key.canonical() == "graphql|mutation|createOrder"),
             "an LLM op with no matching SDL producer must not create a producer"
         );
+    }
+
+    /// #248: an SDL producer field with NO resolver function but a co-located
+    /// backing type (the LLM emits `primary_type_symbol` with a null
+    /// `resolver_function`) picks up the type-locate fallback — the scanner
+    /// records the backing type so the sidecar can bundle + list-wrap it. The
+    /// resolver locators stay `None` (no FunctionReturn), and `resolver_file` is
+    /// still stamped with the file the entry came from.
+    #[test]
+    fn merge_graphql_type_locate_for_resolverless_field() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "orders",
+                Some("[Order!]!"),
+            )],
+            consumers: vec![],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "packages/gateway/src/orders.resolver.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![],
+                graphql_operations: vec![GraphqlOperation {
+                    kind: GraphqlOperationKind::Query,
+                    field: "orders".to_string(),
+                    // No resolver — the field is backed only by a co-located type.
+                    resolver_function: None,
+                    resolver_line: None,
+                    primary_type_symbol: Some("Order".to_string()),
+                    type_import_source: None,
+                }],
+                pubsub_operations: vec![],
+            },
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let orders = graphql
+            .producers
+            .iter()
+            .find(|op| op.key.canonical() == "graphql|query|orders")
+            .expect("orders producer");
+        assert_eq!(
+            orders.resolver_file,
+            Some(PathBuf::from("packages/gateway/src/orders.resolver.ts")),
+            "the file the entry came from is still recorded"
+        );
+        // No FunctionReturn: the resolver locators stay unset.
+        assert_eq!(orders.resolver_line, None);
+        // The type-locate fallback carries the backing type for the sidecar.
+        assert_eq!(orders.response_type_symbol.as_deref(), Some("Order"));
+        assert_eq!(orders.response_type_source, None);
+        // The SDL anchor is untouched.
+        assert_eq!(orders.primary_type_symbol.as_deref(), Some("[Order!]!"));
     }
 
     /// A typed socket emitter produces a Response-kind manifest entry keyed by

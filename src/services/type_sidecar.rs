@@ -121,6 +121,13 @@ pub struct SymbolRequest {
     /// Optional alias for the exported type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// Wrap the bundled symbol in this many TS array levels (#248): a GraphQL
+    /// SDL producer field `[Order!]!` backed by `interface Order` bundles `Order`
+    /// with `array_depth: 1` so the sidecar emits `Order[]` — the element type
+    /// carries the shape, the SDL list marker carries the depth. Omitted/`0`
+    /// bundles the symbol as-is (the HTTP/socket/consumer default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub array_depth: Option<u32>,
 }
 
 /// Request for type inference at a specific location
@@ -1009,9 +1016,12 @@ mod tests {
             symbol_name: "User".to_string(),
             source_file: "src/types.ts".to_string(),
             alias: Some("UserResponse".to_string()),
+            array_depth: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""symbol_name":"User""#));
+        // array_depth defaults to None and is skipped on the wire.
+        assert!(!json.contains("array_depth"));
         assert!(json.contains(r#""alias":"UserResponse""#));
     }
 
@@ -1058,6 +1068,7 @@ mod tests {
                 symbol_name: "User".to_string(),
                 source_file: "src/types.ts".to_string(),
                 alias: None,
+                array_depth: None,
             }],
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -1146,6 +1157,7 @@ mod tests {
             symbol_name: "SomeInterface".to_string(),
             source_file: "src/types.ts".to_string(),
             alias: Some("Endpoint_abc_Response".to_string()),
+            array_depth: None,
         }];
 
         if had_explicit_dts {

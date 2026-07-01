@@ -417,16 +417,18 @@ impl AgentSchemas {
                             },
                             "resolver_function": {
                                 "type": "STRING",
-                                "description": "Name of the resolver function implementing this field (e.g., 'resolveOrder')."
+                                "nullable": true,
+                                "description": "Name of the resolver function implementing this field (e.g., 'resolveOrder'). Null when no function in this file resolves the field but a co-located type declares its response shape — in that case set primary_type_symbol/type_import_source to that type."
                             },
                             "resolver_line": {
                                 "type": "INTEGER",
-                                "description": "Line number where the resolver function is defined (read from the line-number prefix in the source code)."
+                                "nullable": true,
+                                "description": "Line number where the resolver function is defined (read from the line-number prefix in the source code). Null whenever resolver_function is null."
                             },
                             "primary_type_symbol": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "The named return type of the resolver as a bare identifier (e.g., 'ApiResponse'). Unwrap Promise<...>, arrays, and async-iterator wrappers down to the core identifier. Null for untyped, inline-object-literal, or otherwise un-annotated resolver returns."
+                                "description": "The field's response type as a bare identifier. When a resolver_function exists, its return type (e.g., 'ApiResponse' from 'Promise<ApiResponse<Order>>'). When NO resolver exists but a type declared or imported in this file describes the field's response shape, that type (e.g., 'Order' for a field returning '[Order!]!' backed by 'interface Order'). Unwrap Promise<...>, arrays, and async-iterator wrappers down to the core identifier. Null for untyped, inline-object-literal, or otherwise un-annotated returns."
                             },
                             "type_import_source": {
                                 "type": "STRING",
@@ -434,7 +436,7 @@ impl AgentSchemas {
                                 "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/order'), or null if it is declared in the same file. Null whenever `primary_type_symbol` is null."
                             }
                         },
-                        "required": ["kind", "field", "resolver_function", "resolver_line"]
+                        "required": ["kind", "field"]
                     }
                 },
                 "pubsub_operations": {
@@ -793,15 +795,23 @@ mod tests {
 
         assert_eq!(schema_values, serde_values);
 
-        // The four locating fields must always be present; the type slots
-        // (primary_type_symbol / type_import_source) stay optional/nullable.
+        // Only the operation identity (kind/field) is required; the resolver
+        // locators (resolver_function / resolver_line) and the type slots
+        // (primary_type_symbol / type_import_source) stay optional/nullable so a
+        // resolver-less field can be located by its co-located backing type (#248).
         let required = schema["properties"]["graphql_operations"]["items"]["required"]
             .as_array()
             .expect("graphql_operations item required array must exist");
-        for field in ["kind", "field", "resolver_function", "resolver_line"] {
+        for field in ["kind", "field"] {
             assert!(
                 required.iter().any(|v| v == field),
                 "graphql_operations item required must contain {field}"
+            );
+        }
+        for field in ["resolver_function", "resolver_line"] {
+            assert!(
+                !required.iter().any(|v| v == field),
+                "graphql_operations item required must NOT contain {field} (resolver-less fields)"
             );
         }
 
