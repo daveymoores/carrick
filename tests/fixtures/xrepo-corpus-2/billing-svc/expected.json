@@ -4,7 +4,6 @@
     {
       "method": "POST",
       "path": "/ledger/append",
-      "host_contains": "LEDGER_URL",
       "path_contains": "/ledger/append",
       "import_source": "axios",
       "primary_type_symbol": "LedgerEntry",

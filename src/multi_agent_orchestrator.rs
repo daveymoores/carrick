@@ -21,6 +21,7 @@ use crate::{
     framework_detector::{DetectionResult, FrameworkDetector},
     mount_graph::MountGraph,
     packages::Packages,
+    url_normalizer::UrlNormalizer,
     visitor::ImportedSymbol,
 };
 use std::collections::HashMap;
@@ -81,6 +82,7 @@ impl MultiAgentOrchestrator {
         imported_symbols: &HashMap<String, ImportedSymbol>,
         repo_path: &str,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
+        normalizer: &UrlNormalizer,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
@@ -124,6 +126,7 @@ impl MultiAgentOrchestrator {
                 &framework_detection,
                 std::path::Path::new(repo_path),
                 graphql_producer_hints,
+                normalizer,
             )
             .await?;
 

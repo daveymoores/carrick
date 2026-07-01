@@ -164,6 +164,7 @@ impl FileOrchestrator {
         framework_detection: &DetectionResult,
         repo_root: &Path,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
+        normalizer: &UrlNormalizer,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
@@ -567,7 +568,7 @@ impl FileOrchestrator {
         debug!("  - Total data calls: {}", stats.total_data_calls);
 
         // STEP 5: Build aggregated mount graph from all file results
-        let mount_graph = self.build_mount_graph(&file_results);
+        let mount_graph = self.build_mount_graph(&file_results, normalizer);
 
         Ok(FileCentricAnalysisResult {
             file_results,
@@ -742,7 +743,9 @@ impl FileOrchestrator {
             let Some(method) = Self::normalize_consumer_method(Some(&data_call.method)) else {
                 continue;
             };
-            let path = normalizer.extract_path(&data_call.target_url);
+            // Canonical path computed once at mount-graph build time; keep the
+            // manifest join key identical to the projection key for this call.
+            let path = data_call.canonical_path.clone();
             let call_id = build_call_site_id(
                 &file_path,
                 line_number,
@@ -973,7 +976,9 @@ impl FileOrchestrator {
                 else {
                     continue;
                 };
-                let target_path = normalizer.extract_path(&data_call.target);
+                // Same canonicalization the mount-graph loop above and the cloud
+                // projection use, so this fallback path keys identically.
+                let target_path = normalizer.consumer_call_path(&data_call.target);
                 let (method, path, call_id) = data_call_lookup
                     .get(&lookup_key)
                     .and_then(|entries| {
@@ -2200,6 +2205,7 @@ impl FileOrchestrator {
     pub fn build_mount_graph(
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
+        normalizer: &UrlNormalizer,
     ) -> MountGraph {
         let mut graph = MountGraph::new();
 
@@ -2337,6 +2343,7 @@ impl FileOrchestrator {
                 graph.data_calls.push(DataFetchingCall {
                     method,
                     target_url: data_call.target.clone(),
+                    canonical_path: normalizer.consumer_call_path(&data_call.target),
                     client: data_call.pattern_matched.clone(),
                     file_location: format!("{}:{}", file_path, data_call.line_number),
                     call_kind: data_call.call_kind,
@@ -2796,7 +2803,8 @@ mod tests {
             },
         );
 
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
 
         assert_eq!(graph.mounts.len(), 1);
         assert_eq!(graph.endpoints.len(), 1);
@@ -2849,7 +2857,8 @@ mod tests {
             },
         );
 
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
 
         assert_eq!(graph.data_calls.len(), 1);
         assert_eq!(
@@ -2909,7 +2918,8 @@ mod tests {
             },
         );
 
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
         let config = Config::default();
         let (_explicit, infer, _inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -2949,7 +2959,8 @@ mod tests {
             },
         );
 
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
         let config = Config::default();
         let (explicit, infer, inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -3009,7 +3020,8 @@ mod tests {
             },
         );
 
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
         let config = Config::default();
         let (_explicit, infer, _inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -3063,7 +3075,8 @@ mod tests {
             },
         );
 
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
         let config = Config::default();
         let (_explicit, infer, _inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -3130,7 +3143,8 @@ mod tests {
                 pubsub_operations: vec![],
             },
         );
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
         let config = Config::default();
         orchestrator.collect_type_requests(&file_results, ".", &graph, &config)
     }
@@ -3449,7 +3463,8 @@ mod tests {
             },
         );
 
-        let graph = orchestrator.build_mount_graph(&file_results);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
 
         // Should have the mount and both endpoints
         assert_eq!(graph.mounts.len(), 1);

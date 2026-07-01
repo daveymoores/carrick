@@ -490,6 +490,24 @@ impl UrlNormalizer {
         self.normalize(url).path
     }
 
+    /// Canonical path to key a CONSUMER data call on. Strips the host ONLY for a
+    /// declared-internal env-var base (carrick.json `internalEnvVars`) or a plain
+    /// relative path (no host). External/unknown-base and full-URL targets are
+    /// returned VERBATIM, so (a) a third-party call can't collide with an internal
+    /// producer's path, (b) the "unclassified env var" config-suggestion still sees
+    /// the raw var, and (c) a full URL with a query interpolation
+    /// (`https://h/p?u=${id}`) is not mangled into `/https:/h/p`.
+    pub fn consumer_call_path(&self, url: &str) -> String {
+        let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
+        let is_relative_path = trimmed.starts_with('/') && !trimmed.starts_with("//");
+        let normalized = self.normalize(url);
+        if normalized.is_internal || is_relative_path {
+            normalized.path
+        } else {
+            url.to_string()
+        }
+    }
+
     /// Heuristic check for URL-like inputs to avoid matching variable names as paths.
     pub fn is_probable_url(&self, url: &str) -> bool {
         let trimmed = url.trim();
@@ -836,6 +854,48 @@ mod tests {
         let path = normalizer.extract_path("https://example.com/api/users?page=1");
 
         assert_eq!(path, "/api/users");
+    }
+
+    #[test]
+    fn consumer_call_path_strips_internal_base_keeps_external_raw() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        // Declared-internal env-var base: host stripped to the bare path.
+        assert_eq!(
+            normalizer.consumer_call_path("${process.env.API_URL}/users"),
+            "/users"
+        );
+        assert_eq!(normalizer.consumer_call_path("${API_URL}/users"), "/users");
+
+        // Plain relative path: kept as its clean path.
+        assert_eq!(normalizer.consumer_call_path("/track"), "/track");
+
+        // Unknown/external base (STRIPE_URL is not in internalEnvVars): VERBATIM,
+        // so a third-party call can't collide with an internal producer's path
+        // and the "unclassified env var" config-suggestion still sees the raw var.
+        assert_eq!(
+            normalizer.consumer_call_path("${process.env.STRIPE_URL}/charges"),
+            "${process.env.STRIPE_URL}/charges"
+        );
+
+        // A full URL with a query interpolation is kept verbatim, not mangled.
+        assert_eq!(
+            normalizer.consumer_call_path("https://orders.internal/api/orders?user=${userId}"),
+            "https://orders.internal/api/orders?user=${userId}"
+        );
+
+        // A declared-internal base with a param interpolation collapses to a clean
+        // `:`-param segment and never leaks the raw `process.env` var.
+        let param = normalizer.consumer_call_path("${process.env.API_URL}/users/${id}");
+        assert!(
+            param.starts_with("/users/:"),
+            "expected clean param path, got {param}"
+        );
+        assert!(
+            !param.contains("process.env"),
+            "internal base var must be stripped, got {param}"
+        );
     }
 
     #[test]

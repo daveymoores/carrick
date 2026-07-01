@@ -23,7 +23,6 @@
     {
       "method": "GET",
       "path": "/orders/:param",
-      "host_contains": "ORDERS_SERVICE_URL",
       "path_contains": "/orders/",
       "import_source": "axios",
       "primary_type_symbol": "OrderResponse",
@@ -34,7 +33,6 @@
     {
       "method": "POST",
       "path": "/billing/charge",
-      "host_contains": "BILLING_URL",
       "path_contains": "/billing/charge",
       "import_source": "axios",
       "primary_type_symbol": null,

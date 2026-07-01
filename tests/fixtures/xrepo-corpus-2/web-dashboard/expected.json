@@ -4,7 +4,6 @@
     {
       "method": "GET",
       "path": "/notifications/:param",
-      "host_contains": "NOTIFICATIONS_URL",
       "path_contains": "/notifications/",
       "import_source": null,
       "primary_type_symbol": "Notification",
@@ -15,7 +14,6 @@
     {
       "method": "POST",
       "path": "/track",
-      "host_contains": "ANALYTICS_URL",
       "path_contains": "/track",
       "import_source": null,
       "primary_type_symbol": "TrackResult",
