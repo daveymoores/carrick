@@ -596,8 +596,39 @@ export class TypeBundler {
     const depth = symbol.array_depth ?? 0;
     if (depth <= 0) return base;
     const alias = symbol.alias || symbol.symbol_name;
-    const typeString = `${base.typeString}${'[]'.repeat(depth)}`;
+    // Parenthesise a union/intersection/function element so `(A | B)[]` doesn't
+    // misparse as `A | B[]` and `(() => T)[]` as `() => T[]`. Decide from the
+    // TYPE (not the string): a single object literal `{ a: A | B }` is NOT a
+    // top-level union and must stay unparenthesised (`{ a: A | B }[]`).
+    const element = this.elementNeedsArrayParens(symbol)
+      ? `(${base.typeString})`
+      : base.typeString;
+    const typeString = `${element}${'[]'.repeat(depth)}`;
     return { definition: `export type ${alias} = ${typeString};`, typeString };
+  }
+
+  /// Whether the element type must be parenthesised before an `[]` suffix.
+  /// Interfaces/classes/enums are always object/nominal (never a top-level
+  /// union), so only type aliases and typed variables can carry a bare
+  /// union/intersection/function that would misparse; those are re-resolved
+  /// from the source Type here (this runs only on the rare array_depth path).
+  private elementNeedsArrayParens(symbol: SymbolRequest): boolean {
+    const absolutePath = path.isAbsolute(symbol.source_file)
+      ? symbol.source_file
+      : path.resolve(this.repoRoot, symbol.source_file);
+    const sourceFile = this.project.getSourceFile(absolutePath);
+    if (!sourceFile) return false;
+    const name = symbol.symbol_name;
+    const decl =
+      sourceFile.getTypeAlias(name) ?? sourceFile.getVariableDeclaration(name);
+    if (!decl) return false;
+    const t = decl.getType();
+    return (
+      t.isUnion() ||
+      t.isIntersection() ||
+      t.getCallSignatures().length > 0 ||
+      t.getConstructSignatures().length > 0
+    );
   }
 
   private extractTypeDefinitionBase(

@@ -100,4 +100,29 @@ describe('array_depth wraps a bundled symbol in TS array levels (#248)', () => {
       `expanded must inline nested members under the wrap, got: ${def.expanded}`,
     );
   });
+
+  it('parenthesises a union element so `(A | B)[]` does not misparse as `A | B[]`', async () => {
+    const ALIAS = 'Endpoint_arr3_Response';
+    const bundle = await client.send<BundleResponseShape>({
+      action: 'bundle',
+      request_id: 'arr-bundle-3',
+      // UserRole = 'admin' | 'user' | 'guest' (a top-level union type alias).
+      symbols: [
+        { symbol_name: 'UserRole', source_file: TYPES_FIXTURE, alias: ALIAS, array_depth: 1 },
+      ],
+    });
+    assert.strictEqual(bundle.status, 'success', `bundle failed: ${JSON.stringify(bundle.errors)}`);
+    const dts = bundle.dts_content ?? '';
+
+    // The union must be parenthesised before the `[]`, never `... | "guest"[]`.
+    // (ts-morph normalises string-literal members to double quotes.)
+    assert.ok(
+      noWs(dts).includes('("admin"|"user"|"guest")[]'),
+      `union element must be parenthesised under the array wrap, got:\n${dts}`,
+    );
+    assert.ok(
+      !/"guest"\[\]/.test(noWs(dts)),
+      `must NOT misparse the last union member as an array, got:\n${dts}`,
+    );
+  });
 });
