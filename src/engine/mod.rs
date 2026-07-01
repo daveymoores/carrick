@@ -1438,12 +1438,15 @@ fn merge_graphql_resolver_locations(
                     .resolver_line
                     .and_then(|line| u32::try_from(line).ok())
                     .filter(|&line| line > 0);
-            } else if let Some(symbol) = llm_op.primary_type_symbol.clone() {
+            } else if let Some(symbol) = llm_op.backing_type_symbol.clone() {
                 // No resolver function: fall back to the co-located backing type
-                // the LLM located (#248). The sidecar bundles + structurally
+                // the LLM located (#248). Keyed on the dedicated
+                // `backing_type_symbol` (never `primary_type_symbol`, which
+                // describes a resolver's return type) so this can only fire for a
+                // genuinely resolver-less field. The sidecar bundles + structurally
                 // expands it and wraps it in the SDL list depth.
                 producer.response_type_symbol = Some(symbol);
-                producer.response_type_source = llm_op.type_import_source.clone();
+                producer.response_type_source = llm_op.backing_type_source.clone();
             }
         }
     }
@@ -4320,6 +4323,11 @@ mod tests {
                         resolver_line: Some(38),
                         primary_type_symbol: Some("ApiResponse".to_string()),
                         type_import_source: None,
+                        // Even if the model ALSO emits a backing type here, the
+                        // resolver path must win (regression guard: bundling the
+                        // bare `Order` would drop the ApiResponse envelope).
+                        backing_type_symbol: Some("Order".to_string()),
+                        backing_type_source: None,
                     },
                     GraphqlOperation {
                         kind: GraphqlOperationKind::Mutation,
@@ -4328,6 +4336,8 @@ mod tests {
                         resolver_line: Some(7),
                         primary_type_symbol: None,
                         type_import_source: None,
+                        backing_type_symbol: None,
+                        backing_type_source: None,
                     },
                 ],
                 pubsub_operations: vec![],
@@ -4349,9 +4359,10 @@ mod tests {
         assert_eq!(order.resolver_line, Some(38));
         // The SDL anchor is untouched by the merge.
         assert_eq!(order.primary_type_symbol.as_deref(), Some("Order"));
-        // A resolver was matched, so the FunctionReturn path wins: the LLM's
-        // `primary_type_symbol` ("ApiResponse") must NOT become a type-locate
-        // fallback (bundling the bare generic would drop the envelope).
+        // A resolver was matched, so the FunctionReturn path wins even though the
+        // op also carries a `backing_type_symbol`: the type-locate fallback must
+        // NOT fire (bundling the bare `Order` would drop the ApiResponse
+        // envelope — the exact live-eval regression this guards against).
         assert_eq!(order.response_type_symbol, None);
 
         // The producer with no matching LLM op keeps both resolver fields None
@@ -4406,11 +4417,14 @@ mod tests {
                 graphql_operations: vec![GraphqlOperation {
                     kind: GraphqlOperationKind::Query,
                     field: "orders".to_string(),
-                    // No resolver — the field is backed only by a co-located type.
+                    // No resolver — the field is backed only by a co-located type,
+                    // carried on the dedicated backing_type_symbol.
                     resolver_function: None,
                     resolver_line: None,
-                    primary_type_symbol: Some("Order".to_string()),
+                    primary_type_symbol: None,
                     type_import_source: None,
+                    backing_type_symbol: Some("Order".to_string()),
+                    backing_type_source: None,
                 }],
                 pubsub_operations: vec![],
             },

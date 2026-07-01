@@ -418,7 +418,7 @@ impl AgentSchemas {
                             "resolver_function": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "Name of the resolver function implementing this field (e.g., 'resolveOrder'). Null when no function in this file resolves the field but a co-located type declares its response shape — in that case set primary_type_symbol/type_import_source to that type."
+                                "description": "Name of the resolver function implementing this field (e.g., 'resolveOrder'). A function that returns the field's value IS its resolver even when the return is wrapped (Promise, a response envelope, an async iterator) — always link it. Null only when no function in this file resolves the field."
                             },
                             "resolver_line": {
                                 "type": "INTEGER",
@@ -428,12 +428,22 @@ impl AgentSchemas {
                             "primary_type_symbol": {
                                 "type": "STRING",
                                 "nullable": true,
-                                "description": "The field's response type as a bare identifier. When a resolver_function exists, its return type (e.g., 'ApiResponse' from 'Promise<ApiResponse<Order>>'). When NO resolver exists but a type declared or imported in this file describes the field's response shape, that type (e.g., 'Order' for a field returning '[Order!]!' backed by 'interface Order'). Unwrap Promise<...>, arrays, and async-iterator wrappers down to the core identifier. Null for untyped, inline-object-literal, or otherwise un-annotated returns."
+                                "description": "The named return type of the resolver as a bare identifier (e.g., 'ApiResponse'). Unwrap Promise<...>, arrays, and async-iterator wrappers down to the core identifier. Null for untyped, inline-object-literal, or otherwise un-annotated resolver returns."
                             },
                             "type_import_source": {
                                 "type": "STRING",
                                 "nullable": true,
                                 "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/order'), or null if it is declared in the same file. Null whenever `primary_type_symbol` is null."
+                            },
+                            "backing_type_symbol": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "ONLY for a field that NO function in this file resolves: the co-located TS type (declared or imported in this file) that describes the field's response shape, as a bare identifier (e.g. 'Order' for a field returning '[Order!]!' backed by 'interface Order'; unwrap list/array wrappers to the element type). Leave null whenever resolver_function is set — a resolver's return type is richer, so link the resolver instead."
+                            },
+                            "backing_type_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where `backing_type_symbol` is defined (e.g., './types/order'), or null if it is declared in this file. Null whenever `backing_type_symbol` is null."
                             }
                         },
                         "required": ["kind", "field"]
