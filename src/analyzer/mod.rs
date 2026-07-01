@@ -1302,11 +1302,16 @@ impl Analyzer {
         // Structured producer→consumer edges for the eval projection.
         let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
 
-        // Consumer repo lookup: a call's `(METHOD, target_url, file_location)`
+        // Consumer repo lookup: a call's `(METHOD, canonical_path, file_location)`
         // → owning repo. `merge_from_repos` tags each merged data call with its
         // repo; `self.calls` carry only `(key, file_path)`, so this re-attaches
-        // the repo identity at the matching site. Keyed on the full triple
-        // because two calls in one file can share a target.
+        // the repo identity at the matching site. Keyed on `canonical_path` (NOT
+        // the raw `target_url`) because that is exactly the path the matcher looks
+        // up with — `self.calls[].key` is `OperationKey::http(method,
+        // canonical_path)`, so `build_cross_repo_match`'s `target` is the bare
+        // canonical path. Keying on the raw `${ENV}/path` here would never join
+        // (they diverge whenever the host base is stripped). Keyed on the full
+        // triple because two calls in one file can share a canonical path.
         let consumer_repo_by_call: HashMap<(String, String, String), String> = mount_graph
             .get_data_calls()
             .iter()
@@ -1315,7 +1320,7 @@ impl Analyzer {
                     (
                         (
                             c.method.to_uppercase(),
-                            c.target_url.clone(),
+                            c.canonical_path.clone(),
                             c.file_location.clone(),
                         ),
                         repo.clone(),
