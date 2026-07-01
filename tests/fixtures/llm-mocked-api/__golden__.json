@@ -91,13 +91,7 @@
       "request_type": null,
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/client.ts",
-      "line": 4,
-      "type_alias": "Endpoint_8f63852a537138b5_Response_Callb5b4ca6e207adb15",
-      "type_state": "Explicit",
-      "resolved_definition": "export interface Endpoint_8f63852a537138b5_Response_Callb5b4ca6e207adb15 { id: number; userId: number; total: number; }",
-      "expanded_definition": "{ id: number; userId: number; total: number; }",
-      "is_explicit": true,
-      "primary_type_symbol": "Order"
+      "line": 4
     }
   ],
   "cross_repo_matches": [],

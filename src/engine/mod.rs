@@ -2021,6 +2021,16 @@ fn build_type_manifest_entries(
         // Key on the canonical path computed once at mount-graph build time, so
         // the manifest join key is byte-identical to the projection key.
         let path = call.canonical_path.clone();
+        // Only anchor types for a BARE route (internal/declared or relative
+        // target). An external or unclassified call keeps its raw `${HOST}/path`
+        // / full-URL canonical form: it has no internal producer to match, so a
+        // type anchor would be unused — and its `call_id` (a hash of the absolute
+        // file path) would make byte-compared goldens non-portable across
+        // machines. Mirrors main, where the raw projection key never joined an
+        // external call's `extract_path`-keyed manifest entry.
+        if !path.starts_with('/') {
+            continue;
+        }
         let key = OperationKey::http(&method, path);
         let call_id = build_call_site_id(&file_path, line_number, &key);
 
