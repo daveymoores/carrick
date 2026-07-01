@@ -137,10 +137,17 @@ export function validateInferRequestItem(item: InferRequestItem): string | null 
   // Function-anchored inference (function_return for file-based routes,
   // signature_return / function_param for the signature pass) locates the
   // function by line_number alone, so it does not require a span or text.
+  // response_body / request_body also accept a line-only anchor: for a
+  // named-handler route registration the scanner falls back to the registration
+  // line, and the inferrer follows that line to the handler (`handlerAtLine`).
+  // Worst case the line resolves nothing and the alias pads to `unknown` — the
+  // same outcome rejection produced, but now the resolvable cases get through.
   const lineOnlyOk =
     item.infer_kind === 'function_return' ||
     item.infer_kind === 'signature_return' ||
-    item.infer_kind === 'function_param';
+    item.infer_kind === 'function_param' ||
+    item.infer_kind === 'response_body' ||
+    item.infer_kind === 'request_body';
   if (!hasSpan && !hasText && !lineOnlyOk) {
     return 'at least one of (span_start + span_end) or expression_text is required';
   }

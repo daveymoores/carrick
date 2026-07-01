@@ -80,3 +80,17 @@ export const app = {
 app.get('/login-redirect', (_req, res) => {
   res.redirect('/login');
 });
+
+// --- Route-registry object-literal handler (response) ---
+// The locator lands on the registry entry; the response contract is the
+// handler's RETURN type, one indirection away.
+export interface RegistryHealth { ok: boolean; ts: number; }
+export const registryHealthHandler = async (): Promise<RegistryHealth> => { return { ok: true, ts: 0 }; };
+export const gapRouteRegistry = [{ method: 'GET', path: '/registry-health', handler: registryHealthHandler }];
+
+// --- Inline arrow handler with a typed request read (request) ---
+// The locator lands on the registration call; the request contract is the type
+// argument of the first typed request read inside the handler body.
+export interface RegistryTrackReq { path: string; userId: string; }
+export const gapHono = { post(_p: string, _h: (c: { req: { json: <T>() => Promise<T> } }) => unknown): void {} };
+gapHono.post('/registry-track', async (c) => { const body = await c.req.json<RegistryTrackReq>(); return body; });
