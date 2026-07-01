@@ -4,7 +4,7 @@ use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGu
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
-    TypeManifestEntry, get_current_commit_hash,
+    TypeManifestEntry, get_current_commit_hash, mount_graph_to_api_details,
 };
 use crate::config::{Config, create_dynamic_tsconfig};
 use crate::file_finder::find_service_files;
@@ -912,6 +912,7 @@ async fn analyze_current_repo_incremental(
                 &files,
             );
 
+            let normalizer = UrlNormalizer::new(config);
             let new_file_results = if !files_to_analyze.is_empty() {
                 let result = file_orchestrator
                     .analyze_files(
@@ -920,6 +921,7 @@ async fn analyze_current_repo_incremental(
                         &detection,
                         Path::new(repo_path),
                         &graphql_producer_hints,
+                        &normalizer,
                     )
                     .await?;
                 result.file_results
@@ -948,7 +950,7 @@ async fn analyze_current_repo_incremental(
 
             // Rebuild mount graph from full merged results
             let graph_orchestrator = FileOrchestrator::new(agent_service.clone());
-            let mount_graph = graph_orchestrator.build_mount_graph(&merged_results);
+            let mount_graph = graph_orchestrator.build_mount_graph(&merged_results, &normalizer);
 
             // Generate function intents (also strips body_source before upload).
             // Run on the same path as the full analysis so incremental scans
@@ -1584,41 +1586,10 @@ fn build_cloud_data_from_mount_graph(
             })
     });
 
-    let endpoints: Vec<ApiEndpointDetails> = mount_graph
-        .get_resolved_endpoints()
-        .iter()
-        .map(|endpoint| ApiEndpointDetails {
-            owner: Some(crate::visitor::OwnerType::App(endpoint.owner.clone())),
-            key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: endpoint.handler.clone(),
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from(&endpoint.file_location),
-            repo_name: None,
-            service_name: None,
-        })
-        .collect();
-
-    let calls: Vec<ApiEndpointDetails> = mount_graph
-        .get_data_calls()
-        .iter()
-        .map(|call| ApiEndpointDetails {
-            owner: None,
-            key: OperationKey::http(&call.method, call.target_url.clone()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: Some(call.client.clone()),
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from(&call.file_location),
-            repo_name: None,
-            service_name: None,
-        })
-        .collect();
+    // Project endpoints + consumer calls through the shared helper so the
+    // consumer key is the pre-computed `canonical_path` (identical to the
+    // manifest join key).
+    let (endpoints, calls) = mount_graph_to_api_details(mount_graph);
 
     let mounts: Vec<crate::visitor::Mount> = mount_graph
         .get_mounts()
@@ -2047,7 +2018,19 @@ fn build_type_manifest_entries(
         if !is_http_method(&method) {
             continue;
         }
-        let path = normalizer.extract_path(&call.target_url);
+        // Key on the canonical path computed once at mount-graph build time, so
+        // the manifest join key is byte-identical to the projection key.
+        let path = call.canonical_path.clone();
+        // Only anchor types for a BARE route (internal/declared or relative
+        // target). An external or unclassified call keeps its raw `${HOST}/path`
+        // / full-URL canonical form: it has no internal producer to match, so a
+        // type anchor would be unused — and its `call_id` (a hash of the absolute
+        // file path) would make byte-compared goldens non-portable across
+        // machines. Mirrors main, where the raw projection key never joined an
+        // external call's `extract_path`-keyed manifest entry.
+        if !path.starts_with('/') {
+            continue;
+        }
         let key = OperationKey::http(&method, path);
         let call_id = build_call_site_id(&file_path, line_number, &key);
 
@@ -2366,6 +2349,7 @@ async fn analyze_current_repo(
     );
 
     // 4. Run the complete multi-agent analysis
+    let normalizer = UrlNormalizer::new(config);
     let analysis_result = orchestrator
         .run_complete_analysis(
             files.clone(),
@@ -2373,6 +2357,7 @@ async fn analyze_current_repo(
             &all_imported_symbols,
             repo_path,
             &graphql_producer_hints,
+            &normalizer,
         )
         .await?;
 
@@ -3162,27 +3147,43 @@ mod tests {
     /// orphans the live matcher had already correlated.
     #[test]
     fn test_consumer_manifest_paths_strip_env_var_base_urls() {
+        // Declared-internal env-var bases must be stripped from the consumer
+        // manifest key. The canonical path is computed ONCE (via
+        // `consumer_call_path`) at mount-graph build time and stored on the call;
+        // `build_type_manifest_entries` reads that stored `canonical_path` so the
+        // manifest key is byte-identical to the projection key for the same call.
+        let config = Config {
+            internal_env_vars: ["USER_SERVICE_URL", "NOTIFICATION_SERVICE_URL"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Config::default()
+        };
+        let normalizer = UrlNormalizer::new(&config);
+        let mk_call = |target: &str, file: &str| {
+            let target = target.to_string();
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                canonical_path: normalizer.consumer_call_path(&target),
+                target_url: target,
+                client: "fetch".to_string(),
+                file_location: file.to_string(),
+                call_kind: None,
+                repo_name: None,
+            }
+        };
         let mut mount_graph = MountGraph::new();
         mount_graph.data_calls = vec![
-            crate::mount_graph::DataFetchingCall {
-                method: "GET".to_string(),
-                target_url: "`${USER_SERVICE_URL}/api/users/${order.userId}`".to_string(),
-                client: "fetch".to_string(),
-                file_location: "src/orders.ts:42".to_string(),
-                call_kind: None,
-                repo_name: None,
-            },
-            crate::mount_graph::DataFetchingCall {
-                method: "GET".to_string(),
-                target_url: "`${NOTIFICATION_SERVICE_URL}/api/notifications/status`".to_string(),
-                client: "fetch".to_string(),
-                file_location: "src/notify.ts:7".to_string(),
-                call_kind: None,
-                repo_name: None,
-            },
+            mk_call(
+                "`${USER_SERVICE_URL}/api/users/${order.userId}`",
+                "src/orders.ts:42",
+            ),
+            mk_call(
+                "`${NOTIFICATION_SERVICE_URL}/api/notifications/status`",
+                "src/notify.ts:7",
+            ),
         ];
 
-        let config = Config::default();
         let entries = build_type_manifest_entries(&mount_graph, &config);
 
         let consumer_paths: Vec<&str> = entries

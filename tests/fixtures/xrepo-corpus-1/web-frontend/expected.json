@@ -4,7 +4,6 @@
     {
       "method": "GET",
       "path": "/orders/:param",
-      "host_contains": "NEXT_PUBLIC_ORDERS_URL",
       "path_contains": "/orders/",
       "import_source": null,
       "primary_type_symbol": "OrderView",
@@ -15,7 +14,6 @@
     {
       "method": "POST",
       "path": "/payments",
-      "host_contains": "NEXT_PUBLIC_PAYMENTS_URL",
       "path_contains": "/payments",
       "import_source": null,
       "primary_type_symbol": "Payment",

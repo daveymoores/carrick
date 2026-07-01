@@ -182,43 +182,10 @@ impl CloudRepoData {
         });
         let mount_graph = &analysis_result.mount_graph;
 
-        // Convert ResolvedEndpoints to ApiEndpointDetails
-        let endpoints: Vec<ApiEndpointDetails> = mount_graph
-            .get_resolved_endpoints()
-            .iter()
-            .map(|endpoint| ApiEndpointDetails {
-                owner: Some(OwnerType::App(endpoint.owner.clone())),
-                key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: endpoint.handler.clone(),
-                request_type: None,
-                response_type: None,
-                file_path: PathBuf::from(&endpoint.file_location),
-                repo_name: None,
-                service_name: None,
-            })
-            .collect();
-
-        // Convert DataFetchingCalls to ApiEndpointDetails
-        let calls: Vec<ApiEndpointDetails> = mount_graph
-            .get_data_calls()
-            .iter()
-            .map(|call| ApiEndpointDetails {
-                owner: None,
-                key: OperationKey::http(&call.method, call.target_url.clone()),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: Some(call.client.clone()),
-                request_type: None,
-                response_type: None,
-                file_path: PathBuf::from(&call.file_location),
-                repo_name: None,
-                service_name: None,
-            })
-            .collect();
+        // Project endpoints + consumer calls through the shared helper so the
+        // consumer key is the pre-computed `canonical_path` (identical to the
+        // manifest join key).
+        let (endpoints, calls) = mount_graph_to_api_details(mount_graph);
 
         // Convert MountEdges to Mount
         let mounts: Vec<Mount> = mount_graph
@@ -265,6 +232,57 @@ impl CloudRepoData {
             type_extraction_status: None,
         }
     }
+}
+
+/// Project a `MountGraph`'s endpoints and consumer calls into the
+/// `ApiEndpointDetails` shape shared by the cloud index. Returns
+/// `(endpoints, calls)`.
+///
+/// This is the single place both cloud projections
+/// (`CloudRepoData::from_multi_agent_results` and the engine's
+/// `build_cloud_data_from_mount_graph`) key their operations, so a producer
+/// endpoint keys on `full_path` and a consumer call keys on the pre-computed
+/// `canonical_path` — the same key the type manifest joins on.
+pub fn mount_graph_to_api_details(
+    mount_graph: &MountGraph,
+) -> (Vec<ApiEndpointDetails>, Vec<ApiEndpointDetails>) {
+    let endpoints: Vec<ApiEndpointDetails> = mount_graph
+        .get_resolved_endpoints()
+        .iter()
+        .map(|endpoint| ApiEndpointDetails {
+            owner: Some(OwnerType::App(endpoint.owner.clone())),
+            key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: endpoint.handler.clone(),
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(&endpoint.file_location),
+            repo_name: None,
+            service_name: None,
+        })
+        .collect();
+
+    let calls: Vec<ApiEndpointDetails> = mount_graph
+        .get_data_calls()
+        .iter()
+        .map(|call| ApiEndpointDetails {
+            owner: None,
+            key: OperationKey::http(&call.method, call.canonical_path.clone()),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: Some(call.client.clone()),
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(&call.file_location),
+            repo_name: None,
+            service_name: None,
+        })
+        .collect();
+
+    (endpoints, calls)
 }
 
 #[derive(Debug)]

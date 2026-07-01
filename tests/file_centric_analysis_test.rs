@@ -799,6 +799,7 @@ app.post('/users', (req, res) => res.json({ created: true }));
             &detection,
             temp_dir.path(),
             &Default::default(),
+            &carrick::url_normalizer::UrlNormalizer::default_permissive(),
         )
         .await;
 
@@ -838,6 +839,7 @@ async fn test_file_orchestrator_handles_empty_files() {
             &detection,
             temp_dir.path(),
             &Default::default(),
+            &carrick::url_normalizer::UrlNormalizer::default_permissive(),
         )
         .await;
 
@@ -872,6 +874,7 @@ async fn test_file_orchestrator_handles_missing_files() {
             &detection,
             PathBuf::from("/").as_path(),
             &Default::default(),
+            &carrick::url_normalizer::UrlNormalizer::default_permissive(),
         )
         .await;
 

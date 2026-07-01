@@ -95,6 +95,7 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
             &express_detection(),
             &root,
             &Default::default(),
+            &carrick::url_normalizer::UrlNormalizer::default_permissive(),
         )
         .await
         .expect("analysis should succeed");
