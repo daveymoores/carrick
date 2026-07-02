@@ -32,6 +32,44 @@ pub struct Packages {
     pub package_jsons: Vec<PackageJson>,
     pub source_paths: Vec<PathBuf>,
     pub merged_dependencies: HashMap<String, PackageInfo>,
+    /// Package names declared by ANY package.json in the scanned repo tree —
+    /// not just the service-scoped ones in `package_jsons`. A monorepo's
+    /// shared workspace package (`@meridian/contracts` under
+    /// `packages/contracts/`) is not a service, so its package.json is never
+    /// loaded into `package_jsons`; this set is how it is still recognized as
+    /// internal (registry-unresolvable). `default` for CloudRepoData
+    /// payloads persisted before the field existed.
+    #[serde(default)]
+    pub internal_names: std::collections::HashSet<String>,
+}
+
+/// Names declared by every package.json under `repo_root` (workspace members
+/// included), skipping dependency/build directories. Used to recognize
+/// workspace-internal packages that must not be treated as registry deps.
+pub fn collect_internal_package_names(
+    repo_root: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    const SKIP_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
+    let mut names = std::collections::HashSet::new();
+    let walker = walkdir::WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(|e| {
+            !(e.file_type().is_dir()
+                && e.file_name()
+                    .to_str()
+                    .is_some_and(|n| SKIP_DIRS.contains(&n)))
+        });
+    for entry in walker.flatten() {
+        if entry.file_type().is_file()
+            && entry.file_name() == "package.json"
+            && let Ok(text) = std::fs::read_to_string(entry.path())
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(name) = json.get("name").and_then(|n| n.as_str())
+        {
+            names.insert(name.to_string());
+        }
+    }
+    names
 }
 
 impl Packages {
@@ -150,14 +188,16 @@ impl Packages {
         &self.merged_dependencies
     }
 
-    /// Names the scanned package.json files declare themselves (workspace
-    /// members / the repo's own packages). A dependency on one of these is an
-    /// internal, registry-unresolvable link (e.g. an npm-workspaces package
-    /// like `@meridian/contracts`), not an installable third-party package.
+    /// Names the scanned repo declares itself (loaded package.json files plus
+    /// the tree-walked `internal_names`, which covers non-service workspace
+    /// members). A dependency on one of these is an internal,
+    /// registry-unresolvable link (e.g. an npm-workspaces package like
+    /// `@meridian/contracts`), not an installable third-party package.
     pub fn internal_package_names(&self) -> std::collections::HashSet<String> {
         self.package_jsons
             .iter()
             .filter_map(|p| p.name.clone())
+            .chain(self.internal_names.iter().cloned())
             .collect()
     }
 
@@ -177,5 +217,52 @@ impl Packages {
         names.sort();
         names.truncate(DEPENDENCY_NAME_CAP);
         names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_internal_package_names_walks_tree_and_skips_dep_dirs() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("package.json"),
+            r#"{ "name": "platform-monorepo" }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join("packages/contracts")).unwrap();
+        std::fs::write(
+            repo.path().join("packages/contracts/package.json"),
+            r#"{ "name": "@meridian/contracts", "version": "0.1.0" }"#,
+        )
+        .unwrap();
+        // Installed dependency — must NOT be treated as internal.
+        std::fs::create_dir_all(repo.path().join("node_modules/koa")).unwrap();
+        std::fs::write(
+            repo.path().join("node_modules/koa/package.json"),
+            r#"{ "name": "koa" }"#,
+        )
+        .unwrap();
+
+        let names = collect_internal_package_names(repo.path());
+        assert!(names.contains("platform-monorepo"));
+        assert!(names.contains("@meridian/contracts"));
+        assert!(
+            !names.contains("koa"),
+            "node_modules packages are not internal"
+        );
+    }
+
+    /// Regression anchor on the real corpus-3 fixture: the workspace member
+    /// that 404'd the type-check npm install must be recognized as internal.
+    #[test]
+    fn collect_internal_package_names_finds_corpus3_contracts_package() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/xrepo-corpus-3/platform-monorepo");
+        let names = collect_internal_package_names(&fixture);
+        assert!(names.contains("@meridian/contracts"));
+        assert!(names.contains("catalog-api"));
     }
 }

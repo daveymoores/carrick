@@ -2025,13 +2025,19 @@ fn load_packages_for_service(
 ) -> Result<Packages, Box<dyn std::error::Error>> {
     let ignore_patterns = service_ignore_patterns(service);
     let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
-    if let Some(package_path) = package_json_path {
+    let mut packages = if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
         Packages::new(vec![package_path.clone()])
-            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e).into())
+            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e))?
     } else {
-        Ok(Packages::default())
-    }
+        Packages::default()
+    };
+    // Names of every package.json in the WHOLE repo tree (not just this
+    // service's): a workspace member like `packages/contracts` is not a
+    // service, but a dependency on it is internal, not a registry package.
+    packages.internal_names =
+        crate::packages::collect_internal_package_names(std::path::Path::new(repo_path));
+    Ok(packages)
 }
 
 /// Resolve per-endpoint type definitions using the sidecar's compiler.
@@ -3071,6 +3077,42 @@ mod tests {
         );
         assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
         assert_eq!(deps.get("zod").map(String::as_str), Some("3.23.0"));
+    }
+
+    #[test]
+    fn synthetic_type_check_deps_exclude_tree_walked_internal_names() {
+        // Production shape (the corpus-3 baseline failure): only the
+        // SERVICE's package.json is loaded into package_jsons — a workspace
+        // member like packages/contracts never is — so the exclusion must
+        // also honour the tree-walked internal_names set.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("catalog-api".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                ("@meridian/contracts".to_string(), "0.1.0".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+        });
+        packages
+            .source_paths
+            .push(PathBuf::from("packages/catalog-api/package.json"));
+        packages.resolve_dependencies();
+        packages
+            .internal_names
+            .insert("@meridian/contracts".to_string());
+
+        let deps = synthetic_type_check_dependencies(&packages);
+        assert!(
+            !deps.contains_key("@meridian/contracts"),
+            "tree-walked internal name must not be npm-installed"
+        );
+        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
     }
 
     #[test]
