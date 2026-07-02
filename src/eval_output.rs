@@ -308,7 +308,9 @@ impl ManifestIndex {
 
 /// Whether two source paths name the same file across the repo-relative vs
 /// absolute conventions the manifest and op details mix: equal, or one is a
-/// path-component-aligned suffix of the other.
+/// path-component-aligned suffix of the other. Both separator styles count as
+/// a component boundary so a Windows-style absolute path still aligns against
+/// a repo-relative one.
 fn same_source_file(a: &str, b: &str) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
@@ -317,7 +319,7 @@ fn same_source_file(a: &str, b: &str) -> bool {
         return true;
     }
     let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
-    long.ends_with(short) && long.as_bytes()[long.len() - short.len() - 1] == b'/'
+    long.ends_with(short) && matches!(long.as_bytes()[long.len() - short.len() - 1], b'/' | b'\\')
 }
 
 /// `ManifestTypeState` → its String form, matching the manifest's serde naming
