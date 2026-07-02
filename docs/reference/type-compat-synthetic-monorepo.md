@@ -1,6 +1,9 @@
 # Type Compatibility v2 — Compiler-Native Artifacts in a Synthetic Monorepo
 
-**Status:** Proposed (2026-07)
+**Status:** Proposed (2026-07), hardened by three adversarial review passes
+(compiler mechanics — claims tested empirically against tsc; codebase
+fact-check — every file/line reference verified; migration/ops). See
+"Review record" at the end.
 **Supersedes (on completion):** the flat-bundle + `ts_check` comparison path
 **Builds on:** `docs/research/compiler-sidecar-architecture/` (Phase 3, "Synthetic
 Monorepo / Stub Snapshot"), `docs/research/type-checking-flow.md`
@@ -28,27 +31,34 @@ current system is compensation for that loss:
 | `cleanupPaths` regex in `run-type-checking.ts` | absolute `import("...")` specifiers leak into error text |
 | merged `package.json` + `npm install --legacy-peer-deps` | library types kept by-name must resolve *somewhere* at check time |
 | verdict join by re-parsing endpoint label strings (`analyzer/mod.rs`, `parse_compat_endpoint`) | no stable pair identity crosses the Rust/TS boundary |
+| formatter regex-parsing mismatch strings back apart (`analyzer/mod.rs:2220` ↔ `formatter/mod.rs:832`) | verdict detail travels as prose, not structure |
 
 We are incrementally reimplementing TypeScript's declaration emitter — one of
 the hairiest parts of the compiler — one regression at a time (#149, #226,
 #233, #240, #244, #253, #260 are all inline-documented instances).
 
-**Proposal:** finish the synthetic-monorepo architecture that is already ~70%
-built but unreachable from Rust (`MonorepoBuilder`, `SurfaceEmitter`,
+**Proposal:** finish the synthetic-monorepo architecture that is already
+partially built but unreachable from Rust (`MonorepoBuilder`, `SurfaceEmitter`,
 tsconfig/dependency snapshots — the sidecar handles `emit_surface`,
 `build_workspace`, `check_compatibility`, but `SidecarRequest` in
-`src/services/type_sidecar.rs` never sends them), with two corrections to its
-current design:
+`src/services/type_sidecar.rs:161-191` never sends them), with two corrections
+to its current design:
 
 1. **The artifact becomes a compiler-emitted declaration tree** (a types-only
    package per service), not a flattened structurally-expanded string. Let
    `tsc` be the serializer.
 2. **The checker becomes per-pair probe files** checked by `tsc --noEmit` in
-   the workspace, with diagnostics attributed by filename. Let `tsc` be the
-   judge, and let its elaborated errors be the user-facing mismatch report.
+   the workspace, with diagnostics attributed by filename + diagnostic code.
+   Let `tsc` be the judge, and let its elaborated errors be the user-facing
+   mismatch report.
 
 Everything the pipeline currently does to type *text* by hand should either
 become a real file the compiler emitted or a real probe the compiler checked.
+
+Since Carrick has no users and no backwards-compatibility obligations, the old
+path is deleted in the same release that ships the new one. Previously
+uploaded artifacts are simply ignored (join-time artifact-version check) and
+the fleet re-scans once.
 
 ## Framing
 
@@ -60,7 +70,8 @@ endpoint contract. The cross-repo check is then "install all captured packages
 into one workspace and typecheck generated probes."
 
 This is the same insight as the existing Phase-3 stub-snapshot design; the
-correction is *what goes inside the stub package*.
+corrections are *what goes inside the stub package* and *how verdicts are
+attributed*.
 
 ## Current state (what actually runs today)
 
@@ -73,8 +84,9 @@ available):
    requests: explicit `SymbolRequest`s, inline aliases, or `infer` requests.
 3. The sidecar resolves them with ts-morph and serializes each result to
    structural text (`expandTypeStructural`: objects inlined recursively,
-   library types kept by name). `TypeBundler` — `@deprecated` but live —
-   renames declarations via first-occurrence `String.replace`.
+   library types kept by name). `TypeBundler` — `@deprecated` but live
+   (`handleBundle` uses it) — renames declarations via first-occurrence
+   `String.replace`.
 4. Rust concatenates the results into one `.d.ts` string
    (`resolve_all_types`, `append_inline_aliases`), enriches the manifest by
    alias-string join, uploads `bundled_types` + `type_manifest`.
@@ -83,8 +95,10 @@ At check time (any repo's CI, after downloading all `CloudRepoData`):
 
 5. `recreate_type_files_and_check` writes one `<stem>_types.d.ts` per service
    (padded with `= unknown // carrick:missing-alias` for unresolved aliases),
-   merges every repo's dependencies into one `package.json`, runs
-   `npm install --legacy-peer-deps`, and spawns
+   merges every repo's dependencies into one `package.json`, and runs
+   `npm install --legacy-peer-deps` (node_modules and lockfile deleted first —
+   genuinely uncached every run). `Analyzer::run_final_type_checking`
+   (`analyzer/mod.rs:2025`) then spawns
    `npx ts-node ts_check/run-type-checking.ts`.
 6. `ts_check` matches manifests, loads every `.d.ts` into one flat ts-morph
    project, gates unverifiable pairs, and calls `isAssignableTo` with
@@ -92,7 +106,10 @@ At check time (any repo's CI, after downloading all `CloudRepoData`):
    socket/pubsub inverted; GraphQL producers get a structural envelope
    unwrap).
 7. Verdicts come back as JSON keyed by human-readable endpoint labels, which
-   Rust re-parses to join onto `CrossRepoMatch.type_compatible`.
+   Rust re-parses to join onto `CrossRepoMatch.type_compatible`
+   (`parse_compat_endpoint` / `parse_producer_key`, plus `consumerLocation`
+   since #260); mismatch detail is then re-serialized into a prose string the
+   formatter regex-parses apart again for the PR comment.
 
 ### Failure classes this structure produces
 
@@ -104,23 +121,29 @@ At check time (any repo's CI, after downloading all `CloudRepoData`):
   false positive needed a *second* guard on the post-unwrap comparands).
 - **Version-conflict soundness hole.** The merged install resolves conflicting
   majors arbitrarily, so one repo's types are checked against the wrong
-  library version. `xrepo-corpus-1` deliberately ships a zod 3.x/4.x conflict;
-  the current checker resolves it by coin flip.
+  library version. `xrepo-corpus-1` deliberately ships a zod 3.x/4.x conflict
+  (`payments-svc` `^4.0.0` vs siblings `^3.22.0`); the merged dependency map
+  holds one `zod` entry, picked arbitrarily.
 - **Semantic loss.** Eager structural expansion erases generic structure,
   nominal-ish semantics (branded types, classes with privates, enums,
   declaration merging), and type *names* — so even correct mismatch verdicts
   print anonymous `{ ... }` soup instead of "`OrderUpdate` requires `note`".
 - **String-protocol coupling.** The marker comment, the alias-definition
-  regexes duplicated in Rust (`dts_defines_alias` in `type_sidecar.rs` and
-  `engine/mod.rs`), socket direction labels, GraphQL kind casing, and the
-  verdict-label re-parse must all stay byte-compatible across two languages.
-- **Latent direction bug (verify with an eval case).** `compareTypes` keys
-  direction on protocol only, but pairs match per `type_kind`. For an HTTP
-  `request` pair, data flows consumer → producer (the caller sends the body
-  the endpoint must accept), so the check should be `consumer ⊑ producer`;
-  the code runs `producer ⊑ consumer` for everything HTTP. If request-body
-  types ever resolve to real shapes, widening/narrowing verdicts on them are
-  inverted.
+  regexes duplicated in Rust (`dts_defines_alias` in `type_sidecar.rs:815`
+  and `engine/mod.rs:2747`), socket direction labels, GraphQL kind casing,
+  the verdict-label re-parse, and the analyzer→formatter mismatch-string
+  round-trip must all stay byte-compatible across two languages.
+- **CONFIRMED direction bug on HTTP request bodies.** `compareTypes` keys
+  direction on protocol only (`type-checker.ts:387-408`); `type_kind` is used
+  in the label but never in direction selection. Request pairs are built for
+  non-GET/HEAD/OPTIONS endpoints (`engine/mod.rs:2109-2115`), `RequestBody`
+  inference is wired end-to-end (`file_orchestrator.rs:940-953`,
+  `type-inferrer.ts:690`), and the matcher pairs strictly per `type_kind`
+  (`manifest-matcher.ts:732`). Data flows consumer → producer for request
+  bodies (the caller sends the body the endpoint must accept), so the check
+  should be `consumer ⊑ producer`; the code runs `producer ⊑ consumer`.
+  Widening/narrowing verdicts on request bodies are inverted today. No
+  fixture currently pins this — add one regardless of this migration.
 
 ## Target architecture
 
@@ -131,7 +154,7 @@ single `bundled_types` string:
 
 ```
 @carrick/<service>/
-├── package.json          # name, types entry, pinned deps (from lockfile)
+├── package.json          # name, types entry, pinned deps (name@exact-version only)
 ├── tsconfig.snapshot.json
 └── types/
     ├── surface.d.ts      # entry: export type Endpoint_<hash>_Response = ...
@@ -140,65 +163,156 @@ single `bundled_types` string:
 
 Generation:
 
-1. Write a **surface entry `.ts` file inside the real repo project** that
-   aliases each manifest anchor:
+1. Write a **surface entry `.ts` file inside the real repo project** — inside
+   the effective `rootDir` (an entry at repo root with `rootDir: "src"` fails
+   with `TS6059`) — that aliases each manifest anchor:
    - Explicit symbol: `export type Endpoint_abc_Response =
-     import('./src/types/order').OrderResponse;`
+     import('./types/order').OrderResponse;`
    - Addressable handler (implicit): `export type Endpoint_def_Response =
-     Awaited<ReturnType<typeof import('./src/routes/orders').getOrder>>;`
-     (after machinery unwrap — see below).
-2. Run **the compiler's declaration emit** rooted at that entry
-   (`declaration: true, emitDeclarationOnly: true`) and capture the emitted
-   `.d.ts` **tree**. The compiler computes the transitive closure of local
-   declarations and prints external references as real imports. No flattening;
-   no custom printer for anything the compiler can address.
-3. **Anonymous inferred types** (inline handlers with no addressable symbol —
-   the reason the current design serializes everything): print via the
-   compiler's node builder (`checker.typeToTypeNode` /
-   `typeToString` with declaration-emit flags, `NoTruncation`), which emits
-   `import("pkg").T` / `import("./x").T` references that now *resolve* because
-   the tree and pinned deps travel with them. `expandTypeStructural` survives
-   only as a last-resort fallback for shapes the node builder refuses, and its
-   use is recorded per-alias in the manifest (`serialization: emitted |
-   node_builder | structural_fallback`) so fidelity is measurable.
-4. **Machinery unwrapping stays at capture time** where the real `Type` is in
+     Awaited<ReturnType<typeof import('./routes/orders').getOrder>>;`
+     (after machinery unwrap — see below). **Guards required before choosing
+     this form** (all verified failure modes): the symbol must actually be
+     exported (`checker.getExportsOfModule`), must not be an overload set
+     (`ReturnType` silently resolves the *last* overload only), and must not
+     be generic (type parameters erase to their constraint/`unknown`). Anchors
+     failing these guards route to the node-builder path or are marked
+     unverifiable-with-reason.
+2. Run **the compiler's declaration emit** via
+   `ts.createProgram([entry], parsedRepoOptions)` — the repo's own parsed
+   tsconfig options, not CLI file roots (which ignore tsconfig entirely) —
+   with `--noCheck --declaration --emitDeclarationOnly` (TS ≥ 5.5). Verified:
+   `noCheck` emit exits 0 on repos with type errors and still fully computes
+   inferred exported types, so **type-error-laden repos are not a blocker**.
+   The compiler computes the transitive closure of local declarations,
+   synthesizes local non-exported declarations where needed (it handles the
+   unexported-`Secret`-interface case correctly — materially smarter than the
+   node-builder API), and prints external references as real imports.
+3. **Post-emit specifier rewrite pass (required component).** Declaration emit
+   does *not* rewrite tsconfig-`paths`-mapped specifiers — `import { Item }
+   from '@app/models/item'` ships verbatim and dangles after relocation into
+   the stub (verified). `paths` cannot be fixed at check time either: it is
+   program-global, and `@app/*`-style namespaces collide across stubs. The
+   capture pass maps every emitted internal specifier through the producer
+   repo's resolved `paths` to a tree-relative path. True relative specifiers
+   survive relocation correctly (verified) and need no rewriting.
+4. **Global augmentations are handled deliberately.** An entry-rooted program
+   drops `declare global` / module-augmentation files outside the entry's
+   import graph — and because emit proceeds despite errors, the tree ships
+   with dangling global references unless caught. Capture must detect
+   augmentations reachable from the closure's symbols and include those files
+   in the emitted tree. (Their check-time interaction is handled in the
+   checker — see below.)
+5. **Anonymous inferred types** (inline handlers with no addressable symbol)
+   print via the compiler's node builder (`checker.typeToTypeNode` with
+   `NoTruncation`), which emits `import("pkg").T` / relative import-type
+   references that resolve inside the shipped tree + pinned deps.
+   **The node builder fails silently by default** (verified: unexported local
+   interfaces, unique-symbol keys, and local recursive aliases print as
+   dangling names with zero callbacks fired) — the fallback therefore requires
+   a real `SymbolTracker` implementation performing `isSymbolAccessible`
+   bookkeeping per tracked symbol; any inaccessible symbol demotes the alias
+   to `structural_fallback`. `expandTypeStructural` survives only as that
+   last-resort tier, and every alias records its tier in the manifest
+   (`serialization: emitted | node_builder | structural_fallback`) so fidelity
+   is measurable and ratchetable.
+6. **Machinery unwrapping stays at capture time** where the real `Type` is in
    hand: transport generics (`Promise`, async iterables), agent-generated
    `ExtractionConfig` wrapper rules, and — moved here from the checker — the
-   GraphQL resolver envelope unwrap. The checker should never guess at
-   payload shape.
-5. `package.json` dependencies are **pinned exact versions resolved from the
-   repo's lockfile**, pruned to specifiers actually referenced by the emitted
-   tree (the `SurfaceEmitter` already tracks referenced specifiers). tsconfig
-   snapshot records the flags that affect assignability (`strict*`,
-   `exactOptionalPropertyTypes`, …) plus the TypeScript version used.
-6. **Capture-time self-check (new gate):** the stub package must typecheck
-   standalone, and no exported alias may resolve to `any`. Failures downgrade
-   the alias to `type_state: Unknown` *with a recorded reason* at capture
-   time — converting today's silent degradation (discovered at match time as
-   a confusing "unverifiable") into a per-repo, per-alias capture error.
+   GraphQL resolver envelope unwrap. The checker never guesses at payload
+   shape.
+7. `package.json` dependencies are **pinned exact versions resolved from the
+   repo's lockfile**, stored as `name@version` only (registry/proxy URLs
+   stripped), pruned to specifiers actually referenced by the emitted tree.
+8. **Capture-time self-check (new gate), keyed on diagnostics, not artifact
+   existence** (emit succeeds even when poisoned): the stub package must
+   typecheck standalone (module resolution pointed at the source repo's
+   `node_modules` — no extra install), every internal specifier must resolve
+   inside the tree, and no exported alias may resolve to `any`, `unknown`, or
+   `never`. Failures downgrade the alias to `type_state: Unknown` *with a
+   recorded reason* at capture time — converting today's silent degradation
+   (discovered at match time as a confusing "unverifiable") into a per-repo,
+   per-alias capture error.
+9. **JS-heavy services:** declaration emit from `allowJs` sources produces
+   `any`-saturated declarations that will mass-fail the self-check. This is
+   expected and honest — record it as capture degradation
+   (`type_extraction_status` already exists for exactly this), and predict a
+   near-zero surface-fidelity score for such services rather than discovering
+   it in evals.
 
-`CloudRepoData` changes: `bundled_types: Option<String>` →
-`type_surface: Option<TypeSurface>` where `TypeSurface = { files:
-BTreeMap<RelPath, String>, pinned_deps: BTreeMap<String, String>,
-tsconfig_snapshot: Value, ts_version: String }`. Per the no-backwards-compat
-rule, the old field is deleted in the same commit; `cache_version` bumps.
+### Artifact shape and storage (requires coordinated carrick-cloud change)
+
+The doc'd first instinct — `TypeSurface` as a file map inside `CloudRepoData` —
+does not survive contact with the actual transport: `bundled_types` is
+uploaded to S3 but the S3 object is **write-only dead weight**; the live read
+path inlines the entire `CloudRepoData` of every service in the fleet into one
+synchronous Lambda JSON response (`aws_storage.rs:312,354`;
+`download_all_repo_data` reads inline metadata and discards the per-repo
+`s3_url` map — `engine/mod.rs:172` binds it as `_repo_s3_urls`). Sync Lambda
+responses cap at ~6MB; declaration trees per service would blow it.
+
+Therefore:
+
+- **One content-addressed S3 object per surface**: gzip tarball of the tree,
+  key = sha256 of contents. `CloudRepoData` carries only a descriptor:
+  `{ surface_key, digest, byte_size, pinned_deps: BTreeMap<String,String>,
+  tsconfig_snapshot, ts_version, artifact_version }` (~hundreds of bytes).
+- `get-cross-repo-data` returns presigned GETs — the existing unused
+  `AdjacentRepo.s3_url` plumbing is repurposed. The scanner downloads
+  surfaces **lazily, only for repos that produced matched pairs**.
+- Content addressing gives dedup for free: unchanged types across commits →
+  same digest → skip upload (the existing check-or-upload hash dance already
+  has this shape).
+- **Join-time artifact version check:** a peer descriptor with a missing or
+  older `artifact_version` is treated as having no surface — its pairs are
+  unverifiable with reason `peer scanned with older Carrick — re-scan`. No
+  compatibility shims; the fleet re-scans once after the release. (`cache_version`
+  is checked only on the same-repo incremental path, `engine/mod.rs:797-815`;
+  it does not and should not gate cross-repo joins.)
+- This is a **wire-contract change in `carrick-cloud`** (upload flow at
+  `aws_storage.rs:342-368` branches on `bundled_types` today; the Lambdas
+  must store descriptors and serve presigned surface GETs). The migration
+  cannot land from this repo alone.
 
 ### Check phase (synthetic monorepo, at cross-repo analysis time)
 
 Reuses `MonorepoBuilder`'s workspace shape (pnpm, `node-linker=isolated`,
-per-stub `node_modules` — this correctly fixes the version-conflict hole),
-with these corrections:
+per-stub `node_modules`), with these corrections:
 
-1. **Stub packages carry the declaration tree**, not a single `surface.d.ts`
-   of expanded text. `main`/`types` point at `types/surface.d.ts`; internal
-   relative imports resolve within the tree; external imports resolve against
-   the stub's own pinned `node_modules`. The `@carrick/{repo}/*` tsconfig
-   path-mapping gymnastics in `createCheckerTsconfig` become unnecessary for
-   type resolution (each stub resolves its own deps), remaining only for the
-   checker package to import surfaces.
-2. **One probe file per matched pair**, named by the pair's stable ID (reuse
-   the FNV pair hash). Matching itself is unchanged (manifest matcher —
-   whether it stays TS or moves to Rust is orthogonal). Probe content:
+1. **Workspace lives in scratch space** (`$RUNNER_TEMP`-rooted), never
+   `.carrick/workspace` inside the scanned repo (pollutes the working tree,
+   breaks `git diff`-based incremental detection, and risks being swept up by
+   the scanner's own file discovery). Stub directory/package names are keyed
+   on `service_name ?? repo_name` and sanitized exactly like
+   `bundle_file_stems` (`engine/mod.rs:2534-2563`) — the current builder keys
+   on raw `repoName`, re-creating both the monorepo-services-clobber bug and
+   invalid `@carrick/org/repo` package names.
+2. **pnpm is vendored as a devDependency of the sidecar** — version-pinned by
+   the existing lockfile, installed by the `npm ci` step already in
+   `action.yml`, invoked as `<sidecar>/node_modules/.bin/pnpm`. No corepack
+   (deprecated; removed from Node 25 while the action pins Node 24 — a silent
+   time bomb), no runtime tool download. **The silent npm fallback is
+   deleted**: plain-npm flat installs physically duplicate packages and
+   manufacture nominal false-incompatibles program-wide (see 6) while
+   destroying the isolation guarantee — if pnpm is unavailable, the type pass
+   fails with an explicit `isolation-unavailable` reason. Never trade
+   soundness for availability silently.
+3. **Per-stub install failure isolation.** A stub whose install fails (private
+   registry dep of a peer, unpublished pin) degrades **only that repo's
+   pairs** to unverifiable with the install error as the recorded reason —
+   never fatal to the run (today's contract, `Err` at
+   `engine/mod.rs:2858-2877`, would let one stale peer disable type checking
+   for the whole fleet).
+4. **Stub packages carry the declaration tree.** `types` points at
+   `types/surface.d.ts`; internal relative imports resolve within the tree;
+   external imports resolve against the stub's own pinned `node_modules`
+   (verified: one `tsc` program genuinely loads two versions of the same
+   package via per-stub `node_modules` walk-up and elaborates cross-version
+   mismatches correctly). Checker tsconfig maps only the surfaces; use
+   `moduleResolution: "bundler"` — the single program must accept both
+   `.js`-suffixed specifiers (from `node16` producers) and extensionless ones.
+5. **One probe file per matched pair**, named by a pair ID derived with the
+   existing FNV-1a hasher (`type_manifest.rs` — a pair-level ID is new;
+   the hasher is not). Probe content:
 
    ```ts
    // pair_<fnv-hash>.ts — <protocol> <method> <path> (<type_kind>)
@@ -206,13 +320,22 @@ with these corrections:
    import type { Call_def_Response as Expected } from '@carrick/web/surface';
 
    type IsAny<T> = 0 extends 1 & T ? true : false;
+   type IsUnknown<T> = unknown extends T ? (0 extends 1 & T ? false : true) : false;
+   type IsNever<T> = [T] extends [never] ? true : false;
    type Not<T extends boolean> = T extends true ? false : true;
    type Assert<T extends true> = T;
 
-   // Top-type gates: a side that decayed to any/unknown must read
-   // UNVERIFIABLE (its probe errors on these lines), never compatible.
-   type _SentNotTop = Assert<Not<IsAny<Sent>>>;
-   type _ExpectedNotTop = Assert<Not<IsAny<Expected>>>;
+   // Top/bottom-type gates, BOTH sides. IsAny alone is insufficient:
+   // IsAny<unknown> is false; `Expected = unknown` yields zero diagnostics
+   // (false compatible — the graphql|subscription|orderUpdated class), and
+   // `Sent = never` likewise. All three gates, both sides, or the probe
+   // reintroduces the exact hole this design exists to close.
+   type _G1 = Assert<Not<IsAny<Sent>>>;
+   type _G2 = Assert<Not<IsUnknown<Sent>>>;
+   type _G3 = Assert<Not<IsNever<Sent>>>;
+   type _G4 = Assert<Not<IsAny<Expected>>>;
+   type _G5 = Assert<Not<IsUnknown<Expected>>>;
+   type _G6 = Assert<Not<IsNever<Expected>>>;
 
    // Value-level assignability in the data-flow direction.
    declare const sent: Sent;
@@ -220,12 +343,39 @@ with these corrections:
    ```
 
    Value-level assignment, not `[X] extends [Y]` conditional types: the
-   conditional-type relation differs subtly from assignability (notably
-   around `any`), and the compiler's **elaborated errors** — "Property 'note'
-   is missing in type 'OrderUpdate' but required in type …" — become the
-   user-facing mismatch report for free, with real type *names* preserved by
-   the declaration tree.
-3. **Direction is a table in the probe generator**, keyed on
+   conditional-type relation diverges around `any` (resolves both branches),
+   and the compiler's **elaborated errors** become the user-facing mismatch
+   report. Verified equivalences: excess-property checks don't fire (variable,
+   not fresh literal); weak-type rejection matches `isTypeAssignableTo`
+   (parity with today's verdict function); `strictFunctionTypes` applies
+   identically.
+6. **Nominal-identity caveat (new false-positive class to manage).** Isolation
+   makes verdicts nominal at package-copy granularity: two *byte-identical*
+   copies of a class with private members fail cross-assignment ("separate
+   declarations of a private property" — verified), so patch-level drift
+   between repos (`bson@6.8.0` vs `6.8.1` `ObjectId`, `Decimal`, `Dayjs`)
+   produces incompatible verdicts the merged install never did. Mitigation:
+   dedupe semver-compatible pins across stubs (pnpm `overrides` keyed on
+   compatible ranges) before install, so only genuinely conflicting majors
+   remain physically duplicated — those *should* verdict incompatible.
+7. **Verdict classification by diagnostic code + file, not line position
+   alone**, with four buckets:
+   - `TS2344` on a probe's gate lines → **unverifiable** (which side, which
+     gate — `any`/`unknown`/`never` — is recoverable from the gate name);
+   - `TS2322`/`TS2559`/`TS2739`/`TS2741`-class on the assignment → 
+     **incompatible**; diagnostic text is the report;
+   - errors on the probe's **import lines** (missing/renamed surface export) →
+     **unverifiable** (third bucket the naive line-split misses);
+   - **any diagnostic landing in a stub's own files poisons every probe
+     touching that stub** (unverifiable), never reads as "no errors →
+     compatible". This matters because cross-stub `declare global` collisions
+     (`TS2717`) attribute to stub files, not probes (verified); with
+     `skipLibCheck: true` they vanish and one stub's augmentation silently
+     contaminates the other. Policy: `skipLibCheck: false` for stub trees so
+     collisions surface, and the poisoning rule converts them to honest
+     unverifiables. Checker also sets `noUnusedLocals: false` (else `TS6196`/
+     `TS6133` land on gate/assignment lines and confuse classification).
+8. **Direction is a table in the probe generator**, keyed on
    `(protocol, type_kind)` — one place, in Rust:
 
    | protocol | type_kind | sent | expected |
@@ -234,42 +384,73 @@ with these corrections:
    | http | request | consumer | producer |
    | socket, pubsub | both | consumer (emitter/publisher) | producer (listener/subscriber) |
 
-   This structurally fixes the request-direction inversion and replaces the
-   60-line direction comment in `compareTypes`.
-4. **Unresolved anchors generate no probe.** The pair is recorded
-   unverifiable in Rust, carrying the capture-time reason. No `= unknown`
-   padding, no marker comments, no placeholder taxonomy.
-5. **Run `tsc --noEmit` once over the checker package; attribute diagnostics
-   by probe filename.** This kills the weakest part of the current
-   `MonorepoBuilder`: `parseCheckResult` computes an `isRelated` regex match
-   against tsc output and then ignores it, marking every check incompatible
-   on any failure. Verdict classification per probe:
-   - errors only on `_*NotTop` lines → **unverifiable** (with which side);
-   - error on the assignment line → **incompatible**, diagnostic text is the
-     report;
-   - no errors → **compatible**.
-6. **Verdicts return keyed by pair ID**, not by endpoint label strings.
-   `apply_compat_verdicts` joins by ID; `parse_compat_endpoint` /
-   `parse_producer_key` are deleted.
-7. **Workspace caching:** key the installed workspace on a hash of all stubs'
-   pinned dep sets; pnpm's content-addressable store makes warm installs
-   cheap in CI. Record `tsc` version in results (assignability is stable
-   across patch versions, but the artifact should say what judged it).
+   This structurally fixes the confirmed request-direction inversion and
+   replaces the ~40-line direction comment in `compareTypes`.
+9. **Unresolved anchors generate no probe.** The pair is recorded unverifiable
+   in Rust, carrying the capture-time reason. No `= unknown` padding, no
+   marker comments, no placeholder taxonomy.
+10. **Diagnostic post-processing stays — upgraded, not deleted.**
+    `cleanupPaths` cannot simply go: elaborated diagnostics print stub-absolute
+    `import("/tmp/.../stubs/orders/node_modules/zed/index").ZedError` paths in
+    exactly the most interesting error class (cross-stub conflicts), and the
+    probe's `as Sent` aliasing puts `Sent`/`Expected` in the headline instead
+    of real type names (nested elaboration lines keep real names). The scrub
+    pass maps stub-absolute paths → `@carrick/<service>` labels and rewrites
+    the headline aliases — strictly better output than today, but it is a
+    component, not a deletion.
+11. **Verdicts return keyed by pair ID as structured data** — verdict, bucket,
+    scrubbed diagnostic, both anchors. `apply_compat_verdicts` joins by ID;
+    `parse_compat_endpoint` / `parse_producer_key` are deleted, and the
+    formatter consumes the structured payload instead of regex-parsing a
+    prose mismatch string (`formatter/mod.rs:832-872` today).
+12. **Protocol:** `build_workspace` cold installs will exceed the Rust
+    client's 60s read deadline (`type_sidecar.rs:569,610`), and `execSync`
+    blocks the sidecar's event loop so even `health` goes dark. The action
+    spawns the install async and the sidecar emits progress/keepalive frames;
+    the Rust client gets a workspace-scoped deadline. Workspace caching
+    (pnpm store via `actions/cache`, keyed on the fleet pinned-deps hash) is
+    a **same-repo re-run optimization only** — runners are ephemeral and
+    caches are repo-scoped, so cross-repo warmth structurally cannot exist.
+    Budget the cold path as the norm; benchmark on `xrepo-corpus-1/2` with a
+    deliberately dep-heavy fixture **as a landing precondition with a
+    number**, not a post-hoc measurement. Expect check-time memory well above
+    the capture-phase ~100-200MB README figure: N isolated stubs parse N
+    disjoint `@types`/lib graphs.
+
+### Consumers that must be re-pointed (previously missed)
+
+- **`resolve_per_endpoint_definitions` (`engine/mod.rs:1937`)** consumes
+  `cloud_data.bundled_types` today to populate
+  `resolved_definition`/`expanded_definition` on manifest entries — the
+  payload of the MCP `get_endpoint_types` tool and a scored eval metric
+  (`eval_xrepo.rs:749-771`). Re-point it at the surface tree: resolve each
+  alias in the stub package (a strictly richer source), keep emitting both
+  the as-written and structural forms. The definition-fidelity metric is
+  preserved, not deleted.
+- **`src/signature_pass.rs` is unaffected** — it uses only the sidecar
+  `infer` action, no `bundled_types`.
 
 ### What this deletes
 
-- `type-structural-expander.ts` as a primary path (fallback only, measured);
-  `definition-resolver.ts`'s expansion duplication.
+- `type-structural-expander.ts` as a primary path (last-resort tier only,
+  measured); `definition-resolver.ts`'s duplication of it.
 - `append_missing_aliases`, `MISSING_ALIAS_MARKER` (both sides), both
   `dts_defines_alias` regex copies, placeholder-vs-real-`unknown`
   disambiguation (#244 machinery).
 - The `any`/`unknown` imperative guard stack in `compareTypes` (replaced by
-  declarative per-probe gates).
-- `cleanupPaths`, the merged `package.json` + `--legacy-peer-deps` install,
+  declarative per-probe gates covering `any`/`unknown`/`never`).
+- The merged `package.json` + `--legacy-peer-deps` install,
   `create_dynamic_tsconfig`'s `*-types` path mapping.
-- `ts_check/lib/type-checker.ts`'s comparison core and the endpoint-label
-  verdict round-trip in `analyzer/mod.rs`.
+- `ts_check/lib/type-checker.ts`'s comparison core, the endpoint-label
+  verdict round-trip in `analyzer/mod.rs`, and the analyzer→formatter
+  mismatch-string regex round-trip.
 - The deprecated-but-live `TypeBundler` and its `String.replace` renames.
+- `MonorepoBuilder`'s silent npm fallback and its dead `isRelated`
+  computation (`parseCheckResult` currently marks every check incompatible on
+  any tsc failure — `monorepo-builder.ts:661-673`).
+- `CloudRepoData.bundled_types` and the S3 `types.d.ts` upload flow
+  (replaced by the descriptor + content-addressed surface object; requires
+  the coordinated `carrick-cloud` change).
 
 ### What stays unchanged
 
@@ -277,45 +458,25 @@ with these corrections:
 - The manifest, deterministic alias hashing (`type_manifest.rs`), and
   operation keys.
 - The manifest matcher's normalization and per-protocol matching.
-- The warm sidecar process model and stdio protocol (new actions, same
-  transport).
-- The eval corpus and scorer contract — verdict semantics
-  (`compatible / incompatible / unverifiable`, `None` never read as
-  compatible) are preserved.
+- The warm sidecar process model and stdio transport (new actions, async
+  install handling per Check-phase 12).
+- Verdict semantics for the scorer: `compatible / incompatible /
+  unverifiable`, `None` never read as compatible.
 
-## Risks and open questions
+## Known semantic limits (stated, not hidden)
 
-1. **Declaration emit on real-world repos.** `emitDeclarationOnly` requires
-   the program to be declaration-emittable; repos with type errors or
-   `isolatedDeclarations`-hostile patterns may fail. Mitigation: emit is
-   rooted at the surface entry (only its closure matters); on failure, fall
-   back per-alias to the node-builder path and record it. The self-check gate
-   makes fallback quality visible instead of silent. Node-builder output for
-   complex inferred types can still reference unexported local symbols
-   (`TS4023`-class issues) — those aliases degrade to `structural_fallback`,
-   which is today's behavior, now measured.
-2. **Artifact size.** A declaration tree is larger than one flattened string.
-   Trees are trivially compressible and pruned to the entry's closure; S3
-   payloads stay small relative to `file_results` already stored. Measure in
-   the eval fixtures before committing to limits.
-3. **Private-source leakage.** The tree ships real declaration text (as the
-   expanded bundle already does, structurally). Types-only, no
-   implementation bodies; same trust model as today, but worth stating in
-   the artifact docs.
-4. **tsconfig heterogeneity.** Producer and consumer may compile under
-   different strictness. Decide and document one policy: the checker package
-   compiles probes under `strict: true` (recommended — the check asserts
-   wire-contract compatibility, not either repo's local flags), with stub
-   snapshots retained for diagnosis. `exactOptionalPropertyTypes` mismatches
-   are the sharpest edge; add an eval case.
-5. **pnpm availability in the GitHub Action runtime.** `MonorepoBuilder`
-   already falls back to npm; isolated linking is the property that matters,
-   so document that npm fallback loses per-stub isolation and prefer
-   `corepack`-pinned pnpm in the action image.
-6. **Install cost per check.** Bounded by pruned dep sets + workspace
-   caching; the current path already pays an uncached
-   `npm install --legacy-peer-deps` on every run, so this should be neutral
-   or better warm. Benchmark on `xrepo-corpus-1/2`.
+- **Capture-time flags bake irreversibly.** With `strictNullChecks` off in
+  the producer, `cond ? "a" : null` infers (and emits) `string`; no checker
+  policy can recover the lost `null`. The tsconfig snapshot is diagnostic
+  context, not mitigation.
+- **`exactOptionalPropertyTypes` is not part of `strict`.** The checker
+  compiles probes with `strict: true` and eOPT **off** (explicit decision:
+  wire-level JSON cannot distinguish absent-tolerant from undefined-tolerant
+  consumers reliably enough to justify the false-incompatible rate); the
+  per-stub snapshot records each side's original setting for diagnosis.
+- **Nominal drift** (Check-phase 6) is managed by semver-compatible dedupe,
+  not eliminated: genuinely conflicting majors intentionally verdict
+  incompatible.
 
 ## Future hook: wire-truth vs type-truth
 
@@ -332,7 +493,8 @@ const expected: Serialize<Expected> = serializedSent; // Serialize<T> models JSO
 where `Serialize<T>` maps `Date → string`, respects `toJSON()`, and drops
 functions/`undefined`. Impossible to bolt onto `isAssignableTo` over
 pre-serialized text; a natural follow-up experiment once probes are the
-substrate. Not in scope for the initial migration.
+substrate. It would also dissolve the nominal-drift class (Check-phase 6) for
+serializable payloads. Not in scope for the initial migration.
 
 ## Eval leverage
 
@@ -341,37 +503,105 @@ into independently measurable stages:
 
 1. **Anchor resolution rate** (exists): manifest entries reaching
    `Explicit`/`Implicit`.
-2. **Surface fidelity (new):** stub package self-check pass rate +
-   per-alias `serialization` histogram (`emitted` > `node_builder` >
-   `structural_fallback`). Ratchet this in the Tier-A baseline.
+2. **Surface fidelity (new):** stub self-check pass rate + per-alias
+   `serialization` histogram (`emitted` > `node_builder` >
+   `structural_fallback`). Ratchet in the Tier-A baseline. Note: this is a
+   *new* metric with a different denominator than resolution rate — an alias
+   can be `Explicit` today *and* decay to `any` at check time, so today's
+   resolution rate overstates today's fidelity; do not treat the two as
+   comparable gates.
 3. **Match F1** (exists, unchanged).
 4. **Verdict accuracy** (exists): now attributable — a wrong verdict with a
    clean stage-2 is a checker bug; with a dirty stage-2, a capture bug.
+5. **Definition fidelity** (exists): re-pointed at the surface tree, not
+   deleted.
+
+Honesty note: `eval_tier_a.rs` and `eval_xrepo.rs` are **report-only
+monitors** (their own headers say so), not merge gates. For this migration
+specifically, the landing PR asserts the xrepo verdict rows against a
+checked-in expected baseline so "no new false-compatibles" is mechanical, not
+a human eyeballing a `workflow_dispatch` run.
 
 New eval cases to add with the migration: HTTP request-body direction
-(widening and narrowing, both orders), `exactOptionalPropertyTypes` skew,
-conflicting dependency majors where the *types* differ across versions
-(upgrade the zod 3/4 fixture from dependency-report-only to a
-type-verdict assertion), and a `Date`-serialization pair (expected
-incompatible today; flips when `Serialize<T>` lands).
+(widening and narrowing, both orders — pins the confirmed bug independent of
+the migration); `unknown`- and `never`-decayed sides (pins the probe gates);
+a `declare global` / module-augmentation producer (pins closure inclusion and
+the stub-poisoning rule); a tsconfig-`paths`-aliased producer (pins the
+specifier rewrite); patch-level dependency drift on a private-member class
+(pins semver dedupe); conflicting majors where the *types* differ (upgrade
+the zod 3/4 fixture from dependency-report-only to a type-verdict assertion);
+a `Date`-serialization pair (expected incompatible today; flips when
+`Serialize<T>` lands).
 
 ## Migration plan
 
-The engine seams already exist (`bundled_types` artifact per service; manifest
-enrichment; `ts_check_dir` injection). Order:
+**One release, not three.** An intermediate release that captures the new
+artifact but still checks the old way (or vice versa) leaves the fleet with a
+checker whose input no longer exists. Per the no-parallel-paths policy, the
+new capture, the workspace checker, and the deletion of the old path ship in
+the same change. Since there are no users, there is no compatibility window
+to manage — old artifacts are ignored via the join-time `artifact_version`
+check and the fleet re-scans once.
 
-1. **Wire `emit_surface` v2** in the sidecar: surface entry generation,
-   declaration-emit tree capture, node-builder fallback, self-check gate,
-   `serialization` tagging. Ship `TypeSurface` in `CloudRepoData` (replacing
-   `bundled_types`; bump `cache_version`).
-2. **Wire `build_workspace` + probe generation** from matched pairs; verdict
-   classification by probe filename; ID-keyed verdict join. Run the full
-   xrepo eval against the Tier-A baseline.
-3. **Delete the old path** (flat bundles, padding, expander-as-primary,
-   `ts_check` comparator, label re-parse) in the same change that flips the
-   default — no parallel code paths, per repo policy.
+The incremental development happens **pre-merge in the offline harness**:
+`LocalDirStorage` two-phase runs the entire pipeline against
+`xrepo-corpus-1/2` with zero fleet exposure. Sequence of work (all on one
+branch, eval-checked at each step, merged together):
 
-Each step is eval-gated: step 1 lands when surface fidelity ≥ current
-resolution rate on the corpus; step 2/3 land when verdict accuracy is ≥
-baseline with no new false-compatibles (the scorer's §7 guard already fails
-loud if compat data goes silently absent).
+1. Capture: surface entry generation with the anchor guards, `noCheck`
+   declaration-emit tree, specifier rewrite pass, augmentation inclusion,
+   `SymbolTracker`-backed node-builder fallback, self-check gate,
+   `serialization` tagging. Measure surface fidelity on the corpus.
+2. Check: workspace build in scratch space (vendored pnpm, sanitized
+   service-keyed stubs, semver dedupe overrides), probe generation with the
+   full gate set and the `(protocol, type_kind)` direction table,
+   diagnostic-code classification with stub-poisoning, scrub pass, ID-keyed
+   structured verdicts. Measure verdict accuracy vs the checked-in baseline.
+3. Re-point `resolve_per_endpoint_definitions` at the surface tree; swap the
+   formatter to structured verdict payloads; delete the old path.
+4. Coordinated `carrick-cloud` change (descriptor storage, presigned surface
+   GETs, content-addressed objects) lands first on the cloud side — it is a
+   prerequisite, and the plan explicitly budgets it rather than pretending
+   this is scanner-only work.
+5. Release; trigger main-branch re-scans of indexed repos (cloud-side
+   nudge) so the fleet converges without waiting for organic pushes.
+
+Landing preconditions, each with a number attached: surface fidelity and
+verdict accuracy vs the checked-in corpus baseline; cold-install wall-clock
+and peak RSS on the dep-heavy fixture.
+
+## Review record (2026-07)
+
+The proposal was probed by three adversarial passes before landing; material
+findings and their disposition:
+
+- **Compiler mechanics** (claims tested against a real tsc): the two
+  load-bearing bets — tsc as serializer, tsc as judge — **held**, and
+  `--noCheck` declaration emit strengthened the capture story. Refuted as
+  originally drafted and fixed above: `IsAny`-only probe gates missed
+  `unknown`/`never` (reintroducing the design's own motivating false-positive
+  class); global augmentations broke both closure emit and filename-only
+  diagnostic attribution; `paths`-mapped specifiers ship verbatim and dangle
+  (rewrite pass now required); `cleanupPaths` moved from the delete list to
+  an upgraded scrub component; per-stub isolation's nominal false-positives
+  on identical/patch-drifted classes (semver dedupe added); the
+  `ReturnType<typeof import(...)>` form's unexported/overload/generic failure
+  modes (capture guards added); silent node-builder failures
+  (`SymbolTracker` now required).
+- **Codebase fact-check**: every file/line claim verified; the HTTP
+  request-direction bug **confirmed real and reachable**; found hidden
+  consumers the delete list missed — `resolve_per_endpoint_definitions` /
+  MCP `get_endpoint_types` and the definition-fidelity eval metric (now
+  re-pointed, not deleted), the `aws_storage` upload contract, and the
+  analyzer→formatter mismatch-string round-trip (now replaced with
+  structured verdicts).
+- **Migration/ops**: the artifact rides the inline Lambda metadata blob, not
+  S3 (storage redesigned to content-addressed objects + lazy fetch); the
+  original 3-step migration left a checker-less shipped state (collapsed to
+  one release + offline pre-work); `cache_version` doesn't gate cross-repo
+  joins (explicit `artifact_version` added); no pnpm exists in the composite
+  action and corepack is a Node-25 time bomb (vendored via sidecar
+  devDependencies; silent npm fallback deleted); workspace relocated to
+  scratch space; per-stub install-failure isolation; async install protocol
+  for the stdio transport; the cited eval "gates" are report-only monitors
+  (baseline assertion added for the landing PR).
