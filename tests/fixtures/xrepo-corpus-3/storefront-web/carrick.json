@@ -1,0 +1,3 @@
+{
+  "internalEnvVars": ["NEXT_PUBLIC_ORDERS_API_URL", "NEXT_PUBLIC_CATALOG_URL"]
+}

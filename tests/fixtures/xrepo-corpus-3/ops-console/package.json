@@ -1,0 +1,10 @@
+{
+  "name": "ops-console",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "graphql-request": "6.1.0",
+    "graphql-tag": "2.12.6",
+    "nats": "2.28.2"
+  }
+}

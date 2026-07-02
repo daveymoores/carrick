@@ -1,0 +1,44 @@
+{
+  "endpoints": [],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/api/v2/products/:param/variants/:param",
+      "path_contains": "/variants/",
+      "import_source": null,
+      "primary_type_symbol": "VariantView",
+      "resolved_type": "{ id: string; sku: string; price: { amount: number; currency: string; }; inStock: boolean; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "pubsub_operations": [
+    {
+      "role": "producer",
+      "service": "fulfillment-worker",
+      "key": "pubsub|shipments.dispatch",
+      "topic": "shipments.dispatch",
+      "broker": "bullmq",
+      "side": "subscriber",
+      "source": "src/worker.ts",
+      "primary_type_symbol": "DispatchJob",
+      "resolved_type": "{ orderId: string; warehouseId: string; dispatchAfter: Date; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "consumer",
+      "service": "fulfillment-worker",
+      "key": "pubsub|orders.status.changed",
+      "topic": "orders.status.changed",
+      "broker": "nats",
+      "side": "publisher",
+      "source": "src/status.publisher.ts",
+      "primary_type_symbol": "OrderStatusChanged",
+      "resolved_type": "{ orderId: string; status: \"picked\" | \"dispatched\" | \"delivered\"; occurredAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": []
+}

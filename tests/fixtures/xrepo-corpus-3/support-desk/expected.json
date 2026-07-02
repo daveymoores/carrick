@@ -1,0 +1,68 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/tickets/:id",
+      "owner": "findOne",
+      "primary_type_symbol": null,
+      "resolved_type": "{ id: string; subject: string; ageDays: number; }",
+      "type_state": "Implicit",
+      "tier": "capability"
+    }
+  ],
+  "calls": [],
+  "graphql_operations": [
+    {
+      "role": "producer",
+      "service": "support-desk",
+      "key": "graphql|query|ticket",
+      "kind": "query",
+      "field": "ticket",
+      "source": "src/schema.graphql",
+      "primary_type_symbol": "Ticket",
+      "resolved_type": "{ id: string; subject: string; status: \"OPEN\" | \"ESCALATED\" | \"CLOSED\"; priority: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "producer",
+      "service": "support-desk",
+      "key": "graphql|mutation|escalateTicket",
+      "kind": "mutation",
+      "field": "escalateTicket",
+      "source": "src/schema.graphql",
+      "primary_type_symbol": "EscalationResult!",
+      "resolved_type": "{ ticketId: string; escalatedAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "producer",
+      "service": "support-desk",
+      "key": "graphql|subscription|ticketUpdated",
+      "kind": "subscription",
+      "field": "ticketUpdated",
+      "source": "src/schema.graphql",
+      "primary_type_symbol": "Ticket!",
+      "resolved_type": "{ id: string; subject: string; status: \"OPEN\" | \"ESCALATED\" | \"CLOSED\"; priority: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "socket_events": [
+    {
+      "role": "producer",
+      "service": "support-desk",
+      "key": "socket|CLIENT->SERVER|support:message",
+      "event": "support:message",
+      "direction": "CLIENT->SERVER",
+      "side": "listener",
+      "source": "src/support.gateway.ts",
+      "primary_type_symbol": "SupportMessage",
+      "resolved_type": "{ ticketId: string; body: string; sentAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": []
+}

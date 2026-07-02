@@ -251,8 +251,12 @@ struct ExpNonHttpOp {
 
 #[derive(Debug, Deserialize)]
 struct ExpMustNotEmit {
-    /// `"endpoint"` or `"call"` — which projection set this decoy would leak into.
-    #[allow(dead_code)]
+    /// `"endpoint"` or `"call"` — which projection set this decoy would leak
+    /// into. The set matters when a decoy shares `(method, path)` with a legit
+    /// op on the OTHER side (corpus-3's intra-repo self-call decoy is a `call`
+    /// whose path is also a labelled endpoint). Other values (corpus-2's
+    /// non-HTTP `"pubsub"` decoys) match neither HTTP set — documented, not
+    /// yet scoreable.
     kind: String,
     /// `"*"` matches any method.
     method: String,
@@ -627,16 +631,24 @@ fn fuzzy_call_match(ec: &ExpCall, ac: &EvalOp) -> bool {
 }
 
 /// Decoy leakage (contract §6 row 3): the count of actual ops (endpoints +
-/// calls) whose normalized `(method, path)` equals a `_must_not_emit` entry.
-/// `method: "*"` matches any method. Reported separately, not tier-partitioned
-/// (a leak is a leak regardless of which tier the surrounding labels are).
+/// calls) whose normalized `(method, path)` equals a `_must_not_emit` entry
+/// of the SAME projection set (`kind: "endpoint"` matches only endpoints,
+/// `kind: "call"` only calls) — so a call-decoy sharing a path with a legit
+/// endpoint never flags the endpoint. `method: "*"` matches any method.
+/// Reported separately, not tier-partitioned (a leak is a leak regardless of
+/// which tier the surrounding labels are).
 fn score_decoy_leak(repo_expected: &[(String, ExpectedRepo)], proj: &EvalProjection) -> usize {
     let decoys: Vec<&ExpMustNotEmit> = repo_expected
         .iter()
         .flat_map(|(_r, e)| e.must_not_emit.iter())
         .collect();
     let mut leaks = 0usize;
-    for op in proj.endpoints.iter().chain(proj.calls.iter()) {
+    for (op, set_kind) in proj
+        .endpoints
+        .iter()
+        .map(|o| (o, "endpoint"))
+        .chain(proj.calls.iter().map(|o| (o, "call")))
+    {
         let (Some(m), Some(p)) = (op.method.as_deref(), op.path.as_deref()) else {
             // Non-HTTP ops have no (method, path); the corpus decoys are all
             // HTTP-keyed, so a non-HTTP op can never match one.
@@ -645,8 +657,9 @@ fn score_decoy_leak(repo_expected: &[(String, ExpectedRepo)], proj: &EvalProject
         let m_up = m.to_uppercase();
         let p_norm = norm_path(p);
         let is_leak = decoys.iter().any(|d| {
+            let kind_ok = d.kind == set_kind;
             let method_ok = d.method == "*" || d.method.eq_ignore_ascii_case(&m_up);
-            method_ok && norm_path(&d.path) == p_norm
+            kind_ok && method_ok && norm_path(&d.path) == p_norm
         });
         if is_leak {
             leaks += 1;
@@ -2813,6 +2826,123 @@ mod scoring_tests {
         assert_eq!(n_decoys, 4, "4 _must_not_emit decoys across the corpus");
 
         // Dependency conflict: one cross-repo zod 3.x vs 4.x, critical.
+        assert_eq!(expected_output.dependency_conflicts.len(), 1);
+        let dc = &expected_output.dependency_conflicts[0];
+        assert_eq!(dc.package, "zod");
+        assert_eq!(dc.severity, "critical");
+    }
+
+    #[test]
+    fn decoy_leak_respects_projection_set_kind() {
+        // Corpus-3's intra-repo self-call decoy shares (method, path) with the
+        // repo's legit endpoint. The `kind: "call"` label must flag only a
+        // call-set emission — never the endpoint-set one.
+        let repos = vec![(
+            "inventory-svc".to_string(),
+            serde_json::from_value::<ExpectedRepo>(serde_json::json!({
+                "_must_not_emit": [
+                    { "kind": "call", "method": "GET", "path": "/warehouses/:warehouseId/stock/:sku" }
+                ]
+            }))
+            .unwrap(),
+        )];
+        let mut proj = empty_proj();
+        // The legit producer endpoint on the same (method, path): clean.
+        proj.endpoints
+            .push(http_ep("GET", "/warehouses/:warehouseId/stock/:sku"));
+        assert_eq!(score_decoy_leak(&repos, &proj), 0);
+        // The self-call emitted into the call set: a leak.
+        proj.calls
+            .push(http_ep("GET", "/warehouses/:wid/stock/:sku"));
+        assert_eq!(score_decoy_leak(&repos, &proj), 1);
+    }
+
+    #[test]
+    fn corpus3_has_the_expected_protocol_and_edge_shape() {
+        // Answer-key-drift guard for xrepo-corpus-3; skip for other corpora.
+        if corpus_name() != "xrepo-corpus-3" {
+            return;
+        }
+        let corpus = corpus_dir();
+        let repos = discover_repos(&corpus);
+        assert_eq!(repos.len(), 7, "the 7 top-level corpus repos");
+        let repo_expected = load_repo_expected(&repos);
+        let expected_output = load_expected_output(&corpus);
+
+        // 12 matched edges: 4 http + 5 pubsub + 2 graphql + 1 socket, all capability.
+        assert_eq!(expected_output.matches.len(), 12);
+        let n_proto = |p: &str| {
+            expected_output
+                .matches
+                .iter()
+                .filter(|m| m.producer_key.starts_with(&format!("{p}|")))
+                .count()
+        };
+        assert_eq!(n_proto("http"), 4, "4 HTTP edges");
+        assert_eq!(n_proto("pubsub"), 5, "5 pub/sub edges");
+        assert_eq!(n_proto("graphql"), 2, "2 GraphQL edges");
+        assert_eq!(n_proto("socket"), 1, "1 socket edge");
+        assert!(
+            expected_output
+                .matches
+                .iter()
+                .all(|m| m.tier == TIER_CAPABILITY),
+            "every corpus-3 edge is capability tier"
+        );
+
+        // 4 incompatible edges (null-vs-optional, array-vs-scalar, Date-vs-string,
+        // missing-required-field) and a live §7 guard on every edge.
+        let incompatible = expected_output
+            .matches
+            .iter()
+            .filter(|m| m.type_compatible == Some(false))
+            .count();
+        assert_eq!(incompatible, 4, "4 deliberately-incompatible edges");
+        assert!(
+            expected_output
+                .matches
+                .iter()
+                .all(|m| m.type_compatible.is_some()),
+            "every corpus edge labels a compat verdict"
+        );
+
+        // Fan-out: two producers (subscriber repos) on one pubsub key.
+        let fanout = expected_output
+            .matches
+            .iter()
+            .filter(|m| m.producer_key == "pubsub|catalog.price.updated")
+            .count();
+        assert_eq!(
+            fanout, 2,
+            "catalog.price.updated fans out to two subscribers"
+        );
+
+        // 7 orphans: 5 producers + 2 consumers; exactly one roadmap (SQS digest).
+        assert_eq!(expected_output.orphans.len(), 7);
+        let roadmap_orphans: Vec<_> = expected_output
+            .orphans
+            .iter()
+            .filter(|o| o.tier == TIER_ROADMAP)
+            .collect();
+        assert_eq!(roadmap_orphans.len(), 1);
+        assert_eq!(roadmap_orphans[0].key, "pubsub|notifications.digest");
+
+        // The Implicit inference case (support-desk GET /tickets/:id).
+        let any_implicit = repo_expected.iter().any(|(_r, e)| {
+            e.endpoints
+                .iter()
+                .any(|ep| ep.type_state.as_deref() == Some("Implicit"))
+        });
+        assert!(any_implicit, "corpus-3 keeps an Implicit type_state case");
+
+        // 3 formal HTTP-keyed decoys (supertest, msw, self-call).
+        let n_decoys: usize = repo_expected
+            .iter()
+            .map(|(_r, e)| e.must_not_emit.len())
+            .sum();
+        assert_eq!(n_decoys, 3, "3 _must_not_emit decoys across the corpus");
+
+        // Dependency conflict: zod 3.23.0 vs 4.0.0, critical, used in code.
         assert_eq!(expected_output.dependency_conflicts.len(), 1);
         let dc = &expected_output.dependency_conflicts[0];
         assert_eq!(dc.package, "zod");

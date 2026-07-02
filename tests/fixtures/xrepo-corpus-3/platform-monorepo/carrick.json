@@ -1,0 +1,9 @@
+{
+  "services": [
+    {
+      "name": "catalog-api",
+      "directory": "packages/catalog-api",
+      "tsconfig": "tsconfig.json"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "baseUrl": ".",
+    "paths": {
+      "@meridian/contracts": ["../contracts/src/index.ts"]
+    }
+  },
+  "include": ["src", "test", "typings", "../contracts/src"]
+}

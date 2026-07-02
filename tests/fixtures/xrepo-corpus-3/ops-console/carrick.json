@@ -1,0 +1,3 @@
+{
+  "internalEnvVars": ["ORDERS_API_URL", "CATALOG_URL"]
+}

@@ -1,0 +1,29 @@
+type Ticket {
+  id: ID!
+  subject: String!
+  status: TicketStatus!
+  priority: Int!
+}
+
+enum TicketStatus {
+  OPEN
+  ESCALATED
+  CLOSED
+}
+
+type EscalationResult {
+  ticketId: ID!
+  escalatedAt: String!
+}
+
+type Query {
+  ticket(id: ID!): Ticket
+}
+
+type Mutation {
+  escalateTicket(id: ID!, reason: String!): EscalationResult!
+}
+
+type Subscription {
+  ticketUpdated(id: ID!): Ticket!
+}

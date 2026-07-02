@@ -1,0 +1,152 @@
+{
+  "matches": [
+    {
+      "producer_repo": "catalog-api",
+      "producer_key": "http|GET|/api/v2/products/:param/variants/:param",
+      "consumer_repo": "fulfillment-worker",
+      "consumer_key": "http|GET|/api/v2/products/:param/variants/:param",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "catalog-api",
+      "producer_key": "http|PATCH|/api/v2/products/:param",
+      "consumer_repo": "ops-console",
+      "consumer_key": "http|PATCH|/api/v2/products/:param",
+      "type_compatible": false,
+      "mismatch_reason": "producer Product.price is `{ amount; currency } | null` but consumer ProductRecord.price is optional `?: { amount; currency }` (null is not undefined)",
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "orders-api",
+      "producer_key": "http|POST|/orders",
+      "consumer_repo": "storefront-web",
+      "consumer_key": "http|POST|/orders",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "orders-api",
+      "producer_key": "http|GET|/orders/:param/timeline",
+      "consumer_repo": "ops-console",
+      "consumer_key": "http|GET|/orders/:param/timeline",
+      "type_compatible": false,
+      "mismatch_reason": "producer returns TimelineEvent[] but consumer TimelineEntry types a single object (array vs scalar)",
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "inventory-svc",
+      "producer_key": "pubsub|inventory.stock.adjust",
+      "consumer_repo": "orders-api",
+      "consumer_key": "pubsub|inventory.stock.adjust",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "fulfillment-worker",
+      "producer_key": "pubsub|shipments.dispatch",
+      "consumer_repo": "orders-api",
+      "consumer_key": "pubsub|shipments.dispatch",
+      "type_compatible": false,
+      "mismatch_reason": "subscriber DispatchJob.dispatchAfter is Date but publisher DispatchRequest sends an ISO string (date serialization)",
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "orders-api",
+      "producer_key": "pubsub|orders.status.changed",
+      "consumer_repo": "fulfillment-worker",
+      "consumer_key": "pubsub|orders.status.changed",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "inventory-svc",
+      "producer_key": "pubsub|catalog.price.updated",
+      "consumer_repo": "catalog-api",
+      "consumer_key": "pubsub|catalog.price.updated",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "ops-console",
+      "producer_key": "pubsub|catalog.price.updated",
+      "consumer_repo": "catalog-api",
+      "consumer_key": "pubsub|catalog.price.updated",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "pubsub",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "support-desk",
+      "producer_key": "graphql|query|ticket",
+      "consumer_repo": "storefront-web",
+      "consumer_key": "graphql|query|ticket",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "graphql",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "support-desk",
+      "producer_key": "graphql|mutation|escalateTicket",
+      "consumer_repo": "ops-console",
+      "consumer_key": "graphql|mutation|escalateTicket",
+      "type_compatible": false,
+      "mismatch_reason": "consumer EscalationReceipt requires assignee: string; producer EscalationResult has no such field (missing required field)",
+      "protocol": "graphql",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "support-desk",
+      "producer_key": "socket|CLIENT->SERVER|support:message",
+      "consumer_repo": "storefront-web",
+      "consumer_key": "socket|CLIENT->SERVER|support:message",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "socket",
+      "tier": "capability"
+    }
+  ],
+  "orphans": [
+    { "repo": "catalog-api", "side": "producer", "key": "http|GET|/api/v2/products/:param", "tier": "capability" },
+    { "repo": "catalog-api", "side": "producer", "key": "http|DELETE|/api/v2/products/:param", "tier": "capability" },
+    { "repo": "inventory-svc", "side": "producer", "key": "http|GET|/warehouses/:param/stock/:param", "tier": "capability" },
+    { "repo": "support-desk", "side": "producer", "key": "http|GET|/tickets/:param", "tier": "capability" },
+    { "repo": "support-desk", "side": "producer", "key": "graphql|subscription|ticketUpdated", "tier": "capability" },
+    { "repo": "storefront-web", "side": "consumer", "key": "http|GET|/api/v1/products/:param", "tier": "capability" },
+    { "repo": "orders-api", "side": "consumer", "key": "pubsub|notifications.digest", "tier": "roadmap" }
+  ],
+  "dependency_conflicts": [
+    {
+      "package": "zod",
+      "versions": ["3.23.0", "4.0.0"],
+      "severity": "critical",
+      "tier": "capability"
+    }
+  ],
+  "summary": {
+    "total_repos": 7,
+    "producers": 17,
+    "consumers": 13,
+    "matched_edges": 12,
+    "incompatible_edges": 4,
+    "orphan_producers": 5,
+    "orphan_consumers": 2,
+    "decoys_must_not_emit": 3,
+    "matched_edges_by_protocol": { "http": 4, "pubsub": 5, "graphql": 2, "socket": 1 }
+  }
+}
