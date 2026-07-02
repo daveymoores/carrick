@@ -2025,13 +2025,19 @@ fn load_packages_for_service(
 ) -> Result<Packages, Box<dyn std::error::Error>> {
     let ignore_patterns = service_ignore_patterns(service);
     let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
-    if let Some(package_path) = package_json_path {
+    let mut packages = if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
         Packages::new(vec![package_path.clone()])
-            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e).into())
+            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e))?
     } else {
-        Ok(Packages::default())
-    }
+        Packages::default()
+    };
+    // Names of every package.json in the WHOLE repo tree (not just this
+    // service's): a workspace member like `packages/contracts` is not a
+    // service, but a dependency on it is internal, not a registry package.
+    packages.internal_names =
+        crate::packages::collect_internal_package_names(std::path::Path::new(repo_path));
+    Ok(packages)
 }
 
 /// Resolve per-endpoint type definitions using the sidecar's compiler.
@@ -2884,22 +2890,21 @@ fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
     }
 }
 
-/// Recreate package.json and tsconfig.json in the output directory
-fn recreate_package_and_tsconfig(
-    output_dir: &std::path::Path,
+/// Dependencies for the synthetic `carrick-type-check` package.json: the
+/// merged repo dependencies with (a) unusable versions dropped (empty, the
+/// literal "undefined", or digit-less — npm turns `typescript@undefined` into
+/// a hard ERESOLVE that aborts the whole cross-repo type pass), and (b)
+/// packages the scanned repos declare THEMSELVES dropped — a workspace-internal
+/// package (a monorepo's `@meridian/contracts`) resolves via the workspace
+/// link, not the registry, so `npm install` 404s and (per the #149 fail-loud)
+/// would abort type checking. Nothing is lost by dropping it: the bundle
+/// carries its shapes structurally inlined.
+fn synthetic_type_check_dependencies(
     packages: &Packages,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Create package.json
-    let package_json_path = output_dir.join("package.json");
-    let package_dependencies = packages.get_dependencies();
-
-    // Convert PackageInfo objects to simple version strings for npm. Drop
-    // entries whose version is unusable (empty, the literal "undefined", or a
-    // value with no digit) — a merged repo can carry these, and npm turns
-    // `typescript@undefined` into a hard ERESOLVE that aborts the whole
-    // cross-repo type pass.
+) -> std::collections::HashMap<String, String> {
+    let internal = packages.internal_package_names();
     let mut dependencies = std::collections::HashMap::new();
-    for (name, package_info) in package_dependencies {
+    for (name, package_info) in packages.get_dependencies() {
         let version = package_info.version.trim();
         if version.is_empty()
             || version == "undefined"
@@ -2908,8 +2913,26 @@ fn recreate_package_and_tsconfig(
             debug!("Skipping dependency {name} with unusable version {version:?}");
             continue;
         }
+        if internal.contains(name) {
+            debug!(
+                "Skipping workspace-internal dependency {name} (declared by a scanned \
+                 package.json; not registry-resolvable)"
+            );
+            continue;
+        }
         dependencies.insert(name.clone(), version.to_string());
     }
+    dependencies
+}
+
+/// Recreate package.json and tsconfig.json in the output directory
+fn recreate_package_and_tsconfig(
+    output_dir: &std::path::Path,
+    packages: &Packages,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Create package.json
+    let package_json_path = output_dir.join("package.json");
+    let mut dependencies = synthetic_type_check_dependencies(packages);
 
     // Pin the TypeScript toolchain we control for this synthetic type-check
     // package. Overwrite (not insert-if-missing): a merged repo may pin a
@@ -3010,6 +3033,87 @@ mod tests {
     use crate::services::type_sidecar::{InferredType, SourceLocation};
     use crate::visitor::{OwnerType, TypeReference};
     use std::path::PathBuf;
+
+    #[test]
+    fn synthetic_type_check_deps_exclude_workspace_internal_packages() {
+        // catalog-api depends on the workspace package @meridian/contracts.
+        // Installing that from the registry 404s and (fail-loud #149) aborts
+        // the whole type pass — the synthetic package must exclude any name a
+        // scanned package.json declares itself, while keeping real deps from
+        // both sides of the workspace.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("@meridian/contracts".to_string()),
+            version: Some("0.1.0".to_string()),
+            dependencies: HashMap::from([("zod".to_string(), "3.23.0".to_string())]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+        });
+        packages.package_jsons.push(PackageJson {
+            name: Some("catalog-api".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                ("@meridian/contracts".to_string(), "0.1.0".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+        });
+        packages
+            .source_paths
+            .push(PathBuf::from("packages/contracts/package.json"));
+        packages
+            .source_paths
+            .push(PathBuf::from("packages/catalog-api/package.json"));
+        packages.resolve_dependencies();
+
+        let deps = synthetic_type_check_dependencies(&packages);
+        assert!(
+            !deps.contains_key("@meridian/contracts"),
+            "workspace-internal package must not be npm-installed"
+        );
+        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
+        assert_eq!(deps.get("zod").map(String::as_str), Some("3.23.0"));
+    }
+
+    #[test]
+    fn synthetic_type_check_deps_exclude_tree_walked_internal_names() {
+        // Production shape (the corpus-3 baseline failure): only the
+        // SERVICE's package.json is loaded into package_jsons — a workspace
+        // member like packages/contracts never is — so the exclusion must
+        // also honour the tree-walked internal_names set.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("catalog-api".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                ("@meridian/contracts".to_string(), "0.1.0".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+        });
+        packages
+            .source_paths
+            .push(PathBuf::from("packages/catalog-api/package.json"));
+        packages.resolve_dependencies();
+        packages
+            .internal_names
+            .insert("@meridian/contracts".to_string());
+
+        let deps = synthetic_type_check_dependencies(&packages);
+        assert!(
+            !deps.contains_key("@meridian/contracts"),
+            "tree-walked internal name must not be npm-installed"
+        );
+        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
+    }
 
     #[test]
     fn test_ast_stripping_removes_nodes() {
