@@ -1,0 +1,55 @@
+{
+  "endpoints": [],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/orders/:param/timeline",
+      "path_contains": "/timeline",
+      "import_source": null,
+      "primary_type_symbol": "TimelineEntry",
+      "resolved_type": "{ at: string; status: string; note?: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v2/products/:param",
+      "path_contains": "/api/v2/products/",
+      "import_source": null,
+      "primary_type_symbol": "ProductRecord",
+      "resolved_type": "{ id: string; name: string; description: string; price?: { amount: number; currency: string; }; tags: string[]; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "graphql_operations": [
+    {
+      "role": "consumer",
+      "service": "ops-console",
+      "key": "graphql|mutation|escalateTicket",
+      "kind": "mutation",
+      "field": "escalateTicket",
+      "source": "src/gql.ts",
+      "primary_type_symbol": "EscalationReceipt",
+      "resolved_type": "{ ticketId: string; assignee: string; escalatedAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "pubsub_operations": [
+    {
+      "role": "producer",
+      "service": "ops-console",
+      "key": "pubsub|catalog.price.updated",
+      "topic": "catalog.price.updated",
+      "broker": "nats",
+      "side": "subscriber",
+      "source": "src/price.watch.ts",
+      "primary_type_symbol": "PriceAlert",
+      "resolved_type": "{ productId: string; price: { amount: number; currency: string; }; effectiveAt?: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": []
+}

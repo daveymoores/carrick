@@ -1,0 +1,57 @@
+{
+  "endpoints": [],
+  "calls": [
+    {
+      "method": "POST",
+      "path": "/orders",
+      "path_contains": "/orders",
+      "import_source": null,
+      "primary_type_symbol": "OrderAck",
+      "resolved_type": "{ orderId: string; status: \"pending\" | \"confirmed\"; total: { amount: number; currency: string; }; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/products/:param",
+      "path_contains": "/api/v1/products/",
+      "import_source": null,
+      "primary_type_symbol": "LegacyProduct",
+      "resolved_type": "{ id: string; name: string; priceCents: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "graphql_operations": [
+    {
+      "role": "consumer",
+      "service": "storefront-web",
+      "key": "graphql|query|ticket",
+      "kind": "query",
+      "field": "ticket",
+      "source": "lib/support.ts",
+      "primary_type_symbol": "TicketView",
+      "resolved_type": "{ id: string; subject: string; status: \"OPEN\" | \"ESCALATED\" | \"CLOSED\"; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "socket_events": [
+    {
+      "role": "consumer",
+      "service": "storefront-web",
+      "key": "socket|CLIENT->SERVER|support:message",
+      "event": "support:message",
+      "direction": "CLIENT->SERVER",
+      "side": "emitter",
+      "source": "lib/supportSocket.ts",
+      "primary_type_symbol": "SupportMessage",
+      "resolved_type": "{ ticketId: string; body: string; sentAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": [
+    { "kind": "endpoint", "method": "GET", "path": "/api/v2/promotions/:id" }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "support-desk",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@nestjs/common": "10.3.10",
+    "graphql": "16.9.0",
+    "socket.io": "4.7.5"
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/orders",
+      "owner": "server",
+      "primary_type_symbol": "OrderCreated",
+      "resolved_type": "{ orderId: string; status: \"pending\" | \"confirmed\"; total: { amount: number; currency: string; }; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/orders/:orderId/timeline",
+      "owner": "server",
+      "primary_type_symbol": "TimelineEvent",
+      "resolved_type": "{ at: string; status: string; note?: string; }[]",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "calls": [],
+  "pubsub_operations": [
+    {
+      "role": "consumer",
+      "service": "orders-api",
+      "key": "pubsub|inventory.stock.adjust",
+      "topic": "inventory.stock.adjust",
+      "broker": "rabbitmq",
+      "side": "publisher",
+      "source": "src/mq/stock.publisher.ts",
+      "primary_type_symbol": "StockAdjustCommand",
+      "resolved_type": "{ sku: string; delta: number; reason: string; orderId: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "consumer",
+      "service": "orders-api",
+      "key": "pubsub|shipments.dispatch",
+      "topic": "shipments.dispatch",
+      "broker": "bullmq",
+      "side": "publisher",
+      "source": "src/mq/dispatch.publisher.ts",
+      "primary_type_symbol": "DispatchRequest",
+      "resolved_type": "{ orderId: string; warehouseId: string; dispatchAfter: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "producer",
+      "service": "orders-api",
+      "key": "pubsub|orders.status.changed",
+      "topic": "orders.status.changed",
+      "broker": "kafka",
+      "side": "subscriber",
+      "source": "src/mq/status.subscriber.ts",
+      "primary_type_symbol": "OrderStatusChanged",
+      "resolved_type": "{ orderId: string; status: \"picked\" | \"dispatched\" | \"delivered\"; occurredAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "consumer",
+      "service": "orders-api",
+      "key": "pubsub|notifications.digest",
+      "topic": "notifications.digest",
+      "broker": "sqs",
+      "side": "publisher",
+      "source": "src/mq/digest.publisher.ts",
+      "primary_type_symbol": "OrderDigest",
+      "resolved_type": "{ date: string; orderCount: number; totalAmount: number; }",
+      "type_state": "Explicit",
+      "tier": "roadmap"
+    }
+  ],
+  "_must_not_emit": []
+}

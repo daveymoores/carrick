@@ -1,0 +1,59 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/api/v2/products/:id",
+      "owner": "productsRouter",
+      "primary_type_symbol": "Product",
+      "resolved_type": "{ id: string; name: string; description: string; price: null | { amount: number; currency: string; }; tags: string[]; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v2/products/:id/variants/:variantId",
+      "owner": "productsRouter",
+      "primary_type_symbol": "VariantDetail",
+      "resolved_type": "{ id: string; productId: string; sku: string; price: { amount: number; currency: string; }; inStock: boolean; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v2/products/:id",
+      "owner": "productsRouter",
+      "primary_type_symbol": "Product",
+      "resolved_type": "{ id: string; name: string; description: string; price: null | { amount: number; currency: string; }; tags: string[]; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v2/products/:id",
+      "owner": "productsRouter",
+      "primary_type_symbol": null,
+      "resolved_type": null,
+      "type_state": null,
+      "tier": "capability"
+    }
+  ],
+  "calls": [],
+  "pubsub_operations": [
+    {
+      "role": "consumer",
+      "service": "catalog-api",
+      "key": "pubsub|catalog.price.updated",
+      "topic": "catalog.price.updated",
+      "broker": "nats",
+      "side": "publisher",
+      "source": "packages/catalog-api/src/pricing.publisher.ts",
+      "primary_type_symbol": "PriceUpdated",
+      "resolved_type": "{ productId: string; price: { amount: number; currency: string; }; effectiveAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": [
+    { "kind": "call", "method": "GET", "path": "/api/v2/health" }
+  ]
+}

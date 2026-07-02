@@ -1,0 +1,45 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/warehouses/:warehouseId/stock/:sku",
+      "owner": "app",
+      "primary_type_symbol": "StockLevel",
+      "resolved_type": "{ sku: string; warehouseId: string; onHand: number; reserved: number; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "calls": [],
+  "pubsub_operations": [
+    {
+      "role": "producer",
+      "service": "inventory-svc",
+      "key": "pubsub|inventory.stock.adjust",
+      "topic": "inventory.stock.adjust",
+      "broker": "rabbitmq",
+      "side": "subscriber",
+      "source": "src/mq/stock.subscriber.ts",
+      "primary_type_symbol": "StockAdjustCommand",
+      "resolved_type": "{ sku: string; delta: number; reason: string; orderId: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "role": "producer",
+      "service": "inventory-svc",
+      "key": "pubsub|catalog.price.updated",
+      "topic": "catalog.price.updated",
+      "broker": "nats",
+      "side": "subscriber",
+      "source": "src/mq/price.subscriber.ts",
+      "primary_type_symbol": "PriceUpdatedEvent",
+      "resolved_type": "{ productId: string; price: { amount: number; currency: string; }; effectiveAt: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    }
+  ],
+  "_must_not_emit": [
+    { "kind": "call", "method": "GET", "path": "/warehouses/:warehouseId/stock/:sku" }
+  ]
+}
