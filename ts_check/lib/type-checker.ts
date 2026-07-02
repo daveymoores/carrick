@@ -138,6 +138,13 @@ export class TypeCompatibilityChecker {
     // Use provided project or fall back to instance project
     const project = typesProject || this.project;
 
+    // Aliases whose declaration references an unresolved symbol (a library type
+    // kept by name with no declaration in the flat bundle — imports are stripped
+    // cross-repo). Such a reference makes a NESTED field dangle to `any`, which
+    // the top-level any/unknown guard in compareTypes cannot see, so a definite
+    // verdict over it would be a false-compatible. Used as a safety net below.
+    const danglingAliases = this.computeDanglingAliases(project);
+
     // Match endpoints using the manifest matcher
     const { matches, orphanedProducers, orphanedConsumers } =
       this.manifestMatcher.matchEndpoints(producerManifest, consumerManifest);
@@ -224,7 +231,26 @@ export class TypeCompatibilityChecker {
           consumerTypeInfo?.type ?? this.findTypeInProject(project, match.consumer.type_alias)
         );
 
-        if (outcome.kind === "incompatible") {
+        const producerDangling = danglingAliases.has(match.producer.type_alias);
+        const consumerDangling = danglingAliases.has(match.consumer.type_alias);
+        if (outcome.kind !== "unverifiable" && (producerDangling || consumerDangling)) {
+          // Dangling-reference safety net (version-conflict / kept-by-name library
+          // types). compareTypes returned a definite verdict, but one side references
+          // an unresolved symbol so a nested field dangled to `any` — the verdict is
+          // untrustworthy (the false-compatible measured on the hard-types fixture).
+          // Abstain instead of asserting compatible/incompatible.
+          const which = producerDangling ? "producer" : "consumer";
+          result.unknownPairs.push({
+            endpoint,
+            reason: `${which} type references an unresolved symbol (a library type kept by name with no declaration in the bundle) — cannot verify`,
+            producerTypeAlias: match.producer.type_alias,
+            consumerTypeAlias: match.consumer.type_alias,
+            producerLocation: this.formatEntryLocation(match.producer),
+            consumerLocation: this.formatEntryLocation(match.consumer),
+            producerEvidence: match.producer.evidence,
+            consumerEvidence: match.consumer.evidence,
+          });
+        } else if (outcome.kind === "incompatible") {
           result.mismatches.push(outcome.mismatch);
           result.incompatiblePairs++;
         } else if (outcome.kind === "unverifiable") {
@@ -570,6 +596,43 @@ export class TypeCompatibilityChecker {
    * @param typeName - The name of the type to find
    * @returns The Type if found, null otherwise
    */
+  /**
+   * Aliases whose declaration references an unresolved symbol — a library type
+   * kept by name whose declaration never made it into the flat cross-repo bundle
+   * (imports are stripped), or a renamed/missing surface export. Such a reference
+   * makes a NESTED field dangle to `any`, which the top-level any/unknown guard in
+   * compareTypes cannot see, so `isAssignableTo` would compare `any`-vs-`any` at
+   * that position and yield a false verdict (the version-conflict false-compatible
+   * measured on the hard-types fixture). Detected via the compiler's own
+   * unresolved-reference diagnostics — a genuine `any` field produces no such
+   * reference (or a declared-but-`any` alias) is swept in, so genuine concrete
+   * fields keep their verdict. Detected via the AST rather than diagnostics
+   * because the bundle is a `.d.ts` and the check runs `skipLibCheck` (which
+   * suppresses declaration-file diagnostics), so the type checker is queried
+   * directly: an unresolved type name has no symbol and resolves to `any`.
+   */
+  private computeDanglingAliases(project: Project): Set<string> {
+    const dangling = new Set<string>();
+    for (const sf of project.getSourceFiles()) {
+      for (const decl of [...sf.getTypeAliases(), ...sf.getInterfaces()]) {
+        const refs = decl.getDescendantsOfKind(SyntaxKind.TypeReference);
+        for (const ref of refs) {
+          // An unresolved type name (a library type kept by name with no
+          // declaration in the bundle) resolves to `any`, and its symbol — if
+          // ts-morph synthesises one — carries ZERO declarations. A genuine
+          // declared-but-`any` alias has a declaration, so it is not swept in.
+          const sym = ref.getTypeName().getSymbol();
+          const unresolved = !sym || sym.getDeclarations().length === 0;
+          if (unresolved && ref.getType().isAny()) {
+            dangling.add(decl.getName());
+            break;
+          }
+        }
+      }
+    }
+    return dangling;
+  }
+
   private findTypeInProject(project: Project, typeName: string): Type | null {
     for (const sourceFile of project.getSourceFiles()) {
       // Check type aliases
