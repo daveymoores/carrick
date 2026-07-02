@@ -485,6 +485,33 @@ impl AgentSchemas {
                         },
                         "required": ["topic", "role", "line_number"]
                     }
+                },
+                "graphql_consumer_locates": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "kind": {
+                                "type": "STRING",
+                                "enum": ["query", "mutation", "subscription"],
+                                "description": "The GraphQL operation kind of the executable document whose result type is being located: query, mutation, or subscription."
+                            },
+                            "field": {
+                                "type": "STRING",
+                                "description": "The document's top-level field name (e.g., 'order', 'orderUpdated') — matches the consumer operation this entry locates a type for."
+                            },
+                            "result_type_symbol": {
+                                "type": "STRING",
+                                "description": "The co-located TS type describing the GraphQL document's RESULT shape, as a bare identifier (e.g. 'OrderUpdate'). Emit this entry ONLY when a document's result type is identifiable in THIS file WITHOUT an explicit call-site generic (e.g. `client.request<T>(DOC)`) — a document already anchored by an explicit generic needs no entry. NEVER copy a request/variables type (the arguments passed INTO the operation); only the type describing the data the operation RETURNS. If you are not confident which type is co-located, omit the entry entirely rather than guessing."
+                            },
+                            "result_type_source": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Import path where `result_type_symbol` is defined (e.g., './types/order'), or null if it is declared in this file."
+                            }
+                        },
+                        "required": ["kind", "field", "result_type_symbol"]
+                    }
                 }
             },
             "required": ["mounts", "endpoints", "data_calls"]
@@ -875,6 +902,91 @@ mod tests {
         // pubsub_operations is optional at the top level: a model may omit it.
         let top_required = schema["required"].as_array().unwrap();
         assert!(!top_required.iter().any(|v| v == "pubsub_operations"));
+    }
+
+    #[test]
+    fn graphql_consumer_locates_schema_enum_matches_serde_wire_values() {
+        // The graphql_consumer_locates `kind` enum and GraphqlOperationKind's
+        // serde output must stay in lockstep (mirrors graphql_operations /
+        // pubsub_operations / call_kind / emission_style), and the isolation
+        // invariant (#268, mirroring 186cb27's producer lesson): this array is
+        // entirely separate from `graphql_operations`, so it must carry its OWN
+        // three required fields, never overloading a producer field.
+        use crate::operation::GraphqlOperationKind;
+
+        let schema = AgentSchemas::file_analysis_schema();
+        let schema_values: Vec<String> = schema["properties"]["graphql_consumer_locates"]["items"]
+            ["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("graphql_consumer_locates kind enum must exist")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        let serde_values: Vec<String> = [
+            GraphqlOperationKind::Query,
+            GraphqlOperationKind::Mutation,
+            GraphqlOperationKind::Subscription,
+        ]
+        .iter()
+        .map(|k| {
+            serde_json::to_value(k)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+
+        assert_eq!(schema_values, serde_values);
+
+        // kind/field/result_type_symbol are always required; result_type_source
+        // stays optional/nullable (a same-file type has no import source).
+        let required = schema["properties"]["graphql_consumer_locates"]["items"]["required"]
+            .as_array()
+            .expect("graphql_consumer_locates item required array must exist");
+        for field in ["kind", "field", "result_type_symbol"] {
+            assert!(
+                required.iter().any(|v| v == field),
+                "graphql_consumer_locates item required must contain {field}"
+            );
+        }
+        assert!(
+            !required.iter().any(|v| v == "result_type_source"),
+            "result_type_source must stay optional (null for same-file types)"
+        );
+
+        // graphql_consumer_locates is optional at the top level: a model may
+        // omit it for files with no unanchored consumer documents.
+        let top_required = schema["required"].as_array().unwrap();
+        assert!(!top_required.iter().any(|v| v == "graphql_consumer_locates"));
+
+        // Isolation guard (186cb27's lesson applied preemptively): this array's
+        // property set must never intersect graphql_operations' — a shared
+        // field name is exactly how the producer regression happened.
+        let consumer_props: std::collections::HashSet<&str> =
+            schema["properties"]["graphql_consumer_locates"]["items"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+        let producer_props: std::collections::HashSet<&str> =
+            schema["properties"]["graphql_operations"]["items"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+        let overlap: Vec<&&str> = consumer_props
+            .intersection(&producer_props)
+            .filter(|f| !["kind", "field"].contains(*f))
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "graphql_consumer_locates must not share type-slot field names with \
+             graphql_operations (isolation guard): {overlap:?}"
+        );
     }
 
     #[test]

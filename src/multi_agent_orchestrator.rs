@@ -75,6 +75,7 @@ impl MultiAgentOrchestrator {
     ///    - If no candidates → SKIP (zero LLM cost)
     ///    - If candidates exist → Send full file + patterns + hints to LLM
     /// 4. **Graph Construction** - Build MountGraph from all file results
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_complete_analysis(
         &self,
         files: Vec<std::path::PathBuf>,
@@ -82,6 +83,7 @@ impl MultiAgentOrchestrator {
         imported_symbols: &HashMap<String, ImportedSymbol>,
         repo_path: &str,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
+        graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
@@ -126,6 +128,7 @@ impl MultiAgentOrchestrator {
                 &framework_detection,
                 std::path::Path::new(repo_path),
                 graphql_producer_hints,
+                graphql_consumer_hints,
                 normalizer,
             )
             .await?;
