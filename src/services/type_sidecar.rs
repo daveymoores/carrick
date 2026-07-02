@@ -13,7 +13,7 @@
 //! - **JSON message protocol**: All communication is via stdin/stdout JSON messages
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -250,8 +250,17 @@ pub struct InferredType {
     /// sidecar's `getSymbol() || getAliasSymbol()` name with TS/lib globals
     /// filtered out. Fills the manifest anchor (`primary_type_symbol`) when the
     /// LLM emitted none, removing the anchor's sole dependency on the model.
+    /// For an array type this is the ELEMENT's symbol (`TimelineEvent` for
+    /// `TimelineEvent[]`), with the peeled levels reported in `array_depth`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol: Option<String>,
+    /// Array levels the resolved type wraps around `primary_type_symbol`
+    /// (#306): `TimelineEvent[]` reports symbol `TimelineEvent` + depth 1.
+    /// `resolve_all_types` copies this onto an explicit `SymbolRequest` for the
+    /// same alias/symbol so the bundle keeps the use-site's array-ness instead
+    /// of the bare element. Absent when 0 or when there is no anchor symbol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub array_depth: Option<u32>,
 }
 
 /// Information about a symbol that failed to resolve
@@ -678,9 +687,29 @@ impl TypeSidecar {
             errors: vec![],
         };
 
-        // Bundle explicit types
+        // Infer implicit types FIRST: a successful inference is the compiler's
+        // view of the actual use site, and it carries the resolved array depth
+        // relative to its anchor symbol. The explicit bundle below needs that
+        // depth before it runs (#306).
+        if !infer.is_empty() {
+            let infer_response = self.infer_types(infer, extraction_config)?;
+            if let Some(inferred) = infer_response.inferred_types {
+                result.inferred_types = inferred;
+            }
+            if let Some(errors) = infer_response.errors {
+                result.errors.extend(errors);
+            }
+        }
+
+        // Bundle explicit types. An LLM-extracted anchor is a bare identifier
+        // by schema contract (`User[]` → `User`), so bundling it as-is erases
+        // the use-site's array-ness and an array-vs-scalar mismatch scores
+        // compatible (#306). Copy the inference-resolved depth onto each
+        // matching request so the bundler's array_depth wrap (#248) restores
+        // the `[]` levels.
+        let explicit = apply_inferred_array_depth(explicit, &result.inferred_types);
         if !explicit.is_empty() {
-            let bundle_response = self.resolve_types(explicit)?;
+            let bundle_response = self.resolve_types(&explicit)?;
             result.dts_content = bundle_response.dts_content;
             if let Some(manifest) = bundle_response.manifest {
                 result.explicit_manifest = manifest;
@@ -693,17 +722,6 @@ impl TypeSidecar {
             }
         }
 
-        // Infer implicit types
-        if !infer.is_empty() {
-            let infer_response = self.infer_types(infer, extraction_config)?;
-            if let Some(inferred) = infer_response.inferred_types {
-                result.inferred_types = inferred;
-            }
-            if let Some(errors) = infer_response.errors {
-                result.errors.extend(errors);
-            }
-        }
-
         let had_explicit_dts = result.dts_content.is_some();
         let mut combined_dts = result.dts_content.take().unwrap_or_default();
         let mut appended_aliases: HashSet<String> = HashSet::new();
@@ -711,7 +729,7 @@ impl TypeSidecar {
         // Pre-populate with aliases already defined by the bundler so the
         // infer / failure-fallback loops below never shadow them with `= unknown`.
         if had_explicit_dts {
-            for req in explicit {
+            for req in &explicit {
                 if let Some(alias) = &req.alias
                     && Self::dts_defines_alias(&combined_dts, alias)
                 {
@@ -927,6 +945,52 @@ impl TypeSidecar {
     }
 }
 
+/// Copy inference-resolved array depths onto explicit symbol requests (#306).
+///
+/// An LLM-extracted anchor is a bare identifier by schema contract (`User[]` →
+/// `User`), so an explicit bundle built from it erases the use-site's
+/// array-ness: the producer comparand for a handler returning
+/// `TimelineEvent[]` becomes the bare element and an array-vs-scalar mismatch
+/// passes assignability. The inference that runs for the SAME alias resolves
+/// the actual use site through ts-morph and reports the element symbol plus
+/// the peeled depth, so when alias and symbol agree the depth is deterministic
+/// ground truth for the request. Depths already set by the caller (the GraphQL
+/// SDL list marker, #248) are never overwritten; a symbol disagreement means
+/// the anchor doesn't describe the inferred type, so the request is left
+/// untouched.
+fn apply_inferred_array_depth(
+    explicit: &[SymbolRequest],
+    inferred: &[InferredType],
+) -> Vec<SymbolRequest> {
+    // First anchor-carrying inference per alias wins, mirroring the
+    // `or_insert` join `enrich_manifest_with_type_resolution` uses.
+    let mut depth_by_alias: HashMap<&str, (&str, u32)> = HashMap::new();
+    for inf in inferred {
+        if let (Some(symbol), Some(depth)) = (inf.primary_type_symbol.as_deref(), inf.array_depth)
+            && depth > 0
+        {
+            depth_by_alias
+                .entry(inf.alias.as_str())
+                .or_insert((symbol, depth));
+        }
+    }
+
+    explicit
+        .iter()
+        .cloned()
+        .map(|mut req| {
+            if req.array_depth.is_none()
+                && let Some(alias) = req.alias.as_deref()
+                && let Some((symbol, depth)) = depth_by_alias.get(alias)
+                && *symbol == req.symbol_name
+            {
+                req.array_depth = Some(*depth);
+            }
+            req
+        })
+        .collect()
+}
+
 impl Drop for TypeSidecar {
     fn drop(&mut self) {
         debug!("[type_sidecar] Shutting down sidecar");
@@ -1097,6 +1161,90 @@ mod tests {
             SidecarState::Failed("error".to_string()),
             SidecarState::Failed("error".to_string())
         );
+    }
+
+    fn symbol_request(symbol: &str, alias: &str, array_depth: Option<u32>) -> SymbolRequest {
+        SymbolRequest {
+            symbol_name: symbol.to_string(),
+            source_file: "src/types.ts".to_string(),
+            alias: Some(alias.to_string()),
+            array_depth,
+        }
+    }
+
+    fn inferred(alias: &str, symbol: Option<&str>, array_depth: Option<u32>) -> InferredType {
+        InferredType {
+            alias: alias.to_string(),
+            type_string: "{ at: string; }[]".to_string(),
+            is_explicit: false,
+            source_location: SourceLocation {
+                file_path: "src/server.ts".to_string(),
+                start_line: 13,
+                end_line: 16,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::FunctionReturn,
+            primary_type_symbol: symbol.map(str::to_string),
+            array_depth,
+        }
+    }
+
+    /// #306: the timeline shape. The LLM anchor is the bare element
+    /// (`TimelineEvent` from `TimelineEvent[]`), so the explicit bundle would
+    /// erase the array; the same-alias inference resolved the use site to the
+    /// element symbol at depth 1, which must be copied onto the request.
+    #[test]
+    fn inferred_array_depth_wraps_matching_explicit_request() {
+        let explicit = vec![symbol_request("TimelineEvent", "Alias_Response", None)];
+        let inferred = vec![inferred("Alias_Response", Some("TimelineEvent"), Some(1))];
+
+        let adjusted = apply_inferred_array_depth(&explicit, &inferred);
+
+        assert_eq!(adjusted[0].array_depth, Some(1));
+    }
+
+    /// A depth the caller already set (the GraphQL SDL list marker, #248) is
+    /// authoritative — the inference join must never overwrite it.
+    #[test]
+    fn inferred_array_depth_never_overwrites_caller_depth() {
+        let explicit = vec![symbol_request("Order", "Alias_Response", Some(2))];
+        let inferred = vec![inferred("Alias_Response", Some("Order"), Some(1))];
+
+        let adjusted = apply_inferred_array_depth(&explicit, &inferred);
+
+        assert_eq!(adjusted[0].array_depth, Some(2));
+    }
+
+    /// A symbol disagreement means the inferred type is not "an array of the
+    /// requested anchor", so the request must stay untouched.
+    #[test]
+    fn inferred_array_depth_requires_symbol_agreement() {
+        let explicit = vec![symbol_request("TimelineEvent", "Alias_Response", None)];
+        let inferred = vec![inferred("Alias_Response", Some("SomethingElse"), Some(1))];
+
+        let adjusted = apply_inferred_array_depth(&explicit, &inferred);
+
+        assert_eq!(adjusted[0].array_depth, None);
+    }
+
+    /// A scalar inference (no array_depth on the wire) and a different-alias
+    /// inference both leave the request as-is.
+    #[test]
+    fn inferred_array_depth_ignores_scalars_and_other_aliases() {
+        let explicit = vec![
+            symbol_request("TimelineEntry", "Scalar_Response", None),
+            symbol_request("TimelineEvent", "Unrelated_Response", None),
+        ];
+        let inferred = vec![
+            inferred("Scalar_Response", Some("TimelineEntry"), None),
+            inferred("Other_Response", Some("TimelineEvent"), Some(1)),
+        ];
+
+        let adjusted = apply_inferred_array_depth(&explicit, &inferred);
+
+        assert_eq!(adjusted[0].array_depth, None);
+        assert_eq!(adjusted[1].array_depth, None);
     }
 
     #[test]

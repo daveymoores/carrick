@@ -12,8 +12,8 @@
       "line": 6,
       "type_alias": "Endpoint_a9cce7d0d8d0d9e6_Response",
       "type_state": "Explicit",
-      "resolved_definition": "export interface Endpoint_a9cce7d0d8d0d9e6_Response { id: number; name: string; email: string; }",
-      "expanded_definition": "{ id: number; name: string; email: string; }",
+      "resolved_definition": "export type Endpoint_a9cce7d0d8d0d9e6_Response = { id: number; name: string; email: string; }[];",
+      "expanded_definition": "{ id: number; name: string; email: string; }[]",
       "is_explicit": true,
       "primary_type_symbol": "User"
     },
