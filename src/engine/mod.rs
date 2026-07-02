@@ -911,6 +911,14 @@ async fn analyze_current_repo_incremental(
                 service_graphql_roots(repo_path, service),
                 &files,
             );
+            // #268: the consumer mirror — document consumers with no
+            // deterministic call-site anchor, so the file-analyzer can locate
+            // their co-located result type. Same scan-root/files inputs as the
+            // producer hints; empty for services with no unanchored consumers.
+            let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
+                service_graphql_roots(repo_path, service),
+                &files,
+            );
 
             let normalizer = UrlNormalizer::new(config);
             let new_file_results = if !files_to_analyze.is_empty() {
@@ -921,6 +929,7 @@ async fn analyze_current_repo_incremental(
                         &detection,
                         Path::new(repo_path),
                         &graphql_producer_hints,
+                        &graphql_consumer_hints,
                         &normalizer,
                     )
                     .await?;
@@ -1197,6 +1206,7 @@ fn append_deterministic_protocol_operations(
     let scan_roots = service_graphql_roots(repo_path, service);
     let mut graphql = crate::graphql::scan_repo(&scan_roots, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
+    merge_graphql_consumer_locations(&mut graphql, file_results);
     if !graphql.is_empty() {
         debug!(
             producers = graphql.producers.len(),
@@ -1457,6 +1467,67 @@ fn merge_graphql_resolver_locations(
     }
 }
 
+/// Fold the file-analyzer's `graphql_consumer_locates` onto document consumers
+/// with no deterministic anchor (#268 — the consumer mirror of
+/// `merge_graphql_resolver_locations`'s #248 producer backing-type fallback).
+///
+/// KEYING IS THE LOAD-BEARING DIFFERENCE from the producer merge: a producer's
+/// canonical `OperationKey` alone is enough to join on (a schema field has at
+/// most one root producer, service-wide). A consumer field has no such
+/// uniqueness — the SAME field can be consumed from N different files in a
+/// fan-in (a `query order` document duplicated across `web-frontend` and
+/// `admin-dashboard`, say), each potentially binding its own local result
+/// type. Joining on the canonical key alone would collide every file's locate
+/// entry onto whichever consumer op happened to occupy that key first. So this
+/// joins on the triple `(file_path, kind, field)`: each file's located type is
+/// scoped strictly to its own consumer op.
+///
+/// ISOLATION GUARD: an op that already carries `payload_type_symbol` (the
+/// deterministic `TaggedTplVisitor::capture_request_call` explicit-generic
+/// anchor) is left untouched. The file-analyzer is instructed not to emit a
+/// `graphql_consumer_locates` entry for an already-anchored op, but a
+/// stray/hallucinated entry must never be allowed to override it regardless —
+/// mirrors 186cb27's resolver-first gate on the producer side.
+fn merge_graphql_consumer_locations(
+    graphql: &mut crate::graphql::GraphqlExtraction,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    // (file_path, canonical_key) -> index. A consumer op's identity for this
+    // join is its file AND its operation key together — never the key alone.
+    let mut by_file_key: HashMap<(String, String), usize> = HashMap::new();
+    for (idx, op) in graphql.consumers.iter().enumerate() {
+        by_file_key.insert(
+            (
+                op.file_path.to_string_lossy().to_string(),
+                op.key.canonical(),
+            ),
+            idx,
+        );
+    }
+
+    for (path, result) in file_results {
+        for locate in &result.graphql_consumer_locates {
+            let key = OperationKey::graphql(locate.kind, locate.field.clone());
+            let Some(&idx) = by_file_key.get(&(path.clone(), key.canonical())) else {
+                debug!(
+                    op = %key.canonical(),
+                    file = %path,
+                    "graphql_consumer_locate has no matching consumer op in this file; ignoring"
+                );
+                continue;
+            };
+            let consumer = &mut graphql.consumers[idx];
+            if consumer.payload_type_symbol.is_some() {
+                // Isolation guard: an explicit call-site generic already
+                // anchored this op — never let a located type override it.
+                continue;
+            }
+            consumer.consumer_located_type_symbol = Some(locate.result_type_symbol.clone());
+            consumer.consumer_located_type_source = locate.result_type_source.clone();
+        }
+    }
+}
+
 /// Emit type-manifest entries for the deterministically-extracted GraphQL and
 /// Socket.IO operations (#245 Phase 1). Without this, only the HTTP mount-graph
 /// produces manifest entries, so every non-HTTP op reported `type_state=(none)`
@@ -1474,9 +1545,10 @@ fn merge_graphql_resolver_locations(
 /// SymbolRequest path. GraphQL SDL producers carry their deterministic anchor
 /// too (#248): the root field's SDL type expression (`Order`, `[Order!]!`),
 /// the only anchor available without a framework-specific SDL-field → TS-resolver
-/// mapping (follow-up #268). GraphQL document consumers have no SDL type, so
-/// their `primary_type_symbol` stays `None` (their TS result-type anchor is part
-/// of the same #268 mapping work).
+/// mapping. GraphQL document consumers have no SDL type, so their anchor is
+/// the call-site-bound `payload_type_symbol`, falling back to the
+/// file-analyzer-located `consumer_located_type_symbol` (#268) when the
+/// deterministic pass found no explicit call-site generic.
 fn append_protocol_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     extractions: &ProtocolExtractions,
@@ -1502,7 +1574,14 @@ fn append_protocol_manifest_entries(
             // The consumer's real anchor is the bound TS result type captured at
             // the `request<T>(DOC)` call site (#248 consumer side), not the
             // SDL-derived `primary_type_symbol` (always `None` for documents).
-            op.payload_type_symbol.clone(),
+            // When the deterministic pass found no explicit call-site generic,
+            // fall back to the file-analyzer-located co-located type (#268) —
+            // the engine merge's isolation guard already guarantees an op never
+            // carries both, so this is a plain either/or, not a priority
+            // decision made here.
+            op.payload_type_symbol
+                .clone()
+                .or_else(|| op.consumer_located_type_symbol.clone()),
             // Fan-in consumers (multiple repos reading the same field) carry the
             // same latent alias-collision risk the pub/sub publisher path fixes,
             // but neither corpus exercises it today; deferred to #291.
@@ -2371,6 +2450,13 @@ async fn analyze_current_repo(
         service_graphql_roots(repo_path, service),
         &files,
     );
+    // #268: the consumer mirror — document consumers with no deterministic
+    // call-site anchor, so the file-analyzer can locate their co-located
+    // result type. Same duplicate-parse tradeoff as the producer hints above.
+    let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
+        service_graphql_roots(repo_path, service),
+        &files,
+    );
 
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
@@ -2381,6 +2467,7 @@ async fn analyze_current_repo(
             &all_imported_symbols,
             repo_path,
             &graphql_producer_hints,
+            &graphql_consumer_hints,
             &normalizer,
         )
         .await?;
@@ -3117,6 +3204,7 @@ mod tests {
 
     fn make_file_result(endpoints: Vec<&str>, data_calls: Vec<&str>) -> FileAnalysisResult {
         FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: endpoints
                 .into_iter()
@@ -3523,6 +3611,7 @@ mod tests {
             large_results.insert(
                 format!("src/file_{}.ts", i),
                 FileAnalysisResult {
+                    graphql_consumer_locates: vec![],
                     mounts: vec![],
                     endpoints: vec![EndpointResult {
                         candidate_id: large_string.clone(),
@@ -4247,6 +4336,8 @@ mod tests {
             resolver_line: None,
             response_type_symbol: None,
             response_type_source: None,
+            consumer_located_type_symbol: None,
+            consumer_located_type_source: None,
         }
     }
 
@@ -4268,6 +4359,36 @@ mod tests {
             resolver_line: None,
             response_type_symbol: None,
             response_type_source: None,
+            consumer_located_type_symbol: None,
+            consumer_located_type_source: None,
+        }
+    }
+
+    /// Variant of `graphql_consumer_op` with a caller-chosen `kind` and
+    /// `file_path`, for the #268 per-file/per-kind join tests: the consumer
+    /// locate merge is keyed on `(file_path, kind, field)`, so exercising
+    /// fan-in across files or a non-Query kind needs a helper that can vary
+    /// both (the plain `graphql_consumer_op` fixes kind=Query and
+    /// file_path="web-frontend/lib/graphql.ts").
+    fn graphql_consumer_op_at(
+        kind: crate::operation::GraphqlOperationKind,
+        field: &str,
+        file_path: &str,
+        payload_symbol: Option<&str>,
+    ) -> crate::graphql::GraphqlOp {
+        crate::graphql::GraphqlOp {
+            key: OperationKey::graphql(kind, field),
+            file_path: PathBuf::from(file_path),
+            line: 10,
+            primary_type_symbol: None,
+            payload_type_symbol: payload_symbol.map(String::from),
+            payload_type_source: None,
+            resolver_file: None,
+            resolver_line: None,
+            response_type_symbol: None,
+            response_type_source: None,
+            consumer_located_type_symbol: None,
+            consumer_located_type_source: None,
         }
     }
 
@@ -4317,6 +4438,7 @@ mod tests {
         file_results.insert(
             "packages/gateway/src/orders.resolver.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![],
@@ -4416,6 +4538,7 @@ mod tests {
         file_results.insert(
             "packages/gateway/src/orders.resolver.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![],
@@ -4478,6 +4601,7 @@ mod tests {
         file_results.insert(
             "packages/gateway/src/orders.resolver.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![],
@@ -4507,6 +4631,182 @@ mod tests {
         assert_eq!(orders.resolver_line, None);
         // The type-locate fallback still fires (the producer stays anchored).
         assert_eq!(orders.response_type_symbol.as_deref(), Some("Order"));
+    }
+
+    /// #268 isolation guard: a consumer op with an explicit call-site generic
+    /// (`payload_type_symbol` already set by the deterministic
+    /// `TaggedTplVisitor::capture_request_call` pass) must keep that anchor
+    /// even when a stray `graphql_consumer_locates` entry also matches its
+    /// `(file_path, kind, field)` — mirrors 186cb27's resolver-first
+    /// regression guard on the producer side.
+    #[test]
+    fn merge_graphql_consumer_locations_never_overrides_explicit_generic() {
+        use crate::agents::file_analyzer_agent::GraphqlConsumerLocate;
+        use crate::operation::GraphqlOperationKind;
+
+        let anchored = graphql_consumer_op_at(
+            GraphqlOperationKind::Query,
+            "order",
+            "web-frontend/lib/graphql.ts",
+            Some("OrderView"),
+        );
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![anchored],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "web-frontend/lib/graphql.ts".to_string(),
+            FileAnalysisResult {
+                // A stray/hallucinated locate entry for an op that is already
+                // anchored — must be ignored.
+                graphql_consumer_locates: vec![GraphqlConsumerLocate {
+                    kind: GraphqlOperationKind::Query,
+                    field: "order".to_string(),
+                    result_type_symbol: "StrayType".to_string(),
+                    result_type_source: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        merge_graphql_consumer_locations(&mut graphql, &file_results);
+
+        let order = &graphql.consumers[0];
+        assert_eq!(
+            order.payload_type_symbol.as_deref(),
+            Some("OrderView"),
+            "the explicit call-site anchor must be untouched"
+        );
+        assert_eq!(
+            order.consumer_located_type_symbol, None,
+            "a stray locate entry must NEVER populate the fallback when the op \
+             is already anchored"
+        );
+    }
+
+    /// #268 per-file join proof: the SAME `(kind, field)` consumed from TWO
+    /// different files (fan-in) must each get their OWN located type — the
+    /// join is keyed on `(file_path, kind, field)`, not the canonical key
+    /// alone. A canonical-key-only map (the producer merge's approach) would
+    /// collide every file's locate entry onto whichever consumer op happened
+    /// to occupy that key first; this is the load-bearing difference from
+    /// `merge_graphql_resolver_locations`.
+    #[test]
+    fn merge_graphql_consumer_locations_scopes_fan_in_per_file() {
+        use crate::agents::file_analyzer_agent::GraphqlConsumerLocate;
+        use crate::operation::GraphqlOperationKind;
+
+        let consumer_a = graphql_consumer_op_at(
+            GraphqlOperationKind::Subscription,
+            "orderUpdated",
+            "web-frontend/lib/graphql.ts",
+            None,
+        );
+        let consumer_b = graphql_consumer_op_at(
+            GraphqlOperationKind::Subscription,
+            "orderUpdated",
+            "admin-dashboard/lib/graphql.ts",
+            None,
+        );
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![consumer_a, consumer_b],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "web-frontend/lib/graphql.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![GraphqlConsumerLocate {
+                    kind: GraphqlOperationKind::Subscription,
+                    field: "orderUpdated".to_string(),
+                    result_type_symbol: "OrderUpdate".to_string(),
+                    result_type_source: None,
+                }],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "admin-dashboard/lib/graphql.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![GraphqlConsumerLocate {
+                    kind: GraphqlOperationKind::Subscription,
+                    field: "orderUpdated".to_string(),
+                    result_type_symbol: "AdminOrderUpdate".to_string(),
+                    result_type_source: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        merge_graphql_consumer_locations(&mut graphql, &file_results);
+
+        let web = graphql
+            .consumers
+            .iter()
+            .find(|op| op.file_path == Path::new("web-frontend/lib/graphql.ts"))
+            .expect("web-frontend consumer");
+        assert_eq!(
+            web.consumer_located_type_symbol.as_deref(),
+            Some("OrderUpdate"),
+            "web-frontend must get its OWN located type"
+        );
+        let admin = graphql
+            .consumers
+            .iter()
+            .find(|op| op.file_path == Path::new("admin-dashboard/lib/graphql.ts"))
+            .expect("admin-dashboard consumer");
+        assert_eq!(
+            admin.consumer_located_type_symbol.as_deref(),
+            Some("AdminOrderUpdate"),
+            "admin-dashboard must get its OWN located type, not web-frontend's"
+        );
+    }
+
+    /// #268: a `graphql_consumer_locates` entry with no matching consumer op
+    /// (wrong file, or wrong kind/field) is ignored — it must not create a new
+    /// consumer op, touch an unrelated one, or panic.
+    #[test]
+    fn merge_graphql_consumer_locations_ignores_unmatched_locate_entry() {
+        use crate::agents::file_analyzer_agent::GraphqlConsumerLocate;
+        use crate::operation::GraphqlOperationKind;
+
+        let consumer = graphql_consumer_op_at(
+            GraphqlOperationKind::Query,
+            "order",
+            "web-frontend/lib/graphql.ts",
+            None,
+        );
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![consumer],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "web-frontend/lib/graphql.ts".to_string(),
+            FileAnalysisResult {
+                // A locate entry for a field with no matching consumer op in
+                // this file.
+                graphql_consumer_locates: vec![GraphqlConsumerLocate {
+                    kind: GraphqlOperationKind::Mutation,
+                    field: "refundOrder".to_string(),
+                    result_type_symbol: "RefundReceipt".to_string(),
+                    result_type_source: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        merge_graphql_consumer_locations(&mut graphql, &file_results);
+
+        assert_eq!(graphql.consumers.len(), 1, "no new consumer op was created");
+        assert_eq!(
+            graphql.consumers[0].consumer_located_type_symbol, None,
+            "the unrelated `order` consumer must not pick up the unmatched entry"
+        );
     }
 
     /// A typed socket emitter produces a Response-kind manifest entry keyed by
@@ -4973,6 +5273,70 @@ mod tests {
         );
         assert_eq!(manifest_alias, expected);
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// #268: `collect_graphql_type_requests` falls back to
+    /// `consumer_located_type_symbol` ONLY when `payload_type_symbol` is
+    /// absent — the deterministic call-site anchor always wins when both are
+    /// present (pinning the orchestrator's own precedence independently of
+    /// the engine merge's isolation guard, which already keeps the two
+    /// mutually exclusive per op in practice).
+    #[test]
+    fn collect_graphql_type_requests_falls_back_to_located_type_only_when_unanchored() {
+        use crate::operation::GraphqlOperationKind;
+
+        // No call-site anchor, but a located type — the fallback must fire.
+        let mut located_only = graphql_consumer_op_at(
+            GraphqlOperationKind::Subscription,
+            "orderUpdated",
+            "web-frontend/lib/graphql.ts",
+            None,
+        );
+        located_only.consumer_located_type_symbol = Some("OrderUpdate".to_string());
+
+        // BOTH a call-site anchor and a (stray) located type — the explicit
+        // anchor must win, exactly mirroring the resolver-first precedent.
+        let mut both = graphql_consumer_op("order", Some("OrderView"), Some("./types"));
+        both.consumer_located_type_symbol = Some("StrayType".to_string());
+
+        // Neither anchor — no request at all.
+        let neither = graphql_consumer_op_at(
+            GraphqlOperationKind::Query,
+            "unanchored",
+            "web-frontend/lib/graphql.ts",
+            None,
+        );
+
+        let extraction = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![located_only, both, neither],
+        };
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_graphql_type_requests(&extraction, ".");
+
+        assert!(
+            requests.iter().any(|r| r.symbol_name == "OrderUpdate"),
+            "the located type must bundle when there is no call-site anchor, got: {:?}",
+            requests
+        );
+        assert!(
+            requests.iter().any(|r| r.symbol_name == "OrderView"),
+            "the call-site anchor must still bundle, got: {:?}",
+            requests
+        );
+        assert!(
+            !requests.iter().any(|r| r.symbol_name == "StrayType"),
+            "a stray located type on an already-anchored op must NEVER bundle, got: {:?}",
+            requests
+        );
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly two requests (OrderUpdate + OrderView) — the fully-unanchored \
+             op produces none, got: {:?}",
+            requests
+        );
     }
 
     /// Stage B1 producer infer join: a GraphQL PRODUCER whose resolver location

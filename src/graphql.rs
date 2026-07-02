@@ -81,6 +81,25 @@ pub struct GraphqlOp {
     /// is declared in `resolver_file` itself. Null whenever
     /// `response_type_symbol` is null.
     pub response_type_source: Option<String>,
+    /// CONSUMER-only fallback (#268): the co-located TS type describing a
+    /// document's RESULT shape when the deterministic pass found no explicit
+    /// call-site generic (`TaggedTplVisitor::capture_request_call` never
+    /// matched, so `payload_type_symbol` is `None`). Located by the
+    /// file-analyzer (`graphql_consumer_locates`), it is bundled + structurally
+    /// expanded by the type sidecar through the same path
+    /// `payload_type_symbol` uses — the deterministic half of the
+    /// LLM-locate/scanner-expand split (mirrors the producer `response_type_symbol`
+    /// fallback). `None` when the deterministic anchor already exists (that
+    /// signal always wins — see the engine merge's isolation guard) or nothing
+    /// was located. Always `None` for producers.
+    pub consumer_located_type_symbol: Option<String>,
+    /// CONSUMER-only: import specifier the `consumer_located_type_symbol` type is
+    /// declared in (`./types/order`), resolved against `file_path` (the
+    /// consuming file itself — the join is scoped per-file, so there is no
+    /// separate "located file" the way producers have a distinct
+    /// `resolver_file`). `None` when the type is declared in `file_path` itself.
+    /// Null whenever `consumer_located_type_symbol` is null.
+    pub consumer_located_type_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,6 +179,88 @@ impl GraphqlProducerHints {
     /// the zero-candidate skip, never every exported-function file in the repo.
     pub fn file_within_scan_roots(&self, file: &Path) -> bool {
         self.scan_roots.iter().any(|root| file.starts_with(root))
+    }
+}
+
+/// Repo-global GraphQL consumer context for the file-analyzer (#268 — the
+/// consumer mirror of `GraphqlProducerHints`).
+///
+/// The deterministic pass (`TaggedTplVisitor::capture_request_call`) anchors a
+/// document consumer only when it finds an explicit call-site generic
+/// (`client.request<T>(DOC)`). A document consumed with no such generic (e.g. a
+/// subscription handed straight to a callback, `graphql-ws`-style) stays
+/// unanchored even though its result type is often co-located in the same
+/// file. This hint tells the file-analyzer exactly which (kind, field, file)
+/// triples are still unanchored, so it only ever tries to locate a type for an
+/// operation the deterministic pass genuinely missed.
+///
+/// `lines` is one formatted string per unanchored consumer op, stable across
+/// every file in a scan, so it lives in the cacheable front block of the user
+/// message alongside the producer hints. Empty `lines` means every consumer
+/// op in this service already has a deterministic anchor (or there are no
+/// GraphQL consumers at all) and nothing changes.
+#[derive(Debug, Clone, Default)]
+pub struct GraphqlConsumerHints {
+    /// One `"{kind}|{field} @ {file}"` line per consumer op with no
+    /// `payload_type_symbol` anchor.
+    pub lines: Vec<String>,
+    /// Exact files containing at least one unanchored consumer op, so the
+    /// don't-skip routing can rescue a candidate-less file that co-locates
+    /// one (#268). Exact path membership only — unlike the producer's
+    /// scan-root containment check, a consumer's located type has no fixed
+    /// directory to scope to (it can live in any TS/JS file the deterministic
+    /// pass already walked).
+    pub files: std::collections::HashSet<PathBuf>,
+}
+
+impl GraphqlConsumerHints {
+    /// Build the consumer hint context for a service: run the same
+    /// deterministic scan `GraphqlProducerHints::collect` uses (accepted as a
+    /// second walk over the same roots/files — cheap and parse-only, no LLM
+    /// cost) and keep every consumer op with no `payload_type_symbol`. An op
+    /// the deterministic pass already anchored (`TaggedTplVisitor::capture_request_call`
+    /// matched an explicit generic) needs no hint — there is nothing left to
+    /// locate.
+    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf]) -> Self {
+        let extraction = scan_repo(&scan_roots, service_files);
+        let mut lines = Vec::new();
+        let mut files = std::collections::HashSet::new();
+        for op in &extraction.consumers {
+            if op.payload_type_symbol.is_some() {
+                continue;
+            }
+            let Some(line) = Self::format_consumer(op) else {
+                continue;
+            };
+            lines.push(line);
+            files.insert(op.file_path.clone());
+        }
+        Self { lines, files }
+    }
+
+    /// Format a single unanchored consumer op as `"{kind}|{field} @ {file}"`
+    /// (e.g. `"subscription|orderUpdated @ lib/graphql.ts"`). `None` if the op
+    /// is not a GraphQL consumer key (should never happen for `.consumers`).
+    fn format_consumer(op: &GraphqlOp) -> Option<String> {
+        let OperationKey::Graphql { kind, field } = &op.key else {
+            return None;
+        };
+        Some(format!(
+            "{}|{} @ {}",
+            kind.as_str(),
+            field,
+            op.file_path.display()
+        ))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Whether `file` co-locates at least one unanchored consumer op — used to
+    /// rescue an otherwise-skipped, candidate-less file into analysis (#268).
+    pub fn file_has_hint(&self, file: &Path) -> bool {
+        self.files.contains(file)
     }
 }
 
@@ -319,6 +420,10 @@ pub fn extract_from_document_text(
                     // co-located backing type for a resolver-less field (#248).
                     response_type_symbol: None,
                     response_type_source: None,
+                    // Producer-only fallback's consumer counterpart; never set
+                    // on producers.
+                    consumer_located_type_symbol: None,
+                    consumer_located_type_source: None,
                 });
             }
         }
@@ -378,6 +483,12 @@ pub fn extract_from_document_text(
                     // Producer-only fallback; never set on consumers.
                     response_type_symbol: None,
                     response_type_source: None,
+                    // Populated in the engine merge only when the LLM located a
+                    // co-located result type for a document with no explicit
+                    // call-site generic (#268). The TS-file pass below still
+                    // gets first shot via `payload_type_symbol`.
+                    consumer_located_type_symbol: None,
+                    consumer_located_type_source: None,
                 });
             }
         }
@@ -888,6 +999,66 @@ mod tests {
             anchors(&result.consumers),
             vec![("graphql|query|order".to_string(), None)]
         );
+    }
+
+    /// #268: `GraphqlConsumerHints::collect` keeps only consumer ops the
+    /// deterministic pass could NOT anchor (`payload_type_symbol.is_none()`) —
+    /// an op the `request<T>(DOC)` call-site capture already anchored needs no
+    /// hint, so it must be filtered out of both `lines` and `files`.
+    #[test]
+    fn consumer_hints_filter_out_anchored_consumers() {
+        let dir = std::env::temp_dir().join(format!(
+            "carrick-gql-consumer-hints-{}-{:016x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("client.ts");
+        std::fs::write(
+            &file,
+            r#"
+import { gql } from "graphql-tag";
+import { OrderView } from "./types";
+const client = makeClient();
+const GET_ORDER = gql`
+  query GetOrder($id: ID!) { order(id: $id) { id } }
+`;
+const ON_ORDER_UPDATED = gql`
+  subscription OnOrderUpdated { orderUpdated { id } }
+`;
+async function fetchOrder(id) {
+  // Anchored: explicit call-site generic.
+  return client.request<OrderView>(GET_ORDER, { id });
+}
+function subscribe(cb) {
+  // Unanchored: no call-site generic at all — nothing consumes ON_ORDER_UPDATED
+  // through a typed call.
+  return cb;
+}
+"#,
+        )
+        .unwrap();
+
+        let hints = GraphqlConsumerHints::collect(vec![], std::slice::from_ref(&file));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Only the unanchored subscription produces a hint line.
+        assert_eq!(hints.lines.len(), 1, "got lines: {:?}", hints.lines);
+        assert!(
+            hints.lines[0].starts_with("subscription|orderUpdated @ "),
+            "unexpected hint line: {}",
+            hints.lines[0]
+        );
+        assert!(!hints.is_empty());
+        assert!(hints.file_has_hint(&file));
+
+        // A file with no unanchored consumers yields no hints at all.
+        let empty = GraphqlConsumerHints::collect(vec![], &[]);
+        assert!(empty.is_empty());
+        assert!(!empty.file_has_hint(&file));
     }
 
     /// Write `source` to a tempfile and run the TS-file extractor over it,

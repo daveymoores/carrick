@@ -234,6 +234,32 @@ pub struct GraphqlOperation {
     pub backing_type_source: Option<String>,
 }
 
+/// A co-located consumer result type the file-analyzer located for a GraphQL
+/// document with no explicit call-site generic (#268 — the consumer mirror of
+/// the producer `backing_type_symbol` fallback, #248). Mirrors the
+/// `graphql_consumer_locates` array in `AgentSchemas::file_analysis_schema`.
+///
+/// Kept as an entirely separate top-level array from `graphql_operations`
+/// (producer-only) rather than overloading a shared field — the 186cb27
+/// lesson: cramming two purposes onto one field made the model null out an
+/// unrelated signal (a resolver-backed op's `resolver_function`) as a side
+/// effect of teaching the resolver-less case. Isolation here is structural:
+/// there is no field this array could collide with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphqlConsumerLocate {
+    /// The GraphQL operation kind of the document being located.
+    pub kind: crate::operation::GraphqlOperationKind,
+    /// The document's top-level field name (e.g., "order", "orderUpdated") —
+    /// matches the consumer op this entry locates a type for.
+    pub field: String,
+    /// The co-located TS type bound to the document's RESULT shape (e.g.
+    /// "OrderUpdate"). Never a request/variables type.
+    pub result_type_symbol: String,
+    /// Import path where `result_type_symbol` is defined (e.g.,
+    /// "./types/order"), or `None` if declared in this file.
+    pub result_type_source: Option<String>,
+}
+
 /// A pub/sub operation the file-analyzer found: the topic it targets and which
 /// side (subscriber = producer, publisher = consumer) the code sits on. Mirrors
 /// the `pubsub_operations` array in `AgentSchemas::file_analysis_schema`. The
@@ -281,6 +307,12 @@ pub struct FileAnalysisResult {
     /// failing the whole file's parse.
     #[serde(default)]
     pub pubsub_operations: Vec<PubsubOperation>,
+    /// Co-located consumer result types the file-analyzer located for GraphQL
+    /// documents with no explicit call-site generic (#268). Optional on the
+    /// wire (a model may omit it for files with no such documents), so default
+    /// to empty rather than failing the whole file's parse.
+    #[serde(default)]
+    pub graphql_consumer_locates: Vec<GraphqlConsumerLocate>,
 }
 
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
@@ -324,6 +356,7 @@ impl FileAnalyzerAgent {
             &[],
             &[],
             &HashMap::new(),
+            &[],
             &[],
         )
         .await
@@ -381,6 +414,7 @@ impl FileAnalyzerAgent {
         candidate_contexts: &[String],
         imported_symbols: &HashMap<String, ImportedSymbol>,
         graphql_producer_hints: &[String],
+        graphql_consumer_hints: &[String],
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -395,6 +429,7 @@ impl FileAnalyzerAgent {
             candidate_contexts,
             imported_symbols,
             graphql_producer_hints,
+            graphql_consumer_hints,
         );
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
@@ -687,6 +722,7 @@ impl FileAnalyzerAgent {
             &[],
             &HashMap::new(),
             &[],
+            &[],
         )
     }
 
@@ -701,6 +737,7 @@ impl FileAnalyzerAgent {
         candidate_contexts: &[String],
         imported_symbols: &HashMap<String, ImportedSymbol>,
         graphql_producer_hints: &[String],
+        graphql_consumer_hints: &[String],
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
@@ -761,6 +798,36 @@ impl FileAnalyzerAgent {
             )
         };
 
+        // GraphQL consumer context (#268 — the consumer mirror of the producer
+        // section above): document consumers the deterministic pass
+        // (`TaggedTplVisitor::capture_request_call`) could NOT anchor because
+        // there was no explicit call-site generic. Repo-global and stable
+        // across every file in the scan, same caching rationale as
+        // `graphql_producers_section` — an empty section contributes zero
+        // bytes so a non-GraphQL (or fully-anchored) prompt stays byte-for-byte
+        // identical to before.
+        let graphql_consumers_section = if graphql_consumer_hints.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n### GRAPHQL DOCUMENT CONSUMERS WITH NO EXPLICIT RESULT TYPE\n\
+                 The operations below are executable GraphQL documents (`gql`/`graphql` tagged \
+                 templates) this repo consumes whose result type has NO explicit call-site generic \
+                 (e.g. `client.request<T>(DOC)`) anywhere in the codebase. For each one listed below \
+                 that belongs to the file being analyzed, if a type declared or imported in THIS file \
+                 describes the operation's RESULT shape, emit a `graphql_consumer_locates` entry with \
+                 its `kind`/`field` and set `result_type_symbol` (+ `result_type_source`) to that \
+                 type. NEVER use a request/variables type — only the type describing the data the \
+                 operation returns. If you are not confident which type is co-located, omit the entry \
+                 entirely rather than guessing.\n{}\n",
+                graphql_consumer_hints
+                    .iter()
+                    .map(|line| format!("- {}", line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+
         // Add line-number prefixes to file content so Gemini can read line numbers directly
         let mut numbered_content =
             String::with_capacity(file_content.len() + file_content.lines().count() * 7);
@@ -787,7 +854,7 @@ impl FileAnalyzerAgent {
 }}
 
 ### FRAMEWORK-SPECIFIC HINTS
-{}{}
+{}{}{}
 ### FRAMEWORK-SPECIFIC PARSING NOTES
 These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
 {}
@@ -846,6 +913,7 @@ Return ONLY the JSON object, no explanations."#,
             data_patterns,
             guidance.triage_hints,
             graphql_producers_section,
+            graphql_consumers_section,
             guidance.parsing_notes,
             candidates_section,
             candidate_contexts_section,
@@ -1074,6 +1142,7 @@ mod tests {
         endpoint.response_expression_text = Some("users".to_string());
         endpoint.response_expression_line = Some(6);
         let mut result = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![endpoint],
             data_calls: vec![],
@@ -1093,6 +1162,7 @@ mod tests {
         let json = endpoint_json(r#", "emission_style": "no-payload""#);
         let endpoint: EndpointResult = serde_json::from_str(&json).unwrap();
         let mut result = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![endpoint],
             data_calls: vec![],
@@ -1244,6 +1314,7 @@ mod tests {
     #[test]
     fn test_sanitize_result_filters_placeholders() {
         let mut result = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
                 candidate_id: "span:10-50".to_string(),
@@ -1330,6 +1401,7 @@ mod tests {
     #[test]
     fn test_file_analysis_result_serialization() {
         let result = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![MountResult {
                 line_number: 5,
                 parent_node: "app".to_string(),
@@ -1536,6 +1608,7 @@ mod tests {
     #[test]
     fn test_choose_best_result_prefers_richer_output() {
         let initial = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![MountResult {
                 line_number: 1,
                 parent_node: "app".to_string(),
@@ -1583,6 +1656,7 @@ mod tests {
         };
 
         let retry = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![],
             data_calls: vec![],
@@ -1697,6 +1771,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &candidate_contexts,
             &imported,
             &[],
+            &[],
         );
 
         assert!(message.contains("IMPORT TABLE"));
@@ -1755,6 +1830,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &[],
             &HashMap::new(),
             &hints,
+            &[],
         );
 
         assert!(
@@ -1801,6 +1877,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &[],
             &HashMap::new(),
             &[],
+            &[],
         );
 
         assert!(
@@ -1829,6 +1906,90 @@ const data = await fetch('/api/users').then(resp => resp.json());
         assert!(
             !message.contains(&doubled_join),
             "empty hints must NOT leave a doubled blank line before PARSING NOTES, got:\n{message}"
+        );
+    }
+
+    /// #268: the consumer mirror of
+    /// `build_user_message_includes_graphql_producers_when_hints_present` — a
+    /// non-empty `graphql_consumer_hints` list renders the consumer section,
+    /// formats each hint line, points at the `graphql_consumer_locates` output
+    /// channel, and (being repo-global/stable) sits in the cacheable front
+    /// block before any per-file content.
+    #[test]
+    fn build_user_message_includes_graphql_consumers_when_hints_present() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = "export interface OrderUpdate { id: string }\n";
+        let hints = vec!["subscription|orderUpdated @ lib/graphql.ts".to_string()];
+
+        let message = agent.build_user_message_with_candidates(
+            "lib/graphql.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+            &hints,
+        );
+
+        assert!(
+            message.contains("### GRAPHQL DOCUMENT CONSUMERS WITH NO EXPLICIT RESULT TYPE"),
+            "expected GraphQL consumers section, got:\n{message}"
+        );
+        assert!(
+            message.contains("- subscription|orderUpdated @ lib/graphql.ts"),
+            "expected formatted consumer hint line, got:\n{message}"
+        );
+        assert!(
+            message.contains("graphql_consumer_locates"),
+            "expected pointer to the graphql_consumer_locates output channel, got:\n{message}"
+        );
+
+        let pos = |needle: &str| {
+            message
+                .find(needle)
+                .unwrap_or_else(|| panic!("section `{needle}` missing:\n{message}"))
+        };
+        assert!(
+            pos("### GRAPHQL DOCUMENT CONSUMERS WITH NO EXPLICIT RESULT TYPE")
+                < pos("### FILE CONTENT"),
+            "stable GraphQL consumer block must precede per-file content for prefix caching"
+        );
+    }
+
+    /// #268 mirror of `build_user_message_omits_graphql_producers_when_hints_empty`:
+    /// an empty `graphql_consumer_hints` list must omit the section entirely and
+    /// contribute zero bytes, preserving the pre-feature byte-identical prompt.
+    #[test]
+    fn build_user_message_omits_graphql_consumers_when_hints_empty() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = "const x = 1;\n";
+
+        let message = agent.build_user_message_with_candidates(
+            "plain.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        assert!(
+            !message.contains("GRAPHQL DOCUMENT CONSUMERS"),
+            "GraphQL consumers section must be absent when no hints are passed, got:\n{message}"
+        );
+
+        let triage_hints = &guidance.triage_hints;
+        let pre_feature_join = format!(
+            "### FRAMEWORK-SPECIFIC HINTS\n{triage_hints}\n### FRAMEWORK-SPECIFIC PARSING NOTES"
+        );
+        assert!(
+            message.contains(&pre_feature_join),
+            "empty hints must render the pre-feature single-newline join, got:\n{message}"
         );
     }
 

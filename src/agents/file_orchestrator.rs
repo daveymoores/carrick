@@ -157,6 +157,7 @@ impl FileOrchestrator {
     ///
     /// # Returns
     /// A `FileCentricAnalysisResult` containing per-file results and aggregated graph.
+    #[allow(clippy::too_many_arguments)]
     pub async fn analyze_files(
         &self,
         files: &[PathBuf],
@@ -164,6 +165,7 @@ impl FileOrchestrator {
         framework_detection: &DetectionResult,
         repo_root: &Path,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
+        graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
@@ -216,6 +218,12 @@ impl FileOrchestrator {
             /// so the concurrent dispatch closure owns its copy. Empty for repos
             /// with no SDL producers.
             graphql_producer_hints: Vec<String>,
+            /// Repo-global GraphQL consumer hint lines (#268), injected into the
+            /// user message so the model can locate a co-located result type for
+            /// a document with no explicit call-site generic. Identical for every
+            /// file; cloned per-pending so the concurrent dispatch closure owns
+            /// its copy. Empty for repos with no unanchored GraphQL consumers.
+            graphql_consumer_hints: Vec<String>,
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -359,6 +367,17 @@ impl FileOrchestrator {
                     .exported_handlers(file_path, &content)
                     .is_empty();
 
+            // GraphQL consumer routing (#268): a file that only co-locates a
+            // GraphQL document's result type (no `fetch`/`axios`/etc. HTTP call
+            // shape) raises no HTTP candidate, so the candidate-less skip below
+            // would drop it before the file-analyzer ever sees it. Rescue it
+            // when this exact file was recorded in `graphql_consumer_hints` —
+            // simpler than the producer's scan-root containment check: a
+            // consumer's located type has no fixed directory to scope to, so
+            // exact path membership is both correct and cheap (no re-parse).
+            let is_graphql_consumer_file = !graphql_consumer_hints.is_empty()
+                && graphql_consumer_hints.file_has_hint(file_path);
+
             // STEP 2: Check Relevance - if there are no candidates for a routed
             // protocol, SKIP the (expensive) LLM call. File-based route and
             // route-descriptor endpoints are still recorded: they're derived
@@ -393,6 +412,14 @@ impl FileOrchestrator {
                     // file content to emit `graphql_operations`.
                     debug!(
                         "Routed GraphQL resolver file (no HTTP candidates): {}",
+                        path_str
+                    );
+                } else if is_graphql_consumer_file {
+                    // Fall through to the LLM pass with empty HTTP candidates:
+                    // the file-analyzer reads the consumer-hint context and the
+                    // file content to emit `graphql_consumer_locates` (#268).
+                    debug!(
+                        "Routed GraphQL consumer file (no HTTP candidates): {}",
                         path_str
                     );
                 } else if imports_messaging_client {
@@ -459,6 +486,7 @@ impl FileOrchestrator {
                 route_endpoints,
                 descriptor_endpoints,
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
+                graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
             });
         }
 
@@ -487,6 +515,7 @@ impl FileOrchestrator {
                         &pf.candidate_contexts,
                         &pf.symbol_table.imported_symbols,
                         &pf.graphql_producer_hints,
+                        &pf.graphql_consumer_hints,
                     )
                     .await
                     .map_err(|e| e.to_string());
@@ -1296,6 +1325,13 @@ impl FileOrchestrator {
     /// carry a `payload_type_symbol` (SDL producers anchor on their SDL type
     /// expression, not a bundled TS symbol), so this is consumer-only.
     ///
+    /// When `payload_type_symbol` is absent, this falls back to
+    /// `GraphqlOp::consumer_located_type_symbol` (#268): the co-located result
+    /// type the file-analyzer located for a document with no explicit call-site
+    /// generic. Same `SymbolRequest` shape, same alias — the sidecar bundle path
+    /// can't tell the two anchors apart, and doesn't need to. The engine merge's
+    /// isolation guard already guarantees an op never carries both.
+    ///
     /// The alias MUST be `build_manifest_type_alias(&op.key, Consumer, Response)`
     /// — byte-identical to the alias `add_protocol_manifest_entry` stamped on the
     /// manifest entry in `append_protocol_manifest_entries` — or the resolved
@@ -1303,7 +1339,12 @@ impl FileOrchestrator {
     /// guarded by a unit test.
     ///
     /// An absent source means the symbol is declared in the consuming file, so it
-    /// is resolved against that file's absolute path (same-file fallback).
+    /// is resolved against that file's absolute path (same-file fallback). For
+    /// the #268 fallback, "the consuming file" is `op.file_path` itself — unlike
+    /// the producer type-locate (which has a separate `resolver_file` the
+    /// backing type may differ from), the consumer join is scoped per-file, so
+    /// the located type always resolves against the same file the document
+    /// lives in.
     pub fn collect_graphql_type_requests(
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
@@ -1323,12 +1364,24 @@ impl FileOrchestrator {
         let mut requests: Vec<SymbolRequest> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for op in &graphql.consumers {
-            let Some(symbol) = op.payload_type_symbol.as_ref() else {
+            // #268: the deterministic call-site anchor (`payload_type_symbol`,
+            // an explicit `client.request<T>(DOC)` generic) is the
+            // higher-fidelity signal and always wins when present. Fall back to
+            // the file-analyzer's located co-located type
+            // (`consumer_located_type_symbol`) only when the deterministic pass
+            // found nothing to anchor on — the engine merge's isolation guard
+            // already guarantees the two are mutually exclusive per op, so this
+            // fallback never silently shadows a real call-site type.
+            let (symbol, source) = if let Some(symbol) = op.payload_type_symbol.as_ref() {
+                (symbol, op.payload_type_source.as_ref())
+            } else if let Some(symbol) = op.consumer_located_type_symbol.as_ref() {
+                (symbol, op.consumer_located_type_source.as_ref())
+            } else {
                 continue;
             };
             let file_abs =
                 Self::to_absolute_path(&op.file_path.to_string_lossy(), &repo_root_absolute);
-            let source_file = match op.payload_type_source.as_ref() {
+            let source_file = match source {
                 Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
                 // No import → same-file declaration: resolve against the file.
                 None => file_abs,
@@ -2820,6 +2873,7 @@ mod tests {
         file_results.insert(
             "src/app.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![MountResult {
                     line_number: 10,
                     parent_node: "app".to_string(),
@@ -2883,6 +2937,7 @@ mod tests {
         file_results.insert(
             "src/service.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![DataCallResult {
@@ -2926,6 +2981,7 @@ mod tests {
         file_results.insert(
             "src/service.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![
@@ -2985,6 +3041,7 @@ mod tests {
         file_results.insert(
             "src/service.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![DataCallResult {
@@ -3028,6 +3085,7 @@ mod tests {
         file_results.insert(
             "src/service.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![
@@ -3097,6 +3155,7 @@ mod tests {
         file_results.insert(
             "app/users/route.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![EndpointResult {
                     candidate_id: "file-route:GET:42".to_string(),
@@ -3185,6 +3244,7 @@ mod tests {
         file_results.insert(
             "src/server.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![endpoint],
                 data_calls: vec![],
@@ -3332,6 +3392,7 @@ mod tests {
     #[test]
     fn test_validate_type_hints_rejects_invalid_symbols() {
         let mut result = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
@@ -3448,6 +3509,7 @@ mod tests {
         file_results.insert(
             "src/app.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![MountResult {
                     line_number: 10,
                     parent_node: "app".to_string(),
@@ -3467,6 +3529,7 @@ mod tests {
         file_results.insert(
             "src/routes/users.ts".to_string(),
             FileAnalysisResult {
+                graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![
                     EndpointResult {

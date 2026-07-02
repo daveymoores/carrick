@@ -24,3 +24,8 @@ export interface UserSettings {
 export type UserId = string;
 
 export type UserRole = 'admin' | 'user' | 'guest';
+
+export enum UserTier {
+  Free,
+  Pro,
+}
