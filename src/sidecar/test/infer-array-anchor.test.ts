@@ -50,9 +50,9 @@ describe('array-typed inference anchors on the element symbol with array_depth (
       requests: [
         {
           file_path: HANDLERS_FIXTURE,
-          line_number: 50,
+          line_number: 47,
           expression_text: 'latest',
-          expression_line: 52,
+          expression_line: 48,
           infer_kind: 'function_return',
         },
       ],
@@ -111,9 +111,9 @@ describe('array-typed inference anchors on the element symbol with array_depth (
       requests: [
         {
           file_path: HANDLERS_FIXTURE,
-          line_number: 40,
+          line_number: 39,
           expression_text: 'user',
-          expression_line: 42,
+          expression_line: 40,
           infer_kind: 'function_return',
         },
       ],
