@@ -1186,6 +1186,78 @@ describe('TypeCompatibilityChecker', () => {
       );
     });
 
+    it('abstains (unverifiable) when a NESTED field dangles to any via a kept-by-name library type (version-conflict safety)', async () => {
+      // The measured false-compatible: a library/version type (e.g. bson ObjectId,
+      // a zod-inferred class across majors) is serialized BY NAME with no import,
+      // so at check time the field dangles. Here producer/consumer both read
+      // `{ token: Token; amount: number }` with `Token` undeclared. The top-level
+      // any/unknown guard MISSES it (the object type is not itself any; only the
+      // nested `token` field is), so `isAssignableTo` compares any-vs-any on
+      // `token` and reads COMPATIBLE — masking a real wire mismatch. It must
+      // instead read unverifiable: a dangling reference means the shape never
+      // reached the bundle and the verdict cannot be trusted.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        // \`Token\` is a library class kept by name with no declaration in the
+        // bundle (imports are stripped in the flat cross-repo project).
+        export interface Endpoint_vc_Response { token: Token; amount: number; }
+        export interface Endpoint_vc_Response_Call1 { token: Token; amount: number; }
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'producer-svc', commit_hash: 'p',
+        entries: [createManifestEntry('POST', '/x', 'Endpoint_vc_Response', 'producer', 'p.ts', 1)],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'consumer-svc', commit_hash: 'c',
+        entries: [createManifestEntry('POST', '/x', 'Endpoint_vc_Response_Call1', 'consumer', 'c.ts', 1)],
+      };
+
+      const result = await typeChecker.checkCompatibility(producers, consumers, typesProject);
+
+      assert.strictEqual(result.compatiblePairs, 0, 'must NOT read compatible (would be a false-compatible)');
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 1, 'a dangling nested reference must read unverifiable');
+      assert.ok(
+        /unresolved|dangl|not in the bundle|cannot verify/i.test(result.unknownPairs[0].reason),
+        `the reason must name the dangling reference, got: ${result.unknownPairs[0].reason}`
+      );
+    });
+
+    it('does NOT over-abstain: a cleanly-resolved pair with a genuine field type stays a definite verdict', async () => {
+      // Guard against the fix over-firing: identical, cleanly-resolving inlined
+      // shapes (e.g. a nominal class inlined to its wire shape) must keep their
+      // definite verdict, not get swept into unverifiable. No dangling refs here.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export interface Endpoint_ok_Response { cents: number; toJSON: () => { cents: number } }
+        export interface Endpoint_ok_Response_Call1 { cents: number; toJSON: () => { cents: number } }
+        `,
+        { overwrite: true }
+      );
+      const producers: TypeManifest = {
+        repo_name: 'p', commit_hash: 'p',
+        entries: [createManifestEntry('POST', '/x', 'Endpoint_ok_Response', 'producer', 'p.ts', 1)],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'c', commit_hash: 'c',
+        entries: [createManifestEntry('POST', '/x', 'Endpoint_ok_Response_Call1', 'consumer', 'c.ts', 1)],
+      };
+      const result = await typeChecker.checkCompatibility(producers, consumers, typesProject);
+      assert.strictEqual(result.compatiblePairs, 1, 'cleanly-resolving identical shapes stay compatible');
+      assert.strictEqual(result.unknownPairs.length, 0);
+    });
+
     it('should match with path parameter normalization', async () => {
       const producers: TypeManifest = {
         repo_name: 'producer-api',
