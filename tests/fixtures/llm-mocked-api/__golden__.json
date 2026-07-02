@@ -73,10 +73,10 @@
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/routes/users.ts",
       "line": 11,
-      "type_alias": "Endpoint_7624e36e7268b452_Request",
+      "type_alias": "Endpoint_e8e423d0a20a7bde_Response",
       "type_state": "Implicit",
-      "resolved_definition": "export type Endpoint_7624e36e7268b452_Request = { name: string; email: string; };",
-      "expanded_definition": "{ name: string; email: string; }",
+      "resolved_definition": "export type Endpoint_e8e423d0a20a7bde_Response = User;",
+      "expanded_definition": "User",
       "is_explicit": false,
       "primary_type_symbol": "User"
     }
