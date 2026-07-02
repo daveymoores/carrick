@@ -97,6 +97,12 @@ export const SymbolRequestSchema = z.object({
   source_file: z.string().min(1, 'Source file cannot be empty'),
   alias: z.string().optional(),
   // #248: SDL list depth to wrap the bundled element type in (`Order` → `Order[]`).
+  // No upper bound here deliberately: a batch invalid at this schema layer
+  // fails the *whole* bundle request (see the `maxDepth` note above), which
+  // is worse than one bad symbol. The bundler enforces MAX_ARRAY_DEPTH
+  // per-symbol instead, so an over-bound depth becomes a normal
+  // `symbol_failures` entry rather than sinking every other symbol in the
+  // batch.
   array_depth: z.number().int().nonnegative().optional(),
 });
 

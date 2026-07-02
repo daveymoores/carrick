@@ -37,6 +37,17 @@ import type {
 import { expandTypeStructural } from './type-structural-expander.js';
 
 /**
+ * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is
+ * realistically 1-3 levels (`[Order!]!`, at most `[[Order!]!]!`); this is a
+ * generous ceiling, not a realistic value. `array_depth` wraps via string
+ * repetition (`'[]'.repeat(depth)`), so an unbounded value from the model
+ * would let a single symbol blow up the emitted `.d.ts` (and the memory/CPU
+ * spent producing it). Depths above this are treated as unresolvable, same
+ * as any other symbol the bundler can't extract a type for.
+ */
+const MAX_ARRAY_DEPTH = 10;
+
+/**
  * Options for SurfaceEmitter construction
  */
 export interface SurfaceEmitterOptions {
@@ -595,6 +606,12 @@ export class TypeBundler {
     // and the eval's whitespace-collapsed `{...}[]` comparison both hold.
     const depth = symbol.array_depth ?? 0;
     if (depth <= 0) return base;
+    // Reject rather than clamp: silently clamping would emit a type at a
+    // depth the model never asked for, which is wrong in a different way.
+    // Falling through to the symbol's normal "could not extract" failure
+    // keeps this on the existing per-symbol failure path (`symbol_failures`)
+    // instead of rejecting the whole batch.
+    if (depth > MAX_ARRAY_DEPTH) return null;
     const alias = symbol.alias || symbol.symbol_name;
     // Parenthesise a union/intersection/function element so `(A | B)[]` doesn't
     // misparse as `A | B[]` and `(() => T)[]` as `() => T[]`. Decide from the

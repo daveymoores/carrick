@@ -1423,10 +1423,15 @@ fn merge_graphql_resolver_locations(
             };
             let producer = &mut graphql.producers[idx];
             producer.resolver_file = Some(PathBuf::from(path));
+            // Trim before the emptiness check: a whitespace-only string (e.g.
+            // " ") from the model is not a resolver function name, and letting
+            // it through here would wrongly take the FunctionReturn path and
+            // block the type-locate fallback below, leaving the producer
+            // unanchored.
             if llm_op
                 .resolver_function
                 .as_deref()
-                .is_some_and(|f| !f.is_empty())
+                .is_some_and(|f| !f.trim().is_empty())
             {
                 // Resolver located: its concrete return type carries the
                 // wrappers (Promise / ApiResponse envelope / async-iterator) the
@@ -4449,6 +4454,59 @@ mod tests {
         assert_eq!(orders.response_type_source, None);
         // The SDL anchor is untouched.
         assert_eq!(orders.primary_type_symbol.as_deref(), Some("[Order!]!"));
+    }
+
+    /// A whitespace-only `resolver_function` (e.g. `" "`) must be treated the
+    /// same as `None`/empty: it is not a real function name, so it must not
+    /// take the FunctionReturn path, and the type-locate fallback (backing
+    /// type) must still fire.
+    #[test]
+    fn merge_graphql_whitespace_only_resolver_function_is_treated_as_absent() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "orders",
+                Some("[Order!]!"),
+            )],
+            consumers: vec![],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "packages/gateway/src/orders.resolver.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![],
+                graphql_operations: vec![GraphqlOperation {
+                    kind: GraphqlOperationKind::Query,
+                    field: "orders".to_string(),
+                    // Whitespace only, not a real resolver name.
+                    resolver_function: Some("  ".to_string()),
+                    resolver_line: Some(38),
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    backing_type_symbol: Some("Order".to_string()),
+                    backing_type_source: None,
+                }],
+                pubsub_operations: vec![],
+            },
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let orders = graphql
+            .producers
+            .iter()
+            .find(|op| op.key.canonical() == "graphql|query|orders")
+            .expect("orders producer");
+        // No FunctionReturn: a whitespace-only name must not anchor a resolver.
+        assert_eq!(orders.resolver_line, None);
+        // The type-locate fallback still fires (the producer stays anchored).
+        assert_eq!(orders.response_type_symbol.as_deref(), Some("Order"));
     }
 
     /// A typed socket emitter produces a Response-kind manifest entry keyed by
