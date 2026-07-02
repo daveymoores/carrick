@@ -359,13 +359,15 @@ export class TypeInferrer {
       return null;
     }
 
+    const anchor = this.unwrapArrayLevels(awaitedType);
     return this.createInferredType(
       request,
       typeString,
       isExplicit,
       this.getNodeLocation(func),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
-      this.primaryTypeSymbol(awaitedType)
+      this.primaryTypeSymbol(anchor.element),
+      anchor.depth
     );
   }
 
@@ -556,13 +558,15 @@ export class TypeInferrer {
       typeString = this.expandResolvedTypeStructural(resolved, typeString);
     }
 
+    const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(payloadType));
     return this.createInferredType(
       request,
       typeString,
       false,
       this.getNodeLocation(payloadNode),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
-      this.primaryTypeSymbol(this.unwrapPromiseType(payloadType))
+      this.primaryTypeSymbol(anchor.element),
+      anchor.depth
     );
   }
 
@@ -1674,6 +1678,32 @@ export class TypeInferrer {
     return name;
   }
 
+  /**
+   * Peel array levels off a resolved type: `TimelineEvent[]` → element
+   * `TimelineEvent`, depth 1. An array type's own symbol is `Array` (builtin,
+   * filtered), so without this a `T[]` payload has NO anchor and — worse — an
+   * explicit anchor bundled for the same alias silently drops the array-ness
+   * (#306: array-vs-scalar scored compatible). The element drives the anchor
+   * symbol; the depth is reported on the `InferredType` so the bundler's
+   * existing `array_depth` wrap (#248) can restore the `[]` levels on the
+   * explicit bundle. Depth is capped at the bundler's sane ceiling; a deeper
+   * type is treated as depth 0 rather than a runaway loop.
+   */
+  private unwrapArrayLevels(type: Type): { element: Type; depth: number } {
+    const MAX_ANCHOR_ARRAY_DEPTH = 10;
+    let element = type;
+    let depth = 0;
+    while (depth < MAX_ANCHOR_ARRAY_DEPTH) {
+      const el = element.getArrayElementType();
+      if (!el) {
+        return { element, depth };
+      }
+      element = el;
+      depth++;
+    }
+    return { element: type, depth: 0 };
+  }
+
   // ===========================================================================
   // Node Finding
   // ===========================================================================
@@ -2431,7 +2461,8 @@ export class TypeInferrer {
     isExplicit: boolean,
     sourceLocation: SourceLocation,
     payloadTypeString?: string,
-    primaryTypeSymbol?: string
+    primaryTypeSymbol?: string,
+    arrayDepth?: number
   ): InferredType {
     const alias =
       request.alias ||
@@ -2445,6 +2476,12 @@ export class TypeInferrer {
       infer_kind: request.infer_kind,
       payload_type_string: payloadTypeString,
       primary_type_symbol: primaryTypeSymbol,
+      // Only meaningful relative to the anchor symbol: without an element
+      // symbol there is nothing for the explicit-bundle correction to match.
+      array_depth:
+        primaryTypeSymbol !== undefined && arrayDepth !== undefined && arrayDepth > 0
+          ? arrayDepth
+          : undefined,
     };
   }
 

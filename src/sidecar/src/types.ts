@@ -556,9 +556,20 @@ export interface InferredType {
    * from the ts-morph `Type`'s `getSymbol() || getAliasSymbol()` name with
    * TS/lib globals filtered out. Lets the manifest anchor (`primary_type_symbol`)
    * be filled without depending on the LLM. `undefined` when the resolved type
-   * has no single user-defined symbol to anchor on.
+   * has no single user-defined symbol to anchor on. For array types the anchor
+   * is the ELEMENT's symbol (`TimelineEvent` for `TimelineEvent[]`) — the array
+   * type's own symbol is the builtin `Array`, never an anchor.
    */
   primary_type_symbol?: string;
+  /**
+   * Array levels the resolved type wraps around the anchor symbol (#306):
+   * `TimelineEvent[]` reports `primary_type_symbol: 'TimelineEvent'` +
+   * `array_depth: 1`. Lets `resolve_all_types` copy the use-site's array-ness
+   * onto an explicit `SymbolRequest` for the same alias, which would otherwise
+   * bundle the bare element and erase the array (array-vs-scalar scored
+   * compatible, #306). Omitted when 0 or when there is no anchor symbol.
+   */
+  array_depth?: number;
 }
 
 /**

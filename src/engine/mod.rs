@@ -4219,6 +4219,7 @@ mod tests {
             },
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
+            array_depth: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -4246,6 +4247,7 @@ mod tests {
             },
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
+            array_depth: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -4273,6 +4275,7 @@ mod tests {
             },
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: Some(symbol.to_string()),
+            array_depth: None,
         }
     }
 
