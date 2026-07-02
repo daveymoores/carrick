@@ -878,6 +878,7 @@ Analyze this file and return a JSON object with:
 - "mounts": array of mount relationships found
 - "endpoints": array of HTTP endpoint definitions found
 - "data_calls": array of data fetching calls found
+- "pubsub_operations": array of pub/sub publish/subscribe operations found
 
 For each mount, include: line_number, parent_node, child_node, mount_path, import_source (null if local), pattern_matched
 
@@ -898,6 +899,14 @@ primary_type_symbol, type_import_source
   - MUST emit call_expression_line: read the line number from the prefix
   - For payload_expression_text: copy the EXACT payload argument text if detected
   - For payload_expression_line: read the line number from the prefix
+
+For each pubsub_operation, include: topic, role, line_number, primary_type_symbol, type_import_source, broker
+  - topic: the literal topic/channel/subject string (resolve a named const like TOPIC to its string literal)
+  - role: "publisher" if the code SENDS a payload to a topic, "subscriber" if it REGISTERS a handler for a topic
+  - line_number: read the line number from the prefix in the source code
+  - primary_type_symbol: the DECODED application payload type (unwrap envelope/transport wrappers and wire types down to the inner named type); null if untyped
+  - type_import_source: import path where primary_type_symbol is defined (from the import table), or null if local; null whenever primary_type_symbol is null
+  - broker: the messaging library/transport if evident (e.g. "kafka"), else null
 
 Return ONLY the JSON object, no explanations."#,
             // Section order is load-bearing for Vertex implicit prompt caching.
@@ -1718,6 +1727,29 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
         assert!(message.contains("data_fetching_patterns"));
         assert!(message.contains("test.ts"));
         assert!(message.contains("express"));
+    }
+
+    #[test]
+    fn build_user_message_instructs_pubsub_operations() {
+        // The response schema requires `pubsub_operations`, so the message must
+        // also teach it: with no instruction (and nothing in the system prompt)
+        // the lite model omitted the array in 9/12 harness runs on the
+        // corpus-2 Kafka subscriber, silently dropping every pub/sub op in the
+        // file. Instruction and schema were each independently sufficient in
+        // the paired harness experiment (12/12 emission); both ship together.
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+
+        let message = agent.build_user_message("test.ts", "const x = 1;", &guidance);
+
+        assert!(message.contains(
+            "- \"pubsub_operations\": array of pub/sub publish/subscribe operations found"
+        ));
+        assert!(message.contains("For each pubsub_operation, include: topic, role, line_number"));
+        assert!(
+            message.contains("resolve a named const like TOPIC to its string literal"),
+            "topic instruction must teach const-reference resolution"
+        );
     }
 
     fn named(local: &str, source: &str) -> ImportedSymbol {
