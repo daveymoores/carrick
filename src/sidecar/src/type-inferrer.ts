@@ -28,6 +28,7 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
+  type PropertyAssignment,
   type Type,
   type Symbol as TsSymbol,
   ts,
@@ -692,7 +693,7 @@ export class TypeInferrer {
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
-    const located = this.resolveTargetNode(sourceFile, request);
+    let located = this.resolveTargetNode(sourceFile, request);
 
     if (!located) {
       // Line-only anchor: the scanner points a request infer at the route
@@ -747,6 +748,27 @@ export class TypeInferrer {
       return null;
     }
 
+    // A text locator (Gemini `expression_text` + `expression_line`, as opposed
+    // to a byte span) can land on the property itself in `{ body:
+    // JSON.stringify(body) }` — either the whole PropertyAssignment (locator
+    // text is the full `key: value` source) or the property NAME identifier
+    // (locator text is a bare word that exact-matches the name over the
+    // value). Both type as the assigned value's own type — here the useless
+    // `string` result of `JSON.stringify` — not the payload. A property name
+    // is a label, not the contract expression: redirect to the value so the
+    // unwraps below read the real request body. Shorthand (`{ body }`) is
+    // left alone — its identifier already IS the value.
+    if (Node.isPropertyAssignment(located)) {
+      located = located.getInitializer() ?? located;
+    } else if (
+      Node.isIdentifier(located) &&
+      Node.isPropertyAssignment(located.getParent()) &&
+      (located.getParent() as PropertyAssignment).getNameNode() === located
+    ) {
+      const parent = located.getParent() as PropertyAssignment;
+      located = parent.getInitializer() ?? located;
+    }
+
     // Mirror inferCallResult: strip `await`/`as`/parens/`!` so the inner
     // expression's type (not the surrounding `Promise<any>`) is read.
     const unwrapped = this.unwrapExpressionNode(located);
@@ -755,7 +777,31 @@ export class TypeInferrer {
     // is the useless `string`. Drill to the serialized argument so the consumer
     // request shape is the payload's type, not `string`. General: any
     // `JSON.stringify(x)` resolves to the type of `x`.
-    const node = this.unwrapJsonStringifyArg(unwrapped);
+    let node = this.unwrapJsonStringifyArg(unwrapped);
+
+    // A locator can also land on a serialized IDENTIFIER one value-hop from
+    // the payload — `const body = JSON.stringify(payload); sendBeacon(url,
+    // body)` — whose own declared type is `string`, the same useless result
+    // the direct-call unwrap above already handles. Follow the identifier to
+    // its declaration and, only when that declaration's initializer is itself
+    // a `JSON.stringify(...)` call, resolve through to the serialized
+    // argument. One hop only: an identifier declared from anything else
+    // already carries its own correct type and must not be rewritten.
+    if (Node.isIdentifier(node)) {
+      for (const def of node.getDefinitionNodes()) {
+        const varDecl = Node.isVariableDeclaration(def)
+          ? def
+          : def.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+        const initializer = varDecl?.getInitializer();
+        if (!initializer) continue;
+        const unwrappedInit = this.unwrapExpressionNode(initializer);
+        const stringifyArg = this.unwrapJsonStringifyArg(unwrappedInit);
+        if (stringifyArg !== unwrappedInit) {
+          node = stringifyArg;
+          break;
+        }
+      }
+    }
 
     const payloadType = node.getType();
     let typeString = typeText(payloadType, node);
