@@ -313,6 +313,14 @@ export interface SymbolRequest {
   source_file: string;
   /** Optional alias for the exported type */
   alias?: string;
+  /**
+   * Wrap the bundled symbol in this many TS array levels (#248). A GraphQL SDL
+   * producer field `[Order!]!` backed by `interface Order` bundles `Order` with
+   * `array_depth: 1`, so the sidecar emits `Order[]`: the element type carries
+   * the shape, the SDL list marker carries the depth. Omitted/`0` bundles the
+   * symbol as-is (the HTTP/socket/consumer default).
+   */
+  array_depth?: number;
 }
 
 /**

@@ -37,6 +37,17 @@ import type {
 import { expandTypeStructural } from './type-structural-expander.js';
 
 /**
+ * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is
+ * realistically 1-3 levels (`[Order!]!`, at most `[[Order!]!]!`); this is a
+ * generous ceiling, not a realistic value. `array_depth` wraps via string
+ * repetition (`'[]'.repeat(depth)`), so an unbounded value from the model
+ * would let a single symbol blow up the emitted `.d.ts` (and the memory/CPU
+ * spent producing it). Depths above this are treated as unresolvable, same
+ * as any other symbol the bundler can't extract a type for.
+ */
+const MAX_ARRAY_DEPTH = 10;
+
+/**
  * Options for SurfaceEmitter construction
  */
 export interface SurfaceEmitterOptions {
@@ -582,6 +593,62 @@ export class TypeBundler {
   }
 
   private extractTypeDefinition(
+    symbol: SymbolRequest
+  ): { definition: string; typeString: string } | null {
+    const base = this.extractTypeDefinitionBase(symbol);
+    if (!base) return null;
+
+    // #248: wrap the resolved element type in the SDL list depth. A GraphQL
+    // producer field `[Order!]!` backed by `interface Order` bundles `Order`
+    // with `array_depth: 1`; the alias becomes `Order[]` (arrays can't be
+    // interfaces, so it is always emitted as a type alias). The element's
+    // structurally-expanded body carries the shape, so downstream resolution
+    // and the eval's whitespace-collapsed `{...}[]` comparison both hold.
+    const depth = symbol.array_depth ?? 0;
+    if (depth <= 0) return base;
+    // Reject rather than clamp: silently clamping would emit a type at a
+    // depth the model never asked for, which is wrong in a different way.
+    // Falling through to the symbol's normal "could not extract" failure
+    // keeps this on the existing per-symbol failure path (`symbol_failures`)
+    // instead of rejecting the whole batch.
+    if (depth > MAX_ARRAY_DEPTH) return null;
+    const alias = symbol.alias || symbol.symbol_name;
+    // Parenthesise a union/intersection/function element so `(A | B)[]` doesn't
+    // misparse as `A | B[]` and `(() => T)[]` as `() => T[]`. Decide from the
+    // TYPE (not the string): a single object literal `{ a: A | B }` is NOT a
+    // top-level union and must stay unparenthesised (`{ a: A | B }[]`).
+    const element = this.elementNeedsArrayParens(symbol)
+      ? `(${base.typeString})`
+      : base.typeString;
+    const typeString = `${element}${'[]'.repeat(depth)}`;
+    return { definition: `export type ${alias} = ${typeString};`, typeString };
+  }
+
+  /// Whether the element type must be parenthesised before an `[]` suffix.
+  /// Interfaces/classes/enums are always object/nominal (never a top-level
+  /// union), so only type aliases and typed variables can carry a bare
+  /// union/intersection/function that would misparse; those are re-resolved
+  /// from the source Type here (this runs only on the rare array_depth path).
+  private elementNeedsArrayParens(symbol: SymbolRequest): boolean {
+    const absolutePath = path.isAbsolute(symbol.source_file)
+      ? symbol.source_file
+      : path.resolve(this.repoRoot, symbol.source_file);
+    const sourceFile = this.project.getSourceFile(absolutePath);
+    if (!sourceFile) return false;
+    const name = symbol.symbol_name;
+    const decl =
+      sourceFile.getTypeAlias(name) ?? sourceFile.getVariableDeclaration(name);
+    if (!decl) return false;
+    const t = decl.getType();
+    return (
+      t.isUnion() ||
+      t.isIntersection() ||
+      t.getCallSignatures().length > 0 ||
+      t.getConstructSignatures().length > 0
+    );
+  }
+
+  private extractTypeDefinitionBase(
     symbol: SymbolRequest
   ): { definition: string; typeString: string } | null {
     const absolutePath = path.isAbsolute(symbol.source_file)

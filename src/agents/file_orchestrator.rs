@@ -639,6 +639,7 @@ impl FileOrchestrator {
                         symbol_name,
                         source_file,
                         alias,
+                        array_depth: None,
                     });
                 }
             };
@@ -1151,6 +1152,7 @@ impl FileOrchestrator {
                     symbol_name: symbol.clone(),
                     source_file,
                     alias: Some(alias),
+                    array_depth: None,
                 });
             }
         };
@@ -1272,6 +1274,7 @@ impl FileOrchestrator {
                         symbol_name: symbol.clone(),
                         source_file,
                         alias: Some(alias),
+                        array_depth: None,
                     });
                 }
             }
@@ -1341,12 +1344,58 @@ impl FileOrchestrator {
                     symbol_name: symbol.clone(),
                     source_file,
                     alias: Some(alias),
+                    array_depth: None,
+                });
+            }
+        }
+        let consumer_count = requests.len();
+
+        // #248: SDL producer fields with no resolver but a co-located backing
+        // type. Unlike the resolver path (a `FunctionReturn` infer whose concrete
+        // return carries wrappers), this bundles the located element type and
+        // wraps it in the SDL list depth (`Order` + `[Order!]!` → `Order[]`). The
+        // symbol resolves against the file the entry came from (`resolver_file`),
+        // following `response_type_source` when the type is imported.
+        for op in &graphql.producers {
+            let Some(symbol) = op.response_type_symbol.as_ref() else {
+                continue;
+            };
+            let Some(entry_file) = op.resolver_file.as_ref() else {
+                continue;
+            };
+            let file_abs =
+                Self::to_absolute_path(&entry_file.to_string_lossy(), &repo_root_absolute);
+            let source_file = match op.response_type_source.as_ref() {
+                Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                None => file_abs,
+            };
+            let alias = build_manifest_type_alias(
+                &op.key,
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            );
+            // SDL list depth carries the array-ness; the bundled element type
+            // carries the shape. `0` (a non-list field) bundles as-is.
+            let array_depth = op
+                .primary_type_symbol
+                .as_deref()
+                .map(crate::graphql::graphql_list_depth)
+                .filter(|&d| d > 0);
+            let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
+            if seen.insert(dedup_key) {
+                requests.push(SymbolRequest {
+                    symbol_name: symbol.clone(),
+                    source_file,
+                    alias: Some(alias),
+                    array_depth,
                 });
             }
         }
         debug!(
-            "[FileOrchestrator] Collected {} graphql consumer type requests",
-            requests.len()
+            "[FileOrchestrator] Collected {} graphql type requests ({} consumer, {} producer type-locate)",
+            requests.len(),
+            consumer_count,
+            requests.len() - consumer_count,
         );
         requests
     }
