@@ -478,6 +478,61 @@ per-stub `node_modules`), with these corrections:
   not eliminated: genuinely conflicting majors intentionally verdict
   incompatible.
 
+## TypeScript version policy, and TypeScript 7 (ts-go)
+
+Where the TS version materially matters, and where it doesn't:
+
+- **Verdict semantics:** assignability is stable across versions; new
+  strictness is opt-in. Version drift is not a verdict-accuracy risk in
+  practice, but determinism demands **one pinned judge version for the whole
+  fleet** (an accidental feature of today's force-pinned `typescript@5.8.3`
+  that becomes an explicit policy: the check phase pins its own compiler and
+  records it in results).
+- **Capture emit:** the artifact records `ts_version`; the judge's parser
+  must be ≥ the newest capture version (older-emitted `.d.ts` parse fine
+  under newer compilers; the reverse can fail on new syntax).
+- **Deprecation clock:** `baseUrl` is deprecated in TS 6 and gone in TS 7,
+  which retires today's `create_dynamic_tsconfig` gymnastics on its own
+  schedule and reinforces the post-emit specifier-rewrite pass as the
+  correct home for path-alias handling.
+
+**TypeScript 7 (the Go-native compiler) is an argument *for* this design,
+and the adoption line falls exactly on the v2 architecture's seam.** As of
+the 7.0 RC (June 2026), `typescript@rc`'s `tsc` *is* the native compiler
+(~10× faster, shared-memory parallelism), but the stable programmatic API
+slips to 7.1+ — and ts-morph, which wraps the JS ("Strada") compiler API, is
+fully broken on 7.0. That splits cleanly:
+
+- **Check phase: TS7-ready by construction.** v2 deliberately reduces the
+  judge to "run `tsc --noEmit` over real files and classify diagnostics by
+  file + code" — no compiler API at all. Swapping the judge to the native
+  `tsc` is a version bump, and it lands the speedup on precisely the flagged
+  landing precondition (cold-check wall-clock over N isolated stub programs).
+  As a native binary it also removes the check phase's Node/npx dependency.
+  Spike must verify: diagnostic-code parity for the classifier's buckets, and
+  behavior on the probe/gate patterns.
+- **Capture phase: primary tier is TS7-ready; fallback tier is not.** The
+  `emitted` tier is a CLI-shaped declaration emit of a generated entry — no
+  API — but TS7's declaration emit intentionally differs from TS6's
+  (isolated-declarations-leaning); the corpus spike decides whether capture
+  emits on 7 or stays on 6 initially (6-emitted trees check fine under a 7
+  judge, so the phases can adopt independently). The `node_builder` fallback,
+  span→node anchor location, and the inferrer's machinery unwrapping are
+  genuine compiler-API work: they stay on ts-morph/TS6 (side-by-side via the
+  `@typescript/typescript6` compat package if the sidecar also carries 7)
+  until the stable 7.1 API, then migrate.
+- **The deeper alignment:** the current system cannot ride ts-go at all —
+  both the sidecar's extraction and `ts_check`'s `isAssignableTo` live inside
+  the JS compiler API. v2's philosophy (shift heavy lifting from API calls
+  into "generate real files, let the compiler batch-process them") is exactly
+  what makes the native compiler adoptable incrementally, and every anchor
+  the capture phase moves from `node_builder` to `emitted` shrinks the
+  remaining API dependence.
+
+Policy: do not gate the migration on TS7. Pin the judge, measure the spike on
+both 6.x and the 7.0 RC, take the faster one that passes diagnostic-parity,
+and revisit the sidecar's API usage at 7.1.
+
 ## Future hook: wire-truth vs type-truth
 
 TS assignability is a proxy for what Carrick actually claims: **wire
