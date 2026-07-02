@@ -398,7 +398,17 @@ impl AgentSchemas {
                                 "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Read the import statements at the top of the file."
                             }
                         },
-                        "required": ["candidate_id", "line_number", "target", "pattern_matched"]
+                        // The four locator fields are required-but-nullable: the
+                        // lite model OMITS optional fields entirely (~8/12 runs
+                        // dropped payload_expression_line on the corpus-1 POST
+                        // /payments consumer), which starves the sidecar and
+                        // collapses the compat verdict to None. Requiring them
+                        // forces an explicit null instead — measured 12/12
+                        // emission with no hallucinated payload on GET calls.
+                        // Locator fields only; judgment fields (primary_type_symbol)
+                        // must stay optional — requiring them borrows the request
+                        // type when null is correct.
+                        "required": ["candidate_id", "line_number", "target", "pattern_matched", "call_expression_text", "call_expression_line", "payload_expression_text", "payload_expression_line"]
                     }
                 },
                 "graphql_operations": {
@@ -514,7 +524,17 @@ impl AgentSchemas {
                     }
                 }
             },
-            "required": ["mounts", "endpoints", "data_calls"]
+            // `pubsub_operations` is required so the model must always emit the
+            // array (empty when a file has none). As an optional property the
+            // lite model omitted it in 9/12 harness runs on the corpus-2 Kafka
+            // subscriber — the schema is pub/sub extraction's ONLY signal (the
+            // system prompt says nothing about it), so omission silently drops
+            // every pub/sub op in the file. An empty array is always
+            // groundable, so requiring it cannot force hallucination.
+            // `graphql_consumer_locates` stays optional deliberately: its
+            // instruction is "omit the entry rather than guess" — judgment,
+            // not location.
+            "required": ["mounts", "endpoints", "data_calls", "pubsub_operations"]
         })
     }
 
@@ -899,9 +919,46 @@ mod tests {
             );
         }
 
-        // pubsub_operations is optional at the top level: a model may omit it.
+        // pubsub_operations is REQUIRED at the top level. The schema is pub/sub
+        // extraction's only signal, and an optional array is one the lite model
+        // omits (measured 9/12 dropped ops on the corpus-2 Kafka subscriber);
+        // requiring it forces an explicit (possibly empty) array every response.
         let top_required = schema["required"].as_array().unwrap();
-        assert!(!top_required.iter().any(|v| v == "pubsub_operations"));
+        assert!(
+            top_required.iter().any(|v| v == "pubsub_operations"),
+            "pubsub_operations must be top-level required — optional emission drops pub/sub ops"
+        );
+    }
+
+    #[test]
+    fn data_call_locator_fields_are_required_but_type_judgment_stays_optional() {
+        // Locator fields (verbatim text + line) are required-but-nullable so the
+        // model must emit an explicit null instead of omitting them — omission
+        // starves the sidecar and collapses compat verdicts to None (corpus-1
+        // POST /payments consumer, 8/12 runs dropped payload_expression_line).
+        // Judgment fields (primary_type_symbol / type_import_source) must stay
+        // optional: requiring them borrows the request type when null is correct.
+        let schema = AgentSchemas::file_analysis_schema();
+        let required = schema["properties"]["data_calls"]["items"]["required"]
+            .as_array()
+            .expect("data_calls item required array must exist");
+        for field in [
+            "call_expression_text",
+            "call_expression_line",
+            "payload_expression_text",
+            "payload_expression_line",
+        ] {
+            assert!(
+                required.iter().any(|v| v == field),
+                "data_calls item required must contain locator field {field}"
+            );
+        }
+        for field in ["primary_type_symbol", "type_import_source"] {
+            assert!(
+                !required.iter().any(|v| v == field),
+                "judgment field {field} must NOT be required on data_calls"
+            );
+        }
     }
 
     #[test]
