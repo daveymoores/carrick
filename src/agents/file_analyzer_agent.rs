@@ -897,8 +897,8 @@ primary_type_symbol, type_import_source
   - Echo candidate_id from the candidate context
   - MUST emit call_expression_text: copy the EXACT text of the fetch/axios/HTTP call (e.g., 'fetch("/api/users")')
   - MUST emit call_expression_line: read the line number from the prefix
-  - For payload_expression_text: copy the EXACT payload argument text if detected
-  - For payload_expression_line: read the line number from the prefix
+  - For payload_expression_text: copy the EXACT payload argument text if detected; emit null when the call sends no payload
+  - For payload_expression_line: read the line number from the prefix; null whenever payload_expression_text is null
 
 For each pubsub_operation, include: topic, role, line_number, primary_type_symbol, type_import_source, broker
   - topic: the literal topic/channel/subject string (resolve a named const like TOPIC to its string literal)
