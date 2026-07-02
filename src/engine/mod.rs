@@ -959,7 +959,16 @@ async fn analyze_current_repo_incremental(
 
             // Rebuild mount graph from full merged results
             let graph_orchestrator = FileOrchestrator::new(agent_service.clone());
-            let mount_graph = graph_orchestrator.build_mount_graph(&merged_results, &normalizer);
+            let mut mount_graph =
+                graph_orchestrator.build_mount_graph(&merged_results, &normalizer);
+
+            // Deterministic protocol scans run BEFORE the graph is projected:
+            // the GraphQL consumer file set folds transport data calls out of
+            // the graph (#307) so every downstream surface (cloud projection,
+            // type manifest, type requests) sees the same call set.
+            let protocol_extractions =
+                scan_protocol_extractions(repo_path, service, &files, &merged_results);
+            fold_graphql_transport_calls(&mut mount_graph, &protocol_extractions.graphql);
 
             // Generate function intents (also strips body_source before upload).
             // Run on the same path as the full analysis so incremental scans
@@ -1000,11 +1009,9 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
-            let protocol_extractions = append_deterministic_protocol_operations(
+            append_deterministic_protocol_operations(
                 &mut cloud_data,
-                repo_path,
-                service,
-                &files,
+                &protocol_extractions,
                 &merged_results,
             );
 
@@ -1181,13 +1188,90 @@ fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
     roots
 }
 
-fn append_deterministic_protocol_operations(
-    cloud_data: &mut CloudRepoData,
+/// Run the deterministic protocol scans (GraphQL SDL/documents, Socket.IO)
+/// and join in the file-analyzer's located types. Split from
+/// `append_deterministic_protocol_operations` so the extractions exist BEFORE
+/// the mount graph is projected into cloud data — the GraphQL consumer file
+/// set drives `fold_graphql_transport_calls` on the graph first (#307).
+fn scan_protocol_extractions(
     repo_path: &str,
     service: &Config,
     files: &[PathBuf],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) -> ProtocolExtractions {
+    let scan_roots = service_graphql_roots(repo_path, service);
+    let mut graphql = crate::graphql::scan_repo(&scan_roots, files);
+    merge_graphql_resolver_locations(&mut graphql, file_results);
+    merge_graphql_consumer_locations(&mut graphql, file_results);
+    let sockets = crate::socket_io::scan_files(files);
+    ProtocolExtractions { graphql, sockets }
+}
+
+/// #307 (class 2): drop LLM HTTP data calls that are the TRANSPORT of
+/// deterministically-extracted GraphQL consumer operations — one contract must
+/// not be indexed twice. A file whose `gql` documents produced consumer ops
+/// executes them over a POST to the client's endpoint URL, which the
+/// file-analyzer also reports as an HTTP data call (`POST ${GQL_URL}/graphql`);
+/// the document ops are the real modeled contract, so the transport call is
+/// folded into them. Only env-templated / absolute-URL targets are folded: a
+/// plain relative literal path in the same file is a distinct same-origin REST
+/// call and is kept. The shape test reads the RAW `target_url`, not
+/// `canonical_path` — `consumer_call_path` strips a declared-internal env-var
+/// base (`${GQL_URL}/graphql` → `/graphql`), which would otherwise let the
+/// transport leak for exactly the users who configured `internalEnvVars`.
+/// Known limitation (logged): a REST call built on a DIFFERENT env-var base
+/// inside a gql-consumer file is folded too — accepted over leaking a phantom
+/// HTTP contract for every GraphQL client file.
+fn fold_graphql_transport_calls(
+    mount_graph: &mut crate::mount_graph::MountGraph,
+    graphql: &crate::graphql::GraphqlExtraction,
+) {
+    if graphql.consumers.is_empty() {
+        return;
+    }
+    // Normalize both sides component-wise so a `./`-prefixed walk path and a
+    // bare file key still join (`components()` keeps a LEADING CurDir, so it
+    // is skipped explicitly).
+    let normalize_file = |p: &Path| -> PathBuf {
+        p.components()
+            .skip_while(|c| matches!(c, std::path::Component::CurDir))
+            .collect()
+    };
+    let consumer_files: HashSet<PathBuf> = graphql
+        .consumers
+        .iter()
+        .map(|op| normalize_file(&op.file_path))
+        .collect();
+    mount_graph.data_calls.retain(|call| {
+        let raw = call.target_url.trim_matches(['`', '"', '\'']);
+        let is_transport_shape = raw.contains("${")
+            || raw.contains("process.env.")
+            || raw.starts_with("http://")
+            || raw.starts_with("https://");
+        if !is_transport_shape {
+            return true;
+        }
+        let Some((file, _line)) = call.file_location.rsplit_once(':') else {
+            return true;
+        };
+        let file_norm = normalize_file(Path::new(file));
+        if consumer_files.contains(&file_norm) {
+            debug!(
+                "Folding GraphQL transport call {} {} ({}) into its document operations",
+                call.method, call.canonical_path, file
+            );
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn append_deterministic_protocol_operations(
+    cloud_data: &mut CloudRepoData,
+    extractions: &ProtocolExtractions,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
     // Same "{file}:{line}" convention the mount-graph conversions use
     let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
         owner: None,
@@ -1203,10 +1287,7 @@ fn append_deterministic_protocol_operations(
         service_name: None,
     };
 
-    let scan_roots = service_graphql_roots(repo_path, service);
-    let mut graphql = crate::graphql::scan_repo(&scan_roots, files);
-    merge_graphql_resolver_locations(&mut graphql, file_results);
-    merge_graphql_consumer_locations(&mut graphql, file_results);
+    let graphql = &extractions.graphql;
     if !graphql.is_empty() {
         debug!(
             producers = graphql.producers.len(),
@@ -1227,7 +1308,7 @@ fn append_deterministic_protocol_operations(
         );
     }
 
-    let sockets = crate::socket_io::scan_files(files);
+    let sockets = &extractions.sockets;
     if !sockets.is_empty() {
         debug!(
             listeners = sockets.listeners.len(),
@@ -1249,8 +1330,6 @@ fn append_deterministic_protocol_operations(
     }
 
     append_pubsub_operations(cloud_data, file_results, &to_details);
-
-    ProtocolExtractions { graphql, sockets }
 }
 
 /// Fold the file-analyzer's `pubsub_operations` into `cloud_data` so they reach
@@ -2496,6 +2575,19 @@ async fn analyze_current_repo(
     // 4c. Compose function signatures, inferring unannotated slots via sidecar.
     populate_function_signatures(sidecar, &mut function_definitions, repo_path);
 
+    // 4d. Deterministic protocol scans run BEFORE the graph is projected: the
+    // GraphQL consumer file set folds transport data calls out of the mount
+    // graph (#307) so every downstream surface (cloud projection, type
+    // manifest, type requests) sees the same call set.
+    let protocol_extractions =
+        scan_protocol_extractions(repo_path, service, &files, &analysis_result.file_results);
+    let mut analysis_result = analysis_result;
+    fold_graphql_transport_calls(
+        &mut analysis_result.mount_graph,
+        &protocol_extractions.graphql,
+    );
+    let analysis_result = analysis_result;
+
     // 5. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
     let mut cloud_data = CloudRepoData::from_multi_agent_results(
         repo_name.clone(),
@@ -2506,11 +2598,9 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions.clone(),
     );
-    let protocol_extractions = append_deterministic_protocol_operations(
+    append_deterministic_protocol_operations(
         &mut cloud_data,
-        repo_path,
-        service,
-        &files,
+        &protocol_extractions,
         &analysis_result.file_results,
     );
 
@@ -4469,6 +4559,132 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
         }
+    }
+
+    /// #307 (class 2) helper: an LLM HTTP data call at a given file/target.
+    fn transport_call(target: &str, file_location: &str) -> crate::mount_graph::DataFetchingCall {
+        crate::mount_graph::DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: target.to_string(),
+            canonical_path: target.to_string(),
+            client: "fetch(".to_string(),
+            file_location: file_location.to_string(),
+            call_kind: None,
+            repo_name: None,
+        }
+    }
+
+    /// #307 (class 2): an env-templated HTTP call in a file whose gql documents
+    /// produced consumer ops is that file's transport — folded. A relative
+    /// literal call in the same file (same-origin REST) and an env-templated
+    /// call in an unrelated file both stay.
+    #[test]
+    fn fold_drops_graphql_transport_calls_only() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            transport_call("${SUPPORT_GQL_URL}/graphql", "src/gql.ts:25"),
+            transport_call("/api/tickets", "src/gql.ts:30"),
+            transport_call("${ORDERS_API}/orders", "src/orders.ts:12"),
+        ];
+        let graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![graphql_consumer_op_at(
+                crate::operation::GraphqlOperationKind::Mutation,
+                "escalateTicket",
+                "src/gql.ts",
+                None,
+            )],
+        };
+
+        fold_graphql_transport_calls(&mut mount_graph, &graphql);
+
+        let targets: Vec<&str> = mount_graph
+            .data_calls
+            .iter()
+            .map(|c| c.target_url.as_str())
+            .collect();
+        assert_eq!(targets, vec!["/api/tickets", "${ORDERS_API}/orders"]);
+    }
+
+    /// A declared-internal env-var base strips to a bare path in
+    /// `canonical_path` (`${GQL_URL}/graphql` → `/graphql`), so the transport
+    /// shape must be read off the RAW target or the fold would leak for
+    /// exactly the users who configured `internalEnvVars` (Copilot review).
+    #[test]
+    fn fold_reads_raw_target_not_stripped_canonical() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "`${SUPPORT_GQL_URL}/graphql`".to_string(),
+            canonical_path: "/graphql".to_string(),
+            client: "fetch(".to_string(),
+            file_location: "src/gql.ts:25".to_string(),
+            call_kind: None,
+            repo_name: None,
+        }];
+        let graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![graphql_consumer_op_at(
+                crate::operation::GraphqlOperationKind::Mutation,
+                "escalateTicket",
+                "src/gql.ts",
+                None,
+            )],
+        };
+
+        fold_graphql_transport_calls(&mut mount_graph, &graphql);
+
+        assert!(
+            mount_graph.data_calls.is_empty(),
+            "internal-stripped canonical must still fold via the raw target"
+        );
+    }
+
+    /// The file join must normalize path components: the graphql walk can
+    /// yield a `./`-prefixed path while the data call's file key is bare.
+    #[test]
+    fn fold_joins_dot_prefixed_walk_paths() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![transport_call(
+            "https://support.example.com/graphql",
+            "src/gql.ts:25",
+        )];
+        let graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![graphql_consumer_op_at(
+                crate::operation::GraphqlOperationKind::Query,
+                "ticket",
+                "./src/gql.ts",
+                None,
+            )],
+        };
+
+        fold_graphql_transport_calls(&mut mount_graph, &graphql);
+
+        assert!(
+            mount_graph.data_calls.is_empty(),
+            "absolute-URL transport in a ./-walked gql-consumer file must fold"
+        );
+    }
+
+    /// Producer-only extractions (an SDL service with no documents) must not
+    /// fold anything — the transport fold is a CONSUMER-side dedup.
+    #[test]
+    fn fold_ignores_producer_only_extractions() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![transport_call("${SOME_API}/things", "src/schema.ts:5")];
+        let graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                crate::operation::GraphqlOperationKind::Query,
+                "order",
+                Some("Order"),
+            )],
+            consumers: vec![],
+        };
+
+        fold_graphql_transport_calls(&mut mount_graph, &graphql);
+
+        assert_eq!(mount_graph.data_calls.len(), 1);
     }
 
     /// Variant of `graphql_consumer_op` with a caller-chosen `kind` and

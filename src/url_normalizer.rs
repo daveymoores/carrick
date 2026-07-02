@@ -508,6 +508,43 @@ impl UrlNormalizer {
         }
     }
 
+    /// Whether a canonical consumer path carries at least one LITERAL segment —
+    /// text that could ever equal a producer path segment. A call whose
+    /// canonical path is nothing but template interpolations and params
+    /// (`${baseUrl}${path}`, `${GATEWAY_GQL_URL}`, `/:id`) can never match any
+    /// producer key, so it is pure index noise (#307): typically a wrapper's
+    /// internal fetch, whose RESOLVED call-site emissions are extracted
+    /// separately and do match. Full http(s) URLs count as literal — an
+    /// external call kept verbatim is a real reportable operation, host and
+    /// all.
+    pub fn canonical_path_has_literal_segment(path: &str) -> bool {
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return true;
+        }
+        path.split('/').any(|segment| {
+            // Placeholder styles are the MATCHER's definition
+            // (`MountGraph::is_param_segment`: `:id`, `{id}`, `<id>`, `[id]`),
+            // so the gate and the matcher agree on what can never be literal.
+            if segment.is_empty()
+                || segment == "*"
+                || crate::mount_graph::MountGraph::is_param_segment(segment)
+            {
+                return false;
+            }
+            // Strip leading `${...}` interpolations; any residue is literal
+            // text (`v${n}` counts as literal, `${a}${b}` does not).
+            let mut rest = segment;
+            while let Some(after) = rest.strip_prefix("${") {
+                match after.find('}') {
+                    Some(end) => rest = &after[end + 1..],
+                    None => return true, // unterminated template: treat as literal
+                }
+            }
+            !rest.is_empty()
+        })
+    }
+
     /// Heuristic check for URL-like inputs to avoid matching variable names as paths.
     pub fn is_probable_url(&self, url: &str) -> bool {
         let trimmed = url.trim();
@@ -854,6 +891,41 @@ mod tests {
         let path = normalizer.extract_path("https://example.com/api/users?page=1");
 
         assert_eq!(path, "/api/users");
+    }
+
+    /// #307 (class 1): the noise gate — a canonical path with nothing but
+    /// template/param segments can never match a producer key.
+    #[test]
+    fn canonical_path_literal_segment_detection() {
+        let has = UrlNormalizer::canonical_path_has_literal_segment;
+
+        // Pure noise: wrapper-internal templates and bare env-var bases.
+        assert!(!has("${baseUrl}${path}"));
+        assert!(!has("${NEXT_PUBLIC_GATEWAY_GQL_URL}"));
+        assert!(!has("${GATEWAY_GQL_WS_URL}"));
+        assert!(!has("/${slug}"));
+        assert!(!has("/:param"));
+        assert!(!has("/"));
+
+        // Non-colon placeholder styles are params by the MATCHER's own
+        // definition (`MountGraph::is_param_segment`), never literals.
+        assert!(!has("/{id}"));
+        assert!(!has("/<id>"));
+        assert!(!has("/[...slug]"));
+        assert!(has("/users/{id}"));
+
+        // Any literal segment keeps the call, wherever the template sits.
+        assert!(has("${SUPPORT_GQL_URL}/graphql"));
+        assert!(has("/orders/:orderId/timeline"));
+        assert!(has("/orders/${orderId}/timeline"));
+        assert!(has("/track"));
+        assert!(has("/v${apiVersion}")); // mixed segment counts as literal
+
+        // Full URLs are substantive as-is (external calls stay reportable),
+        // and a query interpolation never counts against the path.
+        assert!(has("https://api.stripe.com/v1/charges"));
+        assert!(has("https://orders.internal/api/orders?user=${userId}"));
+        assert!(!has("/${a}?page=${n}"));
     }
 
     #[test]
