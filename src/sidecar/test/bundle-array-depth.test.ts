@@ -127,6 +127,33 @@ describe('array_depth wraps a bundled symbol in TS array levels (#248)', () => {
     );
   });
 
+  it('fails a symbol whose base is declaration text instead of emitting invalid .d.ts', async () => {
+    const ALIAS = 'Endpoint_arr5_Response';
+    const bundle = await client.send<BundleResponseShape>({
+      action: 'bundle',
+      request_id: 'arr-bundle-5',
+      symbols: [
+        // UserTier is an enum: its base typeString is the declaration text
+        // (`export enum UserTier {...}`), not a type expression, so an
+        // array wrap would emit `export type A = export enum UserTier {...}[];`
+        // — unparseable .d.ts. It must land in symbol_failures instead.
+        { symbol_name: 'UserTier', source_file: TYPES_FIXTURE, alias: ALIAS, array_depth: 1 },
+      ],
+    });
+
+    assert.strictEqual(
+      bundle.status,
+      'success',
+      `expected the batch to still succeed with a per-symbol failure, got: ${JSON.stringify(bundle)}`,
+    );
+    const dts = bundle.dts_content ?? '';
+    assert.ok(!dts.includes(ALIAS), `declaration-text alias must not be emitted, got:\n${dts}`);
+    assert.ok(
+      bundle.symbol_failures?.some((f) => f.symbol_name === 'UserTier'),
+      `expected a symbol_failures entry for the enum symbol, got: ${JSON.stringify(bundle.symbol_failures)}`,
+    );
+  });
+
   it('treats an array_depth above the sane ceiling as an unresolvable symbol, not a huge type', async () => {
     const ALIAS = 'Endpoint_arr4_Response';
     const bundle = await client.send<BundleResponseShape>({

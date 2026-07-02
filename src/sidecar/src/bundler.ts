@@ -612,6 +612,12 @@ export class TypeBundler {
     // keeps this on the existing per-symbol failure path (`symbol_failures`)
     // instead of rejecting the whole batch.
     if (depth > MAX_ARRAY_DEPTH) return null;
+    // The wrap suffixes `typeString` with `[]`, which is only valid when it is
+    // a standalone type EXPRESSION. The base's fallback branches (interface
+    // whose expansion failed, class/enum/function) return declaration text,
+    // and `export type A = enum X {...}[]` is not parseable .d.ts — fail the
+    // symbol instead, same per-symbol path as an over-depth request.
+    if (!base.typeStringIsExpression) return null;
     const alias = symbol.alias || symbol.symbol_name;
     // Parenthesise a union/intersection/function element so `(A | B)[]` doesn't
     // misparse as `A | B[]` and `(() => T)[]` as `() => T[]`. Decide from the
@@ -648,9 +654,13 @@ export class TypeBundler {
     );
   }
 
+  // `typeStringIsExpression`: whether `typeString` is a standalone type
+  // expression (an object body, alias RHS, or `Type#getText()`), as opposed to
+  // verbatim declaration text from a fallback branch. Only expressions can be
+  // array-wrapped by `extractTypeDefinition`.
   private extractTypeDefinitionBase(
     symbol: SymbolRequest
-  ): { definition: string; typeString: string } | null {
+  ): { definition: string; typeString: string; typeStringIsExpression: boolean } | null {
     const absolutePath = path.isAbsolute(symbol.source_file)
       ? symbol.source_file
       : path.resolve(this.repoRoot, symbol.source_file);
@@ -677,7 +687,7 @@ export class TypeBundler {
       const text = iface.getText();
       if (expanded) {
         const definition = `export interface ${alias} ${expanded}`;
-        return { definition, typeString: expanded };
+        return { definition, typeString: expanded, typeStringIsExpression: true };
       }
       const typeString = text;
       const alreadyExported = text.trimStart().startsWith('export');
@@ -688,7 +698,7 @@ export class TypeBundler {
         : alreadyExported
           ? text
           : `export ${text}`;
-      return { definition, typeString };
+      return { definition, typeString, typeStringIsExpression: false };
     }
 
     // Try type alias
@@ -702,7 +712,7 @@ export class TypeBundler {
       const expanded = expandTypeStructural(typeAlias.getType());
       if (expanded && expanded !== 'unknown') {
         const definition = `export type ${alias} = ${expanded};`;
-        return { definition, typeString: expanded };
+        return { definition, typeString: expanded, typeStringIsExpression: true };
       }
       const typeString = typeAlias.getType().getText();
       const alreadyExported = text.trimStart().startsWith('export');
@@ -713,7 +723,7 @@ export class TypeBundler {
         : alreadyExported
           ? text
           : `export ${text}`;
-      return { definition, typeString };
+      return { definition, typeString, typeStringIsExpression: true };
     }
 
     // Try class
@@ -729,7 +739,7 @@ export class TypeBundler {
         : alreadyExported
           ? text
           : `export declare ${text}`;
-      return { definition, typeString };
+      return { definition, typeString, typeStringIsExpression: false };
     }
 
     // Try enum
@@ -745,7 +755,7 @@ export class TypeBundler {
         : alreadyExported
           ? text
           : `export ${text}`;
-      return { definition, typeString };
+      return { definition, typeString, typeStringIsExpression: false };
     }
 
     // Try variable (const type definitions)
@@ -754,7 +764,7 @@ export class TypeBundler {
       const type = varDecl.getType();
       const typeString = type.getText();
       const definition = `export type ${alias} = ${typeString};`;
-      return { definition, typeString };
+      return { definition, typeString, typeStringIsExpression: true };
     }
 
     // Try function
@@ -770,7 +780,7 @@ export class TypeBundler {
         : alreadyExported
           ? text
           : `export declare ${text}`;
-      return { definition, typeString };
+      return { definition, typeString, typeStringIsExpression: false };
     }
 
     return null;
