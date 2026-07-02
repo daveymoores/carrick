@@ -348,7 +348,9 @@ impl MountGraph {
     /// Returns true if a single path segment is a route parameter placeholder in any
     /// of the common syntaxes: `:id` (Express/path-to-regexp), `{id}` (OpenAPI/Fastify),
     /// `<id>` (Flask-style), or `[id]`/`[...id]` (Next.js dynamic segments).
-    fn is_param_segment(seg: &str) -> bool {
+    /// Also the param definition `canonical_path_has_literal_segment` (#307)
+    /// reuses, so the noise gate and the matcher agree on what a placeholder is.
+    pub(crate) fn is_param_segment(seg: &str) -> bool {
         seg.starts_with(':')
             || (seg.starts_with('{') && seg.ends_with('}'))
             || (seg.starts_with('<') && seg.ends_with('>'))

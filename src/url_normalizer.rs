@@ -523,7 +523,13 @@ impl UrlNormalizer {
             return true;
         }
         path.split('/').any(|segment| {
-            if segment.is_empty() || segment == "*" || segment.starts_with(':') {
+            // Placeholder styles are the MATCHER's definition
+            // (`MountGraph::is_param_segment`: `:id`, `{id}`, `<id>`, `[id]`),
+            // so the gate and the matcher agree on what can never be literal.
+            if segment.is_empty()
+                || segment == "*"
+                || crate::mount_graph::MountGraph::is_param_segment(segment)
+            {
                 return false;
             }
             // Strip leading `${...}` interpolations; any residue is literal
@@ -900,6 +906,13 @@ mod tests {
         assert!(!has("/${slug}"));
         assert!(!has("/:param"));
         assert!(!has("/"));
+
+        // Non-colon placeholder styles are params by the MATCHER's own
+        // definition (`MountGraph::is_param_segment`), never literals.
+        assert!(!has("/{id}"));
+        assert!(!has("/<id>"));
+        assert!(!has("/[...slug]"));
+        assert!(has("/users/{id}"));
 
         // Any literal segment keeps the call, wherever the template sits.
         assert!(has("${SUPPORT_GQL_URL}/graphql"));

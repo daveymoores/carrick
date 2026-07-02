@@ -1215,9 +1215,13 @@ fn scan_protocol_extractions(
 /// the document ops are the real modeled contract, so the transport call is
 /// folded into them. Only env-templated / absolute-URL targets are folded: a
 /// plain relative literal path in the same file is a distinct same-origin REST
-/// call and is kept. Known limitation (logged): a REST call built on a
-/// DIFFERENT env-var base inside a gql-consumer file is folded too — accepted
-/// over leaking a phantom HTTP contract for every GraphQL client file.
+/// call and is kept. The shape test reads the RAW `target_url`, not
+/// `canonical_path` — `consumer_call_path` strips a declared-internal env-var
+/// base (`${GQL_URL}/graphql` → `/graphql`), which would otherwise let the
+/// transport leak for exactly the users who configured `internalEnvVars`.
+/// Known limitation (logged): a REST call built on a DIFFERENT env-var base
+/// inside a gql-consumer file is folded too — accepted over leaking a phantom
+/// HTTP contract for every GraphQL client file.
 fn fold_graphql_transport_calls(
     mount_graph: &mut crate::mount_graph::MountGraph,
     graphql: &crate::graphql::GraphqlExtraction,
@@ -1239,9 +1243,11 @@ fn fold_graphql_transport_calls(
         .map(|op| normalize_file(&op.file_path))
         .collect();
     mount_graph.data_calls.retain(|call| {
-        let is_transport_shape = call.canonical_path.contains("${")
-            || call.canonical_path.starts_with("http://")
-            || call.canonical_path.starts_with("https://");
+        let raw = call.target_url.trim_matches(['`', '"', '\'']);
+        let is_transport_shape = raw.contains("${")
+            || raw.contains("process.env.")
+            || raw.starts_with("http://")
+            || raw.starts_with("https://");
         if !is_transport_shape {
             return true;
         }
@@ -4598,6 +4604,40 @@ mod tests {
             .map(|c| c.target_url.as_str())
             .collect();
         assert_eq!(targets, vec!["/api/tickets", "${ORDERS_API}/orders"]);
+    }
+
+    /// A declared-internal env-var base strips to a bare path in
+    /// `canonical_path` (`${GQL_URL}/graphql` → `/graphql`), so the transport
+    /// shape must be read off the RAW target or the fold would leak for
+    /// exactly the users who configured `internalEnvVars` (Copilot review).
+    #[test]
+    fn fold_reads_raw_target_not_stripped_canonical() {
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "`${SUPPORT_GQL_URL}/graphql`".to_string(),
+            canonical_path: "/graphql".to_string(),
+            client: "fetch(".to_string(),
+            file_location: "src/gql.ts:25".to_string(),
+            call_kind: None,
+            repo_name: None,
+        }];
+        let graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![graphql_consumer_op_at(
+                crate::operation::GraphqlOperationKind::Mutation,
+                "escalateTicket",
+                "src/gql.ts",
+                None,
+            )],
+        };
+
+        fold_graphql_transport_calls(&mut mount_graph, &graphql);
+
+        assert!(
+            mount_graph.data_calls.is_empty(),
+            "internal-stripped canonical must still fold via the raw target"
+        );
     }
 
     /// The file join must normalize path components: the graphql walk can
