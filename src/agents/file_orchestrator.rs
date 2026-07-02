@@ -2159,7 +2159,15 @@ impl FileOrchestrator {
             });
         }
 
-        // Bare specifier — only attempt baseUrl resolution if a tsconfig in
+        // Bare specifier — try tsconfig `paths` mappings first (in tsc they
+        // take precedence over plain baseUrl lookup). This is how a workspace
+        // shared-types package (`@meridian/contracts` mapped to
+        // `../contracts/src/index.ts`) resolves to a real source file.
+        if let Some(found) = Self::resolve_via_tsconfig_paths(current_dir, import_source) {
+            return found;
+        }
+
+        // Then only attempt baseUrl resolution if a tsconfig in
         // the file's ancestry sets `compilerOptions.baseUrl` *explicitly*.
         // `tsc` only enables non-relative module resolution against baseUrl
         // when it's set; defaulting to "." here would shadow real
@@ -2241,6 +2249,69 @@ impl FileOrchestrator {
     /// Returns `None` for tsconfigs that omit baseUrl (or for repos with
     /// no tsconfig at all). Path aliases (`compilerOptions.paths`) and
     /// `extends` inheritance are out of scope here.
+    /// Resolve a bare import specifier through `compilerOptions.paths`
+    /// mappings of tsconfigs in the file's ancestry (nearest first). Mapping
+    /// targets resolve against `baseUrl` when set (tsc's rule), else the
+    /// tsconfig's own directory (TS 4.1+ paths-without-baseUrl). Supports the
+    /// spec's single-`*` wildcard. Only a target that probes to a real file
+    /// wins — a dangling mapping cannot eat a real package import. Walking
+    /// past a paths-less tsconfig keeps `extends`-style layouts working; the
+    /// probe gate makes that safe.
+    fn resolve_via_tsconfig_paths(
+        start_dir: &std::path::Path,
+        import_source: &str,
+    ) -> Option<String> {
+        let mut dir = Some(start_dir);
+        while let Some(d) = dir {
+            let tsconfig = d.join("tsconfig.json");
+            if tsconfig.is_file()
+                && let Ok(text) = std::fs::read_to_string(&tsconfig)
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+                && let Some(co) = json.get("compilerOptions")
+                && let Some(paths) = co.get("paths").and_then(|p| p.as_object())
+            {
+                let base = co.get("baseUrl").and_then(|v| v.as_str()).unwrap_or(".");
+                for (pattern, targets) in paths {
+                    let Some(targets) = targets.as_array() else {
+                        continue;
+                    };
+                    // At most one `*` per pattern (the tsconfig spec); the
+                    // matched substring substitutes into each target's `*`.
+                    let substitution: Option<String> = match pattern.matches('*').count() {
+                        0 => (pattern == import_source).then(String::new),
+                        1 => {
+                            let (prefix, suffix) = pattern.split_once('*').unwrap();
+                            (import_source.len() >= prefix.len() + suffix.len()
+                                && import_source.starts_with(prefix)
+                                && import_source.ends_with(suffix))
+                            .then(|| {
+                                import_source[prefix.len()..import_source.len() - suffix.len()]
+                                    .to_string()
+                            })
+                        }
+                        _ => None,
+                    };
+                    let Some(substitution) = substitution else {
+                        continue;
+                    };
+                    for target in targets {
+                        let Some(target) = target.as_str() else {
+                            continue;
+                        };
+                        let candidate = target.replacen('*', &substitution, 1);
+                        if let Some(found) = Self::canonicalize_or_probe(
+                            d.join(base).join(candidate).to_string_lossy().as_ref(),
+                        ) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            dir = d.parent();
+        }
+        None
+    }
+
     fn find_tsconfig_base_url(start_dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
         let mut dir = Some(start_dir);
         while let Some(d) = dir {
@@ -2743,6 +2814,104 @@ mod tests {
         std::fs::write(
             repo.path().join("tsconfig.json"),
             r#"{ "compilerOptions": { "baseUrl": "." } }"#,
+        )
+        .unwrap();
+        let server = repo.path().join("server.ts");
+        std::fs::write(&server, "// stub").unwrap();
+
+        let resolved =
+            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "react");
+
+        assert_eq!(resolved, "react");
+    }
+
+    /// Corpus-3 regression (`@meridian/contracts`): a workspace shared-types
+    /// package imported through a tsconfig `paths` mapping must resolve to the
+    /// mapped file. Pre-fix only `baseUrl` was consulted, so the specifier
+    /// fell through unchanged and the sidecar bundler reported "Could not
+    /// extract type definition" for every symbol it carried.
+    #[test]
+    fn test_resolve_import_path_uses_tsconfig_paths_mapping() {
+        let repo = tempfile::tempdir().unwrap();
+        // Mirror the monorepo layout: packages/catalog-api consumes
+        // packages/contracts via a paths alias.
+        std::fs::create_dir_all(repo.path().join("packages/catalog-api/src")).unwrap();
+        std::fs::create_dir_all(repo.path().join("packages/contracts/src")).unwrap();
+        std::fs::write(
+            repo.path().join("packages/catalog-api/tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@meridian/contracts": ["../contracts/src/index.ts"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("packages/contracts/src/index.ts"),
+            "export interface Product { id: string }",
+        )
+        .unwrap();
+        let routes = repo
+            .path()
+            .join("packages/catalog-api/src/products.routes.ts");
+        std::fs::write(&routes, "// stub").unwrap();
+
+        let resolved = FileOrchestrator::resolve_import_path(
+            routes.to_string_lossy().as_ref(),
+            "@meridian/contracts",
+        );
+
+        let expected = repo
+            .path()
+            .join("packages/contracts/src/index.ts")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            std::path::Path::new(&resolved).canonicalize().unwrap(),
+            expected,
+            "bare specifier should resolve via the tsconfig paths mapping"
+        );
+    }
+
+    /// The spec's single-`*` wildcard form (`"@app/*": ["src/*"]`).
+    #[test]
+    fn test_resolve_import_path_uses_tsconfig_paths_wildcard() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src/models")).unwrap();
+        std::fs::write(
+            repo.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@app/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("src/models/user.ts"),
+            "export interface User { id: number }",
+        )
+        .unwrap();
+        let server = repo.path().join("server.ts");
+        std::fs::write(&server, "// stub").unwrap();
+
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "@app/models/user",
+        );
+
+        let expected = repo
+            .path()
+            .join("src/models/user.ts")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            std::path::Path::new(&resolved).canonicalize().unwrap(),
+            expected,
+            "wildcard paths mapping should resolve, baseUrl defaulting to the tsconfig dir"
+        );
+    }
+
+    /// A paths mapping whose target does not exist must not eat the
+    /// specifier — real package imports still pass through.
+    #[test]
+    fn test_resolve_import_path_paths_mapping_falls_through_when_target_missing() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "react": ["vendored/react.ts"] } } }"#,
         )
         .unwrap();
         let server = repo.path().join("server.ts");
