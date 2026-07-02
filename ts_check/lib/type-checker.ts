@@ -348,9 +348,11 @@ export class TypeCompatibilityChecker {
     // Assignability runs in the DATA-flow direction: the value that is sent
     // must satisfy the type the receiver expects.
     //
-    // HTTP: the manifest producer (endpoint) emits the response and the manifest
-    // consumer (call) receives it, so the producer payload must satisfy the
-    // consumer — `producer ⊑ consumer`.
+    // HTTP responses: the manifest producer (endpoint) emits the response and the
+    // manifest consumer (call) receives it, so the producer payload must satisfy
+    // the consumer — `producer ⊑ consumer`. HTTP REQUEST bodies invert this: the
+    // consumer (caller) sends the body the producer (endpoint) must accept, so
+    // `consumer ⊑ producer` (keyed on `type_kind` via `httpRequest` below).
     //
     // GraphQL: same data-flow direction as HTTP. The producer (schema resolver,
     // server) RETURNS the full object; the consumer (document, client) SELECTS a
@@ -387,6 +389,11 @@ export class TypeCompatibilityChecker {
     const socket = producer.protocol === "socket";
     const graphql = producer.protocol === "graphql";
     const pubsub = producer.protocol === "pubsub";
+    // HTTP request bodies flow consumer → producer (the caller sends the body the
+    // endpoint must accept), the inverse of the HTTP response direction. The
+    // matcher pairs strictly per `type_kind`, so producer and consumer agree here.
+    const httpRequest =
+      producer.protocol === "http" && producer.type_kind === "request";
 
     // For GraphQL the producer's resolved type is the resolver's return ENVELOPE
     // (e.g. `{ data: Order; errors: string[] }`), kept verbatim for the
@@ -400,12 +407,15 @@ export class TypeCompatibilityChecker {
       ? this.unwrapGraphqlPayload(producerType, endpoint)
       : producerType;
 
-    // Socket AND pub/sub share the inverted direction: the consumer (emitter /
-    // publisher) sends, the producer (listener / subscriber) accepts. Pub/sub
-    // does NOT unwrap an envelope (its payload type is already decoded), so it
-    // rides the non-graphql `producerComparand` above.
-    const sentType = (socket || pubsub) ? consumerType : producerComparand;
-    const expectedType = (socket || pubsub) ? producerComparand : consumerType;
+    // Socket, pub/sub, AND HTTP request bodies share the inverted direction: the
+    // consumer (emitter / publisher / caller) sends, the producer (listener /
+    // subscriber / endpoint) accepts — `consumer ⊑ producer`. HTTP responses and
+    // GraphQL keep the data-flow-forward `producer ⊑ consumer`. Pub/sub and HTTP
+    // requests do NOT unwrap an envelope (only graphql does), so they ride the
+    // non-graphql `producerComparand` above.
+    const inverted = socket || pubsub || httpRequest;
+    const sentType = inverted ? consumerType : producerComparand;
+    const expectedType = inverted ? producerComparand : consumerType;
 
     // Re-run the `any`/`unknown` → unverifiable guard on the COMPARANDS, not just
     // the raw `producerType`/`consumerType` checked at the top. The GraphQL

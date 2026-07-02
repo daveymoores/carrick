@@ -31,6 +31,26 @@
       "tier": "capability"
     },
     {
+      "producer_repo": "payments-svc",
+      "producer_key": "http|POST|/widgets",
+      "consumer_repo": "web-frontend",
+      "consumer_key": "http|POST|/widgets",
+      "type_compatible": true,
+      "mismatch_reason": null,
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "payments-svc",
+      "producer_key": "http|POST|/invoices",
+      "consumer_repo": "web-frontend",
+      "consumer_key": "http|POST|/invoices",
+      "type_compatible": false,
+      "mismatch_reason": "consumer request body omits amountCents, which producer InvoiceRequest requires (request-body narrowing)",
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
       "producer_repo": "gateway",
       "producer_key": "graphql|query|order",
       "consumer_repo": "web-frontend",
@@ -82,13 +102,13 @@
   ],
   "summary": {
     "total_repos": 3,
-    "producers": 12,
-    "consumers": 8,
-    "matched_edges": 6,
-    "incompatible_edges": 2,
+    "producers": 14,
+    "consumers": 10,
+    "matched_edges": 8,
+    "incompatible_edges": 3,
     "orphan_producers": 6,
     "orphan_consumers": 2,
     "decoys_must_not_emit": 4,
-    "matched_edges_by_protocol": { "http": 3, "graphql": 2, "socket": 1 }
+    "matched_edges_by_protocol": { "http": 5, "graphql": 2, "socket": 1 }
   }
 }

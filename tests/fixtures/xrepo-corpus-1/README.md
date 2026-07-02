@@ -69,6 +69,8 @@ connects to. So the GraphQL/socket connection URLs
 | http | orders-pkg `GET /orders/:param` | payments-svc | `http\|GET\|/orders/:param` | compatible |
 | http | orders-pkg `GET /orders/:param` | web-frontend | `http\|GET\|/orders/:param` | **incompatible** (`id` string vs number) |
 | http | payments-svc `POST /payments` | web-frontend | `http\|POST\|/payments` | compatible |
+| http | payments-svc `POST /widgets` | web-frontend | `http\|POST\|/widgets` | compatible (request-body **widening**) |
+| http | payments-svc `POST /invoices` | web-frontend | `http\|POST\|/invoices` | **incompatible** (request-body **narrowing**: caller omits required `amountCents`) |
 | graphql | gateway `query order` | web-frontend | `graphql\|query\|order` | compatible |
 | graphql | gateway `subscription orderUpdated` | web-frontend | `graphql\|subscription\|orderUpdated` | **incompatible** (optional-field widening: consumer `note` required, producer optional) |
 | socket | web-frontend (listener) | payments-svc (emitter) | `socket\|SERVER->CLIENT\|payment:settled` | compatible |
@@ -83,6 +85,18 @@ web-frontend client *listens*), the structured `matches` edge has
 `producer_repo: web-frontend` (the listener) and `consumer_repo: payments-svc`
 (the emitter), both on `socket|SERVER->CLIENT|payment:settled`. The *event*
 flows payments-svc → web-frontend; the *contract producer* is the listener.
+
+**HTTP request-body direction (`POST /widgets`, `POST /invoices`).** Request
+bodies flow the opposite way to responses: the caller (manifest consumer) sends
+the body the endpoint (manifest producer) must accept, so the assignability
+direction is `consumer ⊑ producer` — the inverse of the response direction. Both
+edges keep their response types byte-identical on each side, so the edge verdict
+is driven purely by the request pair. `POST /widgets` widens (caller sends a
+required superset `{ name, note }` the endpoint tolerates → compatible);
+`POST /invoices` narrows (caller omits the endpoint's required `amountCents` →
+incompatible). These pin the confirmed request-direction inversion — the old
+`compareTypes` keyed direction on protocol only and ran the response direction
+for every HTTP pair, so it read both verdicts inverted.
 
 Orphan producers: orders `GET /api/v1/status`, gateway `GET /users/:param`,
 `GET /users/recent`, `GET /gateway/health`, gateway `graphql query orders`,
