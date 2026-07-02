@@ -26,12 +26,12 @@ current system is compensation for that loss:
 | Compensation | Root cause it patches |
 |---|---|
 | `expandTypeStructural` (custom recursive printer, depth cap 12) | named refs dangle in a flattened bundle → `any` |
-| `append_missing_aliases` + `// carrick:missing-alias` marker (byte-identical across Rust and TS, `engine/mod.rs` ↔ `type-checker.ts:34`) | unresolved anchors must be distinguishable from real `unknown` (#244) |
+| `append_missing_aliases` + `// carrick:missing-alias` marker (byte-identical across Rust and TS, `src/engine/mod.rs` ↔ `ts_check/lib/type-checker.ts:34`) | unresolved anchors must be distinguishable from real `unknown` (#244) |
 | double `any`/`unknown` guards in `compareTypes` (raw types, then comparands) | dangling names resolve to top types → vacuously "compatible" |
-| `cleanupPaths` regex in `run-type-checking.ts` | absolute `import("...")` specifiers leak into error text |
+| `cleanupPaths` regex in `ts_check/run-type-checking.ts` | absolute `import("...")` specifiers leak into error text |
 | merged `package.json` + `npm install --legacy-peer-deps` | library types kept by-name must resolve *somewhere* at check time |
-| verdict join by re-parsing endpoint label strings (`analyzer/mod.rs`, `parse_compat_endpoint`) | no stable pair identity crosses the Rust/TS boundary |
-| formatter regex-parsing mismatch strings back apart (`analyzer/mod.rs:2220` ↔ `formatter/mod.rs:832`) | verdict detail travels as prose, not structure |
+| verdict join by re-parsing endpoint label strings (`src/analyzer/mod.rs`, `parse_compat_endpoint`) | no stable pair identity crosses the Rust/TS boundary |
+| formatter regex-parsing mismatch strings back apart (`src/analyzer/mod.rs:2220` ↔ `src/formatter/mod.rs:832`) | verdict detail travels as prose, not structure |
 
 We are incrementally reimplementing TypeScript's declaration emitter — one of
 the hairiest parts of the compiler — one regression at a time (#149, #226,
@@ -98,7 +98,7 @@ At check time (any repo's CI, after downloading all `CloudRepoData`):
    merges every repo's dependencies into one `package.json`, and runs
    `npm install --legacy-peer-deps` (node_modules and lockfile deleted first —
    genuinely uncached every run). `Analyzer::run_final_type_checking`
-   (`analyzer/mod.rs:2025`) then spawns
+   (`src/analyzer/mod.rs:2025`) then spawns
    `npx ts-node ts_check/run-type-checking.ts`.
 6. `ts_check` matches manifests, loads every `.d.ts` into one flat ts-morph
    project, gates unverifiable pairs, and calls `isAssignableTo` with
@@ -129,17 +129,17 @@ At check time (any repo's CI, after downloading all `CloudRepoData`):
   declaration merging), and type *names* — so even correct mismatch verdicts
   print anonymous `{ ... }` soup instead of "`OrderUpdate` requires `note`".
 - **String-protocol coupling.** The marker comment, the alias-definition
-  regexes duplicated in Rust (`dts_defines_alias` in `type_sidecar.rs:815`
-  and `engine/mod.rs:2747`), socket direction labels, GraphQL kind casing,
+  regexes duplicated in Rust (`dts_defines_alias` in `src/services/type_sidecar.rs:815`
+  and `src/engine/mod.rs:2747`), socket direction labels, GraphQL kind casing,
   the verdict-label re-parse, and the analyzer→formatter mismatch-string
   round-trip must all stay byte-compatible across two languages.
 - **CONFIRMED direction bug on HTTP request bodies.** `compareTypes` keys
-  direction on protocol only (`type-checker.ts:387-408`); `type_kind` is used
+  direction on protocol only (`ts_check/lib/type-checker.ts:387-408`); `type_kind` is used
   in the label but never in direction selection. Request pairs are built for
-  non-GET/HEAD/OPTIONS endpoints (`engine/mod.rs:2109-2115`), `RequestBody`
-  inference is wired end-to-end (`file_orchestrator.rs:940-953`,
-  `type-inferrer.ts:690`), and the matcher pairs strictly per `type_kind`
-  (`manifest-matcher.ts:732`). Data flows consumer → producer for request
+  non-GET/HEAD/OPTIONS endpoints (`src/engine/mod.rs:2109-2115`), `RequestBody`
+  inference is wired end-to-end (`src/agents/file_orchestrator.rs:940-953`,
+  `src/sidecar/src/type-inferrer.ts:690`), and the matcher pairs strictly per `type_kind`
+  (`ts_check/lib/manifest-matcher.ts:732`). Data flows consumer → producer for request
   bodies (the caller sends the body the endpoint must accept), so the check
   should be `consumer ⊑ producer`; the code runs `producer ⊑ consumer`.
   Widening/narrowing verdicts on request bodies are inverted today. No
@@ -245,9 +245,9 @@ The doc'd first instinct — `TypeSurface` as a file map inside `CloudRepoData` 
 does not survive contact with the actual transport: `bundled_types` is
 uploaded to S3 but the S3 object is **write-only dead weight**; the live read
 path inlines the entire `CloudRepoData` of every service in the fleet into one
-synchronous Lambda JSON response (`aws_storage.rs:312,354`;
+synchronous Lambda JSON response (`src/cloud_storage/aws_storage.rs:312,354`;
 `download_all_repo_data` reads inline metadata and discards the per-repo
-`s3_url` map — `engine/mod.rs:172` binds it as `_repo_s3_urls`). Sync Lambda
+`s3_url` map — `src/engine/mod.rs:172` binds it as `_repo_s3_urls`). Sync Lambda
 responses cap at ~6MB; declaration trees per service would blow it.
 
 Therefore:
@@ -266,10 +266,10 @@ Therefore:
   older `artifact_version` is treated as having no surface — its pairs are
   unverifiable with reason `peer scanned with older Carrick — re-scan`. No
   compatibility shims; the fleet re-scans once after the release. (`cache_version`
-  is checked only on the same-repo incremental path, `engine/mod.rs:797-815`;
+  is checked only on the same-repo incremental path, `src/engine/mod.rs:797-815`;
   it does not and should not gate cross-repo joins.)
 - This is a **wire-contract change in `carrick-cloud`** (upload flow at
-  `aws_storage.rs:342-368` branches on `bundled_types` today; the Lambdas
+  `src/cloud_storage/aws_storage.rs:342-368` branches on `bundled_types` today; the Lambdas
   must store descriptors and serve presigned surface GETs). The migration
   cannot land from this repo alone.
 
@@ -283,7 +283,7 @@ per-stub `node_modules`), with these corrections:
    breaks `git diff`-based incremental detection, and risks being swept up by
    the scanner's own file discovery). Stub directory/package names are keyed
    on `service_name ?? repo_name` and sanitized exactly like
-   `bundle_file_stems` (`engine/mod.rs:2534-2563`) — the current builder keys
+   `bundle_file_stems` (`src/engine/mod.rs:2534-2563`) — the current builder keys
    on raw `repoName`, re-creating both the monorepo-services-clobber bug and
    invalid `@carrick/org/repo` package names.
 2. **pnpm is vendored as a devDependency of the sidecar** — version-pinned by
@@ -300,7 +300,7 @@ per-stub `node_modules`), with these corrections:
    registry dep of a peer, unpublished pin) degrades **only that repo's
    pairs** to unverifiable with the install error as the recorded reason —
    never fatal to the run (today's contract, `Err` at
-   `engine/mod.rs:2858-2877`, would let one stale peer disable type checking
+   `src/engine/mod.rs:2858-2877`, would let one stale peer disable type checking
    for the whole fleet).
 4. **Stub packages carry the declaration tree.** `types` points at
    `types/surface.d.ts`; internal relative imports resolve within the tree;
@@ -311,7 +311,7 @@ per-stub `node_modules`), with these corrections:
    `moduleResolution: "bundler"` — the single program must accept both
    `.js`-suffixed specifiers (from `node16` producers) and extensionless ones.
 5. **One probe file per matched pair**, named by a pair ID derived with the
-   existing FNV-1a hasher (`type_manifest.rs` — a pair-level ID is new;
+   existing FNV-1a hasher (`src/type_manifest.rs` — a pair-level ID is new;
    the hasher is not). Probe content:
 
    ```ts
@@ -402,9 +402,9 @@ per-stub `node_modules`), with these corrections:
     scrubbed diagnostic, both anchors. `apply_compat_verdicts` joins by ID;
     `parse_compat_endpoint` / `parse_producer_key` are deleted, and the
     formatter consumes the structured payload instead of regex-parsing a
-    prose mismatch string (`formatter/mod.rs:832-872` today).
+    prose mismatch string (`src/formatter/mod.rs:832-872` today).
 12. **Protocol:** `build_workspace` cold installs will exceed the Rust
-    client's 60s read deadline (`type_sidecar.rs:569,610`), and `execSync`
+    client's 60s read deadline (`src/services/type_sidecar.rs:569,610`), and `execSync`
     blocks the sidecar's event loop so even `health` goes dark. The action
     spawns the install async and the sidecar emits progress/keepalive frames;
     the Rust client gets a workspace-scoped deadline. Workspace caching
@@ -419,11 +419,11 @@ per-stub `node_modules`), with these corrections:
 
 ### Consumers that must be re-pointed (previously missed)
 
-- **`resolve_per_endpoint_definitions` (`engine/mod.rs:1937`)** consumes
+- **`resolve_per_endpoint_definitions` (`src/engine/mod.rs:1937`)** consumes
   `cloud_data.bundled_types` today to populate
   `resolved_definition`/`expanded_definition` on manifest entries — the
   payload of the MCP `get_endpoint_types` tool and a scored eval metric
-  (`eval_xrepo.rs:749-771`). Re-point it at the surface tree: resolve each
+  (`tests/eval_xrepo.rs:749-771`). Re-point it at the surface tree: resolve each
   alias in the stub package (a strictly richer source), keep emitting both
   the as-written and structural forms. The definition-fidelity metric is
   preserved, not deleted.
@@ -432,8 +432,8 @@ per-stub `node_modules`), with these corrections:
 
 ### What this deletes
 
-- `type-structural-expander.ts` as a primary path (last-resort tier only,
-  measured); `definition-resolver.ts`'s duplication of it.
+- `src/sidecar/src/type-structural-expander.ts` as a primary path (last-resort tier only,
+  measured); `src/sidecar/src/definition-resolver.ts`'s duplication of it.
 - `append_missing_aliases`, `MISSING_ALIAS_MARKER` (both sides), both
   `dts_defines_alias` regex copies, placeholder-vs-real-`unknown`
   disambiguation (#244 machinery).
@@ -442,12 +442,12 @@ per-stub `node_modules`), with these corrections:
 - The merged `package.json` + `--legacy-peer-deps` install,
   `create_dynamic_tsconfig`'s `*-types` path mapping.
 - `ts_check/lib/type-checker.ts`'s comparison core, the endpoint-label
-  verdict round-trip in `analyzer/mod.rs`, and the analyzer→formatter
+  verdict round-trip in `src/analyzer/mod.rs`, and the analyzer→formatter
   mismatch-string regex round-trip.
 - The deprecated-but-live `TypeBundler` and its `String.replace` renames.
 - `MonorepoBuilder`'s silent npm fallback and its dead `isRelated`
   computation (`parseCheckResult` currently marks every check incompatible on
-  any tsc failure — `monorepo-builder.ts:661-673`).
+  any tsc failure — `src/sidecar/src/monorepo-builder.ts:661-673`).
 - `CloudRepoData.bundled_types` and the S3 `types.d.ts` upload flow
   (replaced by the descriptor + content-addressed surface object; requires
   the coordinated `carrick-cloud` change).
@@ -455,7 +455,7 @@ per-stub `node_modules`), with these corrections:
 ### What stays unchanged
 
 - LLM anchor extraction, SWC span plumbing, `ExtractionConfig` unwrap rules.
-- The manifest, deterministic alias hashing (`type_manifest.rs`), and
+- The manifest, deterministic alias hashing (`src/type_manifest.rs`), and
   operation keys.
 - The manifest matcher's normalization and per-protocol matching.
 - The warm sidecar process model and stdio transport (new actions, async
@@ -571,7 +571,7 @@ into independently measurable stages:
 5. **Definition fidelity** (exists): re-pointed at the surface tree, not
    deleted.
 
-Honesty note: `eval_tier_a.rs` and `eval_xrepo.rs` are **report-only
+Honesty note: `tests/eval_tier_a.rs` and `tests/eval_xrepo.rs` are **report-only
 monitors** (their own headers say so), not merge gates. For this migration
 specifically, the landing PR asserts the xrepo verdict rows against a
 checked-in expected baseline so "no new false-compatibles" is mechanical, not
