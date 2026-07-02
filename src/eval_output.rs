@@ -16,7 +16,7 @@ use crate::analyzer::{
     ApiAnalysisResult, ApiEndpointDetails, ConflictSeverity,
     CrossRepoMatch as AnalyzerCrossRepoMatch, DependencyConflict,
 };
-use crate::cloud_storage::{ManifestRole, TypeManifestEntry};
+use crate::cloud_storage::{ManifestRole, ManifestTypeKind, TypeManifestEntry};
 use crate::operation::OperationKey;
 
 /// The full eval projection of a single scan: the producer endpoints, the
@@ -162,8 +162,9 @@ impl EvalProjection {
     }
 }
 
-/// The manifest fields an op carries, collapsed from the request/response
-/// manifest entries for a single operation key.
+/// The manifest fields an op carries, selected from the request/response
+/// manifest entries for a single operation key at the op's own call/handler
+/// site.
 #[derive(Default)]
 struct ManifestFields {
     type_alias: Option<String>,
@@ -177,59 +178,146 @@ struct ManifestFields {
     primary_type_symbol: Option<String>,
 }
 
-/// Lookup from `(canonical operation key, role)` → manifest fields. The manifest
-/// carries up to two entries per op-and-role (request + response); we prefer the
-/// entry that has resolved-type detail so the projection surfaces the richest
-/// available type.
+/// One manifest entry, kept whole (kind + site discriminators intact) so the
+/// per-op join can pick the right entry instead of collapsing them.
+struct ManifestRecord {
+    type_kind: ManifestTypeKind,
+    file_path: String,
+    line_number: u32,
+    type_alias: String,
+    type_state: String,
+    resolved_definition: Option<String>,
+    expanded_definition: Option<String>,
+    is_explicit: bool,
+    primary_type_symbol: Option<String>,
+}
+
+impl ManifestRecord {
+    fn has_definition(&self) -> bool {
+        self.resolved_definition.is_some() || self.expanded_definition.is_some()
+    }
+}
+
+/// Lookup from `(canonical operation key, role)` → the manifest entries for
+/// that op-and-role.
 ///
 /// Keying on role as well as the canonical key is load-bearing (#207): a single
 /// canonical key (e.g. `http|GET|/orders/:param`) can be both a producer in one
 /// repo and a consumer in another. Keying by canonical alone collapsed the two
 /// roles' entries into one slot, so the last writer's anchor /
-/// resolved-definition / type-state clobbered the other role's — surfacing, for
-/// instance, the consumer's `OrderView` against the producer's op. Splitting by
-/// role keeps each side's manifest fields distinct.
+/// resolved-definition / type-state clobbered the other role's.
+///
+/// Within a `(key, role)` slot the entries are NOT interchangeable either, on
+/// two axes the previous first-definition-wins collapse got wrong:
+/// - **kind**: an op has up to a request and a response entry. The eval's
+///   per-op resolved-type labels are the op's response contract, so a request
+///   entry that happened to resolve first must not displace the response
+///   (`POST /payments` / `POST /track` surfaced their request shapes).
+/// - **site**: fan-in — several call sites on the same key (two repos
+///   publishing one pub/sub topic, #290) — carries one entry per site. All
+///   sites shared whichever entry won, so one publisher's payload masked the
+///   other's. Each op joins the records at its own file/line.
 struct ManifestIndex {
-    by_key: HashMap<(String, ManifestRole), ManifestFields>,
+    by_key: HashMap<(String, ManifestRole), Vec<ManifestRecord>>,
 }
 
 impl ManifestIndex {
     fn build(entries: &[TypeManifestEntry]) -> Self {
-        let mut by_key: HashMap<(String, ManifestRole), ManifestFields> = HashMap::new();
+        let mut by_key: HashMap<(String, ManifestRole), Vec<ManifestRecord>> = HashMap::new();
         for entry in entries {
-            let key = (entry.key.canonical(), entry.role);
-            let slot = by_key.entry(key).or_default();
-            // Prefer an entry that resolved a concrete definition; otherwise
-            // keep the first-seen alias/state so the field is at least present.
-            let entry_has_definition =
-                entry.resolved_definition.is_some() || entry.expanded_definition.is_some();
-            let slot_has_definition =
-                slot.resolved_definition.is_some() || slot.expanded_definition.is_some();
-            if slot.type_alias.is_none() || (entry_has_definition && !slot_has_definition) {
-                slot.type_alias = Some(entry.type_alias.clone());
-                slot.type_state = Some(manifest_type_state_string(entry.type_state));
-                slot.resolved_definition = entry.resolved_definition.clone();
-                slot.expanded_definition = entry.expanded_definition.clone();
-                slot.is_explicit = Some(entry.is_explicit);
-            }
-            // The anchor symbol is independent of the definition-richness race
-            // above: keep the first non-None symbol seen for this op so a
-            // response entry that wins on definition but carries no symbol does
-            // not erase a request entry's symbol.
-            if slot.primary_type_symbol.is_none() {
-                slot.primary_type_symbol = entry.primary_type_symbol.clone();
-            }
+            by_key
+                .entry((entry.key.canonical(), entry.role))
+                .or_default()
+                .push(ManifestRecord {
+                    type_kind: entry.type_kind,
+                    file_path: entry.file_path.clone(),
+                    line_number: entry.line_number,
+                    type_alias: entry.type_alias.clone(),
+                    type_state: manifest_type_state_string(entry.type_state),
+                    resolved_definition: entry.resolved_definition.clone(),
+                    expanded_definition: entry.expanded_definition.clone(),
+                    is_explicit: entry.is_explicit,
+                    primary_type_symbol: entry.primary_type_symbol.clone(),
+                });
         }
         Self { by_key }
     }
 
-    /// Look up the manifest fields for an op's canonical `key` in the given
-    /// `role`. A producer EvalOp (endpoint) joins the Producer slot, a consumer
-    /// EvalOp (call) the Consumer slot, so a shared canonical key never crosses
-    /// the two roles' manifest fields (#207).
-    fn get(&self, key: &str, role: ManifestRole) -> Option<&ManifestFields> {
-        self.by_key.get(&(key.to_string(), role))
+    /// Join one op to its manifest fields.
+    ///
+    /// 1. **Site filter**: keep the records in the op's own file (suffix-aligned
+    ///    so a repo-relative manifest path matches an absolute op path). When
+    ///    nothing matches — single-site slots, or a path convention drift — all
+    ///    records stay in play, which is exactly the pre-site-aware behavior.
+    /// 2. **Kind preference**: the op-level fields carry the RESPONSE entry
+    ///    (the contract the per-op eval labels are written against), falling
+    ///    back to a request entry only when no response entry resolved a
+    ///    definition, so request-only ops (`POST /billing/charge`) still
+    ///    surface their one known type.
+    /// 3. **Line proximity**: same-kind records left after (1)+(2) are same-file
+    ///    fan-in; the record nearest the op's line is the op's own.
+    fn get(
+        &self,
+        key: &str,
+        role: ManifestRole,
+        op_file: &str,
+        op_line: u32,
+    ) -> Option<ManifestFields> {
+        let records = self.by_key.get(&(key.to_string(), role))?;
+        let site: Vec<&ManifestRecord> = {
+            let in_file: Vec<&ManifestRecord> = records
+                .iter()
+                .filter(|r| same_source_file(&r.file_path, op_file))
+                .collect();
+            if in_file.is_empty() {
+                records.iter().collect()
+            } else {
+                in_file
+            }
+        };
+        let nearest = |kind: ManifestTypeKind, need_definition: bool| {
+            site.iter()
+                .filter(|r| r.type_kind == kind && (!need_definition || r.has_definition()))
+                .min_by_key(|r| r.line_number.abs_diff(op_line))
+                .copied()
+        };
+        let definition_record = nearest(ManifestTypeKind::Response, true)
+            .or_else(|| nearest(ManifestTypeKind::Request, true))
+            .or_else(|| {
+                site.iter()
+                    .min_by_key(|r| r.line_number.abs_diff(op_line))
+                    .copied()
+            })?;
+        // The anchor symbol is independent of the definition-richness pick: a
+        // response entry that wins on definition but carries no symbol must not
+        // erase a request entry's symbol.
+        let primary_type_symbol = definition_record
+            .primary_type_symbol
+            .clone()
+            .or_else(|| site.iter().find_map(|r| r.primary_type_symbol.clone()));
+        Some(ManifestFields {
+            type_alias: Some(definition_record.type_alias.clone()),
+            type_state: Some(definition_record.type_state.clone()),
+            resolved_definition: definition_record.resolved_definition.clone(),
+            expanded_definition: definition_record.expanded_definition.clone(),
+            is_explicit: Some(definition_record.is_explicit),
+            primary_type_symbol,
+        })
     }
+}
+
+/// Whether two source paths name the same file across the repo-relative vs
+/// absolute conventions the manifest and op details mix: equal, or one is a
+/// path-component-aligned suffix of the other.
+fn same_source_file(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    long.ends_with(short) && long.as_bytes()[long.len() - short.len() - 1] == b'/'
 }
 
 /// `ManifestTypeState` → its String form, matching the manifest's serde naming
@@ -253,7 +341,7 @@ impl EvalOp {
         let (protocol, method, path) = project_key(&d.key);
         let (file, line) = split_location(&d.file_path);
         let canonical = d.key.canonical();
-        let fields = manifest.get(&canonical, role);
+        let fields = manifest.get(&canonical, role, &file, line);
         EvalOp {
             key: canonical,
             protocol,
@@ -270,11 +358,11 @@ impl EvalOp {
                 .map(|t| t.composite_type_string.clone()),
             file,
             line,
-            type_alias: fields.and_then(|f| f.type_alias.clone()),
-            type_state: fields.and_then(|f| f.type_state.clone()),
-            resolved_definition: fields.and_then(|f| f.resolved_definition.clone()),
-            expanded_definition: fields.and_then(|f| f.expanded_definition.clone()),
-            is_explicit: fields.and_then(|f| f.is_explicit),
+            type_alias: fields.as_ref().and_then(|f| f.type_alias.clone()),
+            type_state: fields.as_ref().and_then(|f| f.type_state.clone()),
+            resolved_definition: fields.as_ref().and_then(|f| f.resolved_definition.clone()),
+            expanded_definition: fields.as_ref().and_then(|f| f.expanded_definition.clone()),
+            is_explicit: fields.as_ref().and_then(|f| f.is_explicit),
             // The real LLM type anchor (#233): the symbol threaded onto the
             // manifest entry. NO fallback to the hashed `type_alias` — an op whose
             // response is an inline/anonymous type (e.g. `GET /users/recent`
@@ -374,21 +462,51 @@ mod tests {
         resolved: Option<&str>,
         primary_type_symbol: Option<&str>,
     ) -> TypeManifestEntry {
+        manifest_entry_at(
+            key,
+            role,
+            ManifestTypeKind::Response,
+            "Endpoint_abc_Response",
+            "src/orders.ts",
+            12,
+            type_state,
+            is_explicit,
+            resolved,
+            primary_type_symbol,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn manifest_entry_at(
+        key: OperationKey,
+        role: ManifestRole,
+        type_kind: ManifestTypeKind,
+        type_alias: &str,
+        file_path: &str,
+        line_number: u32,
+        type_state: ManifestTypeState,
+        is_explicit: bool,
+        resolved: Option<&str>,
+        primary_type_symbol: Option<&str>,
+    ) -> TypeManifestEntry {
         TypeManifestEntry {
             key,
             role,
-            type_kind: ManifestTypeKind::Response,
-            type_alias: "Endpoint_abc_Response".to_string(),
-            file_path: "src/orders.ts".to_string(),
-            line_number: 12,
+            type_kind,
+            type_alias: type_alias.to_string(),
+            file_path: file_path.to_string(),
+            line_number,
             is_explicit,
             type_state,
             evidence: TypeEvidence {
-                file_path: "src/orders.ts".to_string(),
+                file_path: file_path.to_string(),
                 span_start: None,
                 span_end: None,
-                line_number: 12,
-                infer_kind: InferKind::ResponseBody,
+                line_number,
+                infer_kind: match type_kind {
+                    ManifestTypeKind::Request => InferKind::RequestBody,
+                    ManifestTypeKind::Response => InferKind::ResponseBody,
+                },
                 is_explicit,
                 type_state,
             },
@@ -749,5 +867,198 @@ mod tests {
         assert_eq!(call_op["resolved_definition"], "{ id: number }");
         assert_eq!(call_op["type_state"], "Implicit");
         assert_eq!(call_op["is_explicit"], false);
+    }
+
+    /// The per-op eval labels are written against the op's RESPONSE contract,
+    /// so when an op carries both a request and a response manifest entry, the
+    /// response entry's fields must surface — even when the request entry
+    /// resolved first. Before the kind-aware join, first-definition-wins let the
+    /// request shape displace the response (`POST /payments` / `POST /track`
+    /// surfaced `{ orderId; amountCents }` where the eval expected `Payment`).
+    #[test]
+    fn response_entry_wins_over_request_entry_for_op_fields() {
+        let key = OperationKey::http("POST", "/payments");
+        let result = ApiAnalysisResult {
+            endpoints: vec![endpoint("POST", "/payments", "src/payments.ts:30")],
+            calls: vec![],
+            issues: empty_issues_with_deps(vec![]),
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+        // Request entry FIRST (the manifest order that used to win).
+        let manifest = vec![
+            manifest_entry_at(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Request,
+                "Endpoint_req_Request",
+                "src/payments.ts",
+                30,
+                ManifestTypeState::Explicit,
+                true,
+                Some("{ orderId: number; amountCents: number }"),
+                None,
+            ),
+            manifest_entry_at(
+                key,
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "Endpoint_res_Response",
+                "src/payments.ts",
+                35,
+                ManifestTypeState::Explicit,
+                true,
+                Some("{ id: string; orderId: number; status: string }"),
+                Some("Payment"),
+            ),
+        ];
+
+        let projection = EvalProjection::from_results(&result, &manifest);
+        let json: Value =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        let op = &json["endpoints"].as_array().unwrap()[0];
+
+        assert_eq!(op["type_alias"], "Endpoint_res_Response");
+        assert_eq!(
+            op["resolved_definition"],
+            "{ id: string; orderId: number; status: string }"
+        );
+        assert_eq!(op["primary_type_symbol"], "Payment");
+    }
+
+    /// An op whose only resolved entry is request-kind (`POST /billing/charge`,
+    /// a fire-and-forget consumer with no read response) must keep surfacing
+    /// that request definition — the response preference is a preference, not a
+    /// filter.
+    #[test]
+    fn request_only_op_still_surfaces_request_definition() {
+        let key = OperationKey::http("POST", "/billing/charge");
+        let call = ApiEndpointDetails {
+            owner: None,
+            key: key.clone(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("src/billing.client.ts:19"),
+            repo_name: None,
+            service_name: None,
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![call],
+            issues: empty_issues_with_deps(vec![]),
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+        let manifest = vec![manifest_entry_at(
+            key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Request,
+            "Endpoint_req_Request_Callabc",
+            "src/billing.client.ts",
+            19,
+            ManifestTypeState::Implicit,
+            false,
+            Some("{ paymentId: string; amountCents: number }"),
+            None,
+        )];
+
+        let projection = EvalProjection::from_results(&result, &manifest);
+        let json: Value =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        let op = &json["calls"].as_array().unwrap()[0];
+
+        assert_eq!(
+            op["resolved_definition"],
+            "{ paymentId: string; amountCents: number }"
+        );
+        assert_eq!(op["type_state"], "Implicit");
+    }
+
+    /// Fan-in (#290/#291): two consumer call sites on ONE canonical key — two
+    /// repos publishing the same pub/sub topic with deliberately different
+    /// payloads — carry one manifest entry per site. Each call op must join the
+    /// records at ITS OWN file, not whichever site's entry happened to be
+    /// indexed first (which masked orders-engine's nested payload behind
+    /// billing's flat one and mis-scored its resolution). The manifest path is
+    /// repo-relative while the op path is absolute, mirroring the live mixed
+    /// conventions, so this also pins the suffix-aligned site match.
+    #[test]
+    fn fan_in_consumer_calls_join_their_own_site_records() {
+        let key = OperationKey::pubsub("order.placed");
+        let call_at = |file_line: &str| ApiEndpointDetails {
+            owner: None,
+            key: key.clone(),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(file_line),
+            repo_name: None,
+            service_name: None,
+        };
+        let result = ApiAnalysisResult {
+            endpoints: vec![],
+            calls: vec![
+                call_at("/scan/billing-svc/src/kafka/producer.ts:15"),
+                call_at("/scan/orders-engine/src/kafka/producer.ts:22"),
+            ],
+            issues: empty_issues_with_deps(vec![]),
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+        let manifest = vec![
+            manifest_entry_at(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "Endpoint_x_Response_Callbilling",
+                "billing-svc/src/kafka/producer.ts",
+                15,
+                ManifestTypeState::Explicit,
+                true,
+                Some("{ id: string; total: number }"),
+                Some("OrderPlaced"),
+            ),
+            manifest_entry_at(
+                key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "Endpoint_x_Response_Callorders",
+                "orders-engine/src/kafka/producer.ts",
+                22,
+                ManifestTypeState::Explicit,
+                true,
+                Some("{ id: string; total: { amountCents: number } }"),
+                Some("OrderPlaced"),
+            ),
+        ];
+
+        let projection = EvalProjection::from_results(&result, &manifest);
+        let json: Value =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        let calls = json["calls"].as_array().unwrap();
+
+        assert_eq!(calls[0]["type_alias"], "Endpoint_x_Response_Callbilling");
+        assert_eq!(
+            calls[0]["resolved_definition"],
+            "{ id: string; total: number }"
+        );
+        assert_eq!(calls[1]["type_alias"], "Endpoint_x_Response_Callorders");
+        assert_eq!(
+            calls[1]["resolved_definition"],
+            "{ id: string; total: { amountCents: number } }"
+        );
     }
 }

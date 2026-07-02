@@ -668,16 +668,42 @@ fn index_proj_endpoints(proj: &EvalProjection) -> std::collections::HashMap<OpSe
     idx
 }
 
-/// Index the projection's consumer calls by key, for the consumer-side type
-/// metrics (GraphQL/socket consumers + HTTP calls carry anchors/resolved types).
-fn index_proj_calls(proj: &EvalProjection) -> std::collections::HashMap<OpSetKey, &EvalOp> {
-    let mut idx = std::collections::HashMap::new();
-    for o in &proj.calls {
+/// Group ALL projection ops per key instead of keeping only the first. Fan-in
+/// (two repos publishing one pub/sub topic) puts several ops — with genuinely
+/// different resolved types — on one key; the type metrics 1:1-claim within the
+/// group so each expected slot scores against a distinct actual op rather than
+/// whichever op the old `or_insert` happened to keep.
+fn group_proj_ops(ops: &[EvalOp]) -> std::collections::HashMap<OpSetKey, Vec<&EvalOp>> {
+    let mut idx: std::collections::HashMap<OpSetKey, Vec<&EvalOp>> =
+        std::collections::HashMap::new();
+    for o in ops {
         if let Some(k) = op_to_set_key(o) {
-            idx.entry(k).or_insert(o);
+            idx.entry(k).or_default().push(o);
         }
     }
     idx
+}
+
+/// 1:1 claiming join between the expected typed ops of one key and the actual
+/// ops grouped on that key. Each expected slot claims the first UNCLAIMED op
+/// satisfying `matches`; a claimed op can't satisfy a second slot, so a
+/// duplicate projection entry can no longer double-count (and a genuinely
+/// missing fan-in op scores as the miss it is). Single-op keys — everything but
+/// fan-in — behave exactly as the old first-op join. Returns whether a claim
+/// was made.
+fn claim_matching_op(
+    group: &[&EvalOp],
+    claimed: &mut [bool],
+    matches: impl Fn(&EvalOp) -> bool,
+) -> bool {
+    debug_assert_eq!(group.len(), claimed.len());
+    for (i, op) in group.iter().enumerate() {
+        if !claimed[i] && matches(op) {
+            claimed[i] = true;
+            return true;
+        }
+    }
+    false
 }
 
 /// `(correct, total)` fraction with the convention `(0,0) -> 1.0` (nothing to
@@ -726,15 +752,22 @@ fn score_type_anchor_accuracy(
     proj: &EvalProjection,
     tier: &str,
 ) -> f64 {
-    let ep_idx = index_proj_endpoints(proj);
-    let call_idx = index_proj_calls(proj);
+    let ep_idx = group_proj_ops(&proj.endpoints);
+    let call_idx = group_proj_ops(&proj.calls);
+    let mut claimed: std::collections::HashMap<(bool, OpSetKey), Vec<bool>> =
+        std::collections::HashMap::new();
     let mut correct = 0usize;
     let mut total = 0usize;
     for_each_expected_typed_op(repo_expected, tier, |key, is_producer, anchor, _rt, _ts| {
         let idx = if is_producer { &ep_idx } else { &call_idx };
-        if let Some(actual) = idx.get(&key) {
+        if let Some(group) = idx.get(&key) {
             total += 1;
-            if anchor == actual.primary_type_symbol.as_deref() {
+            let flags = claimed
+                .entry((is_producer, key))
+                .or_insert_with(|| vec![false; group.len()]);
+            if claim_matching_op(group, flags, |op| {
+                anchor == op.primary_type_symbol.as_deref()
+            }) {
                 correct += 1;
             }
         }
@@ -754,8 +787,10 @@ fn score_type_resolution_accuracy(
     proj: &EvalProjection,
     tier: &str,
 ) -> f64 {
-    let ep_idx = index_proj_endpoints(proj);
-    let call_idx = index_proj_calls(proj);
+    let ep_idx = group_proj_ops(&proj.endpoints);
+    let call_idx = group_proj_ops(&proj.calls);
+    let mut claimed: std::collections::HashMap<(bool, OpSetKey), Vec<bool>> =
+        std::collections::HashMap::new();
     let mut correct = 0usize;
     let mut total = 0usize;
     for_each_expected_typed_op(repo_expected, tier, |key, is_producer, _anchor, rt, ts| {
@@ -763,15 +798,20 @@ fn score_type_resolution_accuracy(
             return; // only score ops with an expected resolved type
         };
         let idx = if is_producer { &ep_idx } else { &call_idx };
-        if let Some(actual) = idx.get(&key) {
+        if let Some(group) = idx.get(&key) {
             total += 1;
-            let actual_rt = actual
-                .expanded_definition
-                .as_deref()
-                .or(actual.resolved_definition.as_deref());
-            let state_ok = ts == actual.type_state.as_deref();
-            let rt_ok = actual_rt.map(collapse_ws) == Some(collapse_ws(expected_rt));
-            if state_ok && rt_ok {
+            let flags = claimed
+                .entry((is_producer, key))
+                .or_insert_with(|| vec![false; group.len()]);
+            if claim_matching_op(group, flags, |actual| {
+                let actual_rt = actual
+                    .expanded_definition
+                    .as_deref()
+                    .or(actual.resolved_definition.as_deref());
+                let state_ok = ts == actual.type_state.as_deref();
+                let rt_ok = actual_rt.map(collapse_ws) == Some(collapse_ws(expected_rt));
+                state_ok && rt_ok
+            }) {
                 correct += 1;
             }
         }
@@ -1722,25 +1762,45 @@ fn xrepo_live_scorer() {
             // hashed `type_alias` / a different symbol (`MISS` with the actual
             // value), or has no projection entry at all (`actual=None`, the
             // non-HTTP type-pipeline gap, #245).
-            let ep_idx = index_proj_endpoints(&proj);
-            let call_idx = index_proj_calls(&proj);
+            let ep_idx = group_proj_ops(&proj.endpoints);
+            let call_idx = group_proj_ops(&proj.calls);
+            let mut diag_claimed: std::collections::HashMap<(bool, OpSetKey), Vec<bool>> =
+                std::collections::HashMap::new();
             eprintln!("[diag] anchor (expected primary_type_symbol vs actual):");
             for_each_expected_typed_op(
                 &repo_expected,
                 TIER_CAPABILITY,
                 |key, is_producer, anchor, _rt, _ts| {
                     let idx = if is_producer { &ep_idx } else { &call_idx };
-                    let entry = idx.get(&key);
-                    let actual = entry.and_then(|a| a.primary_type_symbol.as_deref());
-                    // Distinguish "no projection entry at all" (the #245 non-HTTP
-                    // type-pipeline gap) from "entry present but anchor null/wrong"
-                    // so a miss is attributable rather than conflated. `NOENT` =
-                    // the op isn't in the projection; `MISS` = it is, but the
-                    // anchor differs from expected.
-                    let mark = match entry {
-                        None => "NOENT",
-                        Some(_) if anchor == actual => "ok   ",
-                        Some(_) => "MISS ",
+                    let group = idx.get(&key);
+                    // Mirror the metric's 1:1 claiming so the diag shows what the
+                    // score saw. Distinguish "no projection entry at all" (the
+                    // #245 non-HTTP type-pipeline gap) from "entry present but
+                    // anchor null/wrong" so a miss is attributable rather than
+                    // conflated. `NOENT` = the op isn't in the projection;
+                    // `MISS` = it is, but no unclaimed op carries the expected
+                    // anchor.
+                    let (mark, actual) = match group {
+                        None => ("NOENT", None),
+                        Some(group) => {
+                            let flags = diag_claimed
+                                .entry((is_producer, key.clone()))
+                                .or_insert_with(|| vec![false; group.len()]);
+                            if claim_matching_op(group, flags, |op| {
+                                anchor == op.primary_type_symbol.as_deref()
+                            }) {
+                                ("ok   ", anchor)
+                            } else {
+                                // Show the first unclaimed op's anchor as the
+                                // nearest-actual for the report.
+                                let nearest = group
+                                    .iter()
+                                    .zip(flags.iter())
+                                    .find(|(_, claimed)| !**claimed)
+                                    .and_then(|(op, _)| op.primary_type_symbol.as_deref());
+                                ("MISS ", nearest)
+                            }
+                        }
                     };
                     eprintln!(
                         "[diag]   anchor[{mark}] {key:?} expected={anchor:?} actual={actual:?}"
@@ -2278,6 +2338,93 @@ mod scoring_tests {
         proj.endpoints.push(a);
         proj.endpoints.push(b);
         // a correct, b wrong (state mismatch) → 0.5.
+        assert!(
+            (score_type_resolution_accuracy(&repos, &proj, TIER_CAPABILITY) - 0.5).abs() < 1e-9
+        );
+    }
+
+    /// Fan-in (#290/#291): two expected consumer slots on ONE key (two repos
+    /// publishing the same pub/sub topic with different payloads) must each
+    /// claim a DISTINCT actual op. The old first-op join scored both slots
+    /// against whichever op the index kept — the flat-payload slot passed and
+    /// the nested-payload slot could never match.
+    #[test]
+    fn type_resolution_fan_in_slots_claim_distinct_ops() {
+        let repos = vec![
+            (
+                "billing-svc".to_string(),
+                serde_json::from_value::<ExpectedRepo>(serde_json::json!({
+                    "pubsub_operations": [
+                        { "key": "pubsub|order.placed", "role": "consumer",
+                          "resolved_type": "{ id: string; total: number; }",
+                          "type_state": "Explicit", "tier": "capability" }
+                    ]
+                }))
+                .unwrap(),
+            ),
+            (
+                "orders-engine".to_string(),
+                serde_json::from_value::<ExpectedRepo>(serde_json::json!({
+                    "pubsub_operations": [
+                        { "key": "pubsub|order.placed", "role": "consumer",
+                          "resolved_type": "{ id: string; total: { amountCents: number; }; }",
+                          "type_state": "Explicit", "tier": "capability" }
+                    ]
+                }))
+                .unwrap(),
+            ),
+        ];
+        let mut proj = empty_proj();
+        let mut flat = nonhttp_op("pubsub", "pubsub|order.placed");
+        flat.resolved_definition = Some("{ id: string; total: number; }".to_string());
+        flat.type_state = Some("Explicit".to_string());
+        let mut nested = nonhttp_op("pubsub", "pubsub|order.placed");
+        nested.resolved_definition =
+            Some("{ id: string; total: { amountCents: number; }; }".to_string());
+        nested.type_state = Some("Explicit".to_string());
+        proj.calls.push(flat);
+        proj.calls.push(nested);
+        // Both slots find their own op → 1.0 (was 0.5 under the first-op join).
+        assert!(
+            (score_type_resolution_accuracy(&repos, &proj, TIER_CAPABILITY) - 1.0).abs() < 1e-9
+        );
+    }
+
+    /// The claiming join is 1:1: when the projection carries only ONE op for a
+    /// fan-in key (the other site's op is genuinely missing), a single actual
+    /// op must not double-count against both expected slots.
+    #[test]
+    fn type_resolution_single_op_cannot_satisfy_two_slots() {
+        let repos = vec![
+            (
+                "billing-svc".to_string(),
+                serde_json::from_value::<ExpectedRepo>(serde_json::json!({
+                    "pubsub_operations": [
+                        { "key": "pubsub|order.placed", "role": "consumer",
+                          "resolved_type": "{ id: string; total: number; }",
+                          "type_state": "Explicit", "tier": "capability" }
+                    ]
+                }))
+                .unwrap(),
+            ),
+            (
+                "orders-engine".to_string(),
+                serde_json::from_value::<ExpectedRepo>(serde_json::json!({
+                    "pubsub_operations": [
+                        { "key": "pubsub|order.placed", "role": "consumer",
+                          "resolved_type": "{ id: string; total: number; }",
+                          "type_state": "Explicit", "tier": "capability" }
+                    ]
+                }))
+                .unwrap(),
+            ),
+        ];
+        let mut proj = empty_proj();
+        let mut only = nonhttp_op("pubsub", "pubsub|order.placed");
+        only.resolved_definition = Some("{ id: string; total: number; }".to_string());
+        only.type_state = Some("Explicit".to_string());
+        proj.calls.push(only);
+        // Two slots joined (key present), one distinct op to claim → 0.5.
         assert!(
             (score_type_resolution_accuracy(&repos, &proj, TIER_CAPABILITY) - 0.5).abs() < 1e-9
         );
