@@ -2513,10 +2513,23 @@ impl FileOrchestrator {
                     );
                     continue;
                 }
+                // Drop calls whose canonical path has no literal segment left
+                // to match on (`${baseUrl}${path}`, a bare `${GQL_URL}`): they
+                // can never join a producer key, so they are pure index noise
+                // (#307) — typically a wrapper's internal fetch, whose resolved
+                // call-site emissions are extracted separately and do match.
+                let canonical_path = normalizer.consumer_call_path(&data_call.target);
+                if !UrlNormalizer::canonical_path_has_literal_segment(&canonical_path) {
+                    debug!(
+                        "Skipping data call with no literal path segment: {} ({})",
+                        data_call.target, file_path
+                    );
+                    continue;
+                }
                 graph.data_calls.push(DataFetchingCall {
                     method,
                     target_url: data_call.target.clone(),
-                    canonical_path: normalizer.consumer_call_path(&data_call.target),
+                    canonical_path,
                     client: data_call.pattern_matched.clone(),
                     file_location: format!("{}:{}", file_path, data_call.line_number),
                     call_kind: data_call.call_kind,
@@ -3139,6 +3152,63 @@ mod tests {
             "https://api.example.com/data"
         );
         assert_eq!(graph.data_calls[0].method, "POST");
+    }
+
+    /// #307 (class 1): a wrapper-internal call whose canonical path is nothing
+    /// but template interpolations (`${baseUrl}${path}`, a bare `${GQL_URL}`)
+    /// can never match a producer key and must not enter the graph; a call
+    /// with any literal segment stays.
+    #[test]
+    fn test_build_mount_graph_drops_calls_with_no_literal_path_segment() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mk_call = |id: &str, target: &str, method: &str| DataCallResult {
+            call_kind: None,
+            candidate_id: id.to_string(),
+            line_number: 6,
+            target: target.to_string(),
+            method: Some(method.to_string()),
+            pattern_matched: "fetch(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/lib/apiClient.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    mk_call("c1", "${baseUrl}${path}", "GET"),
+                    mk_call("c2", "${NEXT_PUBLIC_GATEWAY_GQL_URL}", "POST"),
+                    mk_call("c3", "/orders/${orderId}/timeline", "GET"),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+            },
+        );
+
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+
+        let targets: Vec<&str> = graph
+            .data_calls
+            .iter()
+            .map(|c| c.target_url.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            vec!["/orders/${orderId}/timeline"],
+            "fully-templated targets must be dropped, literal-segment targets kept"
+        );
     }
 
     #[test]
