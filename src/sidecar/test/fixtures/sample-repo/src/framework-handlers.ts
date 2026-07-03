@@ -40,3 +40,11 @@ export async function bareReturnHandler(): Promise<User> {
   const user: User = { id: 2, name: 'Bob' };
   return user;
 }
+
+// 5. Bare return of an ARRAY (#306): the deterministic anchor must be the
+// ELEMENT symbol (`User`, array_depth 1) — an array type's own symbol is the
+// builtin `Array`, which can never anchor.
+export async function arrayReturnHandler(): Promise<User[]> {
+  const latest: User[] = [{ id: 3, name: 'Cara' }];
+  return latest;
+}
