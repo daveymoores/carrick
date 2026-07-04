@@ -275,12 +275,17 @@ impl MountGraph {
         Some(matching)
     }
 
-    /// Like [`find_matching_endpoints_with_normalizer`] but ignoring the HTTP
-    /// method. Used after a method-filtered lookup came back empty, to
-    /// distinguish "no producer at this path at all" (missing endpoint) from
-    /// "a producer exists under a different verb" (method mismatch — a
+    /// Exact-path lookup ignoring the HTTP method. Used after a
+    /// method-filtered lookup came back empty, to distinguish "no producer
+    /// declares this path" (missing endpoint) from "a producer declares
+    /// exactly this path under a different verb" (method mismatch — a
     /// contract risk, not a connectivity gap).
-    pub fn find_matching_endpoints_any_method(
+    ///
+    /// Unlike [`find_matching_endpoints_with_normalizer`] this does NOT
+    /// wildcard params against concrete segments: `POST /users/:id` must not
+    /// turn a missing `GET /users/list` into a "wrong verb" risk. Segments
+    /// match literally or param-to-param only (param names are not identity).
+    pub fn find_exact_path_matches_any_method(
         &self,
         url: &str,
         normalizer: &UrlNormalizer,
@@ -292,9 +297,25 @@ impl MountGraph {
         Some(
             self.endpoints
                 .iter()
-                .filter(|endpoint| self.paths_match(&endpoint.full_path, &normalized.path))
+                .filter(|endpoint| {
+                    Self::paths_equal_modulo_param_names(&endpoint.full_path, &normalized.path)
+                })
                 .collect(),
         )
+    }
+
+    /// Whether two paths name the same declared route once param NAMES are
+    /// ignored: same segment count, and each segment pair is literally equal
+    /// or a param on BOTH sides (`:id` vs `:param`). Trailing `?` optional
+    /// markers are ignored for the comparison.
+    fn paths_equal_modulo_param_names(a: &str, b: &str) -> bool {
+        let a_segments: Vec<&str> = a.split('/').collect();
+        let b_segments: Vec<&str> = b.split('/').collect();
+        a_segments.len() == b_segments.len()
+            && a_segments.iter().zip(&b_segments).all(|(a_seg, b_seg)| {
+                let (a_seg, b_seg) = (a_seg.trim_end_matches('?'), b_seg.trim_end_matches('?'));
+                a_seg == b_seg || (Self::is_param_segment(a_seg) && Self::is_param_segment(b_seg))
+            })
     }
 
     fn paths_match(&self, endpoint_path: &str, call_path: &str) -> bool {

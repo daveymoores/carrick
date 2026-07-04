@@ -160,10 +160,7 @@ pub fn format_analysis_results(
 /// when there is no prior index to diff against, or when nothing changed.
 /// A removed endpoint whose (method, path) still shows up as a missing
 /// endpoint is flagged — the PR deletes a producer something still calls.
-fn format_pr_delta(
-    pr_delta: Option<&PrDelta>,
-    still_missing: &BTreeSet<(String, String)>,
-) -> String {
+fn format_pr_delta(pr_delta: Option<&PrDelta>, still_missing: &[(String, String)]) -> String {
     let Some(delta) = pr_delta else {
         return String::new();
     };
@@ -180,7 +177,10 @@ fn format_pr_delta(
         ));
     }
     for ep in &delta.removed_endpoints {
-        let consumed = if still_missing.contains(&(ep.method.clone(), ep.path.clone())) {
+        let consumed = if still_missing
+            .iter()
+            .any(|(method, path)| endpoints_overlap(&ep.method, &ep.path, method, path))
+        {
             " — ⚠ still consumed"
         } else {
             ""
@@ -195,6 +195,24 @@ fn format_pr_delta(
     }
     output.push('\n');
     output
+}
+
+/// Whether a removed endpoint and a missing-endpoint finding name the same
+/// route: methods equal case-insensitively, paths segment-wise with a
+/// `:`-prefixed segment on EITHER side matching anything. Literal equality
+/// would never fire on parameterized routes — the removed side carries
+/// declared param names (`/orders/:id`) while the missing side is normalized
+/// (`/orders/:param`) or concrete (`/orders/123`).
+fn endpoints_overlap(a_method: &str, a_path: &str, b_method: &str, b_path: &str) -> bool {
+    if !a_method.eq_ignore_ascii_case(b_method) {
+        return false;
+    }
+    let a_segments: Vec<&str> = a_path.split('/').collect();
+    let b_segments: Vec<&str> = b_path.split('/').collect();
+    a_segments.len() == b_segments.len()
+        && a_segments.iter().zip(&b_segments).all(|(a_seg, b_seg)| {
+            a_seg.starts_with(':') || b_seg.starts_with(':') || a_seg == b_seg
+        })
 }
 
 /// ``(`service`)`` suffix for a delta line; empty when the service is absent
@@ -310,7 +328,7 @@ fn format_no_issues(
         "> [!TIP]\n> All cross-service calls match the indexed contracts across {}.\n\n",
         topology.scope_phrase()
     ));
-    output.push_str(&format_pr_delta(pr_delta, &BTreeSet::new()));
+    output.push_str(&format_pr_delta(pr_delta, &[]));
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
         result.endpoints.len(),
@@ -408,9 +426,10 @@ impl CategorizedFindings<'_> {
         self.major_dependencies.is_empty() && self.unparseable_dependencies.is_empty()
     }
 
-    /// (method, path) of every missing-endpoint finding — the join key for the
-    /// delta section's "still consumed" flag on removed endpoints.
-    fn missing_keys(&self) -> BTreeSet<(String, String)> {
+    /// (method, path) of every missing-endpoint finding — the join keys for
+    /// the delta section's "still consumed" flag on removed endpoints
+    /// (matched param-aware by `endpoints_overlap`, not literally).
+    fn missing_keys(&self) -> Vec<(String, String)> {
         self.missing
             .iter()
             .filter_map(|finding| match finding {
@@ -1331,6 +1350,53 @@ mod tests {
         assert!(output.contains("- Removed `DELETE /api/sessions` — ⚠ still consumed"));
         assert!(output.contains("- Removed `GET /api/unused` (`auth`)\n"));
         assert!(!output.contains("`GET /api/unused` (`auth`) — ⚠"));
+    }
+
+    /// The "still consumed" join must be param-aware: the removed side
+    /// carries declared param names (`/orders/:id`) while the missing side is
+    /// normalized (`/orders/:param`) or concrete — literal equality would
+    /// never flag a parameterized route.
+    #[test]
+    fn test_pr_delta_still_consumed_join_is_param_aware() {
+        let delta = PrDelta {
+            new_endpoints: vec![],
+            removed_endpoints: vec![
+                // Param name differs from the missing finding's `:param`.
+                EndpointRef {
+                    method: "GET".to_string(),
+                    path: "/orders/:id".to_string(),
+                    service: None,
+                },
+                // Same prefix, different segment count — must NOT be flagged.
+                EndpointRef {
+                    method: "GET".to_string(),
+                    path: "/orders".to_string(),
+                    service: None,
+                },
+                // Param matches a concrete missing segment, but the method
+                // differs — must NOT be flagged.
+                EndpointRef {
+                    method: "DELETE".to_string(),
+                    path: "/users/:id".to_string(),
+                    service: None,
+                },
+            ],
+        };
+        let findings = vec![
+            Finding::missing_endpoint(
+                "GET",
+                "/orders/:param",
+                None,
+                vec!["web/src/orders.ts:3".to_string()],
+            ),
+            Finding::missing_endpoint("GET", "/users/42", None, vec![]),
+        ];
+        let output =
+            format_analysis_results(result_with(findings), &topology_baseline(), Some(&delta));
+
+        assert!(output.contains("- Removed `GET /orders/:id` — ⚠ still consumed"));
+        assert!(output.contains("- Removed `GET /orders`\n"));
+        assert!(output.contains("- Removed `DELETE /users/:id`\n"));
     }
 
     #[test]

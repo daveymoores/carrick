@@ -7,7 +7,9 @@
 
 use serde::{Serialize, Serializer, ser::SerializeMap};
 
-/// Wire cap on `call_sites` entries per finding (applied at construction).
+/// Wire cap on `call_sites` entries per finding. Applied when serializing
+/// only — the in-memory finding keeps the full set so the terminal report
+/// shows true counts.
 pub const MAX_CALL_SITES: usize = 5;
 /// Wire cap on `detail` length in *chars* (applied at construction).
 pub const MAX_DETAIL_CHARS: usize = 400;
@@ -17,6 +19,7 @@ pub const MAX_DETAIL_CHARS: usize = 400;
 /// truncation that panicked mid-UTF-8 sequence. For `max >= 3` the result
 /// never exceeds `max` chars including the ellipsis.
 pub fn truncate_chars(s: &str, max: usize) -> String {
+    debug_assert!(max >= 3, "truncate_chars needs room for the ellipsis");
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -25,9 +28,9 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-fn cap_call_sites(mut call_sites: Vec<String>) -> Vec<String> {
-    call_sites.truncate(MAX_CALL_SITES);
-    call_sites
+/// The wire view of a `call_sites` list: at most [`MAX_CALL_SITES`] entries.
+fn wire_call_sites(call_sites: &[String]) -> &[String] {
+    &call_sites[..call_sites.len().min(MAX_CALL_SITES)]
 }
 
 /// Fixed per finding kind (see [`Finding::severity`]); sent explicitly on the
@@ -60,7 +63,7 @@ pub mod tier {
 /// explicit `severity` field (see the custom [`Serialize`] impl below).
 /// `method`/`path` are protocol-agnostic display labels (HTTP verb + route,
 /// GraphQL kind + field, socket direction + event); `call_sites` entries are
-/// `file:line` (or bare `file`), capped at [`MAX_CALL_SITES`].
+/// `file:line` (or bare `file`), capped at [`MAX_CALL_SITES`] on the wire.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Finding {
     /// Producer and consumer types for one endpoint are incompatible.
@@ -128,7 +131,7 @@ impl Finding {
             method: method.into(),
             path: path.into(),
             service,
-            call_sites: cap_call_sites(call_sites),
+            call_sites,
             producer_type: producer_type.into(),
             consumer_type: consumer_type.into(),
             detail: truncate_chars(detail, MAX_DETAIL_CHARS),
@@ -146,7 +149,7 @@ impl Finding {
             method: method.into(),
             path: path.into(),
             service,
-            call_sites: cap_call_sites(call_sites),
+            call_sites,
             expected_method: expected_method.into(),
         }
     }
@@ -161,7 +164,7 @@ impl Finding {
             method: method.into(),
             path: path.into(),
             service,
-            call_sites: cap_call_sites(call_sites),
+            call_sites,
         }
     }
 
@@ -187,7 +190,7 @@ impl Finding {
             method: method.into(),
             path: path.into(),
             env_var: env_var.into(),
-            call_sites: cap_call_sites(call_sites),
+            call_sites,
         }
     }
 
@@ -255,7 +258,7 @@ impl Serialize for Finding {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("service", service)?;
-                map.serialize_entry("call_sites", call_sites)?;
+                map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
                 map.serialize_entry("producer_type", producer_type)?;
                 map.serialize_entry("consumer_type", consumer_type)?;
                 map.serialize_entry("detail", detail)?;
@@ -270,7 +273,7 @@ impl Serialize for Finding {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("service", service)?;
-                map.serialize_entry("call_sites", call_sites)?;
+                map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
                 map.serialize_entry("expected_method", expected_method)?;
             }
             Finding::MissingEndpoint {
@@ -282,7 +285,7 @@ impl Serialize for Finding {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("service", service)?;
-                map.serialize_entry("call_sites", call_sites)?;
+                map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
             }
             Finding::OrphanedEndpoint {
                 method,
@@ -302,7 +305,7 @@ impl Serialize for Finding {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("env_var", env_var)?;
-                map.serialize_entry("call_sites", call_sites)?;
+                map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
             }
             Finding::DependencyConflict {
                 package_name,
@@ -423,13 +426,22 @@ mod tests {
     }
 
     #[test]
-    fn call_sites_capped_at_construction() {
+    fn call_sites_capped_on_the_wire_only() {
+        // The in-memory finding keeps every call site (the terminal report
+        // shows true counts); only the serialized wire form is capped.
         let sites: Vec<String> = (0..9).map(|i| format!("src/a.ts:{i}")).collect();
         let finding = Finding::missing_endpoint("GET", "/x", None, sites);
         let Finding::MissingEndpoint { call_sites, .. } = &finding else {
             panic!("wrong variant");
         };
-        assert_eq!(call_sites.len(), MAX_CALL_SITES);
+        assert_eq!(call_sites.len(), 9);
+
+        let v = serde_json::to_value(&finding).unwrap();
+        let wire_sites = v["call_sites"].as_array().unwrap();
+        assert_eq!(wire_sites.len(), MAX_CALL_SITES);
+        // The first five in order, not an arbitrary subset.
+        assert_eq!(wire_sites[0], "src/a.ts:0");
+        assert_eq!(wire_sites[4], "src/a.ts:4");
     }
 
     #[test]

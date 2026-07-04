@@ -1282,19 +1282,31 @@ impl Analyzer {
     /// comment), and the third captures the structured producer→consumer
     /// edges (consumed only by the eval projection).
     fn analyze_matches_with_mount_graph(&self, mount_graph: &MountGraph) -> MatcherOutput {
+        /// A wrong-verb call group awaiting resolution. Producers hold
+        /// `(EXPECTED_METHOD, suppression key, declared full_path)` for every
+        /// exact-path producer; resolution is deferred to after the call loop
+        /// because "prefer an unverified producer" needs the complete
+        /// verified set.
+        #[derive(Default)]
+        struct MismatchCandidate {
+            call_sites: BTreeSet<String>,
+            producers: Vec<(String, String, String)>,
+        }
+
         // Grouped accumulators, BTree-keyed so same-target call sites collapse
         // into one finding and the emitted order is deterministic.
         // (METHOD, path) → call sites.
         let mut missing: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-        // (METHOD, path, expected_method) → call sites.
-        let mut method_mismatches: BTreeMap<(String, String, String), BTreeSet<String>> =
+        // (METHOD, consumer path) → wrong-verb candidate.
+        let mut mismatch_candidates: BTreeMap<(String, String), MismatchCandidate> =
             BTreeMap::new();
         // (env_var, METHOD, path) → call sites.
         let mut env_var_calls: BTreeMap<(String, String, String), BTreeSet<String>> =
             BTreeMap::new();
-        // Producers surfaced as a method mismatch: suppressed from the orphan
-        // list so a wrong-verb call reports once, as a risk — not as a
-        // missing+orphaned pair.
+        // The single producer each method-mismatch finding names: suppressed
+        // from the orphan list so a wrong-verb call reports once, as a risk —
+        // not as a missing+orphaned pair. Its exact-path siblings keep their
+        // own verified/orphaned classification.
         let mut method_mismatched_producers: HashSet<String> = HashSet::new();
         // Structured producer→consumer edges for the eval projection.
         let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
@@ -1425,11 +1437,16 @@ impl Analyzer {
                     }
                 }
                 Some(_) => {
-                    // No producer under this method — retry ignoring the
-                    // method to tell a wrong verb (a contract risk) apart from
-                    // a genuinely missing endpoint (a connectivity gap).
+                    // No producer under this method — retry with an EXACT
+                    // path match (param-name-agnostic, never wildcarding a
+                    // param against a concrete segment) ignoring the method,
+                    // to tell a wrong verb on a declared route (a contract
+                    // risk) apart from a genuinely missing endpoint (a
+                    // connectivity gap). A wildcard-only collision — e.g.
+                    // `POST /users/:id` while `GET /users/list` is missing —
+                    // stays a missing endpoint.
                     let path_matches = mount_graph
-                        .find_matching_endpoints_any_method(&lookup_url, &normalizer)
+                        .find_exact_path_matches_any_method(&lookup_url, &normalizer)
                         .unwrap_or_default();
                     if path_matches.is_empty() {
                         missing
@@ -1437,26 +1454,48 @@ impl Analyzer {
                             .or_default()
                             .insert(call_site);
                     } else {
-                        // Several verbs can exist at one path; report the
-                        // first (sorted) so the wrong-verb call surfaces as
-                        // one risk row, not a fan-out.
-                        let mut methods: Vec<String> = path_matches
-                            .iter()
-                            .map(|e| e.method.to_uppercase())
-                            .collect();
-                        methods.sort();
-                        methods.dedup();
-                        for endpoint in &path_matches {
-                            method_mismatched_producers
-                                .insert(format!("{}:{}", endpoint.method, endpoint.full_path));
+                        let candidate = mismatch_candidates
+                            .entry((method.to_string(), miss_path))
+                            .or_default();
+                        candidate.call_sites.insert(call_site);
+                        for endpoint in path_matches {
+                            candidate.producers.push((
+                                endpoint.method.to_uppercase(),
+                                format!("{}:{}", endpoint.method, endpoint.full_path),
+                                endpoint.full_path.clone(),
+                            ));
                         }
-                        method_mismatches
-                            .entry((method.to_string(), miss_path, methods.swap_remove(0)))
-                            .or_default()
-                            .insert(call_site);
                     }
                 }
             }
+        }
+
+        // Resolve wrong-verb candidates now that the verified set is
+        // complete: prefer a producer no consumer matched — the wrong verb
+        // most plausibly aims at it, and it would otherwise double-report as
+        // an orphan — falling back to the first in sorted order when every
+        // exact-path producer is verified. Only the chosen producer is
+        // suppressed from the orphan list. Keyed by the producer's DECLARED
+        // path so N consumer spellings of one route collapse into one risk.
+        let mut method_mismatches: BTreeMap<(String, String, String), BTreeSet<String>> =
+            BTreeMap::new();
+        for ((method, _consumer_path), mut candidate) in mismatch_candidates {
+            candidate.producers.sort();
+            candidate.producers.dedup();
+            let Some((expected, producer_key, declared_path)) = candidate
+                .producers
+                .iter()
+                .find(|(_, key, _)| !matched_endpoints.contains(key))
+                .or_else(|| candidate.producers.first())
+                .cloned()
+            else {
+                continue;
+            };
+            method_mismatched_producers.insert(producer_key);
+            method_mismatches
+                .entry((method, declared_path, expected))
+                .or_default()
+                .extend(candidate.call_sites);
         }
 
         // Findings order: risks (method mismatches) first, then gaps, then
@@ -3162,6 +3201,149 @@ mod tests {
                 Finding::orphaned_endpoint("POST", "/api/orders", Some("api".to_string())),
             ]
         );
+    }
+
+    /// Bare HTTP consumer call for the mount-graph matcher tests.
+    fn http_call(method: &str, path: &str, file: &str) -> ApiEndpointDetails {
+        graphql_details(OperationKey::http(method, path.to_string()), file)
+    }
+
+    /// Producer endpoint in the mount graph, repo-tagged `"api"`.
+    fn resolved(method: &str, full_path: &str) -> crate::mount_graph::ResolvedEndpoint {
+        crate::mount_graph::ResolvedEndpoint {
+            method: method.to_string(),
+            path: full_path.to_string(),
+            full_path: full_path.to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "server.ts:10".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("api".to_string()),
+            service_name: None,
+        }
+    }
+
+    /// The wrong-verb retry must require an EXACT declared path, never a
+    /// param wildcard: `POST /users/:id` wildcard-matches `/users/list`, but
+    /// a missing `GET /users/list` is a connectivity gap, not a "call uses
+    /// GET but the producer expects POST" risk (which always headlines and
+    /// would fail the cloud check run even for a no-baseline repo).
+    #[test]
+    fn test_wildcard_only_collision_stays_missing_endpoint() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer
+            .calls
+            .push(http_call("GET", "/users/list", "client.ts:4"));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(resolved("POST", "/users/:id"));
+
+        let (findings, verified, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            findings,
+            vec![
+                Finding::missing_endpoint("GET", "/users/list", None, vec!["client.ts:4".into()]),
+                Finding::orphaned_endpoint("POST", "/users/:id", Some("api".to_string())),
+            ],
+            "a wildcard-only path collision must not become a method mismatch"
+        );
+        assert!(verified.is_empty());
+    }
+
+    /// Param NAMES are not identity: a consumer path normalized to a
+    /// different param name (`/orders/:oid` vs the declared `/orders/:id`)
+    /// still counts as the same declared route, and the finding reports the
+    /// producer's declared spelling.
+    #[test]
+    fn test_method_mismatch_matches_params_by_position_not_name() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer
+            .calls
+            .push(http_call("GET", "/orders/:oid", "client.ts:7"));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(resolved("POST", "/orders/:id"));
+
+        let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            findings,
+            vec![Finding::method_mismatch(
+                "GET",
+                "/orders/:id",
+                None,
+                vec!["client.ts:7".into()],
+                "POST",
+            )]
+        );
+    }
+
+    /// When several verbs exist at the mismatched path, name the UNVERIFIED
+    /// producer (the wrong verb most plausibly aims at it) and suppress only
+    /// that one from the orphan list — every sibling keeps its own
+    /// verified/orphaned classification.
+    #[test]
+    fn test_method_mismatch_prefers_unverified_producer_and_keeps_siblings() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // GET /a is genuinely consumed; PUT /a is the wrong verb; GET /b is
+        // an unrelated real orphan that must survive.
+        analyzer.calls.push(http_call("GET", "/a", "client.ts:1"));
+        analyzer.calls.push(http_call("PUT", "/a", "client.ts:2"));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(resolved("GET", "/a"));
+        mount_graph.endpoints.push(resolved("POST", "/a"));
+        mount_graph.endpoints.push(resolved("GET", "/b"));
+
+        let (findings, verified, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            findings,
+            vec![
+                // Expected method is the unverified POST, not the verified GET.
+                Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "POST"),
+                // GET /b keeps its orphan classification; POST /a is
+                // suppressed (it is the producer the risk names).
+                Finding::orphaned_endpoint("GET", "/b", Some("api".to_string())),
+            ]
+        );
+        assert_eq!(verified, vec![("GET".to_string(), "/a".to_string())]);
+    }
+
+    /// When every exact-path producer is verified, fall back to the first in
+    /// sorted order; a verified producer never sat in the orphan list, so
+    /// nothing is hidden.
+    #[test]
+    fn test_method_mismatch_falls_back_to_sorted_verified_producer() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(http_call("GET", "/a", "client.ts:1"));
+        analyzer.calls.push(http_call("PUT", "/a", "client.ts:2"));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(resolved("GET", "/a"));
+
+        let (findings, verified, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            findings,
+            vec![Finding::method_mismatch(
+                "PUT",
+                "/a",
+                None,
+                vec!["client.ts:2".into()],
+                "GET",
+            )]
+        );
+        assert_eq!(verified, vec![("GET".to_string(), "/a".to_string())]);
     }
 
     // -----------------------------------------------------------------------
