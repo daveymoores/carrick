@@ -111,7 +111,9 @@ runs:
 
         ISSUES=0
         if grep -q "CARRICK_ISSUE_COUNT:" analysis.log; then
-          ISSUES=$(grep "CARRICK_ISSUE_COUNT:" analysis.log | sed 's/.*CARRICK_ISSUE_COUNT:\([0-9]*\).*/\1/')
+          # -m1: only the first marker counts — log echoes of the output (or a
+          # rerun appending to the same log) must not yield a multi-line value.
+          ISSUES=$(grep -m1 "CARRICK_ISSUE_COUNT:" analysis.log | sed 's/.*CARRICK_ISSUE_COUNT:\([0-9]*\).*/\1/')
         fi
 
         if [ $EXIT_CODE -eq 0 ]; then

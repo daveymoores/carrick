@@ -11,6 +11,7 @@ mod eval_output;
 mod extractor;
 mod file_based_router;
 mod file_finder;
+mod findings;
 mod formatter;
 mod framework_detector;
 mod graphql;
