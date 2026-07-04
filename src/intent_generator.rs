@@ -77,9 +77,11 @@ const TRIVIAL_BODY_MAX_CHARS: usize = 80;
 
 /// A body too small to carry business logic worth an LLM description:
 /// single-line and at most [`TRIVIAL_BODY_MAX_CHARS`] chars after trim.
+/// Counted in chars, not bytes, so non-ASCII identifiers/strings don't
+/// shrink the effective threshold.
 fn is_trivial_body(body: &str) -> bool {
     let trimmed = body.trim();
-    trimmed.len() <= TRIVIAL_BODY_MAX_CHARS && !trimmed.contains('\n')
+    !trimmed.contains('\n') && trimmed.chars().count() <= TRIVIAL_BODY_MAX_CHARS
 }
 
 /// True when `body` references `name` as a standalone JS identifier.
@@ -712,6 +714,10 @@ mod tests {
         assert!(is_trivial_body("(x) => x.id"));
         assert!(is_trivial_body("{ return user.email; }"));
         assert!(is_trivial_body("  return config.baseUrl;  "));
+        // Threshold counts chars, not bytes: a one-liner of 80 multi-byte
+        // chars (240 bytes here) is still trivial.
+        assert!(is_trivial_body(&"é".repeat(80)));
+        assert!(!is_trivial_body(&"é".repeat(81)));
 
         // Multi-line bodies always get an intent, however short.
         assert!(!is_trivial_body("const a = 1;\nreturn a;"));

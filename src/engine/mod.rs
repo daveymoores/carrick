@@ -2635,6 +2635,12 @@ async fn analyze_current_repo(
     );
     let analysis_result = analysis_result;
 
+    // Cloud-bound paths must be repo-relative. The incremental path gets
+    // this from build_cloud_data_from_mount_graph; this full path constructs
+    // CloudRepoData directly, so relativize here (after signatures are
+    // composed — they embed the same absolute prefix).
+    relativize_function_definition_paths(&mut function_definitions, repo_path);
+
     // 5. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
     let mut cloud_data = CloudRepoData::from_multi_agent_results(
         repo_name.clone(),
@@ -2643,7 +2649,7 @@ async fn analyze_current_repo(
         serde_json::to_string(config).ok(),
         serde_json::to_string(packages).ok(),
         Some(packages.clone()),
-        function_definitions.clone(),
+        function_definitions,
     );
     append_deterministic_protocol_operations(
         &mut cloud_data,
