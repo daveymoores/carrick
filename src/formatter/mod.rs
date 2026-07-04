@@ -1,22 +1,10 @@
-use crate::analyzer::{
-    ApiAnalysisResult, ApiIssues, ConflictSeverity, DependencyConflict, OrphanedEndpoint,
-};
+use crate::analyzer::ApiAnalysisResult;
+use crate::findings::{Finding, PrDelta, Topology, tier};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Shape of the project being analyzed, threaded from the engine so the PR
-/// comment frames findings for the right setup: a lone repo, a monorepo
-/// (multiple services declared in one carrick.json), or a poly-repo project
-/// (peer repos indexed alongside this one).
-#[derive(Debug, Clone)]
-pub struct Topology {
-    /// This repo's name, used to title single-repo comments.
-    pub repo_name: String,
-    /// Services declared for THIS repo. More than one means a monorepo.
-    pub local_service_count: usize,
-    /// Other repos indexed for the project (peers).
-    pub peer_repo_count: usize,
-}
-
+// Display helpers for the wire [`Topology`]. Defined here (not in
+// `findings`) because they are presentation policy: the cloud renderer
+// applies its own equivalents when it rebuilds the PR comment.
 impl Topology {
     fn is_monorepo(&self) -> bool {
         self.local_service_count > 1
@@ -61,32 +49,6 @@ impl Topology {
     }
 }
 
-/// An endpoint present in the current scan but absent from the repo's
-/// previously-indexed state. `label`/`name` are protocol-agnostic
-/// (`OperationKey::display_labels`): for HTTP they are method + path, for
-/// GraphQL the operation kind + field, for sockets the direction + event.
-#[derive(Debug, Clone)]
-pub struct NewEndpoint {
-    pub label: String,
-    pub name: String,
-    pub service: Option<String>,
-}
-
-/// What this PR added relative to the repo's last-indexed (main) state. Because
-/// the baseline is the last *uploaded* index, this can include an endpoint that
-/// landed on main since its last scan rather than in this PR. `None` outside a
-/// PR run or when there is no prior index to diff against.
-#[derive(Debug, Clone)]
-pub struct PrDelta {
-    pub new_endpoints: Vec<NewEndpoint>,
-}
-
-impl PrDelta {
-    fn is_empty(&self) -> bool {
-        self.new_endpoints.is_empty()
-    }
-}
-
 pub struct FormattedOutput {
     pub content: String,
 }
@@ -100,25 +62,6 @@ impl FormattedOutput {
     pub fn print(&self) {
         println!("{}", self.content);
     }
-
-    /// The comment body to relay to the cloud: the rendered markdown without
-    /// the machine-only marker lines (`CARRICK_OUTPUT_START`/`_END` and
-    /// `CARRICK_ISSUE_COUNT`). The cloud adds its own idempotency marker, so
-    /// these would only be noise in the posted comment. Mirrors the `grep -v`
-    /// the GitHub Action previously applied before posting.
-    pub fn pr_comment_body(&self) -> String {
-        self.content
-            .lines()
-            .filter(|line| {
-                !line.contains("CARRICK_OUTPUT_START")
-                    && !line.contains("CARRICK_OUTPUT_END")
-                    && !line.contains("CARRICK_ISSUE_COUNT")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string()
-    }
 }
 
 pub fn format_analysis_results(
@@ -126,60 +69,45 @@ pub fn format_analysis_results(
     topology: &Topology,
     pr_delta: Option<&PrDelta>,
 ) -> String {
-    if result.issues.is_empty() {
+    if result.findings.is_empty() {
         return format_no_issues(&result, topology, pr_delta);
     }
 
-    let categorized_issues = categorize_issues(&result.issues);
+    let categorized = categorize_findings(&result.findings);
     let has_baseline = topology.has_baseline();
-    // Without a baseline (a lone single-service repo) connectivity findings are
-    // inconclusive, so they stay out of the headline count and the Action's
-    // CARRICK_ISSUE_COUNT — they are still listed below, framed as
-    // informational. Configuration suggestions are advisory and never gate CI,
-    // so they are excluded from the count as well.
+    // Headline rule (mirrored by the cloud renderer): risks always count;
+    // connectivity gaps count only with a baseline (a lone single-service repo
+    // has nothing to match against, so they are listed as informational);
+    // major dependency conflicts count; advisory findings (env-var
+    // suggestions, unparseable version pins) never do.
     let connectivity_in_headline = if has_baseline {
-        categorized_issues.connectivity_len()
+        categorized.connectivity_len()
     } else {
         0
     };
-    let total_issues = categorized_issues.critical.len()
-        + connectivity_in_headline
-        + categorized_issues.dependencies.len();
+    let total_issues =
+        categorized.risks.len() + connectivity_in_headline + categorized.major_dependencies.len();
 
     let mut output = String::new();
 
-    // Machine-readable markers consumed by the GitHub Action (stripped before
-    // the comment is posted). The issue count must stay parseable.
+    // Machine-readable markers consumed by the GitHub Action. The issue count
+    // must stay parseable.
     output.push_str("<!-- CARRICK_OUTPUT_START -->\n");
     output.push_str(&format!("<!-- CARRICK_ISSUE_COUNT:{} -->\n", total_issues));
 
     output.push_str(&format!("## 🪢 Carrick{}\n\n", topology.header_suffix()));
 
-    let state = if !categorized_issues.critical.is_empty() {
-        "risk"
-    } else if total_issues > 0 {
-        "warn"
-    } else {
-        "ok"
-    };
-    output.push_str(&badge_placeholder(
-        state,
-        topology,
-        result.endpoints.len(),
-        categorized_issues.critical.len(),
-    ));
-
     // Verdict callout. GitHub alert blocks carry severity colour natively, so
     // the comment conveys state without leaning on emoji.
     output.push_str(&format_verdict(
-        &categorized_issues,
+        &categorized,
         total_issues,
         has_baseline,
         topology,
     ));
     output.push_str("\n\n");
 
-    output.push_str(&format_pr_delta(pr_delta));
+    output.push_str(&format_pr_delta(pr_delta, &categorized.missing_keys()));
 
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
@@ -195,26 +123,27 @@ pub fn format_analysis_results(
 
     // Sections, ordered by actionability. Verified runs last as a collapsed
     // positive signal.
-    if !categorized_issues.critical.is_empty() {
-        output.push_str(&format_critical_section(&categorized_issues.critical));
+    if !categorized.risks.is_empty() {
+        output.push_str(&format_critical_section(&categorized.risks));
         output.push_str("\n\n");
     }
-    if !categorized_issues.connectivity_is_empty() {
+    if !categorized.connectivity_is_empty() {
         output.push_str(&format_connectivity_section(
-            &categorized_issues.missing,
-            &categorized_issues.orphaned,
+            &categorized.missing,
+            &categorized.orphaned,
             has_baseline,
         ));
         output.push_str("\n\n");
     }
-    if !categorized_issues.dependencies.is_empty() {
-        output.push_str(&format_dependency_section(&categorized_issues.dependencies));
+    if !categorized.dependencies_is_empty() {
+        output.push_str(&format_dependency_section(
+            &categorized.major_dependencies,
+            &categorized.unparseable_dependencies,
+        ));
         output.push_str("\n\n");
     }
-    if !categorized_issues.configuration.is_empty() {
-        output.push_str(&format_configuration_section(
-            &categorized_issues.configuration,
-        ));
+    if !categorized.configuration.is_empty() {
+        output.push_str(&format_configuration_section(&categorized.configuration));
         output.push_str("\n\n");
     }
     if !result.verified_endpoints.is_empty() {
@@ -222,15 +151,19 @@ pub fn format_analysis_results(
         output.push_str("\n\n");
     }
 
-    output.push_str(&dashboard_footer(topology));
-    output.push_str("\n<!-- CARRICK_OUTPUT_END -->\n");
+    output.push_str("<!-- CARRICK_OUTPUT_END -->\n");
     output
 }
 
-/// The "In this PR" block: endpoints this change added relative to the repo's
-/// last-indexed state. Empty (renders nothing) outside a PR run, when there is
-/// no prior index to diff against, or when nothing new was added.
-fn format_pr_delta(pr_delta: Option<&PrDelta>) -> String {
+/// The "In this PR" block: endpoints this change added or removed relative to
+/// the repo's last-indexed state. Empty (renders nothing) outside a PR run,
+/// when there is no prior index to diff against, or when nothing changed.
+/// A removed endpoint whose (method, path) still shows up as a missing
+/// endpoint is flagged — the PR deletes a producer something still calls.
+fn format_pr_delta(
+    pr_delta: Option<&PrDelta>,
+    still_missing: &BTreeSet<(String, String)>,
+) -> String {
     let Some(delta) = pr_delta else {
         return String::new();
     };
@@ -239,34 +172,51 @@ fn format_pr_delta(pr_delta: Option<&PrDelta>) -> String {
     }
     let mut output = String::from("**In this PR**\n\n");
     for ep in &delta.new_endpoints {
-        let suffix = ep
-            .service
-            .as_deref()
-            .map(code_span)
-            .filter(|s| !s.is_empty())
-            .map(|s| format!(" (`{}`)", s))
-            .unwrap_or_default();
         output.push_str(&format!(
             "- New endpoint `{} {}`{}\n",
-            code_span(&ep.label),
-            code_span(&ep.name),
-            suffix
+            code_span(&ep.method),
+            code_span(&ep.path),
+            service_suffix(ep.service.as_deref())
+        ));
+    }
+    for ep in &delta.removed_endpoints {
+        let consumed = if still_missing.contains(&(ep.method.clone(), ep.path.clone())) {
+            " — ⚠ still consumed"
+        } else {
+            ""
+        };
+        output.push_str(&format!(
+            "- Removed `{} {}`{}{}\n",
+            code_span(&ep.method),
+            code_span(&ep.path),
+            service_suffix(ep.service.as_deref()),
+            consumed
         ));
     }
     output.push('\n');
     output
 }
 
+/// ``(`service`)`` suffix for a delta line; empty when the service is absent
+/// or sanitizes away.
+fn service_suffix(service: Option<&str>) -> String {
+    service
+        .map(code_span)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" (`{}`)", s))
+        .unwrap_or_default()
+}
+
 /// Build the GitHub alert block that opens the comment. The alert kind sets
 /// the colour (CAUTION red, WARNING amber, NOTE blue), so severity reads at a
 /// glance without emoji.
 fn format_verdict(
-    categorized: &CategorizedIssues,
+    categorized: &CategorizedFindings,
     total_issues: usize,
     has_baseline: bool,
     topology: &Topology,
 ) -> String {
-    let kind = if !categorized.critical.is_empty() {
+    let kind = if !categorized.risks.is_empty() {
         "CAUTION"
     } else if total_issues > 0 {
         "WARNING"
@@ -275,11 +225,11 @@ fn format_verdict(
     };
 
     let mut parts: Vec<String> = Vec::new();
-    if !categorized.critical.is_empty() {
+    if !categorized.risks.is_empty() {
         parts.push(format!(
             "**{} contract risk{}**",
-            categorized.critical.len(),
-            plural(categorized.critical.len())
+            categorized.risks.len(),
+            plural(categorized.risks.len())
         ));
     }
     if !categorized.connectivity_is_empty() {
@@ -295,12 +245,9 @@ fn format_verdict(
             plural(categorized.connectivity_len())
         ));
     }
-    if !categorized.dependencies.is_empty() {
-        parts.push(format!(
-            "{} dependency conflict{}",
-            categorized.dependencies.len(),
-            plural(categorized.dependencies.len())
-        ));
+    if !categorized.dependencies_is_empty() {
+        let n = categorized.major_dependencies.len() + categorized.unparseable_dependencies.len();
+        parts.push(format!("{} dependency conflict{}", n, plural(n)));
     }
     if !categorized.configuration.is_empty() {
         parts.push(format!(
@@ -334,38 +281,6 @@ fn format_verdict(
     )
 }
 
-/// The status-badge image. Emits a `{{CARRICK_BADGE:<query>}}` placeholder that
-/// the cloud rewrites to the served SVG URL — the scanner can't know the
-/// dashboard host. Scope counts mirror the badge endpoint's own priority
-/// (services for a monorepo, repos for poly-repo, endpoints otherwise).
-fn badge_placeholder(state: &str, topology: &Topology, endpoints: usize, risks: usize) -> String {
-    let mut query = format!("state={}", state);
-    // One scope count, matching the badge endpoint's priority: a monorepo's
-    // service count, else a poly-repo's repo count. (The endpoint prefers
-    // `services` when both are present, but emitting only one keeps the query
-    // unambiguous.)
-    if topology.is_monorepo() {
-        query.push_str(&format!("&services={}", topology.local_service_count));
-    } else if topology.has_peers() {
-        query.push_str(&format!("&repos={}", topology.peer_repo_count + 1));
-    }
-    query.push_str(&format!("&endpoints={}", endpoints));
-    if risks > 0 {
-        query.push_str(&format!("&risks={}", risks));
-    }
-    format!("![Carrick status]({{{{CARRICK_BADGE:{}}}}})\n\n", query)
-}
-
-/// Closing line linking to the dashboard. The scanner can't know the workspace
-/// or project slug (keyless OIDC), so it emits a `{{CARRICK_LINK:<path>}}`
-/// placeholder the cloud rewrites to the absolute dashboard URL.
-fn dashboard_footer(topology: &Topology) -> String {
-    format!(
-        "Full analysis in the [Carrick dashboard]({{{{CARRICK_LINK:explore/{}}}}}).\n",
-        topology.repo_name
-    )
-}
-
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -391,17 +306,11 @@ fn format_no_issues(
     let mut output = String::new();
     output.push_str("<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n");
     output.push_str(&format!("## 🪢 Carrick{}\n\n", topology.header_suffix()));
-    output.push_str(&badge_placeholder(
-        "ok",
-        topology,
-        result.endpoints.len(),
-        0,
-    ));
     output.push_str(&format!(
         "> [!TIP]\n> All cross-service calls match the indexed contracts across {}.\n\n",
         topology.scope_phrase()
     ));
-    output.push_str(&format_pr_delta(pr_delta));
+    output.push_str(&format_pr_delta(pr_delta, &BTreeSet::new()));
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
         result.endpoints.len(),
@@ -415,7 +324,6 @@ fn format_no_issues(
         output.push_str(&format_verified_section(&result.verified_endpoints));
         output.push_str("\n\n");
     }
-    output.push_str(&dashboard_footer(topology));
     output.push_str("<!-- CARRICK_OUTPUT_END -->\n");
     output
 }
@@ -469,22 +377,25 @@ struct EnvVarSuggestionGroup {
     method: String,
     env_var: String,
     path: String,
-    count: usize,
     locations: Vec<String>,
 }
 
-struct CategorizedIssues {
-    critical: Vec<String>,
-    /// Consumer calls with no producer (still string-based; consumer-repo
-    /// attribution is a follow-up).
-    missing: Vec<String>,
-    /// Producers with no consumer, carrying their owning service/repo.
-    orphaned: Vec<OrphanedEndpoint>,
+struct CategorizedFindings<'a> {
+    /// Contract risks: type mismatches and method mismatches.
+    risks: Vec<&'a Finding>,
+    /// Consumer calls with no producer.
+    missing: Vec<&'a Finding>,
+    /// Producers with no consumer.
+    orphaned: Vec<&'a Finding>,
+    /// Env-var calls regrouped for the configuration section.
     configuration: Vec<EnvVarSuggestionGroup>,
-    dependencies: Vec<DependencyConflict>,
+    /// Dependency conflicts split by tier: `major` counts toward the headline,
+    /// `unparseable` is advisory.
+    major_dependencies: Vec<&'a Finding>,
+    unparseable_dependencies: Vec<&'a Finding>,
 }
 
-impl CategorizedIssues {
+impl CategorizedFindings<'_> {
     fn connectivity_len(&self) -> usize {
         self.missing.len() + self.orphaned.len()
     }
@@ -492,73 +403,105 @@ impl CategorizedIssues {
     fn connectivity_is_empty(&self) -> bool {
         self.missing.is_empty() && self.orphaned.is_empty()
     }
+
+    fn dependencies_is_empty(&self) -> bool {
+        self.major_dependencies.is_empty() && self.unparseable_dependencies.is_empty()
+    }
+
+    /// (method, path) of every missing-endpoint finding — the join key for the
+    /// delta section's "still consumed" flag on removed endpoints.
+    fn missing_keys(&self) -> BTreeSet<(String, String)> {
+        self.missing
+            .iter()
+            .filter_map(|finding| match finding {
+                Finding::MissingEndpoint { method, path, .. } => {
+                    Some((method.clone(), path.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
-fn categorize_issues(issues: &ApiIssues) -> CategorizedIssues {
-    let mut critical = Vec::new();
+fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
+    let mut risks = Vec::new();
     let mut missing = Vec::new();
+    let mut orphaned = Vec::new();
+    let mut env_var_calls = Vec::new();
+    let mut major_dependencies = Vec::new();
+    let mut unparseable_dependencies = Vec::new();
 
-    critical.extend(issues.mismatches.clone());
-    critical.extend(issues.type_mismatches.clone());
-
-    for issue in &issues.call_issues {
-        if issue.contains("Method mismatch") {
-            critical.push(issue.clone());
-        } else {
-            missing.push(issue.clone());
+    for finding in findings {
+        match finding {
+            Finding::TypeMismatch { .. } | Finding::MethodMismatch { .. } => risks.push(finding),
+            Finding::MissingEndpoint { .. } => missing.push(finding),
+            Finding::OrphanedEndpoint { .. } => orphaned.push(finding),
+            Finding::EnvVarCall { .. } => env_var_calls.push(finding),
+            Finding::DependencyConflict { tier: t, .. } => {
+                if t == tier::MAJOR {
+                    major_dependencies.push(finding);
+                } else {
+                    unparseable_dependencies.push(finding);
+                }
+            }
         }
     }
 
-    CategorizedIssues {
-        critical,
+    CategorizedFindings {
+        risks,
         missing,
-        orphaned: issues.endpoint_issues.clone(),
-        configuration: group_env_var_suggestions(&issues.env_var_calls),
-        dependencies: issues.dependency_conflicts.clone(),
+        orphaned,
+        configuration: group_env_var_suggestions(&env_var_calls),
+        major_dependencies,
+        unparseable_dependencies,
     }
 }
 
-fn format_critical_section(issues: &[String]) -> String {
+fn format_critical_section(risks: &[&Finding]) -> String {
     let mut output = String::new();
     output.push_str(&format!(
         "<details>\n<summary><strong>Contract risks ({})</strong></summary>\n\n",
-        issues.len()
+        risks.len()
     ));
     output.push_str(
         "> A consumer call conflicts with the producer it targets in the index. These break the consumer at runtime.\n\n",
     );
     output.push_str("| Endpoint | Issue |\n| :--- | :--- |\n");
-    for issue in issues {
-        let (endpoint, detail) = summarize_critical(issue);
+    for finding in risks {
+        let (endpoint, detail) = match finding {
+            Finding::TypeMismatch {
+                method,
+                path,
+                producer_type,
+                consumer_type,
+                detail,
+                ..
+            } => (
+                format!("{} {}", method, path),
+                format!(
+                    "producer `{}` vs consumer `{}`: {}",
+                    producer_type, consumer_type, detail
+                ),
+            ),
+            Finding::MethodMismatch {
+                method,
+                path,
+                expected_method,
+                ..
+            } => (
+                format!("{} {}", method, path),
+                format!(
+                    "call uses `{}` but the producer expects `{}`",
+                    method, expected_method
+                ),
+            ),
+            // categorize_findings only routes the two risk kinds here.
+            _ => continue,
+        };
         output.push_str(&format!("| `{}` | {} |\n", cell(&endpoint), cell(&detail)));
     }
     output.push_str("\n</details>");
     output
-}
-
-/// Reduce a critical-issue string to `(endpoint, one-line detail)` for a table
-/// row, reusing the structured/generic TypeScript error parsers.
-fn summarize_critical(issue: &str) -> (String, String) {
-    if issue.contains("Type mismatch on ") {
-        let (endpoint, producer, consumer, error) = parse_structured_type_error(issue);
-        (
-            endpoint,
-            format!(
-                "producer `{}` vs consumer `{}`: {}",
-                producer, consumer, error
-            ),
-        )
-    } else if issue.contains(": Type '") {
-        parse_generic_typescript_error(issue)
-    } else if issue.contains("Method mismatch") {
-        let (method, path) = extract_method_path(issue);
-        (
-            format!("{} {}", method, path),
-            "HTTP method mismatch".to_string(),
-        )
-    } else {
-        ("-".to_string(), issue.to_string())
-    }
 }
 
 /// Escape a value for a Markdown table cell: no pipes, and no line breaks
@@ -595,8 +538,8 @@ fn code_span(value: &str) -> String {
 }
 
 fn format_connectivity_section(
-    missing: &[String],
-    orphaned: &[OrphanedEndpoint],
+    missing: &[&Finding],
+    orphaned: &[&Finding],
     has_baseline: bool,
 ) -> String {
     let mut output = String::new();
@@ -620,13 +563,27 @@ fn format_connectivity_section(
 
     if !missing.is_empty() {
         output.push_str(&format!("**Missing ({})**\n\n", missing.len()));
-        output.push_str("| Method | Path |\n| :--- | :--- |\n");
-        for issue in missing {
-            let (method, path) = extract_method_path(issue);
+        output.push_str("| Method | Path | Called from |\n| :--- | :--- | :--- |\n");
+        for finding in missing {
+            let Finding::MissingEndpoint {
+                method,
+                path,
+                call_sites,
+                ..
+            } = finding
+            else {
+                continue;
+            };
+            let called_from = if call_sites.is_empty() {
+                "-".to_string()
+            } else {
+                format!("`{}`", code_cell(&call_sites.join(", ")))
+            };
             output.push_str(&format!(
-                "| `{}` | `{}` |\n",
-                code_cell(&method),
-                code_cell(&path)
+                "| `{}` | `{}` | {} |\n",
+                code_cell(method),
+                code_cell(path),
+                called_from
             ));
         }
         output.push('\n');
@@ -634,33 +591,46 @@ fn format_connectivity_section(
 
     if !orphaned.is_empty() {
         output.push_str(&format!("**Orphaned ({})**\n\n", orphaned.len()));
+        fn orphan_row(finding: &Finding) -> Option<(&String, &String, &Option<String>)> {
+            match finding {
+                Finding::OrphanedEndpoint {
+                    method,
+                    path,
+                    service,
+                } => Some((method, path, service)),
+                _ => None,
+            }
+        }
         // Show the owning-service column only when at least one orphan is
         // attributed (single-repo runs have none, so the column is dropped).
-        if orphaned.iter().any(|o| o.service.is_some()) {
+        if orphaned
+            .iter()
+            .filter_map(|f| orphan_row(f))
+            .any(|(_, _, service)| service.is_some())
+        {
             output.push_str("| Method | Path | Service |\n| :--- | :--- | :--- |\n");
-            for o in orphaned {
+            for (method, path, service) in orphaned.iter().filter_map(|f| orphan_row(f)) {
                 // A row can be unattributed even when the column is shown (e.g.
                 // a GraphQL orphan alongside an attributed HTTP one); use a dash
                 // rather than an empty cell.
-                let service = o
-                    .service
+                let service = service
                     .as_deref()
                     .map(|s| format!("`{}`", code_cell(s)))
                     .unwrap_or_else(|| "-".to_string());
                 output.push_str(&format!(
                     "| `{}` | `{}` | {} |\n",
-                    code_cell(&o.method),
-                    code_cell(&o.path),
+                    code_cell(method),
+                    code_cell(path),
                     service
                 ));
             }
         } else {
             output.push_str("| Method | Path |\n| :--- | :--- |\n");
-            for o in orphaned {
+            for (method, path, _) in orphaned.iter().filter_map(|f| orphan_row(f)) {
                 output.push_str(&format!(
                     "| `{}` | `{}` |\n",
-                    code_cell(&o.method),
-                    code_cell(&o.path)
+                    code_cell(method),
+                    code_cell(path)
                 ));
             }
         }
@@ -681,21 +651,21 @@ fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
     output.push_str("> These calls use environment variables to construct the URL. Add them to `internalEnvVars` (to validate routes) or `externalEnvVars` (to ignore) in your `carrick.json`.\n\n");
 
     for issue in issues {
+        let count = issue.locations.len().max(1);
         output.push_str(&format!(
             "  - `{} {}` using **[{}]** ({} call site{})\n",
             issue.method,
             issue.path,
             issue.env_var,
-            issue.count,
-            if issue.count == 1 { "" } else { "s" }
+            count,
+            if count == 1 { "" } else { "s" }
         ));
 
-        let shown = issue.locations.len().min(3);
-        for loc in issue.locations.iter().take(shown) {
+        for loc in issue.locations.iter().take(3) {
             output.push_str(&format!("    - `{}`\n", loc));
         }
-        if shown > 0 && issue.count > shown {
-            output.push_str(&format!("    - … +{} more\n", issue.count - shown));
+        if issue.locations.len() > 3 {
+            output.push_str(&format!("    - … +{} more\n", issue.locations.len() - 3));
         }
     }
 
@@ -703,334 +673,94 @@ fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
     output
 }
 
-fn format_dependency_section(conflicts: &[DependencyConflict]) -> String {
+fn format_dependency_section(major: &[&Finding], unparseable: &[&Finding]) -> String {
     let mut output = String::new();
-
-    // Group conflicts by severity
-    let mut critical = Vec::new();
-    let mut warning = Vec::new();
-    let mut info = Vec::new();
-
-    for conflict in conflicts {
-        match conflict.severity {
-            ConflictSeverity::Critical => critical.push(conflict),
-            ConflictSeverity::Warning => warning.push(conflict),
-            ConflictSeverity::Info => info.push(conflict),
-        }
-    }
 
     output.push_str(&format!(
         "<details>\n<summary><strong>Dependency conflicts ({})</strong></summary>\n\n",
-        conflicts.len()
+        major.len() + unparseable.len()
     ));
 
     output.push_str("> Packages with different versions across services in the index.\n\n");
 
-    // Critical conflicts (major version differences)
-    if !critical.is_empty() {
-        output.push_str(&format!(
-            "### Critical Conflicts ({}) - Major Version Differences\n\n",
-            critical.len()
-        ));
-        for conflict in &critical {
-            output.push_str(&format!("#### {}\n\n", conflict.package_name));
+    let render_group = |output: &mut String, heading: &str, group: &[&Finding]| {
+        if group.is_empty() {
+            return;
+        }
+        output.push_str(&format!("### {} ({})\n\n", heading, group.len()));
+        for finding in group {
+            let Finding::DependencyConflict {
+                package_name,
+                versions,
+                ..
+            } = finding
+            else {
+                continue;
+            };
+            output.push_str(&format!("#### {}\n\n", package_name));
             output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
-
-            for repo_info in &conflict.repos {
+            for v in versions {
                 output.push_str(&format!(
                     "| `{}` | `{}` | `{}` |\n",
-                    repo_info.repo_name,
-                    repo_info.version,
-                    repo_info.source_path.display()
+                    code_cell(&v.repo),
+                    code_cell(&v.version),
+                    code_cell(&v.source)
                 ));
             }
             output.push('\n');
         }
-    }
+    };
 
-    // Warning conflicts (minor version differences)
-    if !warning.is_empty() {
-        output.push_str(&format!(
-            "### Warning Conflicts ({}) - Minor Version Differences\n\n",
-            warning.len()
-        ));
-        for conflict in &warning {
-            output.push_str(&format!("#### {}\n\n", conflict.package_name));
-            output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
-
-            for repo_info in &conflict.repos {
-                output.push_str(&format!(
-                    "| `{}` | `{}` | `{}` |\n",
-                    repo_info.repo_name,
-                    repo_info.version,
-                    repo_info.source_path.display()
-                ));
-            }
-            output.push('\n');
-        }
-    }
-
-    // Info conflicts (patch version differences)
-    if !info.is_empty() {
-        output.push_str(&format!(
-            "### Info Conflicts ({}) - Patch Version Differences\n\n",
-            info.len()
-        ));
-        for conflict in &info {
-            output.push_str(&format!("#### {}\n\n", conflict.package_name));
-            output.push_str("| Repository | Version | Source |\n| :--- | :--- | :--- |\n");
-
-            for repo_info in &conflict.repos {
-                output.push_str(&format!(
-                    "| `{}` | `{}` | `{}` |\n",
-                    repo_info.repo_name,
-                    repo_info.version,
-                    repo_info.source_path.display()
-                ));
-            }
-            output.push('\n');
-        }
-    }
+    render_group(&mut output, "Major version conflicts", major);
+    render_group(
+        &mut output,
+        "Unparseable version pins (advisory)",
+        unparseable,
+    );
 
     output.push_str("</details>");
     output
 }
 
-fn parse_generic_typescript_error(issue: &str) -> (String, String) {
-    // Parse any TypeScript error like: "GET /users/:param: Type '...' error message"
+/// Regroup typed env-var findings by `(env_var, method, path)` for the
+/// configuration section. The analyzer already groups per matcher pass, so
+/// this mostly re-sorts; the BTreeMap keeps the section order deterministic.
+fn group_env_var_suggestions(findings: &[&Finding]) -> Vec<EnvVarSuggestionGroup> {
+    let mut grouped: BTreeMap<(String, String, String), BTreeSet<String>> = BTreeMap::new();
 
-    let endpoint = {
-        let methods = ["GET ", "POST ", "PUT ", "DELETE ", "PATCH "];
-        let mut found_endpoint = "Unknown".to_string();
-
-        for method in &methods {
-            if let Some(start) = issue.find(method)
-                && let Some(end) = issue.find(": Type '")
-            {
-                found_endpoint = issue[start..end].to_string();
-                break;
-            }
-        }
-        found_endpoint
-    };
-
-    let error_message = if let Some(start) = issue.find(": ") {
-        let remaining = &issue[start + 2..];
-        if remaining.len() > 200 {
-            format!("{}...", &remaining[..200])
-        } else {
-            remaining.to_string()
-        }
-    } else {
-        issue.to_string()
-    };
-
-    (endpoint, error_message)
-}
-
-fn parse_structured_type_error(issue: &str) -> (String, String, String, String) {
-    // Parse errors like: "Type mismatch on GET /users/:param: Producer (SomeType) incompatible with Consumer (AnotherType) - Error details"
-
-    let endpoint = if let Some(start) = issue.find("Type mismatch on ") {
-        if let Some(end) = issue.find(": Producer") {
-            issue[start + 17..end].to_string()
-        } else {
-            "Unknown".to_string()
-        }
-    } else {
-        "Unknown".to_string()
-    };
-
-    let producer = if let Some(start) = issue.find("Producer (") {
-        if let Some(end) = issue.find(") incompatible") {
-            issue[start + 10..end].to_string()
-        } else {
-            "Unknown".to_string()
-        }
-    } else {
-        "Unknown".to_string()
-    };
-
-    let consumer = if let Some(start) = issue.find("Consumer (") {
-        if let Some(end) = issue.find(") - ") {
-            issue[start + 10..end].to_string()
-        } else {
-            "Unknown".to_string()
-        }
-    } else {
-        "Unknown".to_string()
-    };
-
-    let error = if let Some(start) = issue.find(") - ") {
-        let remaining = &issue[start + 4..];
-        if remaining.len() > 150 {
-            format!("{}...", &remaining[..150])
-        } else {
-            remaining.to_string()
-        }
-    } else {
-        "Type compatibility issue".to_string()
-    };
-
-    (endpoint, producer, consumer, error)
-}
-
-fn extract_method_path(issue: &str) -> (String, String) {
-    // Handle "Orphaned endpoint: METHOD PATH in FILE"
-    if let Some(rest) = issue.strip_prefix("Orphaned endpoint: ") {
-        let parts: Vec<&str> = rest.splitn(3, ' ').collect();
-        if parts.len() >= 2 {
-            let method = parts[0];
-            let path = parts[1];
-            return (method.to_string(), path.to_string());
-        }
-    }
-
-    // Handle "Missing endpoint for METHOD PATH (normalized: ...)"
-    if let Some(for_pos) = issue.find(" for ") {
-        let method_path = &issue[for_pos + 5..];
-        let parts: Vec<&str> = method_path.splitn(3, ' ').collect();
-        if parts.len() >= 2 {
-            let path = parts[1].split(" (").next().unwrap_or(parts[1]);
-            return (parts[0].to_string(), path.to_string());
-        }
-    }
-
-    // Fallback: try to extract any method and path pattern
-    let methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
-    for method in &methods {
-        if let Some(method_pos) = issue.find(method) {
-            let after_method = &issue[method_pos + method.len()..];
-            if let Some(path_start) = after_method.find(' ') {
-                let path_part = after_method[path_start..].trim();
-                if path_part.starts_with('/') {
-                    let path_end = path_part.find(' ').unwrap_or(path_part.len());
-                    return (method.to_string(), path_part[..path_end].to_string());
-                }
-            }
-        }
-    }
-
-    ("UNKNOWN".to_string(), "UNKNOWN".to_string())
-}
-
-fn extract_env_var_info(issue: &str) -> (String, String, String) {
-    // Parse issues in two formats:
-    // New: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars..."
-    // Old: "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
-
-    let method = if issue.contains("GET") {
-        "GET"
-    } else if issue.contains("POST") {
-        "POST"
-    } else if issue.contains("PUT") {
-        "PUT"
-    } else if issue.contains("DELETE") {
-        "DELETE"
-    } else {
-        "UNKNOWN"
-    };
-
-    let env_vars = if let Some(start) = issue.find('[') {
-        if let Some(end) = issue.find(']') {
-            &issue[start + 1..end]
-        } else {
-            "UNKNOWN"
-        }
-    } else {
-        "UNKNOWN"
-    };
-
-    // Try new format first: "Unclassified env var: GET /path using [ENV_VAR]"
-    // Path is between the method and " using"
-    let path = if issue.starts_with("Unclassified env var:") {
-        // Format: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - ..."
-        if let Some(using_pos) = issue.find(" using") {
-            // Find the method position and extract path after it
-            let after_method = if let Some(pos) = issue.find("GET ") {
-                &issue[pos + 4..using_pos]
-            } else if let Some(pos) = issue.find("POST ") {
-                &issue[pos + 5..using_pos]
-            } else if let Some(pos) = issue.find("PUT ") {
-                &issue[pos + 4..using_pos]
-            } else if let Some(pos) = issue.find("DELETE ") {
-                &issue[pos + 7..using_pos]
-            } else {
-                "UNKNOWN"
-            };
-            after_method.trim()
-        } else {
-            "UNKNOWN"
-        }
-    } else if let Some(start) = issue.find("ENV_VAR:") {
-        // Old format: "ENV_VAR:UNKNOWN_API:/data"
-        let env_var_section = &issue[start..];
-        let parts: Vec<&str> = env_var_section.splitn(3, ':').collect();
-        if parts.len() >= 3 {
-            parts[2]
-        } else {
-            "UNKNOWN"
-        }
-    } else {
-        "UNKNOWN"
-    };
-
-    (method.to_string(), env_vars.to_string(), path.to_string())
-}
-
-fn extract_env_var_location(issue: &str) -> Option<String> {
-    let marker = "(from ";
-    let start = issue.find(marker)?;
-    let rest = &issue[start + marker.len()..];
-    let end = rest.find(')')?;
-    Some(rest[..end].to_string())
-}
-
-fn group_env_var_suggestions(issues: &[String]) -> Vec<EnvVarSuggestionGroup> {
-    #[derive(Default)]
-    struct Acc {
-        raw_count: usize,
-        locations: BTreeSet<String>,
-    }
-
-    let mut grouped: BTreeMap<(String, String, String), Acc> = BTreeMap::new();
-
-    for issue in issues {
-        let (method, env_var, path) = extract_env_var_info(issue);
-        let location = extract_env_var_location(issue);
-
-        let acc = grouped.entry((env_var, method, path)).or_default();
-        acc.raw_count += 1;
-        if let Some(loc) = location {
-            acc.locations.insert(loc);
-        }
+    for finding in findings {
+        let Finding::EnvVarCall {
+            method,
+            path,
+            env_var,
+            call_sites,
+        } = finding
+        else {
+            continue;
+        };
+        grouped
+            .entry((env_var.clone(), method.clone(), path.clone()))
+            .or_default()
+            .extend(call_sites.iter().cloned());
     }
 
     grouped
         .into_iter()
-        .map(|((env_var, method, path), acc)| {
-            let locations: Vec<String> = acc.locations.into_iter().collect();
-            let count = if locations.is_empty() {
-                acc.raw_count
-            } else {
-                locations.len()
-            };
-
-            EnvVarSuggestionGroup {
+        .map(
+            |((env_var, method, path), locations)| EnvVarSuggestionGroup {
                 method,
                 env_var,
                 path,
-                count,
-                locations,
-            }
-        })
+                locations: locations.into_iter().collect(),
+            },
+        )
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{ApiAnalysisResult, ApiIssues};
+    use crate::findings::{EndpointRef, Finding, PackageVersionRef, tier};
 
     /// A poly-repo topology with peers, so connectivity findings are
     /// conclusive (has_baseline == true).
@@ -1052,97 +782,105 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_typescript_error_formatting() {
-        let type_mismatches = vec![
-            "GET /users/:param/comments: Type '{ userId: number; comments: Comment[]; }' is missing the following properties from type 'Comment[]': length, pop, push, concat, and 29 more.".to_string(),
-            "GET /users/:param: Type '{ commentsByUser: Comment[]; }' is missing the following properties from type 'User': id, name, role".to_string(),
-        ];
-
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches,
-            dependency_conflicts: vec![],
-        };
-
-        let result = ApiAnalysisResult {
+    fn result_with(findings: Vec<Finding>) -> ApiAnalysisResult {
+        ApiAnalysisResult {
             endpoints: vec![],
             calls: vec![],
-            issues,
+            findings,
+            dependency_conflicts: vec![],
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
-        };
+        }
+    }
 
-        let output = format_analysis_results(result, &topology_baseline(), None);
+    fn type_mismatch_finding() -> Finding {
+        Finding::type_mismatch(
+            "GET",
+            "/api/users",
+            None,
+            vec!["web/src/client.ts:12".to_string()],
+            "UserResponse",
+            "User[]",
+            "Property 'role' is missing",
+        )
+    }
 
-        // The endpoints and the raw compiler error are surfaced as table rows.
-        assert!(output.contains("GET /users/:param/comments"));
-        assert!(output.contains("GET /users/:param"));
-        assert!(output.contains("Type '{ userId: number; comments: Comment[]; }'"));
-        assert!(output.contains("Type '{ commentsByUser: Comment[]; }'"));
+    fn major_conflict_finding() -> Finding {
+        Finding::dependency_conflict(
+            "zod",
+            tier::MAJOR,
+            vec![
+                PackageVersionRef {
+                    repo: "billing".to_string(),
+                    version: "3.22.0".to_string(),
+                    source: "billing/package.json".to_string(),
+                },
+                PackageVersionRef {
+                    repo: "web".to_string(),
+                    version: "4.0.0".to_string(),
+                    source: "web/package.json".to_string(),
+                },
+            ],
+        )
     }
 
     #[test]
-    fn test_structured_type_error_formatting() {
-        let type_mismatches = vec![
-            "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
-        ];
+    fn test_type_mismatch_renders_as_contract_risk() {
+        let output = format_analysis_results(
+            result_with(vec![type_mismatch_finding()]),
+            &topology_baseline(),
+            None,
+        );
 
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches,
-            dependency_conflicts: vec![],
-        };
-
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
-
-        let output = format_analysis_results(result, &topology_baseline(), None);
-
-        // The endpoint, both type names, and the error are surfaced.
+        // The endpoint, both type names, and the compiler error surface as a
+        // contract-risk table row, and the risk headlines the verdict.
+        assert!(output.contains("Contract risks (1)"));
         assert!(output.contains("GET /api/users"));
         assert!(output.contains("UserResponse"));
         assert!(output.contains("User[]"));
         assert!(output.contains("Property 'role' is missing"));
+        assert!(output.contains("> [!CAUTION]"));
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
+    }
+
+    #[test]
+    fn test_method_mismatch_renders_as_contract_risk() {
+        let finding = Finding::method_mismatch(
+            "GET",
+            "/api/orders",
+            None,
+            vec!["web/src/orders.ts:4".to_string()],
+            "POST",
+        );
+        let output =
+            format_analysis_results(result_with(vec![finding]), &topology_baseline(), None);
+
+        assert!(output.contains("Contract risks (1)"));
+        assert!(output.contains("GET /api/orders"));
+        assert!(output.contains("call uses `GET` but the producer expects `POST`"));
+        assert!(output.contains("> [!CAUTION]"));
+        // A method mismatch is a risk even without a connectivity baseline.
+        let no_baseline = format_analysis_results(
+            result_with(vec![Finding::method_mismatch(
+                "GET",
+                "/api/orders",
+                None,
+                vec![],
+                "POST",
+            )]),
+            &topology_first_repo(),
+            None,
+        );
+        assert!(no_baseline.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
     }
 
     #[test]
     fn test_graphql_banner_renders_when_libraries_detected() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec![
-                "graphql-request".to_string(),
-                "@apollo/client".to_string(),
-            ],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
+        let mut result = result_with(vec![]);
+        result.detected_graphql_libraries =
+            vec!["graphql-request".to_string(), "@apollo/client".to_string()];
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("GraphQL detected"));
         assert!(output.contains("graphql-request"));
@@ -1152,134 +890,51 @@ mod tests {
 
     #[test]
     fn test_graphql_banner_absent_when_operations_indexed() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec!["@apollo/client".to_string()],
-            graphql_operations_indexed: true,
-            cross_repo_matches: vec![],
-        };
+        let mut result = result_with(vec![]);
+        result.detected_graphql_libraries = vec!["@apollo/client".to_string()];
+        result.graphql_operations_indexed = true;
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(!output.contains("GraphQL detected"));
     }
 
     #[test]
     fn test_graphql_banner_absent_when_no_libraries() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
-        let output = format_analysis_results(result, &topology_baseline(), None);
+        let output = format_analysis_results(result_with(vec![]), &topology_baseline(), None);
         assert!(!output.contains("GraphQL detected"));
     }
 
     #[test]
     fn test_no_issues_output() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
+        let output = format_analysis_results(result_with(vec![]), &topology_baseline(), None);
 
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
-
-        let output = format_analysis_results(result, &topology_baseline(), None);
-
-        // Check that no issues message is displayed
         assert!(output.contains("All cross-service calls match the indexed contracts"));
         assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
     }
 
+    /// The machine markers are the Action's contract: the terminal output must
+    /// carry the delimiters and a parseable issue count. (The old
+    /// `pr_comment_body` stripping is gone — the cloud renders its own
+    /// comment from the typed payload.)
     #[test]
-    fn test_pr_comment_body_strips_machine_markers() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
-
-        let formatted = FormattedOutput::new(result, topology_baseline(), None);
-        let body = formatted.pr_comment_body();
-
-        // The marker lines the old Action stripped before posting must not
-        // leak into the comment the cloud relays.
-        assert!(!body.contains("CARRICK_OUTPUT_START"));
-        assert!(!body.contains("CARRICK_OUTPUT_END"));
-        assert!(!body.contains("CARRICK_ISSUE_COUNT"));
-        // The human-facing content is preserved.
-        assert!(body.contains("All cross-service calls match the indexed contracts"));
-        // No leading/trailing blank lines left behind by the stripped markers.
-        assert_eq!(body, body.trim());
+    fn test_terminal_output_carries_machine_markers() {
+        for result in [
+            result_with(vec![]),
+            result_with(vec![type_mismatch_finding()]),
+        ] {
+            let formatted = FormattedOutput::new(result, topology_baseline(), None);
+            assert!(formatted.content.contains("<!-- CARRICK_OUTPUT_START -->"));
+            assert!(formatted.content.contains("<!-- CARRICK_OUTPUT_END -->"));
+            assert!(formatted.content.contains("CARRICK_ISSUE_COUNT:"));
+        }
     }
 
     #[test]
     fn test_verified_section_renders_when_matches_present() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![
-                ("GET".to_string(), "/api/users".to_string()),
-                ("POST".to_string(), "/api/orders".to_string()),
-            ],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![
+            ("GET".to_string(), "/api/users".to_string()),
+            ("POST".to_string(), "/api/orders".to_string()),
+        ];
 
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -1290,26 +945,9 @@ mod tests {
 
     #[test]
     fn test_verified_section_singular_label() {
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
-
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![("GET".to_string(), "/api/users".to_string())];
         let output = format_analysis_results(result, &topology_baseline(), None);
-
         assert!(output.contains("Verified (1)"));
     }
 
@@ -1318,24 +956,8 @@ mod tests {
         // Even when there are zero issues, a clean run with verified
         // matches must surface them — that's the whole point of the
         // section. Pre-fix, `format_no_issues` ignored verified entirely.
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![("GET".to_string(), "/api/users".to_string())],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
-
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![("GET".to_string(), "/api/users".to_string())];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
         assert!(output.contains("All cross-service calls match the indexed contracts"));
@@ -1343,110 +965,61 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_env_var_info_new_format() {
-        // Test the new format: "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to..."
-        let issue = "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] - add to internalEnvVars or externalEnvVars in carrick.json";
-        let (method, env_var, path) = extract_env_var_info(issue);
+    fn test_env_var_findings_group_into_configuration_section() {
+        // Two findings for the same (env_var, method, path) — e.g. one per
+        // matcher pass — regroup into a single suggestion with merged,
+        // deduplicated call sites.
+        let findings = vec![
+            Finding::env_var_call(
+                "GET",
+                "/orders",
+                "ORDER_SERVICE_URL",
+                vec!["src/orders.ts:3".to_string(), "src/retry.ts:9".to_string()],
+            ),
+            Finding::env_var_call(
+                "GET",
+                "/orders",
+                "ORDER_SERVICE_URL",
+                vec!["src/orders.ts:3".to_string()],
+            ),
+        ];
+        let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
 
-        assert_eq!(method, "GET");
-        assert_eq!(env_var, "ORDER_SERVICE_URL");
-        assert_eq!(path, "/orders");
+        assert!(output.contains("Configuration suggestions (1)"));
+        assert!(output.contains("`GET /orders` using **[ORDER_SERVICE_URL]** (2 call sites)"));
+        assert!(output.contains("`src/orders.ts:3`"));
+        assert!(output.contains("`src/retry.ts:9`"));
+        // Advisory findings never gate CI.
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:0 -->"));
     }
 
     #[test]
-    fn test_extract_env_var_info_new_format_with_params() {
-        let issue = "Unclassified env var: POST /users/:id/comments using [USER_API] - add to internalEnvVars or externalEnvVars in carrick.json";
-        let (method, env_var, path) = extract_env_var_info(issue);
+    fn test_missing_endpoint_lists_call_sites() {
+        let finding = Finding::missing_endpoint(
+            "POST",
+            "/api/orders",
+            None,
+            vec!["src/client.ts:8".to_string()],
+        );
+        let output =
+            format_analysis_results(result_with(vec![finding]), &topology_baseline(), None);
 
-        assert_eq!(method, "POST");
-        assert_eq!(env_var, "USER_API");
-        assert_eq!(path, "/users/:id/comments");
-    }
-
-    #[test]
-    fn test_extract_env_var_info_old_format() {
-        // Test the old format: "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users"
-        let issue =
-            "Environment variable endpoint: GET using env vars [API_URL] in ENV_VAR:API_URL:/users";
-        let (method, env_var, path) = extract_env_var_info(issue);
-
-        assert_eq!(method, "GET");
-        assert_eq!(env_var, "API_URL");
-        assert_eq!(path, "/users");
-    }
-
-    #[test]
-    fn test_extract_env_var_info_old_format_complex_path() {
-        let issue = "Environment variable endpoint: DELETE using env vars [ORDER_SERVICE] in ENV_VAR:ORDER_SERVICE:/orders/123/items";
-        let (method, env_var, path) = extract_env_var_info(issue);
-
-        assert_eq!(method, "DELETE");
-        assert_eq!(env_var, "ORDER_SERVICE");
-        assert_eq!(path, "/orders/123/items");
-    }
-
-    #[test]
-    fn test_extract_method_path_orphaned_endpoint() {
-        let issue = "Orphaned endpoint: GET /api/users in src/routes.ts:42";
-        let (method, path) = extract_method_path(issue);
-        assert_eq!(method, "GET");
-        assert_eq!(path, "/api/users");
-    }
-
-    #[test]
-    fn test_extract_method_path_missing_endpoint() {
-        let issue = "Missing endpoint for POST /api/orders (normalized: /api/orders) (called from src/client.ts)";
-        let (method, path) = extract_method_path(issue);
-        assert_eq!(method, "POST");
-        assert_eq!(path, "/api/orders");
-    }
-
-    #[test]
-    fn test_extract_method_path_no_unknown() {
-        // Previously this would return UNKNOWN/UNKNOWN
-        let issue = "Orphaned endpoint: DELETE /items/:id in src/items.ts:10";
-        let (method, path) = extract_method_path(issue);
-        assert_eq!(method, "DELETE");
-        assert_eq!(path, "/items/:id");
+        assert!(output.contains("**Missing (1)**"));
+        assert!(output.contains("| `POST` | `/api/orders` | `src/client.ts:8` |"));
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
     }
 
     #[test]
     fn test_no_baseline_excludes_connectivity_from_headline_count() {
-        // First repo indexed (has_cross_repo_baseline = false): connectivity
-        // findings are inconclusive (no peers to match against) so they must be
-        // kept OUT of the headline CARRICK_ISSUE_COUNT, yet the section must
-        // still render — framed as informational "Observations". This covers
-        // the previously-untested `false` branch of `has_cross_repo_baseline`.
-        let issues = ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![
-                OrphanedEndpoint {
-                    method: "GET".to_string(),
-                    path: "/api/users".to_string(),
-                    service: None,
-                },
-                OrphanedEndpoint {
-                    method: "PUT".to_string(),
-                    path: "/api/sessions".to_string(),
-                    service: None,
-                },
-            ],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        };
-        let result = ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        };
-
-        let output = format_analysis_results(result, &topology_first_repo(), None);
+        // First repo indexed (has_baseline = false): connectivity findings are
+        // inconclusive (no peers to match against) so they must be kept OUT of
+        // the headline CARRICK_ISSUE_COUNT, yet the section must still render —
+        // framed as informational "Observations".
+        let findings = vec![
+            Finding::orphaned_endpoint("GET", "/api/users", None),
+            Finding::orphaned_endpoint("PUT", "/api/sessions", None),
+        ];
+        let output = format_analysis_results(result_with(findings), &topology_first_repo(), None);
 
         // Headline count excludes the two connectivity findings → zero issues.
         assert!(
@@ -1466,45 +1039,22 @@ mod tests {
             output
         );
         // The orphaned endpoints are rendered as Method/Path table rows.
-        assert!(
-            output.contains("`/api/users`"),
-            "the orphaned endpoints must still be listed, got:\n{}",
-            output
-        );
-        assert!(
-            output.contains("`/api/sessions`"),
-            "the orphaned endpoints must still be listed, got:\n{}",
-            output
-        );
+        assert!(output.contains("`/api/users`"));
+        assert!(output.contains("`/api/sessions`"));
         // Headline phrasing reflects the informational framing, not "gaps".
-        assert!(
-            output.contains("connectivity observations"),
-            "headline should frame first-run connectivity as observations, got:\n{}",
-            output
-        );
+        assert!(output.contains("connectivity observations"));
     }
 
-    fn empty_issues() -> ApiIssues {
-        ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts: vec![],
-        }
-    }
-
-    fn result_with(issues: ApiIssues) -> ApiAnalysisResult {
-        ApiAnalysisResult {
-            endpoints: vec![],
-            calls: vec![],
-            issues,
-            verified_endpoints: vec![],
-            detected_graphql_libraries: vec![],
-            graphql_operations_indexed: false,
-            cross_repo_matches: vec![],
-        }
+    #[test]
+    fn test_baseline_counts_connectivity_gaps() {
+        let findings = vec![
+            Finding::missing_endpoint("GET", "/a", None, vec![]),
+            Finding::orphaned_endpoint("POST", "/b", None),
+        ];
+        let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:2 -->"));
+        assert!(output.contains("connectivity gaps"));
+        assert!(output.contains("> [!WARNING]"));
     }
 
     #[test]
@@ -1516,11 +1066,8 @@ mod tests {
         };
         // A monorepo has a cross-service baseline even with no peers, so a
         // type mismatch headlines as a contract risk.
-        let mut issues = empty_issues();
-        issues.type_mismatches = vec![
-            "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
-        ];
-        let output = format_analysis_results(result_with(issues), &topology, None);
+        let output =
+            format_analysis_results(result_with(vec![type_mismatch_finding()]), &topology, None);
 
         assert!(output.contains("## 🪢 Carrick · monorepo (3 services)"));
         assert!(output.contains("> [!CAUTION]"));
@@ -1535,7 +1082,7 @@ mod tests {
             local_service_count: 1,
             peer_repo_count: 0,
         };
-        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
+        let output = format_analysis_results(result_with(vec![]), &topology, None);
 
         assert!(output.contains("## 🪢 Carrick · api-server"));
         assert!(output.contains("> [!TIP]"));
@@ -1552,17 +1099,8 @@ mod tests {
             local_service_count: 3,
             peer_repo_count: 2,
         };
-        let mut issues = empty_issues();
-        issues.dependency_conflicts = vec![DependencyConflict {
-            package_name: "zod".to_string(),
-            repos: vec![crate::analyzer::RepoPackageInfo {
-                repo_name: "billing".to_string(),
-                version: "^3.22".to_string(),
-                source_path: std::path::PathBuf::from("package.json"),
-            }],
-            severity: ConflictSeverity::Warning,
-        }];
-        let output = format_analysis_results(result_with(issues), &topology, None);
+        let output =
+            format_analysis_results(result_with(vec![major_conflict_finding()]), &topology, None);
 
         assert!(output.contains("## 🪢 Carrick · monorepo (3 services)"));
         assert!(output.contains("across 3 repos"));
@@ -1574,34 +1112,53 @@ mod tests {
     }
 
     #[test]
-    fn test_verdict_warning_on_dependencies_only() {
-        let mut issues = empty_issues();
-        issues.dependency_conflicts = vec![DependencyConflict {
-            package_name: "zod".to_string(),
-            repos: vec![crate::analyzer::RepoPackageInfo {
-                repo_name: "billing".to_string(),
-                version: "^3.22".to_string(),
-                source_path: std::path::PathBuf::from("package.json"),
-            }],
-            severity: ConflictSeverity::Warning,
-        }];
-        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
+    fn test_verdict_warning_on_major_dependency_conflict() {
+        let output = format_analysis_results(
+            result_with(vec![major_conflict_finding()]),
+            &topology_baseline(),
+            None,
+        );
 
-        // No contract risks, but a counted issue → amber, not red.
+        // No contract risks, but a counted issue → amber, not red, and the
+        // major tier counts toward the headline.
         assert!(output.contains("> [!WARNING]"));
         assert!(!output.contains("> [!CAUTION]"));
         assert!(output.contains("dependency conflict"));
+        assert!(output.contains("Major version conflicts (1)"));
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
+    }
+
+    #[test]
+    fn test_unparseable_dependency_conflict_is_advisory() {
+        let finding = Finding::dependency_conflict(
+            "internal-lib",
+            tier::UNPARSEABLE,
+            vec![PackageVersionRef {
+                repo: "billing".to_string(),
+                version: "workspace:*".to_string(),
+                source: "billing/package.json".to_string(),
+            }],
+        );
+        let output =
+            format_analysis_results(result_with(vec![finding]), &topology_baseline(), None);
+
+        // Listed, but never counted and never escalating past NOTE.
+        assert!(output.contains("Unparseable version pins"));
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:0 -->"));
+        assert!(output.contains("> [!NOTE]"));
     }
 
     #[test]
     fn test_no_baseline_without_connectivity_omits_baseline_note() {
         // A lone repo with only a configuration suggestion (no connectivity
         // findings) must not claim "connectivity findings are informational".
-        let mut issues = empty_issues();
-        issues.env_var_calls = vec![
-            "Unclassified env var: GET /orders using [ORDER_SERVICE_URL] (from src/orders.ts) - add to internalEnvVars or externalEnvVars in carrick.json".to_string(),
-        ];
-        let output = format_analysis_results(result_with(issues), &topology_first_repo(), None);
+        let findings = vec![Finding::env_var_call(
+            "GET",
+            "/orders",
+            "ORDER_SERVICE_URL",
+            vec!["src/orders.ts".to_string()],
+        )];
+        let output = format_analysis_results(result_with(findings), &topology_first_repo(), None);
 
         assert!(output.contains("configuration suggestion"));
         assert!(
@@ -1615,16 +1172,11 @@ mod tests {
     fn test_no_decorative_emoji_in_output() {
         // Severity is carried by GitHub alert blocks, not emoji. Only the 🪢
         // brand mark in the header is allowed.
-        let mut issues = empty_issues();
-        issues.type_mismatches = vec![
-            "Type mismatch on GET /api/users: Producer (UserResponse) incompatible with Consumer (User[]) - Property 'role' is missing".to_string(),
+        let findings = vec![
+            type_mismatch_finding(),
+            Finding::orphaned_endpoint("GET", "/legacy/ping", Some("billing".to_string())),
         ];
-        issues.endpoint_issues = vec![OrphanedEndpoint {
-            method: "GET".to_string(),
-            path: "/legacy/ping".to_string(),
-            service: Some("billing".to_string()),
-        }];
-        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
+        let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
 
         for banned in ["✅", "ℹ️", "⚠️", "❌", "🔁"] {
             assert!(
@@ -1642,20 +1194,11 @@ mod tests {
     fn test_orphaned_endpoints_show_service_when_attributed() {
         // When orphans carry an owning service, the connectivity table gains a
         // Service column naming where each lives.
-        let mut issues = empty_issues();
-        issues.endpoint_issues = vec![
-            OrphanedEndpoint {
-                method: "GET".to_string(),
-                path: "/users".to_string(),
-                service: Some("auth".to_string()),
-            },
-            OrphanedEndpoint {
-                method: "POST".to_string(),
-                path: "/charges".to_string(),
-                service: Some("billing".to_string()),
-            },
+        let findings = vec![
+            Finding::orphaned_endpoint("GET", "/users", Some("auth".to_string())),
+            Finding::orphaned_endpoint("POST", "/charges", Some("billing".to_string())),
         ];
-        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
+        let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
 
         assert!(output.contains("| Method | Path | Service |"));
         assert!(output.contains("| `GET` | `/users` | `auth` |"));
@@ -1666,13 +1209,8 @@ mod tests {
     fn test_orphaned_endpoints_omit_service_column_when_unattributed() {
         // A lone repo has no service attribution, so the column is dropped
         // rather than rendering an empty cell per row.
-        let mut issues = empty_issues();
-        issues.endpoint_issues = vec![OrphanedEndpoint {
-            method: "GET".to_string(),
-            path: "/legacy/ping".to_string(),
-            service: None,
-        }];
-        let output = format_analysis_results(result_with(issues), &topology_first_repo(), None);
+        let findings = vec![Finding::orphaned_endpoint("GET", "/legacy/ping", None)];
+        let output = format_analysis_results(result_with(findings), &topology_first_repo(), None);
 
         assert!(!output.contains("Service |"));
         assert!(output.contains("| `GET` | `/legacy/ping` |"));
@@ -1692,21 +1230,12 @@ mod tests {
     fn test_orphaned_mixed_attribution_uses_dash_and_escapes_cells() {
         // When the Service column is shown, an unattributed row gets a dash, and
         // any pipe in a value is escaped so it can't break the table.
-        let mut issues = empty_issues();
-        issues.endpoint_issues = vec![
-            OrphanedEndpoint {
-                method: "GET".to_string(),
-                path: "/users".to_string(),
-                // Backtick must be stripped so it can't break the code span.
-                service: Some("au`th".to_string()),
-            },
-            OrphanedEndpoint {
-                method: "QUERY".to_string(),
-                path: "weird|field".to_string(),
-                service: None,
-            },
+        let findings = vec![
+            // Backtick must be stripped so it can't break the code span.
+            Finding::orphaned_endpoint("GET", "/users", Some("au`th".to_string())),
+            Finding::orphaned_endpoint("QUERY", "weird|field", None),
         ];
-        let output = format_analysis_results(result_with(issues), &topology_baseline(), None);
+        let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
 
         assert!(output.contains("| `GET` | `/users` | `auth` |"));
         // Unattributed row → dash, and the pipe in the path is escaped.
@@ -1717,30 +1246,24 @@ mod tests {
     fn test_pr_delta_strip_lists_new_endpoints() {
         let delta = PrDelta {
             new_endpoints: vec![
-                NewEndpoint {
-                    label: "POST".to_string(),
-                    name: "/v2/invoices".to_string(),
+                EndpointRef {
+                    method: "POST".to_string(),
+                    path: "/v2/invoices".to_string(),
                     service: Some("billing".to_string()),
                 },
-                NewEndpoint {
-                    label: "GET".to_string(),
-                    name: "/charges".to_string(),
+                EndpointRef {
+                    method: "GET".to_string(),
+                    path: "/charges".to_string(),
                     service: None,
                 },
             ],
+            removed_endpoints: vec![],
         };
-        let mut issues = empty_issues();
-        issues.dependency_conflicts = vec![DependencyConflict {
-            package_name: "zod".to_string(),
-            repos: vec![crate::analyzer::RepoPackageInfo {
-                repo_name: "billing".to_string(),
-                version: "^3.22".to_string(),
-                source_path: std::path::PathBuf::from("package.json"),
-            }],
-            severity: ConflictSeverity::Warning,
-        }];
-        let output =
-            format_analysis_results(result_with(issues), &topology_baseline(), Some(&delta));
+        let output = format_analysis_results(
+            result_with(vec![major_conflict_finding()]),
+            &topology_baseline(),
+            Some(&delta),
+        );
 
         assert!(output.contains("**In this PR**"));
         assert!(output.contains("- New endpoint `POST /v2/invoices` (`billing`)"));
@@ -1753,8 +1276,7 @@ mod tests {
 
     #[test]
     fn test_pr_delta_absent_renders_no_strip() {
-        let output =
-            format_analysis_results(result_with(empty_issues()), &topology_baseline(), None);
+        let output = format_analysis_results(result_with(vec![]), &topology_baseline(), None);
         assert!(!output.contains("In this PR"));
     }
 
@@ -1763,17 +1285,15 @@ mod tests {
         // A PR can add an endpoint without introducing any issue, so the strip
         // must also appear on the clean (TIP) path.
         let delta = PrDelta {
-            new_endpoints: vec![NewEndpoint {
-                label: "GET".to_string(),
-                name: "/health".to_string(),
+            new_endpoints: vec![EndpointRef {
+                method: "GET".to_string(),
+                path: "/health".to_string(),
                 service: None,
             }],
+            removed_endpoints: vec![],
         };
-        let output = format_analysis_results(
-            result_with(empty_issues()),
-            &topology_baseline(),
-            Some(&delta),
-        );
+        let output =
+            format_analysis_results(result_with(vec![]), &topology_baseline(), Some(&delta));
 
         assert!(output.contains("> [!TIP]"));
         assert!(output.contains("**In this PR**"));
@@ -1781,21 +1301,52 @@ mod tests {
     }
 
     #[test]
+    fn test_pr_delta_lists_removed_endpoints_and_flags_still_consumed() {
+        // A removed endpoint whose (method, path) still shows up as a missing
+        // endpoint is a producer this PR deletes out from under a consumer.
+        let delta = PrDelta {
+            new_endpoints: vec![],
+            removed_endpoints: vec![
+                EndpointRef {
+                    method: "DELETE".to_string(),
+                    path: "/api/sessions".to_string(),
+                    service: None,
+                },
+                EndpointRef {
+                    method: "GET".to_string(),
+                    path: "/api/unused".to_string(),
+                    service: Some("auth".to_string()),
+                },
+            ],
+        };
+        let findings = vec![Finding::missing_endpoint(
+            "DELETE",
+            "/api/sessions",
+            None,
+            vec!["web/src/auth.ts:9".to_string()],
+        )];
+        let output =
+            format_analysis_results(result_with(findings), &topology_baseline(), Some(&delta));
+
+        assert!(output.contains("- Removed `DELETE /api/sessions` — ⚠ still consumed"));
+        assert!(output.contains("- Removed `GET /api/unused` (`auth`)\n"));
+        assert!(!output.contains("`GET /api/unused` (`auth`) — ⚠"));
+    }
+
+    #[test]
     fn test_pr_delta_strip_inline_code_is_prose_safe() {
         // In a prose code span a pipe is literal (must not be backslash-escaped
         // the way a table cell would), and a backtick in the service is dropped.
         let delta = PrDelta {
-            new_endpoints: vec![NewEndpoint {
-                label: "GET".to_string(),
-                name: "/a|b".to_string(),
+            new_endpoints: vec![EndpointRef {
+                method: "GET".to_string(),
+                path: "/a|b".to_string(),
                 service: Some("sv`c".to_string()),
             }],
+            removed_endpoints: vec![],
         };
-        let output = format_analysis_results(
-            result_with(empty_issues()),
-            &topology_baseline(),
-            Some(&delta),
-        );
+        let output =
+            format_analysis_results(result_with(vec![]), &topology_baseline(), Some(&delta));
 
         assert!(output.contains("- New endpoint `GET /a|b` (`svc`)"));
         assert!(
@@ -1809,82 +1360,33 @@ mod tests {
         // A service name that sanitizes to empty (e.g. only backticks) must not
         // render an empty " (``)" suffix.
         let delta = PrDelta {
-            new_endpoints: vec![NewEndpoint {
-                label: "GET".to_string(),
-                name: "/x".to_string(),
+            new_endpoints: vec![EndpointRef {
+                method: "GET".to_string(),
+                path: "/x".to_string(),
                 service: Some("``".to_string()),
             }],
+            removed_endpoints: vec![],
         };
-        let output = format_analysis_results(
-            result_with(empty_issues()),
-            &topology_baseline(),
-            Some(&delta),
-        );
+        let output =
+            format_analysis_results(result_with(vec![]), &topology_baseline(), Some(&delta));
 
         assert!(output.contains("- New endpoint `GET /x`\n"));
         assert!(!output.contains("(`"), "empty service must omit the suffix");
     }
 
+    /// The badge/dashboard placeholder protocol is gone: URLs are built
+    /// cloud-side from the verified identity, so the scanner must not emit
+    /// `{{CARRICK_*}}` markers anymore.
     #[test]
-    fn test_emits_badge_and_dashboard_link_placeholders() {
-        let topology = Topology {
-            repo_name: "api-server".to_string(),
-            local_service_count: 1,
-            peer_repo_count: 2,
-        };
-        let mut issues = empty_issues();
-        issues.type_mismatches = vec![
-            "Type mismatch on POST /x: Producer (A) incompatible with Consumer (B) - bad"
-                .to_string(),
-        ];
-        let output = format_analysis_results(result_with(issues), &topology, None);
-
-        // Badge image placeholder: risk state, poly-repo repo count, risk count.
-        assert!(output.contains("![Carrick status]({{CARRICK_BADGE:state=risk"));
-        assert!(output.contains("&repos=3"));
-        assert!(output.contains("&risks=1"));
-        // Linked dashboard footer scoped to the repo.
-        assert!(output.contains("[Carrick dashboard]({{CARRICK_LINK:explore/api-server}})"));
-    }
-
-    #[test]
-    fn test_clean_run_emits_ok_badge_and_link() {
-        let topology = Topology {
-            repo_name: "api-server".to_string(),
-            local_service_count: 1,
-            peer_repo_count: 0,
-        };
-        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
-
-        assert!(output.contains("![Carrick status]({{CARRICK_BADGE:state=ok"));
-        assert!(output.contains("[Carrick dashboard]({{CARRICK_LINK:explore/api-server}})"));
-    }
-
-    #[test]
-    fn test_monorepo_badge_carries_service_count() {
-        let topology = Topology {
-            repo_name: "platform".to_string(),
-            local_service_count: 3,
-            peer_repo_count: 0,
-        };
-        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
-        assert!(output.contains("{{CARRICK_BADGE:state=ok&services=3"));
-    }
-
-    #[test]
-    fn test_badge_emits_single_scope_count_for_monorepo_with_peers() {
-        // Monorepo that also has peers: emit the monorepo's service count only,
-        // not both services and repos.
-        let topology = Topology {
-            repo_name: "platform".to_string(),
-            local_service_count: 3,
-            peer_repo_count: 2,
-        };
-        let output = format_analysis_results(result_with(empty_issues()), &topology, None);
-        assert!(output.contains("&services=3"));
-        assert!(
-            !output.contains("&repos="),
-            "a monorepo emits services, not repos"
-        );
+    fn test_no_placeholder_protocol_in_output() {
+        for result in [
+            result_with(vec![]),
+            result_with(vec![type_mismatch_finding()]),
+        ] {
+            let output = format_analysis_results(result, &topology_baseline(), None);
+            assert!(!output.contains("{{CARRICK_BADGE"));
+            assert!(!output.contains("{{CARRICK_LINK"));
+            assert!(!output.contains("Carrick dashboard"));
+        }
     }
 }

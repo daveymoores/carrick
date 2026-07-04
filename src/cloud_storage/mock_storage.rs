@@ -44,14 +44,14 @@ impl CloudStorage for MockStorage {
         true
     }
 
-    async fn post_pr_comment(
+    async fn post_pr_result(
         &self,
-        repo: &str,
-        pr_number: u64,
-        _run_id: &str,
-        _body: &str,
+        payload: &crate::findings::PrResultPayload,
     ) -> Result<(), StorageError> {
-        debug!("MOCK: post_pr_comment for {} (PR #{})", repo, pr_number);
+        debug!(
+            "MOCK: post_pr_result for {} (PR #{})",
+            payload.repo, payload.pr_number
+        );
         Ok(())
     }
 

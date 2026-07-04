@@ -82,6 +82,17 @@ struct LambdaResponse {
     multi_service: bool,
 }
 
+/// Envelope for the `post-pr-result` action: the transport adds the action
+/// tag and schema version; every other wire field comes verbatim from the
+/// flattened [`crate::findings::PrResultPayload`].
+#[derive(Serialize)]
+struct PostPrResultRequest<'a> {
+    action: &'a str,
+    schema_version: u32,
+    #[serde(flatten)]
+    payload: &'a crate::findings::PrResultPayload,
+}
+
 #[derive(Deserialize)]
 struct StoreMetadataResponse {
     #[allow(dead_code)]
@@ -484,41 +495,28 @@ impl CloudStorage for AwsStorage {
         Ok(())
     }
 
-    async fn post_pr_comment(
+    async fn post_pr_result(
         &self,
-        repo: &str,
-        pr_number: u64,
-        run_id: &str,
-        body: &str,
+        payload: &crate::findings::PrResultPayload,
     ) -> Result<(), StorageError> {
         // Dedicated action: unlike store-metadata/complete-upload it writes no
-        // index data — the cloud only gates on the project's pr_comments_enabled
-        // toggle and upserts the marked comment via the GitHub App. We keep the
-        // rendered markdown as the source of truth here and let the cloud relay
-        // it verbatim. `run_id` lets the cloud re-run this PR's workflow later
-        // when a sibling repo's main changes.
-        #[derive(Serialize)]
-        struct PostPrCommentRequest<'a> {
-            action: &'a str,
-            repo: &'a str,
-            pr_number: u64,
-            #[serde(skip_serializing_if = "str::is_empty")]
-            run_id: &'a str,
-            pr_comment_body: &'a str,
-        }
-
-        let request = PostPrCommentRequest {
-            action: "post-pr-comment",
-            repo,
-            pr_number,
-            run_id,
-            pr_comment_body: body,
+        // index data — the cloud gates on the project's pr_comments_enabled
+        // toggle and renders/upserts the marked comment + check run itself
+        // from these structured findings (OIDC identity, not the payload's
+        // self-reported repo, decides where they land).
+        let request = PostPrResultRequest {
+            action: "post-pr-result",
+            schema_version: 1,
+            payload,
         };
 
         // Best-effort by contract (caller logs and swallows), but surface the
         // transport error so the caller can log a useful message.
         self.send_lambda(&request).await?;
-        debug!("Posted PR comment for {} (PR #{})", repo, pr_number);
+        debug!(
+            "Posted PR result for {} (PR #{})",
+            payload.repo, payload.pr_number
+        );
         Ok(())
     }
 
@@ -586,5 +584,47 @@ mod tests {
         assert_eq!(retry_backoff(0), Duration::from_secs(2));
         assert_eq!(retry_backoff(1), Duration::from_secs(4));
         assert_eq!(retry_backoff(2), Duration::from_secs(8));
+    }
+
+    /// The transport envelope flattens the payload next to the action tag —
+    /// the cloud reads `action`/`schema_version` and the payload fields from
+    /// one top-level object (pr-result-pipeline.md wire shape).
+    #[test]
+    fn post_pr_result_request_flattens_payload_with_envelope() {
+        let payload = crate::findings::PrResultPayload {
+            repo: "api-server".to_string(),
+            pr_number: 7,
+            head_sha: None,
+            run_id: None,
+            topology: crate::findings::Topology {
+                repo_name: "api-server".to_string(),
+                local_service_count: 1,
+                peer_repo_count: 0,
+            },
+            stats: crate::findings::ScanStats {
+                endpoints: 1,
+                calls: 2,
+            },
+            findings: vec![],
+            delta: None,
+            verified: vec![],
+            graphql: crate::findings::GraphqlStatus {
+                libraries: vec![],
+                operations_indexed: false,
+            },
+        };
+        let request = PostPrResultRequest {
+            action: "post-pr-result",
+            schema_version: 1,
+            payload: &payload,
+        };
+        let v = serde_json::to_value(&request).unwrap();
+        assert_eq!(v["action"], "post-pr-result");
+        assert_eq!(v["schema_version"], 1);
+        // Payload fields sit at the top level, not nested under "payload".
+        assert_eq!(v["repo"], "api-server");
+        assert_eq!(v["pr_number"], 7);
+        assert_eq!(v["stats"]["calls"], 2);
+        assert!(v.get("payload").is_none());
     }
 }

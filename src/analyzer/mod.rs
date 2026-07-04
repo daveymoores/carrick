@@ -7,6 +7,7 @@ use crate::{
     app_context::AppContext,
     config::{Config, create_standard_tsconfig},
     extractor::CoreExtractor,
+    findings::{Finding, PackageVersionRef, tier},
     mount_graph::MountGraph,
     operation::OperationKey,
     packages::Packages,
@@ -15,7 +16,7 @@ use crate::{
     utils::join_prefix_and_path,
     visitor::{Call, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::LazyLock;
 use std::{
     collections::HashMap,
@@ -33,26 +34,10 @@ static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
 
 // Type aliases to reduce complexity
 type RouteFieldMap = HashMap<OperationKey, Json>;
-/// Result of `analyze_matches_with_mount_graph`:
-///   `(call_issues, endpoint_issues, env_var_calls, verified_endpoints,
-///     cross_repo_matches)`.
-type MountGraphMatches = (
-    Vec<String>,
-    Vec<OrphanedEndpoint>,
-    Vec<String>,
-    Vec<(String, String)>,
-    Vec<CrossRepoMatch>,
-);
-/// Result of `analyze_exact_key_matches` (the non-HTTP, exact-operation-key
-/// matcher): `(call_issues, endpoint_issues, verified_endpoints,
-/// cross_repo_matches)`. No `env_var_calls` slot — GraphQL/socket keys carry no
-/// URL to classify.
-type ExactKeyMatches = (
-    Vec<String>,
-    Vec<OrphanedEndpoint>,
-    Vec<(String, String)>,
-    Vec<CrossRepoMatch>,
-);
+/// Result of `analyze_matches_with_mount_graph` and
+/// `analyze_exact_key_matches`: `(findings, verified_endpoints,
+/// cross_repo_matches)`.
+type MatcherOutput = (Vec<Finding>, Vec<(String, String)>, Vec<CrossRepoMatch>);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
@@ -75,15 +60,28 @@ pub struct RepoPackageInfo {
     pub source_path: PathBuf,
 }
 
-/// A producer endpoint with no consumer in the indexed services. `service`
-/// names the owning service (monorepo `serviceName`) or repo (poly-repo) when
-/// known; it is `None` for protocols whose orphans are not repo-tagged
-/// (GraphQL/socket).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct OrphanedEndpoint {
-    pub method: String,
-    pub path: String,
-    pub service: Option<String>,
+/// Project a [`DependencyConflict`] into its wire finding. Tier mapping:
+/// `Critical` (a semver major spread) → `major`; `Warning`/`Info` only reach
+/// here for pins that didn't parse as comparable semver (see
+/// `is_reportable_conflict`), so both map to `unparseable`.
+fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
+    let tier = match conflict.severity {
+        ConflictSeverity::Critical => tier::MAJOR,
+        ConflictSeverity::Warning | ConflictSeverity::Info => tier::UNPARSEABLE,
+    };
+    Finding::dependency_conflict(
+        conflict.package_name.clone(),
+        tier,
+        conflict
+            .repos
+            .iter()
+            .map(|repo| PackageVersionRef {
+                repo: repo.repo_name.clone(),
+                version: repo.version.clone(),
+                source: repo.source_path.display().to_string(),
+            })
+            .collect(),
+    )
 }
 
 /// A structured producer→consumer edge captured at the matching site. This is
@@ -125,26 +123,6 @@ pub struct CrossRepoMatch {
     pub mismatch_reason: Option<String>,
 }
 
-pub struct ApiIssues {
-    pub call_issues: Vec<String>,
-    pub endpoint_issues: Vec<OrphanedEndpoint>,
-    pub env_var_calls: Vec<String>,
-    pub mismatches: Vec<String>,
-    pub type_mismatches: Vec<String>,
-    pub dependency_conflicts: Vec<DependencyConflict>,
-}
-
-impl ApiIssues {
-    pub fn is_empty(&self) -> bool {
-        self.call_issues.is_empty()
-            && self.endpoint_issues.is_empty()
-            && self.env_var_calls.is_empty()
-            && self.mismatches.is_empty()
-            && self.type_mismatches.is_empty()
-            && self.dependency_conflicts.is_empty()
-    }
-}
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApiEndpointDetails {
     // owner is Option as we store both call ands endpoints in this data structure.
@@ -182,7 +160,15 @@ pub struct ApiEndpointDetails {
 pub struct ApiAnalysisResult {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
-    pub issues: ApiIssues,
+    /// Typed findings, in the wire shape the PR-result payload sends and the
+    /// formatter renders (type/method mismatches, missing/orphaned endpoints,
+    /// env-var calls, dependency conflicts).
+    pub findings: Vec<Finding>,
+    /// The structured dependency conflicts behind the `dependency_conflict`
+    /// findings, kept alongside because the eval contract (§4) scores the full
+    /// Critical/Warning/Info severity, which the wire tier collapses to
+    /// major/unparseable.
+    pub dependency_conflicts: Vec<DependencyConflict>,
     /// Endpoints that were successfully matched by at least one consumer
     /// call, with their method + canonical path. Surfaced so users see
     /// what *worked* in the PR comment, not just what's broken — clean
@@ -1290,15 +1276,26 @@ impl Analyzer {
     }
 
     /// Framework-agnostic analysis using mount graph.
-    /// Returns `(call_issues, endpoint_issues, env_var_calls, verified_endpoints,
-    /// cross_repo_matches)` — the fourth element captures (method, path) of every
-    /// endpoint that at least one consumer call successfully matched (positive
-    /// signal for the PR comment), and the fifth captures the structured
-    /// producer→consumer edges (consumed only by the eval projection).
-    fn analyze_matches_with_mount_graph(&self, mount_graph: &MountGraph) -> MountGraphMatches {
-        let mut call_issues = Vec::new();
-        let mut endpoint_issues = Vec::new();
-        let mut env_var_calls = Vec::new();
+    /// Returns `(findings, verified_endpoints, cross_repo_matches)` — the
+    /// second element captures (method, path) of every endpoint that at least
+    /// one consumer call successfully matched (positive signal for the PR
+    /// comment), and the third captures the structured producer→consumer
+    /// edges (consumed only by the eval projection).
+    fn analyze_matches_with_mount_graph(&self, mount_graph: &MountGraph) -> MatcherOutput {
+        // Grouped accumulators, BTree-keyed so same-target call sites collapse
+        // into one finding and the emitted order is deterministic.
+        // (METHOD, path) → call sites.
+        let mut missing: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        // (METHOD, path, expected_method) → call sites.
+        let mut method_mismatches: BTreeMap<(String, String, String), BTreeSet<String>> =
+            BTreeMap::new();
+        // (env_var, METHOD, path) → call sites.
+        let mut env_var_calls: BTreeMap<(String, String, String), BTreeSet<String>> =
+            BTreeMap::new();
+        // Producers surfaced as a method mismatch: suppressed from the orphan
+        // list so a wrong-verb call reports once, as a risk — not as a
+        // missing+orphaned pair.
+        let mut method_mismatched_producers: HashSet<String> = HashSet::new();
         // Structured producer→consumer edges for the eval projection.
         let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
 
@@ -1365,9 +1362,14 @@ impl Analyzer {
             let Some((method, target)) = call.key.as_http() else {
                 continue;
             };
-            // Check for environment variable URLs (framework-agnostic)
-            // Use smarter detection to avoid false positives on path parameters
-            if Self::is_env_var_base_url(target) {
+            let call_site = call.file_path.display().to_string();
+
+            // Env-var base URLs (framework-agnostic; smarter detection avoids
+            // false positives on path parameters) look up by their canonical
+            // `ENV_VAR:` route; everything else looks up the raw target.
+            let (lookup_url, miss_path);
+            let is_env_route = Self::is_env_var_base_url(target);
+            if is_env_route {
                 let env_var_name = Self::extract_env_var_name(target);
                 let normalized_path = normalizer.extract_path(target);
                 let canonical_env_var_route =
@@ -1376,94 +1378,106 @@ impl Analyzer {
                 if self.config.is_external_call(&canonical_env_var_route) {
                     continue;
                 }
-
-                if self.config.is_internal_call(&canonical_env_var_route) {
-                    match mount_graph.find_matching_endpoints_with_normalizer(
-                        &canonical_env_var_route,
-                        method,
-                        &normalizer,
-                    ) {
-                        Some(matching_endpoints) => {
-                            if matching_endpoints.is_empty() {
-                                call_issues.push(format!(
-                                    "Missing endpoint for {} {} (normalized: {}) (called from {})",
-                                    method,
-                                    target,
-                                    normalized_path,
-                                    call.file_path.display()
-                                ));
-                            } else {
-                                for endpoint in matching_endpoints {
-                                    let key = format!("{}:{}", endpoint.method, endpoint.full_path);
-                                    matched_endpoints.insert(key);
-                                    if let Some(edge) = Self::build_cross_repo_match(
-                                        call,
-                                        method,
-                                        target,
-                                        &normalized_path,
-                                        endpoint,
-                                        &consumer_repo_by_call,
-                                    ) {
-                                        cross_repo_matches.push(edge);
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            // Identified as external - skip
-                        }
-                    }
+                if !self.config.is_internal_call(&canonical_env_var_route) {
+                    env_var_calls
+                        .entry((env_var_name, method.to_string(), normalized_path))
+                        .or_default()
+                        .insert(call_site);
                     continue;
                 }
-
-                env_var_calls.push(format!(
-                    "Unclassified env var: {} {} using [{}] (from {}) - add to internalEnvVars or externalEnvVars in carrick.json",
-                    method,
-                    normalized_path,
-                    env_var_name,
-                    call.file_path.display()
-                ));
-                continue;
+                lookup_url = canonical_env_var_route;
+                miss_path = normalized_path;
+            } else {
+                lookup_url = target.to_string();
+                miss_path = normalizer.extract_path(target);
             }
 
-            // Use mount graph to find matching endpoints with URL normalization
-            // This handles full URLs, env var patterns, template literals, etc.
-            match mount_graph.find_matching_endpoints_with_normalizer(target, method, &normalizer) {
+            match mount_graph.find_matching_endpoints_with_normalizer(
+                &lookup_url,
+                method,
+                &normalizer,
+            ) {
                 None => {
                     // URL was identified as external - skip it
-                    continue;
                 }
-                Some(matching_endpoints) => {
-                    if matching_endpoints.is_empty() {
-                        // Extract normalized path for better error message
-                        let normalized_path = normalizer.extract_path(target);
-                        call_issues.push(format!(
-                            "Missing endpoint for {} {} (normalized: {}) (called from {})",
+                Some(matching_endpoints) if !matching_endpoints.is_empty() => {
+                    // The env-var edge keys on the extracted path (identical
+                    // to the pre-typed matcher); the plain edge re-normalizes
+                    // the raw target.
+                    let normalized_path = if is_env_route {
+                        miss_path
+                    } else {
+                        normalizer.normalize(&lookup_url).path
+                    };
+                    for endpoint in matching_endpoints {
+                        let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                        matched_endpoints.insert(key);
+                        if let Some(edge) = Self::build_cross_repo_match(
+                            call,
                             method,
                             target,
-                            normalized_path,
-                            call.file_path.display()
-                        ));
-                    } else {
-                        // Mark endpoints as matched
-                        let normalized_path = normalizer.normalize(target).path;
-                        for endpoint in matching_endpoints {
-                            let key = format!("{}:{}", endpoint.method, endpoint.full_path);
-                            matched_endpoints.insert(key);
-                            if let Some(edge) = Self::build_cross_repo_match(
-                                call,
-                                method,
-                                target,
-                                &normalized_path,
-                                endpoint,
-                                &consumer_repo_by_call,
-                            ) {
-                                cross_repo_matches.push(edge);
-                            }
+                            &normalized_path,
+                            endpoint,
+                            &consumer_repo_by_call,
+                        ) {
+                            cross_repo_matches.push(edge);
                         }
                     }
                 }
+                Some(_) => {
+                    // No producer under this method — retry ignoring the
+                    // method to tell a wrong verb (a contract risk) apart from
+                    // a genuinely missing endpoint (a connectivity gap).
+                    let path_matches = mount_graph
+                        .find_matching_endpoints_any_method(&lookup_url, &normalizer)
+                        .unwrap_or_default();
+                    if path_matches.is_empty() {
+                        missing
+                            .entry((method.to_string(), miss_path))
+                            .or_default()
+                            .insert(call_site);
+                    } else {
+                        // Several verbs can exist at one path; report the
+                        // first (sorted) so the wrong-verb call surfaces as
+                        // one risk row, not a fan-out.
+                        let mut methods: Vec<String> = path_matches
+                            .iter()
+                            .map(|e| e.method.to_uppercase())
+                            .collect();
+                        methods.sort();
+                        methods.dedup();
+                        for endpoint in &path_matches {
+                            method_mismatched_producers
+                                .insert(format!("{}:{}", endpoint.method, endpoint.full_path));
+                        }
+                        method_mismatches
+                            .entry((method.to_string(), miss_path, methods.swap_remove(0)))
+                            .or_default()
+                            .insert(call_site);
+                    }
+                }
             }
+        }
+
+        // Findings order: risks (method mismatches) first, then gaps, then
+        // advisories — mirrors the report's section order.
+        let mut findings: Vec<Finding> = Vec::new();
+        for ((method, path, expected), sites) in method_mismatches {
+            findings.push(Finding::method_mismatch(
+                method,
+                path,
+                None,
+                sites.into_iter().collect(),
+                expected,
+            ));
+        }
+        for ((method, path), sites) in missing {
+            findings.push(Finding::missing_endpoint(
+                method,
+                path,
+                None,
+                sites.into_iter().collect(),
+            ));
         }
 
         // Find orphaned endpoints (not matched by any call), and capture
@@ -1473,18 +1487,28 @@ impl Analyzer {
             let key = format!("{}:{}", endpoint.method, endpoint.full_path);
             if matched_endpoints.contains(&key) {
                 verified.push((endpoint.method.clone(), endpoint.full_path.clone()));
-            } else {
-                endpoint_issues.push(OrphanedEndpoint {
-                    method: endpoint.method.clone(),
-                    path: endpoint.full_path.clone(),
+            } else if !method_mismatched_producers.contains(&key) {
+                // A producer already surfaced in a method-mismatch risk is
+                // neither verified nor re-reported as orphaned.
+                findings.push(Finding::orphaned_endpoint(
+                    endpoint.method.clone(),
+                    endpoint.full_path.clone(),
                     // Prefer the monorepo service name, falling back to the repo
                     // (matches the cloud's service_name ?? repo_name convention).
-                    service: endpoint
+                    endpoint
                         .service_name
                         .clone()
                         .or_else(|| endpoint.repo_name.clone()),
-                });
+                ));
             }
+        }
+        for ((env_var, method, path), sites) in env_var_calls {
+            findings.push(Finding::env_var_call(
+                method,
+                path,
+                env_var,
+                sites.into_iter().collect(),
+            ));
         }
         verified.sort();
         verified.dedup();
@@ -1496,13 +1520,7 @@ impl Analyzer {
         // combined set, so this is the HTTP-only first pass.
         sort_dedup_cross_repo_matches(&mut cross_repo_matches);
 
-        (
-            call_issues,
-            endpoint_issues,
-            env_var_calls,
-            verified,
-            cross_repo_matches,
-        )
+        (findings, verified, cross_repo_matches)
     }
 
     /// Build a [`CrossRepoMatch`] from a matched consumer call + producer
@@ -1554,19 +1572,15 @@ impl Analyzer {
 
     /// Match consumers against producers of a protocol whose operations have
     /// exact key identity (GraphQL fields, socket events) — no URL or mount
-    /// hierarchy to normalize. Returns `(call_issues, endpoint_issues,
-    /// verified)`.
+    /// hierarchy to normalize. Returns `(findings, verified,
+    /// cross_repo_matches)`.
     ///
     /// If no producer of the protocol is indexed anywhere, consumers are
     /// skipped silently: the producing service may simply not be scanned,
     /// and guessing would create false "missing endpoint" noise. Unconsumed
     /// producers are reported as orphans, the same soft signal REST orphans
     /// get.
-    fn analyze_exact_key_matches(
-        &self,
-        protocol: crate::operation::Protocol,
-        protocol_label: &str,
-    ) -> ExactKeyMatches {
+    fn analyze_exact_key_matches(&self, protocol: crate::operation::Protocol) -> MatcherOutput {
         let producer_keys: HashSet<&OperationKey> = self
             .endpoints
             .iter()
@@ -1574,7 +1588,7 @@ impl Analyzer {
             .map(|endpoint| &endpoint.key)
             .collect();
         if producer_keys.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
 
         // Producer repo ids (service_name ?? repo_name) per canonical key, so a
@@ -1604,7 +1618,9 @@ impl Analyzer {
             }
         }
 
-        let mut call_issues = Vec::new();
+        // (label, name) → call sites, BTree-keyed so same-op call sites
+        // collapse into one finding in deterministic order.
+        let mut missing: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
         let mut matched: HashSet<&OperationKey> = HashSet::new();
         let mut seen_calls = HashSet::new();
@@ -1648,17 +1664,19 @@ impl Analyzer {
                 }
             } else {
                 let (label, name) = call.key.display_labels();
-                call_issues.push(format!(
-                    "Missing endpoint for {} {} ({}; called from {})",
-                    label,
-                    name,
-                    protocol_label,
-                    call.file_path.display()
-                ));
+                missing
+                    .entry((label, name))
+                    .or_default()
+                    .insert(call.file_path.display().to_string());
             }
         }
 
-        let mut endpoint_issues = Vec::new();
+        let mut findings: Vec<Finding> = missing
+            .into_iter()
+            .map(|((label, name), sites)| {
+                Finding::missing_endpoint(label, name, None, sites.into_iter().collect())
+            })
+            .collect();
         let mut verified = Vec::new();
         let mut seen_producers = HashSet::new();
         for endpoint in &self.endpoints {
@@ -1674,17 +1692,13 @@ impl Analyzer {
             } else {
                 // GraphQL/socket producers are not repo-tagged at this layer, so
                 // the owning service is unknown.
-                endpoint_issues.push(OrphanedEndpoint {
-                    method: label,
-                    path: name,
-                    service: None,
-                });
+                findings.push(Finding::orphaned_endpoint(label, name, None));
             }
         }
         verified.sort();
         verified.dedup();
 
-        (call_issues, endpoint_issues, verified, cross_repo_matches)
+        (findings, verified, cross_repo_matches)
     }
 
     pub fn compute_full_paths_for_endpoint(
@@ -1899,26 +1913,21 @@ impl Analyzer {
         let mount_graph = self.mount_graph.as_ref()
             .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
 
-        let (
-            mut call_issues,
-            mut endpoint_issues,
-            env_var_calls,
-            mut verified_endpoints,
-            mut cross_repo_matches,
-        ) = self.analyze_matches_with_mount_graph(mount_graph);
-        for (protocol, label) in [
-            (crate::operation::Protocol::Graphql, "GraphQL"),
-            (crate::operation::Protocol::Websocket, "Socket.IO"),
-            (crate::operation::Protocol::Pubsub, "Pub/Sub"),
+        let (matcher_findings, mut verified_endpoints, mut cross_repo_matches) =
+            self.analyze_matches_with_mount_graph(mount_graph);
+        // Findings order mirrors the report: contract risks first (type
+        // mismatches, then the matchers' method mismatches), then gaps, then
+        // advisories.
+        let mut findings = self.get_type_mismatch_findings();
+        findings.extend(matcher_findings);
+        for protocol in [
+            crate::operation::Protocol::Graphql,
+            crate::operation::Protocol::Websocket,
+            crate::operation::Protocol::Pubsub,
         ] {
-            let (
-                protocol_call_issues,
-                protocol_endpoint_issues,
-                protocol_verified,
-                protocol_cross_repo_matches,
-            ) = self.analyze_exact_key_matches(protocol, label);
-            call_issues.extend(protocol_call_issues);
-            endpoint_issues.extend(protocol_endpoint_issues);
+            let (protocol_findings, protocol_verified, protocol_cross_repo_matches) =
+                self.analyze_exact_key_matches(protocol);
+            findings.extend(protocol_findings);
             verified_endpoints.extend(protocol_verified);
             cross_repo_matches.extend(protocol_cross_repo_matches);
         }
@@ -1927,10 +1936,11 @@ impl Analyzer {
         // Re-sort/dedup over the combined HTTP + non-HTTP edge set so the final
         // ordering is stable regardless of which matcher produced an edge.
         sort_dedup_cross_repo_matches(&mut cross_repo_matches);
-        // Note: JSON body comparison removed - type checking is done via TypeScript (ts_check/)
-        let mismatches = Vec::new();
-        let type_mismatches = self.get_type_mismatches();
-        let dependency_conflicts = self.analyze_dependencies();
+        // Sorted by package so the findings (and the eval projection's source
+        // data) don't inherit HashMap iteration order.
+        let mut dependency_conflicts = self.analyze_dependencies();
+        dependency_conflicts.sort_by(|a, b| a.package_name.cmp(&b.package_name));
+        findings.extend(dependency_conflicts.iter().map(dependency_conflict_finding));
 
         // Overlay the per-pair type-compat verdict onto the captured edges. The
         // verdict is keyed by the producer's (METHOD, full_path) AND the consumer's
@@ -1976,14 +1986,8 @@ impl Analyzer {
         ApiAnalysisResult {
             endpoints,
             calls,
-            issues: ApiIssues {
-                call_issues,
-                endpoint_issues,
-                env_var_calls,
-                mismatches,
-                type_mismatches,
-                dependency_conflicts,
-            },
+            findings,
+            dependency_conflicts,
             verified_endpoints,
             detected_graphql_libraries,
             graphql_operations_indexed,
@@ -2197,43 +2201,46 @@ impl Analyzer {
         map
     }
 
-    fn get_type_mismatches(&self) -> Vec<String> {
-        match self.check_type_compatibility() {
-            Ok(result) => {
-                let display_names = self.build_display_name_map();
-
-                if let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) {
-                    mismatches.iter()
-                        .filter_map(|mismatch| {
-                            if let (Some(endpoint), Some(producer), Some(consumer), Some(error)) = (
-                                mismatch.get("endpoint").and_then(|e| e.as_str()),
-                                mismatch.get("producerType").and_then(|t| t.as_str()),
-                                mismatch.get("consumerType").and_then(|t| t.as_str()),
-                                mismatch.get("error").and_then(|e| e.as_str()),
-                            ) {
-                                // Clean up import paths for better readability
-                                let clean_producer = self.clean_type_string(producer, &display_names);
-                                let clean_consumer = self.clean_type_string(consumer, &display_names);
-                                let clean_error = self.clean_error_message(error, &display_names);
-
-                                Some(format!(
-                                    "Type mismatch on {}: Producer ({}) incompatible with Consumer ({}) - {}",
-                                    endpoint,
-                                    clean_producer,
-                                    clean_consumer,
-                                    clean_error
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            Err(_) => Vec::new(),
-        }
+    /// Project ts_check's mismatch list into typed [`Finding::TypeMismatch`]s.
+    /// Returns empty when compat was not evaluated for this run (ts_check_dir
+    /// absent, results file missing, or type checking failed).
+    fn get_type_mismatch_findings(&self) -> Vec<Finding> {
+        let Ok(result) = self.check_type_compatibility() else {
+            return Vec::new();
+        };
+        let display_names = self.build_display_name_map();
+        let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) else {
+            return Vec::new();
+        };
+        mismatches
+            .iter()
+            .filter_map(|mismatch| {
+                let endpoint = mismatch.get("endpoint")?.as_str()?;
+                let producer = mismatch.get("producerType")?.as_str()?;
+                let consumer = mismatch.get("consumerType")?.as_str()?;
+                let error = mismatch.get("error")?.as_str()?;
+                // "GET /users (response)" → ("GET", "/users"); socket/graphql
+                // labels reduce the same way ("SOCKET", "DIRECTION|event").
+                let (method, path) = parse_compat_endpoint(endpoint)
+                    .unwrap_or_else(|| ("UNKNOWN".to_string(), endpoint.to_string()));
+                // The consumer call site is the actionable location — it's
+                // where the broken read/write happens.
+                let call_sites = mismatch
+                    .get("consumerLocation")
+                    .and_then(|c| c.as_str())
+                    .map(|loc| vec![loc.to_string()])
+                    .unwrap_or_default();
+                Some(Finding::type_mismatch(
+                    method,
+                    path,
+                    None,
+                    call_sites,
+                    self.clean_type_string(producer, &display_names),
+                    self.clean_type_string(consumer, &display_names),
+                    &self.clean_error_message(error, &display_names),
+                ))
+            })
+            .collect()
     }
 
     fn clean_type_string(&self, type_str: &str, display_names: &HashMap<String, String>) -> String {
@@ -2715,21 +2722,20 @@ mod tests {
             "client.ts:20",
         ));
 
-        let (call_issues, endpoint_issues, verified, _edges) =
-            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
+        let (findings, verified, _edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql);
 
         assert_eq!(verified, vec![("QUERY".to_string(), "user".to_string())]);
-        assert_eq!(call_issues.len(), 1);
-        assert!(
-            call_issues[0].contains("Missing endpoint for QUERY orders"),
-            "got {}",
-            call_issues[0]
+        assert_eq!(
+            findings,
+            vec![
+                // Protocol-agnostic labels: the GraphQL op kind is the
+                // "method", the field the "path"; the call site travels typed.
+                Finding::missing_endpoint("QUERY", "orders", None, vec!["client.ts:20".into()]),
+                // GraphQL orphans are not repo-tagged at this layer.
+                Finding::orphaned_endpoint("MUTATION", "createUser", None),
+            ]
         );
-        assert_eq!(endpoint_issues.len(), 1);
-        assert_eq!(endpoint_issues[0].method, "MUTATION");
-        assert_eq!(endpoint_issues[0].path, "createUser");
-        // GraphQL orphans are not repo-tagged at this layer.
-        assert!(endpoint_issues[0].service.is_none());
     }
 
     #[test]
@@ -2745,10 +2751,9 @@ mod tests {
             "client.ts:12",
         ));
 
-        let (call_issues, endpoint_issues, verified, edges) =
-            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
-        assert!(call_issues.is_empty());
-        assert!(endpoint_issues.is_empty());
+        let (findings, verified, edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql);
+        assert!(findings.is_empty());
         assert!(verified.is_empty());
         assert!(edges.is_empty());
     }
@@ -2783,8 +2788,8 @@ mod tests {
             "client.ts:9",
         ));
 
-        let (call_issues, endpoint_issues, verified, _edges) =
-            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket, "Socket.IO");
+        let (findings, verified, _edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket);
 
         assert_eq!(
             verified,
@@ -2793,13 +2798,15 @@ mod tests {
                 ("SERVER->CLIENT".to_string(), "chat:broadcast".to_string()),
             ]
         );
-        assert_eq!(call_issues.len(), 1);
-        assert!(
-            call_issues[0].contains("Missing endpoint for CLIENT->SERVER typing"),
-            "got {}",
-            call_issues[0]
+        assert_eq!(
+            findings,
+            vec![Finding::missing_endpoint(
+                "CLIENT->SERVER",
+                "typing",
+                None,
+                vec!["client.ts:9".into()],
+            )]
         );
-        assert!(endpoint_issues.is_empty());
     }
 
     #[test]
@@ -2834,8 +2841,8 @@ mod tests {
             "payments-svc",
         ));
 
-        let (_, _, _, gql_edges) =
-            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
+        let (_, _, gql_edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql);
         assert_eq!(gql_edges.len(), 1, "one graphql edge expected");
         let e = &gql_edges[0];
         assert_eq!(e.producer_repo, "gateway");
@@ -2846,8 +2853,8 @@ mod tests {
         // Compat is filled in later by overlay_compat_verdicts, not here.
         assert_eq!(e.type_compatible, None);
 
-        let (_, _, _, socket_edges) =
-            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket, "Socket.IO");
+        let (_, _, socket_edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Websocket);
         assert_eq!(socket_edges.len(), 1, "one socket edge expected");
         let s = &socket_edges[0];
         // Direction-aware: listener repo is the producer, emitter repo the consumer.
@@ -2877,8 +2884,7 @@ mod tests {
             "analytics-worker",
         ));
 
-        let (_, _, _, edges) =
-            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Pubsub, "Pub/Sub");
+        let (_, _, edges) = analyzer.analyze_exact_key_matches(crate::operation::Protocol::Pubsub);
         assert_eq!(edges.len(), 1, "one pub/sub edge expected");
         let e = &edges[0];
         assert_eq!(e.producer_repo, "web-dashboard");
@@ -2915,8 +2921,7 @@ mod tests {
             "web-frontend",
         ));
 
-        let (_, _, _, edges) =
-            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql, "GraphQL");
+        let (_, _, edges) = analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql);
         assert_eq!(edges.len(), 2, "one edge per producer repo expected");
         let producer_repos: std::collections::BTreeSet<&str> =
             edges.iter().map(|e| e.producer_repo.as_str()).collect();
@@ -2939,11 +2944,9 @@ mod tests {
         ));
 
         let mount_graph = MountGraph::new();
-        let (call_issues, endpoint_issues, env_var_calls, verified, _cross_repo_matches) =
+        let (findings, verified, _cross_repo_matches) =
             analyzer.analyze_matches_with_mount_graph(&mount_graph);
-        assert!(call_issues.is_empty());
-        assert!(endpoint_issues.is_empty());
-        assert!(env_var_calls.is_empty());
+        assert!(findings.is_empty());
         assert!(verified.is_empty());
     }
 
@@ -3024,31 +3027,29 @@ mod tests {
         let mount_graph = MountGraph::new(); // Empty graph
 
         // Run analysis
-        let (call_issues, _, env_var_calls, _verified, _cross_repo_matches) =
+        let (findings, _verified, _cross_repo_matches) =
             analyzer.analyze_matches_with_mount_graph(&mount_graph);
 
         // Check results
-        // 1. Valid internal call should be in call_issues (missing endpoint) because graph is empty
-        // Note: The analyzer normalizes the path for the error message
-        assert!(
-            call_issues
-                .iter()
-                .any(|i| i.contains("Missing endpoint") && i.contains("/users"))
-        );
+        // 1. Valid internal call surfaces as a missing endpoint (graph is
+        // empty), carrying the normalized path and the typed call site.
+        assert!(findings.iter().any(|f| matches!(
+            f,
+            Finding::MissingEndpoint { method, path, call_sites, .. }
+                if method == "GET" && path == "/users" && call_sites == &vec!["test.ts".to_string()]
+        )));
 
-        // 2. Unclassified var should be in env_var_calls
-        assert!(
-            env_var_calls
-                .iter()
-                .any(|i| i.contains("Unclassified env var") && i.contains("UNKNOWN_VAR"))
-        );
+        // 2. Unclassified var becomes an env-var finding.
+        assert!(findings.iter().any(|f| matches!(
+            f,
+            Finding::EnvVarCall { env_var, path, .. } if env_var == "UNKNOWN_VAR" && path == "/posts"
+        )));
 
-        // 3. Process.env var should be in env_var_calls
-        assert!(
-            env_var_calls
-                .iter()
-                .any(|i| i.contains("Unclassified env var") && i.contains("OTHER_VAR"))
-        );
+        // 3. Process.env var becomes an env-var finding too.
+        assert!(findings.iter().any(|f| matches!(
+            f,
+            Finding::EnvVarCall { env_var, .. } if env_var == "OTHER_VAR"
+        )));
 
         // 4. Raw, unresolved `LEGACY_API_URL + "/users"` expressions are now
         // dropped by is_valid_route_shape: the file-analyzer contract requires
@@ -3056,7 +3057,111 @@ mod tests {
         // expression here is unreliable. This is the same tightening that stops
         // bare uppercase identifiers (`CarrickApiKeys`, `DynamoDB`) from being
         // mis-reported as env-var calls.
-        assert!(!env_var_calls.iter().any(|i| i.contains("LEGACY_API_URL")));
+        assert!(!findings.iter().any(|f| matches!(
+            f,
+            Finding::EnvVarCall { env_var, .. } if env_var == "LEGACY_API_URL"
+        )));
+    }
+
+    /// A consumer call whose path exists in the index under a different verb
+    /// must surface exactly once, as a method-mismatch risk — not as a
+    /// missing-endpoint + orphaned-endpoint pair.
+    #[test]
+    fn test_wrong_verb_call_surfaces_as_method_mismatch() {
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            key: OperationKey::http("GET", "/api/orders"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("client.ts:12"),
+            repo_name: None,
+            service_name: None,
+        });
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/api/orders".to_string(),
+            full_path: "/api/orders".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "server.ts:10".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("api".to_string()),
+            service_name: None,
+        });
+
+        let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            findings,
+            vec![Finding::method_mismatch(
+                "GET",
+                "/api/orders",
+                None,
+                vec!["client.ts:12".into()],
+                "POST",
+            )],
+            "a wrong-verb call must surface once, as a risk"
+        );
+        // The producer is neither verified nor orphaned.
+        assert!(verified.is_empty());
+    }
+
+    /// A call whose path matches nothing at all (under any verb) is still a
+    /// plain missing endpoint, and the unrelated producer stays orphaned.
+    #[test]
+    fn test_unmatched_path_still_reports_missing_and_orphaned() {
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            key: OperationKey::http("GET", "/api/missing"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("client.ts:3"),
+            repo_name: None,
+            service_name: None,
+        });
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/api/orders".to_string(),
+            full_path: "/api/orders".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "server.ts:10".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("api".to_string()),
+            service_name: None,
+        });
+
+        let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            findings,
+            vec![
+                Finding::missing_endpoint("GET", "/api/missing", None, vec!["client.ts:3".into()]),
+                Finding::orphaned_endpoint("POST", "/api/orders", Some("api".to_string())),
+            ]
+        );
     }
 
     // -----------------------------------------------------------------------

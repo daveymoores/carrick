@@ -106,7 +106,7 @@ pub struct EvalDependencyConflict {
 impl EvalProjection {
     /// Build the projection from analyzer results plus the merged type manifest.
     /// The manifest is joined per op by `OperationKey`; deps come straight from
-    /// `issues.dependency_conflicts`; matches from `result.cross_repo_matches`.
+    /// `result.dependency_conflicts`; matches from `result.cross_repo_matches`.
     pub fn from_results(result: &ApiAnalysisResult, type_manifest: &[TypeManifestEntry]) -> Self {
         let manifest_index = ManifestIndex::build(type_manifest);
         // Canonical ordering so the projection is deterministic across runs:
@@ -132,7 +132,6 @@ impl EvalProjection {
                 ))
         });
         let mut dependency_conflicts: Vec<EvalDependencyConflict> = result
-            .issues
             .dependency_conflicts
             .iter()
             .map(EvalDependencyConflict::from_conflict)
@@ -446,7 +445,7 @@ fn split_location(p: &Path) -> (String, u32) {
 mod tests {
     use super::*;
     use crate::analyzer::{
-        ApiIssues, ConflictSeverity, CrossRepoMatch as AnalyzerCrossRepoMatch, DependencyConflict,
+        ConflictSeverity, CrossRepoMatch as AnalyzerCrossRepoMatch, DependencyConflict,
         RepoPackageInfo,
     };
     use crate::cloud_storage::{
@@ -515,17 +514,6 @@ mod tests {
             resolved_definition: resolved.map(String::from),
             expanded_definition: None,
             primary_type_symbol: primary_type_symbol.map(String::from),
-        }
-    }
-
-    fn empty_issues_with_deps(dependency_conflicts: Vec<DependencyConflict>) -> ApiIssues {
-        ApiIssues {
-            call_issues: vec![],
-            endpoint_issues: vec![],
-            env_var_calls: vec![],
-            mismatches: vec![],
-            type_mismatches: vec![],
-            dependency_conflicts,
         }
     }
 
@@ -609,7 +597,8 @@ mod tests {
         let result = ApiAnalysisResult {
             endpoints,
             calls: vec![],
-            issues: empty_issues_with_deps(deps),
+            findings: vec![],
+            dependency_conflicts: deps,
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
@@ -690,7 +679,8 @@ mod tests {
         let result = ApiAnalysisResult {
             endpoints: vec![endpoint("GET", "/api/v1/status", "src/status.ts:3")],
             calls: vec![],
-            issues: empty_issues_with_deps(vec![]),
+            findings: vec![],
+            dependency_conflicts: vec![],
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
@@ -749,7 +739,8 @@ mod tests {
         let result = ApiAnalysisResult {
             endpoints: vec![],
             calls: vec![call],
-            issues: empty_issues_with_deps(vec![]),
+            findings: vec![],
+            dependency_conflicts: vec![],
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
@@ -815,7 +806,8 @@ mod tests {
                 repo_name: None,
                 service_name: None,
             }],
-            issues: empty_issues_with_deps(vec![]),
+            findings: vec![],
+            dependency_conflicts: vec![],
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
@@ -883,7 +875,8 @@ mod tests {
         let result = ApiAnalysisResult {
             endpoints: vec![endpoint("POST", "/payments", "src/payments.ts:30")],
             calls: vec![],
-            issues: empty_issues_with_deps(vec![]),
+            findings: vec![],
+            dependency_conflicts: vec![],
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
@@ -953,7 +946,8 @@ mod tests {
         let result = ApiAnalysisResult {
             endpoints: vec![],
             calls: vec![call],
-            issues: empty_issues_with_deps(vec![]),
+            findings: vec![],
+            dependency_conflicts: vec![],
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
@@ -1014,7 +1008,8 @@ mod tests {
                 call_at("/scan/billing-svc/src/kafka/producer.ts:15"),
                 call_at("/scan/orders-engine/src/kafka/producer.ts:22"),
             ],
-            issues: empty_issues_with_deps(vec![]),
+            findings: vec![],
+            dependency_conflicts: vec![],
             verified_endpoints: vec![],
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,

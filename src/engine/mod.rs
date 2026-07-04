@@ -115,11 +115,27 @@ fn pr_number_from_env() -> Option<u64> {
     rest.split('/').next()?.parse::<u64>().ok()
 }
 
-/// This run's GitHub Actions run id (`GITHUB_RUN_ID`), or empty if unset. The
+/// This run's GitHub Actions run id (`GITHUB_RUN_ID`), or None if unset. The
 /// cloud records it against the PR so a later sibling main change can re-run
 /// this exact workflow run and refresh the comment.
-fn run_id_from_env() -> String {
-    env::var("GITHUB_RUN_ID").unwrap_or_default()
+fn run_id_from_env() -> Option<String> {
+    env::var("GITHUB_RUN_ID").ok().filter(|id| !id.is_empty())
+}
+
+/// `pull_request.head.sha` from the GITHUB_EVENT_PATH event payload, or None
+/// on any failure (missing env, unreadable file, unexpected JSON). The cloud
+/// needs the head SHA to attach a check run; a merge-ref SHA from GITHUB_SHA
+/// would pin the check to a commit that isn't on the PR branch.
+fn head_sha_from_event() -> Option<String> {
+    let path = env::var("GITHUB_EVENT_PATH").ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let event: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    event
+        .get("pull_request")?
+        .get("head")?
+        .get("sha")?
+        .as_str()
+        .map(str::to_string)
 }
 
 #[allow(dead_code)]
@@ -352,33 +368,53 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         peer_repo_count, local_service_count
     );
 
-    // On a PR run with a prior index, surface what this change added: operations
-    // in the freshly-analyzed services that the previous (last-uploaded) index
-    // didn't have. Because the baseline is the last uploaded index, this can
-    // include an operation that landed on main since its last scan rather than
-    // in this PR. Computed before `current_services_data` is moved into the
-    // analyzer.
+    // On a PR run with a prior index, surface what this change added and
+    // removed: operations in the freshly-analyzed services that the previous
+    // (last-uploaded) index didn't have, and previously-indexed operations
+    // that no longer exist. Because the baseline is the last uploaded index,
+    // this can include an operation that landed on main since its last scan
+    // rather than in this PR. Computed before `current_services_data` is
+    // moved into the analyzer.
     let pr_delta = if is_pr_run && had_prior_index {
+        let endpoint_ref = |service: &Option<String>, key: &crate::operation::OperationKey| {
+            let (label, name) = key.display_labels();
+            crate::findings::EndpointRef {
+                method: label,
+                path: name,
+                service: service.clone(),
+            }
+        };
+        // Sort by (method, path, service) for deterministic output even when
+        // two services add or drop the same operation.
+        let sort_refs = |refs: &mut Vec<crate::findings::EndpointRef>| {
+            refs.sort_by(|a, b| {
+                (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
+            });
+        };
+
+        let mut current_keys = std::collections::HashSet::new();
         let mut new_endpoints = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for service_data in &current_services_data {
             for endpoint in &service_data.endpoints {
                 let id = (service_data.service_name.clone(), endpoint.key.clone());
+                current_keys.insert(id.clone());
                 if !previous_self_keys.contains(&id) && seen.insert(id) {
-                    let (label, name) = endpoint.key.display_labels();
-                    new_endpoints.push(crate::formatter::NewEndpoint {
-                        label,
-                        name,
-                        service: service_data.service_name.clone(),
-                    });
+                    new_endpoints.push(endpoint_ref(&service_data.service_name, &endpoint.key));
                 }
             }
         }
-        // Sort by (label, name, service) for deterministic output even when two
-        // services add the same operation.
-        new_endpoints
-            .sort_by(|a, b| (&a.label, &a.name, &a.service).cmp(&(&b.label, &b.name, &b.service)));
-        Some(crate::formatter::PrDelta { new_endpoints })
+        let mut removed_endpoints: Vec<crate::findings::EndpointRef> = previous_self_keys
+            .iter()
+            .filter(|id| !current_keys.contains(*id))
+            .map(|(service, key)| endpoint_ref(service, key))
+            .collect();
+        sort_refs(&mut new_endpoints);
+        sort_refs(&mut removed_endpoints);
+        Some(crate::findings::PrDelta {
+            new_endpoints,
+            removed_endpoints,
+        })
     } else {
         None
     };
@@ -418,29 +454,52 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         return Ok(());
     }
 
-    let topology = crate::formatter::Topology {
+    let topology = crate::findings::Topology {
         repo_name: repo_name.clone(),
         local_service_count,
         peer_repo_count,
     };
-    let formatted = crate::formatter::FormattedOutput::new(results, topology, pr_delta);
-    formatted.print();
 
     // On pull_request runs we deliberately skip the index upload (see
     // should_upload_data — PR-branch data must not pollute the cross-repo
-    // index), but we still relay the rendered findings to the cloud, which
-    // posts (and updates in place on later pushes) a single PR comment via
-    // the GitHub App, gated on the project's pr_comments_enabled toggle.
-    // Best-effort: a comment failure is logged, never fatal.
-    if let Some(pr_number) = pr_number_from_env() {
-        let body = formatted.pr_comment_body();
-        let run_id = run_id_from_env();
-        if let Err(e) = storage
-            .post_pr_comment(&repo_name, pr_number, &run_id, &body)
-            .await
-        {
-            warn!("Failed to post PR comment: {}", e);
-        }
+    // index), but we still relay the structured findings to the cloud, which
+    // renders and posts (and updates in place on later pushes) a single PR
+    // comment + check run via the GitHub App, gated on the project's
+    // pr_comments_enabled toggle. Best-effort: a relay failure is logged,
+    // never fatal. Assembled before `results` moves into the formatter.
+    let pr_result = pr_number_from_env().map(|pr_number| crate::findings::PrResultPayload {
+        repo: repo_name.clone(),
+        pr_number,
+        head_sha: head_sha_from_event(),
+        run_id: run_id_from_env(),
+        topology: topology.clone(),
+        stats: crate::findings::ScanStats {
+            endpoints: results.endpoints.len(),
+            calls: results.calls.len(),
+        },
+        findings: results.findings.clone(),
+        delta: pr_delta.clone(),
+        verified: results
+            .verified_endpoints
+            .iter()
+            .map(|(method, path)| crate::findings::VerifiedEndpoint {
+                method: method.clone(),
+                path: path.clone(),
+            })
+            .collect(),
+        graphql: crate::findings::GraphqlStatus {
+            libraries: results.detected_graphql_libraries.clone(),
+            operations_indexed: results.graphql_operations_indexed,
+        },
+    });
+
+    let formatted = crate::formatter::FormattedOutput::new(results, topology, pr_delta);
+    formatted.print();
+
+    if let Some(payload) = pr_result
+        && let Err(e) = storage.post_pr_result(&payload).await
+    {
+        warn!("Failed to post PR result: {}", e);
     }
 
     Ok(())

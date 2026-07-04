@@ -335,20 +335,19 @@ pub trait CloudStorage {
     async fn health_check(&self) -> Result<(), StorageError>;
     async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError>;
 
-    /// Relay a rendered PR-comment body to the cloud, which posts (and
-    /// updates in place on later pushes) a single GitHub App comment on the
-    /// PR. Only called on `pull_request` runs — index data is deliberately
-    /// not uploaded there, so this is the one signal a PR run sends.
+    /// Relay a PR run's structured findings to the cloud, which renders and
+    /// posts (and updates in place on later pushes) a single GitHub App
+    /// comment + check run on the PR. Only called on `pull_request` runs —
+    /// index data is deliberately not uploaded there, so this is the one
+    /// signal a PR run sends.
     ///
-    /// `run_id` is the GitHub Actions run id of this PR check; the cloud
-    /// records it so a later sibling main change can re-run this exact run and
-    /// refresh the comment (see carrick-cloud docs/internal/fanout-pr-rerun.md).
-    async fn post_pr_comment(
+    /// The payload's `run_id` lets the cloud re-run this exact workflow run
+    /// when a sibling repo's main changes (see carrick-cloud
+    /// docs/internal/fanout-pr-rerun.md), and `head_sha` anchors the check
+    /// run. Wire shape: docs/internal/pr-result-pipeline.md in carrick-cloud.
+    async fn post_pr_result(
         &self,
-        repo: &str,
-        pr_number: u64,
-        run_id: &str,
-        body: &str,
+        payload: &crate::findings::PrResultPayload,
     ) -> Result<(), StorageError>;
 }
 

@@ -275,6 +275,28 @@ impl MountGraph {
         Some(matching)
     }
 
+    /// Like [`find_matching_endpoints_with_normalizer`] but ignoring the HTTP
+    /// method. Used after a method-filtered lookup came back empty, to
+    /// distinguish "no producer at this path at all" (missing endpoint) from
+    /// "a producer exists under a different verb" (method mismatch — a
+    /// contract risk, not a connectivity gap).
+    pub fn find_matching_endpoints_any_method(
+        &self,
+        url: &str,
+        normalizer: &UrlNormalizer,
+    ) -> Option<Vec<&ResolvedEndpoint>> {
+        let normalized = normalizer.normalize(url);
+        if normalized.is_external || normalized.is_unresolved {
+            return None;
+        }
+        Some(
+            self.endpoints
+                .iter()
+                .filter(|endpoint| self.paths_match(&endpoint.full_path, &normalized.path))
+                .collect(),
+        )
+    }
+
     fn paths_match(&self, endpoint_path: &str, call_path: &str) -> bool {
         // Exact match
         if endpoint_path == call_path {

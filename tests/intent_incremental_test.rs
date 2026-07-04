@@ -39,14 +39,11 @@ impl CloudStorage for SharedMock {
     async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError> {
         self.0.upload_logs(repo, log_content).await
     }
-    async fn post_pr_comment(
+    async fn post_pr_result(
         &self,
-        repo: &str,
-        pr_number: u64,
-        run_id: &str,
-        body: &str,
+        payload: &carrick::findings::PrResultPayload,
     ) -> Result<(), StorageError> {
-        self.0.post_pr_comment(repo, pr_number, run_id, body).await
+        self.0.post_pr_result(payload).await
     }
 }
 
@@ -83,12 +80,9 @@ impl CloudStorage for StubStorage {
     async fn upload_logs(&self, _repo: &str, _log_content: &str) -> Result<(), StorageError> {
         Ok(())
     }
-    async fn post_pr_comment(
+    async fn post_pr_result(
         &self,
-        _repo: &str,
-        _pr_number: u64,
-        _run_id: &str,
-        _body: &str,
+        _payload: &carrick::findings::PrResultPayload,
     ) -> Result<(), StorageError> {
         Ok(())
     }

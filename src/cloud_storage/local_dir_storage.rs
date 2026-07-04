@@ -164,16 +164,13 @@ impl CloudStorage for LocalDirStorage {
         Ok(())
     }
 
-    async fn post_pr_comment(
+    async fn post_pr_result(
         &self,
-        repo: &str,
-        pr_number: u64,
-        _run_id: &str,
-        _body: &str,
+        payload: &crate::findings::PrResultPayload,
     ) -> Result<(), StorageError> {
         debug!(
-            "LOCAL: Skipping PR comment for {} (PR #{})",
-            repo, pr_number
+            "LOCAL: Skipping PR result for {} (PR #{})",
+            payload.repo, payload.pr_number
         );
         Ok(())
     }
