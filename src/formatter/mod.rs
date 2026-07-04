@@ -198,21 +198,28 @@ fn format_pr_delta(pr_delta: Option<&PrDelta>, still_missing: &[(String, String)
 }
 
 /// Whether a removed endpoint and a missing-endpoint finding name the same
-/// route: methods equal case-insensitively, paths segment-wise with a
-/// `:`-prefixed segment on EITHER side matching anything. Literal equality
-/// would never fire on parameterized routes — the removed side carries
-/// declared param names (`/orders/:id`) while the missing side is normalized
-/// (`/orders/:param`) or concrete (`/orders/123`).
+/// route: methods equal case-insensitively, paths segment-wise with a param
+/// placeholder on EITHER side matching anything. Literal equality would
+/// never fire on parameterized routes — the removed side carries declared
+/// param names (`/orders/:id`) while the missing side is normalized
+/// (`/orders/:param`) or concrete (`/orders/123`). Placeholder syntax and
+/// the trailing-`?` optional marker defer to `MountGraph::is_param_segment`
+/// so this flag and the matcher agree on what a param is (`{id}`, `<id>`,
+/// `[id]` — not just `:id`).
 fn endpoints_overlap(a_method: &str, a_path: &str, b_method: &str, b_path: &str) -> bool {
     if !a_method.eq_ignore_ascii_case(b_method) {
         return false;
     }
+    let is_param = |seg: &str| {
+        crate::mount_graph::MountGraph::is_param_segment(seg.strip_suffix('?').unwrap_or(seg))
+    };
     let a_segments: Vec<&str> = a_path.split('/').collect();
     let b_segments: Vec<&str> = b_path.split('/').collect();
     a_segments.len() == b_segments.len()
-        && a_segments.iter().zip(&b_segments).all(|(a_seg, b_seg)| {
-            a_seg.starts_with(':') || b_seg.starts_with(':') || a_seg == b_seg
-        })
+        && a_segments
+            .iter()
+            .zip(&b_segments)
+            .all(|(a_seg, b_seg)| is_param(a_seg) || is_param(b_seg) || a_seg == b_seg)
 }
 
 /// ``(`service`)`` suffix for a delta line; empty when the service is absent
@@ -1397,6 +1404,20 @@ mod tests {
         assert!(output.contains("- Removed `GET /orders/:id` — ⚠ still consumed"));
         assert!(output.contains("- Removed `GET /orders`\n"));
         assert!(output.contains("- Removed `DELETE /users/:id`\n"));
+    }
+
+    #[test]
+    fn test_still_consumed_join_matches_all_param_syntaxes() {
+        // The overlap check must agree with MountGraph::is_param_segment:
+        // `{id}` (OpenAPI/Fastify), `<id>` (Flask), `[id]` (Next.js), and a
+        // trailing `?` optional marker are placeholders too — not just `:id`.
+        assert!(endpoints_overlap("GET", "/o/{id}", "GET", "/o/:param"));
+        assert!(endpoints_overlap("GET", "/o/<id>", "GET", "/o/123"));
+        assert!(endpoints_overlap("GET", "/o/[id]", "GET", "/o/:param"));
+        assert!(endpoints_overlap("GET", "/o/:id?", "GET", "/o/456"));
+        // Methods still gate, and concrete mismatched segments still fail.
+        assert!(!endpoints_overlap("POST", "/o/{id}", "GET", "/o/:param"));
+        assert!(!endpoints_overlap("GET", "/o/{id}/x", "GET", "/o/:param/y"));
     }
 
     #[test]

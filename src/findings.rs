@@ -16,14 +16,17 @@ pub const MAX_DETAIL_CHARS: usize = 400;
 
 /// Truncate `s` to at most `max` chars, appending `"..."` when cut. Operates
 /// on char boundaries — never byte-slices — replacing the old `&s[..150]`
-/// truncation that panicked mid-UTF-8 sequence. For `max >= 3` the result
-/// never exceeds `max` chars including the ellipsis.
+/// truncation that panicked mid-UTF-8 sequence. The result never exceeds
+/// `max` chars: when `max <= 3` leaves no room for the ellipsis the string
+/// is hard-cut instead, so the ≤ max contract holds for every input.
 pub fn truncate_chars(s: &str, max: usize) -> String {
-    debug_assert!(max >= 3, "truncate_chars needs room for the ellipsis");
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
+    if max <= 3 {
+        return s.chars().take(max).collect();
+    }
+    let mut out: String = s.chars().take(max - 3).collect();
     out.push_str("...");
     out
 }
@@ -423,6 +426,21 @@ mod tests {
 
         // ASCII over the cap.
         assert_eq!(truncate_chars("abcdefgh", 6), "abc...");
+    }
+
+    #[test]
+    fn truncate_chars_never_exceeds_max_even_for_tiny_max() {
+        // max <= 3 leaves no room for the ellipsis: hard-cut instead. The
+        // ≤ max contract must hold for every input (pub fn, release builds).
+        assert_eq!(truncate_chars("abcdef", 3), "abc");
+        assert_eq!(truncate_chars("abcdef", 2), "ab");
+        assert_eq!(truncate_chars("abcdef", 0), "");
+        assert_eq!(truncate_chars("café☕x", 2), "ca");
+        for max in 0..6 {
+            assert!(truncate_chars("abcdefgh", max).chars().count() <= max);
+        }
+        // Short input with tiny max: unchanged.
+        assert_eq!(truncate_chars("ab", 2), "ab");
     }
 
     #[test]
