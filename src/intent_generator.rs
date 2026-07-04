@@ -65,6 +65,25 @@ pub fn intents_by_hash(
         .collect()
 }
 
+/// Bodies at or under this size, on a single line, are trivial
+/// single-expression helpers (getters, re-exports, `(x) => x.id`-style
+/// lambdas). The function's name and signature — already in the index —
+/// say everything an LLM sentence would add, so skipping the
+/// `/generate-intent` call loses nothing while removing a large share of
+/// call volume on real repos. Trivial functions keep `intent = None`;
+/// callers simply get no context line for them (their bodies are equally
+/// readable inline).
+const TRIVIAL_BODY_MAX_CHARS: usize = 80;
+
+/// A body too small to carry business logic worth an LLM description:
+/// single-line and at most [`TRIVIAL_BODY_MAX_CHARS`] chars after trim.
+/// Counted in chars, not bytes, so non-ASCII identifiers/strings don't
+/// shrink the effective threshold.
+fn is_trivial_body(body: &str) -> bool {
+    let trimmed = body.trim();
+    !trimmed.contains('\n') && trimmed.chars().count() <= TRIVIAL_BODY_MAX_CHARS
+}
+
 /// True when `body` references `name` as a standalone JS identifier.
 ///
 /// A plain `contains` over-matches short names — `id` inside `userId`, `get`
@@ -93,7 +112,9 @@ fn body_references_identifier(body: &str, name: &str) -> bool {
     false
 }
 
-/// Generate intents for all exported functions that have body source.
+/// Generate intents for all exported functions that have body source,
+/// except trivial single-expression bodies (see [`TRIVIAL_BODY_MAX_CHARS`]),
+/// which keep `intent = None` and never cost a lambda call.
 ///
 /// After generation:
 /// - Each function's `intent` is populated with a 1-2 sentence description
@@ -111,10 +132,16 @@ pub async fn generate_function_intents(
     _imported_symbols: &HashMap<String, ImportedSymbol>,
     prev_intents_by_hash: &HashMap<String, String>,
 ) {
-    // Process all named functions with body source
+    // Process all named functions with body source, skipping trivial
+    // single-expression bodies (see TRIVIAL_BODY_MAX_CHARS) — no lambda
+    // call, no intent, permanently cheap.
     let eligible: Vec<String> = function_definitions
         .iter()
-        .filter(|(_, def)| def.body_source.is_some())
+        .filter(|(_, def)| {
+            def.body_source
+                .as_ref()
+                .is_some_and(|body| !is_trivial_body(body))
+        })
         .map(|(name, _)| name.clone())
         .collect();
 
@@ -634,22 +661,22 @@ mod tests {
     /// When every function's content hash is present in the previous-scan map,
     /// all intents are reused and NO `/generate-intent` call is made (the test
     /// would otherwise hit the network and fail). Also exercises the caller's
-    /// hash composing its callee's resolved intent.
+    /// hash composing its callee's resolved intent. Bodies are multi-line so
+    /// they clear the trivial-body gate.
     #[tokio::test]
     async fn full_cache_hit_makes_no_lambda_calls() {
         // `main` calls `helper`; helper is the leaf (level 0).
+        let helper_body = "const rate = table[region];\nreturn base * rate;";
+        let main_body = "const base = order.subtotal;\nreturn helper(base);";
         let mut defs = HashMap::new();
-        defs.insert("helper".to_string(), def_with_body("helper", "return 1;"));
-        defs.insert(
-            "main".to_string(),
-            def_with_body("main", "return helper();"),
-        );
+        defs.insert("helper".to_string(), def_with_body("helper", helper_body));
+        defs.insert("main".to_string(), def_with_body("main", main_body));
 
         // Reconstruct the exact hashes the generator will compute.
-        let helper_intent = "returns the number one";
-        let helper_hash = compute_intent_hash("return 1;", &[]);
+        let helper_intent = "applies the regional rate to a base amount";
+        let helper_hash = compute_intent_hash(helper_body, &[]);
         let caller_context = vec![format!("- helper: {}", helper_intent)];
-        let main_hash = compute_intent_hash("return helper();", &caller_context);
+        let main_hash = compute_intent_hash(main_body, &caller_context);
 
         let mut prev = HashMap::new();
         prev.insert(helper_hash.clone(), helper_intent.to_string());
@@ -678,5 +705,47 @@ mod tests {
         // body_source is stripped before upload.
         assert!(defs["helper"].body_source.is_none());
         assert!(defs["main"].body_source.is_none());
+    }
+
+    #[test]
+    fn trivial_body_gate() {
+        // Single-expression one-liners: skipped.
+        assert!(is_trivial_body("return 1;"));
+        assert!(is_trivial_body("(x) => x.id"));
+        assert!(is_trivial_body("{ return user.email; }"));
+        assert!(is_trivial_body("  return config.baseUrl;  "));
+        // Threshold counts chars, not bytes: a one-liner of 80 multi-byte
+        // chars (240 bytes here) is still trivial.
+        assert!(is_trivial_body(&"é".repeat(80)));
+        assert!(!is_trivial_body(&"é".repeat(81)));
+
+        // Multi-line bodies always get an intent, however short.
+        assert!(!is_trivial_body("const a = 1;\nreturn a;"));
+        // Long one-liners can still carry real logic.
+        assert!(!is_trivial_body(
+            "return users.filter((u) => u.active && !u.deleted && u.verifiedAt != null).map((u) => u.email);"
+        ));
+    }
+
+    /// Trivial functions are excluded from generation entirely: no lambda
+    /// call is attempted (the test would hit the network and fail if one
+    /// were), no intent is recorded, and body_source is still stripped.
+    #[tokio::test]
+    async fn trivial_functions_are_skipped_without_lambda_calls() {
+        let mut defs = HashMap::new();
+        defs.insert("getId".to_string(), def_with_body("getId", "return x.id;"));
+
+        let agent = AgentService::new();
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &HashMap::<String, ImportedSymbol>::new(),
+            &HashMap::new(),
+        )
+        .await;
+
+        assert!(defs["getId"].intent.is_none());
+        assert!(defs["getId"].intent_input_hash.is_none());
+        assert!(defs["getId"].body_source.is_none());
     }
 }
