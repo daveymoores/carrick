@@ -1088,7 +1088,17 @@ async fn analyze_current_repo_incremental(
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
     debug!("Running full analysis...");
-    let cloud_data = analyze_current_repo(repo_path, config, packages, sidecar).await?;
+    // The intent content-hash cache is keyed purely on content
+    // (INTENT_CACHE_VERSION + body + callee intents), so it stays valid even
+    // when the ANALYSIS cache is unusable (cache_version bump, missing
+    // file_results, shallow clone). Seed the full scan with the previous
+    // scan's intents so a full re-analysis re-pays /generate-intent only for
+    // functions whose content actually changed.
+    let prev_intents = previous_data
+        .map(|prev| intents_by_hash(&prev.function_definitions))
+        .unwrap_or_default();
+    let cloud_data =
+        analyze_current_repo(repo_path, config, packages, sidecar, &prev_intents).await?;
 
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
@@ -1749,6 +1759,39 @@ fn add_protocol_manifest_entry(
 }
 
 /// Build CloudRepoData from a mount graph (used by incremental path).
+/// Repo-relative paths for cloud-bound function definitions. The scan runs
+/// against a canonicalized absolute repo root (in CI the runner checkout,
+/// e.g. `/home/runner/work/<dir>/<repo>`), and the extractor stamps that
+/// absolute path onto every definition — plus the compiler leaks it into
+/// signatures via `import("/abs/path/x")` type references. Uploading those
+/// verbatim breaks every consumer that joins the path back to the repo
+/// (GitHub deep links, MCP tools telling agents to fetch
+/// `repos/{owner}/{repo}/contents/{file_path}`). Strip the root at the
+/// cloud-projection boundary only — internal passes (sidecar type
+/// resolution, git-diff comparisons) still operate on absolute paths.
+fn relativize_function_definition_paths(
+    function_definitions: &mut HashMap<String, FunctionDefinition>,
+    repo_path: &str,
+) {
+    let root = std::path::Path::new(repo_path);
+    let prefix = format!("{}/", repo_path.trim_end_matches('/'));
+    for def in function_definitions.values_mut() {
+        if let Ok(stripped) = def.file_path.strip_prefix(root) {
+            def.file_path = stripped.to_path_buf();
+        }
+        for call in &mut def.calls {
+            if let Some(stripped) = call.file_path.strip_prefix(&prefix) {
+                call.file_path = stripped.to_string();
+            }
+        }
+        if let Some(sig) = &mut def.signature
+            && sig.contains(&prefix)
+        {
+            *sig = sig.replace(&prefix, "");
+        }
+    }
+}
+
 fn build_cloud_data_from_mount_graph(
     repo_name: &str,
     repo_path: &str,
@@ -1757,6 +1800,8 @@ fn build_cloud_data_from_mount_graph(
     packages: &Packages,
     function_definitions: HashMap<String, FunctionDefinition>,
 ) -> CloudRepoData {
+    let mut function_definitions = function_definitions;
+    relativize_function_definition_paths(&mut function_definitions, repo_path);
     let config_json = serde_json::to_string(config).ok();
     let service_name = config_json.as_ref().and_then(|json| {
         serde_json::from_str::<serde_json::Value>(json)
@@ -2501,6 +2546,7 @@ async fn analyze_current_repo(
     service: &Config,
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
+    prev_intents_by_hash: &HashMap<String, String>,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     // Canonicalize repo_path for consistent path normalization between runs
     let canonical = std::fs::canonicalize(repo_path)
@@ -2561,13 +2607,14 @@ async fn analyze_current_repo(
     let mut function_definitions = function_definitions;
     {
         let intent_agent = AgentService::new();
-        // Full scan: no previous data, so nothing to reuse — every intent is
-        // generated fresh and its content hash recorded for the next scan.
+        // Even on a full scan, intents whose content hash matches the
+        // previous scan are reused — the intent cache is content-addressed
+        // and independent of the analysis cache's validity (see the caller).
         generate_function_intents(
             &intent_agent,
             &mut function_definitions,
             &all_imported_symbols,
-            &HashMap::new(),
+            prev_intents_by_hash,
         )
         .await;
     }
@@ -3123,6 +3170,77 @@ mod tests {
     use crate::services::type_sidecar::{InferredType, SourceLocation};
     use crate::visitor::{OwnerType, TypeReference};
     use std::path::PathBuf;
+
+    /// Cloud-bound function definitions must carry repo-relative paths: the
+    /// extractor stamps the absolute CI checkout path (and the compiler leaks
+    /// it into signatures via `import("...")`), which breaks GitHub deep
+    /// links and the MCP tools' `gh api .../contents/{file_path}` hint.
+    #[test]
+    fn cloud_projection_relativizes_function_paths() {
+        use crate::visitor::{FunctionCallRef, FunctionDefinition};
+
+        let repo_path = "/home/runner/work/acme/acme";
+        let mut defs = HashMap::new();
+        defs.insert(
+            "handler".to_string(),
+            FunctionDefinition {
+                name: "handler".to_string(),
+                file_path: PathBuf::from("/home/runner/work/acme/acme/src/api/handler.ts"),
+                node_type: Default::default(),
+                arguments: vec![],
+                body_source: None,
+                is_exported: true,
+                line_number: 3,
+                intent: Some("handles the thing".to_string()),
+                calls: vec![FunctionCallRef {
+                    name: "helper".to_string(),
+                    file_path: "/home/runner/work/acme/acme/src/lib/helper.ts".to_string(),
+                    line_number: 9,
+                }],
+                return_type: None,
+                return_is_explicit: false,
+                signature: Some(
+                    "(req: import(\"/home/runner/work/acme/acme/src/types\").Req) => void"
+                        .to_string(),
+                ),
+                intent_input_hash: None,
+            },
+        );
+        // A path outside the repo root is left as-is (matches the dashboard's
+        // read-side posture: never mangle what we can't confidently strip).
+        defs.insert(
+            "external".to_string(),
+            FunctionDefinition {
+                name: "external".to_string(),
+                file_path: PathBuf::from("/opt/other/place.ts"),
+                node_type: Default::default(),
+                arguments: vec![],
+                body_source: None,
+                is_exported: true,
+                line_number: 1,
+                intent: None,
+                calls: vec![],
+                return_type: None,
+                return_is_explicit: false,
+                signature: None,
+                intent_input_hash: None,
+            },
+        );
+
+        relativize_function_definition_paths(&mut defs, repo_path);
+
+        let handler = &defs["handler"];
+        assert_eq!(handler.file_path, PathBuf::from("src/api/handler.ts"));
+        assert_eq!(handler.calls[0].file_path, "src/lib/helper.ts");
+        assert_eq!(
+            handler.signature.as_deref(),
+            Some("(req: import(\"src/types\").Req) => void"),
+        );
+        assert_eq!(
+            defs["external"].file_path,
+            PathBuf::from("/opt/other/place.ts")
+        );
+    }
 
     #[test]
     fn synthetic_type_check_deps_exclude_workspace_internal_packages() {
