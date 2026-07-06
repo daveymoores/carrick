@@ -3170,8 +3170,29 @@ fn synthetic_type_check_dependencies(
             continue;
         }
         if let Some(alias) = resolution_aliases.get(name) {
-            debug!("Applying resolutions alias for {name}: {alias}");
-            dependencies.insert(name.clone(), alias.clone());
+            // Validate the alias TARGET too: `npm:<real-name>@<range>` must
+            // carry a registry-resolvable range — an alias like
+            // `npm:pkg@github:user/repo` would smuggle a non-registry spec
+            // past the protocol filter above. The range is everything after
+            // the LAST `@` past the `npm:` prefix (the target name itself may
+            // be scoped).
+            let target = &alias["npm:".len()..];
+            let range = match target.rfind('@') {
+                Some(pos) if pos > 0 => &target[pos + 1..],
+                _ => target,
+            };
+            let range_ok = range.chars().any(|c| c.is_ascii_digit())
+                && !NON_REGISTRY_PROTOCOLS
+                    .iter()
+                    .any(|proto| range.starts_with(proto));
+            if range_ok {
+                debug!("Applying resolutions alias for {name}: {alias}");
+                dependencies.insert(name.clone(), alias.clone());
+            } else {
+                debug!(
+                    "Skipping dependency {name}: resolutions alias {alias:?} has a non-registry target"
+                );
+            }
             continue;
         }
         if internal.contains(name) {
@@ -3512,6 +3533,7 @@ mod tests {
                 ),
                 ("readable-stream-3".to_string(), "^3.6.2".to_string()),
                 ("koa".to_string(), "2.15.3".to_string()),
+                ("sneaky".to_string(), "^1.0.0".to_string()),
             ]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
