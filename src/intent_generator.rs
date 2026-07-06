@@ -192,6 +192,27 @@ pub async fn generate_function_intents(
         }
     }
 
+    // CARRICK_SKIP_INTENTS: stop before any /generate-intent lambda call.
+    // Intents are one LLM call per eligible function — the dominant cost of
+    // scanning a large repo — and feed only the MCP index; no cross-repo
+    // analysis or eval dimension consumes them. Everything deterministic has
+    // already happened above (`calls` is populated), and body_source is still
+    // stripped (source stays in GitHub, not AWS).
+    if std::env::var("CARRICK_SKIP_INTENTS").is_ok() {
+        debug!(
+            "CARRICK_SKIP_INTENTS set — skipping intent generation for {} function(s)",
+            eligible.len()
+        );
+        // Contract under the flag: NO intents at all — clear any pre-seeded
+        // values so a caller can never upload stale ones.
+        for def in function_definitions.values_mut() {
+            def.intent = None;
+            def.intent_input_hash = None;
+        }
+        strip_body_source(function_definitions);
+        return;
+    }
+
     // Topological sort into levels: functions at the same level can run in parallel
     let levels = topological_levels(&eligible, &deps);
 
@@ -640,6 +661,14 @@ mod tests {
         );
     }
 
+    /// Env vars are process-global and tests run in parallel: every test in
+    /// THIS module that sets a CARRICK_* flag — or calls
+    /// generate_function_intents while another of them could have one set —
+    /// serializes on this lock (it is module-private, not a crate-wide
+    /// guarantee). Tokio's mutex, so the guard may be held across await
+    /// points.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn def_with_body(name: &str, body: &str) -> FunctionDefinition {
         FunctionDefinition {
             name: name.to_string(),
@@ -665,6 +694,7 @@ mod tests {
     /// they clear the trivial-body gate.
     #[tokio::test]
     async fn full_cache_hit_makes_no_lambda_calls() {
+        let _env = ENV_LOCK.lock().await;
         // `main` calls `helper`; helper is the leaf (level 0).
         let helper_body = "const rate = table[region];\nreturn base * rate;";
         let main_body = "const base = order.subtotal;\nreturn helper(base);";
@@ -732,6 +762,7 @@ mod tests {
     /// were), no intent is recorded, and body_source is still stripped.
     #[tokio::test]
     async fn trivial_functions_are_skipped_without_lambda_calls() {
+        let _env = ENV_LOCK.lock().await;
         let mut defs = HashMap::new();
         defs.insert("getId".to_string(), def_with_body("getId", "return x.id;"));
 
@@ -747,5 +778,87 @@ mod tests {
         assert!(defs["getId"].intent.is_none());
         assert!(defs["getId"].intent_input_hash.is_none());
         assert!(defs["getId"].body_source.is_none());
+    }
+
+    /// CARRICK_SKIP_INTENTS stops intent generation before any lambda call
+    /// while keeping the deterministic parts: `calls` is populated and
+    /// body_source is stripped. Both cases run inside one test (sequentially)
+    /// because env vars are process-global. Under CARRICK_MOCK_ALL the lambda
+    /// path returns a mock intent, so pre-fix the skip case would record
+    /// `Some("Mock intent: …")` and fail the `None` assertions.
+    #[tokio::test]
+    async fn skip_intents_flag_skips_lambda_calls_but_strips_bodies() {
+        let _env = ENV_LOCK.lock().await;
+        let helper_body = "const rate = table[region];\nreturn base * rate;";
+        let main_body = "const base = order.subtotal;\nreturn helper(base);";
+        let make_defs = || {
+            let mut defs = HashMap::new();
+            defs.insert("helper".to_string(), def_with_body("helper", helper_body));
+            defs.insert("main".to_string(), def_with_body("main", main_body));
+            defs
+        };
+        let agent = AgentService::new();
+
+        // Snapshot pre-existing values so a developer/CI environment that
+        // already sets these flags is restored, not clobbered.
+        let prev_mock = std::env::var("CARRICK_MOCK_ALL").ok();
+        let prev_skip = std::env::var("CARRICK_SKIP_INTENTS").ok();
+
+        // SAFETY: env vars are process-global; ENV_LOCK serializes this
+        // module's env-touching tests, and no test outside it reads these
+        // vars mid-flight (the network-averse tests above assert cache/skip
+        // behavior that MOCK_ALL does not alter).
+        unsafe {
+            std::env::set_var("CARRICK_MOCK_ALL", "1");
+            std::env::set_var("CARRICK_SKIP_INTENTS", "1");
+        }
+        let mut defs = make_defs();
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &HashMap::<String, ImportedSymbol>::new(),
+            &HashMap::new(),
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("CARRICK_SKIP_INTENTS");
+        }
+
+        // No intents, no hashes — the lambda path never ran.
+        assert!(defs["helper"].intent.is_none());
+        assert!(defs["main"].intent.is_none());
+        assert!(defs["helper"].intent_input_hash.is_none());
+        // Deterministic outputs are intact: caller→callee edge + stripping.
+        assert_eq!(defs["main"].calls.len(), 1);
+        assert_eq!(defs["main"].calls[0].name, "helper");
+        assert!(defs["helper"].body_source.is_none());
+        assert!(defs["main"].body_source.is_none());
+
+        // Control: with the flag unset (MOCK_ALL still on), intents flow.
+        let mut defs = make_defs();
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &HashMap::<String, ImportedSymbol>::new(),
+            &HashMap::new(),
+        )
+        .await;
+
+        // Restore whatever the environment had before the test.
+        unsafe {
+            match prev_mock {
+                Some(v) => std::env::set_var("CARRICK_MOCK_ALL", v),
+                None => std::env::remove_var("CARRICK_MOCK_ALL"),
+            }
+            match prev_skip {
+                Some(v) => std::env::set_var("CARRICK_SKIP_INTENTS", v),
+                None => std::env::remove_var("CARRICK_SKIP_INTENTS"),
+            }
+        }
+        assert_eq!(
+            defs["helper"].intent.as_deref(),
+            Some("Mock intent: function does something.")
+        );
+        assert!(defs["main"].intent_input_hash.is_some());
     }
 }
