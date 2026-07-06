@@ -203,6 +203,12 @@ pub async fn generate_function_intents(
             "CARRICK_SKIP_INTENTS set — skipping intent generation for {} function(s)",
             eligible.len()
         );
+        // Contract under the flag: NO intents at all — clear any pre-seeded
+        // values so a caller can never upload stale ones.
+        for def in function_definitions.values_mut() {
+            def.intent = None;
+            def.intent_input_hash = None;
+        }
         strip_body_source(function_definitions);
         return;
     }
@@ -655,10 +661,12 @@ mod tests {
         );
     }
 
-    /// Env vars are process-global and tests run in parallel: any test that
-    /// sets a CARRICK_* flag — or calls generate_function_intents while
-    /// another test could have one set — serializes on this lock. Tokio's
-    /// mutex, so the guard may be held across await points.
+    /// Env vars are process-global and tests run in parallel: every test in
+    /// THIS module that sets a CARRICK_* flag — or calls
+    /// generate_function_intents while another of them could have one set —
+    /// serializes on this lock (it is module-private, not a crate-wide
+    /// guarantee). Tokio's mutex, so the guard may be held across await
+    /// points.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn def_with_body(name: &str, body: &str) -> FunctionDefinition {
@@ -791,7 +799,13 @@ mod tests {
         };
         let agent = AgentService::new();
 
-        // SAFETY: tests in this binary share env; no other test reads these
+        // Snapshot pre-existing values so a developer/CI environment that
+        // already sets these flags is restored, not clobbered.
+        let prev_mock = std::env::var("CARRICK_MOCK_ALL").ok();
+        let prev_skip = std::env::var("CARRICK_SKIP_INTENTS").ok();
+
+        // SAFETY: env vars are process-global; ENV_LOCK serializes this
+        // module's env-touching tests, and no test outside it reads these
         // vars mid-flight (the network-averse tests above assert cache/skip
         // behavior that MOCK_ALL does not alter).
         unsafe {
@@ -829,8 +843,17 @@ mod tests {
             &HashMap::new(),
         )
         .await;
+
+        // Restore whatever the environment had before the test.
         unsafe {
-            std::env::remove_var("CARRICK_MOCK_ALL");
+            match prev_mock {
+                Some(v) => std::env::set_var("CARRICK_MOCK_ALL", v),
+                None => std::env::remove_var("CARRICK_MOCK_ALL"),
+            }
+            match prev_skip {
+                Some(v) => std::env::set_var("CARRICK_SKIP_INTENTS", v),
+                None => std::env::remove_var("CARRICK_SKIP_INTENTS"),
+            }
         }
         assert_eq!(
             defs["helper"].intent.as_deref(),
