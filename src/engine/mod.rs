@@ -3547,6 +3547,9 @@ mod tests {
                     "npm:readable-stream@^3.6.2".to_string(),
                 ),
                 ("koa".to_string(), "2.15.3".to_string()),
+                // alias whose TARGET is itself a non-registry spec: must NOT
+                // be applied (would smuggle a git spec past the filter)
+                ("sneaky".to_string(), "npm:pkg@github:user/repo".to_string()),
             ]),
         });
         packages.source_paths.push(PathBuf::from("package.json"));
@@ -3567,6 +3570,10 @@ mod tests {
             deps.get("koa").map(String::as_str),
             Some("2.15.3"),
             "non-alias resolutions (plain version pins) must not remap"
+        );
+        assert!(
+            !deps.values().any(|v| v.contains("github:")),
+            "an npm: alias with a non-registry target must not be applied, got {deps:?}"
         );
     }
 
