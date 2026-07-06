@@ -239,10 +239,15 @@ export class TypeCompatibilityChecker {
           // an unresolved symbol so a nested field dangled to `any` — the verdict is
           // untrustworthy (the false-compatible measured on the hard-types fixture).
           // Abstain instead of asserting compatible/incompatible.
-          const which = producerDangling ? "producer" : "consumer";
+          const which =
+            producerDangling && consumerDangling
+              ? "producer and consumer types reference"
+              : producerDangling
+                ? "producer type references"
+                : "consumer type references";
           result.unknownPairs.push({
             endpoint,
-            reason: `${which} type references an unresolved symbol (a library type kept by name with no declaration in the bundle) — cannot verify`,
+            reason: `${which} an unresolved symbol (a library type kept by name with no declaration in the bundle) — cannot verify`,
             producerTypeAlias: match.producer.type_alias,
             consumerTypeAlias: match.consumer.type_alias,
             producerLocation: this.formatEntryLocation(match.producer),
@@ -600,26 +605,17 @@ export class TypeCompatibilityChecker {
   }
 
   /**
-   * Find a type alias or interface in the project by name
-   *
-   * @param project - The ts-morph project to search
-   * @param typeName - The name of the type to find
-   * @returns The Type if found, null otherwise
-   */
-  /**
    * Aliases whose declaration references an unresolved symbol — a library type
    * kept by name whose declaration never made it into the flat cross-repo bundle
    * (imports are stripped), or a renamed/missing surface export. Such a reference
    * makes a NESTED field dangle to `any`, which the top-level any/unknown guard in
    * compareTypes cannot see, so `isAssignableTo` would compare `any`-vs-`any` at
    * that position and yield a false verdict (the version-conflict false-compatible
-   * measured on the hard-types fixture). Detected via the compiler's own
-   * unresolved-reference diagnostics — a genuine `any` field produces no such
-   * reference (or a declared-but-`any` alias) is swept in, so genuine concrete
-   * fields keep their verdict. Detected via the AST rather than diagnostics
-   * because the bundle is a `.d.ts` and the check runs `skipLibCheck` (which
-   * suppresses declaration-file diagnostics), so the type checker is queried
-   * directly: an unresolved type name has no symbol and resolves to `any`.
+   * measured on the hard-types fixture). Detection queries the type checker via
+   * the AST rather than reading diagnostics, because the bundle is a `.d.ts` and
+   * the check runs `skipLibCheck` (which suppresses declaration-file diagnostics):
+   * an unresolved type name has no symbol and resolves to `any`, while a genuine
+   * declared-but-`any` alias has a declaration and is not swept in.
    */
   private computeDanglingAliases(project: Project): Set<string> {
     const dangling = new Set<string>();
@@ -643,6 +639,13 @@ export class TypeCompatibilityChecker {
     return dangling;
   }
 
+  /**
+   * Find a type alias or interface in the project by name
+   *
+   * @param project - The ts-morph project to search
+   * @param typeName - The name of the type to find
+   * @returns The Type if found, null otherwise
+   */
   private findTypeInProject(project: Project, typeName: string): Type | null {
     for (const sourceFile of project.getSourceFiles()) {
       // Check type aliases
