@@ -907,6 +907,7 @@ For each pubsub_operation, include: topic, role, line_number, primary_type_symbo
   - primary_type_symbol: the DECODED application payload type (unwrap envelope/transport wrappers and wire types down to the inner named type); null if untyped
   - type_import_source: import path where primary_type_symbol is defined (from the import table), or null if local; null whenever primary_type_symbol is null
   - broker: the messaging library/transport if evident (e.g. "kafka"), else null
+  - COMPLETENESS: the pub/sub candidates in CANDIDATE TARGETS are an exhaustive checklist. For EVERY candidate whose pattern is a publish/subscribe call, either emit a pubsub_operations entry (resolving same-file consts and `${{name}}:event` template topics to their literal string) or skip it ONLY because it is a request/response action invocation (e.g. .call / registerActionHandler / registerMethodActionHandlers) or its topic cannot be resolved to a literal. Never omit one because the file is long or the call site is late in the file.
 
 Return ONLY the JSON object, no explanations."#,
             // Section order is load-bearing for Vertex implicit prompt caching.
