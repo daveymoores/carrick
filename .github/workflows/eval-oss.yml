@@ -76,6 +76,9 @@ jobs:
           # Each line: <dirname>=<https url>@<sha>. Validated before any shell
           # interpolation — dispatch inputs are untrusted text.
           while IFS= read -r line; do
+            # Multiline dispatch inputs often arrive with CRLF line endings;
+            # strip a trailing carriage return before validating.
+            line="${line%$'\r'}"
             [ -z "$line" ] && continue
             if ! printf '%s' "$line" | grep -qE '^[A-Za-z0-9._-]+=https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(\.git)?@[0-9a-fA-F]{7,40}$'; then
               echo "::error::repos line '$line' must match <dirname>=<github https url>@<sha>"
@@ -113,21 +116,36 @@ jobs:
       # Best-effort dependency install per repo: real type resolution needs a
       # node_modules tree, but a failed install must not kill the eval — type
       # metrics degrade to Unknown while extraction (the LLM path) proceeds.
+      # Lifecycle scripts are disabled everywhere: these are untrusted remote
+      # repos and must not execute arbitrary code on the runner (yarn-berry
+      # skips builds via --mode=skip-build; classic yarn via --ignore-scripts).
       - name: Install corpus dependencies (yarn/pnpm/npm-aware, tolerant)
         run: |
           corepack enable || true
+          # Log-file capture instead of a pipe: without pipefail a
+          # `cmd | tail` pipeline reports tail's exit code and a failed
+          # install would silently count as success.
+          try_install() {
+            dir="$1"; shift
+            if (cd "$dir" && "$@" > /tmp/install.log 2>&1); then
+              tail -3 /tmp/install.log
+              return 0
+            fi
+            tail -10 /tmp/install.log
+            return 1
+          }
           for dir in tests/fixtures/oss-corpus/*/; do
             [ -f "${dir}package.json" ] || continue
             echo "::group::install $(basename "$dir")"
             if [ -f "${dir}yarn.lock" ]; then
-              (cd "$dir" && yarn install --mode=skip-build 2>&1 | tail -5) \
-                || (cd "$dir" && yarn install 2>&1 | tail -5) \
+              try_install "$dir" yarn install --mode=skip-build \
+                || try_install "$dir" yarn install --ignore-scripts \
                 || echo "::warning::yarn install failed in $dir — type metrics will degrade"
             elif [ -f "${dir}pnpm-lock.yaml" ]; then
-              (cd "$dir" && corepack pnpm install --ignore-scripts 2>&1 | tail -5) \
+              try_install "$dir" corepack pnpm install --ignore-scripts \
                 || echo "::warning::pnpm install failed in $dir — type metrics will degrade"
             else
-              (cd "$dir" && npm install --ignore-scripts 2>&1 | tail -5) \
+              try_install "$dir" npm install --ignore-scripts \
                 || echo "::warning::npm install failed in $dir — type metrics will degrade"
             fi
             echo "::endgroup::"
