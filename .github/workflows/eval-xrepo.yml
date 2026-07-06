@@ -88,6 +88,11 @@ jobs:
           CARRICK_EVAL_LIVE: "1"
           CARRICK_EVAL_RUNS: ${{ inputs.runs }}
           CARRICK_EVAL_CORPUS: ${{ inputs.corpus }}
+          # Intents feed only the MCP index — no eval dimension consumes them —
+          # and they are one LLM call per eligible function, the dominant cost
+          # term on large corpora (fresh eval runs never carry a prior scan's
+          # content-hash cache). Skip them in eval scans.
+          CARRICK_SKIP_INTENTS: "1"
         run: |
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture
