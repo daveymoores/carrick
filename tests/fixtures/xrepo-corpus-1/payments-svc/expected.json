@@ -17,6 +17,24 @@
       "resolved_type": "{ id: string; orderId: number; amountCents: number; status: \"pending\" | \"settled\"; }",
       "type_state": "Explicit",
       "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/widgets",
+      "owner": "createWidget",
+      "primary_type_symbol": "WidgetCreated",
+      "resolved_type": "{ id: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/invoices",
+      "owner": "createInvoice",
+      "primary_type_symbol": "InvoiceCreated",
+      "resolved_type": "{ id: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
     }
   ],
   "calls": [

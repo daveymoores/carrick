@@ -2777,8 +2777,10 @@ mod scoring_tests {
         let repo_expected = load_repo_expected(&repos);
         let expected_output = load_expected_output(&corpus);
 
-        // 6 matched edges: 3 http + 2 graphql + 1 socket.
-        assert_eq!(expected_output.matches.len(), 6);
+        // 8 matched edges: 5 http + 2 graphql + 1 socket. The two extra HTTP
+        // edges are the request-body direction fixtures (POST /widgets widening,
+        // POST /invoices narrowing) that pin the confirmed request-direction bug.
+        assert_eq!(expected_output.matches.len(), 8);
         let n_proto = |p: &str| {
             expected_output
                 .matches
@@ -2786,17 +2788,18 @@ mod scoring_tests {
                 .filter(|m| m.producer_key.starts_with(&format!("{p}|")))
                 .count()
         };
-        assert_eq!(n_proto("http"), 3, "3 HTTP edges");
+        assert_eq!(n_proto("http"), 5, "5 HTTP edges");
         assert_eq!(n_proto("graphql"), 2, "2 GraphQL edges");
         assert_eq!(n_proto("socket"), 1, "1 socket edge");
 
-        // 2 incompatible edges (one REST, one GraphQL subscription).
+        // 3 incompatible edges: two REST (orders id string-vs-number, and the
+        // POST /invoices request-body narrowing) + one GraphQL subscription.
         let incompatible = expected_output
             .matches
             .iter()
             .filter(|m| m.type_compatible == Some(false))
             .count();
-        assert_eq!(incompatible, 2, "2 deliberately-incompatible edges");
+        assert_eq!(incompatible, 3, "3 deliberately-incompatible edges");
 
         // Every edge carries a non-null verdict → the §7 guard is live.
         assert!(

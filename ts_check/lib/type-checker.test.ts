@@ -1003,6 +1003,117 @@ describe('TypeCompatibilityChecker', () => {
       );
     });
 
+    it('type-checks an HTTP request-body edge as compatible when the caller sends a superset the endpoint tolerates (request-direction proof)', async () => {
+      // HTTP REQUEST bodies flow consumer → producer: the CALLER (manifest
+      // consumer) sends the body the ENDPOINT (manifest producer) must accept,
+      // so the direction is `consumer ⊑ producer` — the inverse of the HTTP
+      // RESPONSE direction. Here the caller sends an extra REQUIRED field `note`
+      // the endpoint does not require; `{ name; note }` IS assignable to
+      // `{ name }`, so a widening request body is COMPATIBLE.
+      //
+      // PRE-FIX-FAILING: the old compareTypes keyed direction on protocol only
+      // and ran the RESPONSE direction `producer ⊑ consumer` for every HTTP pair.
+      // That asks whether `{ name }` is assignable to `{ name; note }` — it is
+      // NOT (the target requires `note`) — so this pair read INCOMPATIBLE. It
+      // only reads compatible once request `type_kind` selects `consumer ⊑ producer`.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        // Endpoint accepts just { name }.
+        export type CreateWidgetRequest = { name: string };
+        // Caller sends { name, note } — a required superset.
+        export type CreateWidgetBody = { name: string; note: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'widgets-svc',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry('POST', '/widgets', 'CreateWidgetRequest', 'producer', 'routes.ts', 10, 'request'),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry('POST', '/widgets', 'CreateWidgetBody', 'consumer', 'api.ts', 5, 'request'),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.matchDetails?.length, 1, 'the request pair must match');
+      assert.strictEqual(result.compatiblePairs, 1);
+      assert.strictEqual(result.incompatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+    });
+
+    it('reads an HTTP request-body edge as incompatible when the caller omits a field the endpoint requires (request-direction proof)', async () => {
+      // Mirror of the widening case. The endpoint REQUIRES both `orderId` and
+      // `amountCents`; the caller sends only `{ orderId }`. In the request
+      // direction `consumer ⊑ producer`, `{ orderId }` is NOT assignable to
+      // `{ orderId; amountCents }` (missing required `amountCents`) → INCOMPATIBLE.
+      //
+      // PRE-FIX-FAILING: the old protocol-only direction ran `producer ⊑ consumer`,
+      // asking whether `{ orderId; amountCents }` is assignable to `{ orderId }` —
+      // it IS (a superset satisfies a subset target) — so this genuine drift read
+      // COMPATIBLE, the inverted verdict. It only reads incompatible once request
+      // `type_kind` selects `consumer ⊑ producer`.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        // Endpoint requires both fields.
+        export type CreatePaymentRequest = { orderId: number; amountCents: number };
+        // Caller omits the required amountCents.
+        export type CreatePaymentBody = { orderId: number };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'payments-svc',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry('POST', '/payments', 'CreatePaymentRequest', 'producer', 'index.ts', 8, 'request'),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry('POST', '/payments', 'CreatePaymentBody', 'consumer', 'api.ts', 45, 'request'),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.incompatiblePairs, 1);
+      assert.strictEqual(result.compatiblePairs, 0);
+      assert.strictEqual(result.unknownPairs.length, 0);
+      assert.strictEqual(result.mismatches.length, 1);
+      assert.ok(
+        result.mismatches[0].endpoint.includes('POST') &&
+          result.mismatches[0].endpoint.includes('request'),
+        `the mismatch endpoint must carry the POST request label, got: ${result.mismatches[0].endpoint}`
+      );
+    });
+
     it('reads a dangling consumer name as unverifiable but its structural shape as incompatible (#257)', async () => {
       // The #257 inference bug: a consumer like `res.json() as Promise<OrderView>`
       // wrote the bare NAME `= OrderView` into the cross-repo bundle. The bundle

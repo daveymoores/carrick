@@ -20,6 +20,26 @@
       "resolved_type": "{ id: string; orderId: number; amountCents: number; status: string; }",
       "type_state": "Explicit",
       "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/widgets",
+      "path_contains": "/widgets",
+      "import_source": null,
+      "primary_type_symbol": "WidgetCreated",
+      "resolved_type": "{ id: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/invoices",
+      "path_contains": "/invoices",
+      "import_source": null,
+      "primary_type_symbol": "InvoiceCreated",
+      "resolved_type": "{ id: string; }",
+      "type_state": "Explicit",
+      "tier": "capability"
     }
   ],
   "graphql_operations": [
