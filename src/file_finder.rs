@@ -8,6 +8,9 @@ const TEST_DIR_NAMES: &[&str] = &[
     "tests",
     "test",
     "fixtures",
+    // Storybook config/preview files live under .storybook/ — tooling, not
+    // product source (same reasoning as the .stories.* suffixes below).
+    ".storybook",
 ];
 
 const TEST_FILE_SUFFIXES: &[&str] = &[
@@ -19,6 +22,14 @@ const TEST_FILE_SUFFIXES: &[&str] = &[
     ".test.jsx",
     ".spec.js",
     ".spec.jsx",
+    // Storybook stories are dev-only component showcases: they never run in
+    // production, so any fetch/publish inside one is not a real contract
+    // surface — and on UI-heavy repos they are numerous enough to matter for
+    // LLM-analysis cost (metamask-extension alone has hundreds).
+    ".stories.ts",
+    ".stories.tsx",
+    ".stories.js",
+    ".stories.jsx",
 ];
 
 fn has_test_dir(path: &Path, root_dir: &Path) -> bool {
@@ -205,6 +216,36 @@ mod tests {
         assert_eq!(files, vec![normal_file]);
         assert_eq!(config, Some(config_path));
         assert_eq!(package, Some(package_path));
+    }
+
+    #[test]
+    fn find_files_skips_storybook_stories_and_config() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src").join("components")).expect("components dir");
+        fs::create_dir_all(root.join(".storybook")).expect(".storybook dir");
+
+        let component = root.join("src").join("components").join("Button.tsx");
+        let story_tsx = root
+            .join("src")
+            .join("components")
+            .join("Button.stories.tsx");
+        let story_ts = root.join("src").join("components").join("api.stories.ts");
+        let sb_config = root.join(".storybook").join("preview.tsx");
+        // "stories" in the basename without the dot-suffix shape stays in.
+        let real_module = root.join("src").join("components").join("stories.ts");
+
+        for f in [&component, &story_tsx, &story_ts, &sb_config, &real_module] {
+            File::create(f).expect("file");
+        }
+
+        let (mut files, _, _) = find_files(root.to_str().unwrap(), &[]);
+        files.sort();
+
+        let mut expected = vec![component, real_module];
+        expected.sort();
+        assert_eq!(files, expected);
     }
 
     #[test]
