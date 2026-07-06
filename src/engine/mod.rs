@@ -3105,6 +3105,24 @@ fn synthetic_type_check_dependencies(
     packages: &Packages,
 ) -> std::collections::HashMap<String, String> {
     let internal = packages.internal_package_names();
+    // Version specs npm cannot resolve from the registry. These are package-
+    // manager resolution protocols (yarn/pnpm/npm define them, not the scanned
+    // frameworks): a digit-containing spec like `patch:@scope/pkg@npm%3A1.2.3#…`
+    // or `workspace:^1.2.3` passes the digit filter below but 404s/EUSAGEs the
+    // whole install (and per the #149 fail-loud, aborts type checking).
+    // Dropping them loses nothing: the bundle carries the shapes structurally.
+    // `npm:` aliases are NOT listed — npm resolves those from the registry.
+    const NON_REGISTRY_PROTOCOLS: &[&str] = &[
+        "workspace:",
+        "patch:",
+        "portal:",
+        "link:",
+        "file:",
+        "catalog:",
+        "git+",
+        "git:",
+        "github:",
+    ];
     let mut dependencies = std::collections::HashMap::new();
     for (name, package_info) in packages.get_dependencies() {
         let version = package_info.version.trim();
@@ -3113,6 +3131,13 @@ fn synthetic_type_check_dependencies(
             || !version.chars().any(|c| c.is_ascii_digit())
         {
             debug!("Skipping dependency {name} with unusable version {version:?}");
+            continue;
+        }
+        if NON_REGISTRY_PROTOCOLS
+            .iter()
+            .any(|proto| version.starts_with(proto))
+        {
+            debug!("Skipping dependency {name} with non-registry version protocol {version:?}");
             continue;
         }
         if internal.contains(name) {
@@ -3184,9 +3209,17 @@ fn recreate_package_and_tsconfig(
         // ts-node's `typescript@>=2.7` vs a repo's pinned major) can't abort
         // the install. This package only feeds ts-morph type extraction, so a
         // looser peer graph is harmless.
+        //
+        // `--ignore-scripts` because only the installed packages' .d.ts files
+        // are consumed — lifecycle scripts add nothing here, execute untrusted
+        // code from the scanned repos' dependency trees on the scanning
+        // machine, and security-guard packages (e.g. LavaMoat's
+        // @lavamoat/preinstall-always-fail, shipped by MetaMask repos)
+        // DELIBERATELY fail any install that runs scripts.
         let install_output = Command::new("npm")
             .arg("install")
             .arg("--legacy-peer-deps")
+            .arg("--ignore-scripts")
             .current_dir(output_dir)
             .output()
             .map_err(|e| format!("Failed to run npm install: {}", e))?;
@@ -3350,6 +3383,63 @@ mod tests {
         );
         assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
         assert_eq!(deps.get("zod").map(String::as_str), Some("3.23.0"));
+    }
+
+    #[test]
+    fn synthetic_type_check_deps_exclude_non_registry_version_protocols() {
+        // yarn/pnpm resolution-protocol specs pass the digit filter when they
+        // embed a version (`patch:…@npm%3A11.1.0#…`, `workspace:^1.2.3`) but
+        // npm cannot resolve them from the registry — the install 404s/EUSAGEs
+        // and (fail-loud #149) aborts the whole type pass. Real-world case:
+        // metamask-extension's `patch:` specs killed the first external-OSS
+        // eval probe. Registry-resolvable specs, including `npm:` aliases,
+        // must survive.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("app".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                (
+                    "@metamask/controller-utils".to_string(),
+                    "patch:@metamask/controller-utils@npm%3A11.1.0#~/.yarn/patches/x.patch"
+                        .to_string(),
+                ),
+                ("shared-lib".to_string(), "workspace:^1.2.3".to_string()),
+                ("linked".to_string(), "portal:../linked-1.0".to_string()),
+                ("local".to_string(), "file:../local-2.0".to_string()),
+                ("pinned".to_string(), "github:user/repo#v1.2.3".to_string()),
+                ("aliased".to_string(), "npm:real-pkg@2.1.0".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+        });
+        packages.source_paths.push(PathBuf::from("package.json"));
+        packages.resolve_dependencies();
+
+        let deps = synthetic_type_check_dependencies(&packages);
+        for dropped in [
+            "@metamask/controller-utils",
+            "shared-lib",
+            "linked",
+            "local",
+            "pinned",
+        ] {
+            assert!(
+                !deps.contains_key(dropped),
+                "non-registry protocol spec for {dropped} must be dropped, got {:?}",
+                deps.get(dropped)
+            );
+        }
+        assert_eq!(
+            deps.get("aliased").map(String::as_str),
+            Some("npm:real-pkg@2.1.0"),
+            "npm: aliases are registry-resolvable and must survive"
+        );
+        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
     }
 
     #[test]
