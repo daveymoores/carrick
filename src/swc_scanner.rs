@@ -1276,13 +1276,18 @@ impl Visit for CandidateVisitor {
         // string/const-string topic as its first argument, but unlike an HTTP
         // call it is not awaited and the method name is library-specific
         // (publish/subscribe/emit/produce/…), so the other signals miss it
-        // inconsistently. This surfaces it as a focused candidate — but ONLY
-        // when the file imports a messaging-client package
-        // (`file_imports_messaging_client`). The shape is identical to
-        // `socket.emit('x')` and `logger.info('x')`; the gate is what keeps this
-        // from firing on socket.io / logging files (socket.io is not a messaging
-        // client), so it has zero socket-skip / corpus-1 collateral. The gate
-        // being false (incl. empty `messaging_clients`) makes this branch inert.
+        // inconsistently. Surfacing is TWO-TIER (carrick#317): tier 1 — the
+        // file imports a messaging-client package
+        // (`file_imports_messaging_client`), any member-call shape qualifies;
+        // tier 2 — no gating import but the repo detected messaging clients
+        // (`repo_has_messaging_clients`, the injected/inherited-client case),
+        // then only calls literally named publish/subscribe qualify. The shape
+        // is identical to `socket.emit('x')` and `logger.info('x')`; the
+        // gating is what keeps this from firing on socket.io / logging files
+        // (socket.io is not a messaging client, and tier 2's method-name
+        // constraint excludes emit/info), so it has zero socket-skip /
+        // corpus-1 collateral. With empty `messaging_clients` both tiers are
+        // off and this branch is inert.
         if (self.file_imports_messaging_client || self.repo_has_messaging_clients)
             && in_pubsub_call_position
             && let Callee::Expr(callee_expr) = &call.callee
