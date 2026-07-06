@@ -196,9 +196,10 @@ impl SwcScanner {
         let import_sources = collect_import_sources(&module);
         let imports_messaging_client =
             file_imports_messaging_client(&import_sources, messaging_clients);
+        let repo_has_messaging_clients = !messaging_clients.is_empty();
         // Const-string topic bindings are only needed for the gated Signal 7, so
-        // skip the pre-pass entirely when the gate is off.
-        let const_string_bindings = if imports_messaging_client {
+        // skip the pre-pass entirely when both gate tiers are off.
+        let const_string_bindings = if imports_messaging_client || repo_has_messaging_clients {
             collect_const_string_bindings(&module)
         } else {
             HashSet::new()
@@ -208,6 +209,7 @@ impl SwcScanner {
             network_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_bindings,
+            repo_has_messaging_clients,
         );
         module.visit_with(&mut visitor);
 
@@ -308,9 +310,10 @@ impl SwcScanner {
         let import_sources = collect_import_sources(&module);
         let imports_messaging_client =
             file_imports_messaging_client(&import_sources, messaging_clients);
+        let repo_has_messaging_clients = !messaging_clients.is_empty();
         // Const-string topic bindings are only needed for the gated Signal 7, so
-        // skip the pre-pass entirely when the gate is off.
-        let const_string_bindings = if imports_messaging_client {
+        // skip the pre-pass entirely when both gate tiers are off.
+        let const_string_bindings = if imports_messaging_client || repo_has_messaging_clients {
             collect_const_string_bindings(&module)
         } else {
             HashSet::new()
@@ -320,6 +323,7 @@ impl SwcScanner {
             network_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_bindings,
+            repo_has_messaging_clients,
         );
         module.visit_with(&mut visitor);
 
@@ -605,6 +609,14 @@ struct CandidateVisitor {
     /// in these two positions — the fire-and-forget publish/subscribe shapes —
     /// so call sites nested inside other expressions are not surfaced.
     in_pubsub_call_position: bool,
+    /// True when the REPO's framework detection found any messaging client,
+    /// regardless of this file's imports. Second tier of the Signal 7 gate:
+    /// a file that receives its messaging client by constructor injection or
+    /// inheritance (`this.messenger` from a base class) has no gating import,
+    /// so the call SHAPE gates instead — but only for member calls literally
+    /// named `publish`/`subscribe`, the protocol vocabulary itself, so
+    /// `logger.info('msg')` / `socket.emit('evt')` stay inert (carrick#317).
+    repo_has_messaging_clients: bool,
 }
 
 impl CandidateVisitor {
@@ -613,6 +625,7 @@ impl CandidateVisitor {
         network_import_locals: HashSet<String>,
         file_imports_messaging_client: bool,
         const_string_bindings: HashSet<String>,
+        repo_has_messaging_clients: bool,
     ) -> Self {
         Self {
             candidates: Vec::new(),
@@ -624,6 +637,7 @@ impl CandidateVisitor {
             file_imports_messaging_client,
             const_string_bindings,
             in_pubsub_call_position: false,
+            repo_has_messaging_clients,
         }
     }
 
@@ -1262,14 +1276,19 @@ impl Visit for CandidateVisitor {
         // string/const-string topic as its first argument, but unlike an HTTP
         // call it is not awaited and the method name is library-specific
         // (publish/subscribe/emit/produce/…), so the other signals miss it
-        // inconsistently. This surfaces it as a focused candidate — but ONLY
-        // when the file imports a messaging-client package
-        // (`file_imports_messaging_client`). The shape is identical to
-        // `socket.emit('x')` and `logger.info('x')`; the gate is what keeps this
-        // from firing on socket.io / logging files (socket.io is not a messaging
-        // client), so it has zero socket-skip / corpus-1 collateral. The gate
-        // being false (incl. empty `messaging_clients`) makes this branch inert.
-        if self.file_imports_messaging_client
+        // inconsistently. Surfacing is TWO-TIER (carrick#317): tier 1 — the
+        // file imports a messaging-client package
+        // (`file_imports_messaging_client`), any member-call shape qualifies;
+        // tier 2 — no gating import but the repo detected messaging clients
+        // (`repo_has_messaging_clients`, the injected/inherited-client case),
+        // then only calls literally named publish/subscribe qualify. The shape
+        // is identical to `socket.emit('x')` and `logger.info('x')`; the
+        // gating is what keeps this from firing on socket.io / logging files
+        // (socket.io is not a messaging client, and tier 2's method-name
+        // constraint excludes emit/info), so it has zero socket-skip /
+        // corpus-1 collateral. With empty `messaging_clients` both tiers are
+        // off and this branch is inert.
+        if (self.file_imports_messaging_client || self.repo_has_messaging_clients)
             && in_pubsub_call_position
             && let Callee::Expr(callee_expr) = &call.callee
             && let Expr::Member(member) = &**callee_expr
@@ -1286,9 +1305,24 @@ impl Visit for CandidateVisitor {
                 },
                 MemberProp::PrivateName(_) => None,
             };
-            let obj_name =
-                Self::extract_callee_object(&member.obj).unwrap_or_else(|| "<pubsub>".to_string());
-            self.push_candidate(call, obj_name, method);
+            // Two-tier gate (carrick#317). Tier 1: the file imports a detected
+            // messaging client — any member-call shape qualifies (unchanged).
+            // Tier 2: the file has NO gating import (injected/inherited client,
+            // e.g. `this.messenger` provided by a base class) but the repo has
+            // detected messaging clients — then the method NAME must be the
+            // pub/sub protocol vocabulary itself (`publish`/`subscribe`), which
+            // keeps `logger.info('msg')` / `socket.emit('evt')` / RxJS
+            // `.subscribe(fn)` (function arg, already excluded by the
+            // stringish-first-arg check) inert.
+            let gates_in = self.file_imports_messaging_client
+                || method
+                    .as_deref()
+                    .is_some_and(|m| m == "publish" || m == "subscribe");
+            if gates_in {
+                let obj_name = Self::extract_callee_object(&member.obj)
+                    .unwrap_or_else(|| "<pubsub>".to_string());
+                self.push_candidate(call, obj_name, method);
+            }
         }
 
         // Continue visiting child nodes
@@ -2223,6 +2257,72 @@ io.on('connection', (socket) => {
             "socket.emit must NOT be surfaced — socket.io is not a messaging client, so the gate \
              excludes socket files even when messaging_clients=[nats], got {:?}",
             socket_scan.candidates
+        );
+    }
+
+    /// carrick#317: a file that receives its messaging client by constructor
+    /// injection or inheritance (`this.messenger` from a base class) has no
+    /// gating import. Tier 2 of the Signal 7 gate surfaces its call sites by
+    /// SHAPE — member calls literally named publish/subscribe with a stringish
+    /// topic — while logger/socket/emit shapes stay inert.
+    #[test]
+    fn pubsub_shape_gate_surfaces_injected_messenger_without_import() {
+        let src = r#"
+import type { Messenger } from './types';
+
+declare const logger: { info: (m: string) => void };
+declare const socket: { emit: (e: string, p: unknown) => void };
+
+export class NetworkMonitor {
+  constructor(private readonly messenger: Messenger) {}
+
+  notifyDegraded(url: string): void {
+    this.messenger.publish('NetworkController:rpcEndpointDegraded', { url });
+  }
+
+  watch(handler: (payload: unknown) => void): void {
+    this.messenger.subscribe('NetworkController:networkDidChange', handler);
+  }
+
+  log(): void {
+    logger.info('a plain log line');
+    socket.emit('user:connected', { id: 1 });
+  }
+}
+"#;
+        let scanner = SwcScanner::new();
+
+        // Repo-level clients detected; this file imports none of them.
+        let result = scanner.scan_content(
+            &PathBuf::from("network-monitor.ts"),
+            src,
+            &[],
+            &["@metamask/messenger".to_string()],
+        );
+        let props: Vec<&str> = result
+            .candidates
+            .iter()
+            .filter_map(|c| c.callee_property.as_deref())
+            .collect();
+        assert!(
+            props.contains(&"publish"),
+            "shape gate must surface the injected messenger publish, got {props:?}"
+        );
+        assert!(
+            props.contains(&"subscribe"),
+            "shape gate must surface the injected messenger subscribe, got {props:?}"
+        );
+        assert!(
+            !props.contains(&"info") && !props.contains(&"emit"),
+            "logger.info / socket.emit must stay inert under the shape gate, got {props:?}"
+        );
+
+        // Empty messaging_clients: both tiers off, file fully inert.
+        let inert = scanner.scan_content(&PathBuf::from("network-monitor.ts"), src, &[], &[]);
+        assert!(
+            inert.candidates.is_empty(),
+            "with no detected messaging clients the file must surface 0 candidates, got {:?}",
+            inert.candidates
         );
     }
 }
