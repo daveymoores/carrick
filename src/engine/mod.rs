@@ -3105,13 +3105,17 @@ fn synthetic_type_check_dependencies(
     packages: &Packages,
 ) -> std::collections::HashMap<String, String> {
     let internal = packages.internal_package_names();
-    // Version specs npm cannot resolve from the registry. These are package-
-    // manager resolution protocols (yarn/pnpm/npm define them, not the scanned
-    // frameworks): a digit-containing spec like `patch:@scope/pkg@npm%3A1.2.3#…`
-    // or `workspace:^1.2.3` passes the digit filter below but 404s/EUSAGEs the
-    // whole install (and per the #149 fail-loud, aborts type checking).
-    // Dropping them loses nothing: the bundle carries the shapes structurally.
-    // `npm:` aliases are NOT listed — npm resolves those from the registry.
+    // Version specs npm cannot (or must not) resolve from the registry. These
+    // are package-manager resolution protocols (yarn/pnpm/npm define them, not
+    // the scanned frameworks): a digit-containing spec like
+    // `patch:@scope/pkg@npm%3A1.2.3#…` or `workspace:^1.2.3` passes the digit
+    // filter below but 404s/EUSAGEs the whole install (and per the #149
+    // fail-loud, aborts type checking). Remote tarball/git URL specs (`https:`,
+    // `ssh:`) are npm-installable but fetch arbitrary URLs from an untrusted
+    // repo's dependency list — dropped on the same security stance as
+    // --ignore-scripts. Dropping loses nothing: the bundle carries the shapes
+    // structurally. `npm:` aliases are NOT listed — npm resolves those from
+    // the registry.
     const NON_REGISTRY_PROTOCOLS: &[&str] = &[
         "workspace:",
         "patch:",
@@ -3122,6 +3126,9 @@ fn synthetic_type_check_dependencies(
         "git+",
         "git:",
         "github:",
+        "http:",
+        "https:",
+        "ssh:",
     ];
     let mut dependencies = std::collections::HashMap::new();
     for (name, package_info) in packages.get_dependencies() {
@@ -3411,6 +3418,14 @@ mod tests {
                 ("linked".to_string(), "portal:../linked-1.0".to_string()),
                 ("local".to_string(), "file:../local-2.0".to_string()),
                 ("pinned".to_string(), "github:user/repo#v1.2.3".to_string()),
+                (
+                    "tarball".to_string(),
+                    "https://example.com/pkg-1.2.3.tgz".to_string(),
+                ),
+                (
+                    "sshgit".to_string(),
+                    "ssh://git@example.com/org/repo.git#semver:1.2.3".to_string(),
+                ),
                 ("aliased".to_string(), "npm:real-pkg@2.1.0".to_string()),
                 ("koa".to_string(), "2.15.3".to_string()),
             ]),
@@ -3427,6 +3442,8 @@ mod tests {
             "linked",
             "local",
             "pinned",
+            "tarball",
+            "sshgit",
         ] {
             assert!(
                 !deps.contains_key(dropped),
