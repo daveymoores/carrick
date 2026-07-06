@@ -15,6 +15,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         dependencies: deps,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages = Packages::default();

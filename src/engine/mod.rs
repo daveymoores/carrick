@@ -3105,6 +3105,53 @@ fn synthetic_type_check_dependencies(
     packages: &Packages,
 ) -> std::collections::HashMap<String, String> {
     let internal = packages.internal_package_names();
+    // Version specs npm cannot (or must not) resolve from the registry. These
+    // are package-manager resolution protocols (yarn/pnpm/npm define them, not
+    // the scanned frameworks): a digit-containing spec like
+    // `patch:@scope/pkg@npm%3A1.2.3#…` or `workspace:^1.2.3` passes the digit
+    // filter below but 404s/EUSAGEs the whole install (and per the #149
+    // fail-loud, aborts type checking). Remote tarball/git URL specs (`https:`,
+    // `ssh:`) are npm-installable but fetch arbitrary URLs from an untrusted
+    // repo's dependency list — dropped on the same security stance as
+    // --ignore-scripts. Dropping loses nothing: the bundle carries the shapes
+    // structurally. `npm:` aliases are NOT listed — npm resolves those from
+    // the registry.
+    const NON_REGISTRY_PROTOCOLS: &[&str] = &[
+        "workspace:",
+        "patch:",
+        "portal:",
+        "link:",
+        "file:",
+        "catalog:",
+        "git+",
+        "git:",
+        "github:",
+        "http:",
+        "https:",
+        "ssh:",
+    ];
+    // yarn/pnpm `resolutions` npm-aliases remap locally-invented dependency
+    // names to real registry packages (`"@types/readable-stream-2":
+    // "npm:@types/readable-stream@^2.3.15"`). The merged version for such a
+    // name is the bare range, so installing `name@range` 404s — apply the
+    // alias spec instead (npm installs `npm:` aliases natively). Resolution
+    // keys may carry a `@range` selector suffix; scoped names keep their
+    // leading `@`, so the selector is everything after the LAST `@` at
+    // index > 0.
+    let mut resolution_aliases: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for package_json in &packages.package_jsons {
+        for (key, value) in &package_json.resolutions {
+            if !value.starts_with("npm:") {
+                continue;
+            }
+            let name = match key.rfind('@') {
+                Some(pos) if pos > 0 => &key[..pos],
+                _ => key.as_str(),
+            };
+            resolution_aliases.insert(name.to_string(), value.clone());
+        }
+    }
     let mut dependencies = std::collections::HashMap::new();
     for (name, package_info) in packages.get_dependencies() {
         let version = package_info.version.trim();
@@ -3113,6 +3160,39 @@ fn synthetic_type_check_dependencies(
             || !version.chars().any(|c| c.is_ascii_digit())
         {
             debug!("Skipping dependency {name} with unusable version {version:?}");
+            continue;
+        }
+        if NON_REGISTRY_PROTOCOLS
+            .iter()
+            .any(|proto| version.starts_with(proto))
+        {
+            debug!("Skipping dependency {name} with non-registry version protocol {version:?}");
+            continue;
+        }
+        if let Some(alias) = resolution_aliases.get(name) {
+            // Validate the alias TARGET too: `npm:<real-name>@<range>` must
+            // carry a registry-resolvable range — an alias like
+            // `npm:pkg@github:user/repo` would smuggle a non-registry spec
+            // past the protocol filter above. The range is everything after
+            // the LAST `@` past the `npm:` prefix (the target name itself may
+            // be scoped).
+            let target = &alias["npm:".len()..];
+            let range = match target.rfind('@') {
+                Some(pos) if pos > 0 => &target[pos + 1..],
+                _ => target,
+            };
+            let range_ok = range.chars().any(|c| c.is_ascii_digit())
+                && !NON_REGISTRY_PROTOCOLS
+                    .iter()
+                    .any(|proto| range.starts_with(proto));
+            if range_ok {
+                debug!("Applying resolutions alias for {name}: {alias}");
+                dependencies.insert(name.clone(), alias.clone());
+            } else {
+                debug!(
+                    "Skipping dependency {name}: resolutions alias {alias:?} has a non-registry target"
+                );
+            }
             continue;
         }
         if internal.contains(name) {
@@ -3184,9 +3264,17 @@ fn recreate_package_and_tsconfig(
         // ts-node's `typescript@>=2.7` vs a repo's pinned major) can't abort
         // the install. This package only feeds ts-morph type extraction, so a
         // looser peer graph is harmless.
+        //
+        // `--ignore-scripts` because only the installed packages' .d.ts files
+        // are consumed — lifecycle scripts add nothing here, execute untrusted
+        // code from the scanned repos' dependency trees on the scanning
+        // machine, and security-guard packages (e.g. LavaMoat's
+        // @lavamoat/preinstall-always-fail, shipped by MetaMask repos)
+        // DELIBERATELY fail any install that runs scripts.
         let install_output = Command::new("npm")
             .arg("install")
             .arg("--legacy-peer-deps")
+            .arg("--ignore-scripts")
             .current_dir(output_dir)
             .output()
             .map_err(|e| format!("Failed to run npm install: {}", e))?;
@@ -3324,6 +3412,7 @@ mod tests {
             dependencies: HashMap::from([("zod".to_string(), "3.23.0".to_string())]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         });
         packages.package_jsons.push(PackageJson {
             name: Some("catalog-api".to_string()),
@@ -3334,6 +3423,7 @@ mod tests {
             ]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         });
         packages
             .source_paths
@@ -3350,6 +3440,141 @@ mod tests {
         );
         assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
         assert_eq!(deps.get("zod").map(String::as_str), Some("3.23.0"));
+    }
+
+    #[test]
+    fn synthetic_type_check_deps_exclude_non_registry_version_protocols() {
+        // yarn/pnpm resolution-protocol specs pass the digit filter when they
+        // embed a version (`patch:…@npm%3A11.1.0#…`, `workspace:^1.2.3`) but
+        // npm cannot resolve them from the registry — the install 404s/EUSAGEs
+        // and (fail-loud #149) aborts the whole type pass. Real-world case:
+        // metamask-extension's `patch:` specs killed the first external-OSS
+        // eval probe. Registry-resolvable specs, including `npm:` aliases,
+        // must survive.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("app".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                (
+                    "@metamask/controller-utils".to_string(),
+                    "patch:@metamask/controller-utils@npm%3A11.1.0#~/.yarn/patches/x.patch"
+                        .to_string(),
+                ),
+                ("shared-lib".to_string(), "workspace:^1.2.3".to_string()),
+                ("linked".to_string(), "portal:../linked-1.0".to_string()),
+                ("local".to_string(), "file:../local-2.0".to_string()),
+                ("pinned".to_string(), "github:user/repo#v1.2.3".to_string()),
+                (
+                    "tarball".to_string(),
+                    "https://example.com/pkg-1.2.3.tgz".to_string(),
+                ),
+                (
+                    "sshgit".to_string(),
+                    "ssh://git@example.com/org/repo.git#semver:1.2.3".to_string(),
+                ),
+                ("aliased".to_string(), "npm:real-pkg@2.1.0".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
+        });
+        packages.source_paths.push(PathBuf::from("package.json"));
+        packages.resolve_dependencies();
+
+        let deps = synthetic_type_check_dependencies(&packages);
+        for dropped in [
+            "@metamask/controller-utils",
+            "shared-lib",
+            "linked",
+            "local",
+            "pinned",
+            "tarball",
+            "sshgit",
+        ] {
+            assert!(
+                !deps.contains_key(dropped),
+                "non-registry protocol spec for {dropped} must be dropped, got {:?}",
+                deps.get(dropped)
+            );
+        }
+        assert_eq!(
+            deps.get("aliased").map(String::as_str),
+            Some("npm:real-pkg@2.1.0"),
+            "npm: aliases are registry-resolvable and must survive"
+        );
+        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
+    }
+
+    #[test]
+    fn synthetic_type_check_deps_apply_resolutions_npm_aliases() {
+        // metamask-extension declares invented dependency names
+        // (`@types/readable-stream-2@^2.3.15`) that only resolve through a
+        // yarn `resolutions` npm-alias. The merged version is the bare range,
+        // so installing `name@range` 404s (killed the second external-OSS
+        // probe) — the synthetic install must carry the alias spec instead.
+        // Resolution keys may be `name@range` selectors (scoped names keep
+        // their leading @) or plain names.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("app".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                (
+                    "@types/readable-stream-2".to_string(),
+                    "^2.3.15".to_string(),
+                ),
+                ("readable-stream-3".to_string(), "^3.6.2".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+                ("sneaky".to_string(), "^1.0.0".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+            resolutions: HashMap::from([
+                (
+                    "@types/readable-stream-2@^2.3.15".to_string(),
+                    "npm:@types/readable-stream@^2.3.15".to_string(),
+                ),
+                (
+                    "readable-stream-3".to_string(),
+                    "npm:readable-stream@^3.6.2".to_string(),
+                ),
+                ("koa".to_string(), "2.15.3".to_string()),
+                // alias whose TARGET is itself a non-registry spec: must NOT
+                // be applied (would smuggle a git spec past the filter)
+                ("sneaky".to_string(), "npm:pkg@github:user/repo".to_string()),
+            ]),
+        });
+        packages.source_paths.push(PathBuf::from("package.json"));
+        packages.resolve_dependencies();
+
+        let deps = synthetic_type_check_dependencies(&packages);
+        assert_eq!(
+            deps.get("@types/readable-stream-2").map(String::as_str),
+            Some("npm:@types/readable-stream@^2.3.15"),
+            "selector-keyed resolutions alias must replace the bare range"
+        );
+        assert_eq!(
+            deps.get("readable-stream-3").map(String::as_str),
+            Some("npm:readable-stream@^3.6.2"),
+            "plain-keyed resolutions alias must replace the bare range"
+        );
+        assert_eq!(
+            deps.get("koa").map(String::as_str),
+            Some("2.15.3"),
+            "non-alias resolutions (plain version pins) must not remap"
+        );
+        assert!(
+            !deps.values().any(|v| v.contains("github:")),
+            "an npm: alias with a non-registry target must not be applied, got {deps:?}"
+        );
     }
 
     #[test]
@@ -3371,6 +3596,7 @@ mod tests {
             ]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         });
         packages
             .source_paths
