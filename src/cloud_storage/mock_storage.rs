@@ -179,6 +179,7 @@ impl MockStorage {
             dependencies,
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         };
 
         Packages::new(vec![PathBuf::from("repo-a/package.json")]).unwrap_or_else(|_| {
@@ -206,6 +207,7 @@ impl MockStorage {
             dependencies,
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         };
 
         Packages::new(vec![PathBuf::from("repo-b/package.json")]).unwrap_or_else(|_| {

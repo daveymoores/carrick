@@ -18,6 +18,14 @@ pub struct PackageJson {
     #[serde(default)]
     #[serde(rename = "peerDependencies")]
     pub peer_dependencies: HashMap<String, String>,
+    /// yarn/pnpm `resolutions` (version-override map). Keys may be plain names
+    /// or `name@range` selectors; values may be `npm:<real-name>@<range>`
+    /// aliases that remap a locally-invented dependency name (e.g. MetaMask's
+    /// `@types/readable-stream-2` → `npm:@types/readable-stream@^2.3.15`) to a
+    /// real registry package. The synthetic type-check install must apply
+    /// these aliases or the invented name 404s.
+    #[serde(default)]
+    pub resolutions: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

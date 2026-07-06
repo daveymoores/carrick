@@ -3130,6 +3130,28 @@ fn synthetic_type_check_dependencies(
         "https:",
         "ssh:",
     ];
+    // yarn/pnpm `resolutions` npm-aliases remap locally-invented dependency
+    // names to real registry packages (`"@types/readable-stream-2":
+    // "npm:@types/readable-stream@^2.3.15"`). The merged version for such a
+    // name is the bare range, so installing `name@range` 404s — apply the
+    // alias spec instead (npm installs `npm:` aliases natively). Resolution
+    // keys may carry a `@range` selector suffix; scoped names keep their
+    // leading `@`, so the selector is everything after the LAST `@` at
+    // index > 0.
+    let mut resolution_aliases: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for package_json in &packages.package_jsons {
+        for (key, value) in &package_json.resolutions {
+            if !value.starts_with("npm:") {
+                continue;
+            }
+            let name = match key.rfind('@') {
+                Some(pos) if pos > 0 => &key[..pos],
+                _ => key.as_str(),
+            };
+            resolution_aliases.insert(name.to_string(), value.clone());
+        }
+    }
     let mut dependencies = std::collections::HashMap::new();
     for (name, package_info) in packages.get_dependencies() {
         let version = package_info.version.trim();
@@ -3145,6 +3167,11 @@ fn synthetic_type_check_dependencies(
             .any(|proto| version.starts_with(proto))
         {
             debug!("Skipping dependency {name} with non-registry version protocol {version:?}");
+            continue;
+        }
+        if let Some(alias) = resolution_aliases.get(name) {
+            debug!("Applying resolutions alias for {name}: {alias}");
+            dependencies.insert(name.clone(), alias.clone());
             continue;
         }
         if internal.contains(name) {
@@ -3364,6 +3391,7 @@ mod tests {
             dependencies: HashMap::from([("zod".to_string(), "3.23.0".to_string())]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         });
         packages.package_jsons.push(PackageJson {
             name: Some("catalog-api".to_string()),
@@ -3374,6 +3402,7 @@ mod tests {
             ]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         });
         packages
             .source_paths
@@ -3431,6 +3460,7 @@ mod tests {
             ]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         });
         packages.source_paths.push(PathBuf::from("package.json"));
         packages.resolve_dependencies();
@@ -3460,6 +3490,65 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_type_check_deps_apply_resolutions_npm_aliases() {
+        // metamask-extension declares invented dependency names
+        // (`@types/readable-stream-2@^2.3.15`) that only resolve through a
+        // yarn `resolutions` npm-alias. The merged version is the bare range,
+        // so installing `name@range` 404s (killed the second external-OSS
+        // probe) — the synthetic install must carry the alias spec instead.
+        // Resolution keys may be `name@range` selectors (scoped names keep
+        // their leading @) or plain names.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("app".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                (
+                    "@types/readable-stream-2".to_string(),
+                    "^2.3.15".to_string(),
+                ),
+                ("readable-stream-3".to_string(), "^3.6.2".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+            resolutions: HashMap::from([
+                (
+                    "@types/readable-stream-2@^2.3.15".to_string(),
+                    "npm:@types/readable-stream@^2.3.15".to_string(),
+                ),
+                (
+                    "readable-stream-3".to_string(),
+                    "npm:readable-stream@^3.6.2".to_string(),
+                ),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+        });
+        packages.source_paths.push(PathBuf::from("package.json"));
+        packages.resolve_dependencies();
+
+        let deps = synthetic_type_check_dependencies(&packages);
+        assert_eq!(
+            deps.get("@types/readable-stream-2").map(String::as_str),
+            Some("npm:@types/readable-stream@^2.3.15"),
+            "selector-keyed resolutions alias must replace the bare range"
+        );
+        assert_eq!(
+            deps.get("readable-stream-3").map(String::as_str),
+            Some("npm:readable-stream@^3.6.2"),
+            "plain-keyed resolutions alias must replace the bare range"
+        );
+        assert_eq!(
+            deps.get("koa").map(String::as_str),
+            Some("2.15.3"),
+            "non-alias resolutions (plain version pins) must not remap"
+        );
+    }
+
+    #[test]
     fn synthetic_type_check_deps_exclude_tree_walked_internal_names() {
         // Production shape (the corpus-3 baseline failure): only the
         // SERVICE's package.json is loaded into package_jsons — a workspace
@@ -3478,6 +3567,7 @@ mod tests {
             ]),
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
         });
         packages
             .source_paths

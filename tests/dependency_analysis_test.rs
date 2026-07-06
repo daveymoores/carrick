@@ -23,6 +23,7 @@ async fn test_dependency_conflict_detection() {
         dependencies: deps_a,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -43,6 +44,7 @@ async fn test_dependency_conflict_detection() {
         dependencies: deps_b,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_b = Packages::default();
@@ -97,6 +99,7 @@ async fn test_no_dependency_conflicts_when_versions_match() {
         dependencies: deps_a,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -116,6 +119,7 @@ async fn test_no_dependency_conflicts_when_versions_match() {
         dependencies: deps_b,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_b = Packages::default();
@@ -153,6 +157,7 @@ async fn test_no_conflicts_for_unique_packages() {
         dependencies: deps_a,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -172,6 +177,7 @@ async fn test_no_conflicts_for_unique_packages() {
         dependencies: deps_b,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_b = Packages::default();
@@ -215,6 +221,7 @@ async fn test_only_major_incompatible_conflicts_reported() {
         dependencies: deps_a,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -235,6 +242,7 @@ async fn test_only_major_incompatible_conflicts_reported() {
         dependencies: deps_b,
         dev_dependencies: HashMap::new(),
         peer_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
     };
 
     let mut packages_b = Packages::default();
