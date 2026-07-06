@@ -1,0 +1,188 @@
+name: eval-oss
+
+# External-OSS anti-overfit eval: materializes a corpus from REMOTE repos at
+# pinned SHAs instead of vendored tests/fixtures, then runs the same live
+# cross-repo scorer as eval-xrepo. Report-only — a MONITOR, never a gate.
+#
+# Everything corpus-specific arrives as dispatch inputs (repo list + ground
+# truth labels); nothing about the scanned repos is committed to this
+# repository. Ground truth for an external repo is a lightly-authored SLICE,
+# so precision against partial labels is meaningless — read the [diag] lines
+# for RECALL per edge, not the run mean.
+#
+# On-demand only (workflow_dispatch): real LLM calls over arbitrary-size
+# repos. CARRICK_SKIP_INTENTS is set — intents are one LLM call per function
+# (the dominant cost on large repos) and no eval dimension consumes them.
+#
+# Auth is GitHub Actions OIDC, exactly as eval-xrepo.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: >-
+          One repo per line: <dirname>=<https clone url>@<full or short sha>
+          e.g. accounts=https://github.com/MetaMask/accounts@abc1234
+        required: true
+      labels_json:
+        description: >-
+          JSON object mapping corpus-relative label paths to their JSON
+          content, e.g. {"accounts/expected.json": {...},
+          "expected-output.json": {...}}
+        required: true
+      runs:
+        description: "N repeated cross-repo scans"
+        required: false
+        default: "1"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  eval-oss:
+    name: External-OSS extraction quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            src/sidecar/package-lock.json
+            ts_check/package-lock.json
+
+      - name: Build type sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
+      - name: Install ts_check type checker
+        run: cd ts_check && npm ci
+
+      - name: Materialize remote corpus at pinned SHAs
+        env:
+          REPOS_INPUT: ${{ inputs.repos }}
+          LABELS_JSON: ${{ inputs.labels_json }}
+        run: |
+          set -euo pipefail
+          corpus_dir="tests/fixtures/oss-corpus"
+          mkdir -p "$corpus_dir"
+
+          # Each line: <dirname>=<https url>@<sha>. Validated before any shell
+          # interpolation — dispatch inputs are untrusted text.
+          while IFS= read -r line; do
+            # Multiline dispatch inputs often arrive with CRLF line endings;
+            # strip a trailing carriage return before validating.
+            line="${line%$'\r'}"
+            [ -z "$line" ] && continue
+            if ! printf '%s' "$line" | grep -qE '^[A-Za-z0-9._-]+=https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(\.git)?@[0-9a-fA-F]{7,40}$'; then
+              echo "::error::repos line '$line' must match <dirname>=<github https url>@<sha>"
+              exit 1
+            fi
+            name="${line%%=*}"; rest="${line#*=}"
+            url="${rest%@*}"; sha="${rest##*@}"
+            dest="$corpus_dir/$name"
+            echo "::group::clone $name @ $sha"
+            mkdir -p "$dest"
+            git -C "$dest" init -q
+            git -C "$dest" remote add origin "$url"
+            # Fetch just the pinned commit; fall back to a full fetch for
+            # servers that reject direct-SHA fetches of non-advertised objects.
+            git -C "$dest" fetch -q --depth 1 origin "$sha" \
+              || git -C "$dest" fetch -q origin
+            git -C "$dest" checkout -q "$sha"
+            rm -rf "$dest/.git"
+            echo "::endgroup::"
+          done <<< "$REPOS_INPUT"
+
+          # Write ground-truth label files from the dispatch input. Paths are
+          # corpus-relative and constrained to plain path chars.
+          printf '%s' "$LABELS_JSON" | jq -e 'type == "object"' > /dev/null
+          for key in $(printf '%s' "$LABELS_JSON" | jq -r 'keys[]'); do
+            if ! printf '%s' "$key" | grep -qE '^[A-Za-z0-9._/-]+\.json$' || printf '%s' "$key" | grep -q '\.\.'; then
+              echo "::error::labels_json key '$key' must be a corpus-relative .json path"
+              exit 1
+            fi
+            mkdir -p "$corpus_dir/$(dirname "$key")"
+            printf '%s' "$LABELS_JSON" | jq ".[\"$key\"]" > "$corpus_dir/$key"
+            echo "wrote $corpus_dir/$key"
+          done
+
+      # Best-effort dependency install per repo: real type resolution needs a
+      # node_modules tree, but a failed install must not kill the eval — type
+      # metrics degrade to Unknown while extraction (the LLM path) proceeds.
+      # Lifecycle scripts are disabled everywhere: these are untrusted remote
+      # repos and must not execute arbitrary code on the runner (yarn-berry
+      # skips builds via --mode=skip-build; classic yarn via --ignore-scripts).
+      - name: Install corpus dependencies (yarn/pnpm/npm-aware, tolerant)
+        run: |
+          corepack enable || true
+          # Log-file capture instead of a pipe: without pipefail a
+          # `cmd | tail` pipeline reports tail's exit code and a failed
+          # install would silently count as success.
+          try_install() {
+            dir="$1"; shift
+            if (cd "$dir" && "$@" > /tmp/install.log 2>&1); then
+              tail -3 /tmp/install.log
+              return 0
+            fi
+            tail -10 /tmp/install.log
+            return 1
+          }
+          for dir in tests/fixtures/oss-corpus/*/; do
+            [ -f "${dir}package.json" ] || continue
+            echo "::group::install $(basename "$dir")"
+            if [ -f "${dir}yarn.lock" ]; then
+              try_install "$dir" yarn install --mode=skip-build \
+                || try_install "$dir" yarn install --ignore-scripts \
+                || echo "::warning::yarn install failed in $dir — type metrics will degrade"
+            elif [ -f "${dir}pnpm-lock.yaml" ]; then
+              try_install "$dir" corepack pnpm install --ignore-scripts \
+                || echo "::warning::pnpm install failed in $dir — type metrics will degrade"
+            else
+              try_install "$dir" npm install --ignore-scripts \
+                || echo "::warning::npm install failed in $dir — type metrics will degrade"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Build scanner (release)
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+        run: cargo build --release
+
+      - name: Run cross-repo live scorer
+        env:
+          CARRICK_API_ENDPOINT: https://api.carrick.tools
+          CARRICK_EVAL_LIVE: "1"
+          CARRICK_EVAL_RUNS: ${{ inputs.runs }}
+          CARRICK_EVAL_CORPUS: oss-corpus
+          # Intents feed only the MCP index (no eval dimension) and are one
+          # LLM call per eligible function — the dominant cost on OSS-size
+          # repos. Never generate them here.
+          CARRICK_SKIP_INTENTS: "1"
+        run: |
+          cargo test --release --test eval_xrepo -- \
+            --ignored xrepo_live_scorer --test-threads=1 --nocapture
+
+      - name: Upload ts_check output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts_check-output
+          path: ts_check/output/
+          if-no-files-found: warn
+
+      - name: Upload eval run records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-oss-runs-jsonl
+          path: |
+            target/eval-runs/xrepo-run-*.jsonl
+          if-no-files-found: warn
