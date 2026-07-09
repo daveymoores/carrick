@@ -47,9 +47,9 @@ impl std::fmt::Display for OidcError {
                 "GitHub Actions OIDC is not available: ACTIONS_ID_TOKEN_REQUEST_URL / \
                  ACTIONS_ID_TOKEN_REQUEST_TOKEN are not set. Add `permissions: id-token: write` \
                  to the workflow job so Carrick can authenticate to the cloud without an API key. \
-                 Note: GitHub never grants OIDC credentials to pull_request runs from forks — \
-                 fork PRs cannot authenticate, and the Carrick Action skips them instead of \
-                 failing."
+                 Note: GitHub never grants OIDC credentials to pull_request runs from forks, \
+                 so fork PRs cannot authenticate (when run via the Carrick GitHub Action, \
+                 fork PRs are skipped instead of failing)."
             ),
             OidcError::Request(e) => write!(f, "OIDC token request failed: {}", e),
             OidcError::BadResponse(e) => write!(f, "OIDC token endpoint error: {}", e),

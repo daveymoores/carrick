@@ -13,10 +13,10 @@ inputs:
 
 outputs:
   success:
-    description: "Analysis completed successfully"
+    description: "Analysis completed successfully (also 'true' when the run was skipped, e.g. fork PRs where OIDC is unavailable)"
     value: ${{ steps.fork-check.outputs.skip == 'true' && 'true' || steps.analysis.outputs.success }}
   issues-found:
-    description: "Number of API issues detected"
+    description: "Number of API issues detected ('0' can also mean the run was skipped, e.g. fork PRs where OIDC is unavailable)"
     value: ${{ steps.fork-check.outputs.skip == 'true' && '0' || steps.analysis.outputs.issues-found }}
 
 runs:
