@@ -4,6 +4,8 @@ Carrick is a live, type-aware, intent-aware cross-repo index of every TypeScript
 
 > Carrick is TypeScript only. Cross-repo features need at least two services indexed in the same GitHub org. A single-service install still gets same-repo validation.
 
+**Get started:** sign up at [app.carrick.tools](https://app.carrick.tools) · full documentation at [docs.carrick.tools](https://docs.carrick.tools)
+
 ## What an agent can ask
 
 Connect Claude Code, Cursor, Windsurf, or Codex to the Carrick MCP endpoint. Carrick answers semantic questions about your org that an agent normally has to grep across repos to answer, badly:
@@ -33,7 +35,7 @@ The MCP endpoint lives at `https://api.carrick.tools/mcp`.
 claude mcp add --transport http carrick https://api.carrick.tools/mcp
 ```
 
-The recommended authentication is sign-in-with-Carrick: your agent opens a browser, you click Approve once, and no API key changes hands. A manual key paste is available as a fallback. Carrick is currently invite-only. Once your org is provisioned, both paths work.
+The recommended authentication is sign-in-with-Carrick: your agent opens a browser, you click Approve once, and no API key changes hands. A manual key paste is available as a fallback. To get started, sign up at [app.carrick.tools](https://app.carrick.tools) — the full setup guide lives at [docs.carrick.tools](https://docs.carrick.tools).
 
 ## Populate the index
 
@@ -66,7 +68,9 @@ jobs:
       - uses: daveymoores/carrick@v1
 ```
 
-No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. On pull requests the Carrick App posts the drift comment itself, so the workflow needs no `pull-requests: write` permission and no comment-posting step. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project in the dashboard.
+No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. On pull requests the Carrick App posts the drift comment itself, so the workflow needs no extra permissions and no comment-posting step. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project in the dashboard.
+
+Pull requests opened from forks are skipped gracefully: GitHub withholds OIDC credentials from fork runs, so the action prints a notice and exits successfully instead of failing the check. The scan runs when a maintainer pushes the branch to the repository itself.
 
 ## MCP tools
 
@@ -74,6 +78,8 @@ The MCP endpoint exposes the index as structured tools your agent can call direc
 
 | Tool | Purpose |
 | :--- | :--- |
+| `search_by_intent` | Find functions by what they do — a plain-English query matched against the intent descriptions |
+| `list_projects` | The Carrick projects in your workspace and each project's connected repos |
 | `list_services` | Every service Carrick has indexed in your org |
 | `list_function_intents` | One or two sentence descriptions of exported functions, searchable by service |
 | `get_api_endpoints` | Endpoints declared by a given service |
@@ -81,10 +87,11 @@ The MCP endpoint exposes the index as structured tools your agent can call direc
 | `get_type_definition` | Fully resolved TypeScript type by name, across the org |
 | `get_service_dependencies` | Services that call a given producer |
 | `check_compatibility` | Whether service A's call to service B matches the producer's contract |
+| `scaffold` | Generates the files to onboard a repo: the GitHub Actions workflow, an agent guide, and a `carrick.json` skeleton |
 
 ## On pull requests
 
-On pull requests the Carrick App posts a comment summarising drift detected against the indexed services: type mismatches between producers and consumers, mismatched HTTP verbs, missing or orphaned routes, and npm-dependency-version conflicts. It updates the same comment in place on each push to the PR. Enable it per project with the PR comments toggle in the dashboard; PR runs never alter the index.
+On pull requests the Carrick App posts a comment summarising drift detected against the indexed services: type mismatches between producers and consumers, mismatched HTTP verbs, missing or orphaned routes, and npm-dependency-version conflicts. It updates the same comment in place on each push to the PR. PR comments are on by default for new projects and can be toggled per project in the dashboard; PR runs never alter the index.
 
 ## Configuration
 
@@ -144,7 +151,7 @@ Each service also accepts the call-classification fields (`internalEnvVars`, `ex
 ## How it works
 
 1. SWC parses each TypeScript file into an AST.
-2. A static-analysis pass extracts function exports, mounted routers, and pattern-matched HTTP calls.
+2. A static-analysis pass extracts function exports, mounted routers, pattern-matched HTTP calls, GraphQL schemas and operations, and Socket.IO event contracts.
 3. An LLM agent handles the cases pattern matching can't reach: dynamic URLs, factory functions, framework-specific routing.
 4. A TypeScript sidecar resolves request and response types against the actual TypeScript compiler.
 5. A second LLM pass writes the per-function intent description.
