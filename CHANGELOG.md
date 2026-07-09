@@ -1,5 +1,89 @@
 # Changelog
 
+## [0.2.0](https://github.com/daveymoores/carrick/compare/carrick-v0.1.40...carrick-v0.2.0) (2026-07-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **findings:** post-pr-comment relay removed; PR surfaces require the post-pr-result cloud pipeline.
+
+### Features
+
+* **compat:** type-check cross-repo SOCKET edges end-to-end ([#273](https://github.com/daveymoores/carrick/issues/273)) ([153d19b](https://github.com/daveymoores/carrick/commit/153d19b2976f771770bfdec8c5e87617c6b8c4ad))
+* **eval:** add cross-repo metric fields to EvalRunRecord (S6 record-half) ([#212](https://github.com/daveymoores/carrick/issues/212)) ([0635707](https://github.com/daveymoores/carrick/commit/0635707fe359b282d1036364bd645fedf32ed219))
+* **eval:** archive ts_check output + de-collapse projection by (key, role) ([#261](https://github.com/daveymoores/carrick/issues/261)) ([1e72fb7](https://github.com/daveymoores/carrick/commit/1e72fb76a7b626fe3b6d83d1fc93da125693c71b)), closes [#207](https://github.com/daveymoores/carrick/issues/207)
+* **eval:** eval-oss workflow — remote corpus at pinned SHAs, dispatch-time labels ([#316](https://github.com/daveymoores/carrick/issues/316)) ([5367999](https://github.com/daveymoores/carrick/commit/5367999d4427e092fa92fae596cc263212f234f1))
+* **eval:** full S4 cross-repo scorer — types/compat/deps/negatives/owner + GraphQL/socket ([#223](https://github.com/daveymoores/carrick/issues/223)) ([#225](https://github.com/daveymoores/carrick/issues/225)) ([b3ef66f](https://github.com/daveymoores/carrick/commit/b3ef66f5f5f969e965c3314a3893d32e89446485))
+* **eval:** live cross-repo scorer — endpoint-set + match F1 (S4 thin slice) ([#215](https://github.com/daveymoores/carrick/issues/215)) ([cc868e1](https://github.com/daveymoores/carrick/commit/cc868e19258e0c33e9564c097a55ea59b21edda8))
+* **eval:** LocalDirStorage + offline two-phase cross-repo harness (S2) ([#211](https://github.com/daveymoores/carrick/issues/211)) ([4def505](https://github.com/daveymoores/carrick/commit/4def50506c62c03aa38669da7c9f2a1008327991))
+* **eval:** surface cross_repo_matches + type manifest + deps in EvalProjection (S1) ([#209](https://github.com/daveymoores/carrick/issues/209)) ([9f08ee6](https://github.com/daveymoores/carrick/commit/9f08ee6a56ae1366e6f04dba240c1c1c6a44f1f5))
+* **eval:** xrepo-corpus-3 — messy-realism cross-repo corpus + kind-aware decoy scoring ([#303](https://github.com/daveymoores/carrick/issues/303)) ([5abd14e](https://github.com/daveymoores/carrick/commit/5abd14e00f6dd17afea6c7c9c8b36a5843a52621))
+* **extraction:** pub/sub candidates are an exhaustive checklist for the analyzer ([#320](https://github.com/daveymoores/carrick/issues/320)) ([bf9d355](https://github.com/daveymoores/carrick/commit/bf9d355c2be974d5046b6f1327dc82df2b2f1ae4))
+* **extraction:** route GraphQL/socket ops into the type pipeline ([#245](https://github.com/daveymoores/carrick/issues/245) Phase 1) ([#251](https://github.com/daveymoores/carrick/issues/251)) ([8253eaa](https://github.com/daveymoores/carrick/commit/8253eaa619f3d0f62f1dc0b3b51096aa1e1c0dc0))
+* **findings:** typed findings + post-pr-result structured wire payload ([#313](https://github.com/daveymoores/carrick/issues/313)) ([a8a6e7e](https://github.com/daveymoores/carrick/commit/a8a6e7e7bf5cb04a6b8237d7444daf807b03db12))
+* **graphql:** cross-repo compat checking (edge query|order → compatible) ([#278](https://github.com/daveymoores/carrick/issues/278)) ([39d1d61](https://github.com/daveymoores/carrick/commit/39d1d61637bcb6c5dda8e2a6bfa9e5c6a3c03c83))
+* **graphql:** locate co-located consumer result types via file-analyzer hints ([#268](https://github.com/daveymoores/carrick/issues/268)) ([#298](https://github.com/daveymoores/carrick/issues/298)) ([107f41f](https://github.com/daveymoores/carrick/commit/107f41f9b313a9ed8509dde3060f17916b001055))
+* **graphql:** resolve consumer bound type from client.request&lt;T&gt; call site ([#275](https://github.com/daveymoores/carrick/issues/275)) ([84d6d3d](https://github.com/daveymoores/carrick/commit/84d6d3dde6a3714321f3d1f153557bb12a82ffe9))
+* **graphql:** resolve producer types from resolver functions (scanner-only) ([#276](https://github.com/daveymoores/carrick/issues/276)) ([3aa881e](https://github.com/daveymoores/carrick/commit/3aa881e729559d01033ea4532588c6694c21a222))
+* **graphql:** resolve resolver-less SDL producers via co-located backing type ([#248](https://github.com/daveymoores/carrick/issues/248)) ([#296](https://github.com/daveymoores/carrick/issues/296)) ([6d91033](https://github.com/daveymoores/carrick/commit/6d910331898e3a18773b4cbe0b03d2d304cdfba3))
+* **intents:** CARRICK_SKIP_INTENTS flag skips /generate-intent lambda calls ([#314](https://github.com/daveymoores/carrick/issues/314)) ([b829576](https://github.com/daveymoores/carrick/commit/b829576306699eaa27b36aec836df95e97dbc258))
+* **intents:** repo-relative cloud paths, full-scan intent reuse, trivial-body gate ([#312](https://github.com/daveymoores/carrick/issues/312)) ([d8d8f1c](https://github.com/daveymoores/carrick/commit/d8d8f1c90db7300a40d3cf8f80532fa25c27ba32))
+* pub/sub family protocol + xrepo-corpus-2 (event-driven accuracy corpus) ([#288](https://github.com/daveymoores/carrick/issues/288)) ([5c35fba](https://github.com/daveymoores/carrick/commit/5c35fba369b579c4000a6d0fc22904b1ddc2d1fd))
+* **pubsub:** gated candidate-surfacing for pub/sub call sites ([#289](https://github.com/daveymoores/carrick/issues/289)) ([d2a8d2b](https://github.com/daveymoores/carrick/commit/d2a8d2b69cd5fcf55134d1cae9871a4cee8082d5))
+* **scanner:** two-tier Signal 7 gate — shape-gate injected/inherited messaging clients ([#317](https://github.com/daveymoores/carrick/issues/317)) ([#319](https://github.com/daveymoores/carrick/issues/319)) ([77bcc7e](https://github.com/daveymoores/carrick/commit/77bcc7e1c1dd948cd09103717cdadccaa825271b))
+* **schema:** trace-rule primary_type_symbol descriptions (anchor accuracy) ([#258](https://github.com/daveymoores/carrick/issues/258)) ([9629ed8](https://github.com/daveymoores/carrick/commit/9629ed8256a7928133637e6ee4ed670606903c43))
+
+
+### Bug Fixes
+
+* **compat:** key type-compat verdicts per consumer, not per producer ([#260](https://github.com/daveymoores/carrick/issues/260)) ([#264](https://github.com/daveymoores/carrick/issues/264)) ([9f3ed50](https://github.com/daveymoores/carrick/commit/9f3ed50dba4c5cfac8fec7fb5e32fb9fbef0e0aa))
+* **compat:** normalize path params in the verdict-join so ts_check verdicts reach the score ([#271](https://github.com/daveymoores/carrick/issues/271)) ([a1d071e](https://github.com/daveymoores/carrick/commit/a1d071ecc311f10d1f41def337cab33594243157))
+* **engine:** exclude workspace-internal packages from the synthetic type-check npm install ([#308](https://github.com/daveymoores/carrick/issues/308)) ([f251fe6](https://github.com/daveymoores/carrick/commit/f251fe6b3ff3b914d340e25556877c81ad0a24df))
+* **engine:** harden synthetic type-check install — no lifecycle scripts, no non-registry version protocols ([#318](https://github.com/daveymoores/carrick/issues/318)) ([6ae0fde](https://github.com/daveymoores/carrick/commit/6ae0fdeb9a149ee6cebe25b9397ab70927aa01f5))
+* **engine:** per-service cross-repo .d.ts bundles so monorepo producer types survive ([#270](https://github.com/daveymoores/carrick/issues/270)) ([195be31](https://github.com/daveymoores/carrick/commit/195be3109774283f166000c5673a5c249a6a6345))
+* **engine:** scope git invocations to repo_path (ignore ambient GIT_DIR) ([#210](https://github.com/daveymoores/carrick/issues/210)) ([32f20ea](https://github.com/daveymoores/carrick/commit/32f20ea7bc02778cc8c14c4909639fa3cb1c75f3))
+* **eval:** GraphQL/socket cross-repo edges + real type-anchor & resolution metrics ([#232](https://github.com/daveymoores/carrick/issues/232), [#233](https://github.com/daveymoores/carrick/issues/233)) ([#239](https://github.com/daveymoores/carrick/issues/239)) ([b4376f5](https://github.com/daveymoores/carrick/commit/b4376f5c89de9d923d3a73229e1e3e043543601c))
+* **eval:** produce cross-repo compat verdicts in the offline harness + non-blocking §7 guard ([#226](https://github.com/daveymoores/carrick/issues/226)) ([#231](https://github.com/daveymoores/carrick/issues/231)) ([729d9ed](https://github.com/daveymoores/carrick/commit/729d9edbf7d6f7f8db1c24ab8d209d8456f7d090))
+* **eval:** projection type-slot correctness + sidecar request-body locator convergence ([#297](https://github.com/daveymoores/carrick/issues/297)) ([a7ebb41](https://github.com/daveymoores/carrick/commit/a7ebb41e9a37fb7809f000fc16839cdb8f3eeb5a))
+* **eval:** resolve spurious GraphQL 'orders' query ([#228](https://github.com/daveymoores/carrick/issues/228)) ([#229](https://github.com/daveymoores/carrick/issues/229)) ([d654417](https://github.com/daveymoores/carrick/commit/d65441743cfd9149be1ebdfc918e1a423e63dfdb))
+* **extraction:** deterministically extract route-descriptor endpoints ([#234](https://github.com/daveymoores/carrick/issues/234)) ([#237](https://github.com/daveymoores/carrick/issues/237)) ([84a74a8](https://github.com/daveymoores/carrick/commit/84a74a8e5fc1d9ad295ff925ed1bd08a0220e261))
+* **extraction:** extract raw-handler GET /gateway/health producer ([#227](https://github.com/daveymoores/carrick/issues/227)) ([#230](https://github.com/daveymoores/carrick/issues/230)) ([56e0453](https://github.com/daveymoores/carrick/commit/56e0453ff80dc001caa8b9640d3a320345f069f5))
+* **extraction:** force pubsub + data-call locator emission via schema required-ness (lever D) ([#300](https://github.com/daveymoores/carrick/issues/300)) ([e43c06d](https://github.com/daveymoores/carrick/commit/e43c06dfc73987ba713acbf176fba47aebb85926))
+* **extraction:** resolve env-var base URLs aliased through a local const ([#218](https://github.com/daveymoores/carrick/issues/218)) ([#219](https://github.com/daveymoores/carrick/issues/219)) ([b47e408](https://github.com/daveymoores/carrick/commit/b47e4081ea52fd14e7376a694ab2bd42fda37352))
+* **extraction:** suppress non-matchable call noise (templated wrapper paths + graphql transport POSTs) ([#310](https://github.com/daveymoores/carrick/issues/310)) ([d981cb4](https://github.com/daveymoores/carrick/commit/d981cb4cca0f076e2280af9791fa4515e8cbe52d))
+* **file_finder:** exclude storybook stories and .storybook config from scans ([#315](https://github.com/daveymoores/carrick/issues/315)) ([3c94ffc](https://github.com/daveymoores/carrick/commit/3c94ffc30b1177145c533a3ecf3811afc0f66e32))
+* **graphql:** deterministic SDL type anchor for producers ([#248](https://github.com/daveymoores/carrick/issues/248)) ([#269](https://github.com/daveymoores/carrick/issues/269)) ([d6c196b](https://github.com/daveymoores/carrick/commit/d6c196b4cfebe7343469ffa000e25066e878fced))
+* **graphql:** scope SDL discovery to the service's own roots ([#242](https://github.com/daveymoores/carrick/issues/242)) ([#252](https://github.com/daveymoores/carrick/issues/252)) ([ab8292b](https://github.com/daveymoores/carrick/commit/ab8292ba8dbe35d93920acc47bff7adab4267767))
+* **hooks:** isolate git env in pre-commit + block on test failure ([#216](https://github.com/daveymoores/carrick/issues/216)) ([692ed97](https://github.com/daveymoores/carrick/commit/692ed9776106cf0758cbade22b025201901f9966))
+* keep ts_check manifests HTTP-only so compat verdicts survive non-HTTP entries ([#254](https://github.com/daveymoores/carrick/issues/254)) ([99d57f7](https://github.com/daveymoores/carrick/commit/99d57f73a673230f821aa2313e117644ac071223))
+* **orchestrator:** resolve bare import specifiers through tsconfig paths mappings ([#305](https://github.com/daveymoores/carrick/issues/305)) ([11a7374](https://github.com/daveymoores/carrick/commit/11a73747a4dcf96b6137fab4f7445c66413f69dc))
+* **pubsub:** disambiguate fan-in publisher aliases by call site ([#290](https://github.com/daveymoores/carrick/issues/290)) ([57896e7](https://github.com/daveymoores/carrick/commit/57896e7f304a3673bedb452239b7b15ea872a27d))
+* **scanner:** gate deterministic route descriptors to real registries ([#241](https://github.com/daveymoores/carrick/issues/241)) ([#249](https://github.com/daveymoores/carrick/issues/249)) ([dcf51d1](https://github.com/daveymoores/carrick/commit/dcf51d19e7f1df0c196a5c06a976831b2e2524ed)), closes [#207](https://github.com/daveymoores/carrick/issues/207)
+* **schema:** require endpoint payload locators; scope type-slot to response ([#274](https://github.com/daveymoores/carrick/issues/274)) ([df4594d](https://github.com/daveymoores/carrick/commit/df4594dabd7cdeb5bbebdd0a9c51d647c4ba8c30))
+* semver-incompatible dep conflicts + drop synthetic anchor fallback (eval 85%→91%) ([#279](https://github.com/daveymoores/carrick/issues/279)) ([f20dd41](https://github.com/daveymoores/carrick/commit/f20dd410993b17592eb24a728cf3e20bed8a4e07))
+* **sidecar:** drill through JSON.stringify(arg) for request-body inference ([#267](https://github.com/daveymoores/carrick/issues/267)) ([552a07b](https://github.com/daveymoores/carrick/commit/552a07b795d86dba5f94e5d5deb807aa922d307e))
+* **sidecar:** expand inferred consumer types structurally ([#257](https://github.com/daveymoores/carrick/issues/257)) ([#259](https://github.com/daveymoores/carrick/issues/259)) ([88f83af](https://github.com/daveymoores/carrick/commit/88f83af05e566485c37e2d522b2531f9ec04284f))
+* **sidecar:** expand resolved request-body type structurally ([#272](https://github.com/daveymoores/carrick/issues/272)) ([331e8c2](https://github.com/daveymoores/carrick/commit/331e8c296ab178caae06d03fa9318616cd4dd8ff))
+* **sidecar:** follow route-registration into handler for type inference (incl. line-only anchors) ([#295](https://github.com/daveymoores/carrick/issues/295)) ([12e1464](https://github.com/daveymoores/carrick/commit/12e1464b21b085af929780f23e74fb31602d0cb9))
+* **sidecar:** inline named member types in expanded_definition ([#246](https://github.com/daveymoores/carrick/issues/246)) ([#255](https://github.com/daveymoores/carrick/issues/255)) ([4216a2e](https://github.com/daveymoores/carrick/commit/4216a2eef03bd77bd9f756cde6e7740da854113e))
+* **sidecar:** producer structural expansion + deterministic type anchor ([#265](https://github.com/daveymoores/carrick/issues/265)) ([61ae9bc](https://github.com/daveymoores/carrick/commit/61ae9bcbe75bcf5aec4bfaf44e0d2acc8adb512f))
+* **ts_check:** abstain instead of false-compatible on dangling library types (MVP safety) ([#302](https://github.com/daveymoores/carrick/issues/302)) ([79059d1](https://github.com/daveymoores/carrick/commit/79059d17641a057ac5cd4861bb16f76ae6f173cb))
+* **ts_check:** correct HTTP request-body assignability direction (+ eval pins) ([#301](https://github.com/daveymoores/carrick/issues/301)) ([553f0a4](https://github.com/daveymoores/carrick/commit/553f0a491a350a1d62f5b07e21b03e68a4212e7c))
+* **ts_check:** tag injected `= unknown` placeholder so genuine unknown isn't downgraded ([#244](https://github.com/daveymoores/carrick/issues/244)) ([#250](https://github.com/daveymoores/carrick/issues/250)) ([925fd0c](https://github.com/daveymoores/carrick/commit/925fd0c294fa835871aa3a7dc035e0309267f7dd)), closes [#207](https://github.com/daveymoores/carrick/issues/207)
+* **ts_check:** treat unknown as unverifiable + land consumer type shape in bundle ([#235](https://github.com/daveymoores/carrick/issues/235)) ([#238](https://github.com/daveymoores/carrick/issues/238)) ([6361d7f](https://github.com/daveymoores/carrick/commit/6361d7f3a351afd2c29f9232f68099002025f326)), closes [#207](https://github.com/daveymoores/carrick/issues/207)
+* **types:** keep use-site array-ness on explicit anchor bundles ([#309](https://github.com/daveymoores/carrick/issues/309)) ([20386e2](https://github.com/daveymoores/carrick/commit/20386e2bbd7a0d8df1b8d0cc9c129b6c87dc0815))
+
+
+### Refactoring
+
+* single canonical consumer-call key (kill conflicting normalization paths) ([#294](https://github.com/daveymoores/carrick/issues/294)) ([954485c](https://github.com/daveymoores/carrick/commit/954485cbadaf4649026c68bcbac8d8ef1058e31f))
+
+
+### CI/CD
+
+* **eval:** push Tier-A records to cloud eval history ([#198](https://github.com/daveymoores/carrick/issues/198)) ([479785b](https://github.com/daveymoores/carrick/commit/479785bb1914853b93b90ada0de6f6d39b1dbae2))
+* run the ts_check test suite in CI ([#280](https://github.com/daveymoores/carrick/issues/280)) ([3045a68](https://github.com/daveymoores/carrick/commit/3045a6869315e00c553e4545168bb26aa6fee8c3))
+
 ## [0.1.40](https://github.com/daveymoores/carrick/compare/carrick-v0.1.39...carrick-v0.1.40) (2026-06-24)
 
 
