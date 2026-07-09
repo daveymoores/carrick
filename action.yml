@@ -13,26 +13,62 @@ inputs:
 
 outputs:
   success:
-    description: "Analysis completed successfully"
-    value: ${{ steps.analysis.outputs.success }}
+    description: "Analysis completed successfully (also 'true' when the run was skipped, e.g. fork PRs where OIDC is unavailable)"
+    value: ${{ steps.fork-check.outputs.skip == 'true' && 'true' || steps.analysis.outputs.success }}
   issues-found:
-    description: "Number of API issues detected"
-    value: ${{ steps.analysis.outputs.issues-found }}
+    description: "Number of API issues detected ('0' can also mean the run was skipped, e.g. fork PRs where OIDC is unavailable)"
+    value: ${{ steps.fork-check.outputs.skip == 'true' && '0' || steps.analysis.outputs.issues-found }}
 
 runs:
   using: "composite"
   steps:
+    - name: Check fork PR (OIDC unavailable)
+      id: fork-check
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        BASE_REPO: ${{ github.repository }}
+      run: |
+        # GitHub withholds OIDC credentials (ACTIONS_ID_TOKEN_REQUEST_URL /
+        # ACTIONS_ID_TOKEN_REQUEST_TOKEN) from pull_request runs that originate
+        # from forks, so the scanner cannot authenticate to the Carrick cloud.
+        # Skip successfully rather than fail the contributor's PR red — the
+        # scan runs when a maintainer pushes the branch to this repository.
+        SKIP=false
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            SKIP=true
+          elif [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            # Belt-and-braces: OIDC env vars absent on a pull_request run —
+            # same fork situation even if the head-repo comparison missed it.
+            SKIP=true
+          fi
+        fi
+        if [ "$SKIP" = "true" ]; then
+          echo "::notice::Carrick skipped: fork PRs don't receive OIDC credentials, so this run can't authenticate to the Carrick cloud. The check will run when a maintainer pushes the branch to this repository."
+        fi
+        echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
     - name: Set up Node.js
+      if: steps.fork-check.outputs.skip != 'true'
       uses: actions/setup-node@v4
       with:
         node-version: "24"
 
     - name: Download Carrick
+      if: steps.fork-check.outputs.skip != 'true'
       id: download
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
+        # The repo that hosts this action's releases. GITHUB_ACTION_REPOSITORY
+        # is set by the runner for action steps, so release downloads follow
+        # the action if the repo moves orgs; the literal is a fallback for
+        # runners that don't set it.
+        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-daveymoores/carrick}"
+
         ASSET="carrick-action-linux.tar.gz"
         JQ_ASSET_URL=".assets[] | select(.name==\"$ASSET\") | .browser_download_url"
 
@@ -51,14 +87,14 @@ runs:
         echo "Resolving Carrick release for version $VERSION"
 
         # release-please tags releases as carrick-v<version>.
-        DOWNLOAD_URL=$(gh api "repos/daveymoores/carrick/releases/tags/carrick-v$VERSION" \
+        DOWNLOAD_URL=$(gh api "repos/$ACTION_REPO/releases/tags/carrick-v$VERSION" \
           --jq "$JQ_ASSET_URL" 2>/dev/null || true)
         valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
 
         if [ -z "$DOWNLOAD_URL" ]; then
           # Fallback for any other tag scheme: match a release whose tag ends
           # with this version.
-          DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases --paginate \
+          DOWNLOAD_URL=$(gh api "repos/$ACTION_REPO/releases" --paginate \
             --jq ".[] | select(.tag_name | endswith(\"$VERSION\")) | $JQ_ASSET_URL" \
             2>/dev/null | head -n 1 || true)
           valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
@@ -66,12 +102,12 @@ runs:
 
         if [ -z "$DOWNLOAD_URL" ]; then
           echo "::warning::No release found matching version $VERSION (expected when running from an untagged ref); falling back to the latest release"
-          DOWNLOAD_URL=$(gh api repos/daveymoores/carrick/releases/latest --jq "$JQ_ASSET_URL" 2>/dev/null || true)
+          DOWNLOAD_URL=$(gh api "repos/$ACTION_REPO/releases/latest" --jq "$JQ_ASSET_URL" 2>/dev/null || true)
           valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
         fi
 
         if [ -z "$DOWNLOAD_URL" ]; then
-          echo "::error::Could not resolve a download URL for $ASSET from any release of daveymoores/carrick"
+          echo "::error::Could not resolve a download URL for $ASSET from any release of $ACTION_REPO"
           exit 1
         fi
 
@@ -87,14 +123,17 @@ runs:
         echo "dist-dir=$DIST_DIR" >> "$GITHUB_OUTPUT"
 
     - name: Install ts_check dependencies
+      if: steps.fork-check.outputs.skip != 'true'
       shell: bash
       run: cd "${{ steps.download.outputs.dist-dir }}/ts_check" && npm ci
 
     - name: Install sidecar dependencies
+      if: steps.fork-check.outputs.skip != 'true'
       shell: bash
       run: cd "${{ steps.download.outputs.dist-dir }}/sidecar" && npm ci
 
     - name: Run analysis
+      if: steps.fork-check.outputs.skip != 'true'
       id: analysis
       shell: bash
       env:
