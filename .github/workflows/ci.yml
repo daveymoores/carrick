@@ -98,6 +98,62 @@ jobs:
       - name: Run library tests
         run: cargo test --lib --verbose
 
+      # Workspace members are NOT covered by the steps above: this is a
+      # non-virtual workspace, so plain `cargo test` invocations only run the
+      # root package. Every member crate needs its own explicit step.
+      - name: Run carrick-match tests
+        run: cargo test -p carrick-match --verbose
+
+  wasm-match:
+    name: carrick-match wasm smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Build carrick-match for wasm32
+        run: cargo build --target wasm32-unknown-unknown -p carrick-match --features wasm --release
+
+      # Version must match the exact wasm-bindgen pin in
+      # crates/carrick-match/Cargo.toml; bump both in lockstep.
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - name: Generate Node.js glue
+        run: wasm-bindgen --target nodejs --out-dir target/wasm-smoke target/wasm32-unknown-unknown/release/carrick_match.wasm
+
+      # Smoke only: proves the glue loads and the exports answer correctly
+      # under Node. The artifact is not uploaded; the committed copy consumed
+      # by carrick-cloud is produced and pinned separately.
+      - name: Load glue in Node and assert matching
+        run: |
+          node -e "
+            const assert = require('assert');
+            const m = require('./target/wasm-smoke/carrick_match.js');
+            assert.strictEqual(m.paths_match('/users/:id', '/users/123'), true);
+            assert.strictEqual(m.paths_match('/users/123', '/users/:id'), true);
+            assert.strictEqual(m.paths_match('/api/**', '/api/users/123/orders'), true);
+            assert.strictEqual(m.paths_match('/users', '/orders'), false);
+            assert.strictEqual(m.is_param_segment(':id'), true);
+            assert.strictEqual(m.is_param_segment('users'), false);
+            console.log('wasm smoke ok');
+          "
+
   lint:
     name: Linting
     runs-on: ubuntu-latest
