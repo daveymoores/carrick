@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/daveymoores/carrick/compare/carrick-v0.2.0...carrick-v0.2.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **action:** launch polish — fail loudly on missing id-token permission, stream scan output live ([#322](https://github.com/daveymoores/carrick/issues/322)) ([3fbfe6c](https://github.com/daveymoores/carrick/commit/3fbfe6cceee7794e3ec6de368a75b5aa3976f119))
+
 ## [0.2.0](https://github.com/daveymoores/carrick/compare/carrick-v0.1.40...carrick-v0.2.0) (2026-07-09)
 
 
