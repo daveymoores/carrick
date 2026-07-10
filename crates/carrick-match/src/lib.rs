@@ -20,9 +20,10 @@
 /// `endpoint_path` is the declared route on the producer side (it may carry
 /// `:param`/`{param}`/`<param>`/`[param]` placeholders, trailing `?` optional
 /// markers, and `*`/`**`/`(.*)` wildcards). `call_path` is the canonical
-/// consumer call path. Matches on exact equality, parameter segments
-/// (symmetric, see [`path_matches_with_params`]), or wildcards (see
-/// [`path_matches_with_wildcards`]).
+/// consumer call path. Matches on exact equality, on parameter segments
+/// (symmetric: a placeholder on either side matches the other side), or on
+/// wildcard patterns (trailing wildcards are prefix matches; a mid-path `*`
+/// matches exactly one segment).
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn paths_match(endpoint_path: &str, call_path: &str) -> bool {
     // Exact match
@@ -45,7 +46,7 @@ pub fn paths_match(endpoint_path: &str, call_path: &str) -> bool {
 
 /// Segment-by-segment matching with route parameters (on either side) and
 /// trailing `?` optional segments on the endpoint side.
-pub fn path_matches_with_params(endpoint_path: &str, call_path: &str) -> bool {
+fn path_matches_with_params(endpoint_path: &str, call_path: &str) -> bool {
     let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
     let call_segments: Vec<&str> = call_path.split('/').collect();
 
@@ -109,12 +110,17 @@ pub fn is_param_segment(seg: &str) -> bool {
         || (seg.starts_with('[') && seg.ends_with(']'))
 }
 
-/// Match paths with wildcard patterns
+/// Match paths with wildcard patterns.
 ///
-/// Supports:
-/// - `*` matches a single path segment
-/// - `**` or `(.*)` matches zero or more path segments
-pub fn path_matches_with_wildcards(endpoint_path: &str, call_path: &str) -> bool {
+/// Semantics as implemented (kept byte-identical to the scanner's original
+/// matcher):
+/// - An endpoint ending in `/*`, `/**`, or `/(.*)` is a prefix match: the
+///   call path only has to start with the part before the wildcard. A
+///   trailing `/*` therefore matches any number of segments, exactly like
+///   `/**`, not just one.
+/// - Anywhere else, a `*` segment matches exactly one call segment, and both
+///   paths must have the same number of segments.
+fn path_matches_with_wildcards(endpoint_path: &str, call_path: &str) -> bool {
     // Check for catch-all patterns
     if endpoint_path.ends_with("/*") || endpoint_path.ends_with("/**") {
         let prefix = endpoint_path.trim_end_matches("/**").trim_end_matches("/*");
