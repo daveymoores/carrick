@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/daveymoores/carrick/compare/carrick-v0.2.1...carrick-v0.2.2) (2026-07-10)
+
+
+### Refactoring
+
+* **matching:** extract carrick-match crate (paths_match + is_param_segment) with wasm feature ([#327](https://github.com/daveymoores/carrick/issues/327)) ([ecdbcfc](https://github.com/daveymoores/carrick/commit/ecdbcfc8d43ffc6d1db3a2b0dd315a55849ca6b5))
+
 ## [0.2.1](https://github.com/daveymoores/carrick/compare/carrick-v0.2.0...carrick-v0.2.1) (2026-07-10)
 
 
