@@ -3,8 +3,15 @@ name = "carrick"
 version = "0.2.1"
 edition = "2024"
 
+# Non-virtual workspace on purpose: release-please's rust strategy edits this
+# root [package] version, so the root package must stay intact. Members are
+# versioned independently, outside release-please.
+[workspace]
+members = ["crates/carrick-match"]
+
 [dependencies]
 async-trait = "0.1"
+carrick-match = { path = "crates/carrick-match" }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 futures = "0.3.32"

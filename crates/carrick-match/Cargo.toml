@@ -1,0 +1,22 @@
+[package]
+name = "carrick-match"
+# Deliberately versioned outside release-please: the root `carrick` package is
+# the only release-please target. Bump manually if the crate is ever published.
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+# `cdylib` is required for the wasm32 build; `rlib` keeps the crate usable as a
+# normal dependency of the scanner.
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# Adds wasm-bindgen exports for Node.js consumers. Default off so the native
+# scanner build pulls in zero new external dependencies.
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+# Pinned exactly: wasm-bindgen requires the CLI that generates the JS glue to
+# match this version. Bump the `cargo install wasm-bindgen-cli --version` pin
+# in .github/workflows/ci.yml in lockstep.
+wasm-bindgen = { version = "=0.2.126", optional = true }
