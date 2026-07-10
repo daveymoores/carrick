@@ -13,10 +13,10 @@ inputs:
 
 outputs:
   success:
-    description: "Analysis completed successfully (also 'true' when the run was skipped, e.g. fork PRs where OIDC is unavailable)"
+    description: "Analysis completed successfully (also 'true' when the run was skipped on a fork PR, where GitHub withholds OIDC credentials)"
     value: ${{ steps.fork-check.outputs.skip == 'true' && 'true' || steps.analysis.outputs.success }}
   issues-found:
-    description: "Number of API issues detected ('0' can also mean the run was skipped, e.g. fork PRs where OIDC is unavailable)"
+    description: "Number of API issues detected ('0' can also mean the run was skipped on a fork PR, where GitHub withholds OIDC credentials)"
     value: ${{ steps.fork-check.outputs.skip == 'true' && '0' || steps.analysis.outputs.issues-found }}
 
 runs:
@@ -35,18 +35,19 @@ runs:
         # from forks, so the scanner cannot authenticate to the Carrick cloud.
         # Skip successfully rather than fail the contributor's PR red — the
         # scan runs when a maintainer pushes the branch to this repository.
+        #
+        # Only genuine forks (head repo differs from base repo) get the green
+        # skip. A same-repo run with the OIDC env vars absent means the
+        # workflow forgot `permissions: id-token: write` — fail loudly with the
+        # fix instead of silently never scanning.
         SKIP=false
-        if [ "$EVENT_NAME" = "pull_request" ]; then
-          if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$BASE_REPO" ]; then
-            SKIP=true
-          elif [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
-            # Belt-and-braces: OIDC env vars absent on a pull_request run —
-            # same fork situation even if the head-repo comparison missed it.
-            SKIP=true
-          fi
-        fi
-        if [ "$SKIP" = "true" ]; then
+        if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+          SKIP=true
           echo "::notice::Carrick skipped: fork PRs don't receive OIDC credentials, so this run can't authenticate to the Carrick cloud. The check will run when a maintainer pushes the branch to this repository."
+        elif [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::Carrick can't mint an OIDC token: this run has no ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN. Add 'permissions: id-token: write' to the workflow (or job) so Carrick can authenticate to the cloud."
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          exit 1
         fi
         echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
 
@@ -143,16 +144,21 @@ runs:
         # sends it as X-Carrick-OIDC. No API key required.
         CI: "true"
       run: |
+        # Stream output live (multi-minute scans shouldn't look hung) while
+        # still capturing it for the issue-count grep below. The log lives in
+        # RUNNER_TEMP so it never pollutes the user's workspace.
+        LOG_FILE="$RUNNER_TEMP/carrick-analysis.log"
+
         set +e
-        "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" > analysis.log 2>&1
-        EXIT_CODE=$?
+        "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
+        EXIT_CODE=${PIPESTATUS[0]}
         set -e
 
         ISSUES=0
-        if grep -q "CARRICK_ISSUE_COUNT:" analysis.log; then
+        if grep -q "CARRICK_ISSUE_COUNT:" "$LOG_FILE"; then
           # -m1: only the first marker counts — log echoes of the output (or a
           # rerun appending to the same log) must not yield a multi-line value.
-          ISSUES=$(grep -m1 "CARRICK_ISSUE_COUNT:" analysis.log | sed 's/.*CARRICK_ISSUE_COUNT:\([0-9]*\).*/\1/')
+          ISSUES=$(grep -m1 "CARRICK_ISSUE_COUNT:" "$LOG_FILE" | sed 's/.*CARRICK_ISSUE_COUNT:\([0-9]*\).*/\1/')
         fi
 
         if [ $EXIT_CODE -eq 0 ]; then
@@ -169,5 +175,4 @@ runs:
         # comment (gated on the project's pr_comments_enabled toggle). No
         # github-script step or pull-requests:write permission is needed here.
 
-        cat analysis.log
         exit $EXIT_CODE

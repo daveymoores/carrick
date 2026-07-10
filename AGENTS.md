@@ -72,8 +72,12 @@ request/response types.
 ### Connect the agent
 
 ```
-claude mcp add --transport http carrick-carrick-ci https://api.carrick.tools/mcp/p/carrick-ci
+claude mcp add --transport http carrick https://api.carrick.tools/mcp
 ```
+
+One install serves every project in the workspace. On Carrick tool calls
+from this repo, pass `project: "carrick-ci"` (or `repo: "<owner/repo>"`
+from the git remote) so Carrick queries the right system.
 
 ### When to reach for Carrick
 
