@@ -1348,15 +1348,18 @@ export class TypeInferrer {
   ): UnwrapResult | null {
     // The outer extraction already succeeded on the paths below; a recursive
     // inner pass that finds nothing more must not demote the result back to
-    // "not unwrapped" (which would discard the recovered payload). The inner
-    // pass's payload wins when it peeled further; otherwise this level's
-    // payload IS the recovered type.
+    // "not unwrapped" (which would discard the recovered payload). Only when
+    // the inner pass unwrapped NOTHING is this level's payload the recovered
+    // type; an inner pass that did unwrap already decided its own payloadType,
+    // and its absence is deliberate — a union join has no single payload, and
+    // a verified-machinery collapse to `unknown` recovered none, so this
+    // level's (wrapper-shaped) payload must not resurface as an anchor.
     const recurse = (payload: Type): UnwrapResult => {
       const inner = this.unwrapType(payload, node, config, depth + 1);
       return {
         ...inner,
         wasUnwrapped: true,
-        payloadType: inner.payloadType ?? payload,
+        payloadType: inner.wasUnwrapped ? inner.payloadType : payload,
       };
     };
 

@@ -16,18 +16,22 @@ import * as fs from 'node:fs';
 import { SidecarClient, FIXTURES_PATH } from './helpers.js';
 
 const FIXTURE = path.join(FIXTURES_PATH, 'src/wrapper-usage.ts');
-const FIXTURE_SOURCE = fs.readFileSync(FIXTURE, 'utf-8');
+const OPAQUE_FIXTURE = path.join(FIXTURES_PATH, 'src/wrapper-opaque.ts');
 
 /** Byte span of `text` in the fixture (ASCII-only file, so byte == char offsets). */
-function spanOf(text: string): { start: number; end: number; line: number } {
-  const start = FIXTURE_SOURCE.indexOf(text);
+function spanOf(
+  text: string,
+  fixturePath: string = FIXTURE
+): { start: number; end: number; line: number } {
+  const source = fs.readFileSync(fixturePath, 'utf-8');
+  const start = source.indexOf(text);
   assert.ok(start >= 0, `fixture must contain: ${text}`);
   assert.strictEqual(
-    FIXTURE_SOURCE.indexOf(text, start + 1),
+    source.indexOf(text, start + 1),
     -1,
     `fixture must contain exactly one occurrence of: ${text}`
   );
-  const line = FIXTURE_SOURCE.slice(0, start).split('\n').length;
+  const line = source.slice(0, start).split('\n').length;
   return { start, end: start + text.length, line };
 }
 
@@ -134,6 +138,64 @@ describe('call_result array payloads anchor on the element symbol with array_dep
     );
     assert.strictEqual(inferred.primary_type_symbol, 'UserData');
     assert.strictEqual(inferred.array_depth, 1);
+  });
+
+  it('recursive unwrap that collapses to `unknown` must not anchor on a wrapper symbol', async () => {
+    const call = spanOf("apiGetOpaque('/api/opaque')", OPAQUE_FIXTURE);
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'call-arr-opaque',
+      extraction_config: {
+        rules: [
+          {
+            wrapperSymbols: ['ApiResponse'],
+            originModuleGlobs: ['wrapper-lib', 'wrapper-lib/*'],
+            payloadGenericIndex: 0,
+            unwrapRecursively: true,
+          },
+          {
+            // Verifies OpaqueHandle's identity but can extract nothing (no
+            // generics, no payloadPropertyPath), so the recursive inner pass
+            // collapses to the unresolved `unknown` sentinel.
+            wrapperSymbols: ['OpaqueHandle'],
+            originModuleGlobs: ['wrapper-lib', 'wrapper-lib/*'],
+          },
+        ],
+      },
+      requests: [
+        {
+          file_path: OPAQUE_FIXTURE,
+          line_number: call.line,
+          span_start: call.start,
+          span_end: call.end,
+          infer_kind: 'call_result',
+          alias: 'OpaqueConsumer',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'OpaqueConsumer'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.type_string,
+      'unknown',
+      'verified machinery with no recoverable payload collapses to unknown'
+    );
+    assert.strictEqual(
+      inferred.primary_type_symbol,
+      undefined,
+      `an unresolved unwrap must not anchor on the collapsed wrapper, got ${JSON.stringify(inferred.primary_type_symbol)}`
+    );
+    assert.strictEqual(
+      inferred.array_depth,
+      undefined,
+      `an unresolved unwrap must not report an array_depth, got ${inferred.array_depth}`
+    );
   });
 
   it('scalar wrapper payload keeps its anchor and reports NO array_depth', async () => {
