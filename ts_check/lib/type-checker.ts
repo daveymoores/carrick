@@ -181,7 +181,17 @@ export class TypeCompatibilityChecker {
 
     // For each match, compare the types
     for (const match of matches) {
-      const endpoint = `${match.method} ${match.path} (${match.type_kind})`;
+      // HTTP matches are keyed on the normalized consumer path, which
+      // collapses every param name to `:param`. Label the pair with the
+      // producer's declared route (`/orders/:id`) so the PR comment agrees
+      // with the Verified table; the Rust verdict-join is param-name-agnostic
+      // (normalize_compat_path collapses both sides back to `:param`).
+      // Non-HTTP matches keep the key (`DIRECTION|event`, `kind|field`, topic).
+      const displayPath =
+        match.producer.protocol === "http" && match.producer.path
+          ? match.producer.path
+          : match.path;
+      const endpoint = `${match.method} ${displayPath} (${match.type_kind})`;
       const producerUnknown =
         match.producer.type_state === "unknown" ||
         match.producer.evidence?.type_state === "unknown";

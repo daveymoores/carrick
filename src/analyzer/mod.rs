@@ -295,6 +295,20 @@ fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
 }
 
+/// Strip the GitHub Actions checkout prefix (`/home/runner/work/<repo>/<repo>/`)
+/// from a call-site location so PR-comment risk rows cite `server.ts:66`, not
+/// the runner's absolute workspace path (#337). Anything else (local absolute
+/// paths, already-relative paths) passes through unchanged.
+fn strip_ci_workspace_prefix(location: &str) -> &str {
+    location
+        .strip_prefix("/home/runner/work/")
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map(|(_, rest)| rest)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(location)
+}
+
 /// Collapse any dynamic path segment (`:id`, `{id}`, `[id]`) to `:param` so the
 /// compat verdict join is param-NAME-agnostic. The cross-repo edge's
 /// `producer_key` keeps the source param name (`/orders/:id`), while ts_check's
@@ -2263,11 +2277,13 @@ impl Analyzer {
                 let (method, path) = parse_compat_endpoint(endpoint)
                     .unwrap_or_else(|| ("UNKNOWN".to_string(), endpoint.to_string()));
                 // The consumer call site is the actionable location — it's
-                // where the broken read/write happens.
+                // where the broken read/write happens. In CI the manifest
+                // carries the runner's absolute checkout path; strip it so
+                // the risk row cites the repo-relative file.
                 let call_sites = mismatch
                     .get("consumerLocation")
                     .and_then(|c| c.as_str())
-                    .map(|loc| vec![loc.to_string()])
+                    .map(|loc| vec![strip_ci_workspace_prefix(loc).to_string()])
                     .unwrap_or_default();
                 Some(Finding::type_mismatch(
                     method,
@@ -2324,6 +2340,13 @@ impl Analyzer {
             .replace("': ", ": ")
             .replace("' is not assignable to type '", " not assignable to ")
             .replace("'.", "");
+
+        // ts_check's own errorDetails wrapper has no trailing period
+        // ("... type 'Y'"), so the "'." replacement above never fires on the
+        // closing quote; drop the unbalanced closer here.
+        if let Some(stripped) = cleaned.strip_suffix('\'') {
+            cleaned = stripped.to_string();
+        }
 
         // Replace hash-based type aliases in error messages
         for (alias, display) in display_names {
@@ -3429,6 +3452,56 @@ mod tests {
             "a producer absent from the mismatch list is compatible (verdict reached)"
         );
         assert!(matches[1].mismatch_reason.is_none());
+    }
+
+    /// PR-comment polish (#337): the risk row's call site must not leak the CI
+    /// runner workspace prefix, and the assignability detail must not end with
+    /// an unbalanced quote. ts_check builds its own errorDetails as
+    /// `Type 'X' is not assignable to type 'Y'` with no trailing period, so
+    /// `clean_error_message`'s `"'."` replacement never fires on the closer.
+    #[test]
+    fn type_mismatch_finding_strips_runner_prefix_and_trailing_quote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let results = r#"{
+            "mismatches": [
+                { "endpoint": "GET /api/notifications/status (response)",
+                  "producerType": "NotificationStatus",
+                  "consumerType": "StatusView",
+                  "consumerLocation": "/home/runner/work/user-service/user-service/server.ts:66",
+                  "error": "Type 'NotificationStatus' is not assignable to type 'StatusView'" }
+            ]
+        }"#;
+        let analyzer = analyzer_with_results(dir.path(), Some(results));
+
+        let findings = analyzer.get_type_mismatch_findings();
+        assert_eq!(findings.len(), 1);
+        let Finding::TypeMismatch {
+            call_sites, detail, ..
+        } = &findings[0]
+        else {
+            panic!("expected a TypeMismatch finding, got {:?}", findings[0]);
+        };
+        assert_eq!(call_sites, &vec!["server.ts:66".to_string()]);
+        assert_eq!(detail, "NotificationStatus not assignable to StatusView");
+    }
+
+    /// A consumer location outside the GitHub Actions workspace passes through
+    /// untouched; the prefix strip must not eat local or repo-relative paths.
+    #[test]
+    fn strip_ci_workspace_prefix_leaves_non_runner_paths_alone() {
+        assert_eq!(
+            strip_ci_workspace_prefix("payments-svc/src/client.ts:12"),
+            "payments-svc/src/client.ts:12"
+        );
+        assert_eq!(
+            strip_ci_workspace_prefix("/home/runner/work/repo/repo/src/api.ts:7"),
+            "src/api.ts:7"
+        );
+        // Degenerate: nothing after the checkout dir → keep the original.
+        assert_eq!(
+            strip_ci_workspace_prefix("/home/runner/work/repo/repo"),
+            "/home/runner/work/repo/repo"
+        );
     }
 
     /// No results file → `check_type_compatibility` errs → every edge keeps
