@@ -86,3 +86,15 @@ jobs:
           git push -f origin v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Builds the carrick-match wasm artifact, attaches it to the release, and
+  # dispatches the pin-bump PR in carrick-cloud (#325). Lives in the same
+  # workflow because release-please creates the release with GITHUB_TOKEN,
+  # which never fires `release:`-triggered workflows.
+  wasm-artifact:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    uses: ./.github/workflows/wasm-artifact.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit
