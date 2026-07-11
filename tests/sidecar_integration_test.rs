@@ -655,6 +655,206 @@ fn test_path_normalization() {
     );
 }
 
+/// #336 (reopened): the END ARTIFACT for an `axios.get<Order[]>`-shaped
+/// consumer must carry the array depth. The live repro is a MULTI-LINE call
+/// whose binding is last used as a scalar projection:
+///
+/// ```ts
+/// const ordersResponse = await axios.get<Order[]>(
+///   `${ORDER_SERVICE_URL}/api/orders`,
+/// );
+/// const orderCount = ordersResponse.data.length;
+/// ```
+///
+/// The LLM anchor is the bare element (`Order`), so the explicit bundle
+/// pre-claims the consumer alias; the depth must be recovered by inference and
+/// copied onto the `SymbolRequest` (`apply_inferred_array_depth`). Before the
+/// fix, the single-line locator print missed the multi-line call AND the
+/// terminal-use walk anchored on `number`, so the bundle rendered
+/// `export interface <alias> {...}` with the `[]` gone and every scan reported
+/// a false `{...}[] not assignable` contract risk. This asserts the rendered
+/// definition — the artifact the manifest stores and ts_check compares — not
+/// the intermediate inference.
+#[test]
+fn test_multiline_call_result_bundles_array_definition() {
+    use carrick::services::type_sidecar::{
+        ExtractionConfig, ExtractionRule, InferKind, InferRequestItem, SymbolRequest, TypeSidecar,
+    };
+    use std::time::Duration;
+
+    if !is_node_available() {
+        eprintln!("Skipping test: Node.js not available");
+        return;
+    }
+    let sidecar_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    if !sidecar_path.exists() {
+        eprintln!("Skipping test: Sidecar not built (run: cd src/sidecar && npm run build)");
+        return;
+    }
+
+    // Consumer repo mirroring carrick-demo-notification-service, with a stub
+    // axios so no npm install is needed.
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let repo = temp_dir.path().join("consumer");
+    fs::create_dir_all(repo.join("src")).expect("Failed to create src");
+    fs::create_dir_all(repo.join("node_modules/axios")).expect("Failed to create axios stub dir");
+    fs::write(
+        repo.join("package.json"),
+        r#"{ "name": "consumer-app", "version": "1.0.0", "dependencies": { "axios": "^1.6.0" } }"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("tsconfig.json"),
+        r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"]
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("node_modules/axios/package.json"),
+        r#"{ "name": "axios", "version": "1.6.0", "main": "index.js", "types": "index.d.ts" }"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("node_modules/axios/index.d.ts"),
+        r#"export interface AxiosResponse<T = any> {
+  data: T;
+  status: number;
+}
+export interface AxiosInstance {
+  get<T = any>(url: string): Promise<AxiosResponse<T>>;
+}
+declare const axios: AxiosInstance;
+export default axios;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("src/types.ts"),
+        r#"export interface Order {
+  id: number;
+  userId: number;
+  product: string;
+  amount: number;
+}
+"#,
+    )
+    .unwrap();
+    // The call spans three lines with a trailing comma (line 7 = call start).
+    fs::write(
+        repo.join("src/api.ts"),
+        r#"import axios from 'axios';
+import { Order } from './types';
+
+const ORDER_SERVICE_URL = 'http://localhost:3002';
+
+export async function getOrderCount(): Promise<number> {
+  const ordersResponse = await axios.get<Order[]>(
+    `${ORDER_SERVICE_URL}/api/orders`,
+  );
+  const orderCount = ordersResponse.data.length;
+  return orderCount;
+}
+"#,
+    )
+    .unwrap();
+
+    let sidecar = TypeSidecar::spawn(&sidecar_path).expect("Failed to spawn sidecar");
+    sidecar.start_init(&repo, None);
+    sidecar
+        .wait_ready(Duration::from_secs(60))
+        .expect("Sidecar failed to initialize");
+
+    let alias = "Endpoint_4022e5b76e4552db_Response_Call8904b52acc58d4d6";
+    // The LLM-extracted anchor: bare element symbol, alias pre-claimed.
+    let explicit = vec![SymbolRequest {
+        symbol_name: "Order".to_string(),
+        source_file: repo.join("src/types.ts").to_string_lossy().to_string(),
+        alias: Some(alias.to_string()),
+        array_depth: None,
+    }];
+    // The LLM's compact single-line locator for the multi-line call.
+    let infer = vec![InferRequestItem {
+        file_path: repo.join("src/api.ts").to_string_lossy().to_string(),
+        line_number: 7,
+        span_start: None,
+        span_end: None,
+        expression_text: Some("axios.get<Order[]>(`${ORDER_SERVICE_URL}/api/orders`)".to_string()),
+        expression_line: Some(7),
+        infer_kind: InferKind::CallResult,
+        alias: Some(alias.to_string()),
+        param_name: None,
+    }];
+    let config = ExtractionConfig {
+        rules: vec![ExtractionRule {
+            wrapper_symbols: vec!["AxiosResponse".to_string()],
+            origin_module_globs: vec!["axios".to_string(), "axios/*".to_string()],
+            payload_generic_index: Some(0),
+            ..Default::default()
+        }],
+    };
+
+    let result = sidecar
+        .resolve_all_types(&explicit, &infer, Some(&config))
+        .expect("resolve_all_types failed");
+    let dts = result.dts_content.expect("expected bundled dts content");
+
+    // The bundled alias must be an array-form type alias. An
+    // `export interface` structurally cannot carry the depth — that is the
+    // exact live artifact this test locks out.
+    assert!(
+        !dts.contains(&format!("export interface {}", alias)),
+        "bundled alias must not render as a depth-less interface:\n{}",
+        dts
+    );
+    let alias_line = dts
+        .lines()
+        .find(|l| l.contains(&format!("export type {} =", alias)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an `export type {} = ...` alias in:\n{}",
+                alias, dts
+            )
+        });
+    assert!(
+        alias_line.trim_end().trim_end_matches(';').ends_with("[]"),
+        "bundled alias must keep the use-site array depth, got: {}",
+        alias_line
+    );
+
+    // And the definition the manifest stores (resolved_definition /
+    // expanded_definition) must resolve to the same array form.
+    let definitions = sidecar
+        .resolve_definitions(&dts, &[alias.to_string()])
+        .expect("resolve_definitions failed");
+    let def = definitions
+        .iter()
+        .find(|d| d.type_alias == alias)
+        .expect("expected a resolved definition for the consumer alias");
+    assert!(
+        def.definition
+            .trim_end()
+            .trim_end_matches(';')
+            .ends_with("[]"),
+        "resolved_definition dropped the array depth: {}",
+        def.definition
+    );
+    assert!(
+        def.expanded.trim_end().ends_with("[]"),
+        "expanded_definition dropped the array depth: {}",
+        def.expanded
+    );
+}
+
 // ============================================================================
 // Integration with Carrick CLI (when available)
 // ============================================================================
