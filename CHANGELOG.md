@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/daveymoores/carrick/compare/carrick-v0.2.3...carrick-v0.2.4) (2026-07-11)
+
+
+### Bug Fixes
+
+* **sidecar:** recover the consumer array depth for multi-line call sites ([#344](https://github.com/daveymoores/carrick/issues/344)) ([041e084](https://github.com/daveymoores/carrick/commit/041e08495f5fe9616f5f1730817257f790f2532c))
+
 ## [0.2.3](https://github.com/daveymoores/carrick/compare/carrick-v0.2.2...carrick-v0.2.3) (2026-07-11)
 
 
