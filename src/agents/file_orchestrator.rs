@@ -1805,12 +1805,16 @@ impl FileOrchestrator {
     /// (`/w/:slug`) dedupe to one entry instead of both surviving and flipping
     /// form between non-deterministic scans. `[id]` -> `:id`, `[...rest]` -> `**`;
     /// `:id`, `*`, and literal segments are left unchanged (idempotent).
+    /// Segment whitespace is trimmed and a whitespace-only path collapses to `/`:
+    /// the LLM emits root routes as `"/ "` and the space otherwise survives into
+    /// `full_path`, breaking matching both ways (#332).
     fn canonicalize_route_path(path: &str) -> String {
         let mut out = String::with_capacity(path.len());
         for (i, seg) in path.split('/').enumerate() {
             if i > 0 {
                 out.push('/');
             }
+            let seg = seg.trim();
             // Catch-all (`[...rest]`) and optional catch-all (`[[...rest]]`) both
             // map to the router's `**`; ordinary dynamic segments (`[id]`, `[[id]]`)
             // map to `:id`.
@@ -1828,6 +1832,10 @@ impl FileOrchestrator {
                 out.push_str(seg);
             }
         }
+        // Empty or whitespace-only input canonicalizes to the root route.
+        if out.chars().all(|c| c == '/') {
+            return "/".to_string();
+        }
         out
     }
 
@@ -1838,6 +1846,16 @@ impl FileOrchestrator {
             let canon = Self::canonicalize_route_path(&ep.path);
             if canon != ep.path {
                 ep.path = canon;
+            }
+        }
+        // Mount prefixes come from the same LLM pass and feed join_paths the
+        // same way; whitespace jitter there would poison every child full_path.
+        // Plain trim only: an empty mount path (`app.use(middleware)`) is
+        // meaningful and must not collapse to `/`.
+        for mount in &mut result.mounts {
+            let trimmed = mount.mount_path.trim();
+            if trimmed != mount.mount_path {
+                mount.mount_path = trimmed.to_string();
             }
         }
     }
@@ -1865,6 +1883,7 @@ impl FileOrchestrator {
                 endpoint.line_number = candidate.line_number as i32;
                 endpoint.call_expression_span_start = Some(candidate.span_start);
                 endpoint.call_expression_span_end = Some(candidate.span_end);
+                Self::reanchor_endpoint_path(&mut endpoint, candidate, file_path);
                 Some(endpoint)
             })
             .collect();
@@ -1901,6 +1920,68 @@ impl FileOrchestrator {
                 dropped_count
             );
         }
+    }
+
+    /// Re-anchor an LLM-emitted endpoint path to the registration call's
+    /// first-arg string literal when the two disagree (#332). For root routes
+    /// the LLM emits whitespace junk (`"/ "`) or copies a sibling route's path
+    /// (`"/:id"`); the literal at the candidate the endpoint already points at
+    /// is deterministic ground truth. An emitted path that merely EXTENDS the
+    /// literal at a segment boundary (`/api/v1/status` vs `/status`) is kept:
+    /// that is a constructor-carried prefix baked into the path, not a
+    /// mis-copy (join_paths' idempotent guard depends on it surviving).
+    fn reanchor_endpoint_path(
+        endpoint: &mut EndpointResult,
+        candidate: &CandidateTarget,
+        file_path: &str,
+    ) {
+        let Some(literal) = Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+        else {
+            return;
+        };
+        let canon_literal = Self::canonicalize_route_path(&literal);
+        let canon_path = Self::canonicalize_route_path(&endpoint.path);
+        if canon_literal == canon_path {
+            return;
+        }
+        // Baked-prefix escape hatch. A root literal never qualifies: every
+        // path trivially "ends with" `/`, and the observed mis-copies are
+        // exactly root routes.
+        if canon_literal != "/"
+            && let Some(rest) = canon_path.strip_suffix(&canon_literal)
+            && (rest.is_empty() || rest.ends_with('/') || canon_literal.starts_with('/'))
+        {
+            return;
+        }
+        warn!(
+            "[FileOrchestrator] Re-anchored endpoint path '{}' to registration literal '{}' ({}:{})",
+            endpoint.path, canon_literal, file_path, candidate.line_number
+        );
+        endpoint.path = canon_literal;
+    }
+
+    /// Extract the route path from a candidate's first-arg source snippet when
+    /// it is a plain single- or double-quoted string literal. Template
+    /// literals, arrays, escaped strings, and truncated snippets return None:
+    /// only an unambiguous literal may override the LLM-emitted path.
+    fn route_literal_from_snippet(snippet: Option<&str>) -> Option<String> {
+        let s = snippet?.trim();
+        let quote = s.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        if s.len() < 2 || !s.ends_with(quote) {
+            return None;
+        }
+        let inner = &s[1..s.len() - 1];
+        if inner.contains(quote) || inner.contains('\\') {
+            return None;
+        }
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return None;
+        }
+        Some(inner.to_string())
     }
 
     /// Rewrite data-call targets that interpolate an env-var base URL aliased
@@ -4191,6 +4272,140 @@ export { routes };
             "colon-form route should dedupe against the canonicalized LLM path"
         );
         assert_eq!(result.endpoints.len(), 1);
+    }
+
+    #[test]
+    fn test_canonicalize_route_path_trims_llm_whitespace() {
+        // The file-analyzer occasionally emits whitespace-jittered root routes
+        // ("/ "); the space must not survive into full_path where it breaks
+        // matching both ways (#332).
+        assert_eq!(FileOrchestrator::canonicalize_route_path("/ "), "/");
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path("/users "),
+            "/users"
+        );
+        assert_eq!(
+            FileOrchestrator::canonicalize_route_path(" /users"),
+            "/users"
+        );
+        // A whitespace-only or empty path is the root route.
+        assert_eq!(FileOrchestrator::canonicalize_route_path(" "), "/");
+        assert_eq!(FileOrchestrator::canonicalize_route_path(""), "/");
+    }
+
+    #[test]
+    fn test_root_route_with_whitespace_joins_to_mount_prefix() {
+        // A root route the LLM emitted as "/ " on a router mounted at
+        // /api/users must resolve to /api/users, not "/api/users/ " (#332).
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut result = FileAnalysisResult {
+            mounts: vec![MountResult {
+                line_number: 10,
+                parent_node: "app".to_string(),
+                child_node: "userRouter".to_string(),
+                mount_path: "/api/users".to_string(),
+                import_source: Some("./routes/users".to_string()),
+                pattern_matched: ".use(".to_string(),
+            }],
+            endpoints: vec![{
+                let mut ep = synthetic_endpoint("GET", "/ ");
+                ep.owner_node = "userRouter".to_string();
+                ep
+            }],
+            ..Default::default()
+        };
+
+        // Ingestion order mirrors analyze_files: canonicalize, then graph build.
+        FileOrchestrator::canonicalize_endpoint_paths(&mut result);
+
+        let mut file_results = HashMap::new();
+        file_results.insert("src/app.ts".to_string(), result);
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+
+        assert_eq!(graph.endpoints.len(), 1);
+        assert_eq!(graph.endpoints[0].full_path, "/api/users");
+    }
+
+    fn candidate_with_snippet(id: &str, snippet: Option<&str>) -> CandidateTarget {
+        CandidateTarget {
+            protocol: crate::operation::Protocol::Http,
+            candidate_id: id.to_string(),
+            span_start: 100,
+            span_end: 140,
+            line_number: 12,
+            callee_object: "router".to_string(),
+            callee_property: Some("get".to_string()),
+            enclosing_function: None,
+            path_snippet: snippet.map(|s| s.to_string()),
+            code_snippet: "router.get(...)".to_string(),
+        }
+    }
+
+    fn endpoint_with_candidate(path: &str, candidate_id: &str) -> EndpointResult {
+        let mut ep = synthetic_endpoint("GET", path);
+        ep.candidate_id = candidate_id.to_string();
+        ep
+    }
+
+    #[test]
+    fn test_apply_candidate_map_reanchors_path_to_registration_literal() {
+        // #332: for a root route the LLM copied the sibling route's path
+        // ("/:id"). The first-arg string literal at the candidate the endpoint
+        // already points at is deterministic ground truth, so it wins.
+        let mut result = FileAnalysisResult {
+            endpoints: vec![endpoint_with_candidate("/:id", "c1")],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            candidate_with_snippet("c1", Some("\"/\"")),
+        );
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "routes/orders.ts");
+        assert_eq!(result.endpoints[0].path, "/");
+    }
+
+    #[test]
+    fn test_apply_candidate_map_keeps_path_that_extends_the_literal() {
+        // A constructor-carried prefix baked into the emitted path extends the
+        // registration literal at a segment boundary. That is not a mis-copy;
+        // it must survive (join_paths' idempotent guard depends on it).
+        let mut result = FileAnalysisResult {
+            endpoints: vec![endpoint_with_candidate("/api/v1/status", "c1")],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            candidate_with_snippet("c1", Some("'/status'")),
+        );
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/app.ts");
+        assert_eq!(result.endpoints[0].path, "/api/v1/status");
+    }
+
+    #[test]
+    fn test_apply_candidate_map_ignores_non_literal_snippets() {
+        // Template literals, expressions, and absent snippets are ambiguous;
+        // only a plain quoted literal may override the emitted path.
+        let mut result = FileAnalysisResult {
+            endpoints: vec![
+                endpoint_with_candidate("/x/:y", "c1"),
+                endpoint_with_candidate("/a", "c2"),
+            ],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            candidate_with_snippet("c1", Some("`/x/${y}`")),
+        );
+        candidate_map.insert("c2".to_string(), candidate_with_snippet("c2", None));
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/app.ts");
+        assert_eq!(result.endpoints[0].path, "/x/:y");
+        assert_eq!(result.endpoints[1].path, "/a");
     }
 
     /// `collect_pubsub_type_requests` walks a `HashMap<String, _>`, whose
