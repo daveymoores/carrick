@@ -295,7 +295,7 @@ fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
 }
 
-/// Strip the GitHub Actions checkout prefix (`/home/runner/work/<owner>/<repo>/`)
+/// Strip the GitHub Actions checkout prefix (`/home/runner/work/<repo>/<repo>/`)
 /// from a call-site location so PR-comment risk rows cite `server.ts:66`, not
 /// the runner's absolute workspace path (#337). Anything else (local absolute
 /// paths, already-relative paths) passes through unchanged.

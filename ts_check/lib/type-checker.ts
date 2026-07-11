@@ -188,7 +188,7 @@ export class TypeCompatibilityChecker {
       // (normalize_compat_path collapses both sides back to `:param`).
       // Non-HTTP matches keep the key (`DIRECTION|event`, `kind|field`, topic).
       const displayPath =
-        match.producer.protocol === 'http' && match.producer.path
+        match.producer.protocol === "http" && match.producer.path
           ? match.producer.path
           : match.path;
       const endpoint = `${match.method} ${displayPath} (${match.type_kind})`;
