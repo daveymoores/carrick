@@ -2200,12 +2200,21 @@ export class TypeInferrer {
 
     // Fall back to substring match
     // For the reverse direction (target contains node text), require a minimum node text
-    // length to avoid matching tiny identifiers like "res" or "body" too broadly
+    // length to avoid matching tiny identifiers like "res" or "body" too broadly.
+    // Also require the node to cover at least half of the target: the reverse
+    // branch exists for a locator with minor syntactic drift around the true
+    // node, not for binding to a fragment. Without the floor, a 100+ char
+    // locator whose exact match failed would bind to the smallest embedded
+    // sub-expression (pickBestMatch prefers small nodes), e.g. the 8-char
+    // literal "active" inside a res.json object payload (#335).
     const MIN_REVERSE_MATCH_LEN = 8;
+    const MIN_REVERSE_MATCH_COVERAGE = 0.5;
     const substringMatches = candidates.filter(
       (c) =>
         c.text.includes(normalizedTarget) ||
-        (c.text.length >= MIN_REVERSE_MATCH_LEN && normalizedTarget.includes(c.text))
+        (c.text.length >= MIN_REVERSE_MATCH_LEN &&
+          c.text.length >= normalizedTarget.length * MIN_REVERSE_MATCH_COVERAGE &&
+          normalizedTarget.includes(c.text))
     );
 
     if (substringMatches.length > 0) {
@@ -2252,9 +2261,18 @@ export class TypeInferrer {
   /**
    * Normalize whitespace for text comparison:
    * collapse runs of whitespace into single spaces, trim.
+   *
+   * Also strips trailing commas before `}` `)` `]`: multi-line source
+   * literals carry them but the LLM's single-line locator print does not,
+   * and that one comma used to defeat exact AND containment matching for
+   * the payload and every enclosing node (#335). Applied symmetrically to
+   * node text and target, so both sides compare equal.
    */
   private normalizeWhitespace(text: string): string {
-    return text.replace(/\s+/g, ' ').trim();
+    return text
+      .replace(/\s+/g, ' ')
+      .replace(/\s*,?\s*([}\)\]])/g, '$1')
+      .trim();
   }
 
   /**
