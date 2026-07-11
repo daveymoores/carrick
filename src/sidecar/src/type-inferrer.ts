@@ -617,17 +617,28 @@ export class TypeInferrer {
     typeString = this.unwrapPromise(typeString, returnType);
 
     // #336: consumer analogue of the #306 producer anchor. Anchor on the
-    // actual payload (the rule-extracted Type, else the awaited use-site
+    // CALL's own payload (the rule-extracted Type, else the awaited call
     // type), peeling array levels to the element symbol + depth. Without the
     // depth, `apply_inferred_array_depth` (Rust) has nothing to copy onto the
     // explicit SymbolRequest that pre-claims this alias, and the bundle for
     // `axios.get<Order[]>` renders the bare `Order` interface with the `[]`
-    // gone. A wrapper that unwrapped to no single payload (union join,
-    // verified machinery) carries no payloadType and anchors nothing; the
-    // wrapper's own symbol must never anchor.
-    const anchorSource = unwrapResult.wasUnwrapped
-      ? unwrapResult.payloadType
-      : this.unwrapPromiseType(returnType);
+    // gone. The anchor must come from the call expression, NOT the terminal
+    // node: the def-use walk follows the binding to its last use, and in the
+    // live repro that is `ordersResponse.data.length` — a `number` with no
+    // symbol and no depth — while the response contract the manifest alias
+    // describes is the call's payload (`Order[]`). A wrapper that unwrapped
+    // to no single payload (union join, verified machinery) carries no
+    // payloadType and anchors nothing; the wrapper's own symbol must never
+    // anchor via that path.
+    const callPayloadType = this.unwrapPromiseType(callExpr.getType());
+    const callUnwrap = this.unwrapTypeWithConfig(
+      callPayloadType,
+      callExpr,
+      extractionConfig
+    );
+    const anchorSource = callUnwrap.wasUnwrapped
+      ? callUnwrap.payloadType
+      : callPayloadType;
     const anchor = anchorSource
       ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
       : undefined;
@@ -2306,11 +2317,19 @@ export class TypeInferrer {
    * and that one comma used to defeat exact AND containment matching for
    * the payload and every enclosing node (#335). Applied symmetrically to
    * node text and target, so both sides compare equal.
+   *
+   * Also strips the space left AFTER `(` `[` `{` by the collapse: a
+   * multi-line call whose arguments start on the next line normalizes to
+   * `f( x)` while the LLM's compact print is `f(x)`, and that one space
+   * defeated exact matching for the call and every enclosing node — the
+   * opening-delimiter mirror of the #335 trailing comma (#336). Symmetric
+   * for the same reason.
    */
   private normalizeWhitespace(text: string): string {
     return text
       .replace(/\s+/g, ' ')
       .replace(/\s*,?\s*([}\)\]])/g, '$1')
+      .replace(/([\(\[{])\s+/g, '$1')
       .trim();
   }
 

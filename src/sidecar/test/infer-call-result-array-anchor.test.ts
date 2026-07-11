@@ -17,6 +17,7 @@ import { SidecarClient, FIXTURES_PATH } from './helpers.js';
 
 const FIXTURE = path.join(FIXTURES_PATH, 'src/wrapper-usage.ts');
 const OPAQUE_FIXTURE = path.join(FIXTURES_PATH, 'src/wrapper-opaque.ts');
+const MULTILINE_FIXTURE = path.join(FIXTURES_PATH, 'src/wrapper-multiline.ts');
 
 /** Byte span of `text` in the fixture (ASCII-only file, so byte == char offsets). */
 function spanOf(
@@ -237,5 +238,99 @@ describe('call_result array payloads anchor on the element symbol with array_dep
       undefined,
       `a scalar must not report an array_depth, got ${inferred.array_depth}`
     );
+  });
+
+  // #336 reopened: the live repro is a MULTI-LINE `axios.get<Order[]>(` call
+  // whose binding is last used as a scalar projection (`.data.length`). Both
+  // halves of that shape used to lose the anchor:
+  //  - the LLM's compact single-line locator failed exact matching (the
+  //    normalized node text keeps a space after `(`), so the fallback bound a
+  //    fragment inside the call instead of the call, and
+  //  - even with the call found, the terminal-use walk anchored on `number`
+  //    (no symbol, no depth) instead of the call's own payload.
+  const MULTILINE_RULES = [
+    {
+      wrapperSymbols: ['ApiResponse'],
+      originModuleGlobs: ['wrapper-lib', 'wrapper-lib/*'],
+      payloadGenericIndex: 0,
+    },
+  ];
+
+  it('multi-line call located by the single-line LLM print → anchor OrderData, depth 1 (#336 live shape)', async () => {
+    const callStart = spanOf('apiGetOrders<OrderData[]>(', MULTILINE_FIXTURE);
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'call-arr-multiline-text',
+      extraction_config: { rules: MULTILINE_RULES },
+      requests: [
+        {
+          file_path: MULTILINE_FIXTURE,
+          line_number: callStart.line,
+          infer_kind: 'call_result',
+          // The LLM prints the call compactly on one line; the source spreads
+          // it over three lines with a trailing comma.
+          expression_text:
+            'apiGetOrders<OrderData[]>(`${ORDER_SERVICE_URL}/api/orders`)',
+          expression_line: callStart.line,
+          alias: 'OrderArrayMultilineConsumer',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'OrderArrayMultilineConsumer'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.primary_type_symbol,
+      'OrderData',
+      `anchor must be the call payload's element symbol, got ${JSON.stringify(inferred.primary_type_symbol)} (type_string: ${JSON.stringify(inferred.type_string)})`
+    );
+    assert.strictEqual(
+      inferred.array_depth,
+      1,
+      'without the depth the explicit bundle renders the bare element and the [] is erased'
+    );
+  });
+
+  it('terminal scalar use (`.data.length`) must not erase the call payload anchor (span locator)', async () => {
+    const source = fs.readFileSync(MULTILINE_FIXTURE, 'utf-8');
+    const start = source.indexOf('apiGetOrders<OrderData[]>(');
+    assert.ok(start >= 0, 'fixture must contain the multi-line call');
+    const end = source.indexOf(');', start) + 1;
+    const line = source.slice(0, start).split('\n').length;
+
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'call-arr-multiline-span',
+      extraction_config: { rules: MULTILINE_RULES },
+      requests: [
+        {
+          file_path: MULTILINE_FIXTURE,
+          line_number: line,
+          span_start: start,
+          span_end: end,
+          infer_kind: 'call_result',
+          alias: 'OrderArraySpanConsumer',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'OrderArraySpanConsumer'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.primary_type_symbol,
+      'OrderData',
+      `anchor must come from the call's payload, not the terminal use, got ${JSON.stringify(inferred.primary_type_symbol)} (type_string: ${JSON.stringify(inferred.type_string)})`
+    );
+    assert.strictEqual(inferred.array_depth, 1);
   });
 });
