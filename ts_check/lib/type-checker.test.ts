@@ -1114,6 +1114,55 @@ describe('TypeCompatibilityChecker', () => {
       );
     });
 
+    it('labels an HTTP mismatch with the producer declared path, not the normalized :param form (#337)', async () => {
+      // The matcher keys HTTP matches on the normalized consumer path, which
+      // collapses every param name to `:param`. The mismatch label built from
+      // that key rendered `GET /api/orders/:param` in the PR-comment risk row
+      // while the Verified table showed the declared `GET /api/orders/:id`.
+      // The label must carry the producer's declared route; the Rust
+      // verdict-join is param-name-agnostic (normalize_compat_path collapses
+      // both sides back to `:param`), so the declared name is join-safe.
+      const typesProject = new Project({
+        compilerOptions: { strict: true, skipLibCheck: true },
+      });
+      typesProject.createSourceFile(
+        'types.d.ts',
+        `
+        export type OrderResponse = { id: number };
+        export type OrderView = { id: string };
+        `,
+        { overwrite: true }
+      );
+
+      const producers: TypeManifest = {
+        repo_name: 'orders-svc',
+        commit_hash: 'abc',
+        entries: [
+          createManifestEntry('GET', '/api/orders/:id', 'OrderResponse', 'producer', 'routes.ts', 10),
+        ],
+      };
+      const consumers: TypeManifest = {
+        repo_name: 'web-frontend',
+        commit_hash: 'def',
+        entries: [
+          createManifestEntry('GET', '/api/orders/:orderId', 'OrderView', 'consumer', 'api.ts', 5),
+        ],
+      };
+
+      const result = await typeChecker.checkCompatibility(
+        producers,
+        consumers,
+        typesProject
+      );
+
+      assert.strictEqual(result.mismatches.length, 1);
+      assert.strictEqual(
+        result.mismatches[0].endpoint,
+        'GET /api/orders/:id (response)',
+        `the mismatch label must carry the declared param name, got: ${result.mismatches[0].endpoint}`
+      );
+    });
+
     it('reads a dangling consumer name as unverifiable but its structural shape as incompatible (#257)', async () => {
       // The #257 inference bug: a consumer like `res.json() as Promise<OrderView>`
       // wrote the bare NAME `= OrderView` into the cross-repo bundle. The bundle
