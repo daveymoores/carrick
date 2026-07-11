@@ -142,6 +142,15 @@ interface UnwrapResult {
   isExplicit: boolean;
   /** Whether unwrapping was actually performed */
   wasUnwrapped: boolean;
+  /**
+   * The single recovered payload `Type`, when a rule extracted one (#336).
+   * The anchor symbol + array depth must be derived from the PAYLOAD, not the
+   * wrapper: `axios.get<Order[]>` resolves to `AxiosResponse<Order[]>`, whose
+   * own symbol is the wrapper and whose array-ness lives one level down.
+   * Absent when nothing was unwrapped, when a union joined several payloads,
+   * or when verified machinery collapsed to `unknown`.
+   */
+  payloadType?: Type;
 }
 
 /**
@@ -607,12 +616,30 @@ export class TypeInferrer {
 
     typeString = this.unwrapPromise(typeString, returnType);
 
+    // #336: consumer analogue of the #306 producer anchor. Anchor on the
+    // actual payload (the rule-extracted Type, else the awaited use-site
+    // type), peeling array levels to the element symbol + depth. Without the
+    // depth, `apply_inferred_array_depth` (Rust) has nothing to copy onto the
+    // explicit SymbolRequest that pre-claims this alias, and the bundle for
+    // `axios.get<Order[]>` renders the bare `Order` interface with the `[]`
+    // gone. A wrapper that unwrapped to no single payload (union join,
+    // verified machinery) carries no payloadType and anchors nothing; the
+    // wrapper's own symbol must never anchor.
+    const anchorSource = unwrapResult.wasUnwrapped
+      ? unwrapResult.payloadType
+      : this.unwrapPromiseType(returnType);
+    const anchor = anchorSource
+      ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
+      : undefined;
+
     return this.createInferredType(
       request,
       typeString,
       isExplicit,
       this.getNodeLocation(terminalNode),
-      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
+      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
+      anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
+      anchor?.depth
     );
   }
 
@@ -1321,11 +1348,20 @@ export class TypeInferrer {
   ): UnwrapResult | null {
     // The outer extraction already succeeded on the paths below; a recursive
     // inner pass that finds nothing more must not demote the result back to
-    // "not unwrapped" (which would discard the recovered payload).
-    const recurse = (payload: Type): UnwrapResult => ({
-      ...this.unwrapType(payload, node, config, depth + 1),
-      wasUnwrapped: true,
-    });
+    // "not unwrapped" (which would discard the recovered payload). Only when
+    // the inner pass unwrapped NOTHING is this level's payload the recovered
+    // type; an inner pass that did unwrap already decided its own payloadType,
+    // and its absence is deliberate — a union join has no single payload, and
+    // a verified-machinery collapse to `unknown` recovered none, so this
+    // level's (wrapper-shaped) payload must not resurface as an anchor.
+    const recurse = (payload: Type): UnwrapResult => {
+      const inner = this.unwrapType(payload, node, config, depth + 1);
+      return {
+        ...inner,
+        wasUnwrapped: true,
+        payloadType: inner.wasUnwrapped ? inner.payloadType : payload,
+      };
+    };
 
     // 1. Try generic type argument at payloadGenericIndex
     const genericIndex = rule.payloadGenericIndex ?? 0;
@@ -1345,6 +1381,7 @@ export class TypeInferrer {
           typeString: argText,
           isExplicit: true,
           wasUnwrapped: true,
+          payloadType: payloadArg,
         };
       }
 
@@ -1360,6 +1397,7 @@ export class TypeInferrer {
             typeString: text,
             isExplicit: true,
             wasUnwrapped: true,
+            payloadType: argType,
           };
         }
       }
@@ -1388,6 +1426,7 @@ export class TypeInferrer {
             typeString: propText,
             isExplicit: false,
             wasUnwrapped: true,
+            payloadType: currentType,
           };
         }
       }
