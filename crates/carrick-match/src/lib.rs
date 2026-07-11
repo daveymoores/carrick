@@ -85,6 +85,13 @@ fn path_matches_with_params(endpoint_path: &str, call_path: &str) -> bool {
         // syntaxes (`{id}`, `<id>`, `[id]`) so that routes captured verbatim from
         // frameworks that don't use Express-style colons still match cross-repo.
         if is_param_segment(seg) || is_param_segment(call_seg) {
+            // A param stands in for a real path value; an empty or
+            // whitespace-only segment on the other side is not one. Without
+            // this guard a route indexed with a stray blank segment (#332,
+            // "/api/users/ ") reads as satisfying "/api/users/:userId".
+            if seg.trim().is_empty() || call_seg.trim().is_empty() {
+                return false;
+            }
             continue;
         }
 
@@ -223,6 +230,30 @@ mod tests {
         assert!(path_matches_with_wildcards("/files/**", "/files/foo"));
         assert!(path_matches_with_wildcards("/files/**", "/files/foo/bar"));
         assert!(!path_matches_with_wildcards("/files/*slug", "/files/foo"));
+    }
+
+    #[test]
+    fn test_param_never_matches_empty_or_whitespace_segment() {
+        // Regression (#333): an endpoint whose full_path carried a trailing
+        // whitespace segment ("/api/users/ ", see #332) matched the consumer
+        // call "/api/users/:userId" because a param on either side skipped the
+        // comparison entirely. A param stands in for a real path value, and an
+        // empty or whitespace segment is not one.
+        assert!(!path_matches_with_params(
+            "/api/users/ ",
+            "/api/users/:userId"
+        ));
+        assert!(!path_matches_with_params(
+            "/api/users/:userId",
+            "/api/users/ "
+        ));
+        assert!(!path_matches_with_params(
+            "/api/users/",
+            "/api/users/:userId"
+        ));
+        assert!(!paths_match("/api/users/ ", "/api/users/:userId"));
+        // Real values still match a param on the other side.
+        assert!(path_matches_with_params("/api/users/:id", "/api/users/123"));
     }
 
     #[test]
