@@ -2413,12 +2413,24 @@ export class TypeInferrer {
     spanStart: number,
     spanEnd: number
   ): CallExpression | undefined {
+    // Tolerate the SWC span convention (#336): the scanner sends raw SWC
+    // BytePos offsets, which are 1-based (BytePos(1) is the file's first
+    // byte), while ts-morph offsets are 0-based — so an SWC-sourced span
+    // sits one byte past the call on BOTH ends. Under strict containment the
+    // shifted end overshoots the call's own end, the true call is excluded,
+    // and the smallest ENCLOSING call wins: for a data call inside a route
+    // registration that is the whole `router.get("/status", handler)`
+    // expression, anchoring the router type instead of the payload. The
+    // slack admits both conventions; the size-delta pick below still prefers
+    // the call whose extent matches the span, so the exactly-covered inner
+    // call always beats its enclosing registration.
+    const SPAN_SLACK = 2;
     const callExpressions = sourceFile
       .getDescendantsOfKind(SyntaxKind.CallExpression);
     const candidates = callExpressions.filter((expr) => {
       const start = expr.getStart();
       const end = expr.getEnd();
-      return start <= spanStart && spanEnd <= end;
+      return start - SPAN_SLACK <= spanStart && spanEnd <= end + SPAN_SLACK;
     });
 
     if (candidates.length === 0) {
