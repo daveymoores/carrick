@@ -227,7 +227,6 @@ impl MountGraph {
     ///
     /// This is the basic matching method that does not perform URL normalization.
     /// For cross-service matching with full URLs, use `find_matching_endpoints_normalized`.
-    #[allow(dead_code)]
     pub fn find_matching_endpoints(&self, path: &str, method: &str) -> Vec<&ResolvedEndpoint> {
         self.endpoints
             .iter()

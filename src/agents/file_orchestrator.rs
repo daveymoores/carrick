@@ -2622,6 +2622,42 @@ impl FileOrchestrator {
         // Sixth pass: resolve full paths for endpoints
         self.resolve_endpoint_paths(&mut graph);
 
+        // Seventh pass: suppress self-calls. A data call whose (method, canonical
+        // path) matches one of THIS service's own resolved endpoints is the
+        // service hitting its own HTTP surface (e.g. a cron/reindex job fetching
+        // `http://localhost:PORT/warehouses/:id/stock/:sku`), not a cross-repo
+        // dependency. Emitting it would (a) inject a spurious self producer↔
+        // consumer edge and (b) leak an operation the service already exposes as
+        // a producer. The mount graph is built per service, so a call matching an
+        // endpoint in the SAME graph is necessarily intra-service; a genuine
+        // cross-service-same-repo call lives in a different service's graph and is
+        // untouched. Runs after path resolution so the endpoint `full_path`s are
+        // final, and matches param-aware (`find_matching_endpoints`) so a
+        // canonicalized `/warehouses/:wid/...` still matches a declared
+        // `/warehouses/:warehouseId/...`. This is only reachable once the literal
+        // origin is stripped from the call key (see `consumer_call_path`); a raw
+        // `http://host:port/...` key matches no endpoint and would evade it.
+        let keep_call: Vec<bool> = graph
+            .data_calls
+            .iter()
+            .map(|call| {
+                let is_self_call = !graph
+                    .find_matching_endpoints(&call.canonical_path, &call.method)
+                    .is_empty();
+                if is_self_call {
+                    debug!(
+                        "Suppressing self-call to own endpoint: {} {} ({})",
+                        call.method, call.canonical_path, call.file_location
+                    );
+                }
+                !is_self_call
+            })
+            .collect();
+        let mut keep_iter = keep_call.into_iter();
+        graph
+            .data_calls
+            .retain(|_| keep_iter.next().unwrap_or(true));
+
         graph
     }
 
@@ -3233,6 +3269,91 @@ mod tests {
             "https://api.example.com/data"
         );
         assert_eq!(graph.data_calls[0].method, "POST");
+    }
+
+    /// A data call to the service's OWN endpoint (same mount graph) is a
+    /// self-call — the service hitting its own HTTP surface — and must be
+    /// dropped so it neither leaks as an indexed consumer op nor forms a
+    /// spurious self producer↔consumer edge. The literal `http://localhost:PORT`
+    /// origin is stripped to a bare param path (`consumer_call_path`), which then
+    /// matches the declared endpoint param-aware (`:wid` ≡ `:warehouseId`). A
+    /// call to a DIFFERENT path survives. Fails before the origin-strip +
+    /// suppression pass: both calls' keys keep the raw `http://host:port/...`
+    /// origin, so nothing matches the endpoint and both survive (len == 2).
+    #[test]
+    fn test_build_mount_graph_suppresses_self_calls() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mk_call = |id: &str, target: &str| DataCallResult {
+            call_kind: None,
+            candidate_id: id.to_string(),
+            line_number: 7,
+            target: target.to_string(),
+            method: Some("GET".to_string()),
+            pattern_matched: "fetch(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/app.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![EndpointResult {
+                    candidate_id: "span:1-40".to_string(),
+                    line_number: 5,
+                    owner_node: "app".to_string(),
+                    method: "GET".to_string(),
+                    path: "/warehouses/:warehouseId/stock/:sku".to_string(),
+                    handler_name: "getStock".to_string(),
+                    pattern_matched: ".get(".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                }],
+                data_calls: vec![
+                    // Self-call to the service's own endpoint over localhost.
+                    mk_call(
+                        "span:100-160",
+                        "http://localhost:4002/warehouses/${wid}/stock/${sku}",
+                    ),
+                    // Genuine outbound call to a different path — survives.
+                    mk_call("span:200-260", "http://localhost:9000/catalog/${id}"),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+            },
+        );
+
+        let graph =
+            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+
+        let call_paths: Vec<&str> = graph
+            .data_calls
+            .iter()
+            .map(|c| c.canonical_path.as_str())
+            .collect();
+        assert_eq!(
+            graph.data_calls.len(),
+            1,
+            "self-call must be suppressed, surviving calls: {call_paths:?}"
+        );
+        assert_eq!(graph.data_calls[0].canonical_path, "/catalog/:id");
     }
 
     /// #307 (class 1): a wrapper-internal call whose canonical path is nothing

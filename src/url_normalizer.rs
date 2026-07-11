@@ -103,6 +103,23 @@ impl UrlNormalizer {
             return self.normalize_env_var_pattern(url, original);
         }
 
+        // Handle full URLs with a LITERAL absolute origin (`scheme://host[:port]`)
+        // BEFORE the `process.env`/`${` branches. A target like
+        // `http://localhost:4002/warehouses/${wid}/stock/${sku}` contains `${`,
+        // so the interpolation branch would fire first and never strip the
+        // literal origin — the host `localhost:4002` would survive into the key.
+        // Dispatching on the concrete scheme prefix first strips the origin and
+        // then converts any `${...}` PATH interpolations to `:param`, so the key
+        // is a bare comparable path (`/warehouses/:wid/stock/:sku`).
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return self.normalize_full_url(url, original);
+        }
+
+        // Handle protocol-relative URLs (//domain.com/path)
+        if url.starts_with("//") {
+            return self.normalize_protocol_relative_url(url, original);
+        }
+
         // Handle process.env patterns (e.g., process.env.API_URL + "/users")
         if url.contains("process.env.") {
             return self.normalize_process_env_pattern(url, original);
@@ -111,16 +128,6 @@ impl UrlNormalizer {
         // Handle template literal interpolations (e.g., ${API_URL}/users/${id})
         if url.contains("${") {
             return self.normalize_template_literal(url, original);
-        }
-
-        // Handle full URLs with protocol
-        if url.starts_with("http://") || url.starts_with("https://") {
-            return self.normalize_full_url(url, original);
-        }
-
-        // Handle protocol-relative URLs (//domain.com/path)
-        if url.starts_with("//") {
-            return self.normalize_protocol_relative_url(url, original);
         }
 
         // Already a path - just clean it up
@@ -380,6 +387,14 @@ impl UrlNormalizer {
         let is_internal = self.is_internal_host(&host);
         let is_external = self.is_external_host(&host);
 
+        // Convert any `${...}` PATH interpolations to `:param` so a literal
+        // absolute URL with template path segments
+        // (`http://host:port/warehouses/${wid}/stock/${sku}`) yields a bare
+        // comparable path (`/warehouses/:wid/stock/:sku`), not a key that still
+        // carries the raw interpolation. `clean_path` drops the query string
+        // first, so a query-only interpolation never reaches this.
+        let path = self.convert_interpolations_to_params(&path);
+
         NormalizedUrl {
             path: self.clean_path(&path),
             is_internal,
@@ -490,18 +505,32 @@ impl UrlNormalizer {
         self.normalize(url).path
     }
 
-    /// Canonical path to key a CONSUMER data call on. Strips the host ONLY for a
-    /// declared-internal env-var base (carrick.json `internalEnvVars`) or a plain
-    /// relative path (no host). External/unknown-base and full-URL targets are
-    /// returned VERBATIM, so (a) a third-party call can't collide with an internal
-    /// producer's path, (b) the "unclassified env var" config-suggestion still sees
-    /// the raw var, and (c) a full URL with a query interpolation
-    /// (`https://h/p?u=${id}`) is not mangled into `/https:/h/p`.
+    /// Canonical path to key a CONSUMER data call on. Strips the origin for:
+    /// a declared-internal env-var base (carrick.json `internalEnvVars`), a plain
+    /// relative path (no host), or a LITERAL absolute URL
+    /// (`scheme://host[:port]/path`, incl. protocol-relative `//host/path`) — the
+    /// origin of a concrete URL is a structural prefix, so stripping it never
+    /// depends on a hostname allowlist. This is what lets a service's self-call
+    /// over its own `http://localhost:PORT/...` surface canonicalize to the bare
+    /// path and match its own endpoint (a literal origin that survived into the
+    /// key could match nothing and evaded the self-call / decoy checks).
+    ///
+    /// An UNKNOWN/undeclared env-var BASE (`${SOME_URL}/charges`, not in
+    /// `internalEnvVars`) is still returned VERBATIM: there is no concrete origin
+    /// to strip, so keeping the raw `${VAR}` (a) prevents a third-party call from
+    /// colliding with an internal producer's path and (b) lets the "unclassified
+    /// env var" config-suggestion still see the raw var.
+    ///
+    /// The raw target is always retained separately on the call (`target_url`)
+    /// for per-call classification/display; only the MATCH key is canonicalized.
     pub fn consumer_call_path(&self, url: &str) -> String {
         let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
         let is_relative_path = trimmed.starts_with('/') && !trimmed.starts_with("//");
+        let is_absolute_url = trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("//");
         let normalized = self.normalize(url);
-        if normalized.is_internal || is_relative_path {
+        if normalized.is_internal || is_relative_path || is_absolute_url {
             normalized.path
         } else {
             url.to_string()
@@ -943,18 +972,30 @@ mod tests {
         // Plain relative path: kept as its clean path.
         assert_eq!(normalizer.consumer_call_path("/track"), "/track");
 
-        // Unknown/external base (STRIPE_URL is not in internalEnvVars): VERBATIM,
-        // so a third-party call can't collide with an internal producer's path
-        // and the "unclassified env var" config-suggestion still sees the raw var.
+        // Unknown/external env-var base (STRIPE_URL is not in internalEnvVars):
+        // VERBATIM, so a third-party call can't collide with an internal
+        // producer's path and the "unclassified env var" config-suggestion still
+        // sees the raw var. There is no concrete origin to strip here.
         assert_eq!(
             normalizer.consumer_call_path("${process.env.STRIPE_URL}/charges"),
             "${process.env.STRIPE_URL}/charges"
         );
 
-        // A full URL with a query interpolation is kept verbatim, not mangled.
+        // A LITERAL absolute URL has its origin (`scheme://host[:port]`) stripped
+        // for the key even with a query interpolation — the origin of a concrete
+        // URL is a structural prefix, so this needs no hostname allowlist. The raw
+        // target is retained separately on the call (`target_url`) for
+        // classification; only the match key is canonicalized. This is what lets a
+        // self-call over the service's own `http://localhost:PORT/...` surface
+        // canonicalize to its bare path and match its own endpoint.
         assert_eq!(
             normalizer.consumer_call_path("https://orders.internal/api/orders?user=${userId}"),
-            "https://orders.internal/api/orders?user=${userId}"
+            "/api/orders"
+        );
+        // A literal origin with `${...}` PATH segments → bare param path.
+        assert_eq!(
+            normalizer.consumer_call_path("http://localhost:4002/warehouses/${wid}/stock/${sku}"),
+            "/warehouses/:wid/stock/:sku"
         );
 
         // A declared-internal base with a param interpolation collapses to a clean
