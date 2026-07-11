@@ -147,7 +147,16 @@ impl EvalProjection {
         // behaves identically for Kafka/Redis/NATS/RabbitMQ and socket events. A
         // key that any OTHER repo also touches (fan-in/fan-out), or that a single
         // repo only produces OR only consumes (an orphan), is left untouched.
-        let self_loop_keys = Self::intra_repo_self_loop_keys(result);
+        let self_loops = Self::intra_repo_self_loops(result);
+        // Drop an op only when its OWN repo attribution matches the self-loop
+        // repo for its key. An op with no attribution is undecidable (it might
+        // belong to a different, untagged repo) and is kept — mirroring the
+        // skip in `intra_repo_self_loops`.
+        let is_self_loop_op = |d: &&ApiEndpointDetails| {
+            self_loops.get(&d.key.canonical()).is_some_and(|loop_repo| {
+                d.service_name.as_deref().or(d.repo_name.as_deref()) == Some(loop_repo)
+            })
+        };
         Self {
             // `endpoints` are producers and `calls` are consumers; the role
             // selects which manifest slot each op joins to. A shared canonical
@@ -159,13 +168,13 @@ impl EvalProjection {
             endpoints: result
                 .endpoints
                 .iter()
-                .filter(|d| !self_loop_keys.contains(&d.key.canonical()))
+                .filter(|d| !is_self_loop_op(d))
                 .map(|d| EvalOp::from_details(d, &manifest_index, ManifestRole::Producer))
                 .collect(),
             calls: result
                 .calls
                 .iter()
-                .filter(|d| !self_loop_keys.contains(&d.key.canonical()))
+                .filter(|d| !is_self_loop_op(d))
                 .map(|d| EvalOp::from_details(d, &manifest_index, ManifestRole::Consumer))
                 .collect(),
             cross_repo_matches,
@@ -173,15 +182,17 @@ impl EvalProjection {
         }
     }
 
-    /// Canonical keys of exact-key (non-HTTP) operations that are pure intra-repo
-    /// self-loops: produced AND consumed within a single repo, with no other repo
-    /// on the key. Those ops are filtered out of the cross-repo projection.
+    /// Pure intra-repo self-loops among exact-key (non-HTTP) operations:
+    /// canonical key → the single repo that both produces AND consumes it, with
+    /// no other repo on the key. The projection filters out the ops of that repo
+    /// on that key.
     ///
     /// HTTP ops are excluded — they get repo provenance from the mount graph, not
     /// from `repo_name`, and localhost self-calls are already dropped at
     /// extraction. A non-HTTP op with no repo attribution is skipped (self-loop is
-    /// undecidable without both repo ids).
-    fn intra_repo_self_loop_keys(result: &ApiAnalysisResult) -> std::collections::HashSet<String> {
+    /// undecidable without both repo ids), on both sides: it neither votes here
+    /// nor gets dropped by the filter.
+    fn intra_repo_self_loops(result: &ApiAnalysisResult) -> HashMap<String, String> {
         use std::collections::HashSet;
         let mut producer_repos: HashMap<String, HashSet<&str>> = HashMap::new();
         let mut consumer_repos: HashMap<String, HashSet<&str>> = HashMap::new();
@@ -198,17 +209,18 @@ impl EvalProjection {
                 }
             }
         }
-        let mut drop_keys = HashSet::new();
+        let mut self_loops = HashMap::new();
         for (key, producers) in &producer_repos {
             let Some(consumers) = consumer_repos.get(key) else {
                 continue; // orphan producer — surfaces as an endpoint, not a self-loop
             };
-            let repos: HashSet<&&str> = producers.iter().chain(consumers.iter()).collect();
+            let repos: HashSet<&str> = producers.iter().chain(consumers.iter()).copied().collect();
             if repos.len() == 1 {
-                drop_keys.insert(key.clone());
+                let repo = repos.iter().next().expect("len checked above");
+                self_loops.insert(key.clone(), repo.to_string());
             }
         }
-        drop_keys
+        self_loops
     }
 }
 
@@ -672,6 +684,60 @@ mod tests {
         assert!(call_keys.contains(&"pubsub|order.placed"));
         // Orphan producer (no consumer) survives.
         assert!(endpoint_keys.contains(&"pubsub|user.registered"));
+    }
+
+    /// An op WITHOUT repo attribution on a self-loop key must survive: with no
+    /// repo id it is undecidable whether it belongs to the self-looping repo or
+    /// to another (untagged) participant, so only the attributed self-loop ops
+    /// are dropped.
+    #[test]
+    fn unattributed_op_on_self_loop_key_survives() {
+        let result = ApiAnalysisResult {
+            endpoints: vec![
+                // attributed self-loop producer: dropped
+                pubsub_op(
+                    "__dlq.retry",
+                    "orders-engine/src/kafka/dlq.ts:26",
+                    "orders-engine",
+                ),
+                // UNATTRIBUTED producer on the same key: kept (undecidable)
+                ApiEndpointDetails {
+                    repo_name: None,
+                    ..pubsub_op("__dlq.retry", "unknown/src/consume.ts:3", "ignored")
+                },
+            ],
+            calls: vec![
+                // attributed self-loop consumer: dropped
+                pubsub_op(
+                    "__dlq.retry",
+                    "orders-engine/src/kafka/dlq.ts:19",
+                    "orders-engine",
+                ),
+            ],
+            findings: vec![],
+            dependency_conflicts: vec![],
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+
+        let projection = EvalProjection::from_results(&result, &[]);
+        let surviving: Vec<(&str, &str)> = projection
+            .endpoints
+            .iter()
+            .map(|o| (o.key.as_str(), o.file.as_str()))
+            .collect();
+        assert_eq!(
+            surviving,
+            vec![("pubsub|__dlq.retry", "unknown/src/consume.ts")],
+            "only the unattributed op survives; attributed self-loop ops are dropped"
+        );
+        assert!(
+            projection.calls.is_empty(),
+            "attributed self-loop call must be dropped, got {:?}",
+            projection.calls.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
     }
 
     /// Build a projection with a cross-repo match, manifest-joined op fields,
