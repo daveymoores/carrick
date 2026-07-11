@@ -1,0 +1,132 @@
+name: Wasm Artifact
+
+# Builds the carrick-match wasm artifact (the query-time matcher that
+# carrick-cloud's mcp-server runs — see crates/carrick-match), attaches it to
+# a GitHub release, and dispatches the pin-bump PR in carrick-cloud (#325).
+#
+# Two entry points:
+#   - workflow_call from release.yml, on every release-please release
+#   - workflow_dispatch against an existing tag, to backfill or re-notify
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build from and attach assets to"
+        required: true
+        type: string
+    secrets:
+      CARRICK_CLOUD_DISPATCH_TOKEN:
+        description: "Fine-grained PAT able to fire repository_dispatch on daveymoores/carrick-cloud (contents:write + pull-requests:write there). Optional: without it assets still attach; only the notify step fails."
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build from and attach assets to (e.g. carrick-v0.2.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  wasm-artifact:
+    name: Build, attach, dispatch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Build carrick-match for wasm32
+        run: cargo build --target wasm32-unknown-unknown -p carrick-match --features wasm --release
+
+      # Version must match the exact wasm-bindgen pin in
+      # crates/carrick-match/Cargo.toml; bump both in lockstep.
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - name: Generate Node.js glue
+        run: wasm-bindgen --target nodejs --out-dir wasm-artifact target/wasm32-unknown-unknown/release/carrick_match.wasm
+
+      # The artifact runs on carrick-cloud's Node 22 Lambda runtime — smoke
+      # it under the same major, not whatever the runner's default is.
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Same assertions as ci.yml's wasm-match smoke, but against the exact
+      # bytes being attached to the release.
+      - name: Load glue in Node and assert matching
+        run: |
+          node -e "
+            const assert = require('assert');
+            const m = require('./wasm-artifact/carrick_match.js');
+            assert.strictEqual(m.paths_match('/users/:id', '/users/123'), true);
+            assert.strictEqual(m.paths_match('/users/123', '/users/:id'), true);
+            assert.strictEqual(m.paths_match('/api/**', '/api/users/123/orders'), true);
+            assert.strictEqual(m.paths_match('/users', '/orders'), false);
+            assert.strictEqual(m.is_param_segment(':id'), true);
+            assert.strictEqual(m.is_param_segment('users'), false);
+            console.log('wasm artifact smoke ok');
+          "
+
+      - name: Write checksums
+        working-directory: wasm-artifact
+        run: sha256sum carrick_match.js carrick_match.d.ts carrick_match_bg.wasm > carrick_match.sha256
+
+      - name: Attach assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.tag }}" \
+            wasm-artifact/carrick_match.js \
+            wasm-artifact/carrick_match.d.ts \
+            wasm-artifact/carrick_match_bg.wasm \
+            wasm-artifact/carrick_match.sha256 \
+            --clobber --repo "${{ github.repository }}"
+
+      # Fires .github/workflows/wasm-pin-bump.yml in carrick-cloud, which
+      # opens the pin-bump PR against the freshly attached assets. The default
+      # GITHUB_TOKEN cannot dispatch cross-repo: CARRICK_CLOUD_DISPATCH_TOKEN
+      # is a fine-grained PAT with contents:write + pull-requests:write on
+      # daveymoores/carrick-cloud. Assets are already attached by this point,
+      # so a failure here means notify-only is what's missing — re-run via
+      # workflow_dispatch with the same tag once the secret exists.
+      - name: Dispatch pin bump to carrick-cloud
+        env:
+          GH_TOKEN: ${{ secrets.CARRICK_CLOUD_DISPATCH_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "CARRICK_CLOUD_DISPATCH_TOKEN is not set; assets are attached but carrick-cloud was not notified." >&2
+            exit 1
+          fi
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          JS_SHA="$(awk '$2 == "carrick_match.js" {print $1}' wasm-artifact/carrick_match.sha256)"
+          DTS_SHA="$(awk '$2 == "carrick_match.d.ts" {print $1}' wasm-artifact/carrick_match.sha256)"
+          WASM_SHA="$(awk '$2 == "carrick_match_bg.wasm" {print $1}' wasm-artifact/carrick_match.sha256)"
+          gh api "repos/daveymoores/carrick-cloud/dispatches" \
+            -f event_type=carrick-match-release \
+            -f "client_payload[tag]=$TAG" \
+            -f "client_payload[source_sha]=$SOURCE_SHA" \
+            -f "client_payload[js_sha256]=$JS_SHA" \
+            -f "client_payload[dts_sha256]=$DTS_SHA" \
+            -f "client_payload[wasm_sha256]=$WASM_SHA"
