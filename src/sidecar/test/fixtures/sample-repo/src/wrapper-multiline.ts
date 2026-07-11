@@ -47,3 +47,19 @@ fakeRouter.get('/status', async () => {
   );
   console.log(statusOrders.data.length);
 });
+
+// #336 fourth path (the CI shape): the scanned checkout has NO node_modules —
+// the demo workflow is checkout + carrick with no npm install — so the client
+// library resolves to `any` and the call's SEMANTIC type carries nothing to
+// anchor on. The caller's payload claim is still in the AST: the single
+// explicit call generic (`axios.get<Order[]>`), whose type resolves against
+// the repo's OWN sources regardless of the untyped client. `untypedAxios: any`
+// mirrors what `import axios from 'axios'` resolves to without node_modules.
+declare const untypedAxios: any;
+
+fakeRouter.get('/orders-untyped', async () => {
+  const ordersResponse = await untypedAxios.get<OrderData[]>(
+    `${ORDER_SERVICE_URL}/api/orders-untyped`,
+  );
+  console.log(ordersResponse.data.length);
+});

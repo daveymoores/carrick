@@ -1050,6 +1050,181 @@ notificationRouter.get('/status', async () => {
     );
 }
 
+/// #336 fourth path — the CI condition proven against the SHIPPED v0.2.5 dist:
+/// the GitHub Action scans a bare checkout (the demo workflow is
+/// `actions/checkout` + `daveymoores/carrick` with no `npm install`), so
+/// `import axios from 'axios'` resolves to `any`, the call's SEMANTIC type
+/// carries no symbol, and the anchor path found nothing — the depth was erased
+/// even with the span-slack (#346) and call-payload-anchor (#344) fixes in
+/// place, because those recover the depth from the resolved type, which no
+/// longer exists. The caller's payload claim is still in the AST: the single
+/// explicit call generic `<Order[]>`, whose type resolves against the repo's
+/// OWN sources. Unlike the sibling tests above, this repo has NO axios stub in
+/// node_modules — exactly like CI.
+#[test]
+fn test_untyped_client_call_result_bundles_array_definition() {
+    use carrick::services::type_sidecar::{
+        ExtractionConfig, ExtractionRule, InferKind, InferRequestItem, SymbolRequest, TypeSidecar,
+    };
+    use std::time::Duration;
+
+    if !is_node_available() {
+        eprintln!("Skipping test: Node.js not available");
+        return;
+    }
+    let sidecar_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    if !sidecar_path.exists() {
+        eprintln!("Skipping test: Sidecar not built (run: cd src/sidecar && npm run build)");
+        return;
+    }
+
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let repo = temp_dir.path().join("consumer");
+    fs::create_dir_all(repo.join("src")).expect("Failed to create src");
+    // Deliberately NO node_modules: mirror the Action's bare checkout.
+    fs::write(
+        repo.join("package.json"),
+        r#"{ "name": "consumer-app", "version": "1.0.0", "dependencies": { "axios": "^1.6.0" } }"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("tsconfig.json"),
+        r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"]
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("src/types.ts"),
+        r#"export interface Order {
+  id: number;
+  userId: number;
+  product: string;
+  amount: number;
+}
+"#,
+    )
+    .unwrap();
+    let api_source = r#"import axios from 'axios';
+import { Order } from './types';
+
+const ORDER_SERVICE_URL = 'http://localhost:3002';
+
+interface Router {
+  get(path: string, handler: () => Promise<void>): Router;
+}
+declare const notificationRouter: Router;
+
+notificationRouter.get('/status', async () => {
+  const ordersResponse = await axios.get<Order[]>(
+    `${ORDER_SERVICE_URL}/api/orders`,
+  );
+  const orderCount = ordersResponse.data.length;
+  console.log(orderCount);
+});
+"#;
+    fs::write(repo.join("src/api.ts"), api_source).unwrap();
+
+    // SWC-style span (1-based on both ends), as the scanner's span_range emits.
+    let call_text = "axios.get<Order[]>(\n    `${ORDER_SERVICE_URL}/api/orders`,\n  )";
+    let call_start = api_source
+        .find(call_text)
+        .expect("api.ts must contain the multi-line call");
+    let span_start = (call_start + 1) as u32;
+    let span_end = (call_start + call_text.len() + 1) as u32;
+    let line_number = (api_source[..call_start].matches('\n').count() + 1) as u32;
+
+    let sidecar = TypeSidecar::spawn(&sidecar_path).expect("Failed to spawn sidecar");
+    sidecar.start_init(&repo, None);
+    sidecar
+        .wait_ready(Duration::from_secs(60))
+        .expect("Sidecar failed to initialize");
+
+    let alias = "Endpoint_4022e5b76e4552db_Response_Call8904b52acc58d4d6";
+    let explicit = vec![SymbolRequest {
+        symbol_name: "Order".to_string(),
+        source_file: repo.join("src/types.ts").to_string_lossy().to_string(),
+        alias: Some(alias.to_string()),
+        array_depth: None,
+    }];
+    let infer = vec![InferRequestItem {
+        file_path: repo.join("src/api.ts").to_string_lossy().to_string(),
+        line_number,
+        span_start: Some(span_start),
+        span_end: Some(span_end),
+        expression_text: None,
+        expression_line: None,
+        infer_kind: InferKind::CallResult,
+        alias: Some(alias.to_string()),
+        param_name: None,
+    }];
+    // Rules are present (the cloud generates them either way) but inert: they
+    // cannot match a wrapper on an `any` call type, exactly as in CI.
+    let config = ExtractionConfig {
+        rules: vec![ExtractionRule {
+            wrapper_symbols: vec!["AxiosResponse".to_string()],
+            origin_module_globs: vec!["axios".to_string(), "axios/*".to_string()],
+            payload_generic_index: Some(0),
+            ..Default::default()
+        }],
+    };
+
+    let result = sidecar
+        .resolve_all_types(&explicit, &infer, Some(&config))
+        .expect("resolve_all_types failed");
+    let dts = result.dts_content.expect("expected bundled dts content");
+
+    assert!(
+        !dts.contains(&format!("export interface {}", alias)),
+        "bundled alias must not render as a depth-less interface:\n{}",
+        dts
+    );
+    let alias_line = dts
+        .lines()
+        .find(|l| l.contains(&format!("export type {} =", alias)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an `export type {} = ...` alias in:\n{}",
+                alias, dts
+            )
+        });
+    assert!(
+        alias_line.trim_end().trim_end_matches(';').ends_with("[]"),
+        "bundled alias must keep the use-site array depth, got: {}",
+        alias_line
+    );
+
+    let definitions = sidecar
+        .resolve_definitions(&dts, &[alias.to_string()])
+        .expect("resolve_definitions failed");
+    let def = definitions
+        .iter()
+        .find(|d| d.type_alias == alias)
+        .expect("expected a resolved definition for the consumer alias");
+    assert!(
+        def.definition
+            .trim_end()
+            .trim_end_matches(';')
+            .ends_with("[]"),
+        "resolved_definition dropped the array depth: {}",
+        def.definition
+    );
+    assert!(
+        def.expanded.trim_end().ends_with("[]"),
+        "expanded_definition dropped the array depth: {}",
+        def.expanded
+    );
+}
+
 // ============================================================================
 // Integration with Carrick CLI (when available)
 // ============================================================================

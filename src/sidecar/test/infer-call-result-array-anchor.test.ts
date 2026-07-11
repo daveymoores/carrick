@@ -389,4 +389,56 @@ describe('call_result array payloads anchor on the element symbol with array_dep
       'without the depth the explicit bundle renders the bare element and the [] is erased'
     );
   });
+
+  it('untyped client (`any`, no node_modules in CI) still anchors from the explicit call generic (#336 CI shape)', async () => {
+    // The live CI scan runs against a checkout with NO node_modules, so
+    // `axios` is `any`, the call's semantic type is `any`, and the semantic
+    // anchor path finds no symbol — the depth was erased even with the span
+    // and unwrap fixes in place. The single explicit generic on the call is
+    // the caller's payload claim and must anchor instead.
+    const source = fs.readFileSync(MULTILINE_FIXTURE, 'utf-8');
+    const callText =
+      'untypedAxios.get<OrderData[]>(\n    `${ORDER_SERVICE_URL}/api/orders-untyped`,\n  )';
+    const start = source.indexOf(callText);
+    assert.ok(start >= 0, 'fixture must contain the untyped-client call');
+    const end = start + callText.length;
+    const line = source.slice(0, start).split('\n').length;
+
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'call-arr-untyped-client',
+      // Rules are present (the cloud generates them either way) but inert:
+      // they cannot match a wrapper on an `any` call type, exactly as in CI.
+      extraction_config: { rules: MULTILINE_RULES },
+      requests: [
+        {
+          file_path: MULTILINE_FIXTURE,
+          line_number: line,
+          // SWC convention, as the scanner sends it.
+          span_start: start + 1,
+          span_end: end + 1,
+          infer_kind: 'call_result',
+          alias: 'OrderArrayUntypedClientConsumer',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'OrderArrayUntypedClientConsumer'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.primary_type_symbol,
+      'OrderData',
+      `an untyped client must anchor from the explicit call generic, got ${JSON.stringify(inferred.primary_type_symbol)} (type_string: ${JSON.stringify(inferred.type_string)})`
+    );
+    assert.strictEqual(
+      inferred.array_depth,
+      1,
+      'without the depth the explicit bundle renders the bare element and the [] is erased'
+    );
+  });
 });

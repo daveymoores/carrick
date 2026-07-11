@@ -639,9 +639,42 @@ export class TypeInferrer {
     const anchorSource = callUnwrap.wasUnwrapped
       ? callUnwrap.payloadType
       : callPayloadType;
-    const anchor = anchorSource
+    let anchor = anchorSource
       ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
       : undefined;
+
+    // #336 CI shape: the scanned checkout often has NO node_modules (the
+    // GitHub Action scans a bare checkout), so the client library resolves to
+    // `any`, the call's semantic type carries no symbol, and the anchor above
+    // is empty — erasing the depth even though the caller wrote it out. The
+    // payload claim is still in the AST: a SINGLE explicit call generic
+    // (`axios.get<Order[]>`), whose type resolves against the repo's own
+    // sources regardless of the untyped client. This is the same generic the
+    // LLM's `primary_type_symbol` schema contract extracts, and the Rust
+    // depth-copy's symbol-agreement guard makes a mismatched fallback inert.
+    // Multi-generic calls are ambiguous and anchor nothing here.
+    if (!anchor || !this.primaryTypeSymbol(anchor.element)) {
+      const typeArgs = callExpr.getTypeArguments();
+      if (typeArgs.length === 1) {
+        const argType = this.unwrapPromiseType(typeArgs[0].getType());
+        const argUnwrap = this.unwrapTypeWithConfig(
+          argType,
+          typeArgs[0],
+          extractionConfig
+        );
+        const argSource = argUnwrap.wasUnwrapped
+          ? argUnwrap.payloadType
+          : argType;
+        if (argSource) {
+          const argAnchor = this.unwrapArrayLevels(
+            this.unwrapPromiseType(argSource)
+          );
+          if (this.primaryTypeSymbol(argAnchor.element)) {
+            anchor = argAnchor;
+          }
+        }
+      }
+    }
 
     return this.createInferredType(
       request,
