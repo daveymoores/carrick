@@ -3990,6 +3990,14 @@ mod tests {
             "same-key producers must not share a manifest alias: {:?}",
             producer_aliases
         );
+        // Lock in the drop-with-warning behavior: the duplicate is dropped,
+        // not disambiguated, so exactly one producer entry survives.
+        assert_eq!(
+            producer_aliases.len(),
+            1,
+            "duplicate same-key producer must be dropped, leaving one entry: {:?}",
+            producer_aliases
+        );
         // The surviving entry is the first declaration.
         let survivor = entries
             .iter()

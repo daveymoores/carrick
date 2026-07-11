@@ -449,8 +449,10 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
 /// entry (same-key alias collision, #334) made ts_check emit the same mismatch
 /// once per duplicate, which rendered as identical rows in the PR comment.
 /// Full-struct equality only: findings differing in any field (call site,
-/// detail, types) are legitimately distinct and kept. Linear scan is fine at
-/// findings scale (tens of rows).
+/// detail, types) are legitimately distinct and kept. The `kept.contains`
+/// check inside the loop makes this O(n^2), which is fine at findings scale
+/// (tens of rows); `Finding` is not `Hash`, so a set-based pass isn't worth
+/// the ceremony here.
 fn dedup_findings(findings: &mut Vec<Finding>) {
     let mut kept: Vec<Finding> = Vec::with_capacity(findings.len());
     for finding in findings.drain(..) {
