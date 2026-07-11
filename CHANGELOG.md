@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.3](https://github.com/daveymoores/carrick/compare/carrick-v0.2.2...carrick-v0.2.3) (2026-07-11)
+
+
+### Bug Fixes
+
+* **comment:** polish contract-risk rows: runner paths, stray quote, declared param names ([#340](https://github.com/daveymoores/carrick/issues/340)) ([c844fc9](https://github.com/daveymoores/carrick/commit/c844fc9f9d27fb989b1095ec6cea08ab56c5e15f))
+* **engine:** drop duplicate same-key producer manifest entries and dedup identical findings rows ([#342](https://github.com/daveymoores/carrick/issues/342)) ([d763245](https://github.com/daveymoores/carrick/commit/d7632457c5d7f3942c0e5949e2ed1d1eddcafb3b))
+* **extraction:** sanitize LLM-emitted route paths and re-anchor them to the registration literal ([#343](https://github.com/daveymoores/carrick/issues/343)) ([1033890](https://github.com/daveymoores/carrick/commit/10338907f1d45949134ccd6ae7a9ccf2ff182804)), closes [#332](https://github.com/daveymoores/carrick/issues/332)
+* **matching:** a param segment never matches an empty or whitespace segment ([#338](https://github.com/daveymoores/carrick/issues/338)) ([3e012be](https://github.com/daveymoores/carrick/commit/3e012bec0ad807c3ec41fc9290fe0acf0215c20b)), closes [#333](https://github.com/daveymoores/carrick/issues/333)
+* **sidecar:** report element anchor + array_depth on call_result inference ([#341](https://github.com/daveymoores/carrick/issues/341)) ([fb6e8bb](https://github.com/daveymoores/carrick/commit/fb6e8bb62349987774953023240036843a666211))
+* **sidecar:** trailing comma no longer defeats matchByText, reverse match needs 50% coverage ([#339](https://github.com/daveymoores/carrick/issues/339)) ([fd999e1](https://github.com/daveymoores/carrick/commit/fd999e191a94135866de8c4dbb3a98027ea4258f)), closes [#335](https://github.com/daveymoores/carrick/issues/335)
+
+
+### CI/CD
+
+* build carrick-match wasm artifact on release and dispatch pin bump to carrick-cloud ([#329](https://github.com/daveymoores/carrick/issues/329)) ([5975ebf](https://github.com/daveymoores/carrick/commit/5975ebf65b9a42746479fccd623ff664e496e025))
+
 ## [0.2.2](https://github.com/daveymoores/carrick/compare/carrick-v0.2.1...carrick-v0.2.2) (2026-07-10)
 
 
