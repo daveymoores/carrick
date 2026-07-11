@@ -249,6 +249,18 @@ impl OperationKey {
         }
     }
 
+    /// The event name when this is a Socket.IO operation, else `None`. Used by
+    /// the same-file pub/sub fold to match a spuriously-classified pub/sub op
+    /// against the deterministic socket op sharing the same event string.
+    pub fn socket_event(&self) -> Option<&str> {
+        match self {
+            OperationKey::Socket { event, .. } => Some(event.as_str()),
+            OperationKey::Http { .. }
+            | OperationKey::Graphql { .. }
+            | OperationKey::Pubsub { .. } => None,
+        }
+    }
+
     /// `(label, name)` pair used by report tables and issue strings: HTTP is
     /// `(method, path)`, GraphQL is `(KIND, field)`, sockets are
     /// `(DIRECTION, event)`.
