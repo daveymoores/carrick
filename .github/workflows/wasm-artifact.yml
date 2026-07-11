@@ -15,6 +15,10 @@ on:
         description: "Release tag to build from and attach assets to"
         required: true
         type: string
+    secrets:
+      CARRICK_CLOUD_DISPATCH_TOKEN:
+        description: "Fine-grained PAT able to fire repository_dispatch on daveymoores/carrick-cloud (contents:write + pull-requests:write there). Optional: without it assets still attach; only the notify step fails."
+        required: false
   workflow_dispatch:
     inputs:
       tag:
@@ -60,6 +64,13 @@ jobs:
 
       - name: Generate Node.js glue
         run: wasm-bindgen --target nodejs --out-dir wasm-artifact target/wasm32-unknown-unknown/release/carrick_match.wasm
+
+      # The artifact runs on carrick-cloud's Node 22 Lambda runtime — smoke
+      # it under the same major, not whatever the runner's default is.
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       # Same assertions as ci.yml's wasm-match smoke, but against the exact
       # bytes being attached to the release.
