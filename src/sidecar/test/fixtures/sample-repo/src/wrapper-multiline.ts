@@ -29,3 +29,21 @@ export async function getOrderCount(): Promise<number> {
   const orderCount = ordersResponse.data.length;
   return orderCount;
 }
+
+// #336 third path: the live locator is an SWC-shaped SPAN (1-based BytePos,
+// so both ends sit one byte past the ts-morph 0-based offsets). Under strict
+// containment that excludes the real call — the shifted end overshoots the
+// call's end by one byte — and escalates to the smallest ENCLOSING call, the
+// route registration, whose type anchors the router instead of the payload.
+// Mirrors the live `notificationRouter.get("/status", async handler)`.
+interface FakeRouter {
+  get(path: string, handler: () => Promise<void>): FakeRouter;
+}
+declare const fakeRouter: FakeRouter;
+
+fakeRouter.get('/status', async () => {
+  const statusOrders = await apiGetOrders<OrderData[]>(
+    `${ORDER_SERVICE_URL}/api/orders-status`,
+  );
+  console.log(statusOrders.data.length);
+});

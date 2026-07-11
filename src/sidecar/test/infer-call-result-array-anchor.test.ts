@@ -257,7 +257,10 @@ describe('call_result array payloads anchor on the element symbol with array_dep
   ];
 
   it('multi-line call located by the single-line LLM print → anchor OrderData, depth 1 (#336 live shape)', async () => {
-    const callStart = spanOf('apiGetOrders<OrderData[]>(', MULTILINE_FIXTURE);
+    const callStart = spanOf(
+      'apiGetOrders<OrderData[]>(\n    `${ORDER_SERVICE_URL}/api/orders`,',
+      MULTILINE_FIXTURE
+    );
     const response = await client.send<InferResponseShape>({
       action: 'infer',
       request_id: 'call-arr-multiline-text',
@@ -298,9 +301,11 @@ describe('call_result array payloads anchor on the element symbol with array_dep
 
   it('terminal scalar use (`.data.length`) must not erase the call payload anchor (span locator)', async () => {
     const source = fs.readFileSync(MULTILINE_FIXTURE, 'utf-8');
-    const start = source.indexOf('apiGetOrders<OrderData[]>(');
+    const callText =
+      'apiGetOrders<OrderData[]>(\n    `${ORDER_SERVICE_URL}/api/orders`,\n  )';
+    const start = source.indexOf(callText);
     assert.ok(start >= 0, 'fixture must contain the multi-line call');
-    const end = source.indexOf(');', start) + 1;
+    const end = start + callText.length;
     const line = source.slice(0, start).split('\n').length;
 
     const response = await client.send<InferResponseShape>({
@@ -332,5 +337,56 @@ describe('call_result array payloads anchor on the element symbol with array_dep
       `anchor must come from the call's payload, not the terminal use, got ${JSON.stringify(inferred.primary_type_symbol)} (type_string: ${JSON.stringify(inferred.type_string)})`
     );
     assert.strictEqual(inferred.array_depth, 1);
+  });
+
+  it('SWC-shaped span (1-based) inside a route registration binds the payload call, not the registration (#336 third path)', async () => {
+    // The scanner sends raw SWC BytePos spans: 1-based, so both ends sit one
+    // byte past the ts-morph 0-based offsets. Strict containment excluded the
+    // real call (the shifted end overshoots its end by one byte) and bound the
+    // enclosing `fakeRouter.get(...)` registration instead, anchoring the
+    // router type with no depth — so the explicit bundle rendered the bare
+    // element interface and the [] was erased.
+    const source = fs.readFileSync(MULTILINE_FIXTURE, 'utf-8');
+    const callText =
+      'apiGetOrders<OrderData[]>(\n    `${ORDER_SERVICE_URL}/api/orders-status`,\n  )';
+    const start = source.indexOf(callText);
+    assert.ok(start >= 0, 'fixture must contain the registration-wrapped call');
+    const end = start + callText.length;
+    const line = source.slice(0, start).split('\n').length;
+
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'call-arr-swc-span',
+      extraction_config: { rules: MULTILINE_RULES },
+      requests: [
+        {
+          file_path: MULTILINE_FIXTURE,
+          line_number: line,
+          // SWC convention: BytePos(1) is the first byte of the file.
+          span_start: start + 1,
+          span_end: end + 1,
+          infer_kind: 'call_result',
+          alias: 'OrderArraySwcSpanConsumer',
+        },
+      ],
+    });
+
+    const inferred = response.inferred_types?.find(
+      (t) => t.alias === 'OrderArraySwcSpanConsumer'
+    );
+    assert.ok(
+      inferred,
+      `expected an inferred type, got errors: ${JSON.stringify(response.errors)}`
+    );
+    assert.strictEqual(
+      inferred.primary_type_symbol,
+      'OrderData',
+      `span lookup must bind the payload call, not the enclosing registration, got ${JSON.stringify(inferred.primary_type_symbol)} (type_string: ${JSON.stringify(inferred.type_string)})`
+    );
+    assert.strictEqual(
+      inferred.array_depth,
+      1,
+      'without the depth the explicit bundle renders the bare element and the [] is erased'
+    );
   });
 });
