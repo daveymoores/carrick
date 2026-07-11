@@ -1415,31 +1415,47 @@ fn normalize_protocol_file(p: &Path) -> PathBuf {
         .collect()
 }
 
-/// Structural fold set: the `(normalized_file, event_name)` pairs for which the
-/// deterministic Socket.IO scan already emitted an operation (emitter OR
-/// listener). The file-analyzer sometimes reports a single `socket.emit("x", …)`
-/// / `socket.on("x", …)` site as BOTH a socket event and a pub/sub op; the
-/// deterministic socket op is the modeled contract, so a pub/sub op sharing the
-/// SAME file AND the SAME event/topic string is folded away (dropped) in favor
-/// of it — otherwise the emit is indexed twice (once `socket|…`, once
-/// `pubsub|…`), inflating the call set.
+/// Structural fold set: normalized file → the event names for which the
+/// deterministic Socket.IO scan already emitted an operation in that file
+/// (emitter OR listener). The file-analyzer sometimes reports a single
+/// `socket.emit("x", …)` / `socket.on("x", …)` site as BOTH a socket event and
+/// a pub/sub op; the deterministic socket op is the modeled contract, so a
+/// pub/sub op sharing the SAME file AND the SAME event/topic string is folded
+/// away (dropped) in favor of it — otherwise the emit is indexed twice (once
+/// `socket|…`, once `pubsub|…`), inflating the call set.
 ///
 /// The match keys purely on structural coincidence (same file + same name),
 /// never on a library/broker name, so a genuine Kafka/NATS/Redis/BullMQ publish
 /// in a file that has NO socket op on that event is untouched. Requiring the
 /// same-file socket twin is what keeps real pub/sub (which lives in files
 /// without socket ops) safe.
-fn socket_event_twins(sockets: &crate::socket_io::SocketExtraction) -> HashSet<(PathBuf, String)> {
-    sockets
-        .listeners
-        .iter()
-        .chain(sockets.emitters.iter())
-        .filter_map(|op| {
-            op.key
-                .socket_event()
-                .map(|event| (normalize_protocol_file(&op.file_path), event.to_string()))
-        })
-        .collect()
+///
+/// Keyed as a map of file → event set (rather than a set of owned pairs) so
+/// membership checks borrow `&Path`/`&str` without per-op cloning.
+fn socket_event_twins(
+    sockets: &crate::socket_io::SocketExtraction,
+) -> HashMap<PathBuf, HashSet<String>> {
+    let mut twins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for op in sockets.listeners.iter().chain(sockets.emitters.iter()) {
+        if let Some(event) = op.key.socket_event() {
+            twins
+                .entry(normalize_protocol_file(&op.file_path))
+                .or_default()
+                .insert(event.to_string());
+        }
+    }
+    twins
+}
+
+/// Membership check against [`socket_event_twins`]'s map using borrowed keys.
+fn has_socket_twin(
+    twins: &HashMap<PathBuf, HashSet<String>>,
+    file_norm: &Path,
+    topic: &str,
+) -> bool {
+    twins
+        .get(file_norm)
+        .is_some_and(|events| events.contains(topic))
 }
 
 /// Fold the file-analyzer's `pubsub_operations` into `cloud_data` so they reach
@@ -1482,7 +1498,7 @@ fn append_pubsub_operations(
             // Same-file socket twin → the file-analyzer double-classified a
             // socket emit/listen site; keep the deterministic socket op, drop
             // this pub/sub form so the site is indexed once.
-            if socket_twins.contains(&(file_norm.clone(), op.topic.clone())) {
+            if has_socket_twin(&socket_twins, &file_norm, &op.topic) {
                 debug!(
                     topic = %op.topic,
                     file = %path,
@@ -1571,7 +1587,7 @@ fn append_pubsub_manifest_entries(
         for op in &result.pubsub_operations {
             // Folded into a same-file socket twin: dropped from cloud_data, so
             // emit no orphan anchor here either.
-            if socket_twins.contains(&(file_norm.clone(), op.topic.clone())) {
+            if has_socket_twin(&socket_twins, &file_norm, &op.topic) {
                 continue;
             }
             let role = match op.role {
