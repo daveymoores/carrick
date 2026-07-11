@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/daveymoores/carrick/compare/carrick-v0.2.5...carrick-v0.2.6) (2026-07-11)
+
+
+### Bug Fixes
+
+* **sidecar:** anchor call_result from the explicit call generic when the client type is untyped ([#348](https://github.com/daveymoores/carrick/issues/348)) ([2831d6f](https://github.com/daveymoores/carrick/commit/2831d6fdb27e679e382c7053aa90e2cd984d50a4))
+
 ## [0.2.5](https://github.com/daveymoores/carrick/compare/carrick-v0.2.4...carrick-v0.2.5) (2026-07-11)
 
 
