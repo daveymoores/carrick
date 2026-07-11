@@ -2653,10 +2653,15 @@ impl FileOrchestrator {
                 !is_self_call
             })
             .collect();
+        // `keep_call` was derived element-for-element from `graph.data_calls`
+        // just above, so the iterator running dry mid-retain can only mean that
+        // invariant was broken — fail loudly rather than silently keeping calls.
         let mut keep_iter = keep_call.into_iter();
-        graph
-            .data_calls
-            .retain(|_| keep_iter.next().unwrap_or(true));
+        graph.data_calls.retain(|_| {
+            keep_iter
+                .next()
+                .expect("keep_call must be exactly as long as graph.data_calls")
+        });
 
         graph
     }

@@ -391,8 +391,10 @@ impl UrlNormalizer {
         // absolute URL with template path segments
         // (`http://host:port/warehouses/${wid}/stock/${sku}`) yields a bare
         // comparable path (`/warehouses/:wid/stock/:sku`), not a key that still
-        // carries the raw interpolation. `clean_path` drops the query string
-        // first, so a query-only interpolation never reaches this.
+        // carries the raw interpolation. Interpolations are converted first —
+        // including any inside a query string — and `clean_path` below then cuts
+        // at the first `?`/`#`, so a query-only interpolation
+        // (`/orders?user=${id}`) never survives into the final path.
         let path = self.convert_interpolations_to_params(&path);
 
         NormalizedUrl {
