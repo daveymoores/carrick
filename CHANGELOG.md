@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/daveymoores/carrick/compare/carrick-v0.2.4...carrick-v0.2.5) (2026-07-11)
+
+
+### Bug Fixes
+
+* **sidecar:** tolerate SWC 1-based spans when binding a call_result locator ([#346](https://github.com/daveymoores/carrick/issues/346)) ([c8b74e4](https://github.com/daveymoores/carrick/commit/c8b74e4c9bc620aabb0aaab41a1814b113bd22b8))
+
 ## [0.2.4](https://github.com/daveymoores/carrick/compare/carrick-v0.2.3...carrick-v0.2.4) (2026-07-11)
 
 
