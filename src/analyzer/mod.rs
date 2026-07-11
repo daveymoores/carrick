@@ -457,6 +457,26 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
     });
 }
 
+/// Order-preserving dedup of byte-identical findings rows, run once at the
+/// `get_results` aggregation point so every renderer (PR comment, terminal
+/// report, eval projection) sees each row once. A duplicated producer manifest
+/// entry (same-key alias collision, #334) made ts_check emit the same mismatch
+/// once per duplicate, which rendered as identical rows in the PR comment.
+/// Full-struct equality only: findings differing in any field (call site,
+/// detail, types) are legitimately distinct and kept. The `kept.contains`
+/// check inside the loop makes this O(n^2), which is fine at findings scale
+/// (tens of rows); `Finding` is not `Hash`, so a set-based pass isn't worth
+/// the ceremony here.
+fn dedup_findings(findings: &mut Vec<Finding>) {
+    let mut kept: Vec<Finding> = Vec::with_capacity(findings.len());
+    for finding in findings.drain(..) {
+        if !kept.contains(&finding) {
+            kept.push(finding);
+        }
+    }
+    *findings = kept;
+}
+
 /// Accept only values whose *shape* is an extractable outgoing-call route, as
 /// produced by the file-analyzer LLM's `target` field (see that lambda's
 /// system prompt): an absolute path (`/users`), a full URL (`http(s)://…`), or
@@ -1994,6 +2014,10 @@ impl Analyzer {
         let mut dependency_conflicts = self.analyze_dependencies();
         dependency_conflicts.sort_by(|a, b| a.package_name.cmp(&b.package_name));
         findings.extend(dependency_conflicts.iter().map(dependency_conflict_finding));
+        // Collapse byte-identical rows (#334) after every source has appended;
+        // order-preserving, so the risks-then-gaps-then-advisories report
+        // ordering above survives.
+        dedup_findings(&mut findings);
 
         // Overlay the per-pair type-compat verdict onto the captured edges. The
         // verdict is keyed by the producer's (METHOD, full_path) AND the consumer's
@@ -2379,6 +2403,37 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for #334: a duplicated producer manifest entry made ts_check
+    /// emit the same mismatch once per duplicate, which reached the PR comment
+    /// as byte-identical rows. Identical rows collapse at the aggregation
+    /// point; findings differing in any field (call site, detail, types) are
+    /// legitimately distinct and must survive.
+    #[test]
+    fn dedup_findings_collapses_identical_rows_only() {
+        let mismatch = || {
+            Finding::type_mismatch(
+                "GET",
+                "/api/orders/:id",
+                None,
+                vec!["src/user-routes.ts:12".to_string()],
+                "Order[]",
+                "OrderWithUser",
+                "Property 'user' is missing",
+            )
+        };
+        let other = Finding::missing_endpoint(
+            "GET",
+            "/api/orders/:id",
+            None,
+            vec!["src/user-routes.ts:30".to_string()],
+        );
+        let mut findings = vec![mismatch(), other.clone(), mismatch()];
+
+        dedup_findings(&mut findings);
+
+        assert_eq!(findings, vec![mismatch(), other]);
+    }
 
     /// Cross-service dependency conflicts are reported only when semver-
     /// INCOMPATIBLE (a major-version spread). `zod` 3.22.0 vs 4.0.0 is a real

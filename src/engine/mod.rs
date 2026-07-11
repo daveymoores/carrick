@@ -2280,6 +2280,15 @@ fn build_type_manifest_entries(
     let normalizer = UrlNormalizer::new(config);
     let mut entries = Vec::new();
 
+    // Producers carry the plain key-only alias (no `_Call<id>` suffix — that
+    // disambiguator exists for consumer fan-in, and the SymbolRequest side
+    // computes the same key-only alias for producers). So two endpoints
+    // colliding on (method, path) — a mis-extracted duplicate route (#332) or a
+    // genuinely twice-declared one — would share one alias and one resolved
+    // definition would silently clobber the other in the bundle (#334). Keep
+    // the first declaration, drop the rest with a warning.
+    let mut seen_producer_keys: HashSet<OperationKey> = HashSet::new();
+
     for endpoint in mount_graph.get_resolved_endpoints() {
         let method = normalize_manifest_method(&endpoint.method);
         if !is_http_method(&method) {
@@ -2291,9 +2300,20 @@ fn build_type_manifest_entries(
         }
         let (file_path, line_number) = parse_file_location(&endpoint.file_location);
 
+        let key = OperationKey::http(&method, path);
+        if !seen_producer_keys.insert(key.clone()) {
+            warn!(
+                "Duplicate producer endpoint {} at {} shares a manifest alias with an \
+                 earlier declaration; dropping this entry to avoid clobbering its \
+                 resolved type definition",
+                key, endpoint.file_location
+            );
+            continue;
+        }
+
         add_manifest_pair(
             &mut entries,
-            OperationKey::http(&method, path),
+            key,
             ManifestRole::Producer,
             &file_path,
             line_number,
@@ -3927,6 +3947,64 @@ mod tests {
             "expected normalized notification path, got {:?}",
             consumer_paths
         );
+    }
+
+    /// Regression for #334: two producer endpoints colliding on (method, path)
+    /// share the plain key-only alias (producers carry no `_Call<id>` suffix),
+    /// so both manifest entries got the same `type_alias` and one resolved
+    /// definition silently clobbered the other in the bundle. Live trigger:
+    /// the file-analyzer emitted a root route as "/:id", duplicating the real
+    /// `GET /api/orders/:id` (#332). The first declaration wins; the duplicate
+    /// is dropped with a warning.
+    #[test]
+    fn test_duplicate_producer_keys_yield_one_manifest_entry() {
+        let config = Config::default();
+        let mk_endpoint = |file: &str| crate::mount_graph::ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/api/orders/:id".to_string(),
+            full_path: "/api/orders/:id".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: file.to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+        };
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints = vec![
+            mk_endpoint("src/routes/orders.ts:11"),
+            mk_endpoint("src/routes/orders.ts:42"),
+        ];
+
+        let entries = build_type_manifest_entries(&mount_graph, &config);
+
+        let producer_aliases: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.role == ManifestRole::Producer)
+            .map(|e| e.type_alias.as_str())
+            .collect();
+        let unique: std::collections::HashSet<&&str> = producer_aliases.iter().collect();
+        assert_eq!(
+            producer_aliases.len(),
+            unique.len(),
+            "same-key producers must not share a manifest alias: {:?}",
+            producer_aliases
+        );
+        // Lock in the drop-with-warning behavior: the duplicate is dropped,
+        // not disambiguated, so exactly one producer entry survives.
+        assert_eq!(
+            producer_aliases.len(),
+            1,
+            "duplicate same-key producer must be dropped, leaving one entry: {:?}",
+            producer_aliases
+        );
+        // The surviving entry is the first declaration.
+        let survivor = entries
+            .iter()
+            .find(|e| e.role == ManifestRole::Producer)
+            .expect("one producer entry expected");
+        assert_eq!(survivor.file_path, "src/routes/orders.ts");
+        assert_eq!(survivor.line_number, 11);
     }
 
     #[test]
