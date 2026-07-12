@@ -1088,7 +1088,11 @@ async fn analyze_current_repo_incremental(
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config);
             stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
             append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
-            append_pubsub_manifest_entries(&mut manifest_entries, &merged_results);
+            append_pubsub_manifest_entries(
+                &mut manifest_entries,
+                &merged_results,
+                &protocol_extractions.sockets,
+            );
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -1398,7 +1402,60 @@ fn append_deterministic_protocol_operations(
         );
     }
 
-    append_pubsub_operations(cloud_data, file_results, &to_details);
+    append_pubsub_operations(cloud_data, file_results, &extractions.sockets, &to_details);
+}
+
+/// Component-wise path normalization used by the protocol folds: strip a leading
+/// `./` (a `CurDir` component) so a walk-derived path (`./realtime/server.ts`)
+/// and a repo-relative file_results key (`realtime/server.ts`) collapse to the
+/// same value. Mirrors the local normalizer in `fold_graphql_transport_calls`.
+fn normalize_protocol_file(p: &Path) -> PathBuf {
+    p.components()
+        .skip_while(|c| matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// Structural fold set: normalized file → the event names for which the
+/// deterministic Socket.IO scan already emitted an operation in that file
+/// (emitter OR listener). The file-analyzer sometimes reports a single
+/// `socket.emit("x", …)` / `socket.on("x", …)` site as BOTH a socket event and
+/// a pub/sub op; the deterministic socket op is the modeled contract, so a
+/// pub/sub op sharing the SAME file AND the SAME event/topic string is folded
+/// away (dropped) in favor of it — otherwise the emit is indexed twice (once
+/// `socket|…`, once `pubsub|…`), inflating the call set.
+///
+/// The match keys purely on structural coincidence (same file + same name),
+/// never on a library/broker name, so a genuine Kafka/NATS/Redis/BullMQ publish
+/// in a file that has NO socket op on that event is untouched. Requiring the
+/// same-file socket twin is what keeps real pub/sub (which lives in files
+/// without socket ops) safe.
+///
+/// Keyed as a map of file → event set (rather than a set of owned pairs) so
+/// membership checks borrow `&Path`/`&str` without per-op cloning.
+fn socket_event_twins(
+    sockets: &crate::socket_io::SocketExtraction,
+) -> HashMap<PathBuf, HashSet<String>> {
+    let mut twins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for op in sockets.listeners.iter().chain(sockets.emitters.iter()) {
+        if let Some(event) = op.key.socket_event() {
+            twins
+                .entry(normalize_protocol_file(&op.file_path))
+                .or_default()
+                .insert(event.to_string());
+        }
+    }
+    twins
+}
+
+/// Membership check against [`socket_event_twins`]'s map using borrowed keys.
+fn has_socket_twin(
+    twins: &HashMap<PathBuf, HashSet<String>>,
+    file_norm: &Path,
+    topic: &str,
+) -> bool {
+    twins
+        .get(file_norm)
+        .is_some_and(|events| events.contains(topic))
 }
 
 /// Fold the file-analyzer's `pubsub_operations` into `cloud_data` so they reach
@@ -1420,20 +1477,36 @@ fn append_deterministic_protocol_operations(
 fn append_pubsub_operations(
     cloud_data: &mut CloudRepoData,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    sockets: &crate::socket_io::SocketExtraction,
     to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
 ) {
     use crate::operation::PubsubRole;
 
+    let socket_twins = socket_event_twins(sockets);
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut dropped = 0usize;
+    let mut folded = 0usize;
     // Deterministic order: HashMap iteration is unordered, so sort by path
     // before pushing endpoints/calls (keeps scanner output stable).
     let mut paths: Vec<&String> = file_results.keys().collect();
     paths.sort();
     for path in paths {
         let result = &file_results[path];
+        let file_norm = normalize_protocol_file(Path::new(path));
         for op in &result.pubsub_operations {
+            // Same-file socket twin → the file-analyzer double-classified a
+            // socket emit/listen site; keep the deterministic socket op, drop
+            // this pub/sub form so the site is indexed once.
+            if has_socket_twin(&socket_twins, &file_norm, &op.topic) {
+                debug!(
+                    topic = %op.topic,
+                    file = %path,
+                    "pub/sub op folded into same-file socket twin"
+                );
+                folded += 1;
+                continue;
+            }
             let line = u32::try_from(op.line_number).unwrap_or(0);
             let file_path = PathBuf::from(path);
             let key = OperationKey::pubsub(op.topic.clone());
@@ -1457,10 +1530,10 @@ fn append_pubsub_operations(
             }
         }
     }
-    if subscribers + publishers + dropped > 0 {
+    if subscribers + publishers + dropped + folded > 0 {
         debug!(
             subscribers,
-            publishers, dropped, "Indexing pub/sub operations"
+            publishers, dropped, folded, "Indexing pub/sub operations"
         );
     }
 }
@@ -1491,18 +1564,32 @@ fn append_pubsub_operations(
 /// `None` symbol — the entry stays `Unknown`, exactly as a socket emitter whose
 /// payload type the extractor couldn't capture. An op with no role is skipped
 /// (it was already dropped from `cloud_data` and has nothing to anchor).
+///
+/// A pub/sub op folded away by the same-file socket-twin guard (see
+/// `socket_event_twins`) is also skipped here: it was dropped from `cloud_data`
+/// by `append_pubsub_operations`, so leaving a manifest anchor for it would
+/// orphan the anchor. The `sockets` extraction feeds the same fold set both
+/// places.
 fn append_pubsub_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    sockets: &crate::socket_io::SocketExtraction,
 ) {
     use crate::operation::PubsubRole;
 
+    let socket_twins = socket_event_twins(sockets);
     // Deterministic order: sort paths before emitting manifest entries.
     let mut paths: Vec<&String> = file_results.keys().collect();
     paths.sort();
     for path in paths {
         let result = &file_results[path];
+        let file_norm = normalize_protocol_file(Path::new(path));
         for op in &result.pubsub_operations {
+            // Folded into a same-file socket twin: dropped from cloud_data, so
+            // emit no orphan anchor here either.
+            if has_socket_twin(&socket_twins, &file_norm, &op.topic) {
+                continue;
+            }
             let role = match op.role {
                 Some(PubsubRole::Subscriber) => ManifestRole::Producer,
                 Some(PubsubRole::Publisher) => ManifestRole::Consumer,
@@ -2739,7 +2826,11 @@ async fn analyze_current_repo(
     let mut manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
     stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
     append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
-    append_pubsub_manifest_entries(&mut manifest_entries, &analysis_result.file_results);
+    append_pubsub_manifest_entries(
+        &mut manifest_entries,
+        &analysis_result.file_results,
+        &protocol_extractions.sockets,
+    );
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -5774,7 +5865,11 @@ mod tests {
         );
 
         let mut entries = Vec::new();
-        append_pubsub_manifest_entries(&mut entries, &file_results);
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &crate::socket_io::SocketExtraction::default(),
+        );
         let manifest_alias = entries
             .iter()
             .find(|e| e.key.canonical() == "pubsub|metrics.page_view")
@@ -5847,7 +5942,11 @@ mod tests {
         );
 
         let mut entries = Vec::new();
-        append_pubsub_manifest_entries(&mut entries, &file_results);
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &crate::socket_io::SocketExtraction::default(),
+        );
         let manifest_aliases: HashSet<String> = entries
             .iter()
             .filter(|e| e.key.canonical() == "pubsub|order.placed")
@@ -5927,7 +6026,12 @@ mod tests {
             repo_name: None,
             service_name: None,
         };
-        append_pubsub_operations(&mut cloud_data, &file_results, &to_details);
+        append_pubsub_operations(
+            &mut cloud_data,
+            &file_results,
+            &crate::socket_io::SocketExtraction::default(),
+            &to_details,
+        );
         assert_eq!(
             cloud_data
                 .endpoints
@@ -5949,7 +6053,11 @@ mod tests {
 
         // PR-4 side: both ops emit a manifest entry anchored on the payload type.
         let mut entries = Vec::new();
-        append_pubsub_manifest_entries(&mut entries, &file_results);
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &crate::socket_io::SocketExtraction::default(),
+        );
 
         let producer = entries
             .iter()
@@ -5983,6 +6091,123 @@ mod tests {
         );
     }
 
+    /// Regression (xrepo-corpus-1): the file-analyzer double-classifies a single
+    /// `socket.emit("payment:settled", …)` site as BOTH a deterministic socket
+    /// op AND an LLM pub/sub op, so the emit is indexed twice — once
+    /// `socket|SERVER->CLIENT|payment:settled` (correct, ground truth), once
+    /// `pubsub|payment:settled` (spurious) — inflating the call set. The
+    /// same-file socket-twin fold drops the pub/sub form. A REAL pub/sub op in a
+    /// file with no socket twin (`orders.created`) is untouched, proving the
+    /// fold keys on the same-file coincidence and not on the topic string or a
+    /// broker name. The socket file uses a `./`-prefixed path to exercise the
+    /// component-wise normalization against the repo-relative file_results key.
+    #[test]
+    fn pubsub_op_folded_when_same_file_socket_twin_present() {
+        use crate::operation::{PubsubRole, SocketDirection};
+
+        let emit_file = "payments-svc/realtime/server.ts";
+        let publish_file = "payments-svc/events/orders.ts";
+
+        let extractions = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction::default(),
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![],
+                emitters: vec![crate::socket_io::SocketOp {
+                    key: OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
+                    // `./`-prefixed to prove the walk-path vs file_results-key join.
+                    file_path: PathBuf::from(format!("./{emit_file}")),
+                    line: 28,
+                    payload_type_symbol: Some("Payment".to_string()),
+                    payload_type_source: Some("../src/types".to_string()),
+                }],
+            },
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        // The spurious twin: same file + same event name as the socket emit.
+        file_results.insert(
+            emit_file.to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "payment:settled",
+                    PubsubRole::Publisher,
+                    Some("Payment"),
+                    Some("../src/types"),
+                )],
+                ..Default::default()
+            },
+        );
+        // A genuine pub/sub publish in a DIFFERENT file with no socket twin —
+        // must survive the fold untouched.
+        file_results.insert(
+            publish_file.to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "orders.created",
+                    PubsubRole::Publisher,
+                    Some("OrderCreated"),
+                    Some("./types/order"),
+                )],
+                ..Default::default()
+            },
+        );
+
+        let mut cloud_data = repo_with_bundle("payments-svc", None, "");
+        append_deterministic_protocol_operations(&mut cloud_data, &extractions, &file_results);
+
+        // The socket emit is indexed exactly once, as the socket op.
+        assert_eq!(
+            cloud_data
+                .calls
+                .iter()
+                .filter(|c| c.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
+                .count(),
+            1,
+            "the deterministic socket emitter must be indexed as a call"
+        );
+        // The spurious pub/sub twin was folded away (pre-fix: this is 1).
+        assert_eq!(
+            cloud_data
+                .calls
+                .iter()
+                .filter(|c| c.key.canonical() == "pubsub|payment:settled")
+                .count(),
+            0,
+            "the same-file socket-twin pub/sub op must be folded, not double-indexed"
+        );
+        // The unrelated real pub/sub publish is untouched.
+        assert_eq!(
+            cloud_data
+                .calls
+                .iter()
+                .filter(|c| c.key.canonical() == "pubsub|orders.created")
+                .count(),
+            1,
+            "a real pub/sub op with no same-file socket twin must survive"
+        );
+
+        // Manifest side folds identically: no orphan anchor for the folded op,
+        // the real pub/sub op still anchors.
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(&mut entries, &file_results, &extractions.sockets);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.key.canonical() == "pubsub|payment:settled")
+                .count(),
+            0,
+            "folded pub/sub op must leave no orphan manifest anchor"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.key.canonical() == "pubsub|orders.created")
+                .count(),
+            1,
+            "the real pub/sub op must still anchor a manifest entry"
+        );
+    }
+
     /// A pub/sub op with no decoded payload type (`primary_type_symbol: None`)
     /// still gets a manifest entry, just with a `None` symbol — exactly how a
     /// socket emitter whose payload the extractor couldn't capture is handled.
@@ -6011,7 +6236,11 @@ mod tests {
         );
 
         let mut entries = Vec::new();
-        append_pubsub_manifest_entries(&mut entries, &file_results);
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &crate::socket_io::SocketExtraction::default(),
+        );
 
         let untyped = entries
             .iter()
