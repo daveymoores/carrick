@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.8](https://github.com/daveymoores/carrick/compare/carrick-v0.2.7...carrick-v0.2.8) (2026-07-12)
+
+
+### Features
+
+* persist per-pair ts_check verdicts into CloudRepoData ([#351](https://github.com/daveymoores/carrick/issues/351) part 1) ([#362](https://github.com/daveymoores/carrick/issues/362)) ([55904e5](https://github.com/daveymoores/carrick/commit/55904e5e5d4e13a3c74a83567e07d7ddede65500))
+
+
+### Bug Fixes
+
+* **extraction:** deterministic guards for request-type borrow + graphql-over-http target ([#361](https://github.com/daveymoores/carrick/issues/361)) ([#363](https://github.com/daveymoores/carrick/issues/363)) ([2ed6762](https://github.com/daveymoores/carrick/commit/2ed6762967180887b1f1a148e8d1c2044bb3bc00))
+
 ## [0.2.7](https://github.com/daveymoores/carrick/compare/carrick-v0.2.6...carrick-v0.2.7) (2026-07-12)
 
 
