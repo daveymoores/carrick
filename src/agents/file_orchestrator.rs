@@ -196,9 +196,12 @@ fn call_text_has_type_generic(call_text: &str, symbol: &str) -> bool {
 /// A data-call target shaped like a transport endpoint (an env-var base, a
 /// `process.env` read, an absolute URL, or the analyzer's canonical
 /// `ENV_VAR:` form) rather than an operation identity. Superset of the
-/// `fold_graphql_transport_calls` shape test.
+/// `fold_graphql_transport_calls` shape test, including its quote/backtick
+/// trim: the model sometimes emits the target with its source quoting intact
+/// (`"https://…/graphql"`, `` `${GQL_URL}/graphql` ``), which must not let the
+/// URL escape the prefix checks.
 fn is_transport_shaped_target(target: &str) -> bool {
-    let t = target.trim();
+    let t = target.trim().trim_matches(['`', '"', '\'']);
     t.contains("${")
         || t.contains("process.env.")
         || t.starts_with("http://")
@@ -232,16 +235,50 @@ fn contains_word(haystack: &str, word: &str) -> bool {
     false
 }
 
+/// Collects every named type reference appearing at ANY depth inside a TS type
+/// (`Response<AuditEvent>` yields `Response` AND `AuditEvent`;
+/// `Promise<Wrapper<AuditEvent>[]>` yields all three). Structural and
+/// name-agnostic — no wrapper allowlist — so an annotated result binding counts
+/// as response evidence for a symbol regardless of which framework envelope
+/// wraps it. A qualified name (`api.AuditEvent`) contributes its rightmost
+/// ident, matching the shape of an emitted `primary_type_symbol`.
+struct TypeRefIdentCollector<'a> {
+    syms: &'a mut HashSet<String>,
+}
+
+impl Visit for TypeRefIdentCollector<'_> {
+    fn visit_ts_type_ref(&mut self, n: &swc_ecma_ast::TsTypeRef) {
+        let mut name = &n.type_name;
+        loop {
+            match name {
+                TsEntityName::Ident(id) => {
+                    self.syms.insert(id.sym.to_string());
+                    break;
+                }
+                TsEntityName::TsQualifiedName(q) => {
+                    self.syms.insert(q.right.sym.to_string());
+                    name = &q.left;
+                }
+            }
+        }
+        n.visit_children_with(self);
+    }
+}
+
 /// Collects the AST evidence `suppress_borrowed_request_types` needs from one
 /// file in a single walk: every binding's declared primary type (params and
-/// typed `const`/`let`), and the set of primary types annotated on a
+/// typed `const`/`let`), and every type symbol MENTIONED in the annotation of a
 /// call-initialized binding (response-side evidence).
 #[derive(Default)]
 struct BindingTypeCollector {
     /// binding identifier -> its declared primary type symbol.
     binding_types: HashMap<String, String>,
-    /// primary type symbols annotated on a call-initialized binding, e.g.
-    /// `AuditEvent` from `const r: AuditEvent = await axios.post(...)`.
+    /// All named type refs (any nesting depth) appearing in the annotation of a
+    /// call-initialized binding: `const r: Response<AuditEvent> = await
+    /// axios.post(...)` contributes `Response` and `AuditEvent`. Membership is
+    /// response-side evidence for that symbol — deliberately mention-based, not
+    /// primary-symbol equality, so a framework envelope never hides a real
+    /// response annotation (and never via a hardcoded wrapper-name list).
     call_annotated_syms: HashSet<String>,
 }
 
@@ -259,9 +296,10 @@ impl Visit for BindingTypeCollector {
         if let Pat::Ident(binding) = &n.name
             && let (Some(type_ann), Some(init)) = (&binding.type_ann, n.init.as_deref())
             && expr_is_call_like(init)
-            && let Some(sym) = base_type_symbol(&type_ann.type_ann)
         {
-            self.call_annotated_syms.insert(sym);
+            type_ann.type_ann.visit_with(&mut TypeRefIdentCollector {
+                syms: &mut self.call_annotated_syms,
+            });
         }
         n.visit_children_with(self);
     }
@@ -1844,8 +1882,10 @@ impl FileOrchestrator {
                 continue;
             }
             // Response-side evidence that the type is legitimate, not borrowed:
-            // an explicit call generic, or any result binding in the file that
-            // is annotated with this symbol.
+            // an explicit call generic, or any call-initialized binding in the
+            // file whose annotation MENTIONS this symbol at any depth
+            // (`const r: Response<AuditEvent> = await ...` counts for
+            // `AuditEvent` — envelope wrappers never hide real evidence).
             let has_response_evidence = dc
                 .call_expression_text
                 .as_deref()
@@ -5251,6 +5291,46 @@ export async function echoAudit(event: AuditEvent): Promise<AuditEvent> {
     }
 
     #[test]
+    fn test_suppress_borrowed_request_type_keeps_wrapped_result_binding() {
+        // The result binding's annotation wraps the shared type in a generic
+        // envelope (`const r: Response<AuditEvent> = await ...`). Evidence is
+        // mention-based (any depth, no wrapper-name allowlist), so the symbol
+        // must be kept exactly like the bare-annotation case.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("wrapped.ts");
+        std::fs::write(
+            &file_path,
+            r#"
+import axios from "axios";
+export interface AuditEvent { paymentId: string; }
+export interface Response<T> { data: T; status: number; }
+export async function echoAudit(event: AuditEvent): Promise<AuditEvent> {
+  const r: Response<AuditEvent> = await axios.post("http://localhost:3099/audit/echo", event);
+  return r.data;
+}
+"#,
+        )
+        .unwrap();
+
+        let mut result = result_with_data_calls(vec![guard_data_call(
+            6,
+            "/audit/echo",
+            Some(r#"axios.post("http://localhost:3099/audit/echo", event)"#),
+            Some("event"),
+            Some("AuditEvent"),
+            Some("./types"),
+        )]);
+
+        FileOrchestrator::suppress_borrowed_request_types(&mut result, &file_path);
+
+        assert_eq!(
+            result.data_calls[0].primary_type_symbol.as_deref(),
+            Some("AuditEvent"),
+            "a generic-wrapped result annotation is response evidence; type must not be nulled"
+        );
+    }
+
+    #[test]
     fn test_suppress_borrowed_request_type_ignores_non_identifier_payload() {
         // An object-literal payload has no resolvable binding type, so the row
         // is untouched even though the symbol is set (we never guess).
@@ -5345,6 +5425,67 @@ export async function loadTicket(id: string) {
         assert_eq!(
             result.data_calls[1].target, "`${API_BASE}/orders`",
             "a non-graphql transport call must be left untouched"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_graphql_document_target_trims_quoted_transport_url() {
+        // The model sometimes emits the target with its source quoting intact
+        // (`"https://…/graphql"`, backticked template). The quote/backtick trim
+        // (mirroring fold_graphql_transport_calls) must not let a quoted URL
+        // escape the transport-shape check.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("support.ts");
+        std::fs::write(
+            &file_path,
+            r#"
+import { gql } from "graphql-tag";
+import { GraphQLClient } from "graphql-request";
+const client = new GraphQLClient("https://support.example.com/graphql");
+const TICKET_QUERY = gql`
+  query ticket($id: ID!) {
+    ticket(id: $id) {
+      id
+    }
+  }
+`;
+export async function loadTicket(id: string) {
+  return client.request(TICKET_QUERY, { id });
+}
+"#,
+        )
+        .unwrap();
+
+        let mut result = result_with_data_calls(vec![
+            // Double-quoted absolute URL -> still transport-shaped -> rewritten.
+            guard_data_call(
+                13,
+                r#""https://support.example.com/graphql""#,
+                Some("client.request(TICKET_QUERY, { id })"),
+                None,
+                None,
+                None,
+            ),
+            // Backticked absolute URL (no `${}`) -> same.
+            guard_data_call(
+                13,
+                "`https://support.example.com/graphql`",
+                Some("client.request(TICKET_QUERY, { id })"),
+                None,
+                None,
+                None,
+            ),
+        ]);
+
+        FileOrchestrator::rewrite_graphql_document_targets(&mut result, &file_path);
+
+        assert_eq!(
+            result.data_calls[0].target, "graphql|query|ticket",
+            "a double-quoted transport URL must be rewritten"
+        );
+        assert_eq!(
+            result.data_calls[1].target, "graphql|query|ticket",
+            "a backticked transport URL must be rewritten"
         );
     }
 
