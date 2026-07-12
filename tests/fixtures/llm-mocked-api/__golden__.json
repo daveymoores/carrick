@@ -83,15 +83,21 @@
   ],
   "calls": [
     {
-      "key": "http|GET|https://orders.internal/api/orders?user=${userId}",
+      "key": "http|GET|/api/orders",
       "protocol": "http",
       "method": "GET",
-      "path": "https://orders.internal/api/orders?user=${userId}",
+      "path": "/api/orders",
       "handler": "fetch(",
       "request_type": null,
       "response_type": null,
       "file": "tests/fixtures/llm-mocked-api/src/client.ts",
-      "line": 4
+      "line": 4,
+      "type_alias": "Endpoint_4022e5b76e4552db_Response_Call0000000000000000",
+      "type_state": "Explicit",
+      "resolved_definition": "export interface Endpoint_4022e5b76e4552db_Response_Call0000000000000000 { id: number; userId: number; total: number; }",
+      "expanded_definition": "{ id: number; userId: number; total: number; }",
+      "is_explicit": true,
+      "primary_type_symbol": "Order"
     }
   ],
   "cross_repo_matches": [],
