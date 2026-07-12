@@ -1578,8 +1578,56 @@ impl FileOrchestrator {
         )
     }
 
+    /// Strip a trailing TypeScript/JavaScript source-file extension from a module
+    /// specifier, returning `Some(stripped)` only when one was present. TS import
+    /// specifiers are written without a source extension, so a specifier that
+    /// carries one (e.g. `../types/events.ts`) is a model artifact.
+    fn strip_source_file_extension(spec: &str) -> Option<&str> {
+        for ext in [
+            ".d.ts", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
+        ] {
+            if let Some(stripped) = spec.strip_suffix(ext) {
+                return Some(stripped);
+            }
+        }
+        None
+    }
+
+    /// Normalize a spurious source-file extension the lite model sometimes
+    /// appends to `type_import_source` (e.g. `../types/events.ts`). We rewrite
+    /// ONLY when the extension-less form matches the symbol's import-table entry,
+    /// so a specifier that legitimately lacks an extension — a scoped package
+    /// like `@metamask/network-controller`, a same-file type — is left untouched.
+    /// Deterministic and framework-agnostic: the AST import table is the source
+    /// of truth, never a hard-coded library list.
+    fn normalize_import_extension(
+        primary: &Option<String>,
+        source: &mut Option<String>,
+        symbol_table: &SymbolTable,
+    ) {
+        let (Some(symbol), Some(src)) = (primary.as_deref(), source.as_deref()) else {
+            return;
+        };
+        let Some(stripped) = Self::strip_source_file_extension(src) else {
+            return;
+        };
+        let root = symbol
+            .split_once('.')
+            .map(|(root, _)| root)
+            .unwrap_or(symbol);
+        if let Some(imported) = symbol_table.imported_symbols.get(root)
+            && imported.source.as_str() == stripped
+        {
+            *source = Some(stripped.to_string());
+        }
+    }
+
     fn validate_type_hints(result: &mut FileAnalysisResult, symbol_table: &SymbolTable) {
         let validate = |primary: &mut Option<String>, source: &mut Option<String>| {
+            // Normalize a spurious `.ts`/`.js` suffix first so a hint that only
+            // differs from its import by the extension is kept (not nulled below).
+            Self::normalize_import_extension(primary, source, symbol_table);
+
             let Some(symbol) = primary.as_ref() else {
                 *source = None;
                 return;
@@ -1624,6 +1672,18 @@ impl FileOrchestrator {
             validate(
                 &mut data_call.primary_type_symbol,
                 &mut data_call.type_import_source,
+            );
+        }
+
+        // Pub/sub type hints intentionally skip the reject-on-mismatch `validate`
+        // above (their payload symbols come from many messaging libraries whose
+        // shapes the import-table check is not tuned for), but the spurious
+        // source-file extension is a universal model artifact, so normalize it.
+        for op in &mut result.pubsub_operations {
+            Self::normalize_import_extension(
+                &op.primary_type_symbol,
+                &mut op.type_import_source,
+                symbol_table,
             );
         }
     }
@@ -3942,6 +4002,138 @@ mod tests {
         let data_call = &result.data_calls[0];
         assert_eq!(data_call.primary_type_symbol.as_deref(), Some("LocalType"));
         assert!(data_call.type_import_source.is_none());
+    }
+
+    #[test]
+    fn test_validate_type_hints_strips_spurious_source_extension() {
+        use crate::agents::file_analyzer_agent::PubsubOperation;
+        use crate::operation::PubsubRole;
+
+        let mut result = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
+            mounts: vec![],
+            endpoints: vec![EndpointResult {
+                candidate_id: "span:1-2".to_string(),
+                line_number: 10,
+                owner_node: "app".to_string(),
+                method: "GET".to_string(),
+                path: "/orders".to_string(),
+                handler_name: "handler".to_string(),
+                pattern_matched: "app.get".to_string(),
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                response_expression_text: None,
+                response_expression_line: None,
+                emission_style: None,
+                // `.ts` appended by the model; the extension-less form is imported.
+                primary_type_symbol: Some("OrderPlacedEvent".to_string()),
+                type_import_source: Some("../types/events.ts".to_string()),
+            }],
+            data_calls: vec![DataCallResult {
+                call_kind: None,
+                candidate_id: "span:3-4".to_string(),
+                line_number: 12,
+                target: "/x".to_string(),
+                method: Some("GET".to_string()),
+                pattern_matched: "fetch(".to_string(),
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                call_expression_text: None,
+                call_expression_line: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: Some("OrderPlacedEvent".to_string()),
+                type_import_source: Some("../types/events.tsx".to_string()),
+            }],
+            graphql_operations: vec![],
+            pubsub_operations: vec![
+                // (a) spurious `.ts` that matches the import table -> stripped + kept.
+                PubsubOperation {
+                    topic: "order.placed".to_string(),
+                    role: Some(PubsubRole::Subscriber),
+                    line_number: 20,
+                    primary_type_symbol: Some("OrderPlacedEvent".to_string()),
+                    type_import_source: Some("../types/events.ts".to_string()),
+                    broker: None,
+                },
+                // (b) scoped-package source (no extension) -> untouched (canary safety).
+                PubsubOperation {
+                    topic: "AccountsController:selectedAccountChange".to_string(),
+                    role: Some(PubsubRole::Subscriber),
+                    line_number: 30,
+                    primary_type_symbol: Some("InternalAccount".to_string()),
+                    type_import_source: Some("@metamask/keyring-internal-api".to_string()),
+                    broker: None,
+                },
+                // (c) `.ts` whose stripped form is NOT in the import table -> left as-is
+                //     (we normalize only against evidence, never guess).
+                PubsubOperation {
+                    topic: "other".to_string(),
+                    role: Some(PubsubRole::Publisher),
+                    line_number: 40,
+                    primary_type_symbol: Some("OrderPlacedEvent".to_string()),
+                    type_import_source: Some("../wrong/path.ts".to_string()),
+                    broker: None,
+                },
+            ],
+        };
+
+        let mut imported_symbols = HashMap::new();
+        imported_symbols.insert(
+            "OrderPlacedEvent".to_string(),
+            ImportedSymbol {
+                local_name: "OrderPlacedEvent".to_string(),
+                imported_name: "OrderPlacedEvent".to_string(),
+                source: "../types/events".to_string(),
+                kind: SymbolKind::Named,
+            },
+        );
+        imported_symbols.insert(
+            "InternalAccount".to_string(),
+            ImportedSymbol {
+                local_name: "InternalAccount".to_string(),
+                imported_name: "InternalAccount".to_string(),
+                source: "@metamask/keyring-internal-api".to_string(),
+                kind: SymbolKind::Named,
+            },
+        );
+
+        let symbol_table = SymbolTable {
+            local_types: HashSet::new(),
+            imported_symbols,
+        };
+
+        FileOrchestrator::validate_type_hints(&mut result, &symbol_table);
+
+        // endpoint + data_call: extension stripped, hint kept (not nulled).
+        assert_eq!(
+            result.endpoints[0].primary_type_symbol.as_deref(),
+            Some("OrderPlacedEvent")
+        );
+        assert_eq!(
+            result.endpoints[0].type_import_source.as_deref(),
+            Some("../types/events")
+        );
+        assert_eq!(
+            result.data_calls[0].type_import_source.as_deref(),
+            Some("../types/events")
+        );
+
+        // pubsub (a) stripped; (b) scoped package untouched; (c) no match, unchanged.
+        assert_eq!(
+            result.pubsub_operations[0].type_import_source.as_deref(),
+            Some("../types/events")
+        );
+        assert_eq!(
+            result.pubsub_operations[1].type_import_source.as_deref(),
+            Some("@metamask/keyring-internal-api")
+        );
+        assert_eq!(
+            result.pubsub_operations[2].type_import_source.as_deref(),
+            Some("../wrong/path.ts")
+        );
     }
 
     #[test]
