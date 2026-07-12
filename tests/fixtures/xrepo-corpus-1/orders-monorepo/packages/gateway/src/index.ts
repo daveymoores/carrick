@@ -3,6 +3,7 @@ export { healthCheckHandler, routeRegistry } from './health.handler';
 export { server as mcpServer } from './mcp-tools';
 export {
   resolveOrder,
+  resolveOrders,
   resolveRefundOrder,
   resolveOrderUpdated,
 } from './orders.resolver';

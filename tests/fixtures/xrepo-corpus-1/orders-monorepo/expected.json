@@ -68,7 +68,7 @@
       "field": "orders",
       "source": "packages/gateway/src/schema.graphql",
       "primary_type_symbol": "[Order!]!",
-      "resolved_type": "{ id: string; total: { amountCents: number; currency: string; }; status: { kind: \"placed\"; placedAt: string; } | { kind: \"refunded\"; refundedAt: string; reason?: string; }; note?: string; }[]",
+      "resolved_type": "{ data: { id: string; total: { amountCents: number; currency: string; }; status: { kind: \"placed\"; placedAt: string; } | { kind: \"refunded\"; refundedAt: string; reason?: string; }; note?: string; }[]; errors: string[]; }",
       "type_state": "Explicit",
       "tier": "capability"
     },

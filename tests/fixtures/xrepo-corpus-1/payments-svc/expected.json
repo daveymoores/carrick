@@ -68,6 +68,18 @@
       "resolved_type": null,
       "type_state": "Unknown",
       "tier": "capability"
+    },
+    {
+      "method": "POST",
+      "path": "/audit/events",
+      "host_contains": null,
+      "path_contains": "/audit/events",
+      "import_source": "axios",
+      "primary_type_symbol": null,
+      "resolved_type": null,
+      "type_state": "Unknown",
+      "tier": "capability",
+      "evidence": "lib/audit.ts: axios.post to `${process.env.AUDIT_WEBHOOK_URL ?? \"http://localhost:3099\"}/audit/events` — an external webhook on the UNDECLARED env var AUDIT_WEBHOOK_URL (deliberately absent from carrick.json internalEnvVars, which lists only ORDERS_SERVICE_URL/BILLING_URL). The live projection keys this call http|POST|${AUDIT_WEBHOOK_URL}/audit/events (raw env-var base survives for undeclared vars, per #294/#354). host_contains is null (no stable host) and path_contains \"/audit/events\" is a substring of the projected path, so fuzzy_call_match joins it. Labelled as an expected call to complete ground truth per owner ruling 2026-07-12."
     }
   ],
   "socket_events": [
