@@ -19,4 +19,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: daveymoores/carrick@v1
+      - uses: carrick-tools/carrick@v1

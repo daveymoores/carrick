@@ -1052,7 +1052,7 @@ notificationRouter.get('/status', async () => {
 
 /// #336 fourth path — the CI condition proven against the SHIPPED v0.2.5 dist:
 /// the GitHub Action scans a bare checkout (the demo workflow is
-/// `actions/checkout` + `daveymoores/carrick` with no `npm install`), so
+/// `actions/checkout` + `carrick-tools/carrick` with no `npm install`), so
 /// `import axios from 'axios'` resolves to `any`, the call's SEMANTIC type
 /// carries no symbol, and the anchor path found nothing — the depth was erased
 /// even with the span-slack (#346) and call-payload-anchor (#344) fixes in
