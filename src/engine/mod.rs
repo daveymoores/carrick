@@ -269,12 +269,18 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         );
     }
 
-    // 5. Conditionally upload each service's data to cloud storage.
+    // 5. Prepare each service's upload payload, but DEFER the actual upload
+    //    until after cross-repo analysis (step 6) so every payload can carry the
+    //    per-pair ts_check compat verdicts that analysis computes (#351). Every
+    //    payload is materialised now (cheap clones), so a serialization problem
+    //    can't surface halfway through a multi-service upload.
+    //
     //    The production index keys on (workspace, project, repo) only, so it
-    //    cannot yet hold more than one service per repo — a multi-service
-    //    upload would clobber. Gate it on the backend advertising support;
-    //    cross-repo analysis below still runs locally regardless.
-    if should_upload {
+    //    cannot yet hold more than one service per repo — a multi-service upload
+    //    would clobber. Gate it on the backend advertising support; cross-repo
+    //    analysis below still runs locally regardless. `None` = do not upload
+    //    (PR/branch mode, or an unsupported multi-service repo).
+    let upload_payloads: Option<Vec<CloudRepoData>> = if should_upload {
         if multi_service && !storage.supports_multi_service() {
             warn!(
                 "Skipping index upload: {} services declared but the cloud key has no \
@@ -282,43 +288,19 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
                  Cross-repo analysis still runs locally.",
                 services.len()
             );
+            None
         } else {
-            let sp = logging::spinner("Uploading results...");
-            // Prepare every payload before uploading any, so a serialization
-            // problem can't surface halfway through a multi-service upload.
-            let payloads: Vec<CloudRepoData> = current_services_data
-                .iter()
-                .map(|data| strip_ast_nodes(data.clone()))
-                .collect();
-            for (i, payload) in payloads.iter().enumerate() {
-                if let Err(e) = storage.upload_repo_data(payload).await {
-                    // Uploads are keyed per (repo, service) and idempotent, so
-                    // a re-run restores consistency — but until then the index
-                    // holds this run's data for some services and the previous
-                    // run's for the rest. Make that state explicit.
-                    let uploaded: Vec<&str> = payloads[..i]
-                        .iter()
-                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
-                        .collect();
-                    let not_uploaded: Vec<&str> = payloads[i..]
-                        .iter()
-                        .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
-                        .collect();
-                    return Err(format!(
-                        "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
-                         The index is mixed-generation for this repo until a successful re-run.",
-                        e,
-                        uploaded.join(", "),
-                        not_uploaded.join(", ")
-                    )
-                    .into());
-                }
-            }
-            logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
+            Some(
+                current_services_data
+                    .iter()
+                    .map(|data| strip_ast_nodes(data.clone()))
+                    .collect(),
+            )
         }
     } else {
         debug!("Skipping upload (PR/branch mode)");
-    }
+        None
+    };
 
     // On a PR run, capture this repo's previously-indexed endpoints (its last
     // uploaded state, i.e. main) before they're removed below, so the diff can
@@ -438,7 +420,19 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
-        build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await?;
+        match build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await {
+            Ok(analyzer) => analyzer,
+            Err(e) => {
+                // Cross-repo analysis (which is what runs ts_check) failed. Preserve
+                // the prior behavior where the per-repo index upload happened BEFORE
+                // cross-repo analysis: still upload this run's data — verdict-less —
+                // so the index stays fresh, then propagate the failure.
+                if let Some(payloads) = &upload_payloads {
+                    upload_service_payloads(storage, payloads).await?;
+                }
+                return Err(e);
+            }
+        };
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let results = analyzer.get_results();
@@ -446,12 +440,24 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // Eval harness output mode: emit a machine-readable projection of the
     // results and skip the human Markdown report + PR-comment relay. Consumed
     // by the offline scorer (Slice 1 of the evals plan). Deliberately terminal —
-    // an eval run wants only the JSON, no upload or comment side effects.
+    // an eval run wants only the JSON, no upload or comment side effects. (Eval
+    // mode never uploads, so `upload_payloads` is always `None` here.)
     if std::env::var("CARRICK_OUTPUT_JSON").is_ok() {
         let projection =
             crate::eval_output::EvalProjection::from_results(&results, &eval_type_manifest);
         println!("{}", serde_json::to_string_pretty(&projection)?);
         return Ok(());
+    }
+
+    // 6b. Upload each service's data, now carrying the per-pair ts_check compat
+    //     verdicts cross-repo analysis just computed for the edges this repo's
+    //     calls consume (#351). Keyed by canonical pair identity so the cloud
+    //     MCP `check_compatibility` tool can surface the real verdict instead of
+    //     structural-matching-only. Absent for edges ts_check didn't evaluate,
+    //     which the cloud reads as "not compared" (fail closed, #324).
+    if let Some(mut payloads) = upload_payloads {
+        crate::cloud_storage::attach_compat_verdicts(&mut payloads, &results.cross_repo_matches);
+        upload_service_payloads(storage, &payloads).await?;
     }
 
     let topology = crate::findings::Topology {
@@ -620,6 +626,39 @@ where
         }
     }
     Ok(T::default())
+}
+
+/// Upload each already-prepared service payload to the cloud index, in order.
+/// On a mid-sequence failure, reports which services made it and which didn't:
+/// uploads are keyed per (repo, service) and idempotent, so a re-run restores
+/// consistency, but until then the index is mixed-generation for this repo.
+async fn upload_service_payloads<T: CloudStorage>(
+    storage: &T,
+    payloads: &[CloudRepoData],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sp = logging::spinner("Uploading results...");
+    for (i, payload) in payloads.iter().enumerate() {
+        if let Err(e) = storage.upload_repo_data(payload).await {
+            let uploaded: Vec<&str> = payloads[..i]
+                .iter()
+                .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                .collect();
+            let not_uploaded: Vec<&str> = payloads[i..]
+                .iter()
+                .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                .collect();
+            return Err(format!(
+                "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
+                 The index is mixed-generation for this repo until a successful re-run.",
+                e,
+                uploaded.join(", "),
+                not_uploaded.join(", ")
+            )
+            .into());
+        }
+    }
+    logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
+    Ok(())
 }
 
 /// Remove AST nodes from CloudRepoData for serialization.
@@ -2005,6 +2044,7 @@ fn build_cloud_data_from_mount_graph(
         package_json_hash: None,
         cache_version: None,
         type_extraction_status: None,
+        compat_verdicts: None,
     }
 }
 
@@ -3778,6 +3818,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            compat_verdicts: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -3818,6 +3859,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            compat_verdicts: None,
         }];
 
         // Test Config merging
@@ -3894,6 +3936,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            compat_verdicts: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -4434,6 +4477,7 @@ mod tests {
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            compat_verdicts: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -4477,6 +4521,7 @@ mod tests {
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            compat_verdicts: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -4612,6 +4657,7 @@ mod tests {
             package_json_hash: Some("abc123hash".to_string()),
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            compat_verdicts: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -4683,6 +4729,7 @@ mod tests {
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            compat_verdicts: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -6561,6 +6608,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            compat_verdicts: None,
         };
 
         // Local mirror of TypeManifestFile for reading back the written JSON
@@ -6727,6 +6775,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            compat_verdicts: None,
         };
 
         #[derive(serde::Deserialize)]
@@ -6806,6 +6855,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            compat_verdicts: None,
         }
     }
 

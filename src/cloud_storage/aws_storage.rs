@@ -458,6 +458,7 @@ impl CloudStorage for AwsStorage {
                     package_json_hash: None,
                     cache_version: None,
                     type_extraction_status: None,
+                    compat_verdicts: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);
