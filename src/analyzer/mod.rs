@@ -1719,6 +1719,17 @@ impl Analyzer {
                     (producer_repos_by_key.get(&canonical), consumer_repo)
                 {
                     for producer_repo in producer_repos {
+                        // Same-repo publisher↔subscriber (or listener↔emitter) is
+                        // an intra-repo self-loop, not a cross-repo contract edge.
+                        // Drop it structurally on repo identity alone (never on
+                        // topic-name or library patterns) so a dead-letter retry
+                        // loop or any in-process fan-out doesn't surface as a
+                        // self-match. A key that OTHER repos also participate on
+                        // still emits its genuine cross-repo edges — only the
+                        // producer==consumer pair is skipped.
+                        if *producer_repo == consumer_repo {
+                            continue;
+                        }
                         cross_repo_matches.push(CrossRepoMatch {
                             producer_repo: producer_repo.clone(),
                             producer_key: canonical.clone(),
@@ -3012,6 +3023,69 @@ mod tests {
         // Compat is filled in later by overlay_compat_verdicts, not here; pub/sub
         // compat machinery is deferred, so it stays None.
         assert_eq!(e.type_compatible, None);
+    }
+
+    #[test]
+    fn pubsub_intra_repo_self_loop_emits_no_edge() {
+        // Corpus-2 `_must_not_emit`: orders-engine BOTH subscribes (producer /
+        // endpoint) and publishes (consumer / call) the internal `__dlq.retry`
+        // dead-letter topic. Same repo on both sides with no other participant is
+        // an intra-repo self-loop, not a cross-repo contract — no edge.
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.endpoints.push(op_details_in_repo(
+            OperationKey::pubsub("__dlq.retry"),
+            "orders-engine/src/kafka/dlq.ts:26",
+            "orders-engine",
+        ));
+        analyzer.calls.push(op_details_in_repo(
+            OperationKey::pubsub("__dlq.retry"),
+            "orders-engine/src/kafka/dlq.ts:19",
+            "orders-engine",
+        ));
+
+        let (_, _, edges) = analyzer.analyze_exact_key_matches(crate::operation::Protocol::Pubsub);
+        assert!(
+            edges.is_empty(),
+            "intra-repo self-loop must not emit a cross-repo edge, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn pubsub_self_edge_dropped_but_cross_edges_survive() {
+        // Fan-in must not regress: two repos subscribe `order.placed`
+        // (producers), and orders-engine ALSO publishes it (consumer). Only the
+        // orders-engine→orders-engine self-edge is dropped; the genuine
+        // orders-engine(publisher) → notifications-svc(subscriber) cross edge
+        // survives.
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.endpoints.push(op_details_in_repo(
+            OperationKey::pubsub("order.placed"),
+            "notifications-svc/src/consume.ts:4",
+            "notifications-svc",
+        ));
+        analyzer.endpoints.push(op_details_in_repo(
+            OperationKey::pubsub("order.placed"),
+            "orders-engine/src/consume.ts:4",
+            "orders-engine",
+        ));
+        analyzer.calls.push(op_details_in_repo(
+            OperationKey::pubsub("order.placed"),
+            "orders-engine/src/producer.ts:7",
+            "orders-engine",
+        ));
+
+        let (_, _, edges) = analyzer.analyze_exact_key_matches(crate::operation::Protocol::Pubsub);
+        assert_eq!(
+            edges.len(),
+            1,
+            "self-edge dropped, cross edge kept; got {edges:?}"
+        );
+        assert_eq!(edges[0].producer_repo, "notifications-svc");
+        assert_eq!(edges[0].consumer_repo, "orders-engine");
     }
 
     #[test]

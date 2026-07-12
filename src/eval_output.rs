@@ -137,6 +137,26 @@ impl EvalProjection {
             .map(EvalDependencyConflict::from_conflict)
             .collect();
         dependency_conflicts.sort_by(|a, b| a.package.cmp(&b.package));
+        // Intra-repo pub/sub (and any exact-key) self-loops must not surface in
+        // the cross-repo projection. A topic that ONE repo both produces and
+        // consumes, with no other repo on the key, is a self-edge — not a
+        // contract edge (the matcher already drops the self-EDGE; this keeps the
+        // producer/consumer OPS out of the endpoint/call sets too, so e.g. a
+        // dead-letter retry loop can't inflate them). Keyed on repo identity +
+        // canonical key alone — never on topic-name or library patterns — so it
+        // behaves identically for Kafka/Redis/NATS/RabbitMQ and socket events. A
+        // key that any OTHER repo also touches (fan-in/fan-out), or that a single
+        // repo only produces OR only consumes (an orphan), is left untouched.
+        let self_loops = Self::intra_repo_self_loops(result);
+        // Drop an op only when its OWN repo attribution matches the self-loop
+        // repo for its key. An op with no attribution is undecidable (it might
+        // belong to a different, untagged repo) and is kept — mirroring the
+        // skip in `intra_repo_self_loops`.
+        let is_self_loop_op = |d: &&ApiEndpointDetails| {
+            self_loops.get(&d.key.canonical()).is_some_and(|loop_repo| {
+                d.service_name.as_deref().or(d.repo_name.as_deref()) == Some(loop_repo)
+            })
+        };
         Self {
             // `endpoints` are producers and `calls` are consumers; the role
             // selects which manifest slot each op joins to. A shared canonical
@@ -148,16 +168,59 @@ impl EvalProjection {
             endpoints: result
                 .endpoints
                 .iter()
+                .filter(|d| !is_self_loop_op(d))
                 .map(|d| EvalOp::from_details(d, &manifest_index, ManifestRole::Producer))
                 .collect(),
             calls: result
                 .calls
                 .iter()
+                .filter(|d| !is_self_loop_op(d))
                 .map(|d| EvalOp::from_details(d, &manifest_index, ManifestRole::Consumer))
                 .collect(),
             cross_repo_matches,
             dependency_conflicts,
         }
+    }
+
+    /// Pure intra-repo self-loops among exact-key (non-HTTP) operations:
+    /// canonical key → the single repo that both produces AND consumes it, with
+    /// no other repo on the key. The projection filters out the ops of that repo
+    /// on that key.
+    ///
+    /// HTTP ops are excluded — they get repo provenance from the mount graph, not
+    /// from `repo_name`, and localhost self-calls are already dropped at
+    /// extraction. A non-HTTP op with no repo attribution is skipped (self-loop is
+    /// undecidable without both repo ids), on both sides: it neither votes here
+    /// nor gets dropped by the filter.
+    fn intra_repo_self_loops(result: &ApiAnalysisResult) -> HashMap<String, String> {
+        use std::collections::HashSet;
+        let mut producer_repos: HashMap<String, HashSet<&str>> = HashMap::new();
+        let mut consumer_repos: HashMap<String, HashSet<&str>> = HashMap::new();
+        for (ops, repos) in [
+            (&result.endpoints, &mut producer_repos),
+            (&result.calls, &mut consumer_repos),
+        ] {
+            for d in ops {
+                if matches!(d.key.protocol(), crate::operation::Protocol::Http) {
+                    continue;
+                }
+                if let Some(repo) = d.service_name.as_deref().or(d.repo_name.as_deref()) {
+                    repos.entry(d.key.canonical()).or_default().insert(repo);
+                }
+            }
+        }
+        let mut self_loops = HashMap::new();
+        for (key, producers) in &producer_repos {
+            let Some(consumers) = consumer_repos.get(key) else {
+                continue; // orphan producer — surfaces as an endpoint, not a self-loop
+            };
+            let repos: HashSet<&str> = producers.iter().chain(consumers.iter()).copied().collect();
+            if repos.len() == 1 {
+                let repo = repos.iter().next().expect("len checked above");
+                self_loops.insert(key.clone(), repo.to_string());
+            }
+        }
+        self_loops
     }
 }
 
@@ -531,6 +594,150 @@ mod tests {
             repo_name: None,
             service_name: None,
         }
+    }
+
+    fn pubsub_op(topic: &str, file_line: &str, repo: &str) -> ApiEndpointDetails {
+        ApiEndpointDetails {
+            owner: None,
+            key: OperationKey::pubsub(topic),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(file_line),
+            repo_name: Some(repo.to_string()),
+            service_name: None,
+        }
+    }
+
+    /// Intra-repo pub/sub self-loop (corpus-2 `_must_not_emit`): a topic one repo
+    /// both publishes and subscribes, with no other repo on it, must NOT surface
+    /// as an endpoint or a call in the projection. A fan-in topic (distinct
+    /// producer/consumer repos) and an orphan producer (no consumer) must survive.
+    #[test]
+    fn intra_repo_pubsub_self_loop_dropped_from_projection() {
+        let result = ApiAnalysisResult {
+            // subscribers are producers (endpoints); publishers are consumers (calls)
+            endpoints: vec![
+                // self-loop: orders-engine subscribes __dlq.retry
+                pubsub_op(
+                    "__dlq.retry",
+                    "orders-engine/src/kafka/dlq.ts:26",
+                    "orders-engine",
+                ),
+                // fan-in: billing-svc subscribes order.placed
+                pubsub_op(
+                    "order.placed",
+                    "billing-svc/src/consume.ts:4",
+                    "billing-svc",
+                ),
+                // orphan producer: nobody publishes user.registered
+                pubsub_op(
+                    "user.registered",
+                    "orders-engine/src/consume.ts:9",
+                    "orders-engine",
+                ),
+            ],
+            calls: vec![
+                // self-loop: orders-engine publishes __dlq.retry
+                pubsub_op(
+                    "__dlq.retry",
+                    "orders-engine/src/kafka/dlq.ts:19",
+                    "orders-engine",
+                ),
+                // fan-in: orders-engine publishes order.placed (other repo consumes)
+                pubsub_op(
+                    "order.placed",
+                    "orders-engine/src/producer.ts:7",
+                    "orders-engine",
+                ),
+            ],
+            findings: vec![],
+            dependency_conflicts: vec![],
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+
+        let projection = EvalProjection::from_results(&result, &[]);
+        let endpoint_keys: Vec<&str> = projection
+            .endpoints
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect();
+        let call_keys: Vec<&str> = projection.calls.iter().map(|o| o.key.as_str()).collect();
+
+        // Self-loop dropped from BOTH sets.
+        assert!(
+            !endpoint_keys.contains(&"pubsub|__dlq.retry"),
+            "self-loop endpoint must be dropped, got {endpoint_keys:?}"
+        );
+        assert!(
+            !call_keys.contains(&"pubsub|__dlq.retry"),
+            "self-loop call must be dropped, got {call_keys:?}"
+        );
+        // Fan-in (distinct repos) survives.
+        assert!(endpoint_keys.contains(&"pubsub|order.placed"));
+        assert!(call_keys.contains(&"pubsub|order.placed"));
+        // Orphan producer (no consumer) survives.
+        assert!(endpoint_keys.contains(&"pubsub|user.registered"));
+    }
+
+    /// An op WITHOUT repo attribution on a self-loop key must survive: with no
+    /// repo id it is undecidable whether it belongs to the self-looping repo or
+    /// to another (untagged) participant, so only the attributed self-loop ops
+    /// are dropped.
+    #[test]
+    fn unattributed_op_on_self_loop_key_survives() {
+        let result = ApiAnalysisResult {
+            endpoints: vec![
+                // attributed self-loop producer: dropped
+                pubsub_op(
+                    "__dlq.retry",
+                    "orders-engine/src/kafka/dlq.ts:26",
+                    "orders-engine",
+                ),
+                // UNATTRIBUTED producer on the same key: kept (undecidable)
+                ApiEndpointDetails {
+                    repo_name: None,
+                    ..pubsub_op("__dlq.retry", "unknown/src/consume.ts:3", "ignored")
+                },
+            ],
+            calls: vec![
+                // attributed self-loop consumer: dropped
+                pubsub_op(
+                    "__dlq.retry",
+                    "orders-engine/src/kafka/dlq.ts:19",
+                    "orders-engine",
+                ),
+            ],
+            findings: vec![],
+            dependency_conflicts: vec![],
+            verified_endpoints: vec![],
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+
+        let projection = EvalProjection::from_results(&result, &[]);
+        let surviving: Vec<(&str, &str)> = projection
+            .endpoints
+            .iter()
+            .map(|o| (o.key.as_str(), o.file.as_str()))
+            .collect();
+        assert_eq!(
+            surviving,
+            vec![("pubsub|__dlq.retry", "unknown/src/consume.ts")],
+            "only the unattributed op survives; attributed self-loop ops are dropped"
+        );
+        assert!(
+            projection.calls.is_empty(),
+            "attributed self-loop call must be dropped, got {:?}",
+            projection.calls.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
     }
 
     /// Build a projection with a cross-repo match, manifest-joined op fields,
