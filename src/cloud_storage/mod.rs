@@ -106,6 +106,44 @@ pub struct TypeManifestEntry {
     pub primary_type_symbol: Option<String>,
 }
 
+/// A persisted per-pair type-compatibility verdict, keyed by CANONICAL pair
+/// identity (never display labels — that is the #324 fail-open trap). Emitted at
+/// scan time from the cross-repo [`crate::analyzer::CrossRepoMatch`] edges this
+/// repo's calls participate in as the consumer, so the cloud MCP
+/// `check_compatibility` tool can surface the REAL ts_check verdict CI already
+/// computes instead of a structural-matching-only answer.
+///
+/// Only edges ts_check actually EVALUATED are persisted (`type_compatible`
+/// `Some(_)`), so `compatible` is never a fabricated `true`: a pair with no
+/// stored verdict is "not compared", never "compatible". The four key fields are
+/// the exact `OperationKey::canonical()` / `service_name ?? repo_name` strings
+/// the cloud reconstructs from the same persisted blob it already reads, so the
+/// join is byte-identical and drift-free.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CompatVerdict {
+    /// Producer repo id (`service_name ?? repo_name`).
+    pub producer_repo: String,
+    /// Producer endpoint `OperationKey::canonical()` (e.g. `http|GET|/orders/:id`).
+    pub producer_key: String,
+    /// Consumer repo id (`service_name ?? repo_name`).
+    pub consumer_repo: String,
+    /// Consumer call `OperationKey::canonical()` (host-free, URL-normalized;
+    /// equal to the persisted `DataFetchingCall::canonical_path` for every edge
+    /// that yields a match).
+    pub consumer_key: String,
+    /// `true` = ts_check found the request/response types compatible, `false` =
+    /// incompatible. Only evaluated edges reach here, so this is never a
+    /// fabricated `true`.
+    pub compatible: bool,
+    /// Populated iff `!compatible`: the human-readable mismatch reason ts_check
+    /// emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatch_reason: Option<String>,
+    /// Scanner release that produced this verdict (`CARGO_PKG_VERSION`), so a
+    /// reader can see how stale the verdict is relative to the current scanner.
+    pub scanner_version: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
@@ -156,6 +194,14 @@ pub struct CloudRepoData {
     /// of that being indistinguishable from "endpoints have no types".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_extraction_status: Option<String>,
+    /// Per-pair ts_check type-compat verdicts for cross-repo edges where THIS
+    /// repo's calls are the consumer, keyed by canonical pair identity (#351).
+    /// Additive and optional: blobs scanned before this field carry `None`, and
+    /// the MCP `check_compatibility` tool falls back to structural-matching-only
+    /// (fail closed) for any pair without a stored verdict. Populated after
+    /// cross-repo type checking by `attach_compat_verdicts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat_verdicts: Option<Vec<CompatVerdict>>,
 }
 
 impl CloudRepoData {
@@ -230,6 +276,7 @@ impl CloudRepoData {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            compat_verdicts: None,
         }
     }
 }
@@ -351,6 +398,82 @@ pub trait CloudStorage {
     ) -> Result<(), StorageError>;
 }
 
+/// Attach per-pair ts_check verdicts to each service payload, for the cross-repo
+/// edges where that service is the CONSUMER. Reads the verdicts off the
+/// `CrossRepoMatch` edges `get_results` produced (compat already overlaid), and
+/// keys each by the canonical pair identity the cloud reconstructs (#351/#324).
+///
+/// Fail-closed by construction: only edges ts_check actually evaluated
+/// (`type_compatible.is_some()`) become a `CompatVerdict`; an unevaluated or
+/// unmatched pair simply has no stored verdict, which the cloud reads as "not
+/// compared", never "compatible". Multiple call sites collapsing onto one
+/// producer/consumer canonical pair are deduped with incompatible-wins, so a
+/// real mismatch is never masked by a sibling call site that happened to agree.
+pub fn attach_compat_verdicts(
+    payloads: &mut [CloudRepoData],
+    matches: &[crate::analyzer::CrossRepoMatch],
+) {
+    let scanner_version = env!("CARGO_PKG_VERSION");
+    for payload in payloads.iter_mut() {
+        let service_id = payload
+            .service_name
+            .clone()
+            .unwrap_or_else(|| payload.repo_name.clone());
+
+        // Dedup by canonical pair key; incompatible wins if call sites disagree.
+        let mut by_pair: std::collections::BTreeMap<
+            (String, String, String, String),
+            CompatVerdict,
+        > = std::collections::BTreeMap::new();
+
+        for m in matches {
+            if m.consumer_repo != service_id {
+                continue;
+            }
+            let Some(compatible) = m.type_compatible else {
+                // ts_check did not evaluate this edge — persist nothing so the
+                // cloud falls back to structural-matching-only (fail closed).
+                continue;
+            };
+            let pair = (
+                m.producer_repo.clone(),
+                m.producer_key.clone(),
+                m.consumer_repo.clone(),
+                m.consumer_key.clone(),
+            );
+            let verdict = CompatVerdict {
+                producer_repo: m.producer_repo.clone(),
+                producer_key: m.producer_key.clone(),
+                consumer_repo: m.consumer_repo.clone(),
+                consumer_key: m.consumer_key.clone(),
+                compatible,
+                mismatch_reason: if compatible {
+                    None
+                } else {
+                    m.mismatch_reason.clone()
+                },
+                scanner_version: scanner_version.to_string(),
+            };
+            by_pair
+                .entry(pair)
+                .and_modify(|existing| {
+                    // Incompatible-wins: a mismatch on any call site to this pair
+                    // is the verdict worth surfacing.
+                    if existing.compatible && !verdict.compatible {
+                        *existing = verdict.clone();
+                    }
+                })
+                .or_insert(verdict);
+        }
+
+        payload.compat_verdicts = if by_pair.is_empty() {
+            None
+        } else {
+            Some(by_pair.into_values().collect())
+        };
+    }
+}
+
 pub fn get_current_commit_hash(repo_path: &str) -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -408,5 +531,205 @@ mod tests {
 
         let back: TypeManifestEntry = serde_json::from_value(json).unwrap();
         assert_eq!(back.key, key);
+    }
+
+    use crate::analyzer::CrossRepoMatch;
+
+    fn empty_repo(repo_name: &str, service_name: Option<&str>) -> CloudRepoData {
+        CloudRepoData {
+            repo_name: repo_name.to_string(),
+            service_name: service_name.map(String::from),
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: Utc::now(),
+            commit_hash: "deadbeef".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+            compat_verdicts: None,
+        }
+    }
+
+    fn edge(
+        producer_repo: &str,
+        producer_key: &str,
+        consumer_repo: &str,
+        consumer_key: &str,
+        type_compatible: Option<bool>,
+        mismatch_reason: Option<&str>,
+    ) -> CrossRepoMatch {
+        CrossRepoMatch {
+            producer_repo: producer_repo.to_string(),
+            producer_key: producer_key.to_string(),
+            consumer_repo: consumer_repo.to_string(),
+            consumer_key: consumer_key.to_string(),
+            consumer_location: Some("src/client.ts".to_string()),
+            match_score: 1.0,
+            type_compatible,
+            mismatch_reason: mismatch_reason.map(String::from),
+        }
+    }
+
+    /// An old blob that predates `compat_verdicts` deserializes with the field
+    /// defaulted to `None` — additive and backwards compatible.
+    #[test]
+    fn cloud_repo_data_without_compat_verdicts_deserializes_to_none() {
+        let json = r#"{
+            "repo_name": "org/api",
+            "endpoints": [],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "config_json": null,
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc123"
+        }"#;
+        let data: CloudRepoData = serde_json::from_str(json).unwrap();
+        assert!(data.compat_verdicts.is_none());
+    }
+
+    /// A verdict round-trips through JSON keyed by canonical pair identity, and a
+    /// `None` (unevaluated) edge is omitted, not serialized as compatible.
+    #[test]
+    fn compat_verdicts_round_trip_keyed_canonically() {
+        let mut payloads = vec![empty_repo(
+            "org/notification-service",
+            Some("notification-service"),
+        )];
+        let matches = vec![
+            // Evaluated + incompatible → persisted with reason.
+            edge(
+                "order-service",
+                "http|GET|/orders/:id",
+                "notification-service",
+                "http|GET|/orders/:id",
+                Some(false),
+                Some("Order[] vs Order"),
+            ),
+            // Evaluated + compatible → persisted, no reason.
+            edge(
+                "order-service",
+                "http|GET|/health",
+                "notification-service",
+                "http|GET|/health",
+                Some(true),
+                None,
+            ),
+            // Not evaluated → NOT persisted (fail closed).
+            edge(
+                "order-service",
+                "http|POST|/orders",
+                "notification-service",
+                "http|POST|/orders",
+                None,
+                None,
+            ),
+        ];
+
+        attach_compat_verdicts(&mut payloads, &matches);
+        let verdicts = payloads[0]
+            .compat_verdicts
+            .clone()
+            .expect("verdicts present");
+        assert_eq!(verdicts.len(), 2, "only evaluated edges are persisted");
+
+        // Round-trips through the wire.
+        let json = serde_json::to_string(&payloads[0]).unwrap();
+        let back: CloudRepoData = serde_json::from_str(&json).unwrap();
+        let back_verdicts = back.compat_verdicts.unwrap();
+        let incompat = back_verdicts
+            .iter()
+            .find(|v| v.producer_key == "http|GET|/orders/:id")
+            .unwrap();
+        assert!(!incompat.compatible);
+        assert_eq!(
+            incompat.mismatch_reason.as_deref(),
+            Some("Order[] vs Order")
+        );
+        assert_eq!(incompat.consumer_repo, "notification-service");
+        assert_eq!(incompat.scanner_version, env!("CARGO_PKG_VERSION"));
+
+        let compat = back_verdicts
+            .iter()
+            .find(|v| v.producer_key == "http|GET|/health")
+            .unwrap();
+        assert!(compat.compatible);
+        assert!(compat.mismatch_reason.is_none());
+
+        // The unevaluated POST /orders pair is absent — the cloud reads its
+        // absence as "not compared", never "compatible".
+        assert!(
+            !back_verdicts
+                .iter()
+                .any(|v| v.producer_key == "http|POST|/orders"),
+            "unevaluated edge must not be persisted"
+        );
+    }
+
+    /// Verdicts are attributed CONSUMER-side: an edge whose consumer is a
+    /// different repo is not stored on this payload.
+    #[test]
+    fn attach_compat_verdicts_only_stores_consumer_side_edges() {
+        let mut payloads = vec![empty_repo("org/order-service", Some("order-service"))];
+        // order-service is the PRODUCER here, notification-service the consumer:
+        // this verdict belongs on notification-service's blob, not order-service's.
+        let matches = vec![edge(
+            "order-service",
+            "http|GET|/orders/:id",
+            "notification-service",
+            "http|GET|/orders/:id",
+            Some(false),
+            Some("Order[] vs Order"),
+        )];
+        attach_compat_verdicts(&mut payloads, &matches);
+        assert!(payloads[0].compat_verdicts.is_none());
+    }
+
+    /// When two call sites hit the same producer/consumer canonical pair and
+    /// disagree, the incompatible verdict wins (a real risk is never masked).
+    #[test]
+    fn attach_compat_verdicts_dedup_incompatible_wins() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let matches = vec![
+            edge(
+                "producer",
+                "http|GET|/x",
+                "consumer",
+                "http|GET|/x",
+                Some(true),
+                None,
+            ),
+            edge(
+                "producer",
+                "http|GET|/x",
+                "consumer",
+                "http|GET|/x",
+                Some(false),
+                Some("mismatch"),
+            ),
+        ];
+        attach_compat_verdicts(&mut payloads, &matches);
+        let verdicts = payloads[0].compat_verdicts.clone().unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert!(!verdicts[0].compatible);
+        assert_eq!(verdicts[0].mismatch_reason.as_deref(), Some("mismatch"));
     }
 }
