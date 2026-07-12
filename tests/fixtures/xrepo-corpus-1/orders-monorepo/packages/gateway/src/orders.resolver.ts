@@ -47,6 +47,33 @@ export async function resolveOrder(id: string): Promise<ApiResponse<Order>> {
   };
 }
 
+// query orders: [Order!]! — producer for `query orders` (orphan producer; no
+// cross-repo consumer). Returns the full order list wrapped in the ApiResponse
+// envelope, so the sidecar resolves ApiResponse<Order[]> for the type-enrichment
+// work (#222 generics-over-array case).
+export async function resolveOrders(): Promise<ApiResponse<Order[]>> {
+  return {
+    data: [
+      {
+        id: "ord_1",
+        total: { amountCents: 4999, currency: "EUR" },
+        status: { kind: "placed", placedAt: new Date().toISOString() },
+        note: "gift wrap",
+      },
+      {
+        id: "ord_2",
+        total: { amountCents: 1200, currency: "EUR" },
+        status: {
+          kind: "refunded",
+          refundedAt: new Date().toISOString(),
+          reason: "damaged in transit",
+        },
+      },
+    ],
+    errors: [],
+  };
+}
+
 // mutation refundOrder(id, reason): Order!
 export async function resolveRefundOrder(
   id: string,

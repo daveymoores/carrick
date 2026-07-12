@@ -2835,6 +2835,58 @@ mod scoring_tests {
         assert_eq!(dc.severity, "critical");
     }
 
+    /// PROOF (owner ruling 2026-07-12): the undeclared-env-var audit-webhook call
+    /// joins the LIVE projected key. payments-svc/lib/audit.ts posts to
+    /// `${process.env.AUDIT_WEBHOOK_URL ?? ...}/audit/events`, and because
+    /// AUDIT_WEBHOOK_URL is deliberately NOT declared in payments-svc/carrick.json,
+    /// the live projection keys the call with the raw env-var base intact:
+    /// `http|POST|${AUDIT_WEBHOOK_URL}/audit/events` (post-#294/#354). The offline
+    /// mock can't synthesize this LLM-extracted call, so this test loads the
+    /// COMMITTED label and asserts it fuzzy-joins that exact op — i.e. the call
+    /// scores as an expected consumer, never as an extra.
+    #[test]
+    fn audit_webhook_label_joins_live_projected_key() {
+        if corpus_name() != "xrepo-corpus-1" {
+            return;
+        }
+        let corpus = corpus_dir();
+        let repos = discover_repos(&corpus);
+        let repo_expected = load_repo_expected(&repos);
+        let (_r, payments) = repo_expected
+            .iter()
+            .find(|(r, _)| r == "payments-svc")
+            .expect("payments-svc repo present");
+        let audit = payments
+            .calls
+            .iter()
+            .find(|c| c.path_contains.as_deref() == Some("/audit/events"))
+            .expect("committed audit-webhook call label present");
+
+        // The op EXACTLY as the live projection emits it: `http_ep` yields
+        // key `http|POST|${AUDIT_WEBHOOK_URL}/audit/events` and the same path,
+        // the raw-env-var-base form that survives for the undeclared var.
+        let live = http_ep("POST", "${AUDIT_WEBHOOK_URL}/audit/events");
+        assert_eq!(live.key, "http|POST|${AUDIT_WEBHOOK_URL}/audit/events");
+        assert!(
+            fuzzy_call_match(audit, &live),
+            "committed audit label must join the live env-var-base key"
+        );
+
+        // Negative control: same method, different path must NOT join, so the
+        // `path_contains` constraint is load-bearing (not match-anything).
+        let other = http_ep("POST", "${AUDIT_WEBHOOK_URL}/other/path");
+        assert!(
+            !fuzzy_call_match(audit, &other),
+            "the label's path_contains constraint is load-bearing"
+        );
+        // Method discrimination: a GET to the same path must NOT join.
+        let wrong_method = http_ep("GET", "${AUDIT_WEBHOOK_URL}/audit/events");
+        assert!(
+            !fuzzy_call_match(audit, &wrong_method),
+            "method must match for the fuzzy call join"
+        );
+    }
+
     #[test]
     fn decoy_leak_respects_projection_set_kind() {
         // Corpus-3's intra-repo self-call decoy shares (method, path) with the
