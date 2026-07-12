@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.7](https://github.com/daveymoores/carrick/compare/carrick-v0.2.6...carrick-v0.2.7) (2026-07-12)
+
+
+### Bug Fixes
+
+* canonicalize literal-origin consumer call keys + suppress self-calls ([#354](https://github.com/daveymoores/carrick/issues/354)) ([47b1d45](https://github.com/daveymoores/carrick/commit/47b1d450ce55da6cb3b17d659630e8775992509e))
+* **corpus-1:** label audit-webhook call + add resolveOrders resolver ([#358](https://github.com/daveymoores/carrick/issues/358)) ([418f106](https://github.com/daveymoores/carrick/commit/418f1061de39cb8749af90c3ae38bd59b1e0089e))
+* **extraction:** normalize spurious .ts on type_import_source deterministically (flake pattern 1) ([#360](https://github.com/daveymoores/carrick/issues/360)) ([b68fc85](https://github.com/daveymoores/carrick/commit/b68fc851c9e3f591f00e6f04957f846cafec80b2))
+* suppress intra-repo pub/sub self-loops in cross-repo projection ([#353](https://github.com/daveymoores/carrick/issues/353)) ([47cb1c1](https://github.com/daveymoores/carrick/commit/47cb1c1077309bfbf889e8926b4c4370f3ccea0f))
+
 ## [0.2.6](https://github.com/daveymoores/carrick/compare/carrick-v0.2.5...carrick-v0.2.6) (2026-07-11)
 
 
