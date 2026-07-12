@@ -423,10 +423,14 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         match build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await {
             Ok(analyzer) => analyzer,
             Err(e) => {
-                // Cross-repo analysis (which is what runs ts_check) failed. Preserve
-                // the prior behavior where the per-repo index upload happened BEFORE
-                // cross-repo analysis: still upload this run's data — verdict-less —
-                // so the index stays fresh, then propagate the failure.
+                // Cross-repo analysis (which is what runs ts_check) failed. Close
+                // the spinner with a warning first so the upload's own spinner
+                // and log lines don't interleave with an unfinished one in
+                // non-TTY CI logs, then preserve the prior behavior where the
+                // per-repo index upload happened BEFORE cross-repo analysis:
+                // still upload this run's data — verdict-less — so the index
+                // stays fresh, then propagate the failure.
+                logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
                 if let Some(payloads) = &upload_payloads {
                     upload_service_payloads(storage, payloads).await?;
                 }
@@ -457,6 +461,13 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     //     which the cloud reads as "not compared" (fail closed, #324).
     if let Some(mut payloads) = upload_payloads {
         crate::cloud_storage::attach_compat_verdicts(&mut payloads, &results.cross_repo_matches);
+        // The size guard already ran once inside strip_ast_nodes, but the
+        // verdicts were appended after it — re-apply so a payload that was
+        // near the cap can't be re-inflated past it and 413 the upload
+        // (verdicts are tiny; the caches are what gets dropped).
+        for payload in &mut payloads {
+            enforce_payload_size_limit(payload);
+        }
         upload_service_payloads(storage, &payloads).await?;
     }
 
@@ -672,8 +683,24 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     data.endpoints.iter_mut().for_each(strip_endpoint_ast);
     data.calls.iter_mut().for_each(strip_endpoint_ast);
 
-    // Payload size guard: Lambda function URLs have a 6MB request payload limit.
-    // If serialized data exceeds ~5MB, drop file_results to stay under the limit.
+    enforce_payload_size_limit(&mut data);
+
+    data
+}
+
+/// Payload size guard: Lambda function URLs have a 6MB request payload limit.
+/// If serialized data exceeds ~5MB, drop the incremental caches (file_results
+/// being the bulk) to stay under the limit; warn loudly if it is still over
+/// Lambda's hard limit afterwards.
+///
+/// Called twice per upload payload: inside [`strip_ast_nodes`] when the payload
+/// is prepared, and again after [`crate::cloud_storage::attach_compat_verdicts`]
+/// adds the per-pair type verdicts (#351) — anything appended after the first
+/// pass could otherwise re-inflate the JSON past the cap and 413 the upload.
+/// Degradation order is deliberate: verdicts are tiny (a handful of short
+/// strings per cross-repo edge) while `file_results` is the multi-MB bulk, so
+/// the caches are always what gets dropped; verdicts are kept.
+fn enforce_payload_size_limit(data: &mut CloudRepoData) {
     const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
     const LAMBDA_HARD_LIMIT_BYTES: usize = 6 * 1024 * 1024;
     if let Ok(serialized) = serde_json::to_string(&data)
@@ -704,8 +731,6 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
             );
         }
     }
-
-    data
 }
 
 /// Get files changed between a base commit and HEAD.
@@ -4530,6 +4555,114 @@ mod tests {
         assert!(
             stripped.file_results.is_some(),
             "file_results should be preserved when payload is small"
+        );
+    }
+
+    /// #351 regression: `attach_compat_verdicts` runs AFTER the strip_ast_nodes
+    /// size-guard pass, so verdicts appended to a payload that squeaked under
+    /// the 5MB cap could re-inflate it past the Lambda limit and 413 the
+    /// upload. The engine re-applies `enforce_payload_size_limit` after
+    /// attachment; this pins that a near-limit payload with verdicts attached
+    /// still respects the cap, with the SAME degradation order as the first
+    /// pass — the bulky caches are dropped, the tiny verdicts are kept.
+    #[test]
+    fn test_payload_size_guard_reapplied_after_verdict_attachment() {
+        const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // mirrors the guard
+
+        let base = CloudRepoData {
+            repo_name: "consumer-svc".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test-hash".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: Some(CACHE_VERSION),
+            type_extraction_status: None,
+            compat_verdicts: None,
+        };
+
+        // Size the file_results filler so the payload lands just UNDER the 5MB
+        // cap: the strip_ast_nodes guard pass keeps everything, and only the
+        // verdicts appended afterwards push it over.
+        let base_len = serde_json::to_string(&base).unwrap().len();
+        let mut result = make_file_result(vec!["/api/orders"], vec![]);
+        result.endpoints[0].payload_expression_text = Some(String::new());
+        let mut probe = HashMap::new();
+        probe.insert("src/big.ts".to_string(), result.clone());
+        let mut with_empty = base.clone();
+        with_empty.file_results = Some(probe);
+        let overhead = serde_json::to_string(&with_empty).unwrap().len() - base_len;
+        // 200 bytes of headroom below the cap — less than the verdicts add.
+        let filler_len = MAX_PAYLOAD_BYTES - base_len - overhead - 200;
+        result.endpoints[0].payload_expression_text = Some("x".repeat(filler_len));
+        let mut file_results = HashMap::new();
+        file_results.insert("src/big.ts".to_string(), result);
+        let mut data = base;
+        data.file_results = Some(file_results);
+
+        // First guard pass (as strip_ast_nodes runs it): under the cap, so the
+        // caches survive.
+        let mut payloads = vec![strip_ast_nodes(data)];
+        assert!(
+            payloads[0].file_results.is_some(),
+            "test setup: payload must start under the cap with caches intact"
+        );
+        let before = serde_json::to_string(&payloads[0]).unwrap().len();
+        assert!(before <= MAX_PAYLOAD_BYTES);
+
+        // Verdict attachment re-inflates past the cap (mismatch reason > the
+        // 200-byte headroom).
+        let matches = vec![crate::analyzer::CrossRepoMatch {
+            producer_repo: "producer-svc".to_string(),
+            producer_key: "http|GET|/api/orders/:id".to_string(),
+            consumer_repo: "consumer-svc".to_string(),
+            consumer_key: "http|GET|/api/orders/:id".to_string(),
+            consumer_location: Some("src/client.ts".to_string()),
+            match_score: 1.0,
+            type_compatible: Some(false),
+            mismatch_reason: Some("y".repeat(400)),
+        }];
+        crate::cloud_storage::attach_compat_verdicts(&mut payloads, &matches);
+        assert!(
+            serde_json::to_string(&payloads[0]).unwrap().len() > MAX_PAYLOAD_BYTES,
+            "test setup: verdicts must push the payload over the cap"
+        );
+
+        // The engine's post-attachment pass: back under the cap, caches
+        // dropped, verdicts kept.
+        enforce_payload_size_limit(&mut payloads[0]);
+        let after = serde_json::to_string(&payloads[0]).unwrap().len();
+        assert!(
+            after <= MAX_PAYLOAD_BYTES,
+            "payload must respect the cap after verdict attachment ({}KB > {}KB)",
+            after / 1024,
+            MAX_PAYLOAD_BYTES / 1024
+        );
+        assert!(
+            payloads[0].file_results.is_none(),
+            "the bulky caches are what gets dropped"
+        );
+        assert!(
+            payloads[0]
+                .compat_verdicts
+                .as_ref()
+                .is_some_and(|v| v.len() == 1),
+            "the tiny verdicts are kept"
         );
     }
 
