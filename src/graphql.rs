@@ -597,6 +597,44 @@ fn extract_from_ts_file(file_path: &Path) -> GraphqlExtraction {
     })
 }
 
+/// Map every tracked `const NAME = gql\`...\`` document binding in `file_path`
+/// to its single operation's canonical key (`TICKET_QUERY → graphql|query|ticket`).
+///
+/// This is the deterministic document-identity index the file-analyzer
+/// post-processor uses to repair a `client.request(DOC)` data call whose target
+/// the model reported as the shared transport URL instead of the operation: the
+/// call text names the document binding, and this map turns that binding into
+/// the exact canonical key the operation matcher joins on. Reuses the same
+/// single-parse `gql_const_key` the anchor path already builds, so there is no
+/// second document parse and no separate identity notion to drift.
+///
+/// Returns an empty map when the file has no tracked single-operation documents
+/// (a multi-field document or SDL never enters `gql_const_key`, so it is never a
+/// rewrite target — we only ever rewrite to an unambiguous operation key).
+pub fn document_operation_keys(file_path: &Path) -> HashMap<String, String> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let Some(module) = parse_file(file_path, &cm, &handler) else {
+            return HashMap::new();
+        };
+
+        let mut visitor = TaggedTplVisitor {
+            cm: cm.clone(),
+            file_path,
+            extraction: GraphqlExtraction::default(),
+            type_imports: HashMap::new(),
+            gql_const_key: HashMap::new(),
+            request_key_types: HashMap::new(),
+            pending_gql_binding: None,
+        };
+        module.visit_with(&mut visitor);
+        visitor.gql_const_key
+    })
+}
+
 struct TaggedTplVisitor<'a> {
     cm: Lrc<SourceMap>,
     file_path: &'a Path,
