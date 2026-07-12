@@ -1579,9 +1579,12 @@ impl FileOrchestrator {
     }
 
     /// Strip a trailing TypeScript/JavaScript source-file extension from a module
-    /// specifier, returning `Some(stripped)` only when one was present. TS import
-    /// specifiers are written without a source extension, so a specifier that
-    /// carries one (e.g. `../types/events.ts`) is a model artifact.
+    /// specifier, returning `Some(stripped)` only when one was present. Import
+    /// specifiers CAN legitimately carry extensions (NodeNext/bundler ESM writes
+    /// `./foo.js`), so this alone never decides anything: the caller rewrites
+    /// only when the extension-less form matches the AST import table, i.e. when
+    /// the source demonstrably imported without the extension and the suffix was
+    /// added by the model.
     fn strip_source_file_extension(spec: &str) -> Option<&str> {
         for ext in [
             ".d.ts", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
