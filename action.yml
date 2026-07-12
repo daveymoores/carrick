@@ -68,7 +68,7 @@ runs:
         # is set by the runner for action steps, so release downloads follow
         # the action if the repo moves orgs; the literal is a fallback for
         # runners that don't set it.
-        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-daveymoores/carrick}"
+        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-carrick-tools/carrick}"
 
         ASSET="carrick-action-linux.tar.gz"
         JQ_ASSET_URL=".assets[] | select(.name==\"$ASSET\") | .browser_download_url"

@@ -64,7 +64,7 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 
 ## Carrick
 
-This repo is part of the **daveymoores / carrick-ci** Carrick
+This repo is part of the **carrick-tools / carrick-ci** Carrick
 project. Carrick indexes every service in the project — exported functions
 (with intent descriptions), dependencies, and API endpoints with real
 request/response types.

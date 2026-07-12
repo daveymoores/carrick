@@ -17,7 +17,7 @@ on:
         type: string
     secrets:
       CARRICK_CLOUD_DISPATCH_TOKEN:
-        description: "Fine-grained PAT able to fire repository_dispatch on daveymoores/carrick-cloud (contents:write + pull-requests:write there). Optional: without it assets still attach; only the notify step fails."
+        description: "Fine-grained PAT able to fire repository_dispatch on carrick-tools/carrick-cloud (contents:write + pull-requests:write there). Optional: without it assets still attach; only the notify step fails."
         required: false
   workflow_dispatch:
     inputs:
@@ -107,7 +107,7 @@ jobs:
       # opens the pin-bump PR against the freshly attached assets. The default
       # GITHUB_TOKEN cannot dispatch cross-repo: CARRICK_CLOUD_DISPATCH_TOKEN
       # is a fine-grained PAT with contents:write + pull-requests:write on
-      # daveymoores/carrick-cloud. Assets are already attached by this point,
+      # carrick-tools/carrick-cloud. Assets are already attached by this point,
       # so a failure here means notify-only is what's missing — re-run via
       # workflow_dispatch with the same tag once the secret exists.
       - name: Dispatch pin bump to carrick-cloud
@@ -123,7 +123,7 @@ jobs:
           JS_SHA="$(awk '$2 == "carrick_match.js" {print $1}' wasm-artifact/carrick_match.sha256)"
           DTS_SHA="$(awk '$2 == "carrick_match.d.ts" {print $1}' wasm-artifact/carrick_match.sha256)"
           WASM_SHA="$(awk '$2 == "carrick_match_bg.wasm" {print $1}' wasm-artifact/carrick_match.sha256)"
-          gh api "repos/daveymoores/carrick-cloud/dispatches" \
+          gh api "repos/carrick-tools/carrick-cloud/dispatches" \
             -f event_type=carrick-match-release \
             -f "client_payload[tag]=$TAG" \
             -f "client_payload[source_sha]=$SOURCE_SHA" \
