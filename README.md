@@ -2,7 +2,7 @@
 
 Carrick is a live, type-aware, intent-aware cross-repo index of every TypeScript service in your GitHub org, exposed to AI coding agents over the Model Context Protocol.
 
-> Carrick is TypeScript only. Cross-repo features need at least two services indexed in the same GitHub org. A single-service install still gets same-repo validation.
+> Carrick is TypeScript only. Any `package.json`-based project works, whichever package manager you use — npm, pnpm, Yarn, or Bun. Carrick reads the manifest and never runs your install, so it needs no lockfile and no `node_modules`. Deno-native projects (no `package.json`) aren't supported yet. Cross-repo features need at least two services indexed in the same GitHub org; a single-service install still gets same-repo validation.
 
 **Get started:** sign up at [app.carrick.tools](https://app.carrick.tools) · full documentation at [docs.carrick.tools](https://docs.carrick.tools)
 
