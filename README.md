@@ -151,7 +151,7 @@ Each service also accepts the call-classification fields (`internalEnvVars`, `ex
 ## How it works
 
 1. SWC parses each TypeScript file into an AST.
-2. A static-analysis pass extracts function exports, mounted routers, pattern-matched HTTP calls, GraphQL schemas and operations, and Socket.IO event contracts.
+2. A static-analysis pass extracts function exports, mounted routers, pattern-matched HTTP calls, GraphQL schemas and operations, and WebSocket event contracts.
 3. An LLM agent handles the cases pattern matching can't reach: dynamic URLs, factory functions, framework-specific routing.
 4. A TypeScript sidecar resolves request and response types against the actual TypeScript compiler.
 5. A second LLM pass writes the per-function intent description.

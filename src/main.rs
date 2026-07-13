@@ -141,6 +141,23 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    // A Deno-native project (deno.json/deno.jsonc, no package.json anywhere)
+    // would otherwise produce a silently thin scan: dependency discovery,
+    // framework detection, and type resolution all start from a package.json
+    // manifest.
+    if is_deno_native_project(Path::new(&args.repo_path)) {
+        return Err(format!(
+            "'{}' looks like a Deno-native project (deno.json present, no package.json \
+             anywhere in the tree). Carrick can't scan Deno-native projects yet — \
+             dependency discovery, framework detection, and type resolution all start \
+             from a package.json. A project that also maintains a package.json \
+             (npm-compatibility mode) may scan partially. If Deno support matters to \
+             you, please open an issue: https://github.com/carrick-tools/carrick/issues",
+            args.repo_path
+        )
+        .into());
+    }
+
     // =======================================================================
     // STEP 1: Discover and spawn sidecar (non-blocking)
     // The sidecar is bundled with the tool - auto-discover its location
@@ -330,6 +347,31 @@ fn discover_sidecar_path() -> Option<PathBuf> {
     None
 }
 
+/// True when the scan target is a Deno-native project: a `deno.json` /
+/// `deno.jsonc` at the root and no `package.json` anywhere in the tree
+/// (dependency/build directories excluded). A repo that keeps both manifests
+/// (Deno's npm-compatibility mode) is not flagged — it may scan partially.
+fn is_deno_native_project(repo_root: &Path) -> bool {
+    let has_deno_config =
+        repo_root.join("deno.json").is_file() || repo_root.join("deno.jsonc").is_file();
+    if !has_deno_config {
+        return false;
+    }
+
+    const SKIP_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
+    let walker = walkdir::WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(|e| {
+            !(e.file_type().is_dir()
+                && e.file_name()
+                    .to_str()
+                    .is_some_and(|n| SKIP_DIRS.contains(&n)))
+        });
+    !walker
+        .flatten()
+        .any(|entry| entry.file_type().is_file() && entry.file_name() == "package.json")
+}
+
 /// Get a path relative to the executable location
 fn get_executable_relative_path(relative: &str) -> PathBuf {
     if let Ok(exe_path) = env::current_exe()
@@ -434,5 +476,55 @@ mod tests {
         assert!(cli.verbose);
         assert!(cli.no_cache);
         assert_eq!(cli.repo_path, "/my/repo");
+    }
+
+    #[test]
+    fn deno_native_project_is_flagged() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
+        assert!(is_deno_native_project(repo.path()));
+    }
+
+    #[test]
+    fn deno_jsonc_counts_as_deno_config() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("deno.jsonc"), "{}").unwrap();
+        assert!(is_deno_native_project(repo.path()));
+    }
+
+    #[test]
+    fn deno_with_package_json_is_not_flagged() {
+        // npm-compatibility mode: both manifests present → scan proceeds.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
+        std::fs::write(repo.path().join("package.json"), "{}").unwrap();
+        assert!(!is_deno_native_project(repo.path()));
+    }
+
+    #[test]
+    fn deno_with_nested_package_json_is_not_flagged() {
+        // A workspace member's manifest anywhere in the tree is enough.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
+        std::fs::create_dir_all(repo.path().join("packages/api")).unwrap();
+        std::fs::write(repo.path().join("packages/api/package.json"), "{}").unwrap();
+        assert!(!is_deno_native_project(repo.path()));
+    }
+
+    #[test]
+    fn package_json_inside_node_modules_does_not_count() {
+        // A vendored dependency's manifest is not the project's manifest.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
+        std::fs::create_dir_all(repo.path().join("node_modules/koa")).unwrap();
+        std::fs::write(repo.path().join("node_modules/koa/package.json"), "{}").unwrap();
+        assert!(is_deno_native_project(repo.path()));
+    }
+
+    #[test]
+    fn plain_node_project_is_not_flagged() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("package.json"), "{}").unwrap();
+        assert!(!is_deno_native_project(repo.path()));
     }
 }
