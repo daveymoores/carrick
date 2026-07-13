@@ -147,7 +147,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // manifest.
     if is_deno_native_project(Path::new(&args.repo_path)) {
         return Err(format!(
-            "'{}' looks like a Deno-native project (deno.json present, no package.json \
+            "'{}' looks like a Deno-native project (deno.json/deno.jsonc present, no package.json \
              anywhere in the tree). Carrick can't scan Deno-native projects yet — \
              dependency discovery, framework detection, and type resolution all start \
              from a package.json. A project that also maintains a package.json \
@@ -358,14 +358,16 @@ fn is_deno_native_project(repo_root: &Path) -> bool {
         return false;
     }
 
-    const SKIP_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
+    // depth() == 0 keeps the scan root traversable even when its own basename
+    // matches a skip dir (a service directory named `build` is still a repo).
     let walker = walkdir::WalkDir::new(repo_root)
         .into_iter()
         .filter_entry(|e| {
-            !(e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|n| SKIP_DIRS.contains(&n)))
+            e.depth() == 0
+                || !(e.file_type().is_dir()
+                    && e.file_name()
+                        .to_str()
+                        .is_some_and(|n| packages::MANIFEST_SKIP_DIRS.contains(&n)))
         });
     !walker
         .flatten()
@@ -519,6 +521,31 @@ mod tests {
         std::fs::create_dir_all(repo.path().join("node_modules/koa")).unwrap();
         std::fs::write(repo.path().join("node_modules/koa/package.json"), "{}").unwrap();
         assert!(is_deno_native_project(repo.path()));
+    }
+
+    #[test]
+    fn package_json_inside_build_output_does_not_count() {
+        // Build output isn't the project's own manifest — every skip dir
+        // beyond node_modules behaves the same way.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
+        for dir in ["dist", "build", ".next"] {
+            std::fs::create_dir_all(repo.path().join(dir)).unwrap();
+            std::fs::write(repo.path().join(dir).join("package.json"), "{}").unwrap();
+        }
+        assert!(is_deno_native_project(repo.path()));
+    }
+
+    #[test]
+    fn scan_root_named_like_skip_dir_is_still_walked() {
+        // A repo directory legitimately named `build` must not be skipped as
+        // its own walk root: its nested package.json still counts.
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("build");
+        std::fs::create_dir_all(repo.join("packages/api")).unwrap();
+        std::fs::write(repo.join("deno.json"), "{}").unwrap();
+        std::fs::write(repo.join("packages/api/package.json"), "{}").unwrap();
+        assert!(!is_deno_native_project(&repo));
     }
 
     #[test]

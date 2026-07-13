@@ -51,21 +51,27 @@ pub struct Packages {
     pub internal_names: std::collections::HashSet<String>,
 }
 
+/// Directories excluded when walking a repo tree for manifests: dependency
+/// installs and build output are not the project's own manifests. The walk
+/// root itself is always traversed, even when its basename matches (a repo
+/// legitimately named `build` is still a repo).
+pub const MANIFEST_SKIP_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
+
 /// Names declared by every package.json under `repo_root` (workspace members
 /// included), skipping dependency/build directories. Used to recognize
 /// workspace-internal packages that must not be treated as registry deps.
 pub fn collect_internal_package_names(
     repo_root: &std::path::Path,
 ) -> std::collections::HashSet<String> {
-    const SKIP_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
     let mut names = std::collections::HashSet::new();
     let walker = walkdir::WalkDir::new(repo_root)
         .into_iter()
         .filter_entry(|e| {
-            !(e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|n| SKIP_DIRS.contains(&n)))
+            e.depth() == 0
+                || !(e.file_type().is_dir()
+                    && e.file_name()
+                        .to_str()
+                        .is_some_and(|n| MANIFEST_SKIP_DIRS.contains(&n)))
         });
     for entry in walker.flatten() {
         if entry.file_type().is_file()
