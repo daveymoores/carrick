@@ -1044,13 +1044,14 @@ async fn analyze_current_repo_incremental(
             );
 
             let normalizer = UrlNormalizer::new(config);
+            let service_root = service_scan_root(repo_path, config);
             let new_file_results = if !files_to_analyze.is_empty() {
                 let result = file_orchestrator
                     .analyze_files(
                         &files_to_analyze,
                         &guidance,
                         &detection,
-                        Path::new(repo_path),
+                        &service_root,
                         &graphql_producer_hints,
                         &graphql_consumer_hints,
                         &normalizer,
@@ -2081,6 +2082,18 @@ fn build_cloud_data_from_mount_graph(
 /// Re-init rebuilds the sidecar's ts-morph project; for a large monorepo this
 /// runs once per scoped service. A future optimization could load all service
 /// projects in a single init via the sidecar's monorepo builder.
+/// The root that file-based route derivation strips before matching a
+/// convention's root globs. Conventions declare app-root globs like `app` /
+/// `src/app`, which are SERVICE-relative: in a monorepo the app lives at e.g.
+/// `apps/web/app/**`, so stripping only the repo root would leave a path no
+/// glob matches and silently derive zero routes for every declared service.
+fn service_scan_root(repo_path: &str, service: &Config) -> std::path::PathBuf {
+    match &service.directory {
+        Some(dir) => Path::new(repo_path).join(dir),
+        None => Path::new(repo_path).to_path_buf(),
+    }
+}
+
 fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, service: &Config) {
     let Some(sidecar) = sidecar else { return };
     if service.directory.is_none() && service.tsconfig.is_none() {
@@ -2822,12 +2835,13 @@ async fn analyze_current_repo(
 
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
+    let service_root = service_scan_root(repo_path, config);
     let analysis_result = orchestrator
         .run_complete_analysis(
             files.clone(),
             packages,
             &all_imported_symbols,
-            repo_path,
+            &service_root.to_string_lossy(),
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
@@ -3495,6 +3509,24 @@ fn recreate_package_and_tsconfig(
 mod tests {
     use super::*;
     use crate::analyzer::ApiEndpointDetails;
+
+    #[test]
+    fn service_scan_root_joins_declared_directory() {
+        let flat = Config::default();
+        assert_eq!(
+            service_scan_root("/repo", &flat),
+            std::path::PathBuf::from("/repo")
+        );
+
+        let service = Config {
+            directory: Some("apps/web".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            service_scan_root("/repo", &service),
+            std::path::PathBuf::from("/repo/apps/web")
+        );
+    }
     use crate::cloud_storage::TypeEvidence;
     use crate::services::type_sidecar::{InferredType, SourceLocation};
     use crate::visitor::{OwnerType, TypeReference};

@@ -346,7 +346,10 @@ impl FileOrchestrator {
         files: &[PathBuf],
         guidance: &ProtocolGuidance,
         framework_detection: &DetectionResult,
-        repo_root: &Path,
+        // Root for file-based route derivation: the SERVICE directory when
+        // carrick.json declares one, else the repo root. Convention root globs
+        // (`app`, `src/app`, …) are matched against paths relative to THIS.
+        service_root: &Path,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
@@ -492,7 +495,7 @@ impl FileOrchestrator {
             let route_endpoints = if conventions.is_empty() {
                 Vec::new()
             } else {
-                let rel_path = file_path.strip_prefix(repo_root).unwrap_or(file_path);
+                let rel_path = file_path.strip_prefix(service_root).unwrap_or(file_path);
                 Self::file_based_endpoints(
                     &self.swc_scanner,
                     rel_path,

@@ -81,7 +81,10 @@ impl MultiAgentOrchestrator {
         files: Vec<std::path::PathBuf>,
         packages: &Packages,
         imported_symbols: &HashMap<String, ImportedSymbol>,
-        repo_path: &str,
+        // Root for file-based route derivation: the SERVICE directory when
+        // carrick.json declares one, else the repo root (see
+        // `engine::service_scan_root`).
+        service_root: &str,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
@@ -126,7 +129,7 @@ impl MultiAgentOrchestrator {
                 &files,
                 &framework_guidance,
                 &framework_detection,
-                std::path::Path::new(repo_path),
+                std::path::Path::new(service_root),
                 graphql_producer_hints,
                 graphql_consumer_hints,
                 normalizer,
