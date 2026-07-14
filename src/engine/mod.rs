@@ -1044,13 +1044,14 @@ async fn analyze_current_repo_incremental(
             );
 
             let normalizer = UrlNormalizer::new(config);
+            let service_root = service_scan_root(repo_path, config);
             let new_file_results = if !files_to_analyze.is_empty() {
                 let result = file_orchestrator
                     .analyze_files(
                         &files_to_analyze,
                         &guidance,
                         &detection,
-                        &service_scan_root(repo_path, config),
+                        &service_root,
                         &graphql_producer_hints,
                         &graphql_consumer_hints,
                         &normalizer,
