@@ -410,11 +410,30 @@ impl FileOrchestrator {
             /// file; cloned per-pending so the concurrent dispatch closure owns
             /// its copy. Empty for repos with no unanchored GraphQL consumers.
             graphql_consumer_hints: Vec<String>,
+            /// Source of same-repo HTTP wrapper modules this file imports
+            /// (#369 — cross-file wrapper-site resolution). Injected into the
+            /// user message so call sites of an imported wrapper can be emitted
+            /// as resolved data calls. Empty for files with no such imports.
+            wrapper_context: Vec<String>,
+        }
+
+        /// A zero-candidate file whose skip decision is deferred until the
+        /// repo's wrapper modules are known (#369): if it imports a same-repo
+        /// module that performs HTTP, it is rescued into the LLM pass with
+        /// that wrapper's source as context; otherwise it is skipped exactly
+        /// as before. Content is deliberately NOT retained — most files in a
+        /// repo land here, so holding their bodies would spike peak memory to
+        /// roughly the repo's source size; the rare rescued file is re-read.
+        struct DeferredZeroCandidate {
+            path_str: String,
+            file_path: PathBuf,
+            import_sources: Vec<String>,
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
+        let mut deferred_zero_candidates: Vec<DeferredZeroCandidate> = Vec::new();
         for file_path in files {
             let path_str = file_path.to_string_lossy().to_string();
 
@@ -620,11 +639,15 @@ impl FileOrchestrator {
                         path_str
                     );
                 } else if unrouted_candidates.is_empty() {
-                    debug!("Skipped (no API patterns): {} [0 candidates]", path_str);
-                    stats.files_skipped += 1;
-                    stats.files_skipped_no_candidates += 1;
-                    // Store empty result so incremental cache knows this file was processed
-                    file_results.insert(path_str, FileAnalysisResult::default());
+                    // Defer the skip decision (#369): if this file imports a
+                    // same-repo module that performs HTTP (a request wrapper),
+                    // it is rescued into the LLM pass after the wrapper map is
+                    // built below; otherwise it is skipped exactly as before.
+                    deferred_zero_candidates.push(DeferredZeroCandidate {
+                        path_str,
+                        file_path: file_path.clone(),
+                        import_sources: scan_result.import_sources,
+                    });
                     continue;
                 } else {
                     debug!(
@@ -673,6 +696,136 @@ impl FileOrchestrator {
                 descriptor_endpoints,
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
+                wrapper_context: Vec::new(),
+            });
+        }
+
+        // PHASE 1b (#369 — cross-file wrapper-site resolution). Wrapper map:
+        // same-repo modules that themselves perform HTTP (≥1 HTTP candidate)
+        // AND export at least one binding — the shape of a request wrapper
+        // another file would import. Keyed by canonical file path. The whole
+        // (size-capped) file is the context snippet: wrappers are small client
+        // modules, and slicing exact function spans buys little over the cap.
+        const WRAPPER_SNIPPET_MAX: usize = 4_000;
+        let mut wrapper_map: HashMap<PathBuf, String> = HashMap::new();
+        for pf in &pending {
+            // Rescued files (graphql/messaging fall-throughs) carry no HTTP
+            // candidates and are not wrapper material.
+            if pf.candidate_hints.is_empty() {
+                continue;
+            }
+            let path = Path::new(&pf.path_str);
+            if self
+                .swc_scanner
+                .exported_handlers(path, &pf.content)
+                .is_empty()
+            {
+                continue; // nothing importable
+            }
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            let mut snippet = format!("--- wrapper module: {} ---\n", pf.path_str);
+            if pf.content.len() > WRAPPER_SNIPPET_MAX {
+                let mut end = WRAPPER_SNIPPET_MAX;
+                while end > 0 && !pf.content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                snippet.push_str(&pf.content[..end]);
+                snippet.push_str("\n// (truncated)");
+            } else {
+                snippet.push_str(&pf.content);
+            }
+            wrapper_map.insert(canonical, snippet);
+        }
+
+        // Attach wrapper context to files that import a wrapper module via a
+        // RELATIVE specifier (v1 scope: `./`/`../` only — tsconfig path
+        // aliases would need sidecar-grade resolution).
+        if !wrapper_map.is_empty() {
+            for pf in &mut pending {
+                let importer = Path::new(&pf.path_str).to_path_buf();
+                let self_canon = importer.canonicalize().ok();
+                let mut seen: HashSet<PathBuf> = HashSet::new();
+                let mut ctx: Vec<String> = Vec::new();
+                for symbol in pf.symbol_table.imported_symbols.values() {
+                    let Some(resolved) = Self::resolve_relative_import(&importer, &symbol.source)
+                    else {
+                        continue;
+                    };
+                    if self_canon.as_ref() == Some(&resolved) || !seen.insert(resolved.clone()) {
+                        continue;
+                    }
+                    if let Some(snippet) = wrapper_map.get(&resolved) {
+                        ctx.push(snippet.clone());
+                    }
+                }
+                pf.wrapper_context = ctx;
+            }
+        }
+
+        // Rescue or finalize the deferred zero-candidate skips: a file that
+        // imports a wrapper module is force-analyzed with the wrapper's source
+        // as context (its call sites are the repo's real outbound calls);
+        // everything else is skipped exactly as before this pass existed.
+        for deferred in deferred_zero_candidates {
+            let mut seen: HashSet<PathBuf> = HashSet::new();
+            let mut ctx: Vec<String> = Vec::new();
+            if !wrapper_map.is_empty() {
+                for spec in &deferred.import_sources {
+                    let Some(resolved) = Self::resolve_relative_import(&deferred.file_path, spec)
+                    else {
+                        continue;
+                    };
+                    if !seen.insert(resolved.clone()) {
+                        continue;
+                    }
+                    if let Some(snippet) = wrapper_map.get(&resolved) {
+                        ctx.push(snippet.clone());
+                    }
+                }
+            }
+            if ctx.is_empty() {
+                debug!(
+                    "Skipped (no API patterns): {} [0 candidates]",
+                    deferred.path_str
+                );
+                stats.files_skipped += 1;
+                stats.files_skipped_no_candidates += 1;
+                // Store empty result so incremental cache knows this file was processed
+                file_results.insert(deferred.path_str, FileAnalysisResult::default());
+                continue;
+            }
+            debug!(
+                "Force-analyzing wrapper-importing file (no HTTP candidates): {}",
+                deferred.path_str
+            );
+            // Re-read the rescued file: content was not retained at defer time
+            // (memory), and the file was readable moments ago in this pass.
+            let Ok(content) = std::fs::read_to_string(&deferred.file_path) else {
+                warn!(
+                    "Wrapper-importing file became unreadable, skipping: {}",
+                    deferred.path_str
+                );
+                stats.files_skipped += 1;
+                file_results.insert(deferred.path_str, FileAnalysisResult::default());
+                continue;
+            };
+            let (symbol_table, env_alias_map) =
+                Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
+            pending.push(PendingFile {
+                path_str: deferred.path_str,
+                content,
+                candidate_hints: Vec::new(),
+                candidate_contexts: Vec::new(),
+                candidate_map: HashMap::new(),
+                symbol_table,
+                env_alias_map,
+                route_endpoints: Vec::new(),
+                descriptor_endpoints: Vec::new(),
+                graphql_producer_hints: graphql_producer_hints.lines.clone(),
+                graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
+                wrapper_context: ctx,
             });
         }
 
@@ -702,6 +855,7 @@ impl FileOrchestrator {
                         &pf.symbol_table.imported_symbols,
                         &pf.graphql_producer_hints,
                         &pf.graphql_consumer_hints,
+                        &pf.wrapper_context,
                     )
                     .await
                     .map_err(|e| e.to_string());
@@ -1729,6 +1883,41 @@ impl FileOrchestrator {
     /// Pub/sub Part B: does this file import a package the cloud
     /// /framework-detect step flagged as a messaging client?
     ///
+    /// Resolve a RELATIVE import specifier (`./x`, `../y/z`) from `importer`
+    /// to the canonical path of an existing file, trying the TypeScript
+    /// resolution order for extension-less specifiers (#369). Non-relative
+    /// specifiers (packages, tsconfig aliases) return `None` — alias
+    /// resolution needs the sidecar's tsconfig knowledge and is out of scope
+    /// here.
+    fn resolve_relative_import(importer: &Path, spec: &str) -> Option<PathBuf> {
+        if !(spec.starts_with("./") || spec.starts_with("../")) {
+            return None;
+        }
+        let base = importer.parent()?.join(spec);
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if base.extension().is_some() {
+            candidates.push(base.clone());
+        }
+        for ext in ["ts", "tsx", "js", "mjs", "cjs"] {
+            let mut with_ext = base.as_os_str().to_owned();
+            with_ext.push(".");
+            with_ext.push(ext);
+            candidates.push(PathBuf::from(with_ext));
+        }
+        for index in [
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "index.mjs",
+            "index.cjs",
+        ] {
+            candidates.push(base.join(index));
+        }
+        candidates
+            .into_iter()
+            .find_map(|c| c.is_file().then(|| c.canonicalize().ok())?)
+    }
+
     /// An import source matches a `messaging_clients` entry when it is exactly
     /// the entry (`"nats"`) or a subpath/scoped specifier under it
     /// (`"@nats-io/nats-core"` matches `"@nats-io/nats-core"`; `"nats/foo"`
@@ -3191,6 +3380,37 @@ impl FileOrchestrator {
 mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
+
+    /// #369: relative import specifiers resolve through the TS extension
+    /// order to an existing file; package and alias specifiers resolve to
+    /// nothing (alias resolution is sidecar territory).
+    #[test]
+    fn resolve_relative_import_extension_order_and_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("nodes")).unwrap();
+        std::fs::create_dir_all(root.join("lib/client")).unwrap();
+        std::fs::write(root.join("nodes/GenericFunctions.ts"), "export {}").unwrap();
+        std::fs::write(root.join("lib/client/index.ts"), "export {}").unwrap();
+        let importer = root.join("nodes/Formbricks.node.ts");
+        std::fs::write(&importer, "import {} from './GenericFunctions';").unwrap();
+
+        // Extension-less sibling specifier → .ts file.
+        let resolved = FileOrchestrator::resolve_relative_import(&importer, "./GenericFunctions")
+            .expect("sibling .ts should resolve");
+        assert!(resolved.ends_with("nodes/GenericFunctions.ts"));
+
+        // Directory specifier → index.ts.
+        let resolved = FileOrchestrator::resolve_relative_import(&importer, "../lib/client")
+            .expect("directory index should resolve");
+        assert!(resolved.ends_with("lib/client/index.ts"));
+
+        // Package + alias specifiers are out of scope.
+        assert!(FileOrchestrator::resolve_relative_import(&importer, "n8n-workflow").is_none());
+        assert!(FileOrchestrator::resolve_relative_import(&importer, "@/lib/client").is_none());
+        // Nonexistent target resolves to nothing.
+        assert!(FileOrchestrator::resolve_relative_import(&importer, "./missing").is_none());
+    }
 
     /// Pub/sub Part B: a NATS pub/sub-only file produces ZERO SWC candidates,
     /// so the orchestrator's zero-candidate skip would drop it before the

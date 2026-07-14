@@ -358,6 +358,7 @@ impl FileAnalyzerAgent {
             &HashMap::new(),
             &[],
             &[],
+            &[],
         )
         .await
     }
@@ -415,6 +416,7 @@ impl FileAnalyzerAgent {
         imported_symbols: &HashMap<String, ImportedSymbol>,
         graphql_producer_hints: &[String],
         graphql_consumer_hints: &[String],
+        wrapper_context: &[String],
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -430,6 +432,7 @@ impl FileAnalyzerAgent {
             imported_symbols,
             graphql_producer_hints,
             graphql_consumer_hints,
+            wrapper_context,
         );
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
@@ -723,6 +726,7 @@ impl FileAnalyzerAgent {
             &HashMap::new(),
             &[],
             &[],
+            &[],
         )
     }
 
@@ -738,6 +742,7 @@ impl FileAnalyzerAgent {
         imported_symbols: &HashMap<String, ImportedSymbol>,
         graphql_producer_hints: &[String],
         graphql_consumer_hints: &[String],
+        wrapper_context: &[String],
     ) -> String {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
@@ -828,6 +833,37 @@ impl FileAnalyzerAgent {
             )
         };
 
+        // Imported HTTP wrapper definitions (#369 — cross-file wrapper-site
+        // resolution): same-repo modules this file imports whose exported
+        // functions perform the actual HTTP request. Without their source the
+        // model cannot know a call like `apiRequest("GET", "/things")` is an
+        // outbound HTTP call, or what base path the wrapper prepends. Empty
+        // for files with no such imports, contributing zero bytes so every
+        // existing prompt stays byte-for-byte identical (cache-safe).
+        let wrapper_context_section = if wrapper_context.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n### IMPORTED HTTP WRAPPER DEFINITIONS (same-repo modules imported by this file)\n\
+                 The source below defines HTTP request wrapper function(s) that live in OTHER \
+                 files of this repo and are IMPORTED by the file being analyzed. A call in THIS \
+                 file to one of these imported wrappers (directly, or via `.call(...)`/`.apply(...)`) \
+                 is a real outbound HTTP data call happening at that call site. For each such call \
+                 site, emit a data_call whose method and target are RESOLVED through the wrapper. \
+                 The target MUST be the full request URL the wrapper builds: the wrapper's base \
+                 (keep any `${{...}}` host/config interpolation verbatim) + the wrapper's path \
+                 prefix + the site's path argument. Example: the wrapper's options carry baseURL \
+                 `${{cfg.host}}/api/v1` and the site passes \"/things\" -> target \
+                 `${{cfg.host}}/api/v1/things`. Emitting only the site's argument (\"/things\") \
+                 or dropping the wrapper's path prefix is WRONG — always prepend the wrapper's \
+                 full base. Take the method from the site's arguments when the wrapper \
+                 parameterizes it. Report the site's own line numbers and call_expression_text. \
+                 Do NOT report the wrapper's internal request line here — it belongs to the \
+                 wrapper's own file.\n{}\n",
+                wrapper_context.join("\n")
+            )
+        };
+
         // Add line-number prefixes to file content so Gemini can read line numbers directly
         let mut numbered_content =
             String::with_capacity(file_content.len() + file_content.lines().count() * 7);
@@ -867,7 +903,7 @@ These notes are generated per-scan by the framework guidance layer and describe 
 
 ### IMPORT TABLE (Do not hallucinate sources)
 {}
-
+{}
 ### FILE CONTENT (Path: {})
 Lines are prefixed with line numbers. Use these numbers for *_expression_line fields.
 ```
@@ -928,6 +964,7 @@ Return ONLY the JSON object, no explanations."#,
             candidates_section,
             candidate_contexts_section,
             imports_section,
+            wrapper_context_section,
             file_path,
             numbered_content
         )
@@ -1780,6 +1817,53 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
         }
     }
 
+    /// #369: the wrapper-context section appears exactly when context is
+    /// supplied, and an empty context leaves the message byte-identical to
+    /// the pre-#369 shape (the cache-safety contract of every optional
+    /// section).
+    #[test]
+    fn test_wrapper_context_section_present_iff_supplied() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = r#"import { apiRequest } from "./GenericFunctions";
+const r = await apiRequest.call(this, "GET", "/webhooks", {});"#;
+
+        let without = agent.build_user_message_with_candidates(
+            "node.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!without.contains("IMPORTED HTTP WRAPPER DEFINITIONS"));
+
+        let wrapper = vec![
+            "--- wrapper module: nodes/GenericFunctions.ts ---\nexport async function apiRequest(method, resource) { /* baseURL: `${credentials.host}/api/v1` */ }".to_string(),
+        ];
+        let with = agent.build_user_message_with_candidates(
+            "node.ts",
+            file_content,
+            &guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &wrapper,
+        );
+        assert!(with.contains("### IMPORTED HTTP WRAPPER DEFINITIONS"));
+        assert!(with.contains("wrapper module: nodes/GenericFunctions.ts"));
+        // The section sits in the per-file zone: after the import table,
+        // before the file content (cache-prefix invariant).
+        let sec = with.find("### IMPORTED HTTP WRAPPER DEFINITIONS").unwrap();
+        assert!(with.find("### IMPORT TABLE").unwrap() < sec);
+        assert!(sec < with.find("### FILE CONTENT").unwrap());
+    }
+
     #[test]
     fn test_build_user_message_includes_import_table_and_candidates() {
         let agent = FileAnalyzerAgent::new(AgentService::new());
@@ -1803,6 +1887,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &candidates,
             &candidate_contexts,
             &imported,
+            &[],
             &[],
             &[],
         );
@@ -1864,6 +1949,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &HashMap::new(),
             &hints,
             &[],
+            &[],
         );
 
         assert!(
@@ -1909,6 +1995,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &[],
             &[],
             &HashMap::new(),
+            &[],
             &[],
             &[],
         );
@@ -1964,6 +2051,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &HashMap::new(),
             &[],
             &hints,
+            &[],
         );
 
         assert!(
@@ -2007,6 +2095,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             &[],
             &[],
             &HashMap::new(),
+            &[],
             &[],
             &[],
         );
