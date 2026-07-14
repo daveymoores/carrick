@@ -421,11 +421,12 @@ impl FileOrchestrator {
         /// repo's wrapper modules are known (#369): if it imports a same-repo
         /// module that performs HTTP, it is rescued into the LLM pass with
         /// that wrapper's source as context; otherwise it is skipped exactly
-        /// as before.
+        /// as before. Content is deliberately NOT retained — most files in a
+        /// repo land here, so holding their bodies would spike peak memory to
+        /// roughly the repo's source size; the rare rescued file is re-read.
         struct DeferredZeroCandidate {
             path_str: String,
             file_path: PathBuf,
-            content: String,
             import_sources: Vec<String>,
         }
 
@@ -645,7 +646,6 @@ impl FileOrchestrator {
                     deferred_zero_candidates.push(DeferredZeroCandidate {
                         path_str,
                         file_path: file_path.clone(),
-                        content,
                         import_sources: scan_result.import_sources,
                     });
                     continue;
@@ -800,11 +800,22 @@ impl FileOrchestrator {
                 "Force-analyzing wrapper-importing file (no HTTP candidates): {}",
                 deferred.path_str
             );
+            // Re-read the rescued file: content was not retained at defer time
+            // (memory), and the file was readable moments ago in this pass.
+            let Ok(content) = std::fs::read_to_string(&deferred.file_path) else {
+                warn!(
+                    "Wrapper-importing file became unreadable, skipping: {}",
+                    deferred.path_str
+                );
+                stats.files_skipped += 1;
+                file_results.insert(deferred.path_str, FileAnalysisResult::default());
+                continue;
+            };
             let (symbol_table, env_alias_map) =
                 Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
             pending.push(PendingFile {
                 path_str: deferred.path_str,
-                content: deferred.content,
+                content,
                 candidate_hints: Vec::new(),
                 candidate_contexts: Vec::new(),
                 candidate_map: HashMap::new(),
@@ -1893,7 +1904,13 @@ impl FileOrchestrator {
             with_ext.push(ext);
             candidates.push(PathBuf::from(with_ext));
         }
-        for index in ["index.ts", "index.tsx", "index.js"] {
+        for index in [
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "index.mjs",
+            "index.cjs",
+        ] {
             candidates.push(base.join(index));
         }
         candidates
