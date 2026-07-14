@@ -96,6 +96,43 @@ fn nextjs_app_router_fixture_derives_expected_routes() {
     );
 }
 
+/// Monorepo trap: the app lives under `apps/web/app/**`, so deriving against
+/// the REPO root leaves paths (`apps/web/app/...`) that no convention root
+/// glob (`app`, `src/app`) matches — zero routes, silently. The engine must
+/// strip the SERVICE root (carrick.json `services[].directory`, here
+/// `apps/web`) instead; deriving against it yields the routes. The fixture
+/// also locks two export shapes route files use in the wild: a wrapped-const
+/// handler (`export const GET = wrapper({...})`) and a pure re-export route
+/// file whose handlers live outside the `app/` tree (the modules file itself
+/// derives nothing).
+#[test]
+fn nextjs_app_router_monorepo_derives_routes_relative_to_service_root() {
+    let conventions = builtin_conventions(&["Next.js".to_string()]);
+
+    let repo_root_relative = synthesized_routes("nextjs-app-monorepo", &conventions);
+    assert!(
+        repo_root_relative.is_empty(),
+        "repo-root-relative derivation must find nothing in a monorepo layout \
+         (this is why the engine strips the service root), got {repo_root_relative:?}"
+    );
+
+    let routes = synthesized_routes("nextjs-app-monorepo/apps/web", &conventions);
+    let expected: BTreeSet<String> = [
+        "GET /api/v1/client/:workspaceId/environment",
+        "POST /api/v2/client/:workspaceId/user",
+        "OPTIONS /api/v2/client/:workspaceId/user",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        routes, expected,
+        "service-root-relative derivation should yield the app routes: the \
+         wrapped-const GET, and the re-exported POST/OPTIONS at the app-side \
+         path (never the modules/ implementation path)"
+    );
+}
+
 #[test]
 fn astro_fixture_derives_expected_routes() {
     let routes = synthesized_routes("astro", &builtin_conventions(&["Astro".to_string()]));
