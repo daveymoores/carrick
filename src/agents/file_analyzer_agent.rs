@@ -864,6 +864,40 @@ impl FileAnalyzerAgent {
             )
         };
 
+        // Web postMessage channel guidance (#372): emitted ONLY when this
+        // file's candidates include a `.postMessage(...)` send or an
+        // `addEventListener('message', …)` listener (the Signal-8 shapes).
+        // The pubsub schema descriptions define topics as first-argument
+        // strings; postMessage carries its topic inside the envelope, so the
+        // mapping is taught here instead of in the (globally shared) schema
+        // text — description edits there measurably perturb unrelated
+        // messenger/broker extraction on flash-lite. Files without
+        // postMessage candidates contribute zero bytes, so every existing
+        // prompt stays byte-for-byte identical (cache-safe).
+        let has_postmessage_candidates = candidate_hints
+            .iter()
+            .any(|h| h.contains(".postMessage [fn:") || h.contains(".addEventListener [fn:"));
+        let postmessage_section = if !has_postmessage_candidates {
+            String::new()
+        } else {
+            "\n### WEB POSTMESSAGE CHANNEL (candidates above include postMessage / 'message'-listener sites)\n\
+             The browser postMessage channel is a pub/sub surface; extract pubsub_operations from \
+             these candidate sites. A `.postMessage(...)` call whose message object carries a string \
+             literal under an `action` or `type` key PUBLISHES that string as the topic \
+             (`parent.postMessage({ action: 'doc-ready', data }, '*')` -> one operation, role \
+             `publisher`, topic 'doc-ready'). A listener registered with \
+             `addEventListener('message', handler)` SUBSCRIBES: each string-literal dispatch case \
+             over that envelope key inside the handler (`case 'doc-ready':`) is one operation, role \
+             `subscriber`, with that case's string as the topic — follow the handler function \
+             reference to its body, and emit one operation per case. A postMessage call whose \
+             message has no literal `action`/`type` key is a raw data transfer: emit nothing for \
+             it. The DOM event name 'message' is never itself a topic — a catch-all listener whose \
+             handler does not dispatch on envelope keys yields NO operations. For \
+             `primary_type_symbol` use the payload's named type when evident (e.g. the declared \
+             type of the callback receiving `event.data.data`), else null; `broker` is null.\n"
+                .to_string()
+        };
+
         // Add line-number prefixes to file content so Gemini can read line numbers directly
         let mut numbered_content =
             String::with_capacity(file_content.len() + file_content.lines().count() * 7);
@@ -903,7 +937,7 @@ These notes are generated per-scan by the framework guidance layer and describe 
 
 ### IMPORT TABLE (Do not hallucinate sources)
 {}
-{}
+{}{}
 ### FILE CONTENT (Path: {})
 Lines are prefixed with line numbers. Use these numbers for *_expression_line fields.
 ```
@@ -965,6 +999,7 @@ Return ONLY the JSON object, no explanations."#,
             candidate_contexts_section,
             imports_section,
             wrapper_context_section,
+            postmessage_section,
             file_path,
             numbered_content
         )
@@ -1860,6 +1895,72 @@ const r = await apiRequest.call(this, "GET", "/webhooks", {});"#;
         // The section sits in the per-file zone: after the import table,
         // before the file content (cache-prefix invariant).
         let sec = with.find("### IMPORTED HTTP WRAPPER DEFINITIONS").unwrap();
+        assert!(with.find("### IMPORT TABLE").unwrap() < sec);
+        assert!(sec < with.find("### FILE CONTENT").unwrap());
+    }
+
+    /// #372: the postMessage-channel section appears exactly when a Signal-8
+    /// candidate (`.postMessage` / `.addEventListener` on a 'message' event)
+    /// is among the hints; any other candidate mix leaves the message
+    /// byte-identical to the pre-#372 shape (cache-safety contract).
+    #[test]
+    fn test_postmessage_section_present_iff_candidates_match() {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let guidance = create_test_guidance();
+        let file_content = r#"window.parent.postMessage({ action: 'done' }, '*');"#;
+
+        let http_only = vec![
+            "- Candidate span:0-10: Line 1 (span 0-10) fetch [fn: <module>] [path: '/x'] - `fetch('/x')`"
+                .to_string(),
+        ];
+        let without = agent.build_user_message_with_candidates(
+            "page.tsx",
+            file_content,
+            &guidance,
+            &http_only,
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!without.contains("WEB POSTMESSAGE CHANNEL"));
+
+        let pm = vec![
+            "- Candidate span:0-10: Line 1 (span 0-10) window.postMessage [fn: notify] [path: <path unavailable>] - `window.parent.postMessage(`"
+                .to_string(),
+        ];
+        let with = agent.build_user_message_with_candidates(
+            "page.tsx",
+            file_content,
+            &guidance,
+            &pm,
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(with.contains("### WEB POSTMESSAGE CHANNEL"));
+        // Listener-shape hints gate it too.
+        let listener = vec![
+            "- Candidate span:0-10: Line 1 (span 0-10) window.addEventListener [fn: mount] [path: <path unavailable>] - `window.addEventListener('message', handleMessage);`"
+                .to_string(),
+        ];
+        let with_listener = agent.build_user_message_with_candidates(
+            "sdk.ts",
+            file_content,
+            &guidance,
+            &listener,
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(with_listener.contains("### WEB POSTMESSAGE CHANNEL"));
+        // Per-file zone: after the import table, before the file content.
+        let sec = with.find("### WEB POSTMESSAGE CHANNEL").unwrap();
         assert!(with.find("### IMPORT TABLE").unwrap() < sec);
         assert!(sec < with.find("### FILE CONTENT").unwrap());
     }
