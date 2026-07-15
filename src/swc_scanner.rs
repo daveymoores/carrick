@@ -1283,24 +1283,46 @@ impl Visit for CandidateVisitor {
         // cases (receive side) — so topic extraction is LLM-side; the shape
         // only routes the file. Topicless transfers (`worker.postMessage(buf)`)
         // surface as candidates too and are rejected there.
-        if let Callee::Expr(callee_expr) = &call.callee
-            && let Expr::Member(member) = &**callee_expr
+        if let Callee::Expr(callee_expr) = &call.callee {
+            // The callee name comes from a member property (`window.parent
+            // .postMessage`, incl. computed string form `w['postMessage']`) or
+            // a bare identifier (`postMessage(...)` / `addEventListener(
+            // 'message', ...)` in worker/global scope, where the receiver is
+            // the implicit global).
+            let (receiver, prop_name): (Option<&Expr>, Option<String>) = match &**callee_expr {
+                Expr::Member(member) => {
+                    let name = match &member.prop {
+                        MemberProp::Ident(id) => Some(id.sym.to_string()),
+                        MemberProp::Computed(c) => match &*c.expr {
+                            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+                            _ => None,
+                        },
+                        MemberProp::PrivateName(_) => None,
+                    };
+                    (Some(&*member.obj), name)
+                }
+                Expr::Ident(id) => (None, Some(id.sym.to_string())),
+                _ => (None, None),
+            };
             // Receiver must not be a string/number literal (a `"str".method()`
             // chain is never a messaging context).
-            && !matches!(&*member.obj, Expr::Lit(Lit::Str(_)) | Expr::Lit(Lit::Num(_)))
-            && let MemberProp::Ident(prop) = &member.prop
-        {
-            let prop_name = prop.sym.as_ref();
-            let is_post_message = prop_name == "postMessage";
-            let is_message_listener = prop_name == "addEventListener"
-                && matches!(
-                    call.args.first().map(|a| &*a.expr),
-                    Some(Expr::Lit(Lit::Str(s))) if s.value.as_ref() == "message"
-                );
-            if is_post_message || is_message_listener {
-                let obj_name = Self::extract_callee_object(&member.obj)
-                    .unwrap_or_else(|| "<postmessage>".to_string());
-                self.push_candidate(call, obj_name, Some(prop_name.to_string()));
+            let receiver_ok = !matches!(
+                receiver,
+                Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Lit(Lit::Num(_)))
+            );
+            if receiver_ok && let Some(prop_name) = prop_name {
+                let is_post_message = prop_name == "postMessage";
+                let is_message_listener = prop_name == "addEventListener"
+                    && matches!(
+                        call.args.first().map(|a| &*a.expr),
+                        Some(Expr::Lit(Lit::Str(s))) if s.value.as_ref() == "message"
+                    );
+                if is_post_message || is_message_listener {
+                    let obj_name = receiver
+                        .and_then(Self::extract_callee_object)
+                        .unwrap_or_else(|| "<global>".to_string());
+                    self.push_candidate(call, obj_name, Some(prop_name));
+                }
             }
         }
 
@@ -1689,6 +1711,32 @@ async function run() { return sdk.doThing(); }
                     && c.callee_property.as_deref() == Some("addEventListener")
             }),
             "expected a window.addEventListener('message') candidate"
+        );
+    }
+
+    #[test]
+    fn detects_bare_global_post_message_and_listener() {
+        // Worker/global scope uses the implicit global: `postMessage(...)` and
+        // `addEventListener('message', ...)` with no receiver at all.
+        let content = r#"addEventListener('message', (event) => {
+    postMessage({ type: 'result', data: event.data });
+});"#;
+        let result = scan_test_content(content);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("addEventListener")
+                    && c.callee_object == "<global>"),
+            "expected a bare addEventListener('message') candidate"
+        );
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("postMessage")
+                    && c.callee_object == "<global>"),
+            "expected a bare postMessage candidate"
         );
     }
 
