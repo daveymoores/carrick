@@ -32,7 +32,7 @@ The intent layer is the difference. It is what lets an agent answer "where do we
 The MCP endpoint lives at `https://api.carrick.tools/mcp`.
 
 ```bash
-claude mcp add --transport http carrick https://api.carrick.tools/mcp
+claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
 ```
 
 The recommended authentication is sign-in-with-Carrick: your agent opens a browser, you click Approve once, and no API key changes hands. A manual key paste is available as a fallback. To get started, sign up at [app.carrick.tools](https://app.carrick.tools) — the full setup guide lives at [docs.carrick.tools](https://docs.carrick.tools).
