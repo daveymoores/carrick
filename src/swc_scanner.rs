@@ -1270,6 +1270,40 @@ impl Visit for CandidateVisitor {
             }
         }
 
+        // Signal 8 (UNGATED): web-platform cross-context messaging. postMessage
+        // sends a message envelope to another browsing context (parent window,
+        // iframe contentWindow, worker, message port, broadcast channel);
+        // addEventListener('message', …) registers the receiving side. Like
+        // `navigator.sendBeacon` (Signal 1b) these are web-platform primitives
+        // with no package import to gate on, so they are recognized purely by
+        // shape: the `postMessage` property name, and the literal 'message'
+        // event name on the listener side. Unlike Signal 7 the topic is NOT the
+        // first argument — it is a string literal on the envelope's
+        // `action`/`type` property (send side) or in the handler's dispatch
+        // cases (receive side) — so topic extraction is LLM-side; the shape
+        // only routes the file. Topicless transfers (`worker.postMessage(buf)`)
+        // surface as candidates too and are rejected there.
+        if let Callee::Expr(callee_expr) = &call.callee
+            && let Expr::Member(member) = &**callee_expr
+            // Receiver must not be a string/number literal (a `"str".method()`
+            // chain is never a messaging context).
+            && !matches!(&*member.obj, Expr::Lit(Lit::Str(_)) | Expr::Lit(Lit::Num(_)))
+            && let MemberProp::Ident(prop) = &member.prop
+        {
+            let prop_name = prop.sym.as_ref();
+            let is_post_message = prop_name == "postMessage";
+            let is_message_listener = prop_name == "addEventListener"
+                && matches!(
+                    call.args.first().map(|a| &*a.expr),
+                    Some(Expr::Lit(Lit::Str(s))) if s.value.as_ref() == "message"
+                );
+            if is_post_message || is_message_listener {
+                let obj_name = Self::extract_callee_object(&member.obj)
+                    .unwrap_or_else(|| "<postmessage>".to_string());
+                self.push_candidate(call, obj_name, Some(prop_name.to_string()));
+            }
+        }
+
         // Signal 7 (GATED): fire-and-forget pub/sub call sites. The
         // publish/subscribe shape (`nc.publish(SUBJECT, payload);`,
         // `const sub = nc.subscribe("topic")`) is a member call with a
@@ -1599,6 +1633,80 @@ async function run() { return sdk.doThing(); }
                 .any(|c| c.callee_object == "navigator"
                     && c.callee_property.as_deref() == Some("sendBeacon")),
             "non-navigator.sendBeacon must not be tagged as the navigator primitive"
+        );
+    }
+
+    #[test]
+    fn detects_window_parent_post_message() {
+        // `window.parent.postMessage({action: 'x'}, '*')` is the web-platform
+        // cross-context messaging send primitive. No name heuristic matches
+        // `window.parent` or `postMessage`, the first arg is an object literal
+        // (no URL scheme, not stringish), and the file has no messaging-client
+        // import — only the Signal 8 shape surfaces it.
+        let content = r#"function notify() {
+    window.parent.postMessage({ action: 'document-completed', data: null }, '*');
+}"#;
+        let result = scan_test_content(content);
+        assert!(
+            result.candidates.iter().any(|c| {
+                c.callee_object == "window" && c.callee_property.as_deref() == Some("postMessage")
+            }),
+            "expected a window.parent.postMessage candidate, got {:?}",
+            result
+                .candidates
+                .iter()
+                .map(|c| (&c.callee_object, &c.callee_property))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn detects_arbitrary_receiver_post_message() {
+        // The receiver is arbitrary (iframe.contentWindow, worker, port) —
+        // the property name is the signal; the LLM rejects topicless
+        // transfers downstream.
+        let content = r#"function send(worker) { worker.postMessage({ lines }); }"#;
+        let result = scan_test_content(content);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("postMessage")),
+            "expected a postMessage candidate for a non-window receiver"
+        );
+    }
+
+    #[test]
+    fn detects_message_event_listener() {
+        // `window.addEventListener('message', handler)` is the receiving side
+        // of the postMessage channel. The literal 'message' first argument is
+        // required — see ignores_non_message_event_listener.
+        let content = r#"function mount(handler) { window.addEventListener('message', handler); }"#;
+        let result = scan_test_content(content);
+        assert!(
+            result.candidates.iter().any(|c| {
+                c.callee_object == "window"
+                    && c.callee_property.as_deref() == Some("addEventListener")
+            }),
+            "expected a window.addEventListener('message') candidate"
+        );
+    }
+
+    #[test]
+    fn ignores_non_message_event_listener() {
+        // addEventListener with any other event name is generic DOM wiring,
+        // not the messaging channel.
+        let content = r#"function mount(el, onClick) {
+    el.addEventListener('click', onClick);
+    document.addEventListener('keydown', onClick);
+}"#;
+        let result = scan_test_content(content);
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("addEventListener")),
+            "non-'message' addEventListener must not produce candidates"
         );
     }
 
