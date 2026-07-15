@@ -65,28 +65,50 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 ## Carrick
 
 This repo is part of the **carrick-tools / carrick-ci** Carrick
-project. Carrick indexes every service in the project — exported functions
-(with intent descriptions), dependencies, and API endpoints with real
+project. Carrick indexes every service in the project: exported functions
+with intent descriptions, dependencies, and API endpoints with their real
 request/response types.
 
 ### Connect the agent
 
 ```
-claude mcp add --transport http carrick https://api.carrick.tools/mcp
+claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
 ```
 
 One install serves every project in the workspace. On Carrick tool calls
 from this repo, pass `project: "carrick-ci"` (or `repo: "<owner/repo>"`
 from the git remote) so Carrick queries the right system.
 
-### When to reach for Carrick
+### The loop for cross-service work
 
-- Before writing a helper/parser/validator/formatter: `search_by_intent` to
-  find an existing implementation in a sibling repo.
-- Before calling another service's API: `get_api_endpoints` +
-  `get_endpoint_types` instead of guessing the JSON shape.
-- Before changing a response shape, removing an endpoint, or renaming a path:
-  `check_compatibility` against each consumer.
-- Before adding/bumping an npm dependency: `get_service_dependencies`.
+1. Topology: `get_service_graph` shows who calls whom across the project.
+2. Prior art: `search_by_intent` with a plain-English description of what
+   you are about to write. Do this before writing any helper, parser,
+   validator, or domain function, even when you are sure it is new.
+3. Contracts: `get_endpoint_types` for the real request/response types of
+   anything you will call; `get_api_endpoints` first only when you don't
+   yet know which operations exist.
+4. Build.
+5. Consumers: `check_compatibility` against each consumer before changing
+   a response shape, removing an endpoint, or renaming a path.
+
+Also call `get_service_dependencies` before adding or bumping an npm
+package.
+
+### Building against a sibling before merge
+
+Pull the producer's contract with `get_endpoint_types`, code to it, done.
+The index at main is what production integrates against; your unmerged
+local state does not need to be visible to Carrick. All matching runs the
+same shared carrick-match code in the scanner, the cloud, and the MCP
+server (responses carry its `matcher_version`), so what the tools report
+is what the scan will compute.
+
+### Division of labor
+
+Write correct, idiomatic, explicitly typed code, and never contort code so
+the scanner can read it. If Carrick fails to extract something written
+normally, that is a Carrick bug to report, not a constraint to code
+around.
 
 Carrick is read-only; data reflects the most recent scan of each repo.
