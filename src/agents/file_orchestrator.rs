@@ -3175,6 +3175,10 @@ impl FileOrchestrator {
                         Path::new(file_path),
                         scan_root,
                     ),
+                    // Assumed a route definition here; reclassified to
+                    // `CallSite` by `classify_endpoint_evidence` when the same
+                    // source site was also extracted as a data call (#379).
+                    evidence: carrick_match::MatchEvidence::RouteDefinition,
                 });
             }
         }
@@ -3225,6 +3229,17 @@ impl FileOrchestrator {
         // Sixth pass: resolve full paths for endpoints
         self.resolve_endpoint_paths(&mut graph);
 
+        // Evidence classification (#379): an "endpoint" whose exact source
+        // site was ALSO extracted as a data call is a client call expression
+        // the extraction double-classified (an integration/SDK operation
+        // definition), not a route this service defines. Mark it as call-site
+        // evidence so the cross-repo matcher reports a pair against it as a
+        // shared external contract instead of fabricating a producer role.
+        // Must run BEFORE the self-call suppression below: suppression deletes
+        // the twin data call (the fabricated endpoint matches it), destroying
+        // the evidence.
+        Self::classify_endpoint_evidence(&mut graph);
+
         // Seventh pass: suppress self-calls. A data call whose (method, canonical
         // path) matches one of THIS service's own resolved endpoints is the
         // service hitting its own HTTP surface (e.g. a cron/reindex job fetching
@@ -3244,18 +3259,28 @@ impl FileOrchestrator {
             .data_calls
             .iter()
             .map(|call| {
-                // A zero-agreement routing match (#381) — this service's own
-                // catch-all fallback (`GET /*`) absorbing the call — is not
-                // evidence of a self-call: it would suppress every one of the
-                // service's real outgoing calls. Only a producer that shares
-                // literal path signal with the call counts.
+                // Two guards on what counts as a self-call, composed:
+                // - A zero-agreement routing match (#381) — this service's own
+                //   catch-all fallback (`GET /*`) absorbing the call — is not
+                //   evidence of a self-call: it would suppress every one of
+                //   the service's real outgoing calls. Only a producer that
+                //   shares literal path signal with the call counts.
+                // - Only route-definition evidence counts (#379): a call whose
+                //   only match is a call-site-evidence endpoint (its own
+                //   double-extracted twin) is a call to an EXTERNAL contract,
+                //   not the service hitting its own surface — keep it so the
+                //   shared-external-contract group can form cross-repo.
                 let is_self_call = graph
                     .find_matching_endpoints(&call.canonical_path, &call.method)
                     .iter()
                     .any(|endpoint| {
-                        carrick_match::match_agreement(&endpoint.full_path, &call.canonical_path)
+                        endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
+                            && carrick_match::match_agreement(
+                                &endpoint.full_path,
+                                &call.canonical_path,
+                            )
                             .unwrap_or(0)
-                            > 0
+                                > 0
                     });
                 if is_self_call {
                     debug!(
@@ -3360,6 +3385,40 @@ impl FileOrchestrator {
         for endpoint in &mut graph.endpoints {
             if let Some(prefix) = owner_prefixes.get(&endpoint.owner) {
                 endpoint.full_path = Self::join_paths(prefix, &endpoint.path);
+            }
+        }
+    }
+
+    /// Reclassify endpoints whose evidence is actually a client call
+    /// expression (#379).
+    ///
+    /// An endpoint is call-site evidence when a data call in the SAME graph
+    /// shares its exact source site (`file:line`), its method, and a matching
+    /// path — the extraction emitted one call expression as BOTH an endpoint
+    /// and a data call (e.g. an integration platform's request-descriptor
+    /// `perform` operation). The triple gate is deliberately strict, purely
+    /// structural, and framework-agnostic: a genuine route definition never
+    /// shares its exact line, verb, AND path with an outbound call. Known
+    /// limitation (logged at debug level via the reclassification message
+    /// only): a fabricated endpoint whose twin call was emitted at a
+    /// different line is not caught and keeps route-definition evidence.
+    ///
+    /// Runs after `resolve_endpoint_paths` (so `full_path` is final) and
+    /// before self-call suppression (which deletes the twin call).
+    fn classify_endpoint_evidence(graph: &mut MountGraph) {
+        for endpoint in &mut graph.endpoints {
+            let twinned = graph.data_calls.iter().any(|call| {
+                call.file_location == endpoint.file_location
+                    && call.method.eq_ignore_ascii_case(&endpoint.method)
+                    && carrick_match::paths_match(&endpoint.full_path, &call.canonical_path)
+            });
+            if twinned {
+                debug!(
+                    "Endpoint {} {} at {} is a double-extracted call expression; \
+                     reclassifying as call-site evidence",
+                    endpoint.method, endpoint.full_path, endpoint.file_location
+                );
+                endpoint.evidence = carrick_match::MatchEvidence::CallSite;
             }
         }
     }
@@ -4122,6 +4181,116 @@ mod tests {
             "self-call must be suppressed, surviving calls: {call_paths:?}"
         );
         assert_eq!(graph.data_calls[0].canonical_path, "/catalog/:id");
+    }
+
+    /// #379: an "endpoint" whose exact source site (file:line), method, and
+    /// path were ALSO extracted as a data call is a double-extracted client
+    /// call expression, not a route definition. It must be reclassified to
+    /// call-site evidence, and its twin call must SURVIVE self-call
+    /// suppression (the call targets an external contract, not the service's
+    /// own surface). A genuine route definition in the same file keeps
+    /// route-definition evidence, and a call matching THAT one is still
+    /// suppressed as a self-call.
+    #[test]
+    fn test_build_mount_graph_reclassifies_double_extracted_call_as_call_site_evidence() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mk_endpoint = |line: u32, method: &str, path: &str| EndpointResult {
+            candidate_id: format!("span:{line}"),
+            line_number: line as i32,
+            owner_node: "app".to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler_name: "handler".to_string(),
+            pattern_matched: ".request(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        };
+        let mk_call = |line: u32, method: &str, target: &str| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("call:{line}"),
+            line_number: line as i32,
+            target: target.to_string(),
+            method: Some(method.to_string()),
+            pattern_matched: "request(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "operations/create-widget.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![
+                    // Double-extracted client call: same line, verb, and path
+                    // as the data call below → call-site evidence.
+                    mk_endpoint(14, "POST", "/v2/widgets"),
+                    // Genuine route definition at a different site.
+                    mk_endpoint(40, "GET", "/health"),
+                ],
+                data_calls: vec![
+                    mk_call(14, "POST", "/v2/widgets"),
+                    // Self-call to the genuine route: still suppressed.
+                    mk_call(52, "GET", "/health"),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
+
+        let evidence_of = |method: &str| {
+            graph
+                .endpoints
+                .iter()
+                .find(|e| e.method == method)
+                .expect("endpoint present")
+                .evidence
+        };
+        assert_eq!(
+            evidence_of("POST"),
+            carrick_match::MatchEvidence::CallSite,
+            "double-extracted call expression must be call-site evidence"
+        );
+        assert_eq!(
+            evidence_of("GET"),
+            carrick_match::MatchEvidence::RouteDefinition,
+            "a genuine route definition keeps route-definition evidence"
+        );
+
+        // The twin call survives (external contract encoding); the genuine
+        // self-call is still suppressed.
+        let surviving: Vec<&str> = graph
+            .data_calls
+            .iter()
+            .map(|c| c.canonical_path.as_str())
+            .collect();
+        assert_eq!(
+            surviving,
+            vec!["/v2/widgets"],
+            "twin call must survive; self-call to the real route must not"
+        );
     }
 
     /// #307 (class 1): a wrapper-internal call whose canonical path is nothing

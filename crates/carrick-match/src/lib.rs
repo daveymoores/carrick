@@ -1,10 +1,12 @@
 //! Path-matching primitives shared by every Carrick surface that compares
-//! HTTP route paths.
+//! HTTP route paths, plus the evidence-kind classification of what a matched
+//! pair means ([`classify_relationship`]).
 //!
 //! Extracted verbatim from the scanner's `MountGraph` (whose methods now
 //! delegate here) so the scanner and, via the optional `wasm` feature,
 //! Node.js consumers run the exact same matching semantics. Everything is a
-//! pure function over `&str`; the native build has zero dependencies.
+//! pure function; the default native build has zero dependencies (the
+//! optional `serde` feature adds derives on the classification enums).
 //!
 //! Two questions, two functions (#378/#381):
 //!
@@ -24,13 +26,73 @@
 //!
 //! The `wasm` feature (default off) adds wasm-bindgen exports for
 //! [`paths_match`], [`is_param_segment`], [`match_agreement`],
-//! [`path_literal_specificity`], and [`is_catch_all_path`]:
+//! [`path_literal_specificity`], [`is_catch_all_path`], and
+//! [`classify_relationship`]:
 //!
 //! ```text
 //! cargo build --target wasm32-unknown-unknown -p carrick-match --features wasm
 //! wasm-bindgen --target nodejs --out-dir <dir> \
 //!     target/wasm32-unknown-unknown/<profile>/carrick_match.wasm
 //! ```
+
+/// The kind of source evidence backing one side of a match: a route
+/// definition (a server declaring the operation) or a call site (a client
+/// invoking it).
+///
+/// Every match side is backed by one of these two. The distinction is what
+/// separates a real producer/consumer relationship from two clients that
+/// merely encode the same externally-hosted contract (#379).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum MatchEvidence {
+    /// The side declares/serves the operation (a route definition, an SDL
+    /// root field, a socket listener, a pub/sub subscriber).
+    #[default]
+    RouteDefinition,
+    /// The side invokes the operation (an outbound call expression). An
+    /// index entry that sits on the producer side but was derived from a
+    /// call expression carries this kind.
+    CallSite,
+}
+
+/// What a matched pair of operations means, classified purely by the
+/// evidence kind on each side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum MatchRelationship {
+    /// One side defines the route, the other calls it: a genuine
+    /// producer→consumer contract edge.
+    ProducerConsumer,
+    /// Both sides are call sites: nobody in the pair defines the route, so
+    /// the operations encode the same contract served outside the index.
+    /// Producer/consumer roles do not apply to this relationship.
+    SharedExternalContract,
+}
+
+/// Classify what a matched pair means from the evidence kind of each side.
+///
+/// A pair is a producer/consumer edge only when the producer-side entry is
+/// backed by a route definition. When the producer-side evidence is itself a
+/// call site, the "producer" role would be fabricated from a call expression
+/// (#379): both sides merely encode the same external contract.
+///
+/// The consumer side is accepted for symmetry (matchers know both sides);
+/// today's matchers always pass `CallSite` there, and its value does not
+/// change the classification — only the producer side's evidence decides.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn classify_relationship(
+    producer_side: MatchEvidence,
+    _consumer_side: MatchEvidence,
+) -> MatchRelationship {
+    match producer_side {
+        MatchEvidence::RouteDefinition => MatchRelationship::ProducerConsumer,
+        MatchEvidence::CallSite => MatchRelationship::SharedExternalContract,
+    }
+}
 
 /// Whether a producer route path matches a consumer call path.
 ///
@@ -332,6 +394,31 @@ mod tests {
         assert!(!paths_match("/api/users/ ", "/api/users/:userId"));
         // Real values still match a param on the other side.
         assert!(agreement_with_params("/api/users/:id", "/api/users/123").is_some());
+    }
+
+    #[test]
+    fn test_classify_relationship_by_evidence_kind() {
+        // A route definition on the producer side is a real producer/consumer
+        // contract edge, regardless of the consumer side's evidence.
+        assert_eq!(
+            classify_relationship(MatchEvidence::RouteDefinition, MatchEvidence::CallSite),
+            MatchRelationship::ProducerConsumer
+        );
+        // Producer-side evidence that is itself a call site means nobody in
+        // the pair defines the route: the pair is two encodings of the same
+        // external contract, never a fabricated producer role (#379).
+        assert_eq!(
+            classify_relationship(MatchEvidence::CallSite, MatchEvidence::CallSite),
+            MatchRelationship::SharedExternalContract
+        );
+    }
+
+    #[test]
+    fn test_match_evidence_default_is_route_definition() {
+        // Index entries recorded before evidence kinds existed deserialize to
+        // the default; a producer-side entry defaults to a route definition so
+        // pre-existing matches keep their producer/consumer classification.
+        assert_eq!(MatchEvidence::default(), MatchEvidence::RouteDefinition);
     }
 
     #[test]

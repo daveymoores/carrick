@@ -14,9 +14,14 @@ crate-type = ["rlib", "cdylib"]
 # Adds wasm-bindgen exports for Node.js consumers. Default off so the native
 # scanner build pulls in zero new external dependencies.
 wasm = ["dep:wasm-bindgen"]
+# Adds serde derives to the classification enums so consumers that serialize
+# match output (the scanner's `CrossRepoMatch`) can embed them directly.
+# Default off so the bare crate stays dependency-free.
+serde = ["dep:serde"]
 
 [dependencies]
 # Pinned exactly: wasm-bindgen requires the CLI that generates the JS glue to
 # match this version. Bump the `cargo install wasm-bindgen-cli --version` pin
 # in .github/workflows/ci.yml in lockstep.
 wasm-bindgen = { version = "=0.2.126", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }

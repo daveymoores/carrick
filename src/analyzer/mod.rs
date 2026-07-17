@@ -133,9 +133,25 @@ pub struct CrossRepoMatch {
     /// handler (#380). Carried from the producer endpoint's structural
     /// classification so downstream surfaces can present a mismatch against a
     /// mock with the right amount of trust. When several producers share one
-    /// exact key, route-wins (`EndpointProvenance::min`).
+    /// exact key, route-wins (`EndpointProvenance::min`). Orthogonal to
+    /// `relationship`: provenance says where the producer-side entry was
+    /// written; relationship says what the pair means. A
+    /// shared-external-contract edge still carries the producer side's
+    /// provenance (a mock call-site is conceivable and the tags compose).
     #[serde(default)]
     pub producer_provenance: crate::operation::EndpointProvenance,
+    /// What this pair means, classified by evidence kind
+    /// (`carrick_match::classify_relationship`, #379). `ProducerConsumer` is
+    /// the ordinary case: the producer side is a route definition. For
+    /// `SharedExternalContract` the producer side's evidence was itself a
+    /// call site — both sides encode the same externally-served contract, and
+    /// the `producer_*`/`consumer_*` field names carry NO role meaning (they
+    /// only say which side sat in the endpoint index vs the call index);
+    /// renderers must not label either side producer or consumer, and
+    /// ts_check verdicts are never overlaid on these edges (they would be
+    /// request-vs-request comparisons mislabelled as producer-contract
+    /// verdicts).
+    pub relationship: carrick_match::MatchRelationship,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -415,6 +431,16 @@ fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMat
     }
 
     for edge in matches.iter_mut() {
+        // A shared-external-contract edge has no producer contract to verify:
+        // both sides are call sites, so any ts_check comparison keyed on the
+        // same (method, path, consumer) would be request-vs-request — and the
+        // optimistic `Some(true)` fallback below would otherwise fabricate a
+        // "compatible" verdict for a check that never ran. These edges are
+        // verdict-exempt: `type_compatible` stays `None` (#379).
+        if edge.relationship != carrick_match::MatchRelationship::ProducerConsumer {
+            edge.type_compatible = None;
+            continue;
+        }
         // Recover the join key from the producer_key. ts_check type-checks HTTP
         // (`http|METHOD|path`), socket (`socket|DIRECTION|event`), and graphql
         // (`graphql|KIND|field`), so all three join here. A key for any other
@@ -455,6 +481,15 @@ fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMat
 /// identity so two distinct call sites in one consumer repo against the same
 /// producer endpoint stay separate edges (each carries its own verdict).
 fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
+    // Relationship is part of edge identity: one repo can index BOTH a real
+    // route definition and a call-site-evidence entry on the same key, and
+    // the resulting producer/consumer and shared-external-contract edges are
+    // distinct facts. Ordered as a stable tiebreaker (ProducerConsumer <
+    // SharedExternalContract via the discriminant), never collapsed.
+    let relationship_rank = |m: &CrossRepoMatch| match m.relationship {
+        carrick_match::MatchRelationship::ProducerConsumer => 0u8,
+        carrick_match::MatchRelationship::SharedExternalContract => 1u8,
+    };
     matches.sort_by(|a, b| {
         (
             &a.producer_repo,
@@ -462,6 +497,7 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
             &a.consumer_repo,
             &a.consumer_key,
             &a.consumer_location,
+            relationship_rank(a),
         )
             .cmp(&(
                 &b.producer_repo,
@@ -469,6 +505,7 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
                 &b.consumer_repo,
                 &b.consumer_key,
                 &b.consumer_location,
+                relationship_rank(b),
             ))
     });
     matches.dedup_by(|a, b| {
@@ -477,6 +514,7 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
             && a.consumer_repo == b.consumer_repo
             && a.consumer_key == b.consumer_key
             && a.consumer_location == b.consumer_location
+            && a.relationship == b.relationship
     });
 }
 
@@ -1383,6 +1421,14 @@ impl Analyzer {
         let mut method_mismatched_producers: HashSet<String> = HashSet::new();
         // Structured producer→consumer edges for the eval projection.
         let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
+        // Shared-external-contract groups (#379): (METHOD, path) → (repo ids,
+        // call sites) for matches whose "producer" side is itself call-site
+        // evidence — no one in the pair defines the route, so the repos merely
+        // encode the same externally-served contract. BTree-keyed for
+        // deterministic emission; reported as one group finding per contract,
+        // with no producer/consumer roles.
+        type SharedGroup = (BTreeSet<String>, BTreeSet<String>);
+        let mut shared_contract_groups: BTreeMap<(String, String), SharedGroup> = BTreeMap::new();
 
         // Consumer repo lookup: a call's `(METHOD, canonical_path, file_location)`
         // → owning repo. `merge_from_repos` tags each merged data call with its
@@ -1511,15 +1557,39 @@ impl Analyzer {
                         }
                         let key = format!("{}:{}", endpoint.method, endpoint.full_path);
                         matched_endpoints.insert(key);
-                        if let Some(edge) = Self::build_cross_repo_match(
+                        let Some(edge) = Self::build_cross_repo_match(
                             call,
                             method,
                             target,
                             &normalized_path,
                             endpoint,
                             &consumer_repo_by_call,
-                        ) {
-                            cross_repo_matches.push(edge);
+                        ) else {
+                            continue;
+                        };
+                        match edge.relationship {
+                            carrick_match::MatchRelationship::ProducerConsumer => {
+                                cross_repo_matches.push(edge);
+                            }
+                            carrick_match::MatchRelationship::SharedExternalContract => {
+                                // Both sides are call-site encodings of the
+                                // same external contract (#379): record group
+                                // membership for the report. The edge's
+                                // producer_/consumer_ fields carry no roles
+                                // (see `CrossRepoMatch::relationship`); a
+                                // same-repo pair (a repo re-matching its own
+                                // double-extracted site) still counts toward
+                                // the group but emits no self edge.
+                                let (repos, sites) = shared_contract_groups
+                                    .entry((method.to_string(), normalized_path.clone()))
+                                    .or_default();
+                                repos.insert(edge.producer_repo.clone());
+                                repos.insert(edge.consumer_repo.clone());
+                                sites.insert(call_site.clone());
+                                if edge.producer_repo != edge.consumer_repo {
+                                    cross_repo_matches.push(edge);
+                                }
+                            }
                         }
                     }
                 }
@@ -1532,9 +1602,17 @@ impl Analyzer {
                     // connectivity gap). A wildcard-only collision — e.g.
                     // `POST /users/:id` while `GET /users/list` is missing —
                     // stays a missing endpoint.
-                    let path_matches = mount_graph
+                    // Only route-definition evidence can back "the producer
+                    // expects METHOD": a call-site-evidence entry (#379) is
+                    // not a producer, so naming it here would fabricate the
+                    // same role the shared-external-contract classification
+                    // exists to remove.
+                    let mut path_matches = mount_graph
                         .find_exact_path_matches_any_method(&lookup_url, &normalizer)
                         .unwrap_or_default();
+                    path_matches.retain(|endpoint| {
+                        endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
+                    });
                     if path_matches.is_empty() {
                         missing
                             .entry((method.to_string(), miss_path))
@@ -1611,6 +1689,13 @@ impl Analyzer {
         // formatter.
         let mut verified: Vec<VerifiedEndpointEntry> = Vec::new();
         for endpoint in mount_graph.get_resolved_endpoints() {
+            // Call-site-evidence entries are not producers (#379): matched or
+            // not, they are neither "verified endpoints" (nothing was served)
+            // nor "orphaned endpoints" (nothing was defined). Their matches
+            // surface as shared-external-contract groups instead.
+            if endpoint.evidence == carrick_match::MatchEvidence::CallSite {
+                continue;
+            }
             let key = format!("{}:{}", endpoint.method, endpoint.full_path);
             if matched_endpoints.contains(&key) {
                 verified.push((
@@ -1649,6 +1734,22 @@ impl Analyzer {
                 method,
                 path,
                 env_var,
+                sites.into_iter().collect(),
+            ));
+        }
+        // Shared-external-contract groups (#379): only groups spanning ≥2
+        // repos are reported — "N repos encode the same external contract" is
+        // signal; a single repo's own encoding (every SDK operation would
+        // qualify) is noise, and unattributed single-repo runs collect no repo
+        // ids at all.
+        for ((method, path), (repos, sites)) in shared_contract_groups {
+            if repos.len() < 2 {
+                continue;
+            }
+            findings.push(Finding::shared_external_contract(
+                method,
+                path,
+                repos.into_iter().collect(),
                 sites.into_iter().collect(),
             ));
         }
@@ -1704,6 +1805,13 @@ impl Analyzer {
             producer_key: producer_key.canonical(),
             consumer_repo,
             consumer_key: consumer_key.canonical(),
+            // Classified by evidence kind (#379): the consumer side is always
+            // a call site here; the producer side is whatever evidence backs
+            // the matched endpoint entry.
+            relationship: carrick_match::classify_relationship(
+                endpoint.evidence,
+                carrick_match::MatchEvidence::CallSite,
+            ),
             // The consumer call's source location — the per-pair join key for the
             // compat verdict (#260). Shares the consumer manifest entry's source
             // (both come from this call's `file_location`), so the overlay can
@@ -1814,6 +1922,14 @@ impl Analyzer {
                             producer_key: canonical.clone(),
                             consumer_repo: consumer_repo.clone(),
                             consumer_key: canonical.clone(),
+                            // Exact-key producers are definition-side entries
+                            // (SDL root fields, socket listeners, pub/sub
+                            // subscribers), so the pair is a real
+                            // producer/consumer edge.
+                            relationship: carrick_match::classify_relationship(
+                                carrick_match::MatchEvidence::RouteDefinition,
+                                carrick_match::MatchEvidence::CallSite,
+                            ),
                             // Exact-key protocols (GraphQL/socket) ARE type-checked
                             // by ts_check now, so this consumer location feeds the
                             // compat overlay (`apply_compat_verdicts`) and also keeps
@@ -3430,6 +3546,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
 
         let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -3485,6 +3602,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -3537,6 +3655,7 @@ mod tests {
             repo_name: Some("producer-repo".to_string()),
             service_name: None,
             provenance: EndpointProvenance::Mock,
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
@@ -3550,6 +3669,7 @@ mod tests {
             repo_name: Some("producer-repo".to_string()),
             service_name: None,
             provenance: EndpointProvenance::Mock,
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -3625,6 +3745,182 @@ mod tests {
         );
     }
 
+    /// #379: when the producer-side entry is call-site evidence (a client
+    /// call double-extracted as an endpoint), a match against another repo's
+    /// identical call is a shared-external-contract pair: the edge carries
+    /// the relationship, the report gets one role-free group finding naming
+    /// both repos, and no producer role is fabricated (the entry is neither
+    /// verified nor orphaned, and there is no missing-endpoint gap).
+    #[test]
+    fn test_call_site_evidence_pair_reports_shared_external_contract() {
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        // repo-alpha: a client call expression the extraction double-emitted;
+        // reclassified to call-site evidence at scan time.
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/v2/widgets".to_string(),
+            full_path: "/v2/widgets".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "operations/create-widget.ts:14".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("repo-alpha".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::CallSite,
+        });
+        // repo-beta: the identical call to the same external endpoint.
+        mount_graph.data_calls.push(DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "https://api.vendor.example/v2/widgets".to_string(),
+            canonical_path: "/v2/widgets".to_string(),
+            client: "fetch".to_string(),
+            file_location: "src/widgets-client.ts:33".to_string(),
+            call_kind: None,
+            repo_name: Some("repo-beta".to_string()),
+        });
+        analyzer
+            .calls
+            .push(http_call("POST", "/v2/widgets", "src/widgets-client.ts:33"));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        // One edge, classified — with NO producer role asserted beyond the
+        // side names (see CrossRepoMatch::relationship).
+        assert_eq!(edges.len(), 1, "edges: {edges:?}");
+        assert_eq!(
+            edges[0].relationship,
+            carrick_match::MatchRelationship::SharedExternalContract
+        );
+        assert_eq!(edges[0].producer_repo, "repo-alpha");
+        assert_eq!(edges[0].consumer_repo, "repo-beta");
+
+        // One role-free group finding; no gaps, no fabricated producer.
+        assert_eq!(
+            findings,
+            vec![Finding::shared_external_contract(
+                "POST",
+                "/v2/widgets",
+                vec!["repo-alpha".to_string(), "repo-beta".to_string()],
+                vec!["src/widgets-client.ts:33".to_string()],
+            )],
+            "the pair must surface once, as a shared-external-contract group"
+        );
+        assert!(
+            verified.is_empty(),
+            "a call-site-evidence entry is never a verified producer"
+        );
+    }
+
+    /// #379 control: a real route definition matched by another repo's call
+    /// stays a plain producer/consumer edge — verified endpoint (with its
+    /// provenance, #380), no shared group, no behaviour change.
+    #[test]
+    fn test_route_definition_pair_stays_producer_consumer() {
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/v2/widgets".to_string(),
+            full_path: "/v2/widgets".to_string(),
+            handler: Some("createWidget".to_string()),
+            owner: "app".to_string(),
+            file_location: "src/server.ts:14".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("repo-alpha".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+        });
+        mount_graph.data_calls.push(DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "/v2/widgets".to_string(),
+            canonical_path: "/v2/widgets".to_string(),
+            client: "fetch".to_string(),
+            file_location: "src/widgets-client.ts:33".to_string(),
+            call_kind: None,
+            repo_name: Some("repo-beta".to_string()),
+        });
+        analyzer
+            .calls
+            .push(http_call("POST", "/v2/widgets", "src/widgets-client.ts:33"));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].relationship,
+            carrick_match::MatchRelationship::ProducerConsumer
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+        assert_eq!(
+            verified,
+            vec![(
+                "POST".to_string(),
+                "/v2/widgets".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )]
+        );
+    }
+
+    /// #379: a repo re-matching its OWN call-site-evidence entry (the twin
+    /// call kept by scan-time suppression) is not signal — no self edge, and
+    /// a group confined to one repo is not reported.
+    #[test]
+    fn test_same_repo_call_site_pair_emits_no_edge_or_group() {
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/v2/widgets".to_string(),
+            full_path: "/v2/widgets".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "operations/create-widget.ts:14".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("repo-alpha".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::CallSite,
+        });
+        mount_graph.data_calls.push(DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "/v2/widgets".to_string(),
+            canonical_path: "/v2/widgets".to_string(),
+            client: "request".to_string(),
+            file_location: "operations/create-widget.ts:14".to_string(),
+            call_kind: None,
+            repo_name: Some("repo-alpha".to_string()),
+        });
+        analyzer.calls.push(http_call(
+            "POST",
+            "/v2/widgets",
+            "operations/create-widget.ts:14",
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(edges.is_empty(), "no self edge: {edges:?}");
+        assert!(
+            findings.is_empty(),
+            "single-repo group is noise: {findings:?}"
+        );
+        assert!(verified.is_empty());
+    }
+
     /// Bare HTTP consumer call for the mount-graph matcher tests.
     fn http_call(method: &str, path: &str, file: &str) -> ApiEndpointDetails {
         graphql_details(OperationKey::http(method, path.to_string()), file)
@@ -3643,6 +3939,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         }
     }
 
@@ -3826,6 +4123,7 @@ mod tests {
             type_compatible: None,
             mismatch_reason: None,
             producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
         }
     }
 
@@ -3867,6 +4165,35 @@ mod tests {
             "a producer absent from the mismatch list is compatible (verdict reached)"
         );
         assert!(matches[1].mismatch_reason.is_none());
+    }
+
+    /// #379: a shared-external-contract edge is verdict-exempt. Both sides
+    /// are call sites, so any ts_check comparison on the same key would be
+    /// request-vs-request — and without the guard the overlay's optimistic
+    /// fallback would stamp `Some(true)` on an edge ts_check never verified
+    /// as a producer contract.
+    #[test]
+    fn apply_compat_verdicts_leaves_shared_external_contract_edges_unevaluated() {
+        // No mismatch entry for this key: the fallback would say Some(true).
+        let results: serde_json::Value = serde_json::from_str(
+            r#"{ "mismatches": [], "totalChecked": 1, "compatibleCount": 1 }"#,
+        )
+        .unwrap();
+
+        let mut shared = edge("http|POST|/v2/widgets");
+        shared.relationship = carrick_match::MatchRelationship::SharedExternalContract;
+        let mut matches = vec![shared, edge("http|POST|/v2/widgets")];
+        apply_compat_verdicts(&results, &mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "shared-external-contract edges are verdict-exempt"
+        );
+        assert_eq!(
+            matches[1].type_compatible,
+            Some(true),
+            "the producer/consumer edge on the same key still gets its verdict"
+        );
     }
 
     /// PR-comment polish (#337): the risk row's call site must not leak the CI
