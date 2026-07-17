@@ -2579,12 +2579,16 @@ impl FileOrchestrator {
 
     /// Merge deterministically-anchored pub/sub operations (carrick#387) into a
     /// file's extraction, adding only the ops the LLM pass missed. An anchor is
-    /// considered covered — and skipped — when the extraction already has an op
-    /// at the same line (the LLM extracted this site, possibly with different
-    /// topic text; its judgment wins) or with the same (topic, role) pair (the
-    /// operation is already on the right side of the topic). Backfilled ops are
-    /// payload-less by construction, so every judgment field is `None`: there is
-    /// no type to capture and no locator to emit — pure topic recall.
+    /// considered covered — and skipped — exactly when the extraction already
+    /// carries its contribution: an op with the same (topic, role) pair, at any
+    /// line (the matching join is topic-keyed; one op per side suffices). Line
+    /// numbers deliberately play no part in coverage: a line can carry several
+    /// pub/sub ops, and an extracted op that shares the anchor's line but not
+    /// its topic (e.g. a template the model kept verbatim) does not put the
+    /// resolved topic on the wire — the anchor still must (Copilot review on
+    /// #389). Backfilled ops are payload-less by construction, so every
+    /// judgment field is `None`: there is no type to capture and no locator to
+    /// emit — pure topic recall.
     fn merge_pubsub_anchor_ops(
         result: &mut FileAnalysisResult,
         anchor_ops: Vec<PubsubAnchorOp>,
@@ -2592,9 +2596,10 @@ impl FileOrchestrator {
         let mut added = 0;
         for anchor in anchor_ops {
             let line = i32::try_from(anchor.line_number).unwrap_or(i32::MAX);
-            let covered = result.pubsub_operations.iter().any(|op| {
-                op.line_number == line || (op.topic == anchor.topic && op.role == Some(anchor.role))
-            });
+            let covered = result
+                .pubsub_operations
+                .iter()
+                .any(|op| op.topic == anchor.topic && op.role == Some(anchor.role));
             if covered {
                 continue;
             }
@@ -6309,8 +6314,9 @@ const ESCALATE_MUTATION = gql`
 
     /// carrick#387: a deterministically-anchored payload-less pub/sub op the
     /// LLM extraction missed is backfilled with all judgment fields `None`;
-    /// anchors the extraction already covers (same line, or same topic+role)
-    /// are skipped so the LLM's judgment is never duplicated or overridden.
+    /// an anchor is covered — and skipped — exactly when the extraction
+    /// already carries its (topic, role) contribution. Line numbers play no
+    /// part in coverage: a line is not an operation identity.
     #[test]
     fn merge_pubsub_anchor_ops_backfills_only_missed_ops() {
         use crate::agents::file_analyzer_agent::PubsubOperation;
@@ -6330,23 +6336,24 @@ const ESCALATE_MUTATION = gql`
 
         let mut result = FileAnalysisResult {
             pubsub_operations: vec![
-                // Covers anchor (a) by exact line — even though the LLM's topic
-                // text differs (kept the template verbatim), its judgment wins.
-                llm_op("${name}:pollingStarted", 182),
-                // Covers anchor (b) by topic+role at a different line.
+                // Covers anchor (a): identical (topic, role) at the same site.
+                llm_op("PollController:pollingStarted", 182),
+                // Covers anchor (b) by (topic, role) at a different line — the
+                // topic is already on the publisher side, one op per side is
+                // all the matching join needs.
                 llm_op("PollController:stateChange", 90),
             ],
             ..Default::default()
         };
 
         let anchors = vec![
-            // (a) same line as an extracted op -> skipped.
+            // (a) same (topic, role) as an extracted op -> skipped.
             PubsubAnchorOp {
                 topic: "PollController:pollingStarted".to_string(),
                 role: PubsubRole::Publisher,
                 line_number: 182,
             },
-            // (b) same topic+role as an extracted op -> skipped.
+            // (b) same (topic, role) as an extracted op at another line -> skipped.
             PubsubAnchorOp {
                 topic: "PollController:stateChange".to_string(),
                 role: PubsubRole::Publisher,
@@ -6376,6 +6383,78 @@ const ESCALATE_MUTATION = gql`
         assert_eq!(backfilled.broker, None);
         assert_eq!(backfilled.payload_expression_text, None);
         assert_eq!(backfilled.payload_expression_line, None);
+    }
+
+    /// Copilot review on #389: an extracted op on the same LINE must not mask
+    /// a missing (topic, role) contribution — a line can carry several pub/sub
+    /// ops (`bus.publish('a'); bus.subscribe('b')` minified onto one line), and
+    /// the extraction may have produced only one of them, or one with a
+    /// different topic entirely (e.g. a template kept verbatim). Coverage is
+    /// keyed on (topic, role) alone.
+    #[test]
+    fn merge_pubsub_anchor_ops_same_line_does_not_mask_missing_ops() {
+        use crate::agents::file_analyzer_agent::PubsubOperation;
+        use crate::operation::PubsubRole;
+        use crate::swc_scanner::PubsubAnchorOp;
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![PubsubOperation {
+                topic: "jobs.retry".to_string(),
+                role: Some(PubsubRole::Publisher),
+                line_number: 7,
+                primary_type_symbol: None,
+                type_import_source: None,
+                broker: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+            }],
+            ..Default::default()
+        };
+
+        let anchors = vec![
+            // Publisher+subscriber share line 7; only the publisher was
+            // extracted -> the subscriber must backfill despite the shared line.
+            PubsubAnchorOp {
+                topic: "jobs.retry".to_string(),
+                role: PubsubRole::Publisher,
+                line_number: 7,
+            },
+            PubsubAnchorOp {
+                topic: "jobs.completed".to_string(),
+                role: PubsubRole::Subscriber,
+                line_number: 7,
+            },
+            // Same line, same role, DIFFERENT topic (the extraction kept a
+            // template verbatim, say) -> the resolved-topic anchor must
+            // backfill; the resolved literal is the joinable key.
+            PubsubAnchorOp {
+                topic: "jobs.failed".to_string(),
+                role: PubsubRole::Publisher,
+                line_number: 7,
+            },
+        ];
+
+        let added = FileOrchestrator::merge_pubsub_anchor_ops(&mut result, anchors);
+        assert_eq!(
+            added, 2,
+            "line-sharing must not mask the subscriber or the different-topic anchor"
+        );
+        assert!(
+            result
+                .pubsub_operations
+                .iter()
+                .any(|op| op.topic == "jobs.completed"
+                    && op.role == Some(PubsubRole::Subscriber)
+                    && op.line_number == 7),
+            "subscriber sharing the publisher's line must be backfilled"
+        );
+        assert!(
+            result
+                .pubsub_operations
+                .iter()
+                .any(|op| op.topic == "jobs.failed" && op.role == Some(PubsubRole::Publisher)),
+            "different-topic anchor on the same line must be backfilled"
+        );
     }
 
     /// Same topic on the OTHER side is not coverage: a publisher extraction
