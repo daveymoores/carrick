@@ -3232,9 +3232,19 @@ impl FileOrchestrator {
             .data_calls
             .iter()
             .map(|call| {
-                let is_self_call = !graph
+                // A zero-agreement routing match (#381) — this service's own
+                // catch-all fallback (`GET /*`) absorbing the call — is not
+                // evidence of a self-call: it would suppress every one of the
+                // service's real outgoing calls. Only a producer that shares
+                // literal path signal with the call counts.
+                let is_self_call = graph
                     .find_matching_endpoints(&call.canonical_path, &call.method)
-                    .is_empty();
+                    .iter()
+                    .any(|endpoint| {
+                        carrick_match::match_agreement(&endpoint.full_path, &call.canonical_path)
+                            .unwrap_or(0)
+                            > 0
+                    });
                 if is_self_call {
                     debug!(
                         "Suppressing self-call to own endpoint: {} {} ({})",

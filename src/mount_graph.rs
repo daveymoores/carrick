@@ -247,6 +247,14 @@ impl MountGraph {
     ///
     /// Returns `None` if the URL is identified as external (should be skipped).
     /// Returns `Some(vec)` with matching endpoints (may be empty if no match found).
+    ///
+    /// A call pairs with the MOST SPECIFIC producers available (#381): among
+    /// all routing matches, only the candidates with maximal literal
+    /// agreement are returned. A catch-all mount (`/api/**`, agreement 1)
+    /// therefore never shadows a concrete route (`/api/v1/chat/new`,
+    /// agreement 4) declared elsewhere in the org; it is returned only when
+    /// nothing more specific matches. The relative selection is
+    /// data-derived — no absolute specificity threshold.
     pub fn find_matching_endpoints_with_normalizer(
         &self,
         url: &str,
@@ -262,16 +270,24 @@ impl MountGraph {
             return None;
         }
 
-        let matching = self
+        let scored: Vec<(&ResolvedEndpoint, u32)> = self
             .endpoints
             .iter()
-            .filter(|endpoint| {
-                endpoint.method.eq_ignore_ascii_case(method)
-                    && self.paths_match(&endpoint.full_path, &normalized.path)
+            .filter(|endpoint| endpoint.method.eq_ignore_ascii_case(method))
+            .filter_map(|endpoint| {
+                carrick_match::match_agreement(&endpoint.full_path, &normalized.path)
+                    .map(|agreement| (endpoint, agreement))
             })
             .collect();
+        let best = scored.iter().map(|(_, a)| *a).max().unwrap_or(0);
 
-        Some(matching)
+        Some(
+            scored
+                .into_iter()
+                .filter(|(_, agreement)| *agreement == best)
+                .map(|(endpoint, _)| endpoint)
+                .collect(),
+        )
     }
 
     /// Exact-path lookup ignoring the HTTP method. Used after a
@@ -789,6 +805,53 @@ mod tests {
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    /// #381: the matcher pairs a call with the MOST specific producers only.
+    /// A catch-all mount is returned when nothing better matches, and never
+    /// alongside (or instead of) a concrete route for the same call.
+    #[test]
+    fn test_matching_returns_only_most_specific_producers() {
+        let mut graph = MountGraph::new();
+        for full_path in ["/api/**", "/api/v1/chat/new"] {
+            graph.endpoints.push(ResolvedEndpoint {
+                method: "GET".to_string(),
+                path: full_path.to_string(),
+                full_path: full_path.to_string(),
+                handler: None,
+                owner: "app".to_string(),
+                file_location: "server.ts:1".to_string(),
+                middleware_chain: vec![],
+                repo_name: None,
+                service_name: None,
+            });
+        }
+        let normalizer = UrlNormalizer::default_permissive();
+
+        // The concrete route out-ranks the catch-all for its own path.
+        let result = graph
+            .find_matching_endpoints_with_normalizer("/api/v1/chat/new", "GET", &normalizer)
+            .expect("internal path");
+        assert_eq!(
+            result
+                .iter()
+                .map(|e| e.full_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/api/v1/chat/new"],
+            "the catch-all must not pair when a more specific producer matches"
+        );
+
+        // With no better candidate, the catch-all is still the router truth.
+        let result = graph
+            .find_matching_endpoints_with_normalizer("/api/v2/other", "GET", &normalizer)
+            .expect("internal path");
+        assert_eq!(
+            result
+                .iter()
+                .map(|e| e.full_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/api/**"]
+        );
     }
 
     // The path-matching unit tests (optional segments, symmetric params, param
