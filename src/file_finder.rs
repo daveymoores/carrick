@@ -128,6 +128,12 @@ fn is_ignored(path: &Path, root_dir: &Path, ignore_patterns: &[&str]) -> bool {
 /// dev-dependency placement of the registering import or reachability from
 /// runtime entry points is follow-up work.
 pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
+    // A path outside the scan root has no segments below the root to
+    // classify; is_test_path's suffix check alone would still fire on it,
+    // contradicting the conservative guarantee above.
+    if path.strip_prefix(root_dir).is_err() {
+        return EndpointProvenance::Route;
+    }
     if has_dir_named(path, root_dir, MOCK_DIR_NAMES) || is_test_path(path, root_dir) {
         EndpointProvenance::Mock
     } else {
@@ -481,6 +487,16 @@ mod tests {
         // A FILE named after the convention is not a mock tree.
         assert_eq!(
             endpoint_provenance(Path::new("src/api/mocks.ts"), root),
+            EndpointProvenance::Route
+        );
+    }
+
+    #[test]
+    fn endpoint_provenance_outside_scan_root_stays_route() {
+        // A test-suffixed file OUTSIDE the scan root must not classify as
+        // Mock via the suffix check alone.
+        assert_eq!(
+            endpoint_provenance(Path::new("elsewhere/foo.spec.ts"), Path::new("service")),
             EndpointProvenance::Route
         );
     }
