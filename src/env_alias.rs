@@ -21,12 +21,37 @@
 //! direct-`process.env` handling in [`crate::url_normalizer`] and
 //! [`crate::analyzer`], rather than duplicating env-var parsing.
 //!
-//! Scope is deliberately tight: only bindings initialized *directly* from
-//! `process.env` (optionally with a `??`/`||` default) are tracked. Anything
-//! beyond the direct alias — reassignment, string concatenation building the
-//! base URL, cross-file/imported bases, deep data flow — is intentionally not
+//! A second, equally common real pattern (#218 cross-file scope) centralizes
+//! env reads in a config *object*, often in a separate module:
+//!
+//! ```ts
+//! // config.ts
+//! export const config = {
+//!   catalogUrl: process.env.CATALOG_URL ?? "http://localhost:4001",
+//! };
+//! // consumer.ts
+//! import { config } from "./config";
+//! const client = makeClient(config.catalogUrl);
+//! ```
+//!
+//! The call target then carries `${config.catalogUrl}` as its base. The alias
+//! map handles this with *dotted keys* (`config.catalogUrl -> CATALOG_URL`):
+//! [`EnvAliasExtractor`] records object-literal properties of local bindings,
+//! [`exported_env_aliases`] projects a module's aliases onto its export names,
+//! and [`merge_imported_env_aliases`] folds imported modules' exported aliases
+//! into the importing file's map under the local import names. The rewrite in
+//! [`resolve_target_env_alias`] needs no changes: the text between `${` and
+//! `}` is the lookup key whether or not it contains dots.
+//!
+//! Scope is deliberately structural and tight: only values that read
+//! `process.env` *directly* (optionally with a `??`/`||` default), either as a
+//! plain binding or one object-literal level deep, are tracked. Anything
+//! beyond — reassignment, string concatenation building the base URL, nested
+//! config objects (`config.api.url`), `Object.freeze(...)` wrappers, re-export
+//! chains (`export * from`), tsconfig path aliases — is intentionally not
 //! resolved. See the TODO in [`EnvAliasExtractor`].
 
+use crate::visitor::{ImportedSymbol, SymbolKind};
 use std::collections::HashMap;
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
@@ -36,13 +61,15 @@ use swc_ecma_visit::{Visit, VisitWith};
 pub type EnvAliasMap = HashMap<String, String>;
 
 /// Visitor that collects `const/let/var X = process.env.NAME [?? default]`
-/// bindings into an [`EnvAliasMap`].
+/// bindings — and object-literal config properties
+/// (`const config = { url: process.env.NAME }`, recorded under the dotted key
+/// `config.url`) — into an [`EnvAliasMap`].
 ///
-/// TODO(#218 follow-up): only direct `process.env` aliases are tracked. We do
-/// not follow reassignments, concatenated/templated bases
-/// (`const b = process.env.X + "/v1"`), or aliases imported from another
-/// module. Those need real data-flow / cross-file analysis and are out of
-/// scope for the deterministic direct-alias fix.
+/// TODO(#218 follow-up): only direct `process.env` reads (plain or one
+/// object-literal level deep) are tracked. We do not follow reassignments,
+/// concatenated/templated bases (`const b = process.env.X + "/v1"`), nested
+/// objects, or `Object.freeze(...)` wrappers. Those need real data-flow
+/// analysis and are out of scope for the deterministic structural fix.
 #[derive(Default)]
 pub struct EnvAliasExtractor {
     pub aliases: EnvAliasMap,
@@ -76,10 +103,217 @@ impl Visit for EnvAliasExtractor {
                 // nested scope would collide here, but that is vanishingly rare
                 // for a base-URL const and far better than not resolving at all.
                 self.aliases.insert(binding.id.sym.to_string(), env_name);
+            } else if let Expr::Object(obj) = unwrap_transparent(init) {
+                // Config-object pattern (#218 cross-file scope): record each
+                // env-reading property under the dotted key `binding.prop`, so
+                // a call target of `${config.catalogUrl}/...` resolves through
+                // the same map lookup as a plain alias.
+                for (prop, env_name) in object_env_props(obj, &self.aliases) {
+                    self.aliases
+                        .insert(format!("{}.{}", binding.id.sym, prop), env_name);
+                }
             }
         }
 
         var_decl.visit_children_with(self);
+    }
+}
+
+/// Collect `(property_name, env_var_name)` pairs from an object literal's
+/// key-value properties whose values read `process.env` directly — or reference
+/// an already-collected local alias (`{ catalogUrl: CATALOG_BASE }` /
+/// shorthand `{ catalogUrl }` where `const CATALOG_BASE = process.env.X`
+/// appeared earlier in the file). Spreads, methods, computed keys, and nested
+/// objects are skipped: they need data-flow analysis, not a structural read.
+fn object_env_props(obj: &ObjectLit, known_aliases: &EnvAliasMap) -> Vec<(String, String)> {
+    let mut props = Vec::new();
+    for prop in &obj.props {
+        let PropOrSpread::Prop(prop) = prop else {
+            continue;
+        };
+        match &**prop {
+            Prop::KeyValue(kv) => {
+                let name = match &kv.key {
+                    PropName::Ident(ident) => ident.sym.to_string(),
+                    PropName::Str(s) => s.value.to_string(),
+                    _ => continue,
+                };
+                let env_name = process_env_name(&kv.value).or_else(|| {
+                    // A property referencing a local alias binding.
+                    match unwrap_transparent(&kv.value) {
+                        Expr::Ident(ident) => known_aliases.get(ident.sym.as_ref()).cloned(),
+                        _ => None,
+                    }
+                });
+                if let Some(env_name) = env_name {
+                    props.push((name, env_name));
+                }
+            }
+            // `{ catalogUrl }` shorthand for a local alias binding.
+            Prop::Shorthand(ident) => {
+                if let Some(env_name) = known_aliases.get(ident.sym.as_ref()) {
+                    props.push((ident.sym.to_string(), env_name.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    props
+}
+
+/// Strip expression wrappers that do not change the runtime value:
+/// parentheses, `as` / `satisfies` / `as const` assertions, and non-null `!`.
+fn unwrap_transparent(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(e) => unwrap_transparent(&e.expr),
+        Expr::TsAs(e) => unwrap_transparent(&e.expr),
+        Expr::TsConstAssertion(e) => unwrap_transparent(&e.expr),
+        Expr::TsSatisfies(e) => unwrap_transparent(&e.expr),
+        Expr::TsNonNull(e) => unwrap_transparent(&e.expr),
+        _ => expr,
+    }
+}
+
+/// The env aliases a module makes visible to its importers, keyed by *export*
+/// name: `config.catalogUrl` for `export const config = { catalogUrl:
+/// process.env.CATALOG_URL }`, `CATALOG_BASE` for `export const CATALOG_BASE =
+/// process.env.CATALOG_URL`, and `default` / `default.prop` for the default
+/// export. `export { a as b }` renames are followed; re-exports
+/// (`export * from`, `export { x } from "./y"`) are not — they would need
+/// recursive module resolution (documented limitation).
+pub fn exported_env_aliases(module: &Module) -> EnvAliasMap {
+    let locals = EnvAliasExtractor::build(module);
+
+    // (exported name, local name) pairs for every export that could carry an
+    // env alias.
+    let mut exports: Vec<(String, String)> = Vec::new();
+    let mut out = EnvAliasMap::new();
+
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(decl) = item else {
+            continue;
+        };
+        match decl {
+            // `export const config = {...}` / `export const BASE = process.env.X`
+            ModuleDecl::ExportDecl(export_decl) => {
+                if let Decl::Var(var_decl) = &export_decl.decl {
+                    for d in &var_decl.decls {
+                        if let Pat::Ident(binding) = &d.name {
+                            let name = binding.id.sym.to_string();
+                            exports.push((name.clone(), name));
+                        }
+                    }
+                }
+            }
+            // `export { config }` / `export { config as settings }` — local
+            // bindings only; `export { x } from "./y"` re-exports carry no
+            // local binding to resolve.
+            ModuleDecl::ExportNamed(named) if named.src.is_none() => {
+                for spec in &named.specifiers {
+                    let ExportSpecifier::Named(named_spec) = spec else {
+                        continue;
+                    };
+                    let ModuleExportName::Ident(orig) = &named_spec.orig else {
+                        continue;
+                    };
+                    let exported = match &named_spec.exported {
+                        Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
+                        Some(ModuleExportName::Str(s)) => s.value.to_string(),
+                        None => orig.sym.to_string(),
+                    };
+                    exports.push((exported, orig.sym.to_string()));
+                }
+            }
+            // `export default config` / `export default {...}`
+            ModuleDecl::ExportDefaultExpr(default_expr) => {
+                match unwrap_transparent(&default_expr.expr) {
+                    Expr::Ident(ident) => {
+                        exports.push(("default".to_string(), ident.sym.to_string()));
+                    }
+                    Expr::Object(obj) => {
+                        for (prop, env_name) in object_env_props(obj, &locals) {
+                            out.insert(format!("default.{}", prop), env_name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (exported, local) in exports {
+        // Plain alias exported under this name.
+        if let Some(env_name) = locals.get(&local) {
+            out.insert(exported.clone(), env_name.clone());
+        }
+        // Config-object properties exported under this name.
+        let prefix = format!("{}.", local);
+        for (key, env_name) in &locals {
+            if let Some(suffix) = key.strip_prefix(&prefix) {
+                out.insert(format!("{}.{}", exported, suffix), env_name.clone());
+            }
+        }
+    }
+
+    out
+}
+
+/// Fold imported modules' exported env aliases into an importing file's alias
+/// map, keyed under the file's *local* import names so call-target lookups
+/// resolve directly:
+///
+/// - named import `import { config } from "./config"` (renames included) maps
+///   the source module's `config` / `config.prop` keys to the local name;
+/// - default import maps the source's `default` / `default.prop` keys;
+/// - namespace import `import * as cfg` maps every exported key under `cfg.`.
+///
+/// `resolve_module` maps an import specifier to that module's
+/// [`exported_env_aliases`] (or `None` when the specifier does not resolve to
+/// a parseable same-repo file). Locally-defined aliases always win: imports
+/// only fill vacant keys.
+pub fn merge_imported_env_aliases<F>(
+    aliases: &mut EnvAliasMap,
+    imported_symbols: &HashMap<String, ImportedSymbol>,
+    mut resolve_module: F,
+) where
+    F: FnMut(&str) -> Option<EnvAliasMap>,
+{
+    for (local_name, symbol) in imported_symbols {
+        let Some(exports) = resolve_module(&symbol.source) else {
+            continue;
+        };
+        if exports.is_empty() {
+            continue;
+        }
+        match symbol.kind {
+            SymbolKind::Named | SymbolKind::Default => {
+                let exported_name = match symbol.kind {
+                    SymbolKind::Default => "default",
+                    _ => symbol.imported_name.as_str(),
+                };
+                if let Some(env_name) = exports.get(exported_name) {
+                    aliases
+                        .entry(local_name.clone())
+                        .or_insert_with(|| env_name.clone());
+                }
+                let prefix = format!("{}.", exported_name);
+                for (key, env_name) in &exports {
+                    if let Some(suffix) = key.strip_prefix(&prefix) {
+                        aliases
+                            .entry(format!("{}.{}", local_name, suffix))
+                            .or_insert_with(|| env_name.clone());
+                    }
+                }
+            }
+            SymbolKind::Namespace => {
+                for (key, env_name) in &exports {
+                    aliases
+                        .entry(format!("{}.{}", local_name, key))
+                        .or_insert_with(|| env_name.clone());
+                }
+            }
+        }
     }
 }
 
@@ -90,8 +324,13 @@ impl Visit for EnvAliasExtractor {
 /// - `process.env.NAME`
 /// - `process.env["NAME"]`
 /// - `process.env.NAME ?? <default>` / `process.env.NAME || <default>`
+///
+/// Transparent wrappers (parens, `!`, `as`, `as const`, `satisfies`) are
+/// stripped via [`unwrap_transparent`] before matching, so every caller —
+/// direct-alias bindings AND config-object property values — recognizes a
+/// wrapped env read.
 fn process_env_name(expr: &Expr) -> Option<String> {
-    match expr {
+    match unwrap_transparent(expr) {
         Expr::Member(member) => process_env_member_name(member),
         // `process.env.NAME ?? "default"` / `... || "default"`: the env read is
         // the left operand. The default literal is discarded — the env-var name
@@ -99,11 +338,6 @@ fn process_env_name(expr: &Expr) -> Option<String> {
         Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
             process_env_name(&bin.left)
         }
-        // Unwrap transparent wrappers so `(process.env.X)`, `process.env.X!`,
-        // and `process.env.X as string` still resolve.
-        Expr::Paren(paren) => process_env_name(&paren.expr),
-        Expr::TsNonNull(non_null) => process_env_name(&non_null.expr),
-        Expr::TsAs(ts_as) => process_env_name(&ts_as.expr),
         _ => None,
     }
 }
@@ -259,6 +493,274 @@ const { Y_URL } = process.env;"#,
         // NOT map to a partial env name.
         assert!(!map.contains_key("BASE"));
         assert!(!map.contains_key("Y_URL"));
+    }
+
+    #[test]
+    fn extracts_config_object_properties_as_dotted_keys() {
+        // The corpus-3 ops-console shape: a central config object reads the
+        // env vars; call targets carry `${config.catalogUrl}` bases.
+        let map = build_map(
+            r#"const config = {
+  ordersApiUrl: process.env.ORDERS_API_URL ?? "http://localhost:4003",
+  catalogUrl: process.env.CATALOG_URL ?? "http://localhost:4001",
+  timeoutMs: 5000,
+};"#,
+        );
+        assert_eq!(
+            map.get("config.ordersApiUrl").map(String::as_str),
+            Some("ORDERS_API_URL")
+        );
+        assert_eq!(
+            map.get("config.catalogUrl").map(String::as_str),
+            Some("CATALOG_URL")
+        );
+        // Non-env properties never enter the map.
+        assert!(!map.contains_key("config.timeoutMs"));
+    }
+
+    #[test]
+    fn extracts_config_object_through_transparent_wrappers() {
+        let map = build_map(
+            r#"const config = {
+  base: process.env.BASE_URL,
+} as const;
+const cfg2 = ({ url: process.env.URL2 }) satisfies Record<string, string>;"#,
+        );
+        assert_eq!(map.get("config.base").map(String::as_str), Some("BASE_URL"));
+        assert_eq!(map.get("cfg2.url").map(String::as_str), Some("URL2"));
+    }
+
+    #[test]
+    fn config_object_property_values_unwrap_transparent_wrappers() {
+        // Copilot-flagged gap on #388: wrappers on a PROPERTY VALUE (not just
+        // on a direct-alias initializer) must also be stripped before the env
+        // read is recognized.
+        let map = build_map(
+            r#"const config = {
+  parens: (process.env.PARENS_URL),
+  nonNull: process.env.NON_NULL_URL!,
+  asString: process.env.AS_URL as string,
+  asConst: process.env.CONST_URL as const,
+  sat: process.env.SAT_URL satisfies string,
+  wrappedDefault: (process.env.DEF_URL ?? "http://localhost:1") as string,
+};"#,
+        );
+        assert_eq!(
+            map.get("config.parens").map(String::as_str),
+            Some("PARENS_URL")
+        );
+        assert_eq!(
+            map.get("config.nonNull").map(String::as_str),
+            Some("NON_NULL_URL")
+        );
+        assert_eq!(
+            map.get("config.asString").map(String::as_str),
+            Some("AS_URL")
+        );
+        assert_eq!(
+            map.get("config.asConst").map(String::as_str),
+            Some("CONST_URL")
+        );
+        assert_eq!(map.get("config.sat").map(String::as_str), Some("SAT_URL"));
+        assert_eq!(
+            map.get("config.wrappedDefault").map(String::as_str),
+            Some("DEF_URL")
+        );
+    }
+
+    #[test]
+    fn direct_alias_unwraps_const_assertion_and_satisfies() {
+        // The shared unwrap also closes the same gap on the direct-alias path.
+        let map = build_map(
+            r#"const A = process.env.A_URL as const;
+const B = process.env.B_URL satisfies string;"#,
+        );
+        assert_eq!(map.get("A").map(String::as_str), Some("A_URL"));
+        assert_eq!(map.get("B").map(String::as_str), Some("B_URL"));
+    }
+
+    #[test]
+    fn config_object_resolves_local_alias_references() {
+        // Properties referencing an earlier direct alias (long-hand and
+        // shorthand) resolve through the already-collected map.
+        let map = build_map(
+            r#"const CATALOG_BASE = process.env.CATALOG_URL ?? "http://localhost:4001";
+const catalogUrl = process.env.CATALOG_URL_ALT;
+const config = { base: CATALOG_BASE, catalogUrl };"#,
+        );
+        assert_eq!(
+            map.get("config.base").map(String::as_str),
+            Some("CATALOG_URL")
+        );
+        assert_eq!(
+            map.get("config.catalogUrl").map(String::as_str),
+            Some("CATALOG_URL_ALT")
+        );
+    }
+
+    #[test]
+    fn config_object_skips_nested_and_dynamic_shapes() {
+        // Nested objects, spreads, and computed keys need data flow — out of
+        // scope, must not produce partial/wrong keys.
+        let map = build_map(
+            r#"const other = { x: process.env.X_URL };
+const config = {
+  api: { url: process.env.API_URL },
+  ...other,
+  ["computed"]: process.env.COMPUTED_URL,
+};"#,
+        );
+        assert!(!map.keys().any(|k| k.starts_with("config.api")));
+        assert!(!map.contains_key("config.x"));
+        assert!(!map.contains_key("config.computed"));
+        // The helper object itself still resolves normally.
+        assert_eq!(map.get("other.x").map(String::as_str), Some("X_URL"));
+    }
+
+    fn build_exports(source: &str) -> EnvAliasMap {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+
+        exported_env_aliases(&module)
+    }
+
+    #[test]
+    fn exports_inline_export_const_object_and_plain_alias() {
+        let exports = build_exports(
+            r#"export const config = { catalogUrl: process.env.CATALOG_URL ?? "x" };
+export const CATALOG_BASE = process.env.CATALOG_URL;"#,
+        );
+        assert_eq!(
+            exports.get("config.catalogUrl").map(String::as_str),
+            Some("CATALOG_URL")
+        );
+        assert_eq!(
+            exports.get("CATALOG_BASE").map(String::as_str),
+            Some("CATALOG_URL")
+        );
+    }
+
+    #[test]
+    fn exports_follow_named_export_renames() {
+        let exports = build_exports(
+            r#"const config = { url: process.env.SVC_URL };
+export { config as settings };"#,
+        );
+        assert_eq!(
+            exports.get("settings.url").map(String::as_str),
+            Some("SVC_URL")
+        );
+        assert!(!exports.contains_key("config.url"));
+    }
+
+    #[test]
+    fn exports_default_object_and_default_identifier() {
+        let direct = build_exports(r#"export default { url: process.env.D_URL };"#);
+        assert_eq!(direct.get("default.url").map(String::as_str), Some("D_URL"));
+
+        let via_ident = build_exports(
+            r#"const config = { url: process.env.I_URL };
+export default config;"#,
+        );
+        assert_eq!(
+            via_ident.get("default.url").map(String::as_str),
+            Some("I_URL")
+        );
+    }
+
+    #[test]
+    fn exports_ignore_reexports_and_unexported_locals() {
+        let exports = build_exports(
+            r#"const hidden = { url: process.env.HIDDEN_URL };
+export { config } from "./elsewhere";
+export * from "./other";"#,
+        );
+        assert!(exports.is_empty());
+    }
+
+    #[test]
+    fn merge_maps_named_default_and_namespace_imports_to_local_names() {
+        use crate::visitor::{ImportedSymbol, SymbolKind};
+
+        let mut exports = EnvAliasMap::new();
+        exports.insert("config.catalogUrl".to_string(), "CATALOG_URL".to_string());
+        exports.insert("CATALOG_BASE".to_string(), "CATALOG_URL".to_string());
+        exports.insert("default.url".to_string(), "D_URL".to_string());
+
+        let symbol = |local: &str, imported: &str, kind: SymbolKind| ImportedSymbol {
+            local_name: local.to_string(),
+            imported_name: imported.to_string(),
+            source: "./config".to_string(),
+            kind,
+        };
+
+        let mut imported = HashMap::new();
+        // Renamed named import of the config object.
+        imported.insert(
+            "cfg".to_string(),
+            symbol("cfg", "config", SymbolKind::Named),
+        );
+        // Named import of a plain alias.
+        imported.insert(
+            "CATALOG_BASE".to_string(),
+            symbol("CATALOG_BASE", "CATALOG_BASE", SymbolKind::Named),
+        );
+        // Default import.
+        imported.insert(
+            "appConfig".to_string(),
+            symbol("appConfig", "appConfig", SymbolKind::Default),
+        );
+        // Namespace import.
+        imported.insert("ns".to_string(), symbol("ns", "ns", SymbolKind::Namespace));
+
+        let mut aliases = EnvAliasMap::new();
+        // A locally-defined alias must never be clobbered by an import.
+        aliases.insert("CATALOG_BASE".to_string(), "LOCAL_WINS".to_string());
+
+        merge_imported_env_aliases(&mut aliases, &imported, |spec| {
+            assert_eq!(spec, "./config");
+            Some(exports.clone())
+        });
+
+        assert_eq!(
+            aliases.get("cfg.catalogUrl").map(String::as_str),
+            Some("CATALOG_URL")
+        );
+        assert_eq!(
+            aliases.get("CATALOG_BASE").map(String::as_str),
+            Some("LOCAL_WINS")
+        );
+        assert_eq!(
+            aliases.get("appConfig.url").map(String::as_str),
+            Some("D_URL")
+        );
+        assert_eq!(
+            aliases.get("ns.config.catalogUrl").map(String::as_str),
+            Some("CATALOG_URL")
+        );
+        assert_eq!(
+            aliases.get("ns.CATALOG_BASE").map(String::as_str),
+            Some("CATALOG_URL")
+        );
+    }
+
+    #[test]
+    fn resolves_dotted_config_property_target() {
+        // The end shape #218's cross-file scope produces: dotted key lookup in
+        // the unchanged target rewrite.
+        let mut aliases = EnvAliasMap::new();
+        aliases.insert("config.catalogUrl".to_string(), "CATALOG_URL".to_string());
+
+        assert_eq!(
+            resolve_target_env_alias("${config.catalogUrl}/api/v2/products/${id}", &aliases)
+                .as_deref(),
+            Some("${process.env.CATALOG_URL}/api/v2/products/${id}")
+        );
     }
 
     #[test]
