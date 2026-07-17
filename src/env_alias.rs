@@ -324,8 +324,13 @@ pub fn merge_imported_env_aliases<F>(
 /// - `process.env.NAME`
 /// - `process.env["NAME"]`
 /// - `process.env.NAME ?? <default>` / `process.env.NAME || <default>`
+///
+/// Transparent wrappers (parens, `!`, `as`, `as const`, `satisfies`) are
+/// stripped via [`unwrap_transparent`] before matching, so every caller —
+/// direct-alias bindings AND config-object property values — recognizes a
+/// wrapped env read.
 fn process_env_name(expr: &Expr) -> Option<String> {
-    match expr {
+    match unwrap_transparent(expr) {
         Expr::Member(member) => process_env_member_name(member),
         // `process.env.NAME ?? "default"` / `... || "default"`: the env read is
         // the left operand. The default literal is discarded — the env-var name
@@ -333,11 +338,6 @@ fn process_env_name(expr: &Expr) -> Option<String> {
         Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
             process_env_name(&bin.left)
         }
-        // Unwrap transparent wrappers so `(process.env.X)`, `process.env.X!`,
-        // and `process.env.X as string` still resolve.
-        Expr::Paren(paren) => process_env_name(&paren.expr),
-        Expr::TsNonNull(non_null) => process_env_name(&non_null.expr),
-        Expr::TsAs(ts_as) => process_env_name(&ts_as.expr),
         _ => None,
     }
 }
@@ -528,6 +528,55 @@ const cfg2 = ({ url: process.env.URL2 }) satisfies Record<string, string>;"#,
         );
         assert_eq!(map.get("config.base").map(String::as_str), Some("BASE_URL"));
         assert_eq!(map.get("cfg2.url").map(String::as_str), Some("URL2"));
+    }
+
+    #[test]
+    fn config_object_property_values_unwrap_transparent_wrappers() {
+        // Copilot-flagged gap on #388: wrappers on a PROPERTY VALUE (not just
+        // on a direct-alias initializer) must also be stripped before the env
+        // read is recognized.
+        let map = build_map(
+            r#"const config = {
+  parens: (process.env.PARENS_URL),
+  nonNull: process.env.NON_NULL_URL!,
+  asString: process.env.AS_URL as string,
+  asConst: process.env.CONST_URL as const,
+  sat: process.env.SAT_URL satisfies string,
+  wrappedDefault: (process.env.DEF_URL ?? "http://localhost:1") as string,
+};"#,
+        );
+        assert_eq!(
+            map.get("config.parens").map(String::as_str),
+            Some("PARENS_URL")
+        );
+        assert_eq!(
+            map.get("config.nonNull").map(String::as_str),
+            Some("NON_NULL_URL")
+        );
+        assert_eq!(
+            map.get("config.asString").map(String::as_str),
+            Some("AS_URL")
+        );
+        assert_eq!(
+            map.get("config.asConst").map(String::as_str),
+            Some("CONST_URL")
+        );
+        assert_eq!(map.get("config.sat").map(String::as_str), Some("SAT_URL"));
+        assert_eq!(
+            map.get("config.wrappedDefault").map(String::as_str),
+            Some("DEF_URL")
+        );
+    }
+
+    #[test]
+    fn direct_alias_unwraps_const_assertion_and_satisfies() {
+        // The shared unwrap also closes the same gap on the direct-alias path.
+        let map = build_map(
+            r#"const A = process.env.A_URL as const;
+const B = process.env.B_URL satisfies string;"#,
+        );
+        assert_eq!(map.get("A").map(String::as_str), Some("A_URL"));
+        assert_eq!(map.get("B").map(String::as_str), Some("B_URL"));
     }
 
     #[test]
