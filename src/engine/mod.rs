@@ -6329,6 +6329,17 @@ mod tests {
                         payload_expression_text: Some("order".to_string()),
                         payload_expression_line: Some(30),
                     },
+                    // Envelope-copy guard: the locator text contains the op's
+                    // own topic literal (the model copied the whole enqueue
+                    // options object), so it must be dropped — an envelope's
+                    // type on the manifest is a false compat verdict waiting
+                    // to happen; Unknown is recoverable.
+                    locator_op(
+                        "records.reindex",
+                        PubsubRole::Publisher,
+                        41,
+                        "{ id, job: \"records.reindex\", payload: { resourceId } }",
+                    ),
                 ],
                 ..Default::default()
             },
@@ -6349,8 +6360,9 @@ mod tests {
         let orchestrator = FileOrchestrator::new(AgentService::new());
         let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
 
-        // Isolation guard: only the two locator-anchored itemArchived ops
-        // produce requests; the named-anchor op is excluded.
+        // Isolation + envelope guards: only the two locator-anchored
+        // itemArchived ops produce requests; the named-anchor op and the
+        // topic-containing envelope copy are both excluded.
         assert_eq!(requests.len(), 2, "requests: {requests:?}");
         assert!(
             !requests
@@ -6358,6 +6370,14 @@ mod tests {
                 .any(|r| r.param_name.as_deref() == Some("order")
                     || r.expression_text.as_deref() == Some("order")),
             "an op with a primary_type_symbol must not also get an infer request"
+        );
+        assert!(
+            !requests.iter().any(|r| r
+                .expression_text
+                .as_deref()
+                .is_some_and(|t| t.contains("records.reindex"))),
+            "a locator containing the op's topic literal is an envelope copy \
+             and must be dropped, not resolved"
         );
 
         // Subscriber (producer side): FunctionParam, param_name = locator text,

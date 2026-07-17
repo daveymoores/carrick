@@ -1733,6 +1733,25 @@ impl FileOrchestrator {
                 let Some(text) = op.payload_expression_text.as_ref() else {
                     continue;
                 };
+                // Envelope guard (measured 10/20 on the wrapper-dispatch harness
+                // fixture): the model sometimes copies the whole options/envelope
+                // object or call instead of the payload value. When the locator
+                // text contains the op's own extracted topic literal, it
+                // demonstrably includes the ROUTING key — that text is the
+                // envelope or the call, never the decoded payload. Resolving it
+                // would put the envelope's type on the manifest and feed false
+                // compat verdicts; dropping it keeps the op Unknown, which is
+                // recoverable. Structural on purpose: keyed on this op's topic
+                // string alone, no property-name or library conventions.
+                if text.contains(op.topic.as_str()) {
+                    debug!(
+                        topic = %op.topic,
+                        file = %path,
+                        "pub/sub payload locator contains the topic literal; \
+                         treating as envelope copy and leaving the op unanchored"
+                    );
+                    continue;
+                }
                 let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
                 let key = OperationKey::pubsub(op.topic.clone());
                 let alias = match role {

@@ -574,6 +574,40 @@ impl FileAnalyzerAgent {
             }
         }
 
+        /// Strip balanced ENCLOSING parenthesis pairs from a locator string:
+        /// `(decision)` → `decision`, `(({ payload }))` → `{ payload }`.
+        /// Only strips when the leading `(` matches the trailing `)` around the
+        /// WHOLE string — `(a).b(c)` is untouched (its first paren closes
+        /// mid-string). Pure syntax normalization for the model's habit of
+        /// copying an arrow-function parameter with its parameter-list parens.
+        fn strip_enclosing_parens(text: &str) -> &str {
+            let mut current = text.trim();
+            loop {
+                let inner = current
+                    .strip_prefix('(')
+                    .and_then(|rest| rest.strip_suffix(')'));
+                let Some(inner) = inner else {
+                    return current;
+                };
+                // The stripped pair must enclose the whole string: scan the
+                // candidate inner text and reject if depth ever goes negative
+                // (that means the leading paren closed before the end).
+                let mut depth = 0i32;
+                let balanced = inner.chars().all(|ch| {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    depth >= 0
+                }) && depth == 0;
+                if !balanced {
+                    return current;
+                }
+                current = inner.trim();
+            }
+        }
+
         fn is_suspicious_import_source(value: &str) -> bool {
             if value.contains("primary_type_symbol") || value.contains("type_import_source") {
                 return true;
@@ -712,6 +746,21 @@ impl FileAnalyzerAgent {
             // a locator without a positive 1-based line can't anchor the
             // sidecar's text search. Keep the pair consistent (text ⇔ line).
             normalize_optional_string(&mut op.payload_expression_text);
+            // The model frequently copies a subscriber handler's payload
+            // parameter WITH its arrow-parameter-list parens (`(decision)`,
+            // `({ time, run })`) — measured 12/20 on the wrapper-relay harness
+            // fixture. Enclosing parens are pure syntax, never part of the
+            // binding or expression the sidecar must locate, so strip balanced
+            // outer pairs deterministically here rather than fighting the
+            // model's copy granularity in the schema description.
+            if let Some(text) = op.payload_expression_text.take() {
+                let stripped = strip_enclosing_parens(&text);
+                op.payload_expression_text = if stripped.is_empty() {
+                    None
+                } else {
+                    Some(stripped.to_string())
+                };
+            }
             if op
                 .payload_expression_line
                 .is_some_and(|line| line <= 0)
@@ -1471,6 +1520,61 @@ mod tests {
         assert_eq!(data_call.method, Some("POST".to_string()));
         assert!(data_call.primary_type_symbol.is_none());
         assert!(data_call.type_import_source.is_none());
+    }
+
+    #[test]
+    fn sanitize_normalizes_pubsub_payload_locators() {
+        let op = |text: Option<&str>, line: Option<i32>| PubsubOperation {
+            topic: "itemArchived".to_string(),
+            role: Some(crate::operation::PubsubRole::Subscriber),
+            line_number: 13,
+            primary_type_symbol: None,
+            type_import_source: None,
+            broker: None,
+            payload_expression_text: text.map(String::from),
+            payload_expression_line: line,
+        };
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![
+                // Arrow-param-list parens stripped (the measured 12/20 shape).
+                op(Some("(decision)"), Some(36)),
+                op(Some("({ time, item })"), Some(13)),
+                // Non-enclosing parens untouched.
+                op(Some("(a).b(c)"), Some(1)),
+                // Null-like text nulls the pair; line-only never survives alone.
+                op(Some("null"), Some(5)),
+                op(None, Some(7)),
+                // Non-positive line dropped, text kept.
+                op(Some("payload"), Some(0)),
+            ],
+            ..Default::default()
+        };
+        FileAnalyzerAgent::sanitize_result(&mut result);
+        let texts: Vec<Option<&str>> = result
+            .pubsub_operations
+            .iter()
+            .map(|o| o.payload_expression_text.as_deref())
+            .collect();
+        let lines: Vec<Option<i32>> = result
+            .pubsub_operations
+            .iter()
+            .map(|o| o.payload_expression_line)
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                Some("decision"),
+                Some("{ time, item }"),
+                Some("(a).b(c)"),
+                None,
+                None,
+                Some("payload"),
+            ]
+        );
+        assert_eq!(
+            lines,
+            vec![Some(36), Some(13), Some(1), None, None, None]
+        );
     }
 
     #[test]
