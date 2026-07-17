@@ -3173,7 +3173,11 @@ fn recreate_type_files_and_check(
     write_manifest_files(all_repo_data, output_dir)?;
 
     // Recreate package.json and tsconfig.json after writing type files
-    recreate_package_and_tsconfig(output_dir, packages)?;
+    recreate_package_and_tsconfig(
+        output_dir,
+        packages,
+        &corpus_internal_package_names(all_repo_data),
+    )?;
 
     Ok(())
 }
@@ -3325,10 +3329,19 @@ fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
 /// link, not the registry, so `npm install` 404s and (per the #149 fail-loud)
 /// would abort type checking. Nothing is lost by dropping it: the bundle
 /// carries its shapes structurally inlined.
+///
+/// `corpus_internal` extends (b) across the whole scanned corpus: a repo that
+/// depends on a package which IS another repo/service in the corpus (an org
+/// depending on its own, possibly unpublished, workspace package) gets that
+/// dependency excluded too — its types arrive via that service's sidecar
+/// `.d.ts` bundle, and the registry copy ETARGETs when the version was never
+/// published (#390).
 fn synthetic_type_check_dependencies(
     packages: &Packages,
+    corpus_internal: &std::collections::HashSet<String>,
 ) -> std::collections::HashMap<String, String> {
-    let internal = packages.internal_package_names();
+    let mut internal = packages.internal_package_names();
+    internal.extend(corpus_internal.iter().cloned());
     // Version specs npm cannot (or must not) resolve from the registry. These
     // are package-manager resolution protocols (yarn/pnpm/npm define them, not
     // the scanned frameworks): a digit-containing spec like
@@ -3431,14 +3444,235 @@ fn synthetic_type_check_dependencies(
     dependencies
 }
 
+/// Package names declared by ANY package.json of ANY repo/service in the
+/// scanned corpus (each service's `Packages` carries its own tree-walked
+/// `internal_names`; older cloud payloads without the structured `packages`
+/// field fall back to the serialized `package_json`). A dependency on one of
+/// these is a link to a sibling service in the corpus, not an installable
+/// third-party package — its types arrive via that service's sidecar `.d.ts`
+/// bundle, so the npm copy is redundant, and (an org's own unpublished
+/// workspace package) often ETARGETs, which used to abort the whole type pass.
+fn corpus_internal_package_names(
+    all_repo_data: &[CloudRepoData],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for repo_data in all_repo_data {
+        if let Some(packages) = &repo_data.packages {
+            names.extend(packages.internal_package_names());
+        } else if let Some(json) = &repo_data.package_json
+            && let Ok(packages) = serde_json::from_str::<Packages>(json)
+        {
+            names.extend(packages.internal_package_names());
+        }
+    }
+    names
+}
+
+/// Package names npm's OWN resolution-failure output blames for an install
+/// failure. Two message shapes, stable across npm major versions (only the
+/// `npm ERR!` vs `npm error` line prefix differs, which this deliberately
+/// keys past):
+///
+///   ETARGET: `notarget No matching version found for <name>@<spec>.`
+///   E404:    `404  '<name>@<spec>' is not in this registry.`
+///
+/// The `<name>@<spec>` split is at the LAST `@` at index > 0 so scoped names
+/// keep their leading `@`. No name heuristics beyond what npm itself states:
+/// any other failure class (ERESOLVE, network, EUSAGE, …) parses to empty,
+/// so the caller keeps the hard-fail path — dropping packages cannot fix
+/// those.
+fn npm_unresolvable_packages(stderr: &str) -> Vec<String> {
+    let etarget =
+        regex::Regex::new(r"No matching version found for\s+(\S+)").expect("static regex");
+    let e404 = regex::Regex::new(r"'([^']+)'\s+is not in this registry").expect("static regex");
+    let mut names: Vec<String> = Vec::new();
+    for caps in etarget
+        .captures_iter(stderr)
+        .chain(e404.captures_iter(stderr))
+    {
+        let spec = caps[1].trim_end_matches(['.', ',']);
+        let name = match spec.rfind('@') {
+            Some(pos) if pos > 0 => &spec[..pos],
+            _ => spec,
+        };
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Manifest keys to drop for the packages npm blamed: a key matches when it
+/// IS the blamed name, or when its value is an `npm:` alias whose target is
+/// the blamed name (npm's resolution errors report the alias TARGET, not the
+/// manifest key it hangs off). A blamed name matching neither is a transitive
+/// dependency this manifest cannot drop. Sorted for deterministic drop
+/// order and logs.
+fn unresolvable_manifest_keys(
+    dependencies: &std::collections::HashMap<String, String>,
+    blamed: &[String],
+) -> Vec<String> {
+    let mut keys: Vec<String> = dependencies
+        .iter()
+        .filter(|(key, value)| {
+            blamed.iter().any(|name| {
+                key.as_str() == name
+                    || value.strip_prefix("npm:").is_some_and(|target| {
+                        let target_name = match target.rfind('@') {
+                            Some(pos) if pos > 0 => &target[..pos],
+                            _ => target,
+                        };
+                        target_name == name
+                    })
+            })
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Write the synthetic `carrick-type-check` package.json. Called once at
+/// assembly and again after each retry-drop so the manifest on disk always
+/// matches the dependency map npm is asked to install.
+fn write_type_check_package_json(
+    output_dir: &std::path::Path,
+    dependencies: &std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let package_json_content = serde_json::json!({
+        "name": "carrick-type-check",
+        "version": "1.0.0",
+        "dependencies": dependencies
+    });
+    std::fs::write(
+        output_dir.join("package.json"),
+        serde_json::to_string_pretty(&package_json_content)?,
+    )?;
+    Ok(())
+}
+
+/// Last ~2000 chars of npm stderr, for error messages.
+fn stderr_tail(stderr: &str) -> &str {
+    let tail_start = stderr
+        .char_indices()
+        .rev()
+        .nth(1999)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    &stderr[tail_start..]
+}
+
+/// Retry-drop rounds allowed when npm's resolution errors name specific
+/// packages. Each round drops only what npm itself blamed and reinstalls.
+const MAX_INSTALL_DROP_ROUNDS: usize = 3;
+
+/// `npm install` for the synthetic type-check package, degrading gracefully
+/// on per-package resolution failures instead of all-or-nothing (#390):
+///
+/// - On ETARGET/E404 the offending package(s) — exactly the ones npm's own
+///   error output names, no heuristics — are dropped from the manifest and
+///   the install retried, at most [`MAX_INSTALL_DROP_ROUNDS`] times, each
+///   drop logged loudly. Types that then dangle resolve to `any`/`unknown`
+///   in ts_check and are reported as unverifiable (the existing abstain
+///   semantics), NOT compatible.
+/// - Every other failure class, and exhausted retries, keep the #149
+///   fail-loud hard error — with the drop history in the message — because a
+///   swallowed install failure used to let the run print "✓ Cross-repo
+///   analysis complete" while type checking silently degraded.
+fn install_type_check_dependencies(
+    output_dir: &std::path::Path,
+    dependencies: &mut std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    let mut rounds_left = MAX_INSTALL_DROP_ROUNDS;
+    let mut dropped: Vec<String> = Vec::new();
+    loop {
+        debug!("Installing dependencies...");
+
+        // `--legacy-peer-deps` so a transitive peer-range disagreement (e.g.
+        // ts-node's `typescript@>=2.7` vs a repo's pinned major) can't abort
+        // the install. This package only feeds ts-morph type extraction, so a
+        // looser peer graph is harmless.
+        //
+        // `--ignore-scripts` because only the installed packages' .d.ts files
+        // are consumed — lifecycle scripts add nothing here, execute untrusted
+        // code from the scanned repos' dependency trees on the scanning
+        // machine, and security-guard packages (e.g. LavaMoat's
+        // @lavamoat/preinstall-always-fail, shipped by MetaMask repos)
+        // DELIBERATELY fail any install that runs scripts.
+        let install_output = Command::new("npm")
+            .arg("install")
+            .arg("--legacy-peer-deps")
+            .arg("--ignore-scripts")
+            .current_dir(output_dir)
+            .output()
+            .map_err(|e| format!("Failed to run npm install: {}", e))?;
+
+        if install_output.status.success() {
+            if dropped.is_empty() {
+                debug!("Dependencies installed successfully");
+            } else {
+                warn!(
+                    "Cross-repo type-check install succeeded after dropping unresolvable \
+                     dependencies: {}. Types resolving through them will be reported as \
+                     unverifiable, not compatible.",
+                    dropped.join(", ")
+                );
+            }
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&install_output.stderr).into_owned();
+
+        if rounds_left > 0 {
+            let blamed = npm_unresolvable_packages(&stderr);
+            let drop_keys = unresolvable_manifest_keys(dependencies, &blamed);
+            if !drop_keys.is_empty() {
+                for key in &drop_keys {
+                    warn!(
+                        "npm cannot resolve dependency {key} (ETARGET/E404) — dropping it \
+                         from the cross-repo type-check package and retrying. Its types will \
+                         be reported as unverifiable, not compatible."
+                    );
+                    dependencies.remove(key);
+                    dropped.push(key.clone());
+                }
+                write_type_check_package_json(output_dir, dependencies)?;
+                // A lockfile written during the failed attempt could still pin
+                // the dropped names.
+                let _ = std::fs::remove_file(output_dir.join("package-lock.json"));
+                rounds_left -= 1;
+                continue;
+            }
+        }
+
+        let drop_history = if dropped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Dropped unresolvable dependencies before failing: {}.",
+                dropped.join(", ")
+            )
+        };
+        return Err(format!(
+            "npm install failed for the cross-repo type-check package — type checking \
+             cannot run. Set CARRICK_SKIP_NPM_INSTALL=1 to bypass (type checking will \
+             be skipped).{drop_history} npm stderr (tail):\n{}",
+            stderr_tail(&stderr)
+        )
+        .into());
+    }
+}
+
 /// Recreate package.json and tsconfig.json in the output directory
 fn recreate_package_and_tsconfig(
     output_dir: &std::path::Path,
     packages: &Packages,
+    corpus_internal: &std::collections::HashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create package.json
     let package_json_path = output_dir.join("package.json");
-    let mut dependencies = synthetic_type_check_dependencies(packages);
+    let mut dependencies = synthetic_type_check_dependencies(packages, corpus_internal);
 
     // Pin the TypeScript toolchain we control for this synthetic type-check
     // package. Overwrite (not insert-if-missing): a merged repo may pin a
@@ -3448,16 +3682,7 @@ fn recreate_package_and_tsconfig(
     dependencies.insert("typescript".to_string(), "5.8.3".to_string());
     dependencies.insert("ts-node".to_string(), "10.9.2".to_string());
 
-    let package_json_content = serde_json::json!({
-        "name": "carrick-type-check",
-        "version": "1.0.0",
-        "dependencies": dependencies
-    });
-
-    std::fs::write(
-        &package_json_path,
-        serde_json::to_string_pretty(&package_json_content)?,
-    )?;
+    write_type_check_package_json(output_dir, &dependencies)?;
     debug!("Recreated package.json at {}", package_json_path.display());
 
     let skip_npm_install = std::env::var("CARRICK_SKIP_NPM_INSTALL").is_ok()
@@ -3480,50 +3705,7 @@ fn recreate_package_and_tsconfig(
             std::fs::remove_file(&package_lock_path).ok();
         }
 
-        // Install dependencies
-        use std::process::Command;
-        debug!("Installing dependencies...");
-
-        // `--legacy-peer-deps` so a transitive peer-range disagreement (e.g.
-        // ts-node's `typescript@>=2.7` vs a repo's pinned major) can't abort
-        // the install. This package only feeds ts-morph type extraction, so a
-        // looser peer graph is harmless.
-        //
-        // `--ignore-scripts` because only the installed packages' .d.ts files
-        // are consumed — lifecycle scripts add nothing here, execute untrusted
-        // code from the scanned repos' dependency trees on the scanning
-        // machine, and security-guard packages (e.g. LavaMoat's
-        // @lavamoat/preinstall-always-fail, shipped by MetaMask repos)
-        // DELIBERATELY fail any install that runs scripts.
-        let install_output = Command::new("npm")
-            .arg("install")
-            .arg("--legacy-peer-deps")
-            .arg("--ignore-scripts")
-            .current_dir(output_dir)
-            .output()
-            .map_err(|e| format!("Failed to run npm install: {}", e))?;
-
-        if !install_output.status.success() {
-            // Fail loudly (#149): a swallowed install failure used to let the
-            // run print "✓ Cross-repo analysis complete" while type checking
-            // silently degraded — masking, e.g., an ERESOLVE conflict.
-            let stderr = String::from_utf8_lossy(&install_output.stderr);
-            let tail_start = stderr
-                .char_indices()
-                .rev()
-                .nth(1999)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            let excerpt = &stderr[tail_start..];
-            return Err(format!(
-                "npm install failed for the cross-repo type-check package — type checking \
-                 cannot run. Set CARRICK_SKIP_NPM_INSTALL=1 to bypass (type checking will \
-                 be skipped). npm stderr (tail):\n{}",
-                excerpt
-            )
-            .into());
-        }
-        debug!("Dependencies installed successfully");
+        install_type_check_dependencies(output_dir, &mut dependencies)?;
     }
 
     // Create tsconfig.json with dynamic path mappings based on actual type files
@@ -3675,7 +3857,7 @@ mod tests {
             .push(PathBuf::from("packages/catalog-api/package.json"));
         packages.resolve_dependencies();
 
-        let deps = synthetic_type_check_dependencies(&packages);
+        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
         assert!(
             !deps.contains_key("@meridian/contracts"),
             "workspace-internal package must not be npm-installed"
@@ -3728,7 +3910,7 @@ mod tests {
         packages.source_paths.push(PathBuf::from("package.json"));
         packages.resolve_dependencies();
 
-        let deps = synthetic_type_check_dependencies(&packages);
+        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
         for dropped in [
             "@metamask/controller-utils",
             "shared-lib",
@@ -3797,7 +3979,7 @@ mod tests {
         packages.source_paths.push(PathBuf::from("package.json"));
         packages.resolve_dependencies();
 
-        let deps = synthetic_type_check_dependencies(&packages);
+        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
         assert_eq!(
             deps.get("@types/readable-stream-2").map(String::as_str),
             Some("npm:@types/readable-stream@^2.3.15"),
@@ -3848,12 +4030,216 @@ mod tests {
             .internal_names
             .insert("@meridian/contracts".to_string());
 
-        let deps = synthetic_type_check_dependencies(&packages);
+        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
         assert!(
             !deps.contains_key("@meridian/contracts"),
             "tree-walked internal name must not be npm-installed"
         );
         assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
+    }
+
+    /// Test-local CloudRepoData with only the package-related fields set.
+    fn repo_data_with_packages(
+        repo_name: &str,
+        packages: Option<crate::packages::Packages>,
+        package_json: Option<String>,
+    ) -> CloudRepoData {
+        CloudRepoData {
+            repo_name: repo_name.to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: std::collections::HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: std::collections::HashMap::new(),
+            config_json: None,
+            package_json,
+            packages,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "deadbeef".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+            compat_verdicts: None,
+        }
+    }
+
+    #[test]
+    fn synthetic_type_check_deps_exclude_corpus_repo_packages() {
+        // repo-a depends on @acme/shared-contracts at a version that was never
+        // published to the registry — the package IS another repo/service in
+        // the same scanned corpus. Its types arrive via that service's sidecar
+        // .d.ts bundle, so the npm copy is redundant AND unresolvable (the
+        // ETARGET used to abort the whole type pass, #390). The assembly must
+        // exclude any name declared by any package.json in the corpus, not
+        // just the current repo's own.
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        let mut packages = Packages::default();
+        packages.package_jsons.push(PackageJson {
+            name: Some("repo-a-api".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::from([
+                ("@acme/shared-contracts".to_string(), "0.4.2".to_string()),
+                ("koa".to_string(), "2.15.3".to_string()),
+            ]),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
+        });
+        packages.source_paths.push(PathBuf::from("package.json"));
+        packages.resolve_dependencies();
+
+        let corpus_internal =
+            std::collections::HashSet::from(["@acme/shared-contracts".to_string()]);
+        let deps = synthetic_type_check_dependencies(&packages, &corpus_internal);
+        assert!(
+            !deps.contains_key("@acme/shared-contracts"),
+            "a package that is itself a repo/service in the scanned corpus must not be \
+             npm-installed"
+        );
+        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
+    }
+
+    #[test]
+    fn corpus_internal_names_union_all_repos_with_serialized_fallback() {
+        use crate::packages::{PackageJson, Packages};
+        use std::collections::HashMap;
+
+        // Repo A: structured `packages` with a declared name + tree-walked
+        // workspace member.
+        let mut packages_a = Packages::default();
+        packages_a.package_jsons.push(PackageJson {
+            name: Some("@acme/shared-contracts".to_string()),
+            version: Some("0.4.2".to_string()),
+            dependencies: HashMap::new(),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
+        });
+        packages_a
+            .internal_names
+            .insert("@acme/shared-tooling".to_string());
+
+        // Repo B: pre-`packages`-field payload — only the serialized
+        // `package_json` string is available.
+        let mut packages_b = Packages::default();
+        packages_b.package_jsons.push(PackageJson {
+            name: Some("repo-b-api".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: HashMap::new(),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+            resolutions: HashMap::new(),
+        });
+        let serialized_b = serde_json::to_string(&packages_b).unwrap();
+
+        let all_repo_data = vec![
+            repo_data_with_packages("acme/repo-a", Some(packages_a), None),
+            repo_data_with_packages("acme/repo-b", None, Some(serialized_b)),
+        ];
+
+        let names = corpus_internal_package_names(&all_repo_data);
+        assert!(names.contains("@acme/shared-contracts"));
+        assert!(names.contains("@acme/shared-tooling"));
+        assert!(
+            names.contains("repo-b-api"),
+            "serialized fallback must count"
+        );
+    }
+
+    #[test]
+    fn npm_unresolvable_packages_parses_etarget_stderr() {
+        // Synthetic stderr in npm 10's format (generic package names).
+        let stderr = "\
+npm error code ETARGET
+npm error notarget No matching version found for @acme/shared-contracts@0.4.2.
+npm error notarget In most cases you or one of your dependencies are requesting
+npm error notarget a package version that doesn't exist.
+npm error A complete log of this run can be found in: /home/user/.npm/_logs/debug-0.log
+";
+        assert_eq!(
+            npm_unresolvable_packages(stderr),
+            vec!["@acme/shared-contracts".to_string()]
+        );
+    }
+
+    #[test]
+    fn npm_unresolvable_packages_parses_unscoped_and_legacy_prefix() {
+        // npm 8/9 prefix lines with `npm ERR!` instead of `npm error`; the
+        // parser keys on the message text, not the prefix. Also dedupes.
+        let stderr = "\
+npm ERR! code ETARGET
+npm ERR! notarget No matching version found for left-pad-utils@9.9.9.
+npm ERR! notarget No matching version found for left-pad-utils@9.9.9.
+";
+        assert_eq!(
+            npm_unresolvable_packages(stderr),
+            vec!["left-pad-utils".to_string()]
+        );
+    }
+
+    #[test]
+    fn npm_unresolvable_packages_parses_e404_stderr() {
+        let stderr = "\
+npm error code E404
+npm error 404 Not Found - GET https://registry.npmjs.org/@acme%2fghost-pkg - Not found
+npm error 404
+npm error 404  '@acme/ghost-pkg@^1.0.0' is not in this registry.
+npm error 404
+npm error 404 Note that you can also install from a
+npm error 404 tarball, folder, http url, or git url.
+";
+        assert_eq!(
+            npm_unresolvable_packages(stderr),
+            vec!["@acme/ghost-pkg".to_string()]
+        );
+    }
+
+    #[test]
+    fn npm_unresolvable_packages_ignores_other_failure_classes() {
+        // An ERESOLVE conflict names packages too, but is NOT a resolution
+        // 404/ETARGET — dropping deps can't fix it, so it must stay a hard
+        // error (empty parse → no retry).
+        let stderr = "\
+npm error code ERESOLVE
+npm error ERESOLVE unable to resolve dependency tree
+npm error Found: typescript@5.8.3
+npm error Could not resolve dependency:
+npm error peer typescript@\">=4.2\" from ts-node@10.9.2
+";
+        assert!(npm_unresolvable_packages(stderr).is_empty());
+    }
+
+    #[test]
+    fn unresolvable_manifest_keys_match_direct_and_alias_targets() {
+        use std::collections::HashMap;
+
+        let deps = HashMap::from([
+            ("@acme/ghost-pkg".to_string(), "1.0.0".to_string()),
+            ("aliased".to_string(), "npm:ghost-target@2.0.0".to_string()),
+            ("koa".to_string(), "2.15.3".to_string()),
+        ]);
+        let blamed = vec![
+            "@acme/ghost-pkg".to_string(),
+            // npm blames the alias TARGET, not the manifest key.
+            "ghost-target".to_string(),
+            // Transitive dependency (not a manifest key): nothing to drop.
+            "not-in-manifest".to_string(),
+        ];
+        assert_eq!(
+            unresolvable_manifest_keys(&deps, &blamed),
+            vec!["@acme/ghost-pkg".to_string(), "aliased".to_string()]
+        );
     }
 
     #[test]
