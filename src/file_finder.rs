@@ -76,7 +76,12 @@ fn is_test_path(path: &Path, root_dir: &Path) -> bool {
 /// (e.g. a service directory `packages/build`) still gets scanned — only its
 /// descendants can trigger the ignore.
 fn is_ignored(path: &Path, root_dir: &Path, ignore_patterns: &[&str]) -> bool {
-    let relative_path = path.strip_prefix(root_dir).unwrap_or(path);
+    // A path outside the scan root has no segments "below the root" to test;
+    // matching against the full (possibly absolute) path would let ignore
+    // patterns hit unrelated leading segments.
+    let Ok(relative_path) = path.strip_prefix(root_dir) else {
+        return false;
+    };
     relative_path.components().any(|component| {
         component
             .as_os_str()
