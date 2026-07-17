@@ -5,6 +5,7 @@
 //! source of truth: the cloud renders the PR comment/check run from this
 //! JSON and never re-parses prose.
 
+use crate::operation::EndpointProvenance;
 use serde::{Serialize, Serializer, ser::SerializeMap};
 
 /// Wire cap on `call_sites` entries per finding. Applied when serializing
@@ -79,6 +80,11 @@ pub enum Finding {
         consumer_type: String,
         /// Compiler error, pre-truncated to [`MAX_DETAIL_CHARS`] chars.
         detail: String,
+        /// Whether the producer shape comes from a real route or a mock/test
+        /// handler (#380) — a mismatch against a mock is often still real
+        /// (mocks frequently encode the canonical contract) but should be
+        /// presented with that caveat.
+        producer_provenance: EndpointProvenance,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -101,6 +107,10 @@ pub enum Finding {
         method: String,
         path: String,
         service: Option<String>,
+        /// Whether this producer is a real route or a mock/test handler
+        /// (#380). Orphaned mocks are expected (most mock handlers have no
+        /// scanned consumer), so surfaces can de-noise on this.
+        provenance: EndpointProvenance,
     },
     /// A call whose URL is built from an env var not classified in
     /// carrick.json (`internalEnvVars` / `externalEnvVars`).
@@ -138,6 +148,7 @@ impl Finding {
             producer_type: producer_type.into(),
             consumer_type: consumer_type.into(),
             detail: truncate_chars(detail, MAX_DETAIL_CHARS),
+            producer_provenance: EndpointProvenance::default(),
         }
     }
 
@@ -180,7 +191,25 @@ impl Finding {
             method: method.into(),
             path: path.into(),
             service,
+            provenance: EndpointProvenance::default(),
         }
+    }
+
+    /// Attach producer-side provenance (real route vs mock/test handler) to a
+    /// finding that has a producer side. Constructors default to `Route`, so
+    /// existing call sites stay unchanged; the matchers chain this where the
+    /// producer's classification is known. No-op for kinds without a
+    /// producer-side provenance field.
+    pub fn with_producer_provenance(mut self, producer: EndpointProvenance) -> Self {
+        match &mut self {
+            Finding::TypeMismatch {
+                producer_provenance,
+                ..
+            } => *producer_provenance = producer,
+            Finding::OrphanedEndpoint { provenance, .. } => *provenance = producer,
+            _ => {}
+        }
+        self
     }
 
     pub fn env_var_call(
@@ -257,6 +286,7 @@ impl Serialize for Finding {
                 producer_type,
                 consumer_type,
                 detail,
+                producer_provenance,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -265,6 +295,7 @@ impl Serialize for Finding {
                 map.serialize_entry("producer_type", producer_type)?;
                 map.serialize_entry("consumer_type", consumer_type)?;
                 map.serialize_entry("detail", detail)?;
+                map.serialize_entry("producer_provenance", producer_provenance)?;
             }
             Finding::MethodMismatch {
                 method,
@@ -294,10 +325,12 @@ impl Serialize for Finding {
                 method,
                 path,
                 service,
+                provenance,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("service", service)?;
+                map.serialize_entry("provenance", provenance)?;
             }
             Finding::EnvVarCall {
                 method,
@@ -373,6 +406,9 @@ pub struct ScanStats {
 pub struct VerifiedEndpoint {
     pub method: String,
     pub path: String,
+    /// Real route vs mock/test handler (#380); route-wins when several
+    /// producers share the (method, path) key.
+    pub provenance: EndpointProvenance,
 }
 
 /// GraphQL coverage signal: libraries detected vs operations actually
@@ -463,6 +499,32 @@ mod tests {
     }
 
     #[test]
+    fn producer_provenance_defaults_to_route_and_serializes() {
+        // Constructors default to `route`; the wire always carries the field
+        // so the cloud renderer never has to infer it (#380).
+        let mismatch = Finding::type_mismatch("GET", "/x", None, vec![], "A", "B", "boom");
+        let v = serde_json::to_value(&mismatch).unwrap();
+        assert_eq!(v["producer_provenance"], json!("route"));
+
+        let mismatch = mismatch.with_producer_provenance(EndpointProvenance::Mock);
+        let v = serde_json::to_value(&mismatch).unwrap();
+        assert_eq!(v["producer_provenance"], json!("mock"));
+
+        let orphan = Finding::orphaned_endpoint("GET", "/x", None)
+            .with_producer_provenance(EndpointProvenance::Mock);
+        let v = serde_json::to_value(&orphan).unwrap();
+        assert_eq!(v["provenance"], json!("mock"));
+
+        // No-op on kinds without a producer-side field.
+        let missing = Finding::missing_endpoint("GET", "/x", None, vec![])
+            .with_producer_provenance(EndpointProvenance::Mock);
+        assert_eq!(
+            missing,
+            Finding::missing_endpoint("GET", "/x", None, vec![])
+        );
+    }
+
+    #[test]
     fn detail_truncated_at_construction() {
         let long = "☕".repeat(500);
         let finding = Finding::type_mismatch("GET", "/x", None, vec![], "A", "B", &long);
@@ -548,6 +610,7 @@ mod tests {
             verified: vec![VerifiedEndpoint {
                 method: "GET".to_string(),
                 path: "/api/users".to_string(),
+                provenance: Default::default(),
             }],
             graphql: GraphqlStatus {
                 libraries: vec![],
@@ -575,7 +638,7 @@ mod tests {
         );
         assert_eq!(
             v["verified"],
-            json!([{ "method": "GET", "path": "/api/users" }])
+            json!([{ "method": "GET", "path": "/api/users", "provenance": "route" }])
         );
         assert_eq!(
             v["graphql"],
@@ -595,6 +658,7 @@ mod tests {
                 "producer_type": "UserResponse",
                 "consumer_type": "User[]",
                 "detail": "Property 'role' is missing",
+                "producer_provenance": "route",
             })
         );
         assert_eq!(
@@ -628,6 +692,7 @@ mod tests {
                 "method": "GET",
                 "path": "/legacy/ping",
                 "service": "billing",
+                "provenance": "route",
             })
         );
         assert_eq!(

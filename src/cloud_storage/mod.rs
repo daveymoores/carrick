@@ -308,6 +308,7 @@ pub fn mount_graph_to_api_details(
             file_path: PathBuf::from(&endpoint.file_location),
             repo_name: None,
             service_name: None,
+            provenance: endpoint.provenance,
         })
         .collect();
 
@@ -326,6 +327,8 @@ pub fn mount_graph_to_api_details(
             file_path: PathBuf::from(&call.file_location),
             repo_name: None,
             service_name: None,
+            // Provenance is producer-side metadata; calls keep the default.
+            provenance: Default::default(),
         })
         .collect();
 
@@ -533,6 +536,37 @@ mod tests {
         assert_eq!(back.key, key);
     }
 
+    /// The uploaded index (extraction output) must carry each endpoint's
+    /// provenance so downstream matching/rendering can tell a mock producer
+    /// from a real route (#380). Calls keep the `Route` default.
+    #[test]
+    fn mount_graph_projection_carries_endpoint_provenance() {
+        use crate::mount_graph::ResolvedEndpoint;
+        use crate::operation::EndpointProvenance;
+
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/api/widgets".to_string(),
+            full_path: "/api/widgets".to_string(),
+            handler: Some("handler".to_string()),
+            owner: "http".to_string(),
+            file_location: "src/mocks/handlers.ts:5".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: EndpointProvenance::Mock,
+        });
+
+        let (endpoints, _calls) = mount_graph_to_api_details(&graph);
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].provenance, EndpointProvenance::Mock);
+
+        // And it is on the serialized wire (the index blob).
+        let json = serde_json::to_value(&endpoints[0]).unwrap();
+        assert_eq!(json["provenance"], "mock");
+    }
+
     use crate::analyzer::CrossRepoMatch;
 
     fn empty_repo(repo_name: &str, service_name: Option<&str>) -> CloudRepoData {
@@ -581,6 +615,7 @@ mod tests {
             match_score: 1.0,
             type_compatible,
             mismatch_reason: mismatch_reason.map(String::from),
+            producer_provenance: Default::default(),
         }
     }
 

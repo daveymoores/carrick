@@ -34,10 +34,18 @@ static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
 
 // Type aliases to reduce complexity
 type RouteFieldMap = HashMap<OperationKey, Json>;
+/// A verified (matched) producer endpoint for the report: display label +
+/// name (`(method, path)` for HTTP) plus the producer's provenance so the
+/// verified table can mark mock/test handlers (#380).
+type VerifiedEndpointEntry = (String, String, crate::operation::EndpointProvenance);
 /// Result of `analyze_matches_with_mount_graph` and
 /// `analyze_exact_key_matches`: `(findings, verified_endpoints,
 /// cross_repo_matches)`.
-type MatcherOutput = (Vec<Finding>, Vec<(String, String)>, Vec<CrossRepoMatch>);
+type MatcherOutput = (
+    Vec<Finding>,
+    Vec<VerifiedEndpointEntry>,
+    Vec<CrossRepoMatch>,
+);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSeverity {
@@ -121,6 +129,13 @@ pub struct CrossRepoMatch {
     pub type_compatible: Option<bool>,
     /// `Some(..)` iff `type_compatible == Some(false)`; human-readable reason.
     pub mismatch_reason: Option<String>,
+    /// Whether the producer side of this edge is a real route or a mock/test
+    /// handler (#380). Carried from the producer endpoint's structural
+    /// classification so downstream surfaces can present a mismatch against a
+    /// mock with the right amount of trust. When several producers share one
+    /// exact key, route-wins (`EndpointProvenance::min`).
+    #[serde(default)]
+    pub producer_provenance: crate::operation::EndpointProvenance,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -155,6 +170,13 @@ pub struct ApiEndpointDetails {
     /// `serviceName`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    /// For endpoints: whether the evidence is a real route or a mock/test
+    /// handler, classified structurally from the source path at extraction
+    /// (#380). For calls the field is meaningless and stays at its `Route`
+    /// default. `default` so index blobs written before the field existed
+    /// deserialize as `Route`.
+    #[serde(default)]
+    pub provenance: crate::operation::EndpointProvenance,
 }
 
 pub struct ApiAnalysisResult {
@@ -170,10 +192,11 @@ pub struct ApiAnalysisResult {
     /// major/unparseable.
     pub dependency_conflicts: Vec<DependencyConflict>,
     /// Endpoints that were successfully matched by at least one consumer
-    /// call, with their method + canonical path. Surfaced so users see
-    /// what *worked* in the PR comment, not just what's broken — clean
-    /// runs otherwise produce no positive signal.
-    pub verified_endpoints: Vec<(String, String)>,
+    /// call, with their method + canonical path + producer provenance (real
+    /// route vs mock/test handler). Surfaced so users see what *worked* in
+    /// the PR comment, not just what's broken — clean runs otherwise produce
+    /// no positive signal.
+    pub verified_endpoints: Vec<VerifiedEndpointEntry>,
     /// GraphQL libraries detected across all scanned repos (subset of
     /// `detected_data_fetchers`). When libraries are present but no
     /// operations were extracted, the formatter suggests committing an
@@ -763,6 +786,8 @@ impl Analyzer {
                 file_path: call.call_file.clone(),
                 repo_name: None,
                 service_name: None,
+                // Provenance is producer-side metadata; calls keep the default.
+                provenance: Default::default(),
             });
         }
     }
@@ -1582,12 +1607,17 @@ impl Analyzer {
         }
 
         // Find orphaned endpoints (not matched by any call), and capture
-        // verified matches as (method, path) tuples for the formatter.
-        let mut verified: Vec<(String, String)> = Vec::new();
+        // verified matches as (method, path, provenance) tuples for the
+        // formatter.
+        let mut verified: Vec<VerifiedEndpointEntry> = Vec::new();
         for endpoint in mount_graph.get_resolved_endpoints() {
             let key = format!("{}:{}", endpoint.method, endpoint.full_path);
             if matched_endpoints.contains(&key) {
-                verified.push((endpoint.method.clone(), endpoint.full_path.clone()));
+                verified.push((
+                    endpoint.method.clone(),
+                    endpoint.full_path.clone(),
+                    endpoint.provenance,
+                ));
             } else if !method_mismatched_producers.contains(&key)
                 && !carrick_match::is_catch_all_path(&endpoint.full_path)
                 && carrick_match::path_literal_specificity(&endpoint.full_path) > 0
@@ -1599,16 +1629,19 @@ impl Analyzer {
                 // design (#381), so "no consumer matched" is not a meaningful
                 // observation — they are routing infrastructure, not an
                 // unconsumed contract.
-                findings.push(Finding::orphaned_endpoint(
-                    endpoint.method.clone(),
-                    endpoint.full_path.clone(),
-                    // Prefer the monorepo service name, falling back to the repo
-                    // (matches the cloud's service_name ?? repo_name convention).
-                    endpoint
-                        .service_name
-                        .clone()
-                        .or_else(|| endpoint.repo_name.clone()),
-                ));
+                findings.push(
+                    Finding::orphaned_endpoint(
+                        endpoint.method.clone(),
+                        endpoint.full_path.clone(),
+                        // Prefer the monorepo service name, falling back to the repo
+                        // (matches the cloud's service_name ?? repo_name convention).
+                        endpoint
+                            .service_name
+                            .clone()
+                            .or_else(|| endpoint.repo_name.clone()),
+                    )
+                    .with_producer_provenance(endpoint.provenance),
+                );
             }
         }
         for ((env_var, method, path), sites) in env_var_calls {
@@ -1620,7 +1653,10 @@ impl Analyzer {
             ));
         }
         verified.sort();
-        verified.dedup();
+        // Collapse same (method, path) rows; sorting put `Route` first
+        // (`Route < Mock`), and `dedup_by` keeps the first of a run, so a key
+        // backed by both a real route and a mock reads as a route.
+        verified.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
         // Deterministic order for the projection (mirrors verified.sort()): the
         // matcher iterates calls/endpoints in a non-deterministic order, so sort
@@ -1676,6 +1712,7 @@ impl Analyzer {
             match_score: 1.0,
             type_compatible: None,
             mismatch_reason: None,
+            producer_provenance: endpoint.provenance,
         })
     }
 
@@ -1706,11 +1743,15 @@ impl Analyzer {
         // Multiple producers can legitimately share one exact key — two services
         // exposing the same GraphQL field, or several listeners for one socket
         // event — and exact-key matching has no URL to disambiguate them. So
-        // collect ALL distinct producer repos (a `BTreeSet` for deterministic
+        // collect ALL distinct producer repos (a `BTreeMap` for deterministic
         // order) and emit one edge per producer↔consumer pair, rather than
-        // arbitrarily keeping the first by iteration order.
-        let mut producer_repos_by_key: HashMap<String, std::collections::BTreeSet<String>> =
-            HashMap::new();
+        // arbitrarily keeping the first by iteration order. Each repo carries
+        // the producer's provenance; when one repo has several producers on the
+        // same key, route-wins (`EndpointProvenance::min`, #380).
+        let mut producer_repos_by_key: HashMap<
+            String,
+            std::collections::BTreeMap<String, crate::operation::EndpointProvenance>,
+        > = HashMap::new();
         for endpoint in &self.endpoints {
             if endpoint.key.protocol() != protocol {
                 continue;
@@ -1723,7 +1764,9 @@ impl Analyzer {
                 producer_repos_by_key
                     .entry(endpoint.key.canonical())
                     .or_default()
-                    .insert(repo);
+                    .entry(repo)
+                    .and_modify(|provenance| *provenance = (*provenance).min(endpoint.provenance))
+                    .or_insert(endpoint.provenance);
             }
         }
 
@@ -1754,7 +1797,7 @@ impl Analyzer {
                 if let (Some(producer_repos), Some(consumer_repo)) =
                     (producer_repos_by_key.get(&canonical), consumer_repo)
                 {
-                    for producer_repo in producer_repos {
+                    for (producer_repo, producer_provenance) in producer_repos {
                         // Same-repo publisher↔subscriber (or listener↔emitter) is
                         // an intra-repo self-loop, not a cross-repo contract edge.
                         // Drop it structurally on repo identity alone (never on
@@ -1779,6 +1822,7 @@ impl Analyzer {
                             match_score: 1.0,
                             type_compatible: None,
                             mismatch_reason: None,
+                            producer_provenance: *producer_provenance,
                         });
                     }
                 }
@@ -1808,15 +1852,19 @@ impl Analyzer {
             }
             let (label, name) = endpoint.key.display_labels();
             if matched.contains(&endpoint.key) {
-                verified.push((label, name));
+                verified.push((label, name, endpoint.provenance));
             } else {
                 // GraphQL/socket producers are not repo-tagged at this layer, so
                 // the owning service is unknown.
-                findings.push(Finding::orphaned_endpoint(label, name, None));
+                findings.push(
+                    Finding::orphaned_endpoint(label, name, None)
+                        .with_producer_provenance(endpoint.provenance),
+                );
             }
         }
         verified.sort();
-        verified.dedup();
+        // Route-wins per (label, name), mirroring the HTTP matcher's dedup.
+        verified.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
         (findings, verified, cross_repo_matches)
     }
@@ -2052,7 +2100,9 @@ impl Analyzer {
             cross_repo_matches.extend(protocol_cross_repo_matches);
         }
         verified_endpoints.sort();
-        verified_endpoints.dedup();
+        // Route-wins per (method, path): sorted order puts `Route` first and
+        // `dedup_by` keeps the first of each run.
+        verified_endpoints.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         // Re-sort/dedup over the combined HTTP + non-HTTP edge set so the final
         // ordering is stable regardless of which matcher produced an edge.
         sort_dedup_cross_repo_matches(&mut cross_repo_matches);
@@ -2356,17 +2406,47 @@ impl Analyzer {
                     .and_then(|c| c.as_str())
                     .map(|loc| vec![strip_ci_workspace_prefix(loc).to_string()])
                     .unwrap_or_default();
-                Some(Finding::type_mismatch(
-                    method,
-                    path,
-                    None,
-                    call_sites,
-                    self.clean_type_string(producer, &display_names),
-                    self.clean_type_string(consumer, &display_names),
-                    &self.clean_error_message(error, &display_names),
-                ))
+                let producer_provenance = self.producer_provenance_for(&method, &path);
+                Some(
+                    Finding::type_mismatch(
+                        method,
+                        path,
+                        None,
+                        call_sites,
+                        self.clean_type_string(producer, &display_names),
+                        self.clean_type_string(consumer, &display_names),
+                        &self.clean_error_message(error, &display_names),
+                    )
+                    .with_producer_provenance(producer_provenance),
+                )
             })
             .collect()
+    }
+
+    /// Provenance of the producer behind a ts_check verdict, joined against
+    /// the mount graph's resolved endpoints by `(METHOD, path)` — the same
+    /// param-name-agnostic path normalization the compat overlay uses. When
+    /// several producers share the key, route-wins (`.min()`); an unmatched
+    /// key (non-HTTP labels, no mount graph) conservatively reads as `Route`.
+    fn producer_provenance_for(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> crate::operation::EndpointProvenance {
+        let Some(mount_graph) = self.mount_graph.as_ref() else {
+            return Default::default();
+        };
+        let want = normalize_compat_path(path);
+        mount_graph
+            .get_resolved_endpoints()
+            .iter()
+            .filter(|endpoint| {
+                endpoint.method.eq_ignore_ascii_case(method)
+                    && normalize_compat_path(&endpoint.full_path) == want
+            })
+            .map(|endpoint| endpoint.provenance)
+            .min()
+            .unwrap_or_default()
     }
 
     fn clean_type_string(&self, type_str: &str, display_names: &HashMap<String, String>) -> String {
@@ -2854,6 +2934,7 @@ mod tests {
             file_path: PathBuf::from(file),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         }
     }
 
@@ -2892,7 +2973,14 @@ mod tests {
         let (findings, verified, _edges) =
             analyzer.analyze_exact_key_matches(crate::operation::Protocol::Graphql);
 
-        assert_eq!(verified, vec![("QUERY".to_string(), "user".to_string())]);
+        assert_eq!(
+            verified,
+            vec![(
+                "QUERY".to_string(),
+                "user".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )]
+        );
         assert_eq!(
             findings,
             vec![
@@ -2961,8 +3049,16 @@ mod tests {
         assert_eq!(
             verified,
             vec![
-                ("CLIENT->SERVER".to_string(), "chat:message".to_string()),
-                ("SERVER->CLIENT".to_string(), "chat:broadcast".to_string()),
+                (
+                    "CLIENT->SERVER".to_string(),
+                    "chat:message".to_string(),
+                    crate::operation::EndpointProvenance::Route
+                ),
+                (
+                    "SERVER->CLIENT".to_string(),
+                    "chat:broadcast".to_string(),
+                    crate::operation::EndpointProvenance::Route
+                ),
             ]
         );
         assert_eq!(
@@ -3206,6 +3302,7 @@ mod tests {
             file_path: PathBuf::from("test.ts"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -3221,6 +3318,7 @@ mod tests {
             file_path: PathBuf::from("test.ts"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -3236,6 +3334,7 @@ mod tests {
             file_path: PathBuf::from("test.ts"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -3252,6 +3351,7 @@ mod tests {
             file_path: PathBuf::from("test.ts"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
@@ -3315,6 +3415,7 @@ mod tests {
             file_path: PathBuf::from("client.ts:12"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         let mut mount_graph = MountGraph::new();
@@ -3328,6 +3429,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: Some("api".to_string()),
             service_name: None,
+            provenance: Default::default(),
         });
 
         let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -3368,6 +3470,7 @@ mod tests {
             file_path: PathBuf::from("client.ts:3"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         let mut mount_graph = MountGraph::new();
@@ -3381,6 +3484,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: Some("api".to_string()),
             service_name: None,
+            provenance: Default::default(),
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -3391,6 +3495,133 @@ mod tests {
                 Finding::missing_endpoint("GET", "/api/missing", None, vec!["client.ts:3".into()]),
                 Finding::orphaned_endpoint("POST", "/api/orders", Some("api".to_string())),
             ]
+        );
+    }
+
+    /// A matched wire whose producer is a mock/test handler must expose that
+    /// provenance on the edge, the verified entry, and — when unmatched — the
+    /// orphan finding (#380).
+    #[test]
+    fn test_matched_wire_exposes_mock_producer_provenance() {
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+        use crate::operation::EndpointProvenance;
+
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            key: OperationKey::http("GET", "/api/widgets"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("client.ts:12"),
+            repo_name: Some("consumer-repo".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+        });
+
+        let mut mount_graph = MountGraph::new();
+        // The matched producer: an MSW-style handler under a mock tree.
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/api/widgets".to_string(),
+            full_path: "/api/widgets".to_string(),
+            handler: None,
+            owner: "http".to_string(),
+            file_location: "src/mocks/handlers.ts:5".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("producer-repo".to_string()),
+            service_name: None,
+            provenance: EndpointProvenance::Mock,
+        });
+        // An unmatched mock producer: must orphan WITH the mock tag.
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/api/widgets".to_string(),
+            full_path: "/api/widgets".to_string(),
+            handler: None,
+            owner: "http".to_string(),
+            file_location: "src/mocks/handlers.ts:9".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("producer-repo".to_string()),
+            service_name: None,
+            provenance: EndpointProvenance::Mock,
+        });
+        mount_graph.data_calls.push(DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "/api/widgets".to_string(),
+            canonical_path: "/api/widgets".to_string(),
+            client: "fetch".to_string(),
+            file_location: "client.ts:12".to_string(),
+            call_kind: None,
+            repo_name: Some("consumer-repo".to_string()),
+        });
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(edges.len(), 1, "one matched wire expected, got {edges:?}");
+        assert_eq!(edges[0].producer_repo, "producer-repo");
+        assert_eq!(
+            edges[0].producer_provenance,
+            EndpointProvenance::Mock,
+            "the matched wire must expose the producer's mock provenance"
+        );
+        assert_eq!(
+            verified,
+            vec![(
+                "GET".to_string(),
+                "/api/widgets".to_string(),
+                EndpointProvenance::Mock
+            )],
+            "the verified entry must carry the mock tag"
+        );
+        assert_eq!(
+            findings,
+            vec![
+                Finding::orphaned_endpoint("POST", "/api/widgets", Some("producer-repo".into()))
+                    .with_producer_provenance(EndpointProvenance::Mock)
+            ],
+            "the orphaned mock must carry the mock tag"
+        );
+    }
+
+    /// Exact-key protocols thread producer provenance onto the edge the same
+    /// way the HTTP matcher does (#380).
+    #[test]
+    fn test_exact_key_edge_carries_producer_provenance() {
+        use crate::operation::EndpointProvenance;
+
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        let mut producer = op_details_in_repo(
+            OperationKey::pubsub("orders.created"),
+            "svc/src/mocks/bus.ts:4",
+            "producer-repo",
+        );
+        producer.provenance = EndpointProvenance::Mock;
+        analyzer.endpoints.push(producer);
+        analyzer.calls.push(op_details_in_repo(
+            OperationKey::pubsub("orders.created"),
+            "worker/src/publish.ts:9",
+            "consumer-repo",
+        ));
+
+        let (_, verified, edges) =
+            analyzer.analyze_exact_key_matches(crate::operation::Protocol::Pubsub);
+        assert_eq!(edges.len(), 1, "one pub/sub edge expected, got {edges:?}");
+        assert_eq!(edges[0].producer_provenance, EndpointProvenance::Mock);
+        assert_eq!(
+            verified,
+            vec![(
+                "PUBSUB".to_string(),
+                "orders.created".to_string(),
+                EndpointProvenance::Mock
+            )]
         );
     }
 
@@ -3411,6 +3642,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: Some("api".to_string()),
             service_name: None,
+            provenance: Default::default(),
         }
     }
 
@@ -3505,7 +3737,14 @@ mod tests {
                 Finding::orphaned_endpoint("GET", "/b", Some("api".to_string())),
             ]
         );
-        assert_eq!(verified, vec![("GET".to_string(), "/a".to_string())]);
+        assert_eq!(
+            verified,
+            vec![(
+                "GET".to_string(),
+                "/a".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )]
+        );
     }
 
     /// When every exact-path producer is verified, fall back to the first in
@@ -3534,7 +3773,14 @@ mod tests {
                 "GET",
             )]
         );
-        assert_eq!(verified, vec![("GET".to_string(), "/a".to_string())]);
+        assert_eq!(
+            verified,
+            vec![(
+                "GET".to_string(),
+                "/a".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3579,6 +3825,7 @@ mod tests {
             match_score: 1.0,
             type_compatible: None,
             mismatch_reason: None,
+            producer_provenance: Default::default(),
         }
     }
 
@@ -4305,7 +4552,11 @@ mod tests {
         assert_eq!(edges[0].consumer_repo, "web-client");
         assert_eq!(
             verified,
-            vec![("GET".to_string(), "/api/v1/chat/new".to_string())],
+            vec![(
+                "GET".to_string(),
+                "/api/v1/chat/new".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )],
             "the catch-all is not verified by a call it lost"
         );
         assert!(
@@ -4404,7 +4655,11 @@ mod tests {
         assert_eq!(edges[0].consumer_key, "http|POST|/oauth/token");
         assert_eq!(
             verified,
-            vec![("POST".to_string(), "/oauth/token".to_string())]
+            vec![(
+                "POST".to_string(),
+                "/oauth/token".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )]
         );
         assert!(findings.is_empty(), "got {findings:?}");
     }
@@ -4493,7 +4748,14 @@ mod tests {
 
         assert_eq!(edges.len(), 1, "got {edges:?}");
         assert_eq!(edges[0].producer_repo, "files-svc");
-        assert_eq!(verified, vec![("GET".to_string(), "/files/**".to_string())]);
+        assert_eq!(
+            verified,
+            vec![(
+                "GET".to_string(),
+                "/files/**".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )]
+        );
         assert!(findings.is_empty(), "got {findings:?}");
     }
 }
