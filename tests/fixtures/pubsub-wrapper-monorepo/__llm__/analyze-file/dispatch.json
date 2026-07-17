@@ -1,0 +1,37 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "itemArchived",
+      "role": "publisher",
+      "line_number": 9,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ time: new Date(), item: { id: itemId, status: \"archived\", error: null } }",
+      "payload_expression_line": 9
+    },
+    {
+      "topic": "records.reindex",
+      "role": "publisher",
+      "line_number": 18,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ resourceId, mode: \"full\" }",
+      "payload_expression_line": 21
+    },
+    {
+      "topic": "approval",
+      "role": "publisher",
+      "line_number": 33,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "decision",
+      "payload_expression_line": 33
+    }
+  ]
+}

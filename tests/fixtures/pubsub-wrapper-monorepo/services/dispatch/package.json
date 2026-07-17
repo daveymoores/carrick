@@ -1,0 +1,6 @@
+{
+  "name": "@fixture/dispatch",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/dispatch.ts"
+}

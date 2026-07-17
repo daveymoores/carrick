@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@fixture/contracts": ["packages/contracts/src/index.ts"],
+      "@fixture/relay": ["services/relay/src/relay.ts"]
+    }
+  },
+  "include": ["packages/**/*.ts", "services/**/*.ts"]
+}

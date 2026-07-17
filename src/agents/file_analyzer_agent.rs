@@ -289,6 +289,17 @@ pub struct PubsubOperation {
     /// Not part of the operation's identity.
     #[serde(default)]
     pub broker: Option<String>,
+    /// Verbatim text of the value holding the decoded payload at this site: a
+    /// publisher's payload expression, or a subscriber handler's payload
+    /// parameter/binding. The locator for the sidecar's location-based
+    /// inference when `primary_type_symbol` is null (wrapper patterns whose
+    /// payload type is carried by a generic binding, never a bare identifier).
+    #[serde(default)]
+    pub payload_expression_text: Option<String>,
+    /// Line where the payload expression starts. Null whenever
+    /// `payload_expression_text` is null.
+    #[serde(default)]
+    pub payload_expression_line: Option<i32>,
 }
 
 /// Complete analysis result for a single file
@@ -563,6 +574,40 @@ impl FileAnalyzerAgent {
             }
         }
 
+        /// Strip balanced ENCLOSING parenthesis pairs from a locator string:
+        /// `(decision)` → `decision`, `(({ payload }))` → `{ payload }`.
+        /// Only strips when the leading `(` matches the trailing `)` around the
+        /// WHOLE string — `(a).b(c)` is untouched (its first paren closes
+        /// mid-string). Pure syntax normalization for the model's habit of
+        /// copying an arrow-function parameter with its parameter-list parens.
+        fn strip_enclosing_parens(text: &str) -> &str {
+            let mut current = text.trim();
+            loop {
+                let inner = current
+                    .strip_prefix('(')
+                    .and_then(|rest| rest.strip_suffix(')'));
+                let Some(inner) = inner else {
+                    return current;
+                };
+                // The stripped pair must enclose the whole string: scan the
+                // candidate inner text and reject if depth ever goes negative
+                // (that means the leading paren closed before the end).
+                let mut depth = 0i32;
+                let balanced = inner.chars().all(|ch| {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    depth >= 0
+                }) && depth == 0;
+                if !balanced {
+                    return current;
+                }
+                current = inner.trim();
+            }
+        }
+
         fn is_suspicious_import_source(value: &str) -> bool {
             if value.contains("primary_type_symbol") || value.contains("type_import_source") {
                 return true;
@@ -697,6 +742,37 @@ impl FileAnalyzerAgent {
                 op.primary_type_symbol = None;
             }
             normalize_optional_string(&mut op.broker);
+            // Payload locator hygiene: a blank/null-like text is no locator,
+            // and a non-positive line is not a valid 1-based anchor. The line
+            // is a PRECISION aid, not a prerequisite — the sidecar's text
+            // search runs file-wide without one — so a valid text with a
+            // missing/invalid line is kept, and the infer collector
+            // (`collect_pubsub_infer_requests`) anchors the search to the
+            // operation's own line instead (the payload expression starts at
+            // the publish call; the handler starts at the subscribe call). A
+            // line WITHOUT a text is meaningless, so that direction nulls.
+            normalize_optional_string(&mut op.payload_expression_text);
+            // The model frequently copies a subscriber handler's payload
+            // parameter WITH its arrow-parameter-list parens (`(decision)`,
+            // `({ time, run })`) — measured 12/20 on the wrapper-relay harness
+            // fixture. Enclosing parens are pure syntax, never part of the
+            // binding or expression the sidecar must locate, so strip balanced
+            // outer pairs deterministically here rather than fighting the
+            // model's copy granularity in the schema description.
+            if let Some(text) = op.payload_expression_text.take() {
+                let stripped = strip_enclosing_parens(&text);
+                op.payload_expression_text = if stripped.is_empty() {
+                    None
+                } else {
+                    Some(stripped.to_string())
+                };
+            }
+            if op.payload_expression_line.is_some_and(|line| line <= 0) {
+                op.payload_expression_line = None;
+            }
+            if op.payload_expression_text.is_none() {
+                op.payload_expression_line = None;
+            }
             true
         });
 
@@ -970,7 +1046,7 @@ primary_type_symbol, type_import_source
   - For payload_expression_text: copy the EXACT payload argument text if detected; emit null when the call sends no payload
   - For payload_expression_line: read the line number from the prefix; null whenever payload_expression_text is null
 
-For each pubsub_operation, include: topic, role, line_number, primary_type_symbol, type_import_source, broker
+For each pubsub_operation, include: topic, role, line_number, primary_type_symbol, type_import_source, broker, payload_expression_text, payload_expression_line
   - topic: the literal topic/channel/subject string (resolve a named const like TOPIC to its string literal)
   - role: "publisher" if the code SENDS a payload to a topic, "subscriber" if it REGISTERS a handler for a topic
   - line_number: read the line number from the prefix in the source code
@@ -1450,6 +1526,58 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_normalizes_pubsub_payload_locators() {
+        let op = |text: Option<&str>, line: Option<i32>| PubsubOperation {
+            topic: "itemArchived".to_string(),
+            role: Some(crate::operation::PubsubRole::Subscriber),
+            line_number: 13,
+            primary_type_symbol: None,
+            type_import_source: None,
+            broker: None,
+            payload_expression_text: text.map(String::from),
+            payload_expression_line: line,
+        };
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![
+                // Arrow-param-list parens stripped (the measured 12/20 shape).
+                op(Some("(decision)"), Some(36)),
+                op(Some("({ time, item })"), Some(13)),
+                // Non-enclosing parens untouched.
+                op(Some("(a).b(c)"), Some(1)),
+                // Null-like text nulls the pair; line-only never survives alone.
+                op(Some("null"), Some(5)),
+                op(None, Some(7)),
+                // Non-positive line dropped, text kept.
+                op(Some("payload"), Some(0)),
+            ],
+            ..Default::default()
+        };
+        FileAnalyzerAgent::sanitize_result(&mut result);
+        let texts: Vec<Option<&str>> = result
+            .pubsub_operations
+            .iter()
+            .map(|o| o.payload_expression_text.as_deref())
+            .collect();
+        let lines: Vec<Option<i32>> = result
+            .pubsub_operations
+            .iter()
+            .map(|o| o.payload_expression_line)
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                Some("decision"),
+                Some("{ time, item }"),
+                Some("(a).b(c)"),
+                None,
+                None,
+                Some("payload"),
+            ]
+        );
+        assert_eq!(lines, vec![Some(36), Some(13), Some(1), None, None, None]);
+    }
+
+    #[test]
     fn sanitize_drops_pubsub_ops_with_null_like_topic() {
         let pubsub_op = |topic: &str| PubsubOperation {
             topic: topic.to_string(),
@@ -1458,6 +1586,8 @@ mod tests {
             primary_type_symbol: None,
             type_import_source: None,
             broker: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
         };
 
         let mut result = FileAnalysisResult {

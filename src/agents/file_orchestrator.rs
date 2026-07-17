@@ -1664,6 +1664,171 @@ impl FileOrchestrator {
         requests
     }
 
+    /// Build `InferRequestItem`s for pub/sub payloads whose type is NOT a bare
+    /// named symbol — the wrapper patterns where the payload type lives in a
+    /// generic binding (a topic→payload type map on a bus, a schema catalog's
+    /// `infer`, a handle factory's declaration-site type argument) and is
+    /// therefore invisible to the `primary_type_symbol` bundle path.
+    ///
+    /// Sibling of `collect_pubsub_type_requests`, mirroring the division the
+    /// HTTP family already uses: the LLM supplies a LOCATOR
+    /// (`payload_expression_text` + `payload_expression_line`), and the
+    /// sidecar's location-based inference resolves the type deterministically
+    /// with tsc — which has already instantiated the wrapper's generics at the
+    /// site. No library or method-name matching is involved anywhere.
+    ///
+    /// Routing is by role, not by syntax: a publisher's locator is a value
+    /// EXPRESSION (the payload argument / `payload:` property initializer), so
+    /// it takes `InferKind::Expression`; a subscriber's locator is the handler
+    /// parameter or destructured binding holding the payload, so it takes
+    /// `InferKind::FunctionParam` (the sidecar matches the param by name,
+    /// whole binding pattern, or binding element — see `inferFunctionParam`).
+    ///
+    /// Isolation guard (mirrors #268): an op that already carries a
+    /// `primary_type_symbol` bundles through the explicit-symbol path and must
+    /// never get a second, competing anchor here — every existing corpus pub/sub
+    /// fixture keeps its current path untouched.
+    ///
+    /// The alias MUST be byte-identical to the one
+    /// `append_pubsub_manifest_entries` stamped on the manifest entry — same
+    /// key, role, kind, and (for publishers) the same `build_call_site_id` over
+    /// the same raw `file_results` path and >=1-clamped line — or the
+    /// enrich-join silently fails to flip `Unknown` → `Implicit`. Guarded by a
+    /// unit test alongside the symbol-path alias test.
+    pub fn collect_pubsub_infer_requests(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        repo_path: &str,
+    ) -> Vec<InferRequestItem> {
+        use crate::operation::{OperationKey, PubsubRole};
+
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let mut requests: Vec<InferRequestItem> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        // Sorted walk for output determinism, same as the symbol collector.
+        let mut paths: Vec<&String> = file_results.keys().collect();
+        paths.sort();
+        for path in paths {
+            let result = &file_results[path];
+            for op in &result.pubsub_operations {
+                let role = match op.role {
+                    Some(PubsubRole::Subscriber) => ManifestRole::Producer,
+                    Some(PubsubRole::Publisher) => ManifestRole::Consumer,
+                    None => continue,
+                };
+                // Isolation guard: a named anchor already owns this op.
+                if op.primary_type_symbol.is_some() {
+                    continue;
+                }
+                let Some(text) = op.payload_expression_text.as_ref() else {
+                    continue;
+                };
+                // Envelope guard (measured 10/20 on the wrapper-dispatch harness
+                // fixture): the model sometimes copies the whole options/envelope
+                // object or call instead of the payload value. When the locator
+                // text contains the op's own extracted topic literal, it
+                // demonstrably includes the ROUTING key — that text is the
+                // envelope or the call, never the decoded payload. Resolving it
+                // would put the envelope's type on the manifest and feed false
+                // compat verdicts; dropping it keeps the op Unknown, which is
+                // recoverable. Structural on purpose: keyed on this op's topic
+                // string alone, no property-name or library conventions.
+                if text.contains(op.topic.as_str()) {
+                    debug!(
+                        topic = %op.topic,
+                        file = %path,
+                        "pub/sub payload locator contains the topic literal; \
+                         treating as envelope copy and leaving the op unanchored"
+                    );
+                    continue;
+                }
+                let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
+                let key = OperationKey::pubsub(op.topic.clone());
+                let alias = match role {
+                    ManifestRole::Consumer => {
+                        let call_id = build_call_site_id(path, line, &key);
+                        build_manifest_type_alias_with_call_id(
+                            &key,
+                            role,
+                            ManifestTypeKind::Response,
+                            Some(&call_id),
+                        )
+                    }
+                    ManifestRole::Producer => {
+                        build_manifest_type_alias(&key, role, ManifestTypeKind::Response)
+                    }
+                };
+                let file_abs = Self::to_absolute_path(path, &repo_root_absolute);
+                // The sidecar's text search anchors on the expression's own
+                // line when the model reported one, falling back to the
+                // operation line.
+                let expression_line = op
+                    .payload_expression_line
+                    .and_then(|l| u32::try_from(l).ok())
+                    .filter(|&l| l > 0);
+                let dedup_key = format!("{}|{}|{}", file_abs, text, alias);
+                if !seen.insert(dedup_key) {
+                    continue;
+                }
+                let request = match role {
+                    ManifestRole::Consumer => InferRequestItem {
+                        file_path: file_abs,
+                        line_number: line,
+                        span_start: None,
+                        span_end: None,
+                        expression_text: Some(text.clone()),
+                        // Anchor the text search even when the model omitted the
+                        // expression's own line: the payload is an argument of
+                        // the publish call at the op's line, so it STARTS within
+                        // the sidecar's +/-5-line window of it. An unanchored
+                        // search scans the whole file and, for identical text at
+                        // multiple sites, has no proximity tie-break — a wrong
+                        // occurrence resolves a confidently wrong type, whereas
+                        // an anchored miss degrades to Unknown (recoverable).
+                        expression_line: expression_line.or(Some(line)),
+                        infer_kind: InferKind::Expression,
+                        alias: Some(alias),
+                        param_name: None,
+                    },
+                    ManifestRole::Producer => InferRequestItem {
+                        // Anchor the containing-function search on the payload
+                        // binding's own line when present (the handler may start
+                        // lines away from the subscribe call the op is keyed on).
+                        file_path: file_abs,
+                        line_number: expression_line.unwrap_or(line),
+                        span_start: None,
+                        span_end: None,
+                        // No expression_text: `resolveContainingFunction` treats
+                        // a failed text match as terminal, while the line-only
+                        // fallback tolerates ±2 lines — strictly more robust for
+                        // a locator that names a binding, not an expression.
+                        expression_text: None,
+                        expression_line: None,
+                        infer_kind: InferKind::FunctionParam,
+                        alias: Some(alias),
+                        param_name: Some(text.clone()),
+                    },
+                };
+                requests.push(request);
+            }
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} pub/sub payload infer requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Build `SymbolRequest`s for GraphQL consumer result-type anchors (#248
     /// consumer side).
     ///
@@ -4947,6 +5112,8 @@ mod tests {
                     primary_type_symbol: Some("OrderPlacedEvent".to_string()),
                     type_import_source: Some("../types/events.ts".to_string()),
                     broker: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
                 },
                 // (b) scoped-package source (no extension) -> untouched (canary safety).
                 PubsubOperation {
@@ -4956,6 +5123,8 @@ mod tests {
                     primary_type_symbol: Some("InternalAccount".to_string()),
                     type_import_source: Some("@metamask/keyring-internal-api".to_string()),
                     broker: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
                 },
                 // (c) `.ts` whose stripped form is NOT in the import table -> left as-is
                 //     (we normalize only against evidence, never guess).
@@ -4966,6 +5135,8 @@ mod tests {
                     primary_type_symbol: Some("OrderPlacedEvent".to_string()),
                     type_import_source: Some("../wrong/path.ts".to_string()),
                     broker: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
                 },
             ],
         };
@@ -5642,6 +5813,8 @@ export { routes };
             primary_type_symbol: Some(symbol.to_string()),
             type_import_source: None,
             broker: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
         };
 
         // Three files, each contributing a typed op. The HashMap insertion order

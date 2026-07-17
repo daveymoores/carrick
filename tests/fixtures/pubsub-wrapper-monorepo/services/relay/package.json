@@ -1,0 +1,6 @@
+{
+  "name": "@fixture/relay",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/relay.ts"
+}

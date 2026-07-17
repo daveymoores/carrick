@@ -28,6 +28,7 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
+  type ParameterDeclaration,
   type PropertyAssignment,
   type Type,
   type Symbol as TsSymbol,
@@ -432,26 +433,80 @@ export class TypeInferrer {
       return null;
     }
 
-    const param = func
-      .getParameters()
-      .find((p) => p.getName() === request.param_name);
+    const target = this.resolveParamTarget(func, request.param_name);
 
-    if (!param) {
+    if (!target) {
       this.log(
         `Parameter "${request.param_name}" not found at ${request.file_path}:${request.line_number}`
       );
       return null;
     }
 
-    const isExplicit = param.getTypeNode() !== undefined;
-    const typeString = typeText(param.getType(), param);
+    const isExplicit = target.param.getTypeNode() !== undefined;
+    const typeString = typeText(target.node.getType(), target.node);
 
     return this.createInferredType(
       request,
       typeString,
       isExplicit,
-      this.getNodeLocation(param)
+      this.getNodeLocation(target.node)
     );
+  }
+
+  /**
+   * Resolve a `function_param` locator against a function's parameter list.
+   * Three shapes, tried in order:
+   *
+   * 1. A parameter whose name matches exactly (`(payload) => …` ← "payload").
+   * 2. A parameter whose DESTRUCTURED BINDING PATTERN matches the locator
+   *    text under whitespace normalization (`({ time, run }) => …` ←
+   *    "{ time, run }") — the handler destructures the payload itself, so the
+   *    pattern's own type IS the payload type.
+   * 3. A named BINDING ELEMENT inside a destructured parameter
+   *    (`({ payload }) => …` ← "payload") — the payload is one property of an
+   *    envelope param, and the checker projects the element's type
+   *    (catalog-worker handlers: `params: { id, payload: Infer<…> }`).
+   *
+   * All three read the type off a node the checker has already instantiated,
+   * so generic wrappers (topic-map emitters, schema catalogs, channel handles)
+   * resolve without any named payload symbol existing anywhere.
+   */
+  private resolveParamTarget(
+    func: FunctionLike,
+    paramName: string
+  ): { param: ParameterDeclaration; node: Node } | undefined {
+    const params = func.getParameters();
+
+    // 1. Exact parameter name.
+    const byName = params.find((p) => p.getName() === paramName);
+    if (byName) {
+      return { param: byName, node: byName };
+    }
+
+    // 2. Whole binding pattern, whitespace-normalized.
+    const normalizedTarget = this.normalizeWhitespace(paramName);
+    for (const param of params) {
+      const nameNode = param.getNameNode();
+      if (
+        (Node.isObjectBindingPattern(nameNode) || Node.isArrayBindingPattern(nameNode)) &&
+        this.normalizeWhitespace(nameNode.getText()) === normalizedTarget
+      ) {
+        return { param, node: param };
+      }
+    }
+
+    // 3. Binding element inside a destructured parameter.
+    for (const param of params) {
+      const nameNode = param.getNameNode();
+      if (!Node.isObjectBindingPattern(nameNode)) continue;
+      for (const element of nameNode.getElements()) {
+        if (element.getName() === paramName) {
+          return { param, node: element };
+        }
+      }
+    }
+
+    return undefined;
   }
 
   private inferResponseBody(

@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "dispatch", "directory": "services/dispatch" },
+    { "name": "relay", "directory": "services/relay" }
+  ]
+}
