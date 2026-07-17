@@ -436,9 +436,12 @@ fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMat
         // same (method, path, consumer) would be request-vs-request — and the
         // optimistic `Some(true)` fallback below would otherwise fabricate a
         // "compatible" verdict for a check that never ran. These edges are
-        // verdict-exempt: `type_compatible` stays `None` (#379).
+        // verdict-exempt: `type_compatible` stays `None` (#379), and the
+        // reason is cleared with it — `mismatch_reason` is only ever present
+        // alongside `type_compatible == Some(false)`.
         if edge.relationship != carrick_match::MatchRelationship::ProducerConsumer {
             edge.type_compatible = None;
+            edge.mismatch_reason = None;
             continue;
         }
         // Recover the join key from the producer_key. ts_check type-checks HTTP
@@ -1586,6 +1589,12 @@ impl Analyzer {
                                 repos.insert(edge.producer_repo.clone());
                                 repos.insert(edge.consumer_repo.clone());
                                 sites.insert(call_site.clone());
+                                // The endpoint-side entry is ITSELF a call
+                                // site (that is what made the pair shared) —
+                                // its source location is a group member too,
+                                // so the report shows where every encoding
+                                // lives, including the double-extracted one.
+                                sites.insert(endpoint.file_location.clone());
                                 if edge.producer_repo != edge.consumer_repo {
                                     cross_repo_matches.push(edge);
                                 }
@@ -3800,14 +3809,20 @@ mod tests {
         assert_eq!(edges[0].producer_repo, "repo-alpha");
         assert_eq!(edges[0].consumer_repo, "repo-beta");
 
-        // One role-free group finding; no gaps, no fabricated producer.
+        // One role-free group finding; no gaps, no fabricated producer. The
+        // call sites name BOTH encodings — repo-beta's call AND repo-alpha's
+        // double-extracted site — so the report shows where every encoding
+        // of the contract lives.
         assert_eq!(
             findings,
             vec![Finding::shared_external_contract(
                 "POST",
                 "/v2/widgets",
                 vec!["repo-alpha".to_string(), "repo-beta".to_string()],
-                vec!["src/widgets-client.ts:33".to_string()],
+                vec![
+                    "operations/create-widget.ts:14".to_string(),
+                    "src/widgets-client.ts:33".to_string(),
+                ],
             )],
             "the pair must surface once, as a shared-external-contract group"
         );
@@ -4182,12 +4197,20 @@ mod tests {
 
         let mut shared = edge("http|POST|/v2/widgets");
         shared.relationship = carrick_match::MatchRelationship::SharedExternalContract;
+        // A stale reason (e.g. from an earlier overlay pass) must be cleared
+        // along with the verdict: `mismatch_reason` is only ever present
+        // alongside `type_compatible == Some(false)`.
+        shared.mismatch_reason = Some("stale request-vs-request reason".to_string());
         let mut matches = vec![shared, edge("http|POST|/v2/widgets")];
         apply_compat_verdicts(&results, &mut matches);
 
         assert_eq!(
             matches[0].type_compatible, None,
             "shared-external-contract edges are verdict-exempt"
+        );
+        assert_eq!(
+            matches[0].mismatch_reason, None,
+            "a verdict-exempt edge carries no mismatch reason"
         );
         assert_eq!(
             matches[1].type_compatible,
