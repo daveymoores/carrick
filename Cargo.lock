@@ -242,6 +242,7 @@ dependencies = [
 name = "carrick-match"
 version = "0.3.0"
 dependencies = [
+ "serde",
  "wasm-bindgen",
 ]
 

@@ -92,6 +92,19 @@ pub struct CrossRepoMatch {
     /// `Some(..)` iff `type_compatible == Some(false)`; omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mismatch_reason: Option<String>,
+    /// Additive (#379): `"producer_consumer"` or `"shared_external_contract"`
+    /// (`carrick_match::MatchRelationship`'s serde wire values). For
+    /// shared-external-contract edges the `producer_*`/`consumer_*` names
+    /// carry no roles — both sides are call-site encodings of the same
+    /// external contract. Defaults to producer/consumer so projections
+    /// recorded before this field existed keep their meaning.
+    #[serde(default = "default_relationship")]
+    pub relationship: String,
+}
+
+/// The pre-#379 implied relationship of every edge.
+fn default_relationship() -> String {
+    "producer_consumer".to_string()
 }
 
 /// A dependency version conflict (contract §4). `versions` is sorted ascending
@@ -449,6 +462,13 @@ impl CrossRepoMatch {
             match_score: m.match_score,
             type_compatible: m.type_compatible,
             mismatch_reason: m.mismatch_reason.clone(),
+            relationship: match m.relationship {
+                carrick_match::MatchRelationship::ProducerConsumer => "producer_consumer",
+                carrick_match::MatchRelationship::SharedExternalContract => {
+                    "shared_external_contract"
+                }
+            }
+            .to_string(),
         }
     }
 }
@@ -761,6 +781,7 @@ mod tests {
                 type_compatible: Some(true),
                 mismatch_reason: None,
                 producer_provenance: Default::default(),
+                relationship: carrick_match::MatchRelationship::ProducerConsumer,
             },
             // Compat evaluated, incompatible.
             AnalyzerCrossRepoMatch {
@@ -773,6 +794,7 @@ mod tests {
                 type_compatible: Some(false),
                 mismatch_reason: Some("id: number vs string".to_string()),
                 producer_provenance: Default::default(),
+                relationship: carrick_match::MatchRelationship::ProducerConsumer,
             },
             // Compat NOT evaluated (the load-bearing None).
             AnalyzerCrossRepoMatch {
@@ -785,6 +807,7 @@ mod tests {
                 type_compatible: None,
                 mismatch_reason: None,
                 producer_provenance: Default::default(),
+                relationship: carrick_match::MatchRelationship::ProducerConsumer,
             },
         ];
 
@@ -844,6 +867,8 @@ mod tests {
         assert_eq!(compatible["consumer_repo"], "payments-svc");
         assert_eq!(compatible["match_score"], 1.0);
         assert_eq!(compatible["type_compatible"], true);
+        // Additive #379 field: the evidence-kind classification travels.
+        assert_eq!(compatible["relationship"], "producer_consumer");
         // mismatch_reason omitted when None.
         assert!(compatible.get("mismatch_reason").is_none());
 

@@ -146,6 +146,12 @@ pub fn format_analysis_results(
         output.push_str(&format_configuration_section(&categorized.configuration));
         output.push_str("\n\n");
     }
+    if !categorized.shared_contracts.is_empty() {
+        output.push_str(&format_shared_contract_section(
+            &categorized.shared_contracts,
+        ));
+        output.push_str("\n\n");
+    }
     if !result.verified_endpoints.is_empty() {
         output.push_str(&format_verified_section(&result.verified_endpoints));
         output.push_str("\n\n");
@@ -279,6 +285,13 @@ fn format_verdict(
             "{} configuration suggestion{}",
             categorized.configuration.len(),
             plural(categorized.configuration.len())
+        ));
+    }
+    if !categorized.shared_contracts.is_empty() {
+        parts.push(format!(
+            "{} shared external contract{}",
+            categorized.shared_contracts.len(),
+            plural(categorized.shared_contracts.len())
         ));
     }
 
@@ -427,6 +440,10 @@ struct CategorizedFindings<'a> {
     /// `unparseable` is advisory.
     major_dependencies: Vec<&'a Finding>,
     unparseable_dependencies: Vec<&'a Finding>,
+    /// Shared external contracts (#379): groups of repos whose call sites
+    /// encode the same externally-served API. Advisory; carries no
+    /// producer/consumer roles.
+    shared_contracts: Vec<&'a Finding>,
 }
 
 impl CategorizedFindings<'_> {
@@ -465,6 +482,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
     let mut env_var_calls = Vec::new();
     let mut major_dependencies = Vec::new();
     let mut unparseable_dependencies = Vec::new();
+    let mut shared_contracts = Vec::new();
 
     for finding in findings {
         match finding {
@@ -479,6 +497,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
                     unparseable_dependencies.push(finding);
                 }
             }
+            Finding::SharedExternalContract { .. } => shared_contracts.push(finding),
         }
     }
 
@@ -489,6 +508,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
         configuration: group_env_var_suggestions(&env_var_calls),
         major_dependencies,
         unparseable_dependencies,
+        shared_contracts,
     }
 }
 
@@ -732,6 +752,54 @@ fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
     output
 }
 
+/// Render the shared-external-contract groups (#379): repos whose call sites
+/// all target the same route that no indexed service defines. Deliberately
+/// role-free wording — none of the repos is a producer, and no contract
+/// verdict is implied.
+fn format_shared_contract_section(shared: &[&Finding]) -> String {
+    let mut output = String::new();
+
+    output.push_str(&format!(
+        "<details>\n<summary><strong>Shared external contracts ({})</strong></summary>\n\n",
+        shared.len()
+    ));
+    output.push_str(
+        "> These repos call the same API, but no indexed service defines it — they encode the same external contract. Useful as a change-impact signal; no producer exists in the index, so no contract verdict is implied.\n\n",
+    );
+    output.push_str("| Method | Path | Encoded by | Call sites |\n| :--- | :--- | :--- | :--- |\n");
+    for finding in shared {
+        let Finding::SharedExternalContract {
+            method,
+            path,
+            repos,
+            call_sites,
+        } = finding
+        else {
+            // categorize_findings only routes SharedExternalContract here.
+            continue;
+        };
+        let repo_list = repos
+            .iter()
+            .map(|r| format!("`{}`", code_cell(r)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sites = if call_sites.is_empty() {
+            "-".to_string()
+        } else {
+            format!("`{}`", code_cell(&call_sites.join(", ")))
+        };
+        output.push_str(&format!(
+            "| `{}` | `{}` | {} | {} |\n",
+            code_cell(method),
+            code_cell(path),
+            repo_list,
+            sites
+        ));
+    }
+    output.push_str("\n</details>");
+    output
+}
+
 fn format_dependency_section(major: &[&Finding], unparseable: &[&Finding]) -> String {
     let mut output = String::new();
 
@@ -853,6 +921,38 @@ mod tests {
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
         }
+    }
+
+    /// #379: a shared-external-contract group renders as its own role-free
+    /// advisory section — named repos, no producer/consumer labels, no
+    /// headline issue counted, and no connectivity framing.
+    #[test]
+    fn shared_external_contract_renders_role_free_group() {
+        let result = result_with(vec![Finding::shared_external_contract(
+            "POST",
+            "/v2/widgets",
+            vec!["repo-alpha".to_string(), "repo-beta".to_string()],
+            vec!["src/widgets-client.ts:33".to_string()],
+        )]);
+        let output = format_analysis_results(result, &topology_baseline(), None);
+
+        assert!(
+            output.contains("Shared external contracts (1)"),
+            "missing section: {output}"
+        );
+        assert!(output.contains("`repo-alpha`") && output.contains("`repo-beta`"));
+        assert!(output.contains("`POST`") && output.contains("`/v2/widgets`"));
+        // Advisory: never a headline issue.
+        assert!(
+            output.contains("<!-- CARRICK_ISSUE_COUNT:0 -->"),
+            "shared contracts must not count as issues: {output}"
+        );
+        // Role-free table: repos are "Encoded by", never a Producer/Consumer
+        // column.
+        assert!(output.contains("| Method | Path | Encoded by | Call sites |"));
+        assert!(!output.contains("| Producer") && !output.contains("| Consumer"));
+        // The verdict mentions the group.
+        assert!(output.contains("1 shared external contract"));
     }
 
     fn type_mismatch_finding() -> Finding {

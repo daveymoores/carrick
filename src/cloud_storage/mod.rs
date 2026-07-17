@@ -556,6 +556,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: EndpointProvenance::Mock,
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
 
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
@@ -616,6 +617,7 @@ mod tests {
             type_compatible,
             mismatch_reason: mismatch_reason.map(String::from),
             producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
         }
     }
 

@@ -128,6 +128,18 @@ pub enum Finding {
         tier: String,
         versions: Vec<PackageVersionRef>,
     },
+    /// Multiple repos encode the same external contract (#379): every side of
+    /// the match is a call site, so no indexed service defines the route and
+    /// producer/consumer roles do not apply. Advisory signal — "these N repos
+    /// speak the same external API" — never a contract verdict.
+    SharedExternalContract {
+        method: String,
+        path: String,
+        /// Repo ids (service_name ?? repo_name) that encode this contract,
+        /// sorted; always ≥2 (single-repo groups are not emitted).
+        repos: Vec<String>,
+        call_sites: Vec<String>,
+    },
 }
 
 impl Finding {
@@ -238,6 +250,20 @@ impl Finding {
         }
     }
 
+    pub fn shared_external_contract(
+        method: impl Into<String>,
+        path: impl Into<String>,
+        repos: Vec<String>,
+        call_sites: Vec<String>,
+    ) -> Self {
+        Finding::SharedExternalContract {
+            method: method.into(),
+            path: path.into(),
+            repos,
+            call_sites,
+        }
+    }
+
     /// The wire `kind` tag.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -247,6 +273,7 @@ impl Finding {
             Finding::OrphanedEndpoint { .. } => "orphaned_endpoint",
             Finding::EnvVarCall { .. } => "env_var_call",
             Finding::DependencyConflict { .. } => "dependency_conflict",
+            Finding::SharedExternalContract { .. } => "shared_external_contract",
         }
     }
 
@@ -257,7 +284,9 @@ impl Finding {
         match self {
             Finding::TypeMismatch { .. } | Finding::MethodMismatch { .. } => Severity::Risk,
             Finding::MissingEndpoint { .. } | Finding::OrphanedEndpoint { .. } => Severity::Gap,
-            Finding::EnvVarCall { .. } => Severity::Advisory,
+            Finding::EnvVarCall { .. } | Finding::SharedExternalContract { .. } => {
+                Severity::Advisory
+            }
             Finding::DependencyConflict { tier, .. } => {
                 if tier == tier::MAJOR {
                     Severity::Gap
@@ -351,6 +380,17 @@ impl Serialize for Finding {
                 map.serialize_entry("package_name", package_name)?;
                 map.serialize_entry("tier", tier)?;
                 map.serialize_entry("versions", versions)?;
+            }
+            Finding::SharedExternalContract {
+                method,
+                path,
+                repos,
+                call_sites,
+            } => {
+                map.serialize_entry("method", method)?;
+                map.serialize_entry("path", path)?;
+                map.serialize_entry("repos", repos)?;
+                map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
             }
         }
         map.end()
@@ -594,6 +634,12 @@ mod tests {
                     }],
                 ),
                 Finding::dependency_conflict("typescript", tier::UNPARSEABLE, vec![]),
+                Finding::shared_external_contract(
+                    "POST",
+                    "/v2/widgets",
+                    vec!["repo-alpha".to_string(), "repo-beta".to_string()],
+                    vec!["src/widgets-client.ts:33".to_string()],
+                ),
             ],
             delta: Some(PrDelta {
                 new_endpoints: vec![EndpointRef {
@@ -719,6 +765,19 @@ mod tests {
         // Unparseable tier downgrades the severity to advisory.
         assert_eq!(findings[6]["severity"], "advisory");
         assert_eq!(findings[6]["tier"], "unparseable");
+        // Shared external contract (#379): role-free — repos, never a
+        // producer/consumer or service attribution.
+        assert_eq!(
+            findings[7],
+            json!({
+                "kind": "shared_external_contract",
+                "severity": "advisory",
+                "method": "POST",
+                "path": "/v2/widgets",
+                "repos": ["repo-alpha", "repo-beta"],
+                "call_sites": ["src/widgets-client.ts:33"],
+            })
+        );
     }
 
     /// An empty `run_id` is omitted, not sent as `""` — the cloud validates

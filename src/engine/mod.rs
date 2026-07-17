@@ -2471,6 +2471,15 @@ fn build_type_manifest_entries(
         if !is_http_method(&method) {
             continue;
         }
+        // Call-site-evidence entries (#379) never anchor Producer types: they
+        // are client encodings of an external contract, and a producer
+        // manifest entry would make ts_check run a request-vs-request
+        // comparison mislabelled as a producer-contract verdict. Their pairs
+        // are verdict-exempt at the source; the site's Consumer entry is
+        // still emitted from the twin data call below.
+        if endpoint.evidence == carrick_match::MatchEvidence::CallSite {
+            continue;
+        }
         let path = endpoint.full_path.clone();
         if !path.starts_with('/') {
             continue;
@@ -4175,6 +4184,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -4211,6 +4221,53 @@ mod tests {
             .expect("one producer entry expected");
         assert_eq!(survivor.file_path, "src/routes/orders.ts");
         assert_eq!(survivor.line_number, 11);
+    }
+
+    /// #379: a call-site-evidence entry never anchors Producer manifest
+    /// types — a producer entry would make ts_check run a request-vs-request
+    /// comparison mislabelled as a producer-contract verdict. The twin data
+    /// call's Consumer entries are unaffected.
+    #[test]
+    fn test_call_site_evidence_endpoint_emits_no_producer_manifest_entries() {
+        let config = Config::default();
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints = vec![crate::mount_graph::ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/v2/widgets".to_string(),
+            full_path: "/v2/widgets".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "operations/create-widget.ts:14".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::CallSite,
+        }];
+        mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "/v2/widgets".to_string(),
+            canonical_path: "/v2/widgets".to_string(),
+            client: "request".to_string(),
+            file_location: "operations/create-widget.ts:14".to_string(),
+            call_kind: None,
+            repo_name: None,
+        }];
+
+        let entries = build_type_manifest_entries(&mount_graph, &config);
+
+        assert!(
+            entries.iter().all(|e| e.role != ManifestRole::Producer),
+            "call-site evidence must not produce Producer manifest entries: {:?}",
+            entries
+                .iter()
+                .map(|e| (&e.role, &e.type_alias))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            entries.iter().any(|e| e.role == ManifestRole::Consumer),
+            "the twin call's Consumer entries are still emitted"
+        );
     }
 
     #[test]
@@ -4684,6 +4741,7 @@ mod tests {
             type_compatible: Some(false),
             mismatch_reason: Some("y".repeat(400)),
             producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
         }];
         crate::cloud_storage::attach_compat_verdicts(&mut payloads, &matches);
         assert!(

@@ -47,9 +47,23 @@ pub struct ResolvedEndpoint {
     /// Where this endpoint's evidence comes from — a real route or a mock/test
     /// handler — classified structurally from the source path when the graph
     /// is built (`file_finder::endpoint_provenance`). `default` so graphs
-    /// serialized before the field existed read as `Route`.
+    /// serialized before the field existed read as `Route`. Orthogonal to
+    /// `evidence`: provenance describes WHERE the entry was written (route vs
+    /// mock tree), evidence describes WHAT KIND of expression backs it (a
+    /// definition vs a client call) — a mock call-site carries both tags.
     #[serde(default)]
     pub provenance: crate::operation::EndpointProvenance,
+    /// What kind of source evidence backs this entry (#379). Endpoints are
+    /// route definitions by construction, but extraction can fabricate one
+    /// from a client call expression (the same site double-extracted as an
+    /// endpoint AND a data call — see
+    /// `FileOrchestrator::classify_endpoint_evidence`). A `CallSite` entry is
+    /// not a producer: a consumer call matching it is classified as a
+    /// shared-external-contract pair, not producer/consumer. Defaults to
+    /// `RouteDefinition` so index data recorded before this field existed
+    /// keeps its meaning.
+    #[serde(default)]
+    pub evidence: carrick_match::MatchEvidence,
 }
 
 /// Represents a data-fetching call with its target
@@ -452,6 +466,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
 
         // Create config with internal domain
@@ -727,6 +742,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
 
         let config = Config {
@@ -769,6 +785,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
 
         let config = Config {
@@ -802,6 +819,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
 
         let config = Config::default();
@@ -835,6 +853,7 @@ mod tests {
                 repo_name: None,
                 service_name: None,
                 provenance: Default::default(),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
             });
         }
         let normalizer = UrlNormalizer::default_permissive();
@@ -885,6 +904,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
         });
         crate::cloud_storage::CloudRepoData {
             repo_name: repo.to_string(),
