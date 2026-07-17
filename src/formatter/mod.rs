@@ -357,7 +357,9 @@ fn format_no_issues(
 /// at least one consumer call successfully matched. Surfaced so PR comments
 /// communicate what's *working*, not just what's broken — without it, a
 /// clean cross-repo run produces no positive signal at all.
-fn format_verified_section(verified: &[(String, String)]) -> String {
+fn format_verified_section(
+    verified: &[(String, String, crate::operation::EndpointProvenance)],
+) -> String {
     let mut output = String::new();
     output.push_str(&format!(
         "<details>\n<summary><strong>Verified ({})</strong></summary>\n\n",
@@ -367,8 +369,15 @@ fn format_verified_section(verified: &[(String, String)]) -> String {
         "> Endpoints with at least one matching consumer call. Types were resolved and compared by the TypeScript compiler pass.\n\n",
     );
     output.push_str("| Method | Path |\n| :--- | :--- |\n");
-    for (method, path) in verified {
-        output.push_str(&format!("| `{}` | `{}` |\n", method, path));
+    for (method, path, provenance) in verified {
+        // A producer whose evidence is a mock/test handler is marked so the
+        // match is trusted accordingly (#380).
+        let marker = if provenance.is_mock() {
+            " (mock handler)"
+        } else {
+            ""
+        };
+        output.push_str(&format!("| `{}` | `{}`{} |\n", method, path, marker));
     }
     output.push_str("\n</details>");
     output
@@ -501,12 +510,22 @@ fn format_critical_section(risks: &[&Finding]) -> String {
                 producer_type,
                 consumer_type,
                 detail,
+                producer_provenance,
                 ..
             } => (
                 format!("{} {}", method, path),
                 format!(
-                    "producer `{}` vs consumer `{}`: {}",
-                    producer_type, consumer_type, detail
+                    "producer `{}`{} vs consumer `{}`: {}",
+                    producer_type,
+                    // The producer shape comes from a mock/test handler —
+                    // often still the canonical contract, but say so (#380).
+                    if producer_provenance.is_mock() {
+                        " (mock handler)"
+                    } else {
+                        ""
+                    },
+                    consumer_type,
+                    detail
                 ),
             ),
             Finding::MethodMismatch {
@@ -617,13 +636,25 @@ fn format_connectivity_section(
 
     if !orphaned.is_empty() {
         output.push_str(&format!("**Orphaned ({})**\n\n", orphaned.len()));
-        fn orphan_row(finding: &Finding) -> Option<(&String, &String, &Option<String>)> {
+        type OrphanRow<'a> = (&'a String, &'a String, &'a Option<String>, &'static str);
+        fn orphan_row(finding: &Finding) -> Option<OrphanRow<'_>> {
             match finding {
                 Finding::OrphanedEndpoint {
                     method,
                     path,
                     service,
-                } => Some((method, path, service)),
+                    provenance,
+                } => {
+                    // Mark mock/test-handler producers: an orphaned mock is
+                    // expected (its consumers are usually not scanned), so the
+                    // row should not read like a dead product route (#380).
+                    let marker = if provenance.is_mock() {
+                        " (mock handler)"
+                    } else {
+                        ""
+                    };
+                    Some((method, path, service, marker))
+                }
                 _ => None,
             }
         }
@@ -632,10 +663,10 @@ fn format_connectivity_section(
         if orphaned
             .iter()
             .filter_map(|f| orphan_row(f))
-            .any(|(_, _, service)| service.is_some())
+            .any(|(_, _, service, _)| service.is_some())
         {
             output.push_str("| Method | Path | Service |\n| :--- | :--- | :--- |\n");
-            for (method, path, service) in orphaned.iter().filter_map(|f| orphan_row(f)) {
+            for (method, path, service, marker) in orphaned.iter().filter_map(|f| orphan_row(f)) {
                 // A row can be unattributed even when the column is shown (e.g.
                 // a GraphQL orphan alongside an attributed HTTP one); use a dash
                 // rather than an empty cell.
@@ -644,19 +675,21 @@ fn format_connectivity_section(
                     .map(|s| format!("`{}`", code_cell(s)))
                     .unwrap_or_else(|| "-".to_string());
                 output.push_str(&format!(
-                    "| `{}` | `{}` | {} |\n",
+                    "| `{}` | `{}`{} | {} |\n",
                     code_cell(method),
                     code_cell(path),
+                    marker,
                     service
                 ));
             }
         } else {
             output.push_str("| Method | Path |\n| :--- | :--- |\n");
-            for (method, path, _) in orphaned.iter().filter_map(|f| orphan_row(f)) {
+            for (method, path, _, marker) in orphaned.iter().filter_map(|f| orphan_row(f)) {
                 output.push_str(&format!(
-                    "| `{}` | `{}` |\n",
+                    "| `{}` | `{}`{} |\n",
                     code_cell(method),
-                    code_cell(path)
+                    code_cell(path),
+                    marker
                 ));
             }
         }
@@ -787,6 +820,7 @@ fn group_env_var_suggestions(findings: &[&Finding]) -> Vec<EnvVarSuggestionGroup
 mod tests {
     use super::*;
     use crate::findings::{EndpointRef, Finding, PackageVersionRef, tier};
+    use crate::operation::EndpointProvenance;
 
     /// A poly-repo topology with peers, so connectivity findings are
     /// conclusive (has_baseline == true).
@@ -958,8 +992,16 @@ mod tests {
     fn test_verified_section_renders_when_matches_present() {
         let mut result = result_with(vec![]);
         result.verified_endpoints = vec![
-            ("GET".to_string(), "/api/users".to_string()),
-            ("POST".to_string(), "/api/orders".to_string()),
+            (
+                "GET".to_string(),
+                "/api/users".to_string(),
+                EndpointProvenance::Route,
+            ),
+            (
+                "POST".to_string(),
+                "/api/orders".to_string(),
+                EndpointProvenance::Route,
+            ),
         ];
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -970,9 +1012,69 @@ mod tests {
     }
 
     #[test]
+    fn test_verified_section_marks_mock_producers() {
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![
+            (
+                "GET".to_string(),
+                "/api/users".to_string(),
+                EndpointProvenance::Route,
+            ),
+            (
+                "GET".to_string(),
+                "/api/widgets".to_string(),
+                EndpointProvenance::Mock,
+            ),
+        ];
+
+        let output = format_analysis_results(result, &topology_baseline(), None);
+
+        assert!(output.contains("`GET` | `/api/users` |"));
+        assert!(
+            output.contains("`GET` | `/api/widgets` (mock handler) |"),
+            "mock producer must be marked in the verified table: {output}"
+        );
+    }
+
+    #[test]
+    fn test_orphaned_and_mismatch_rows_mark_mock_producers() {
+        use crate::operation::EndpointProvenance;
+
+        let findings = vec![
+            Finding::type_mismatch(
+                "GET",
+                "/api/widgets",
+                None,
+                vec!["client.ts:3".into()],
+                "Widget",
+                "Gadget",
+                "boom",
+            )
+            .with_producer_provenance(EndpointProvenance::Mock),
+            Finding::orphaned_endpoint("POST", "/api/widgets", None)
+                .with_producer_provenance(EndpointProvenance::Mock),
+        ];
+        let result = result_with(findings);
+        let output = format_analysis_results(result, &topology_baseline(), None);
+
+        assert!(
+            output.contains("producer `Widget` (mock handler) vs consumer `Gadget`"),
+            "type-mismatch row must mark a mock producer: {output}"
+        );
+        assert!(
+            output.contains("`/api/widgets` (mock handler)"),
+            "orphaned row must mark a mock producer: {output}"
+        );
+    }
+
+    #[test]
     fn test_verified_section_singular_label() {
         let mut result = result_with(vec![]);
-        result.verified_endpoints = vec![("GET".to_string(), "/api/users".to_string())];
+        result.verified_endpoints = vec![(
+            "GET".to_string(),
+            "/api/users".to_string(),
+            EndpointProvenance::Route,
+        )];
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("Verified (1)"));
     }
@@ -983,7 +1085,11 @@ mod tests {
         // matches must surface them — that's the whole point of the
         // section. Pre-fix, `format_no_issues` ignored verified entirely.
         let mut result = result_with(vec![]);
-        result.verified_endpoints = vec![("GET".to_string(), "/api/users".to_string())];
+        result.verified_endpoints = vec![(
+            "GET".to_string(),
+            "/api/users".to_string(),
+            EndpointProvenance::Route,
+        )];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
         assert!(output.contains("All cross-service calls match the indexed contracts"));

@@ -593,6 +593,7 @@ mod tests {
             file_path: PathBuf::from(file_line),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         }
     }
 
@@ -609,6 +610,7 @@ mod tests {
             file_path: PathBuf::from(file_line),
             repo_name: Some(repo.to_string()),
             service_name: None,
+            provenance: Default::default(),
         }
     }
 
@@ -758,6 +760,7 @@ mod tests {
                 match_score: 1.0,
                 type_compatible: Some(true),
                 mismatch_reason: None,
+                producer_provenance: Default::default(),
             },
             // Compat evaluated, incompatible.
             AnalyzerCrossRepoMatch {
@@ -769,6 +772,7 @@ mod tests {
                 match_score: 1.0,
                 type_compatible: Some(false),
                 mismatch_reason: Some("id: number vs string".to_string()),
+                producer_provenance: Default::default(),
             },
             // Compat NOT evaluated (the load-bearing None).
             AnalyzerCrossRepoMatch {
@@ -780,6 +784,7 @@ mod tests {
                 match_score: 1.0,
                 type_compatible: None,
                 mismatch_reason: None,
+                producer_provenance: Default::default(),
             },
         ];
 
@@ -941,6 +946,7 @@ mod tests {
             file_path: PathBuf::from("src/socket.ts:12"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         };
 
         let result = ApiAnalysisResult {
@@ -1012,6 +1018,7 @@ mod tests {
                 file_path: PathBuf::from("web/src/orders.ts:7"),
                 repo_name: None,
                 service_name: None,
+                provenance: Default::default(),
             }],
             findings: vec![],
             dependency_conflicts: vec![],
@@ -1149,6 +1156,7 @@ mod tests {
             file_path: PathBuf::from("src/billing.client.ts:19"),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
@@ -1208,6 +1216,7 @@ mod tests {
             file_path: PathBuf::from(file_line),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],

@@ -77,6 +77,41 @@ impl CallKind {
     }
 }
 
+/// Where a producer endpoint's evidence comes from: a real runtime route, or
+/// a handler registered in a mock/test tree (e.g. a mock-service-worker style
+/// `http.get(...)` under `src/mocks/`).
+///
+/// Classified STRUCTURALLY from the endpoint's source path (directory-name
+/// conventions shared across the ecosystem — see
+/// [`crate::file_finder::endpoint_provenance`]), never from a
+/// framework/package name list. Mock endpoints are still extracted and
+/// matched — a mock frequently encodes the org's canonical contract, so
+/// mismatches against it are real — but the tag travels through matching into
+/// findings and the report so a consumer mismatch whose producer shape comes
+/// from a mock can be presented with the right amount of trust.
+///
+/// `Ord` is deliberate: `Route < Mock`, so `.min()` over several candidate
+/// producers implements "route-wins" when a real route and a mock share one
+/// operation key.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointProvenance {
+    /// A route registration in product source.
+    #[default]
+    Route,
+    /// A handler registered under a mock/test tree (`mocks/`, `__mocks__/`,
+    /// test directories, or test-suffixed files).
+    Mock,
+}
+
+impl EndpointProvenance {
+    pub fn is_mock(&self) -> bool {
+        matches!(self, EndpointProvenance::Mock)
+    }
+}
+
 /// Which side of a pub/sub topic an operation sits on. A subscriber registers a
 /// handler for a topic and is the contract producer (endpoint); a publisher
 /// sends to a topic and is the contract consumer (call). Assigned by the

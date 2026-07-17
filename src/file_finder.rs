@@ -1,3 +1,4 @@
+use crate::operation::EndpointProvenance;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -32,25 +33,40 @@ const TEST_FILE_SUFFIXES: &[&str] = &[
     ".stories.jsx",
 ];
 
-fn has_test_dir(path: &Path, root_dir: &Path) -> bool {
-    // We only check for test directories relative to the root directory being scanned.
-    // This allows scanning a directory that is itself inside a "tests" folder (e.g. fixtures).
+/// Directory-name conventions that mark a subtree as mock/test-double code
+/// while still being product-adjacent source (so its files ARE scanned, unlike
+/// [`TEST_DIR_NAMES`] trees, which `find_files` skips entirely). The canonical
+/// case is a mock-service-worker handler tree under `src/mocks/`. These are
+/// ecosystem-wide path conventions, deliberately NOT a mock-framework package
+/// list — provenance must hold for any registration idiom.
+const MOCK_DIR_NAMES: &[&str] = &["mocks", "mock"];
+
+/// Whether any directory segment of `path`, relative to the scanned
+/// `root_dir`, matches one of `dir_names` (case-insensitive). Only checked
+/// relative to the root so a scan whose root itself sits inside such a
+/// directory (e.g. eval fixtures under `tests/fixtures/`) is unaffected;
+/// a path outside `root_dir` conservatively returns false.
+fn has_dir_named(path: &Path, root_dir: &Path, dir_names: &[&str]) -> bool {
     let relative_path = match path.strip_prefix(root_dir) {
         Ok(p) => p,
         Err(_) => return false,
     };
 
-    relative_path.ancestors().any(|ancestor| {
+    relative_path.ancestors().skip(1).any(|ancestor| {
         ancestor
             .file_name()
             .and_then(|name| name.to_str())
             .map(|name| {
-                TEST_DIR_NAMES
+                dir_names
                     .iter()
                     .any(|pattern| name.eq_ignore_ascii_case(pattern))
             })
             .unwrap_or(false)
     })
+}
+
+fn has_test_dir(path: &Path, root_dir: &Path) -> bool {
+    has_dir_named(path, root_dir, TEST_DIR_NAMES)
 }
 
 fn has_test_suffix(path: &Path) -> bool {
@@ -89,6 +105,40 @@ fn is_ignored(path: &Path, root_dir: &Path, ignore_patterns: &[&str]) -> bool {
             .map(|segment| ignore_patterns.contains(&segment))
             .unwrap_or(false)
     })
+}
+
+/// Classify where an endpoint's evidence comes from, structurally, from its
+/// source path relative to the scanned root: a file under a mock tree
+/// ([`MOCK_DIR_NAMES`]) — or any test path per [`is_test_path`], should one
+/// ever reach extraction via a custom include — yields
+/// [`EndpointProvenance::Mock`]; everything else is a real
+/// [`EndpointProvenance::Route`].
+///
+/// This is the `is_test_path` classification extended to mock trees (#380):
+/// test trees are excluded from scanning outright, while mock trees are kept
+/// — their handlers often encode the canonical contract — and tagged so
+/// matching and the report can say "this producer shape comes from a mock".
+///
+/// Conservative by construction: a path that cannot be resolved relative to
+/// `root_dir` (e.g. an `include` root outside the service directory) is left
+/// as `Route` rather than risking segment matches against prefix directories
+/// the scan never chose (the same guard `has_test_dir` uses). Known
+/// limitation, logged in #380: mock servers living outside a conventionally
+/// named tree are not detected; composing structural signals such as
+/// dev-dependency placement of the registering import or reachability from
+/// runtime entry points is follow-up work.
+pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
+    // A path outside the scan root has no segments below the root to
+    // classify; is_test_path's suffix check alone would still fire on it,
+    // contradicting the conservative guarantee above.
+    if path.strip_prefix(root_dir).is_err() {
+        return EndpointProvenance::Route;
+    }
+    if has_dir_named(path, root_dir, MOCK_DIR_NAMES) || is_test_path(path, root_dir) {
+        EndpointProvenance::Mock
+    } else {
+        EndpointProvenance::Route
+    }
 }
 
 /// Find all JavaScript and TypeScript files in a directory
@@ -402,6 +452,79 @@ mod tests {
 
         assert_eq!(files, vec![kept]);
         assert_eq!(package, Some(pkg));
+    }
+
+    #[test]
+    fn endpoint_provenance_tags_mock_trees_and_test_paths() {
+        use crate::operation::EndpointProvenance;
+
+        let root = Path::new("");
+        // The observed real-world shape: an MSW-style handler tree.
+        assert_eq!(
+            endpoint_provenance(Path::new("src/mocks/handlers.ts"), root),
+            EndpointProvenance::Mock
+        );
+        // Case-insensitive segment match, any depth, singular variant.
+        assert_eq!(
+            endpoint_provenance(Path::new("src/testing/Mock/server.ts"), root),
+            EndpointProvenance::Mock
+        );
+        // Test-path classification is folded in (defensive: such files are
+        // normally excluded from scanning entirely).
+        assert_eq!(
+            endpoint_provenance(Path::new("src/__mocks__/api.ts"), root),
+            EndpointProvenance::Mock
+        );
+        assert_eq!(
+            endpoint_provenance(Path::new("src/api/server.spec.ts"), root),
+            EndpointProvenance::Mock
+        );
+        // Real product routes stay routes.
+        assert_eq!(
+            endpoint_provenance(Path::new("src/routes/users.ts"), root),
+            EndpointProvenance::Route
+        );
+        // A FILE named after the convention is not a mock tree.
+        assert_eq!(
+            endpoint_provenance(Path::new("src/api/mocks.ts"), root),
+            EndpointProvenance::Route
+        );
+    }
+
+    #[test]
+    fn endpoint_provenance_outside_scan_root_stays_route() {
+        // A test-suffixed file OUTSIDE the scan root must not classify as
+        // Mock via the suffix check alone.
+        assert_eq!(
+            endpoint_provenance(Path::new("elsewhere/foo.spec.ts"), Path::new("service")),
+            EndpointProvenance::Route
+        );
+    }
+
+    #[test]
+    fn endpoint_provenance_is_relative_to_scan_root() {
+        use crate::operation::EndpointProvenance;
+
+        // A scan rooted INSIDE a mocks/tests prefix (e.g. eval fixtures under
+        // tests/fixtures/) must not tag everything mock: only segments below
+        // the root count.
+        let root = Path::new("tests/fixtures/mocks/repo-a");
+        assert_eq!(
+            endpoint_provenance(Path::new("tests/fixtures/mocks/repo-a/src/app.ts"), root),
+            EndpointProvenance::Route
+        );
+        assert_eq!(
+            endpoint_provenance(
+                Path::new("tests/fixtures/mocks/repo-a/src/mocks/handlers.ts"),
+                root
+            ),
+            EndpointProvenance::Mock
+        );
+        // A path outside the root cannot be classified — conservative Route.
+        assert_eq!(
+            endpoint_provenance(Path::new("elsewhere/mocks/handlers.ts"), root),
+            EndpointProvenance::Route
+        );
     }
 
     #[test]

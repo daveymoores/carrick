@@ -499,10 +499,13 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         verified: results
             .verified_endpoints
             .iter()
-            .map(|(method, path)| crate::findings::VerifiedEndpoint {
-                method: method.clone(),
-                path: path.clone(),
-            })
+            .map(
+                |(method, path, provenance)| crate::findings::VerifiedEndpoint {
+                    method: method.clone(),
+                    path: path.clone(),
+                    provenance: *provenance,
+                },
+            )
             .collect(),
         graphql: crate::findings::GraphqlStatus {
             libraries: results.detected_graphql_libraries.clone(),
@@ -1083,8 +1086,13 @@ async fn analyze_current_repo_incremental(
 
             // Rebuild mount graph from full merged results
             let graph_orchestrator = FileOrchestrator::new(agent_service.clone());
-            let mut mount_graph =
-                graph_orchestrator.build_mount_graph(&merged_results, &normalizer);
+            // `merged_results` keys were normalized to repo-relative paths
+            // above, so provenance classification resolves against "" here.
+            let mut mount_graph = graph_orchestrator.build_mount_graph(
+                &merged_results,
+                &normalizer,
+                std::path::Path::new(""),
+            );
 
             // Deterministic protocol scans run BEFORE the graph is projected:
             // the GraphQL consumer file set folds transport data calls out of
@@ -1423,6 +1431,10 @@ fn append_deterministic_protocol_operations(
         file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
         repo_name: None,
         service_name: None,
+        // Provenance classification is HTTP-only today (#380): non-HTTP op
+        // paths are not root-stripped here, and segment-matching an
+        // un-relativized path would misfire on scan-prefix directories.
+        provenance: Default::default(),
     };
 
     let graphql = &extractions.graphql;
@@ -3849,6 +3861,7 @@ mod tests {
             handler_name: Some("testHandler".to_string()),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         };
 
         let test_data = CloudRepoData {
@@ -3967,6 +3980,7 @@ mod tests {
             handler_name: Some("testHandler".to_string()),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         };
 
         let test_data = vec![CloudRepoData {
@@ -4160,6 +4174,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -4668,6 +4683,7 @@ mod tests {
             match_score: 1.0,
             type_compatible: Some(false),
             mismatch_reason: Some("y".repeat(400)),
+            producer_provenance: Default::default(),
         }];
         crate::cloud_storage::attach_compat_verdicts(&mut payloads, &matches);
         assert!(
@@ -6237,6 +6253,7 @@ mod tests {
             file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         };
         append_pubsub_operations(
             &mut cloud_data,

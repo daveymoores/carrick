@@ -44,6 +44,12 @@ pub struct ResolvedEndpoint {
     /// during cross-repo merge so findings can name the owning service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    /// Where this endpoint's evidence comes from — a real route or a mock/test
+    /// handler — classified structurally from the source path when the graph
+    /// is built (`file_finder::endpoint_provenance`). `default` so graphs
+    /// serialized before the field existed read as `Route`.
+    #[serde(default)]
+    pub provenance: crate::operation::EndpointProvenance,
 }
 
 /// Represents a data-fetching call with its target
@@ -445,6 +451,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         // Create config with internal domain
@@ -719,6 +726,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         let config = Config {
@@ -760,6 +768,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         let config = Config {
@@ -792,6 +801,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
 
         let config = Config::default();
@@ -824,6 +834,7 @@ mod tests {
                 middleware_chain: vec![],
                 repo_name: None,
                 service_name: None,
+                provenance: Default::default(),
             });
         }
         let normalizer = UrlNormalizer::default_permissive();
@@ -873,6 +884,7 @@ mod tests {
             middleware_chain: vec![],
             repo_name: None,
             service_name: None,
+            provenance: Default::default(),
         });
         crate::cloud_storage::CloudRepoData {
             repo_name: repo.to_string(),

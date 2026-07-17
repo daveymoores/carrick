@@ -946,7 +946,7 @@ impl FileOrchestrator {
         debug!("  - Total data calls: {}", stats.total_data_calls);
 
         // STEP 5: Build aggregated mount graph from all file results
-        let mount_graph = self.build_mount_graph(&file_results, normalizer);
+        let mount_graph = self.build_mount_graph(&file_results, normalizer, service_root);
 
         Ok(FileCentricAnalysisResult {
             file_results,
@@ -3051,6 +3051,12 @@ impl FileOrchestrator {
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
         normalizer: &UrlNormalizer,
+        // Root the `file_results` keys are resolved against when classifying
+        // endpoint provenance (real route vs mock/test handler): the service
+        // scan root when keys are as-scanned paths, or `Path::new("")` when
+        // the keys are already repo-relative (the engine normalizes them
+        // before rebuilding the graph).
+        scan_root: &Path,
     ) -> MountGraph {
         let mut graph = MountGraph::new();
 
@@ -3163,6 +3169,12 @@ impl FileOrchestrator {
                     middleware_chain: Vec::new(),
                     repo_name: None,
                     service_name: None,
+                    // Structural classification from the source path: mock
+                    // trees keep producing endpoints, tagged as such (#380).
+                    provenance: crate::file_finder::endpoint_provenance(
+                        Path::new(file_path),
+                        scan_root,
+                    ),
                 });
             }
         }
@@ -3842,14 +3854,127 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
 
         assert_eq!(graph.mounts.len(), 1);
         assert_eq!(graph.endpoints.len(), 1);
         assert_eq!(graph.mounts[0].parent, "app");
         assert_eq!(graph.mounts[0].child, "userRouter");
         assert_eq!(graph.mounts[0].path_prefix, "/users");
+    }
+
+    #[test]
+    fn test_build_mount_graph_tags_mock_tree_endpoints_with_provenance() {
+        use crate::operation::EndpointProvenance;
+
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let endpoint = |path: &str| EndpointResult {
+            candidate_id: "span:100-140".to_string(),
+            line_number: 5,
+            owner_node: "http".to_string(),
+            method: "GET".to_string(),
+            path: path.to_string(),
+            handler_name: "handler".to_string(),
+            pattern_matched: ".get(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        };
+        let file_result = |path: &str| FileAnalysisResult {
+            endpoints: vec![endpoint(path)],
+            ..Default::default()
+        };
+
+        let mut file_results = HashMap::new();
+        // MSW-style mock-service-worker handler tree: extracted, but tagged.
+        file_results.insert(
+            "src/mocks/handlers.ts".to_string(),
+            file_result("/api/widgets"),
+        );
+        // A real route registration in product source.
+        file_results.insert("src/routes/widgets.ts".to_string(), file_result("/widgets"));
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
+
+        assert_eq!(graph.endpoints.len(), 2);
+        let by_file = |needle: &str| {
+            graph
+                .endpoints
+                .iter()
+                .find(|e| e.file_location.starts_with(needle))
+                .unwrap_or_else(|| panic!("no endpoint from {needle}"))
+        };
+        assert_eq!(
+            by_file("src/mocks/").provenance,
+            EndpointProvenance::Mock,
+            "a mock-tree handler must be extracted with provenance=mock"
+        );
+        assert_eq!(
+            by_file("src/routes/").provenance,
+            EndpointProvenance::Route,
+            "a real route must be extracted with provenance=route"
+        );
+    }
+
+    #[test]
+    fn test_build_mount_graph_provenance_is_scan_root_relative() {
+        use crate::operation::EndpointProvenance;
+
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "tests/fixtures/mocks/service-a/src/index.ts".to_string(),
+            FileAnalysisResult {
+                endpoints: vec![EndpointResult {
+                    candidate_id: "span:1-2".to_string(),
+                    line_number: 1,
+                    owner_node: "app".to_string(),
+                    method: "GET".to_string(),
+                    path: "/health".to_string(),
+                    handler_name: "health".to_string(),
+                    pattern_matched: ".get(".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        // A scan rooted inside a mock/test prefix (eval fixtures) must not tag
+        // everything under it as mock: only segments below the root count.
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new("tests/fixtures/mocks/service-a"),
+        );
+
+        assert_eq!(graph.endpoints.len(), 1);
+        assert_eq!(graph.endpoints[0].provenance, EndpointProvenance::Route);
     }
 
     #[test]
@@ -3897,8 +4022,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
 
         assert_eq!(graph.data_calls.len(), 1);
         assert_eq!(
@@ -3977,8 +4105,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
 
         let call_paths: Vec<&str> = graph
             .data_calls
@@ -4035,8 +4166,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
 
         let targets: Vec<&str> = graph
             .data_calls
@@ -4101,8 +4235,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
         let config = Config::default();
         let (_explicit, infer, _inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -4143,8 +4280,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
         let config = Config::default();
         let (explicit, infer, inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -4205,8 +4345,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
         let config = Config::default();
         let (_explicit, infer, _inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -4261,8 +4404,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
         let config = Config::default();
         let (_explicit, infer, _inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
@@ -4330,8 +4476,11 @@ mod tests {
                 pubsub_operations: vec![],
             },
         );
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
         let config = Config::default();
         orchestrator.collect_type_requests(&file_results, ".", &graph, &config)
     }
@@ -4785,8 +4934,11 @@ mod tests {
             },
         );
 
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
 
         // Should have the mount and both endpoints
         assert_eq!(graph.mounts.len(), 1);
@@ -5212,8 +5364,11 @@ export { routes };
 
         let mut file_results = HashMap::new();
         file_results.insert("src/app.ts".to_string(), result);
-        let graph =
-            orchestrator.build_mount_graph(&file_results, &UrlNormalizer::default_permissive());
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
 
         assert_eq!(graph.endpoints.len(), 1);
         assert_eq!(graph.endpoints[0].full_path, "/api/users");
