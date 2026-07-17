@@ -26,7 +26,10 @@ use crate::{
     },
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
-    env_alias::{EnvAliasExtractor, EnvAliasMap, resolve_target_env_alias},
+    env_alias::{
+        EnvAliasExtractor, EnvAliasMap, exported_env_aliases, merge_imported_env_aliases,
+        resolve_target_env_alias,
+    },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
@@ -827,6 +830,30 @@ impl FileOrchestrator {
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
             });
+        }
+
+        // PHASE 1c (#218 — cross-file env-alias resolution). A consumer that
+        // builds its URLs from an imported config-object property
+        // (`config.catalogUrl` ← `process.env.CATALOG_URL` in another file)
+        // has an empty per-file alias map, so the declared env-var name was
+        // never recovered and the base stayed verbatim in the call key. Follow
+        // each file's import graph one hop (relative specifiers, same scope as
+        // the #369 wrapper pass) and fold the imported modules' exported env
+        // aliases into the importer's map. Parsed modules are memoized per
+        // canonical path, so each config module is parsed once per scan.
+        {
+            let mut module_exports_cache: HashMap<PathBuf, EnvAliasMap> = HashMap::new();
+            for pf in &mut pending {
+                let importer = PathBuf::from(&pf.path_str);
+                Self::merge_cross_file_env_aliases(
+                    &mut pf.env_alias_map,
+                    &importer,
+                    &pf.symbol_table.imported_symbols,
+                    &mut module_exports_cache,
+                    &cm,
+                    &handler,
+                );
+            }
         }
 
         // PHASE 2 (concurrent, I/O-bound): dispatch the LLM calls. `AgentService` owns a
@@ -2752,6 +2779,40 @@ impl FileOrchestrator {
     /// edge never forms. Rewriting the leading `${ALIAS}` to
     /// `${process.env.NAME}` funnels the call back through the existing
     /// direct-`process.env` handling instead of duplicating env-var parsing.
+    /// Fold env aliases exported by same-repo modules `importer` imports into
+    /// its alias map (#218 cross-file scope): resolve each RELATIVE import
+    /// specifier to a file, parse it (memoized in `module_exports_cache` by
+    /// canonical path), project its aliases onto its export names, and merge
+    /// them under the importer's local names. One hop only — a config module
+    /// that itself re-exports another module's aliases is a documented
+    /// limitation, not followed. Package and tsconfig-alias specifiers resolve
+    /// to nothing, exactly as in the #369 wrapper pass.
+    ///
+    /// Pub because the corpus-3 regression test drives this exact seam over
+    /// the committed fixture files.
+    pub fn merge_cross_file_env_aliases(
+        env_alias_map: &mut EnvAliasMap,
+        importer: &Path,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+        module_exports_cache: &mut HashMap<PathBuf, EnvAliasMap>,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) {
+        merge_imported_env_aliases(env_alias_map, imported_symbols, |spec| {
+            let resolved = Self::resolve_relative_import(importer, spec)?;
+            Some(
+                module_exports_cache
+                    .entry(resolved.clone())
+                    .or_insert_with(|| {
+                        parse_file(&resolved, cm, handler)
+                            .map(|module| exported_env_aliases(&module))
+                            .unwrap_or_default()
+                    })
+                    .clone(),
+            )
+        });
+    }
+
     fn resolve_env_var_aliases(result: &mut FileAnalysisResult, env_alias_map: &EnvAliasMap) {
         if env_alias_map.is_empty() {
             return;
