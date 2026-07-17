@@ -1034,10 +1034,12 @@ impl Analyzer {
     /// - "ENV_VAR:API_URL:/users" (explicit ENV_VAR format)
     /// - "${process.env.API_URL}/users" (process.env pattern at start)
     /// - "${API_BASE_URL}/users" (UPPER_CASE var at start)
+    /// - "${authHost}/oauth/token" (ANY leading variable followed by a path)
     ///
     /// Returns false for:
     /// - "/users/${userId}" (path parameter, not base URL)
     /// - "/api/${version}/data" (path parameter in middle)
+    /// - "${userId}" (whole-URL opaque variable — no path to classify)
     fn is_env_var_base_url(route: &str) -> bool {
         // Check for explicit ENV_VAR: prefix format
         if route.starts_with("ENV_VAR:") {
@@ -1060,6 +1062,18 @@ impl Analyzer {
                     .chars()
                     .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
             {
+                return true;
+            }
+            // #378: casing is not identity. ANY leading variable followed by
+            // a path remainder is structurally a base URL — the call cannot
+            // be located without knowing it, so it must be classified
+            // (internalEnvVars/externalEnvVars) before it may match. This is
+            // the same policy the persisted consumer key already applies
+            // (`consumer_call_path` keeps an undeclared `${var}` base
+            // verbatim); previously the matcher silently stripped lowercase
+            // bases and paired third-party calls with in-org producers that
+            // happened to share a generic path.
+            if route[end + 1..].starts_with('/') {
                 return true;
             }
         }
@@ -1456,6 +1470,20 @@ impl Analyzer {
                         normalizer.normalize(&lookup_url).path
                     };
                     for endpoint in matching_endpoints {
+                        // #381: a pairing with zero literal agreement — a
+                        // wildcard-only producer (`GET /*`) absorbing an
+                        // arbitrary call — carries no signal. The call is
+                        // ROUTED (so it is not a missing endpoint) but not
+                        // MATCHED: no verified mark, no cross-repo edge.
+                        // Non-zero pairs are already the most specific
+                        // available (the mount graph filters to maximal
+                        // agreement).
+                        if carrick_match::match_agreement(&endpoint.full_path, &normalized_path)
+                            .unwrap_or(0)
+                            == 0
+                        {
+                            continue;
+                        }
                         let key = format!("{}:{}", endpoint.method, endpoint.full_path);
                         matched_endpoints.insert(key);
                         if let Some(edge) = Self::build_cross_repo_match(
@@ -1560,9 +1588,17 @@ impl Analyzer {
             let key = format!("{}:{}", endpoint.method, endpoint.full_path);
             if matched_endpoints.contains(&key) {
                 verified.push((endpoint.method.clone(), endpoint.full_path.clone()));
-            } else if !method_mismatched_producers.contains(&key) {
+            } else if !method_mismatched_producers.contains(&key)
+                && !carrick_match::is_catch_all_path(&endpoint.full_path)
+                && carrick_match::path_literal_specificity(&endpoint.full_path) > 0
+            {
                 // A producer already surfaced in a method-mismatch risk is
-                // neither verified nor re-reported as orphaned.
+                // neither verified nor re-reported as orphaned. Nor is a
+                // catch-all mount (`/*`, `/api/**`) or a route with no
+                // literal segment at all (`/:slug`): those absorb calls by
+                // design (#381), so "no consumer matched" is not a meaningful
+                // observation — they are routing infrastructure, not an
+                // unconsumed contract.
                 findings.push(Finding::orphaned_endpoint(
                     endpoint.method.clone(),
                     endpoint.full_path.clone(),
@@ -2798,8 +2834,11 @@ mod tests {
         assert!(!Analyzer::is_env_var_base_url("/api/users"));
 
         // Edge cases
-        assert!(!Analyzer::is_env_var_base_url("${userId}")); // lowercase, not env var pattern
-        assert!(!Analyzer::is_env_var_base_url("${camelCase}/path")); // camelCase, not env var
+        assert!(!Analyzer::is_env_var_base_url("${userId}")); // whole-URL opaque var, no path to classify
+        // #378: a leading variable followed by a path is a base regardless of
+        // casing — it must be classified before the path may match anything.
+        assert!(Analyzer::is_env_var_base_url("${camelCase}/path"));
+        assert!(Analyzer::is_env_var_base_url("${authHost}/oauth/token"));
         assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
     }
     fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
@@ -4147,5 +4186,314 @@ mod tests {
             matches[0].type_compatible, None,
             "an error result is not a verdict — edges stay None"
         );
+    }
+
+    // ---- #378/#381: path-specificity gate on cross-repo pairing ----
+
+    /// Repo-tagged producer endpoint for the specificity-gate tests.
+    fn resolved_in(
+        method: &str,
+        full_path: &str,
+        repo: &str,
+    ) -> crate::mount_graph::ResolvedEndpoint {
+        crate::mount_graph::ResolvedEndpoint {
+            repo_name: Some(repo.to_string()),
+            ..resolved(method, full_path)
+        }
+    }
+
+    /// Consumer-side data call, repo-tagged as the cross-repo merge does, so
+    /// `build_cross_repo_match` can attribute the consumer repo. The
+    /// `(METHOD, canonical_path, file_location)` triple must mirror the
+    /// `analyzer.calls` entry it corresponds to.
+    fn data_call_in(
+        method: &str,
+        canonical_path: &str,
+        file: &str,
+        repo: &str,
+    ) -> crate::mount_graph::DataFetchingCall {
+        crate::mount_graph::DataFetchingCall {
+            method: method.to_string(),
+            target_url: canonical_path.to_string(),
+            canonical_path: canonical_path.to_string(),
+            client: "fetch".to_string(),
+            file_location: file.to_string(),
+            call_kind: None,
+            repo_name: Some(repo.to_string()),
+        }
+    }
+
+    /// KILL (#381): a wildcard-only producer (`GET /*`, the SPA fallback
+    /// shape) routes every call but corroborates none of them. The pairing
+    /// must not produce a cross-repo edge, must not mark the fallback
+    /// verified, must not turn the absorbed call into a missing endpoint, and
+    /// must not report the fallback as orphaned.
+    #[test]
+    fn catch_all_only_producer_absorbs_but_never_pairs() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(http_call(
+            "GET",
+            "/internal/metrics/export",
+            "metrics-svc/src/client.ts:9",
+        ));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/*", "site-shell"));
+        mount_graph.data_calls.push(data_call_in(
+            "GET",
+            "/internal/metrics/export",
+            "metrics-svc/src/client.ts:9",
+            "metrics-svc",
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(
+            edges.is_empty(),
+            "a wildcard-only producer must not pair with arbitrary calls, got {edges:?}"
+        );
+        assert!(
+            verified.is_empty(),
+            "no-signal absorption is not verification, got {verified:?}"
+        );
+        assert!(
+            findings.is_empty(),
+            "absorbed call is not missing, and a catch-all is never orphaned; got {findings:?}"
+        );
+    }
+
+    /// KILL (#381): a catch-all producer must not pair with a call that has a
+    /// more specific in-org producer available — the call pairs with the
+    /// maximal-agreement producer only.
+    #[test]
+    fn catch_all_never_outranks_specific_producer() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(http_call(
+            "GET",
+            "/api/v1/chat/new",
+            "web-client/src/chat.ts:14",
+        ));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/api/**", "gateway"));
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/api/v1/chat/new", "chat-svc"));
+        mount_graph.data_calls.push(data_call_in(
+            "GET",
+            "/api/v1/chat/new",
+            "web-client/src/chat.ts:14",
+            "web-client",
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "only the most specific producer pairs, got {edges:?}"
+        );
+        assert_eq!(edges[0].producer_repo, "chat-svc");
+        assert_eq!(edges[0].consumer_repo, "web-client");
+        assert_eq!(
+            verified,
+            vec![("GET".to_string(), "/api/v1/chat/new".to_string())],
+            "the catch-all is not verified by a call it lost"
+        );
+        assert!(
+            findings.is_empty(),
+            "the out-ranked catch-all is a mount, not an orphan; got {findings:?}"
+        );
+    }
+
+    /// KILL (#378): a consumer call whose base is an UNDECLARED template
+    /// variable (`${authHost}/oauth/token`) must not silently strip the base
+    /// and pair with an in-org producer that happens to serve the same
+    /// generic path. The call surfaces as an env-var advisory (declare the
+    /// base in carrick.json) and the producer keeps its honest orphan state.
+    #[test]
+    fn unknown_template_base_is_advisory_not_match() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(http_call(
+            "POST",
+            "${authHost}/oauth/token",
+            "billing-svc/src/auth.ts:21",
+        ));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("POST", "/oauth/token", "auth-shim"));
+        mount_graph.data_calls.push(data_call_in(
+            "POST",
+            "${authHost}/oauth/token",
+            "billing-svc/src/auth.ts:21",
+            "billing-svc",
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(
+            edges.is_empty(),
+            "an undeclared base must never pair across repos, got {edges:?}"
+        );
+        assert!(verified.is_empty());
+        assert_eq!(
+            findings,
+            vec![
+                Finding::orphaned_endpoint("POST", "/oauth/token", Some("auth-shim".to_string())),
+                Finding::env_var_call(
+                    "POST",
+                    "/oauth/token",
+                    "authHost",
+                    vec!["billing-svc/src/auth.ts:21".into()],
+                ),
+            ],
+            "the call is an advisory to classify the base, not a match or a missing endpoint"
+        );
+    }
+
+    /// KEEP (#378): the SAME generic path pairs fine once the base is
+    /// declared internal — corroboration comes from the declared base, not
+    /// from the path's shape. No path is ever blanket-excluded.
+    #[test]
+    fn declared_internal_base_still_pairs_generic_path() {
+        let config = Config {
+            internal_env_vars: ["AUTH_HOST".to_string()].into_iter().collect(),
+            ..Config::default()
+        };
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(config, cm);
+
+        analyzer.calls.push(http_call(
+            "POST",
+            "ENV_VAR:AUTH_HOST:/oauth/token",
+            "billing-svc/src/auth.ts:21",
+        ));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("POST", "/oauth/token", "auth-shim"));
+        mount_graph.data_calls.push(data_call_in(
+            "POST",
+            "ENV_VAR:AUTH_HOST:/oauth/token",
+            "billing-svc/src/auth.ts:21",
+            "billing-svc",
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "declared base corroborates the pair, got {edges:?}"
+        );
+        assert_eq!(edges[0].producer_repo, "auth-shim");
+        assert_eq!(edges[0].consumer_repo, "billing-svc");
+        assert_eq!(edges[0].consumer_key, "http|POST|/oauth/token");
+        assert_eq!(
+            verified,
+            vec![("POST".to_string(), "/oauth/token".to_string())]
+        );
+        assert!(findings.is_empty(), "got {findings:?}");
+    }
+
+    /// KEEP: literal paths keep pairing on their own signal — a
+    /// single-segment `/nodes` as much as a deep `/api/v1/chat/new`, and a
+    /// param route against a concrete caller value. No specificity threshold
+    /// is applied to a pairing that literal segments corroborate.
+    #[test]
+    fn literal_and_param_paths_keep_pairing() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer
+            .calls
+            .push(http_call("GET", "/nodes", "web-client/src/graph.ts:3"));
+        analyzer.calls.push(http_call(
+            "GET",
+            "/api/v1/chat/new",
+            "web-client/src/chat.ts:14",
+        ));
+        analyzer
+            .calls
+            .push(http_call("GET", "/users/123", "web-client/src/user.ts:8"));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/nodes", "graph-svc"));
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/api/v1/chat/new", "chat-svc"));
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/users/:id", "user-svc"));
+        for (path, file) in [
+            ("/nodes", "web-client/src/graph.ts:3"),
+            ("/api/v1/chat/new", "web-client/src/chat.ts:14"),
+            ("/users/123", "web-client/src/user.ts:8"),
+        ] {
+            mount_graph
+                .data_calls
+                .push(data_call_in("GET", path, file, "web-client"));
+        }
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        let producer_repos: std::collections::BTreeSet<&str> =
+            edges.iter().map(|e| e.producer_repo.as_str()).collect();
+        assert_eq!(
+            producer_repos,
+            ["chat-svc", "graph-svc", "user-svc"].into_iter().collect(),
+            "got {edges:?}"
+        );
+        assert_eq!(verified.len(), 3);
+        assert!(findings.is_empty(), "got {findings:?}");
+    }
+
+    /// KEEP: a catch-all with a literal mount prefix (the shape file-based
+    /// routing synthesizes for a Next.js `[...slug]` route) still pairs when
+    /// it is the most specific producer available — the literal prefix is the
+    /// corroborating signal.
+    #[test]
+    fn sole_prefixed_catch_all_still_pairs() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(http_call(
+            "GET",
+            "/files/report/pdf",
+            "web-client/src/files.ts:5",
+        ));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/files/**", "files-svc"));
+        mount_graph.data_calls.push(data_call_in(
+            "GET",
+            "/files/report/pdf",
+            "web-client/src/files.ts:5",
+            "web-client",
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(edges.len(), 1, "got {edges:?}");
+        assert_eq!(edges[0].producer_repo, "files-svc");
+        assert_eq!(verified, vec![("GET".to_string(), "/files/**".to_string())]);
+        assert!(findings.is_empty(), "got {findings:?}");
     }
 }
