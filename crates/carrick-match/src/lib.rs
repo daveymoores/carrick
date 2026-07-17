@@ -205,19 +205,27 @@ pub fn is_param_segment(seg: &str) -> bool {
 ///   paths must have the same number of segments. Agreement counts the
 ///   literal positions.
 fn agreement_with_wildcards(endpoint_path: &str, call_path: &str) -> Option<u32> {
+    // A catch-all prefix only matches on a segment boundary: the call path is
+    // the prefix itself, or continues with '/'. A raw byte-prefix check would
+    // let `/api/**` claim `/api2/...`.
+    fn prefix_matches_on_boundary(prefix: &str, call_path: &str) -> bool {
+        match call_path.strip_prefix(prefix) {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        }
+    }
+
     // Check for catch-all patterns
     if endpoint_path.ends_with("/*") || endpoint_path.ends_with("/**") {
         let prefix = endpoint_path.trim_end_matches("/**").trim_end_matches("/*");
-        return call_path
-            .starts_with(prefix)
+        return prefix_matches_on_boundary(prefix, call_path)
             .then(|| path_literal_specificity(prefix));
     }
 
     // Check for regex-style catch-all
     if endpoint_path.ends_with("/(.*)") {
         let prefix = endpoint_path.trim_end_matches("/(.*)");
-        return call_path
-            .starts_with(prefix)
+        return prefix_matches_on_boundary(prefix, call_path)
             .then(|| path_literal_specificity(prefix));
     }
 
@@ -424,6 +432,15 @@ mod tests {
         assert_eq!(path_literal_specificity("/api/v1/chat/new"), 4);
         // Optional marker doesn't change what's literal.
         assert_eq!(path_literal_specificity("/users/:id?"), 1);
+    }
+
+    #[test]
+    fn catch_all_prefix_requires_segment_boundary() {
+        // /api/** must not claim /api2/... (raw byte-prefix bug)
+        assert_eq!(match_agreement("/api/**", "/api2/users"), None);
+        assert_eq!(match_agreement("/api/**", "/api/users"), Some(1));
+        assert_eq!(match_agreement("/api/**", "/api"), Some(1));
+        assert_eq!(match_agreement("/files/(.*)", "/filesystem/a"), None);
     }
 
     #[test]
