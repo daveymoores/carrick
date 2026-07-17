@@ -1,0 +1,37 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "itemArchived",
+      "role": "subscriber",
+      "line_number": 13,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ time, item }",
+      "payload_expression_line": 13
+    },
+    {
+      "topic": "records.reindex",
+      "role": "subscriber",
+      "line_number": 23,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "payload",
+      "payload_expression_line": 23
+    },
+    {
+      "topic": "approval",
+      "role": "subscriber",
+      "line_number": 36,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "decision",
+      "payload_expression_line": 36
+    }
+  ]
+}

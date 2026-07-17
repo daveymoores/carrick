@@ -289,6 +289,17 @@ pub struct PubsubOperation {
     /// Not part of the operation's identity.
     #[serde(default)]
     pub broker: Option<String>,
+    /// Verbatim text of the value holding the decoded payload at this site: a
+    /// publisher's payload expression, or a subscriber handler's payload
+    /// parameter/binding. The locator for the sidecar's location-based
+    /// inference when `primary_type_symbol` is null (wrapper patterns whose
+    /// payload type is carried by a generic binding, never a bare identifier).
+    #[serde(default)]
+    pub payload_expression_text: Option<String>,
+    /// Line where the payload expression starts. Null whenever
+    /// `payload_expression_text` is null.
+    #[serde(default)]
+    pub payload_expression_line: Option<i32>,
 }
 
 /// Complete analysis result for a single file
@@ -697,6 +708,19 @@ impl FileAnalyzerAgent {
                 op.primary_type_symbol = None;
             }
             normalize_optional_string(&mut op.broker);
+            // Payload locator hygiene: a blank/null-like text is no locator, and
+            // a locator without a positive 1-based line can't anchor the
+            // sidecar's text search. Keep the pair consistent (text ⇔ line).
+            normalize_optional_string(&mut op.payload_expression_text);
+            if op
+                .payload_expression_line
+                .is_some_and(|line| line <= 0)
+            {
+                op.payload_expression_line = None;
+            }
+            if op.payload_expression_text.is_none() {
+                op.payload_expression_line = None;
+            }
             true
         });
 
@@ -970,7 +994,7 @@ primary_type_symbol, type_import_source
   - For payload_expression_text: copy the EXACT payload argument text if detected; emit null when the call sends no payload
   - For payload_expression_line: read the line number from the prefix; null whenever payload_expression_text is null
 
-For each pubsub_operation, include: topic, role, line_number, primary_type_symbol, type_import_source, broker
+For each pubsub_operation, include: topic, role, line_number, primary_type_symbol, type_import_source, broker, payload_expression_text, payload_expression_line
   - topic: the literal topic/channel/subject string (resolve a named const like TOPIC to its string literal)
   - role: "publisher" if the code SENDS a payload to a topic, "subscriber" if it REGISTERS a handler for a topic
   - line_number: read the line number from the prefix in the source code
@@ -1458,6 +1482,8 @@ mod tests {
             primary_type_symbol: None,
             type_import_source: None,
             broker: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
         };
 
         let mut result = FileAnalysisResult {

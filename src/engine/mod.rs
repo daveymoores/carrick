@@ -1188,8 +1188,14 @@ async fn analyze_current_repo_incremental(
             // GraphQL producers take the infer path, not the bundle path: their
             // response contract is the resolver's expanded RETURN type, so they
             // become `FunctionReturn` infer requests (Stage B1).
-            let graphql_producer_infer = file_orchestrator
+            let mut protocol_infer = file_orchestrator
                 .collect_graphql_producer_infer_requests(&protocol_extractions.graphql, repo_path);
+            // Pub/sub payloads with no named symbol (wrapper patterns:
+            // topic-map emitters, schema-catalog workers, generic channel
+            // handles) resolve via the LLM-located payload expression through
+            // the same infer path.
+            protocol_infer
+                .extend(file_orchestrator.collect_pubsub_infer_requests(&merged_results, repo_path));
 
             // Type resolution via sidecar
             resolve_types_if_available(
@@ -1201,7 +1207,7 @@ async fn analyze_current_repo_incremental(
                 &mount_graph,
                 config,
                 &protocol_requests,
-                &graphql_producer_infer,
+                &protocol_infer,
                 &mut cloud_data,
             );
 
@@ -2966,8 +2972,14 @@ async fn analyze_current_repo(
     // GraphQL producers take the infer path, not the bundle path: their response
     // contract is the resolver's expanded RETURN type, so they become
     // `FunctionReturn` infer requests (Stage B1).
-    let graphql_producer_infer = file_orchestrator
+    let mut protocol_infer = file_orchestrator
         .collect_graphql_producer_infer_requests(&protocol_extractions.graphql, repo_path);
+    // Pub/sub payloads with no named symbol (wrapper patterns: topic-map
+    // emitters, schema-catalog workers, generic channel handles) resolve via
+    // the LLM-located payload expression through the same infer path.
+    protocol_infer.extend(
+        file_orchestrator.collect_pubsub_infer_requests(&analysis_result.file_results, repo_path),
+    );
 
     resolve_types_if_available(
         sidecar,
@@ -2978,7 +2990,7 @@ async fn analyze_current_repo(
         &analysis_result.mount_graph,
         config,
         &protocol_requests,
-        &graphql_producer_infer,
+        &protocol_infer,
         &mut cloud_data,
     );
 
@@ -5595,6 +5607,8 @@ mod tests {
             primary_type_symbol: symbol.map(String::from),
             type_import_source: source.map(String::from),
             broker: Some("redis".to_string()),
+            payload_expression_text: None,
+            payload_expression_line: None,
         }
     }
 
@@ -6258,6 +6272,122 @@ mod tests {
         );
     }
 
+    /// The same fragile alias contract for the pub/sub INFER path (wrapper
+    /// patterns whose payload type is generic-bound, never a named symbol):
+    /// the `InferRequestItem` alias produced by `collect_pubsub_infer_requests`
+    /// MUST byte-match the manifest entry's alias from
+    /// `append_pubsub_manifest_entries` — same plain alias for subscribers
+    /// (producers), same call-site-disambiguated alias for publishers
+    /// (consumers) — or the resolved payload type never joins back and the op
+    /// stays `Unknown`, silently. Also pins the role → InferKind routing and
+    /// the isolation guard (a named anchor suppresses the infer request).
+    #[test]
+    fn pubsub_infer_request_alias_matches_manifest_alias() {
+        use crate::operation::PubsubRole;
+        use crate::services::type_sidecar::InferKind;
+
+        let locator_op = |topic: &str, role: PubsubRole, line: i32, text: &str| {
+            crate::agents::file_analyzer_agent::PubsubOperation {
+                topic: topic.to_string(),
+                role: Some(role),
+                line_number: line,
+                primary_type_symbol: None,
+                type_import_source: None,
+                broker: None,
+                payload_expression_text: Some(text.to_string()),
+                payload_expression_line: Some(line),
+            }
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "relay/src/relay.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![locator_op(
+                    "itemArchived",
+                    PubsubRole::Subscriber,
+                    13,
+                    "{ time, item }",
+                )],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "dispatch/src/dispatch.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![
+                    locator_op("itemArchived", PubsubRole::Publisher, 9, "event"),
+                    // Named anchor present → the bundle path owns this op; the
+                    // infer collector must emit NOTHING for it.
+                    crate::agents::file_analyzer_agent::PubsubOperation {
+                        topic: "orders.placed".to_string(),
+                        role: Some(PubsubRole::Publisher),
+                        line_number: 30,
+                        primary_type_symbol: Some("OrderPlaced".to_string()),
+                        type_import_source: None,
+                        broker: None,
+                        payload_expression_text: Some("order".to_string()),
+                        payload_expression_line: Some(30),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &crate::socket_io::SocketExtraction::default(),
+        );
+        let manifest_aliases: HashMap<ManifestRole, String> = entries
+            .iter()
+            .filter(|e| e.key.canonical() == "pubsub|itemArchived")
+            .map(|e| (e.role, e.type_alias.clone()))
+            .collect();
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
+
+        // Isolation guard: only the two locator-anchored itemArchived ops
+        // produce requests; the named-anchor op is excluded.
+        assert_eq!(requests.len(), 2, "requests: {requests:?}");
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.param_name.as_deref() == Some("order")
+                    || r.expression_text.as_deref() == Some("order")),
+            "an op with a primary_type_symbol must not also get an infer request"
+        );
+
+        // Subscriber (producer side): FunctionParam, param_name = locator text,
+        // plain alias byte-matching the manifest.
+        let subscriber = requests
+            .iter()
+            .find(|r| r.infer_kind == InferKind::FunctionParam)
+            .expect("subscriber infer request");
+        assert_eq!(subscriber.param_name.as_deref(), Some("{ time, item }"));
+        assert_eq!(
+            subscriber.alias.as_deref(),
+            manifest_aliases.get(&ManifestRole::Producer).map(|s| s.as_str()),
+            "subscriber infer alias must byte-match the Producer manifest alias"
+        );
+
+        // Publisher (consumer side): Expression, expression_text = locator
+        // text, call-site alias byte-matching the manifest.
+        let publisher = requests
+            .iter()
+            .find(|r| r.infer_kind == InferKind::Expression)
+            .expect("publisher infer request");
+        assert_eq!(publisher.expression_text.as_deref(), Some("event"));
+        assert_eq!(
+            publisher.alias.as_deref(),
+            manifest_aliases.get(&ManifestRole::Consumer).map(|s| s.as_str()),
+            "publisher infer alias must byte-match the Consumer manifest alias \
+             (same build_call_site_id over the same path/line/key)"
+        );
+    }
+
     /// PR-4: a subscriber pub/sub op carrying a decoded-payload
     /// `primary_type_symbol` reaches BOTH `cloud_data.endpoints` (via
     /// `append_pubsub_operations`, PR-3) AND the type manifest as a
@@ -6516,6 +6646,8 @@ mod tests {
                         primary_type_symbol: Some("Shipment".to_string()),
                         type_import_source: None,
                         broker: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
                     },
                 ],
                 ..Default::default()

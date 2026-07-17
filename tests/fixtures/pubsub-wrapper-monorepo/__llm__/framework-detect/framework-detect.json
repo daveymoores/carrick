@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": ["@fixture/contracts", "@fixture/relay"],
+  "notes": "Monorepo with an in-house typed messaging layer in the contracts workspace package."
+}

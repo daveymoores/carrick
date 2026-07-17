@@ -491,9 +491,19 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "nullable": true,
                                 "description": "Diagnostic only: the pub/sub library or transport the call uses if evident (e.g., 'redis'), or null. Not part of the operation's identity."
+                            },
+                            "payload_expression_text": {
+                                "type": "STRING",
+                                "nullable": true,
+                                "description": "Verbatim code text of the value that holds the DECODED payload at this operation, copied EXACTLY as it appears in the source code. For a `publisher`: the payload expression handed to the publish/send/enqueue call (e.g., 'event', '{ userId, plan }', or the initializer of a `payload:` property). For a `subscriber`: the handler parameter or destructured binding that holds the decoded payload (e.g., 'message', 'payload', '{ time, run }'). Emit this even when `primary_type_symbol` is null — it is how inline or generically-typed payloads get resolved. Null only when the operation carries no payload value."
+                            },
+                            "payload_expression_line": {
+                                "type": "INTEGER",
+                                "nullable": true,
+                                "description": "Line number where the payload expression starts (read from the line-number prefix in the source code). Null whenever `payload_expression_text` is null."
                             }
                         },
-                        "required": ["topic", "role", "line_number"]
+                        "required": ["topic", "role", "line_number", "payload_expression_text", "payload_expression_line"]
                     }
                 },
                 "graphql_consumer_locates": {
@@ -907,15 +917,29 @@ mod tests {
 
         assert_eq!(schema_values, serde_values);
 
-        // The three locating fields are always present; the type slots and the
-        // diagnostic broker stay optional/nullable.
+        // The locating fields are always present (required-but-nullable for the
+        // payload locator pair, same lever as data_calls: omission starves the
+        // sidecar); the type-judgment slots and the diagnostic broker stay
+        // optional/nullable.
         let required = schema["properties"]["pubsub_operations"]["items"]["required"]
             .as_array()
             .expect("pubsub_operations item required array must exist");
-        for field in ["topic", "role", "line_number"] {
+        for field in [
+            "topic",
+            "role",
+            "line_number",
+            "payload_expression_text",
+            "payload_expression_line",
+        ] {
             assert!(
                 required.iter().any(|v| v == field),
                 "pubsub_operations item required must contain {field}"
+            );
+        }
+        for field in ["primary_type_symbol", "type_import_source", "broker"] {
+            assert!(
+                !required.iter().any(|v| v == field),
+                "judgment/diagnostic field {field} must NOT be required on pubsub_operations"
             );
         }
 
