@@ -69,6 +69,28 @@ fn is_test_path(path: &Path, root_dir: &Path) -> bool {
     has_test_dir(path, root_dir) || has_test_suffix(path)
 }
 
+/// Whether any path segment BELOW the scan root matches an ignore pattern
+/// exactly. Matching whole segments (not substrings) keeps files like
+/// `src/buildkite.ts` or `lib/distances.ts` in scope, and stripping the root
+/// first means an explicitly configured scan root named after a pattern
+/// (e.g. a service directory `packages/build`) still gets scanned — only its
+/// descendants can trigger the ignore.
+fn is_ignored(path: &Path, root_dir: &Path, ignore_patterns: &[&str]) -> bool {
+    // A path outside the scan root has no segments "below the root" to test;
+    // matching against the full (possibly absolute) path would let ignore
+    // patterns hit unrelated leading segments.
+    let Ok(relative_path) = path.strip_prefix(root_dir) else {
+        return false;
+    };
+    relative_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .map(|segment| ignore_patterns.contains(&segment))
+            .unwrap_or(false)
+    })
+}
+
 /// Find all JavaScript and TypeScript files in a directory
 /// Also looks for carrick.json configuration file
 /// Returns (js_ts_files, config_file_option)
@@ -92,10 +114,7 @@ pub fn find_files(
             continue;
         }
 
-        if ignore_patterns
-            .iter()
-            .any(|pattern| path.to_string_lossy().contains(pattern))
-        {
+        if is_ignored(path, root_path, ignore_patterns) {
             continue;
         }
 
@@ -271,6 +290,118 @@ mod tests {
         assert_eq!(files, vec![source_file]);
         assert_eq!(config, Some(config_path));
         assert_eq!(package, Some(package_path));
+    }
+
+    const ARTIFACT_IGNORES: &[&str] = &["node_modules", "dist", "build", ".next"];
+
+    #[test]
+    fn find_files_ignore_matches_segments_not_substrings() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::create_dir_all(root.join("lib")).expect("lib dir");
+        fs::create_dir_all(root.join("builder")).expect("builder dir");
+
+        // Basenames and directory names that merely contain an ignore pattern
+        // as a substring must still be scanned.
+        let substring_in_basename = root.join("src").join("buildkite.ts");
+        let substring_in_basename_2 = root.join("lib").join("distances.ts");
+        let substring_in_dir = root.join("builder").join("plan.ts");
+
+        for f in [
+            &substring_in_basename,
+            &substring_in_basename_2,
+            &substring_in_dir,
+        ] {
+            File::create(f).expect("file");
+        }
+
+        let (mut files, _, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        files.sort();
+
+        let mut expected = vec![
+            substring_in_basename,
+            substring_in_basename_2,
+            substring_in_dir,
+        ];
+        expected.sort();
+        assert_eq!(files, expected);
+    }
+
+    #[test]
+    fn find_files_ignores_artifact_dirs_below_root() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::create_dir_all(root.join("node_modules").join("dep")).expect("node_modules dir");
+        fs::create_dir_all(root.join("dist")).expect("dist dir");
+        fs::create_dir_all(root.join("build")).expect("build dir");
+        fs::create_dir_all(root.join(".next").join("server")).expect(".next dir");
+
+        let kept = root.join("src").join("app.ts");
+        File::create(&kept).expect("kept file");
+        File::create(root.join("node_modules/dep/index.ts")).expect("dep file");
+        File::create(root.join("node_modules/dep/package.json")).expect("dep package");
+        File::create(root.join("dist/app.js")).expect("dist file");
+        File::create(root.join("build/app.js")).expect("build file");
+        File::create(root.join(".next/server/page.js")).expect(".next file");
+
+        let (files, _, package) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+
+        assert_eq!(files, vec![kept]);
+        // The package.json inside node_modules must not be picked up either.
+        assert_eq!(package, None);
+    }
+
+    #[test]
+    fn find_files_allows_root_dir_named_like_ignore_pattern() {
+        let tmp = tempdir().expect("temp dir");
+        // The explicitly configured scan root is named after an ignore
+        // pattern; only descendants below the root may trigger the ignore.
+        let root = tmp.path().join("packages").join("build");
+
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::create_dir_all(root.join("node_modules").join("dep")).expect("node_modules dir");
+
+        let kept = root.join("src").join("index.ts");
+        let pkg = root.join("package.json");
+        File::create(&kept).expect("kept file");
+        File::create(&pkg).expect("package file");
+        File::create(root.join("node_modules/dep/index.ts")).expect("dep file");
+
+        let (files, _, package) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+
+        assert_eq!(files, vec![kept]);
+        assert_eq!(package, Some(pkg));
+    }
+
+    #[test]
+    fn find_service_files_scans_service_root_named_like_ignore_pattern() {
+        use crate::config::Config;
+
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("packages/build/src")).expect("service dir");
+        fs::create_dir_all(root.join("packages/build/node_modules/dep")).expect("dep dir");
+
+        let kept = root.join("packages/build/src/index.ts");
+        let pkg = root.join("packages/build/package.json");
+        File::create(&kept).expect("kept file");
+        File::create(&pkg).expect("package file");
+        File::create(root.join("packages/build/node_modules/dep/index.ts")).expect("dep file");
+
+        let service = Config {
+            directory: Some("packages/build".to_string()),
+            ..Default::default()
+        };
+        let (files, package) =
+            find_service_files(root.to_str().unwrap(), &service, ARTIFACT_IGNORES);
+
+        assert_eq!(files, vec![kept]);
+        assert_eq!(package, Some(pkg));
     }
 
     #[test]
