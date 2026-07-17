@@ -20,7 +20,7 @@ use crate::{
     agent_service::AgentService,
     agents::{
         file_analyzer_agent::{
-            EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
+            EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent, PubsubOperation,
         },
         framework_guidance_agent::ProtocolGuidance,
     },
@@ -39,7 +39,7 @@ use crate::{
         ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
         TypeSidecar,
     },
-    swc_scanner::{CandidateTarget, RouteDescriptorEndpoint, SwcScanner},
+    swc_scanner::{CandidateTarget, PubsubAnchorOp, RouteDescriptorEndpoint, SwcScanner},
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
         is_http_method, normalize_manifest_method, parse_file_location,
@@ -99,6 +99,11 @@ pub struct ProcessingStats {
     /// (`{ method, path, handler }` in a registry array) rather than from the
     /// file-analyzer LLM. A subset of `total_endpoints`. See #234.
     pub route_descriptor_endpoints: usize,
+    /// Pub/sub operations asserted deterministically from the AST and merged in
+    /// because the file-analyzer's extraction omitted them (carrick#387). The
+    /// anchors themselves are computed for every gated file; only the ones the
+    /// LLM missed are counted here.
+    pub pubsub_anchor_backfills: usize,
     pub total_data_calls: usize,
     pub errors: Vec<String>,
 }
@@ -418,6 +423,10 @@ impl FileOrchestrator {
             /// user message so call sites of an imported wrapper can be emitted
             /// as resolved data calls. Empty for files with no such imports.
             wrapper_context: Vec<String>,
+            /// Pub/sub operations asserted deterministically from the AST
+            /// (carrick#387), merged in after the LLM pass so an extraction
+            /// omission cannot lose them. Empty when Signal 7's gates are off.
+            pubsub_anchor_ops: Vec<PubsubAnchorOp>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -700,6 +709,7 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
+                pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
             });
         }
 
@@ -829,6 +839,9 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
+                // Rescued zero-candidate files by definition raised no Signal 7
+                // candidate, so they can carry no anchor ops either.
+                pubsub_anchor_ops: Vec::new(),
             });
         }
 
@@ -931,6 +944,14 @@ impl FileOrchestrator {
                     // for such routes (#234).
                     stats.route_descriptor_endpoints +=
                         Self::merge_file_based_endpoints(&mut adjusted, pf.descriptor_endpoints);
+
+                    // Merge deterministically-anchored pub/sub operations the
+                    // LLM pass didn't already produce (carrick#387). A
+                    // payload-less publish/subscribe with a resolvable literal
+                    // topic is a structural fact — an extraction omission must
+                    // not lose the operation.
+                    stats.pubsub_anchor_backfills +=
+                        Self::merge_pubsub_anchor_ops(&mut adjusted, pf.pubsub_anchor_ops);
 
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
@@ -2579,6 +2600,51 @@ impl FileOrchestrator {
                 result.endpoints.push(ep);
                 added += 1;
             }
+        }
+        added
+    }
+
+    /// Merge deterministically-anchored pub/sub operations (carrick#387) into a
+    /// file's extraction, adding only the ops the LLM pass missed. An anchor is
+    /// considered covered — and skipped — exactly when the extraction already
+    /// carries its contribution: an op with the same (topic, role) pair, at any
+    /// line (the matching join is topic-keyed; one op per side suffices). Line
+    /// numbers deliberately play no part in coverage: a line can carry several
+    /// pub/sub ops, and an extracted op that shares the anchor's line but not
+    /// its topic (e.g. a template the model kept verbatim) does not put the
+    /// resolved topic on the wire — the anchor still must (Copilot review on
+    /// #389). Backfilled ops are payload-less by construction, so every
+    /// judgment field is `None`: there is no type to capture and no locator to
+    /// emit — pure topic recall.
+    fn merge_pubsub_anchor_ops(
+        result: &mut FileAnalysisResult,
+        anchor_ops: Vec<PubsubAnchorOp>,
+    ) -> usize {
+        let mut added = 0;
+        for anchor in anchor_ops {
+            let line = i32::try_from(anchor.line_number).unwrap_or(i32::MAX);
+            let covered = result
+                .pubsub_operations
+                .iter()
+                .any(|op| op.topic == anchor.topic && op.role == Some(anchor.role));
+            if covered {
+                continue;
+            }
+            debug!(
+                "Backfilling pub/sub op the extraction missed: {} ({:?}) at line {}",
+                anchor.topic, anchor.role, line
+            );
+            result.pubsub_operations.push(PubsubOperation {
+                topic: anchor.topic,
+                role: Some(anchor.role),
+                line_number: line,
+                primary_type_symbol: None,
+                type_import_source: None,
+                broker: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+            });
+            added += 1;
         }
         added
     }
@@ -6304,6 +6370,191 @@ const ESCALATE_MUTATION = gql`
         assert_eq!(
             keys.get("ESCALATE_MUTATION").map(String::as_str),
             Some("graphql|mutation|escalateTicket")
+        );
+    }
+
+    /// carrick#387: a deterministically-anchored payload-less pub/sub op the
+    /// LLM extraction missed is backfilled with all judgment fields `None`;
+    /// an anchor is covered — and skipped — exactly when the extraction
+    /// already carries its (topic, role) contribution. Line numbers play no
+    /// part in coverage: a line is not an operation identity.
+    #[test]
+    fn merge_pubsub_anchor_ops_backfills_only_missed_ops() {
+        use crate::agents::file_analyzer_agent::PubsubOperation;
+        use crate::operation::PubsubRole;
+        use crate::swc_scanner::PubsubAnchorOp;
+
+        let llm_op = |topic: &str, line: i32| PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(PubsubRole::Publisher),
+            line_number: line,
+            primary_type_symbol: None,
+            type_import_source: None,
+            broker: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+        };
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![
+                // Covers anchor (a): identical (topic, role) at the same site.
+                llm_op("PollController:pollingStarted", 182),
+                // Covers anchor (b) by (topic, role) at a different line — the
+                // topic is already on the publisher side, one op per side is
+                // all the matching join needs.
+                llm_op("PollController:stateChange", 90),
+            ],
+            ..Default::default()
+        };
+
+        let anchors = vec![
+            // (a) same (topic, role) as an extracted op -> skipped.
+            PubsubAnchorOp {
+                topic: "PollController:pollingStarted".to_string(),
+                role: PubsubRole::Publisher,
+                line_number: 182,
+            },
+            // (b) same (topic, role) as an extracted op at another line -> skipped.
+            PubsubAnchorOp {
+                topic: "PollController:stateChange".to_string(),
+                role: PubsubRole::Publisher,
+                line_number: 95,
+            },
+            // (c) genuinely missed -> backfilled.
+            PubsubAnchorOp {
+                topic: "PollController:pollingStopped".to_string(),
+                role: PubsubRole::Publisher,
+                line_number: 201,
+            },
+        ];
+
+        let added = FileOrchestrator::merge_pubsub_anchor_ops(&mut result, anchors);
+        assert_eq!(added, 1, "only the missed anchor must be backfilled");
+        assert_eq!(result.pubsub_operations.len(), 3);
+
+        let backfilled = result
+            .pubsub_operations
+            .iter()
+            .find(|op| op.topic == "PollController:pollingStopped")
+            .expect("missed anchor must be present after the merge");
+        assert_eq!(backfilled.role, Some(PubsubRole::Publisher));
+        assert_eq!(backfilled.line_number, 201);
+        assert_eq!(backfilled.primary_type_symbol, None);
+        assert_eq!(backfilled.type_import_source, None);
+        assert_eq!(backfilled.broker, None);
+        assert_eq!(backfilled.payload_expression_text, None);
+        assert_eq!(backfilled.payload_expression_line, None);
+    }
+
+    /// Copilot review on #389: an extracted op on the same LINE must not mask
+    /// a missing (topic, role) contribution — a line can carry several pub/sub
+    /// ops (`bus.publish('a'); bus.subscribe('b')` minified onto one line), and
+    /// the extraction may have produced only one of them, or one with a
+    /// different topic entirely (e.g. a template kept verbatim). Coverage is
+    /// keyed on (topic, role) alone.
+    #[test]
+    fn merge_pubsub_anchor_ops_same_line_does_not_mask_missing_ops() {
+        use crate::agents::file_analyzer_agent::PubsubOperation;
+        use crate::operation::PubsubRole;
+        use crate::swc_scanner::PubsubAnchorOp;
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![PubsubOperation {
+                topic: "jobs.retry".to_string(),
+                role: Some(PubsubRole::Publisher),
+                line_number: 7,
+                primary_type_symbol: None,
+                type_import_source: None,
+                broker: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+            }],
+            ..Default::default()
+        };
+
+        let anchors = vec![
+            // Publisher+subscriber share line 7; only the publisher was
+            // extracted -> the subscriber must backfill despite the shared line.
+            PubsubAnchorOp {
+                topic: "jobs.retry".to_string(),
+                role: PubsubRole::Publisher,
+                line_number: 7,
+            },
+            PubsubAnchorOp {
+                topic: "jobs.completed".to_string(),
+                role: PubsubRole::Subscriber,
+                line_number: 7,
+            },
+            // Same line, same role, DIFFERENT topic (the extraction kept a
+            // template verbatim, say) -> the resolved-topic anchor must
+            // backfill; the resolved literal is the joinable key.
+            PubsubAnchorOp {
+                topic: "jobs.failed".to_string(),
+                role: PubsubRole::Publisher,
+                line_number: 7,
+            },
+        ];
+
+        let added = FileOrchestrator::merge_pubsub_anchor_ops(&mut result, anchors);
+        assert_eq!(
+            added, 2,
+            "line-sharing must not mask the subscriber or the different-topic anchor"
+        );
+        assert!(
+            result
+                .pubsub_operations
+                .iter()
+                .any(|op| op.topic == "jobs.completed"
+                    && op.role == Some(PubsubRole::Subscriber)
+                    && op.line_number == 7),
+            "subscriber sharing the publisher's line must be backfilled"
+        );
+        assert!(
+            result
+                .pubsub_operations
+                .iter()
+                .any(|op| op.topic == "jobs.failed" && op.role == Some(PubsubRole::Publisher)),
+            "different-topic anchor on the same line must be backfilled"
+        );
+    }
+
+    /// Same topic on the OTHER side is not coverage: a publisher extraction
+    /// does not cover a subscriber anchor for the same topic.
+    #[test]
+    fn merge_pubsub_anchor_ops_role_disambiguates_coverage() {
+        use crate::agents::file_analyzer_agent::PubsubOperation;
+        use crate::operation::PubsubRole;
+        use crate::swc_scanner::PubsubAnchorOp;
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![PubsubOperation {
+                topic: "jobs.retry".to_string(),
+                role: Some(PubsubRole::Publisher),
+                line_number: 10,
+                primary_type_symbol: None,
+                type_import_source: None,
+                broker: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+            }],
+            ..Default::default()
+        };
+
+        let added = FileOrchestrator::merge_pubsub_anchor_ops(
+            &mut result,
+            vec![PubsubAnchorOp {
+                topic: "jobs.retry".to_string(),
+                role: PubsubRole::Subscriber,
+                line_number: 25,
+            }],
+        );
+        assert_eq!(added, 1);
+        assert!(
+            result
+                .pubsub_operations
+                .iter()
+                .any(|op| op.topic == "jobs.retry" && op.role == Some(PubsubRole::Subscriber)),
+            "subscriber anchor must be backfilled alongside the publisher extraction"
         );
     }
 }

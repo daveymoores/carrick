@@ -276,6 +276,7 @@ fn test_processing_stats_tracking() {
         total_endpoints: 10,
         file_based_endpoints: 2,
         route_descriptor_endpoints: 1,
+        pubsub_anchor_backfills: 0,
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
     };
