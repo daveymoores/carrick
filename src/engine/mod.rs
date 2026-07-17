@@ -6413,6 +6413,49 @@ mod tests {
         );
     }
 
+    /// A publisher locator whose `payload_expression_line` the model omitted
+    /// must still anchor the sidecar's text search: the collector defaults
+    /// `expression_line` to the operation's own line. An unanchored request
+    /// searches the whole file, and identical locator text at another site
+    /// can resolve a confidently wrong type — an anchored miss degrades to
+    /// Unknown instead (see the sidecar's `matchByText` window/proximity
+    /// selection, pinned by `infer-expression-line-anchor.test.ts`).
+    #[test]
+    fn pubsub_publisher_locator_defaults_expression_line_to_op_line() {
+        use crate::operation::PubsubRole;
+        use crate::services::type_sidecar::InferKind;
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "dispatch/src/dispatch.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![crate::agents::file_analyzer_agent::PubsubOperation {
+                    topic: "itemArchived".to_string(),
+                    role: Some(PubsubRole::Publisher),
+                    line_number: 9,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    broker: None,
+                    payload_expression_text: Some("event".to_string()),
+                    payload_expression_line: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.infer_kind, InferKind::Expression);
+        assert_eq!(
+            request.expression_line,
+            Some(9),
+            "a missing payload_expression_line must default to the op's line, \
+             not fall through to an unanchored file-wide search"
+        );
+    }
+
     /// PR-4: a subscriber pub/sub op carrying a decoded-payload
     /// `primary_type_symbol` reaches BOTH `cloud_data.endpoints` (via
     /// `append_pubsub_operations`, PR-3) AND the type manifest as a

@@ -742,9 +742,15 @@ impl FileAnalyzerAgent {
                 op.primary_type_symbol = None;
             }
             normalize_optional_string(&mut op.broker);
-            // Payload locator hygiene: a blank/null-like text is no locator, and
-            // a locator without a positive 1-based line can't anchor the
-            // sidecar's text search. Keep the pair consistent (text ⇔ line).
+            // Payload locator hygiene: a blank/null-like text is no locator,
+            // and a non-positive line is not a valid 1-based anchor. The line
+            // is a PRECISION aid, not a prerequisite — the sidecar's text
+            // search runs file-wide without one — so a valid text with a
+            // missing/invalid line is kept, and the infer collector
+            // (`collect_pubsub_infer_requests`) anchors the search to the
+            // operation's own line instead (the payload expression starts at
+            // the publish call; the handler starts at the subscribe call). A
+            // line WITHOUT a text is meaningless, so that direction nulls.
             normalize_optional_string(&mut op.payload_expression_text);
             // The model frequently copies a subscriber handler's payload
             // parameter WITH its arrow-parameter-list parens (`(decision)`,

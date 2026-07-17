@@ -114,9 +114,13 @@ fn find_op<'a>(
                 })
         })
         .collect();
-    assert!(
-        !matched.is_empty(),
-        "no `{side}` op with key `{key}` in `{file_suffix}`; keys present: {:?}",
+    assert_eq!(
+        matched.len(),
+        1,
+        "expected exactly one `{side}` op with key `{key}` in `{file_suffix}` \
+         (multi-site keys would make the assertions nondeterministic); \
+         found {}; keys present: {:?}",
+        matched.len(),
         ops.iter().map(|o| &o["key"]).collect::<Vec<_>>()
     );
     matched[0]

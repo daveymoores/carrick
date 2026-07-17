@@ -46,3 +46,30 @@ export function registerReindex(): void {
     console.log(payload.resourceId, payload.mode);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Multi-occurrence disambiguation: the SAME locator text (`payloadValue`)
+// appears at two publish sites with different types. A line-anchored
+// expression search must resolve each site's own type; an unanchored search
+// has no proximity signal and can bind the wrong occurrence.
+// ---------------------------------------------------------------------------
+
+declare function send(topic: string, payload: unknown): boolean;
+
+export function publishFirst(): void {
+  const payloadValue = { kind: "first", n: 1 };
+  void send("first.topic", payloadValue);
+}
+
+// Spacer comments keep the two occurrences farther apart than the text
+// search's +/-5-line window, so each anchored request can only see its own
+// site's occurrences.
+//
+//
+//
+//
+
+export function publishSecond(): void {
+  const payloadValue = { kind: "second", s: "x" };
+  void send("second.topic", payloadValue);
+}

@@ -1787,7 +1787,15 @@ impl FileOrchestrator {
                         span_start: None,
                         span_end: None,
                         expression_text: Some(text.clone()),
-                        expression_line,
+                        // Anchor the text search even when the model omitted the
+                        // expression's own line: the payload is an argument of
+                        // the publish call at the op's line, so it STARTS within
+                        // the sidecar's +/-5-line window of it. An unanchored
+                        // search scans the whole file and, for identical text at
+                        // multiple sites, has no proximity tie-break — a wrong
+                        // occurrence resolves a confidently wrong type, whereas
+                        // an anchored miss degrades to Unknown (recoverable).
+                        expression_line: expression_line.or(Some(line)),
                         infer_kind: InferKind::Expression,
                         alias: Some(alias),
                         param_name: None,
