@@ -109,9 +109,9 @@ fn find_op<'a>(
         .iter()
         .filter(|op| {
             op["key"].as_str() == Some(key)
-                && op["file"]
-                    .as_str()
-                    .is_some_and(|f| Path::new(f).ends_with(file_suffix) || f.ends_with(file_suffix))
+                && op["file"].as_str().is_some_and(|f| {
+                    Path::new(f).ends_with(file_suffix) || f.ends_with(file_suffix)
+                })
         })
         .collect();
     assert!(
@@ -162,12 +162,22 @@ fn pubsub_wrapper_payloads_resolve_on_both_sides() {
 
     // Shape 2: schema-catalog queue worker (payload via mapped/conditional types).
     assert_resolved(
-        find_op(&projection, "calls", "pubsub|records.reindex", "dispatch.ts"),
+        find_op(
+            &projection,
+            "calls",
+            "pubsub|records.reindex",
+            "dispatch.ts",
+        ),
         "worker.enqueue publisher",
         &["resourceId", "mode"],
     );
     assert_resolved(
-        find_op(&projection, "endpoints", "pubsub|records.reindex", "relay.ts"),
+        find_op(
+            &projection,
+            "endpoints",
+            "pubsub|records.reindex",
+            "relay.ts",
+        ),
         "jobs-map subscriber (envelope binding element)",
         &["resourceId", "mode"],
     );

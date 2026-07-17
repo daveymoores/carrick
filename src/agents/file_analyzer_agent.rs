@@ -761,10 +761,7 @@ impl FileAnalyzerAgent {
                     Some(stripped.to_string())
                 };
             }
-            if op
-                .payload_expression_line
-                .is_some_and(|line| line <= 0)
-            {
+            if op.payload_expression_line.is_some_and(|line| line <= 0) {
                 op.payload_expression_line = None;
             }
             if op.payload_expression_text.is_none() {
@@ -1571,10 +1568,7 @@ mod tests {
                 Some("payload"),
             ]
         );
-        assert_eq!(
-            lines,
-            vec![Some(36), Some(13), Some(1), None, None, None]
-        );
+        assert_eq!(lines, vec![Some(36), Some(13), Some(1), None, None, None]);
     }
 
     #[test]

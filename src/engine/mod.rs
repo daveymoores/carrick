@@ -1194,8 +1194,9 @@ async fn analyze_current_repo_incremental(
             // topic-map emitters, schema-catalog workers, generic channel
             // handles) resolve via the LLM-located payload expression through
             // the same infer path.
-            protocol_infer
-                .extend(file_orchestrator.collect_pubsub_infer_requests(&merged_results, repo_path));
+            protocol_infer.extend(
+                file_orchestrator.collect_pubsub_infer_requests(&merged_results, repo_path),
+            );
 
             // Type resolution via sidecar
             resolve_types_if_available(
@@ -6389,7 +6390,9 @@ mod tests {
         assert_eq!(subscriber.param_name.as_deref(), Some("{ time, item }"));
         assert_eq!(
             subscriber.alias.as_deref(),
-            manifest_aliases.get(&ManifestRole::Producer).map(|s| s.as_str()),
+            manifest_aliases
+                .get(&ManifestRole::Producer)
+                .map(|s| s.as_str()),
             "subscriber infer alias must byte-match the Producer manifest alias"
         );
 
@@ -6402,7 +6405,9 @@ mod tests {
         assert_eq!(publisher.expression_text.as_deref(), Some("event"));
         assert_eq!(
             publisher.alias.as_deref(),
-            manifest_aliases.get(&ManifestRole::Consumer).map(|s| s.as_str()),
+            manifest_aliases
+                .get(&ManifestRole::Consumer)
+                .map(|s| s.as_str()),
             "publisher infer alias must byte-match the Consumer manifest alias \
              (same build_call_site_id over the same path/line/key)"
         );
