@@ -3148,6 +3148,8 @@ fn write_bundle_files(all_repo_data: &[CloudRepoData], output_dir: &std::path::P
     }
 }
 
+// End-to-end flow and failure modes of manifest-based cross-repo type
+// checking: docs/reference/type-checking-flow.md
 fn recreate_type_files_and_check(
     all_repo_data: &[CloudRepoData],
     packages: &Packages,

@@ -7,6 +7,8 @@
  *
  * Usage:
  *   npx ts-node run-type-checking.ts <tsconfig-path> --producer <path> --consumer <path> [options]
+ *
+ * End-to-end flow and failure modes: docs/reference/type-checking-flow.md
  */
 
 import { TypeCompatibilityChecker } from "./lib/type-checker";

@@ -21,4 +21,6 @@ If you need to touch a Lambda, Terraform, or a prompt, the change goes in `carri
 
 `AGENTS.md` is the canonical repo-guidelines doc — read it for project structure, build commands, testing conventions, and commit style.
 
+Reading or writing documentation, or running evals? Start at `docs/README.md` — the map. It says where everything lives and where new docs go; don't place a doc without it. Otherwise ignore `docs/`.
+
 The Carrick → carrick-cloud split landed in 2026-05. Follow-up work (OAuth dashboard, ELv2 relicense + flip public, etc.) is tracked as GitHub issues.

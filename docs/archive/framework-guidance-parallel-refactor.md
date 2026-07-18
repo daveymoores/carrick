@@ -5,8 +5,8 @@
 ## ⚠️ IMPORTANT: REQUIRED READING BEFORE IMPLEMENTING
 
 **YOU MUST READ THESE FILES FIRST:**
-1. `.thoughts/README.md` - Project overview and current status
-2. `.thoughts/OUTSTANDING_WORK.md` - Prioritized next steps
+1. `.thoughts/README.md` - Project overview and current status (dir no longer exists; historical)
+2. `.thoughts/OUTSTANDING_WORK.md` - Prioritized next steps (dir no longer exists; historical)
 3. `lambdas/README.md` - Lambda function documentation
 
 ---

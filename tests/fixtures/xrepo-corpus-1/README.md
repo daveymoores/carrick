@@ -6,7 +6,7 @@ first, code built to match, never derived from a scan. Change a label only by ha
 in a separate commit, reviewed against the spec — never to match scanner output.
 
 - Field shapes and per-metric comparison rules: the scorer contract
-  (`carrick-cloud/docs/internal/cross-repo-eval-scorer-contract.md`).
+  (`carrick-cloud/docs/internal/decisions/cross-repo-eval-scorer-contract.md`).
 - Per-failure-mode spec: build plan §6.
 
 ## Repos
@@ -37,7 +37,7 @@ producer only fires when the env var is classified internal
 the HTTP edges never form (a fresh corpus scan showed cross-repo match F1 = 0).
 This is deliberate: the explicit internal/external classification is kept
 (internal-by-default was considered and rejected — see
-`carrick-cloud/docs/internal/cross-repo-call-classification-decision.md`).
+`carrick-cloud/docs/internal/decisions/cross-repo-call-classification-decision.md`).
 
 **GraphQL and Socket.IO need no connection-classification config.** Their
 matchers (`Analyzer::analyze_exact_key_matches`, `src/analyzer/mod.rs`) key on

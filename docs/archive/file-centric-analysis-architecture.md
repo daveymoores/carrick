@@ -327,7 +327,7 @@ FileOrchestrator
 | Dependencies | Manual traversal | Automatic bundling |
 | Framework Support | Framework-specific patterns | Framework-agnostic |
 
-For detailed architecture documentation, see: `docs/research/compiler-sidecar-architecture/ARCHITECTURE.md`
+For detailed architecture documentation, see: `docs/archive/compiler-sidecar-architecture/ARCHITECTURE.md`
 
 ---
 
