@@ -345,6 +345,17 @@ struct PubsubTopicWitnessCollector {
 }
 
 impl PubsubTopicWitnessCollector {
+    /// Record a composed-string pattern, unless every static part is empty
+    /// (`` `${x}` ``, `a + b`): a fully dynamic composition provides no
+    /// textual evidence FOR any particular topic, and recording it would make
+    /// every topic vacuously witnessed, defeating the guard (Copilot review
+    /// on #395).
+    fn push_pattern(&mut self, quasis: Vec<String>) {
+        if quasis.iter().any(|q| !q.is_empty()) {
+            self.template_patterns.push(quasis);
+        }
+    }
+
     fn witnessed(&self, topic: &str) -> bool {
         self.literals.contains(topic)
             || self
@@ -375,7 +386,7 @@ impl Visit for PubsubTopicWitnessCollector {
         if tpl.exprs.is_empty() {
             self.literals.insert(quasis.concat());
         } else {
-            self.template_patterns.push(quasis);
+            self.push_pattern(quasis);
         }
     }
 
@@ -407,7 +418,7 @@ impl Visit for PubsubTopicWitnessCollector {
         }
         // Inner sub-chains are visited again by the traversal and yield
         // strictly more lenient sub-patterns; the redundancy is harmless.
-        self.template_patterns.push(quasis);
+        self.push_pattern(quasis);
     }
 }
 
@@ -6961,6 +6972,41 @@ export class PollController {
             ],
             "inline, const-ref, template-composed, and concat-composed topics must all survive"
         );
+    }
+
+    /// Copilot review on #395: a fully dynamic composition (`` `${x}` ``,
+    /// `a + b`) has no static parts and must not act as a match-anything
+    /// witness — a phantom topic in a file containing one is still dropped.
+    #[test]
+    fn suppress_phantom_pubsub_topics_ignores_fully_dynamic_compositions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("dynamic.ts");
+        std::fs::write(
+            &file_path,
+            r#"
+import { publishStatusChanged } from "./status.publisher";
+
+export function run(evt: object, label: string, tail: string): void {
+  const rendered = `${label}`;
+  const joined = label + tail;
+  console.log(rendered, joined);
+  publishStatusChanged(evt);
+}
+"#,
+        )
+        .unwrap();
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![phantom_guard_op("status.changed", 8)],
+            ..Default::default()
+        };
+
+        let dropped = FileOrchestrator::suppress_phantom_pubsub_topics(&mut result, &file_path);
+        assert_eq!(
+            dropped, 1,
+            "a fully dynamic template or concat must not witness the phantom"
+        );
+        assert!(result.pubsub_operations.is_empty());
     }
 
     /// The template witness anchors on the static parts: a composed topic must
