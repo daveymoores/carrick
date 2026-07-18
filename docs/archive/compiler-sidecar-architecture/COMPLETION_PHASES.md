@@ -29,7 +29,7 @@ Key folders:
 - Rust engine: `src/`
 - Type sidecar: `src/sidecar/`
 - Type checker: `ts_check/`
-- Research docs: `docs/research/compiler-sidecar-architecture/`
+- Research docs: `docs/archive/compiler-sidecar-architecture/`
 
 Do not run Terraform commands in this repo.
 

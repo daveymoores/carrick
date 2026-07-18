@@ -14,7 +14,7 @@
 - `src/sidecar/` is the TypeScript type-extraction sidecar with tests in `src/sidecar/test/`.
 - `ts_check/` runs the final cross-repo HTTP type-compatibility check. The scanner discovers it at runtime (`run-type-checking.ts`, via `discover_ts_check_path` in `src/main.rs`) and spawns it with `npx ts-node` to compare producer/consumer manifests. Type *extraction* now lives in `src/sidecar/`; `ts_check/` retains only the compatibility check. It is bundled into the released Action artifact and gated by the pre-commit hook — not legacy or optional.
 - `scripts/` contains developer tooling (pre-commit hook installer).
-- `docs/research/` stores architecture and research notes.
+- `docs/` — see `docs/README.md` for the map and where to put new docs: `docs/reference/` (durable subsystem docs), `docs/archive/` (frozen historical plans), `docs/evals.md` (how to run every eval and scanner run).
 - `action.yml` defines the GitHub Action entrypoint.
 - `examples/` contains reference Express services used as e2e fixtures by CI and as user-facing demos.
 
@@ -33,6 +33,8 @@ cargo test
 cargo test --test integration_test
 cargo fmt
 cargo clippy
+
+# Evals (Tier-A, cross-repo, OSS runs): see docs/evals.md
 
 # Type sidecar (Node)
 cd src/sidecar

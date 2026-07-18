@@ -294,5 +294,5 @@ Log format:
 ## See Also
 
 - `src/services/type_sidecar.rs` - Rust client for the sidecar
-- `docs/research/compiler-sidecar-architecture/ARCHITECTURE.md` - Full architecture documentation
-- `docs/research/compiler-sidecar-architecture/IMPLEMENTATION_PLAN.md` - Implementation plan
+- `docs/archive/compiler-sidecar-architecture/ARCHITECTURE.md` - Full architecture documentation
+- `docs/archive/compiler-sidecar-architecture/IMPLEMENTATION_PLAN.md` - Implementation plan

@@ -581,7 +581,7 @@ This document provides sequential prompts for implementing the Compiler Sidecar 
 >    - Document the sidecar architecture
 >    - Update the Type Checking System section
 > 
-> 3. Update `docs/research/file-centric-analysis-architecture.md`:
+> 3. Update `docs/archive/file-centric-analysis-architecture.md`:
 >    - Add section on type extraction via sidecar
 >    - Remove references to position-based extraction
 > 
