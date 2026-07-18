@@ -31,7 +31,10 @@ their answer-key conventions).
 
 1. **Explaining how something works?** → `reference/`, or the component's own
    README if it's component-scoped. Extend an existing doc before creating a
-   new file.
+   new file. A reference doc must be pointed to by a comment at the code it
+   governs — code work reaches docs through those pointers, not by browsing
+   this tree, so an unreferenced reference doc is invisible: link it or
+   delete it.
 2. **Explaining how to run something?** → `evals.md` for eval/run procedure;
    `AGENTS.md` for everyday build/test commands.
 3. **Planning or handing off work?** → a GitHub issue, not a doc. If a plan
