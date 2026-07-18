@@ -1177,6 +1177,7 @@ impl FileOrchestrator {
                 &file_path,
                 line_number,
                 &OperationKey::http(&method, path.clone()),
+                repo_path,
             );
             data_call_lookup
                 .entry((file_path, line_number))
@@ -1432,6 +1433,7 @@ impl FileOrchestrator {
                                 file_path,
                                 line_number,
                                 &OperationKey::http(&method_fallback, target_path.clone()),
+                                repo_path,
                             ),
                         )
                     });
@@ -1674,15 +1676,17 @@ impl FileOrchestrator {
                 // publishers (consumers) disambiguate by call site so fan-in
                 // publishers don't collide on one alias; subscribers (producers)
                 // stay plain. `build_call_site_id` MUST see the same (path, line,
-                // key) the manifest side passes — `path` is the raw `file_results`
-                // key on both sides — or the alias diverges and the resolution
-                // enrich-join silently drops the resolved payload type.
+                // key, repo_root) the manifest side passes — `path` is the raw
+                // `file_results` key on both sides and the id relativizes it
+                // against `repo_root` internally (#355) — or the alias diverges
+                // and the resolution enrich-join silently drops the resolved
+                // payload type.
                 let alias = match role {
                     ManifestRole::Consumer => {
                         // Same >= 1 clamp as the manifest side (see
                         // `append_pubsub_manifest_entries`) so the call_id matches.
                         let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
-                        let call_id = build_call_site_id(path, line, &key);
+                        let call_id = build_call_site_id(path, line, &key, repo_path);
                         build_manifest_type_alias_with_call_id(
                             &key,
                             role,
@@ -1804,7 +1808,7 @@ impl FileOrchestrator {
                 let key = OperationKey::pubsub(op.topic.clone());
                 let alias = match role {
                     ManifestRole::Consumer => {
-                        let call_id = build_call_site_id(path, line, &key);
+                        let call_id = build_call_site_id(path, line, &key, repo_path);
                         build_manifest_type_alias_with_call_id(
                             &key,
                             role,
