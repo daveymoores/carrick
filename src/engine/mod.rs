@@ -1158,13 +1158,14 @@ async fn analyze_current_repo_incremental(
             cloud_data.cache_version = Some(CACHE_VERSION);
 
             // Build type manifest
-            let mut manifest_entries = build_type_manifest_entries(&mount_graph, config);
+            let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
             stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
             append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
                 &merged_results,
                 &protocol_extractions.sockets,
+                repo_path,
             );
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
@@ -1658,6 +1659,7 @@ fn append_pubsub_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     sockets: &crate::socket_io::SocketExtraction,
+    repo_root: &str,
 ) {
     use crate::operation::PubsubRole;
 
@@ -1696,7 +1698,7 @@ fn append_pubsub_manifest_entries(
             // Subscribers (producers) keep the plain alias: one definition per
             // topic per repo, exactly like an HTTP endpoint.
             let call_id = match role {
-                ManifestRole::Consumer => Some(build_call_site_id(path, line, &key)),
+                ManifestRole::Consumer => Some(build_call_site_id(path, line, &key, repo_root)),
                 ManifestRole::Producer => None,
             };
             add_protocol_manifest_entry(
@@ -2460,6 +2462,7 @@ fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut Clou
 fn build_type_manifest_entries(
     mount_graph: &MountGraph,
     config: &Config,
+    repo_root: &str,
 ) -> Vec<TypeManifestEntry> {
     let normalizer = UrlNormalizer::new(config);
     let mut entries = Vec::new();
@@ -2529,15 +2532,14 @@ fn build_type_manifest_entries(
         // Only anchor types for a BARE route (internal/declared or relative
         // target). An external or unclassified call keeps its raw `${HOST}/path`
         // / full-URL canonical form: it has no internal producer to match, so a
-        // type anchor would be unused — and its `call_id` (a hash of the absolute
-        // file path) would make byte-compared goldens non-portable across
-        // machines. Mirrors main, where the raw projection key never joined an
-        // external call's `extract_path`-keyed manifest entry.
+        // type anchor would be unused. Mirrors main, where the raw projection
+        // key never joined an external call's `extract_path`-keyed manifest
+        // entry.
         if !path.starts_with('/') {
             continue;
         }
         let key = OperationKey::http(&method, path);
-        let call_id = build_call_site_id(&file_path, line_number, &key);
+        let call_id = build_call_site_id(&file_path, line_number, &key, repo_root);
 
         add_manifest_pair(
             &mut entries,
@@ -2930,13 +2932,15 @@ async fn analyze_current_repo(
         &analysis_result.file_results,
     );
 
-    let mut manifest_entries = build_type_manifest_entries(&analysis_result.mount_graph, config);
+    let mut manifest_entries =
+        build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
     stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
     append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
     append_pubsub_manifest_entries(
         &mut manifest_entries,
         &analysis_result.file_results,
         &protocol_extractions.sockets,
+        repo_path,
     );
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
@@ -4534,7 +4538,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             ),
         ];
 
-        let entries = build_type_manifest_entries(&mount_graph, &config);
+        let entries = build_type_manifest_entries(&mount_graph, &config, ".");
 
         let consumer_paths: Vec<&str> = entries
             .iter()
@@ -4593,7 +4597,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             mk_endpoint("src/routes/orders.ts:42"),
         ];
 
-        let entries = build_type_manifest_entries(&mount_graph, &config);
+        let entries = build_type_manifest_entries(&mount_graph, &config, ".");
 
         let producer_aliases: Vec<&str> = entries
             .iter()
@@ -4655,7 +4659,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             repo_name: None,
         }];
 
-        let entries = build_type_manifest_entries(&mount_graph, &config);
+        let entries = build_type_manifest_entries(&mount_graph, &config, ".");
 
         assert!(
             entries.iter().all(|e| e.role != ManifestRole::Producer),
@@ -6558,6 +6562,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            ".",
         );
         let manifest_alias = entries
             .iter()
@@ -6635,6 +6640,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            ".",
         );
         let manifest_aliases: HashSet<String> = entries
             .iter()
@@ -6739,6 +6745,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            ".",
         );
         let manifest_aliases: HashMap<ManifestRole, String> = entries
             .iter()
@@ -6930,6 +6937,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            ".",
         );
 
         let producer = entries
@@ -7062,7 +7070,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
         // Manifest side folds identically: no orphan anchor for the folded op,
         // the real pub/sub op still anchors.
         let mut entries = Vec::new();
-        append_pubsub_manifest_entries(&mut entries, &file_results, &extractions.sockets);
+        append_pubsub_manifest_entries(&mut entries, &file_results, &extractions.sockets, ".");
         assert_eq!(
             entries
                 .iter()
@@ -7115,6 +7123,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            ".",
         );
 
         let untyped = entries
