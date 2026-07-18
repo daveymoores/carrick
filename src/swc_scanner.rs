@@ -1062,7 +1062,6 @@ impl CandidateVisitor {
         })
     }
 
-    /// Extract callee object name from expression
     /// Property name of a member-expression callee (`axios.post(...)` ->
     /// "post", `w['post'](...)` -> "post"). `None` for non-member callees and
     /// non-literal computed properties. Used by the structural signals (URL
@@ -1086,6 +1085,7 @@ impl CandidateVisitor {
         }
     }
 
+    /// Extract callee object name from expression
     fn extract_callee_object(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Ident(ident) => Some(ident.sym.to_string()),
@@ -1300,13 +1300,10 @@ impl Visit for CandidateVisitor {
             && let Some(root) = Self::callee_root_ident(callee_expr)
             && self.network_import_locals.contains(&root)
         {
-            let property = match &**callee_expr {
-                Expr::Member(member) => match &member.prop {
-                    MemberProp::Ident(id) => Some(id.sym.to_string()),
-                    _ => None,
-                },
-                _ => None,
-            };
+            // Same member-property extraction as Signals 3/4 (incl. computed
+            // string properties like `client["post"](url)`), so every signal
+            // that can emit this span first labels it identically.
+            let property = Self::callee_member_prop(callee_expr);
             self.push_candidate(call, root, property);
         }
 
@@ -1705,6 +1702,26 @@ export async function record(event: unknown): Promise<void> {
         let b = pick(&without_fetcher);
         assert_eq!(a, b, "candidate must not depend on data_fetchers");
         assert_eq!(a.2.as_deref(), Some("post"));
+    }
+
+    #[test]
+    fn imported_fetcher_computed_property_call_carries_property() {
+        // Signal 2 (import-gated) must extract computed string properties the
+        // same way Signals 3/4 do, so whichever signal emits a span first
+        // labels it identically.
+        let content = r#"
+import client from "client-lib";
+export async function load() {
+  await client["post"]("/things", {});
+}
+"#;
+        let result = scan_test_content_with_fetchers(content, &["client-lib".to_string()]);
+        let c = result
+            .candidates
+            .iter()
+            .find(|c| c.callee_object == "client")
+            .expect("imported-fetcher candidate must be emitted");
+        assert_eq!(c.callee_property.as_deref(), Some("post"));
     }
 
     #[test]
