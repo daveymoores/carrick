@@ -55,7 +55,7 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
-use swc_ecma_ast::{BindingIdent, Expr, Pat, TsEntityName, TsType, VarDeclarator};
+use swc_ecma_ast::{BindingIdent, Expr, Pat, Str, Tpl, TsEntityName, TsType, VarDeclarator};
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
 
@@ -104,6 +104,12 @@ pub struct ProcessingStats {
     /// anchors themselves are computed for every gated file; only the ones the
     /// LLM missed are counted here.
     pub pubsub_anchor_backfills: usize,
+    /// LLM-emitted pub/sub operations dropped because their topic has no
+    /// literal witness (string literal or template-literal shape) in the
+    /// analyzed file's source (carrick#311). The analyzer occasionally invents
+    /// a topic from a wrapper-function NAME (`publishStatusChanged` ->
+    /// `status.changed`); the real op lives in the file that holds the literal.
+    pub pubsub_phantom_topic_drops: usize,
     pub total_data_calls: usize,
     pub errors: Vec<String>,
 }
@@ -311,6 +317,91 @@ impl Visit for BindingTypeCollector {
         }
         n.visit_children_with(self);
     }
+}
+
+/// Collects the textual witnesses `suppress_phantom_pubsub_topics` checks an
+/// LLM-emitted pub/sub topic against (carrick#311): every string-literal value
+/// in the file, plus the static-part shape of every template literal. A topic
+/// is witnessed when it equals a literal (inline topics and same-file
+/// const-ref topics) or fits a template's static parts in order (composed
+/// topics like `` `${this.name}:stateChange` `` -> `PollController:stateChange`,
+/// which the analyzer resolves from context the AST pre-pass cannot). Witness
+/// collection is deliberately lenient — any literal anywhere in the file
+/// counts — because the guard is a precision tool: it only needs to reject
+/// topics with NO textual basis at all, the invented-from-a-function-name
+/// class.
+#[derive(Default)]
+struct PubsubTopicWitnessCollector {
+    /// Every string-literal value in the file, including zero-interpolation
+    /// template literals.
+    literals: HashSet<String>,
+    /// The cooked static parts (quasis, in order) of every template literal
+    /// with at least one interpolation.
+    template_patterns: Vec<Vec<String>>,
+}
+
+impl PubsubTopicWitnessCollector {
+    fn witnessed(&self, topic: &str) -> bool {
+        self.literals.contains(topic)
+            || self
+                .template_patterns
+                .iter()
+                .any(|quasis| template_pattern_matches(quasis, topic))
+    }
+}
+
+impl Visit for PubsubTopicWitnessCollector {
+    fn visit_str(&mut self, s: &Str) {
+        self.literals.insert(s.value.to_string());
+    }
+
+    fn visit_tpl(&mut self, tpl: &Tpl) {
+        // Interpolations can contain further literals (`${flag ? 'a' : 'b'}`).
+        tpl.visit_children_with(self);
+        let cooked: Option<Vec<String>> = tpl
+            .quasis
+            .iter()
+            .map(|q| q.cooked.as_ref().map(|c| c.to_string()))
+            .collect();
+        // A quasi with no cooked value contains an invalid escape; such a
+        // template is not a usable witness.
+        let Some(quasis) = cooked else {
+            return;
+        };
+        if tpl.exprs.is_empty() {
+            self.literals.insert(quasis.concat());
+        } else {
+            self.template_patterns.push(quasis);
+        }
+    }
+}
+
+/// Glob-style match of a topic against a template literal's static parts:
+/// `quasis` are the cooked strings between interpolations, so the topic fits
+/// when it starts with the first quasi, ends with the last, and contains the
+/// middle ones in order — each interpolation matching any (possibly empty)
+/// text. Middles are consumed greedily left to right, which is exact for the
+/// non-overlapping shapes topic templates take.
+fn template_pattern_matches(quasis: &[String], topic: &str) -> bool {
+    let Some((first, rest)) = quasis.split_first() else {
+        return false;
+    };
+    let Some(after_prefix) = topic.strip_prefix(first.as_str()) else {
+        return false;
+    };
+    let Some((last, middle)) = rest.split_last() else {
+        // A single quasi means no interpolations: exact match only (already
+        // covered by the literal set, kept for correctness).
+        return after_prefix.is_empty();
+    };
+    let mut remaining = after_prefix;
+    for quasi in middle {
+        match remaining.find(quasi.as_str()) {
+            Some(idx) => remaining = &remaining[idx + quasi.len()..],
+            None => return false,
+        }
+    }
+    remaining.ends_with(last.as_str())
 }
 
 /// Orchestrates file-centric analysis using the FileAnalyzerAgent.
@@ -944,6 +1035,15 @@ impl FileOrchestrator {
                     // for such routes (#234).
                     stats.route_descriptor_endpoints +=
                         Self::merge_file_based_endpoints(&mut adjusted, pf.descriptor_endpoints);
+
+                    // Drop LLM-emitted pub/sub ops whose topic has no literal
+                    // witness in the file's source (carrick#311): the analyzer
+                    // occasionally invents a topic from a wrapper-function
+                    // NAME (`publishStatusChanged` -> `status.changed`). Must
+                    // run before the anchor merge below so deterministic
+                    // anchor ops are never candidates for the drop.
+                    stats.pubsub_phantom_topic_drops +=
+                        Self::suppress_phantom_pubsub_topics(&mut adjusted, file_path);
 
                     // Merge deterministically-anchored pub/sub operations the
                     // LLM pass didn't already produce (carrick#387). A
@@ -2368,6 +2468,52 @@ impl FileOrchestrator {
                 dc.target = key.clone();
             }
         }
+    }
+
+    /// Drop a `pubsub_operations` entry whose topic has no textual witness in
+    /// the analyzed file's source (carrick#311).
+    ///
+    /// The file-analyzer occasionally invents a topic from a wrapper-function
+    /// NAME: `worker.ts` calls `publishStatusChanged(evt)` (imported from
+    /// `./status.publisher`) and the model emits a phantom
+    /// `pubsub|status.changed` op even though no such string exists anywhere in
+    /// the file. The real operation is extracted from the file that holds the
+    /// literal, so the phantom is pure precision noise. Enforcing the existing
+    /// only-literal-topics extraction contract (`append_pubsub_operations` doc)
+    /// deterministically: a kept topic must equal a string literal in the file
+    /// or fit a template literal's static parts (see
+    /// [`PubsubTopicWitnessCollector`] for why both forms count). Runs BEFORE
+    /// `merge_pubsub_anchor_ops`, so deterministic anchor ops (carrick#387) are
+    /// never candidates for the drop. An unparseable file yields no witness
+    /// evidence either way, so everything is kept (fail open, like the other
+    /// re-parse guards). Returns the number of ops dropped.
+    fn suppress_phantom_pubsub_topics(result: &mut FileAnalysisResult, file_path: &Path) -> usize {
+        // Gate: only re-parse when there is a pub/sub op to check.
+        if result.pubsub_operations.is_empty() {
+            return 0;
+        }
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        let Some(module) = parse_file(file_path, &cm, &handler) else {
+            return 0;
+        };
+        let mut witnesses = PubsubTopicWitnessCollector::default();
+        module.visit_with(&mut witnesses);
+
+        let before = result.pubsub_operations.len();
+        result.pubsub_operations.retain(|op| {
+            let witnessed = witnesses.witnessed(&op.topic);
+            if !witnessed {
+                debug!(
+                    topic = %op.topic,
+                    file = %file_path.display(),
+                    "pub/sub topic has no literal witness in the file; dropping phantom op"
+                );
+            }
+            witnessed
+        });
+        before - result.pubsub_operations.len()
     }
 
     fn validate_type_hints(result: &mut FileAnalysisResult, symbol_table: &SymbolTable) {
@@ -6650,6 +6796,152 @@ const ESCALATE_MUTATION = gql`
                 .iter()
                 .any(|op| op.topic == "jobs.retry" && op.role == Some(PubsubRole::Subscriber)),
             "subscriber anchor must be backfilled alongside the publisher extraction"
+        );
+    }
+
+    /// Test-local pub/sub op constructor for the phantom-topic guard tests.
+    fn phantom_guard_op(
+        topic: &str,
+        line: i32,
+    ) -> crate::agents::file_analyzer_agent::PubsubOperation {
+        crate::agents::file_analyzer_agent::PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(crate::operation::PubsubRole::Publisher),
+            line_number: line,
+            primary_type_symbol: None,
+            type_import_source: None,
+            broker: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+        }
+    }
+
+    /// carrick#311 reproduction: `worker.ts` calls `publishStatusChanged(evt)`
+    /// (a wrapper imported from `./status.publisher`) and contains no topic
+    /// literal at all, but the analyzer emits a `status.changed` op derived
+    /// from the function NAME. No literal witness -> the phantom is dropped.
+    #[test]
+    fn suppress_phantom_pubsub_topics_drops_wrapper_name_derived_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("worker.ts");
+        std::fs::write(
+            &file_path,
+            r#"
+import { publishStatusChanged } from "./status.publisher";
+import type { OrderEvent } from "./types";
+
+export async function processOrder(evt: OrderEvent): Promise<void> {
+  await publishStatusChanged(evt);
+}
+"#,
+        )
+        .unwrap();
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![phantom_guard_op("status.changed", 6)],
+            ..Default::default()
+        };
+
+        let dropped = FileOrchestrator::suppress_phantom_pubsub_topics(&mut result, &file_path);
+        assert_eq!(dropped, 1, "the name-derived phantom topic must be dropped");
+        assert!(
+            result.pubsub_operations.is_empty(),
+            "no op may survive in a file with no topic witness, got {:?}",
+            result.pubsub_operations
+        );
+    }
+
+    /// Every literal-witnessed topic form survives the guard: an inline
+    /// string-literal topic, a same-file const-ref topic (the literal lives in
+    /// the const initializer), and a template-composed topic the analyzer
+    /// resolved from context the AST pre-pass cannot reach (a class-property
+    /// interpolation, the MetaMask messenger shape). A phantom mixed into the
+    /// same file is still dropped.
+    #[test]
+    fn suppress_phantom_pubsub_topics_keeps_literal_witnessed_topics() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("controller.ts");
+        std::fs::write(
+            &file_path,
+            r#"
+import { bus } from "somebus";
+
+const SUBJECT = "user.registered";
+
+export class PollController {
+  private name = "PollController";
+
+  run(payload: object, state: object): void {
+    bus.publish("orders.created", payload);
+    bus.publish(SUBJECT, payload);
+    bus.publish(`${this.name}:stateChange`, state);
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut result = FileAnalysisResult {
+            pubsub_operations: vec![
+                phantom_guard_op("orders.created", 10),
+                phantom_guard_op("user.registered", 11),
+                phantom_guard_op("PollController:stateChange", 12),
+                // Invented from nothing in this file -> must be dropped.
+                phantom_guard_op("status.changed", 12),
+            ],
+            ..Default::default()
+        };
+
+        let dropped = FileOrchestrator::suppress_phantom_pubsub_topics(&mut result, &file_path);
+        assert_eq!(dropped, 1, "only the unwitnessed topic may be dropped");
+        let topics: Vec<&str> = result
+            .pubsub_operations
+            .iter()
+            .map(|op| op.topic.as_str())
+            .collect();
+        assert_eq!(
+            topics,
+            vec![
+                "orders.created",
+                "user.registered",
+                "PollController:stateChange"
+            ],
+            "inline, const-ref, and template-composed topics must all survive"
+        );
+    }
+
+    /// The template witness anchors on the static parts: a composed topic must
+    /// start with the first quasi, contain the middles in order, and end with
+    /// the last quasi. A topic that merely shares no shape with any template
+    /// is not witnessed.
+    #[test]
+    fn template_pattern_matches_anchors_static_parts() {
+        let leading_interp = vec![String::new(), ":stateChange".to_string()];
+        assert!(template_pattern_matches(
+            &leading_interp,
+            "PollController:stateChange"
+        ));
+        assert!(!template_pattern_matches(&leading_interp, "status.changed"));
+
+        let trailing_interp = vec!["orders.".to_string(), String::new()];
+        assert!(template_pattern_matches(&trailing_interp, "orders.created"));
+        assert!(
+            !template_pattern_matches(&trailing_interp, "prefix.orders.created"),
+            "the first quasi anchors as a prefix"
+        );
+
+        let middle_interp = vec![
+            "jobs.".to_string(),
+            ".retry.".to_string(),
+            ".done".to_string(),
+        ];
+        assert!(template_pattern_matches(
+            &middle_interp,
+            "jobs.email.retry.3.done"
+        ));
+        assert!(
+            !template_pattern_matches(&middle_interp, "jobs.email.retry.3"),
+            "the last quasi anchors as a suffix"
         );
     }
 }
