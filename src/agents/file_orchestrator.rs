@@ -55,7 +55,9 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
-use swc_ecma_ast::{BindingIdent, Expr, Pat, Str, Tpl, TsEntityName, TsType, VarDeclarator};
+use swc_ecma_ast::{
+    BinExpr, BinaryOp, BindingIdent, Expr, Lit, Pat, Str, Tpl, TsEntityName, TsType, VarDeclarator,
+};
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
 
@@ -321,22 +323,24 @@ impl Visit for BindingTypeCollector {
 
 /// Collects the textual witnesses `suppress_phantom_pubsub_topics` checks an
 /// LLM-emitted pub/sub topic against (carrick#311): every string-literal value
-/// in the file, plus the static-part shape of every template literal. A topic
-/// is witnessed when it equals a literal (inline topics and same-file
-/// const-ref topics) or fits a template's static parts in order (composed
-/// topics like `` `${this.name}:stateChange` `` -> `PollController:stateChange`,
-/// which the analyzer resolves from context the AST pre-pass cannot). Witness
-/// collection is deliberately lenient — any literal anywhere in the file
-/// counts — because the guard is a precision tool: it only needs to reject
-/// topics with NO textual basis at all, the invented-from-a-function-name
-/// class.
+/// in the file, plus the static-part shape of every composed string (template
+/// literal or `+` concatenation chain). A topic is witnessed when it equals a
+/// literal (inline topics and same-file const-ref topics) or fits a composed
+/// shape's static parts in order (topics like `` `${this.name}:stateChange` ``
+/// -> `PollController:stateChange`, which the analyzer resolves from context
+/// the AST pre-pass cannot). Witness collection is deliberately lenient — any
+/// literal anywhere in the file counts — because the guard is a precision
+/// tool: it only needs to reject topics with NO textual basis at all, the
+/// invented-from-a-function-name class.
 #[derive(Default)]
 struct PubsubTopicWitnessCollector {
     /// Every string-literal value in the file, including zero-interpolation
     /// template literals.
     literals: HashSet<String>,
-    /// The cooked static parts (quasis, in order) of every template literal
-    /// with at least one interpolation.
+    /// The static parts, in order, of every composed string in the file: the
+    /// cooked quasis of a template literal with at least one interpolation,
+    /// and the literal operands of a `+` chain containing at least one string
+    /// literal (dynamic pieces become the gaps between parts).
     template_patterns: Vec<Vec<String>>,
 }
 
@@ -373,6 +377,52 @@ impl Visit for PubsubTopicWitnessCollector {
         } else {
             self.template_patterns.push(quasis);
         }
+    }
+
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        // Operands can contain further literals and composed strings.
+        n.visit_children_with(self);
+        if n.op != BinaryOp::Add {
+            return;
+        }
+        // A `+` chain composes a string the same way a template literal does:
+        // `'orders.' + kind + '.changed'` witnesses `orders.<anything>.changed`.
+        // Record it as the equivalent static-part pattern. Chains with no
+        // string-literal operand (numeric arithmetic) are not string witnesses.
+        let mut parts: Vec<Option<String>> = Vec::new();
+        flatten_concat_parts(&n.left, &mut parts);
+        flatten_concat_parts(&n.right, &mut parts);
+        if !parts.iter().any(Option::is_some) {
+            return;
+        }
+        let mut quasis = vec![String::new()];
+        for part in parts {
+            match part {
+                Some(text) => quasis
+                    .last_mut()
+                    .expect("quasis starts non-empty")
+                    .push_str(&text),
+                None => quasis.push(String::new()),
+            }
+        }
+        // Inner sub-chains are visited again by the traversal and yield
+        // strictly more lenient sub-patterns; the redundancy is harmless.
+        self.template_patterns.push(quasis);
+    }
+}
+
+/// Flatten a `+` expression tree into its ordered operands for the concat
+/// witness: a string-literal operand contributes its value, anything dynamic
+/// contributes a gap (`None`).
+fn flatten_concat_parts(expr: &Expr, parts: &mut Vec<Option<String>>) {
+    match expr {
+        Expr::Bin(bin) if bin.op == BinaryOp::Add => {
+            flatten_concat_parts(&bin.left, parts);
+            flatten_concat_parts(&bin.right, parts);
+        }
+        Expr::Paren(paren) => flatten_concat_parts(&paren.expr, parts),
+        Expr::Lit(Lit::Str(s)) => parts.push(Some(s.value.to_string())),
+        _ => parts.push(None),
     }
 }
 
@@ -2481,8 +2531,8 @@ impl FileOrchestrator {
     /// literal, so the phantom is pure precision noise. Enforcing the existing
     /// only-literal-topics extraction contract (`append_pubsub_operations` doc)
     /// deterministically: a kept topic must equal a string literal in the file
-    /// or fit a template literal's static parts (see
-    /// [`PubsubTopicWitnessCollector`] for why both forms count). Runs BEFORE
+    /// or fit the static parts of a composed string (template literal or `+`
+    /// concatenation; see [`PubsubTopicWitnessCollector`]). Runs BEFORE
     /// `merge_pubsub_anchor_ops`, so deterministic anchor ops (carrick#387) are
     /// never candidates for the drop. An unparseable file yields no witness
     /// evidence either way, so everything is kept (fail open, like the other
@@ -6871,10 +6921,11 @@ const SUBJECT = "user.registered";
 export class PollController {
   private name = "PollController";
 
-  run(payload: object, state: object): void {
+  run(payload: object, state: object, kind: string): void {
     bus.publish("orders.created", payload);
     bus.publish(SUBJECT, payload);
     bus.publish(`${this.name}:stateChange`, state);
+    bus.publish("orders." + kind + ".changed", payload);
   }
 }
 "#,
@@ -6886,6 +6937,7 @@ export class PollController {
                 phantom_guard_op("orders.created", 10),
                 phantom_guard_op("user.registered", 11),
                 phantom_guard_op("PollController:stateChange", 12),
+                phantom_guard_op("orders.priority.changed", 13),
                 // Invented from nothing in this file -> must be dropped.
                 phantom_guard_op("status.changed", 12),
             ],
@@ -6904,9 +6956,10 @@ export class PollController {
             vec![
                 "orders.created",
                 "user.registered",
-                "PollController:stateChange"
+                "PollController:stateChange",
+                "orders.priority.changed"
             ],
-            "inline, const-ref, and template-composed topics must all survive"
+            "inline, const-ref, template-composed, and concat-composed topics must all survive"
         );
     }
 
