@@ -1,5 +1,8 @@
 # docs/ — map and placement rules
 
+Read this when you need to find existing documentation or add new
+documentation; nothing else requires it.
+
 Documentation for the public Carrick scanner. The private companion repo
 (`carrick-cloud`) uses the same layout under `docs/internal/`; user-facing
 product docs live there in `docs-site/` (docs.carrick.tools), not here.
