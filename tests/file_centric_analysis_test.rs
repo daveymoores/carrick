@@ -277,6 +277,7 @@ fn test_processing_stats_tracking() {
         file_based_endpoints: 2,
         route_descriptor_endpoints: 1,
         pubsub_anchor_backfills: 0,
+        pubsub_phantom_topic_drops: 0,
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
     };
