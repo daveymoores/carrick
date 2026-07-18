@@ -3660,25 +3660,45 @@ impl FileOrchestrator {
 
     /// Resolve full paths for endpoints by traversing the mount graph.
     fn resolve_endpoint_paths(&self, graph: &mut MountGraph) {
-        // Build owner -> mount path prefix map
-        let mut owner_prefixes: HashMap<String, String> = HashMap::new();
-
-        // Traverse mounts to build path prefixes
+        // Build owner -> mount path prefixes map. A child mounted under
+        // several prefixes (path aliases, e.g. the same sub-router mounted at
+        // both `/api/v2` and `/api/v2-beta`) serves its routes under EACH of
+        // them, so every prefix is kept separately (#373). Concatenating them
+        // into one string produced junk keys like `/api/v2/api/v2-beta/x` and
+        // silently dropped every alias's endpoint set but the fused one.
+        let mut owner_prefixes: HashMap<String, Vec<String>> = HashMap::new();
         for mount in &graph.mounts {
-            let existing = owner_prefixes
-                .get(&mount.child)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let new_prefix = format!("{}{}", existing, mount.path_prefix);
-            owner_prefixes.insert(mount.child.clone(), new_prefix);
-        }
-
-        // Apply prefixes to endpoints
-        for endpoint in &mut graph.endpoints {
-            if let Some(prefix) = owner_prefixes.get(&endpoint.owner) {
-                endpoint.full_path = Self::join_paths(prefix, &endpoint.path);
+            let prefixes = owner_prefixes.entry(mount.child.clone()).or_default();
+            if !prefixes.contains(&mount.path_prefix) {
+                prefixes.push(mount.path_prefix.clone());
             }
         }
+
+        // Apply prefixes to endpoints, fanning an endpoint out once per
+        // distinct alias prefix. Endpoints whose owner is not mounted keep
+        // their path as the full path.
+        let mut resolved = Vec::with_capacity(graph.endpoints.len());
+        for endpoint in graph.endpoints.drain(..) {
+            match owner_prefixes.get(&endpoint.owner) {
+                Some(prefixes) => {
+                    let mut seen_full_paths: HashSet<String> = HashSet::new();
+                    for prefix in prefixes {
+                        let full_path = Self::join_paths(prefix, &endpoint.path);
+                        // Distinct prefixes can still join to the same full
+                        // path (the idempotent guard in `join_paths` skips a
+                        // prefix the path already carries); emit each full
+                        // path once.
+                        if seen_full_paths.insert(full_path.clone()) {
+                            let mut fanned = endpoint.clone();
+                            fanned.full_path = full_path;
+                            resolved.push(fanned);
+                        }
+                    }
+                }
+                None => resolved.push(endpoint),
+            }
+        }
+        graph.endpoints = resolved;
     }
 
     /// Reclassify endpoints whose evidence is actually a client call
@@ -4216,6 +4236,77 @@ mod tests {
         assert_eq!(graph.mounts[0].parent, "app");
         assert_eq!(graph.mounts[0].child, "userRouter");
         assert_eq!(graph.mounts[0].path_prefix, "/users");
+    }
+
+    /// #373: a sub-router mounted under multiple path aliases serves its routes
+    /// under EACH alias. Reproduces the reported Hono shape
+    /// (`app.route('/api/v2', downloadRoute); app.route('/api/v2-beta', downloadRoute)`):
+    /// the two mount prefixes must fan out into one endpoint per alias, not
+    /// concatenate into a junk key like `/api/v2/api/v2-beta/download`.
+    #[test]
+    fn test_build_mount_graph_fans_out_mount_path_aliases() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mount = |line_number: i32, mount_path: &str| MountResult {
+            line_number,
+            parent_node: "app".to_string(),
+            child_node: "downloadRoute".to_string(),
+            mount_path: mount_path.to_string(),
+            import_source: Some("./routes/download".to_string()),
+            pattern_matched: ".route(".to_string(),
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/app.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![mount(10, "/api/v2"), mount(11, "/api/v2-beta")],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "src/routes/download.ts".to_string(),
+            FileAnalysisResult {
+                endpoints: vec![EndpointResult {
+                    candidate_id: "span:100-140".to_string(),
+                    line_number: 5,
+                    owner_node: "downloadRoute".to_string(),
+                    method: "GET".to_string(),
+                    path: "/download".to_string(),
+                    handler_name: "getDownload".to_string(),
+                    pattern_matched: ".get(".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
+
+        let mut full_paths: Vec<&str> = graph
+            .endpoints
+            .iter()
+            .map(|e| e.full_path.as_str())
+            .collect();
+        full_paths.sort_unstable();
+        assert_eq!(
+            full_paths,
+            vec!["/api/v2-beta/download", "/api/v2/download"],
+            "each mount alias must yield its own endpoint"
+        );
     }
 
     #[test]
