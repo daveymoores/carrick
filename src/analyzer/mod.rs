@@ -106,7 +106,9 @@ pub struct CrossRepoMatch {
     pub producer_repo: String,
     /// `OperationKey::canonical()` of the producer endpoint (mount-resolved path).
     pub producer_key: String,
-    /// Repo id of the consumer call.
+    /// Repo id of the consumer call (service_name ?? repo_name — the SAME
+    /// convention as `producer_repo`, so the two sides of an edge join on one
+    /// identity; #368).
     pub consumer_repo: String,
     /// `OperationKey::canonical()` of the consumer call (URL-normalized path).
     pub consumer_key: String,
@@ -1433,10 +1435,14 @@ impl Analyzer {
         type SharedGroup = (BTreeSet<String>, BTreeSet<String>);
         let mut shared_contract_groups: BTreeMap<(String, String), SharedGroup> = BTreeMap::new();
 
-        // Consumer repo lookup: a call's `(METHOD, canonical_path, file_location)`
-        // → owning repo. `merge_from_repos` tags each merged data call with its
-        // repo; `self.calls` carry only `(key, file_path)`, so this re-attaches
-        // the repo identity at the matching site. Keyed on `canonical_path` (NOT
+        // Consumer id lookup: a call's `(METHOD, canonical_path, file_location)`
+        // → owning `service_name ?? repo_name` id — the SAME id convention the
+        // producer side resolves through `endpoint.service_name ??
+        // endpoint.repo_name`, so both sides of an edge join on one identity
+        // (#368; a repo-only consumer id left monorepo rows asymmetric).
+        // `merge_from_repos` tags each merged data call with its repo and
+        // service; `self.calls` carry only `(key, file_path)`, so this
+        // re-attaches the identity at the matching site. Keyed on `canonical_path` (NOT
         // the raw `target_url`) because that is exactly the path the matcher looks
         // up with — `self.calls[].key` is `OperationKey::http(method,
         // canonical_path)`, so `build_cross_repo_match`'s `target` is the bare
@@ -1447,14 +1453,14 @@ impl Analyzer {
             .get_data_calls()
             .iter()
             .filter_map(|c| {
-                c.repo_name.as_ref().map(|repo| {
+                c.service_name.as_ref().or(c.repo_name.as_ref()).map(|id| {
                     (
                         (
                             c.method.to_uppercase(),
                             c.canonical_path.clone(),
                             c.file_location.clone(),
                         ),
-                        repo.clone(),
+                        id.clone(),
                     )
                 })
             })
@@ -1779,9 +1785,10 @@ impl Analyzer {
     }
 
     /// Build a [`CrossRepoMatch`] from a matched consumer call + producer
-    /// endpoint. Returns `None` only when the consumer's repo cannot be
-    /// attributed (no `repo_name` tag in the merged graph for this call) — an
-    /// edge without both repo ids is not useful to the scorer.
+    /// endpoint. Both sides carry the `service_name ?? repo_name` id (#368).
+    /// Returns `None` only when the consumer cannot be attributed (no
+    /// `service_name`/`repo_name` tag in the merged graph for this call) — an
+    /// edge without both ids is not useful to the scorer.
     ///
     /// `match_score` is `1.0`: every edge captured here is an exact
     /// normalized-key match (there is no finer scorer yet). `type_compatible`
@@ -3688,6 +3695,7 @@ mod tests {
             file_location: "client.ts:12".to_string(),
             call_kind: None,
             repo_name: Some("consumer-repo".to_string()),
+            service_name: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -3792,6 +3800,7 @@ mod tests {
             file_location: "src/widgets-client.ts:33".to_string(),
             call_kind: None,
             repo_name: Some("repo-beta".to_string()),
+            service_name: None,
         });
         analyzer
             .calls
@@ -3864,6 +3873,7 @@ mod tests {
             file_location: "src/widgets-client.ts:33".to_string(),
             call_kind: None,
             repo_name: Some("repo-beta".to_string()),
+            service_name: None,
         });
         analyzer
             .calls
@@ -3919,6 +3929,7 @@ mod tests {
             file_location: "operations/create-widget.ts:14".to_string(),
             call_kind: None,
             repo_name: Some("repo-alpha".to_string()),
+            service_name: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -4817,7 +4828,53 @@ mod tests {
             file_location: file.to_string(),
             call_kind: None,
             repo_name: Some(repo.to_string()),
+            service_name: None,
         }
+    }
+
+    /// Convention pin (#368): both sides of a cross-repo match row carry the
+    /// `service_name ?? repo_name` id. In a monorepo (carrick.json
+    /// `services[]`) producer AND consumer are named by service; a repo-only
+    /// consumer id left rows asymmetric (`web -> <repo>`), breaking every
+    /// join on edge identity — the eval scorer's owner attribution and the
+    /// cloud's `attach_compat_verdicts` consumer filter included.
+    #[test]
+    fn match_row_ids_are_service_qualified_on_both_sides() {
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(Config::default(), cm);
+
+        analyzer.calls.push(http_call(
+            "POST",
+            "/api/v2/client/:workspaceId/user",
+            "apps/web/src/client.ts:12",
+        ));
+
+        let mut mount_graph = MountGraph::new();
+        // Producer: the `api` service of monorepo `acme-mono`.
+        let mut producer = resolved_in("POST", "/api/v2/client/:workspaceId/user", "acme-mono");
+        producer.service_name = Some("api".to_string());
+        mount_graph.endpoints.push(producer);
+        // Consumer: the `web` service of the same monorepo.
+        let mut consumer = data_call_in(
+            "POST",
+            "/api/v2/client/:workspaceId/user",
+            "apps/web/src/client.ts:12",
+            "acme-mono",
+        );
+        consumer.service_name = Some("web".to_string());
+        mount_graph.data_calls.push(consumer);
+
+        let (_, _, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(edges.len(), 1, "expected one edge, got {edges:?}");
+        assert_eq!(
+            (
+                edges[0].producer_repo.as_str(),
+                edges[0].consumer_repo.as_str()
+            ),
+            ("api", "web"),
+            "both sides must carry the service-qualified id"
+        );
     }
 
     /// KILL (#381): a wildcard-only producer (`GET /*`, the SPA fallback

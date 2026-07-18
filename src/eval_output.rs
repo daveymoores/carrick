@@ -77,6 +77,12 @@ pub struct EvalOp {
 }
 
 /// A structured producer→consumer edge (contract §2 FROZEN field set).
+///
+/// `producer_repo` and `consumer_repo` both carry the `service_name ??
+/// repo_name` id — one convention on BOTH sides (#368). In a plain repo that
+/// is the repo name; in a monorepo with carrick.json `services[]` it is the
+/// service name, on the producer AND the consumer, so a join on edge identity
+/// never sees a service on one side and a repo on the other.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CrossRepoMatch {
     pub producer_repo: String,
