@@ -1582,13 +1582,15 @@ fn overall_correctness(cap: &TierScore, compat_scored: bool) -> f64 {
     dims.iter().sum::<f64>() / dims.len() as f64
 }
 
-/// Whether a run's per-edge diagnostics block should print. Run 1 always prints
-/// (the healthy reference to diff a dip against); any later run prints only when
-/// it dipped: a scored dimension below full marks (surfaced as OVERALL < 100%,
-/// exact because a mean of exact 1.0s is exactly 1.0), a decoy leak, or an
-/// absent compat verdict (§7). Keeps CI output sane — a clean N-run eval prints
-/// one block, while a dip run captures its own failing signature in the log it
-/// happened in instead of forcing a manual re-root-cause next session.
+/// Whether a run dipped and therefore needs its per-edge diagnostics block: a
+/// scored dimension below full marks (surfaced as OVERALL < 100%, exact because
+/// a mean of exact 1.0s is exactly 1.0), a decoy leak, or an absent compat
+/// verdict (§7). The caller additionally always prints run 1 as the healthy
+/// reference to diff a dip against (`run_idx == 1 || run_needs_diag(..)`);
+/// run indexing is deliberately not this predicate's concern. Keeps CI output
+/// sane — a clean N-run eval prints one block, while a dip run captures its own
+/// failing signature in the log it happened in instead of forcing a manual
+/// re-root-cause next session.
 fn run_needs_diag(cap: &TierScore, compat_scored: bool, decoy_leak: usize) -> bool {
     !compat_scored || decoy_leak > 0 || overall_correctness(cap, compat_scored) < 1.0
 }
