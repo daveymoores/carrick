@@ -93,9 +93,22 @@ jobs:
           # term on large corpora (fresh eval runs never carry a prior scan's
           # content-hash cache). Skip them in eval scans.
           CARRICK_SKIP_INTENTS: "1"
+          # #359 capture mode: persist every file-analyzer request/response so
+          # the exact live prompt for any file can be replayed in the cloud
+          # prompt harness. The scanner child processes inherit this env.
+          CARRICK_EVAL_DUMP_DIR: ${{ github.workspace }}/target/eval-dump
         run: |
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture
+
+      # #359: raw analyzer I/O per file (input prompt + raw model response).
+      - name: Upload analyzer dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyzer-dump
+          path: target/eval-dump/
+          if-no-files-found: warn
 
       # Archive the cross-repo type-check artifacts so compat verdicts are
       # inspectable post-run. The release binary auto-discovers ts_check/ via
