@@ -443,13 +443,25 @@ export class TypeInferrer {
     }
 
     const isExplicit = target.param.getTypeNode() !== undefined;
-    const typeString = typeText(target.node.getType(), target.node);
+    const paramType = target.node.getType();
+    const typeString = typeText(paramType, target.node);
 
+    // Deterministic anchor for the pub/sub two-anchor arbitration
+    // (carrick#413): report the payload type's root symbol, its declaration
+    // file, and the peeled array depth. The type STRING deliberately keeps
+    // ts-morph's default named form (see the doc comment above) — the
+    // scanner re-aims the explicit bundle at the root symbol instead of
+    // pasting this string, so the alias's definition stays self-contained.
+    const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(paramType));
     return this.createInferredType(
       request,
       typeString,
       isExplicit,
-      this.getNodeLocation(target.node)
+      this.getNodeLocation(target.node),
+      undefined,
+      this.primaryTypeSymbol(anchor.element),
+      anchor.depth,
+      this.primaryTypeSymbolSource(anchor.element)
     );
   }
 
@@ -809,12 +821,25 @@ export class TypeInferrer {
 
     typeString = this.unwrapPromise(typeString, type);
 
+    // Deterministic anchor for the pub/sub two-anchor arbitration
+    // (carrick#413). When an unwrap rule fired (envelope publishers), the
+    // anchor follows the extracted PAYLOAD type, so a correct explicit
+    // anchor naming the inner contract type reads as agreement, never as a
+    // disagreement to arbitrate.
+    const anchorSource =
+      unwrapResult.wasUnwrapped && unwrapResult.payloadType
+        ? unwrapResult.payloadType
+        : type;
+    const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource));
     return this.createInferredType(
       request,
       typeString,
       false,
       this.getNodeLocation(node),
-      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
+      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
+      this.primaryTypeSymbol(anchor.element),
+      anchor.depth,
+      this.primaryTypeSymbolSource(anchor.element)
     );
   }
 
@@ -1817,6 +1842,23 @@ export class TypeInferrer {
   }
 
   /**
+   * Declaration file (absolute path) of the anchor symbol
+   * `primaryTypeSymbol` reports for this type, or `undefined` when the type
+   * has no user-facing anchor or no source declaration. The scanner's
+   * pub/sub two-anchor arbitration (carrick#413) uses this to re-aim a
+   * demoted explicit bundle request: the bundler resolves a `SymbolRequest`
+   * only against declarations IN its `source_file`, so the request must
+   * point at the file that actually declares the tsc-witnessed payload type.
+   */
+  private primaryTypeSymbolSource(type: Type): string | undefined {
+    if (this.primaryTypeSymbol(type) === undefined) {
+      return undefined;
+    }
+    const decl = (type.getSymbol() || type.getAliasSymbol())?.getDeclarations()?.[0];
+    return decl?.getSourceFile().getFilePath();
+  }
+
+  /**
    * Peel array levels off a resolved type: `TimelineEvent[]` → element
    * `TimelineEvent`, depth 1. An array type's own symbol is `Array` (builtin,
    * filtered), so without this a `T[]` payload has NO anchor and — worse — an
@@ -2638,7 +2680,8 @@ export class TypeInferrer {
     sourceLocation: SourceLocation,
     payloadTypeString?: string,
     primaryTypeSymbol?: string,
-    arrayDepth?: number
+    arrayDepth?: number,
+    primaryTypeSymbolSource?: string
   ): InferredType {
     const alias =
       request.alias ||
@@ -2658,6 +2701,9 @@ export class TypeInferrer {
         primaryTypeSymbol !== undefined && arrayDepth !== undefined && arrayDepth > 0
           ? arrayDepth
           : undefined,
+      // Same gate: a declaration source without an anchor symbol is useless.
+      primary_type_symbol_source:
+        primaryTypeSymbol !== undefined ? primaryTypeSymbolSource : undefined,
     };
   }
 

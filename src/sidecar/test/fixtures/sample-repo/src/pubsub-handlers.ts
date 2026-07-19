@@ -73,3 +73,24 @@ export function publishSecond(): void {
   const payloadValue = { kind: "second", s: "x" };
   void send("second.topic", payloadValue);
 }
+
+// ---------------------------------------------------------------------------
+// Named-annotation payloads for the two-anchor arbitration (carrick#413):
+// the subscriber param and the publisher argument both carry a NAMED payload
+// type, so the deterministic anchor (primary_type_symbol + its declaration
+// source file) must be reported alongside the named type string.
+// ---------------------------------------------------------------------------
+
+export interface OrderPlacedPayload {
+  orderId: string;
+  totalCents: number;
+}
+
+export function onOrderPlaced(evt: OrderPlacedPayload): void {
+  void evt;
+}
+
+export function publishOrder(): void {
+  const order: OrderPlacedPayload = { orderId: "o1", totalCents: 100 };
+  void send("orders.placed", order);
+}

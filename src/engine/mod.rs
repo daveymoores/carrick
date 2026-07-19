@@ -5587,6 +5587,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
             array_depth: None,
+            primary_type_symbol_source: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -5615,6 +5616,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
             array_depth: None,
+            primary_type_symbol_source: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -5643,6 +5645,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: Some(symbol.to_string()),
             array_depth: None,
+            primary_type_symbol_source: None,
         }
     }
 
@@ -6781,8 +6784,9 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
     /// `append_pubsub_manifest_entries` — same plain alias for subscribers
     /// (producers), same call-site-disambiguated alias for publishers
     /// (consumers) — or the resolved payload type never joins back and the op
-    /// stays `Unknown`, silently. Also pins the role → InferKind routing and
-    /// the isolation guard (a named anchor suppresses the infer request).
+    /// stays `Unknown`, silently. Also pins the role → InferKind routing, the
+    /// two-anchor co-emission (#413: a named anchor no longer suppresses the
+    /// infer request — the sidecar arbitrates), and the envelope-copy guard.
     #[test]
     fn pubsub_infer_request_alias_matches_manifest_alias() {
         use crate::operation::PubsubRole;
@@ -6819,8 +6823,11 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             FileAnalysisResult {
                 pubsub_operations: vec![
                     locator_op("itemArchived", PubsubRole::Publisher, 9, "event"),
-                    // Named anchor present → the bundle path owns this op; the
-                    // infer collector must emit NOTHING for it.
+                    // Named anchor present WITH a usable locator → the op
+                    // co-emits an infer request (#413) so the sidecar can
+                    // arbitrate the two anchors; the explicit bundle still
+                    // wins unless a borrow witness plus a root disagreement
+                    // demotes it.
                     crate::agents::file_analyzer_agent::PubsubOperation {
                         topic: "orders.placed".to_string(),
                         role: Some(PubsubRole::Publisher),
@@ -6863,16 +6870,16 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
         let orchestrator = FileOrchestrator::new(AgentService::new());
         let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
 
-        // Isolation + envelope guards: only the two locator-anchored
-        // itemArchived ops produce requests; the named-anchor op and the
-        // topic-containing envelope copy are both excluded.
-        assert_eq!(requests.len(), 2, "requests: {requests:?}");
+        // Co-emission + envelope guard: the two locator-anchored itemArchived
+        // ops AND the named-anchor orders.placed op produce requests (#413);
+        // only the topic-containing envelope copy is excluded.
+        assert_eq!(requests.len(), 3, "requests: {requests:?}");
         assert!(
-            !requests
+            requests
                 .iter()
-                .any(|r| r.param_name.as_deref() == Some("order")
-                    || r.expression_text.as_deref() == Some("order")),
-            "an op with a primary_type_symbol must not also get an infer request"
+                .any(|r| r.expression_text.as_deref() == Some("order")),
+            "an op with a primary_type_symbol and a usable locator must ALSO \
+             emit an infer request so the sidecar can arbitrate the anchors"
         );
         assert!(
             !requests.iter().any(|r| r
