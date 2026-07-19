@@ -1695,8 +1695,14 @@ impl Visit for CandidateVisitor {
                         // topic anchors, payload-less — the message handler is
                         // registered elsewhere (`run({ eachMessage })`) and
                         // receives an envelope, so there is no deterministic
-                        // payload locator to record.
-                        if call.args.len() == 1 {
+                        // payload locator to record. SUBSCRIBER role only
+                        // (Copilot review on #409): a `publish({ topic, ... })`
+                        // options object may carry the payload as a sibling
+                        // property, so a payload-less publisher assertion could
+                        // put a typeless op on the wire where the LLM's locator
+                        // judgment should own the site. Publisher object shapes
+                        // keep the candidate below but stay LLM-owned.
+                        if role == PubsubRole::Subscriber && call.args.len() == 1 {
                             for topic in topics {
                                 self.pubsub_anchor_ops.push(PubsubAnchorOp {
                                     topic: topic.clone(),
@@ -3084,8 +3090,11 @@ bus.publish('plain.topic');
 
     /// carrick#402 shape a: `subscribe({ topics: ['a','b'] })` anchors every
     /// resolvable topic; a vocabulary key on a NON-vocabulary method
-    /// (`configure({ topic })`) and the handler-registration object
-    /// (`run({ eachMessage })`) stay inert.
+    /// (`configure({ topic })`), the handler-registration object
+    /// (`run({ eachMessage })`), and a `publish({ topic, ... })` options
+    /// object (whose sibling property may be the payload — Copilot review on
+    /// #409) stay anchor-inert. The publish object shape still surfaces as a
+    /// candidate so the LLM owns the site.
     #[test]
     fn object_literal_topics_array_anchors_each_topic() {
         use crate::operation::PubsubRole;
@@ -3093,10 +3102,12 @@ bus.publish('plain.topic');
         let src = r#"
 import { Kafka } from 'fakekafka';
 const consumer = new Kafka({ brokers: [] }).consumer({ groupId: 'g' });
+declare const bus: { publish: (opts: object) => void };
 export async function start(): Promise<void> {
   await consumer.subscribe({ topics: ['order.created', 'order.cancelled'], fromBeginning: true });
   await consumer.configure({ topic: 'not.a.subscription' });
   await consumer.run({ eachMessage: async () => {} });
+  bus.publish({ topic: 'order.audited', payload: { id: 1 } });
 }
 "#;
         let scanner = SwcScanner::new();
@@ -3110,7 +3121,7 @@ export async function start(): Promise<void> {
         assert_eq!(
             ops.len(),
             2,
-            "expected one anchor per topics[] entry, got {ops:?}"
+            "expected one anchor per topics[] entry and nothing else, got {ops:?}"
         );
         for topic in ["order.created", "order.cancelled"] {
             assert!(
@@ -3119,6 +3130,14 @@ export async function start(): Promise<void> {
                 "topics[] entry {topic} must anchor, got {ops:?}"
             );
         }
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("publish")),
+            "publish({{ topic }}) must still surface as a candidate, got {:?}",
+            result.candidates
+        );
     }
 
     /// carrick#402 shape b, on the exact corpus-3 file that flaked (BullMQ
