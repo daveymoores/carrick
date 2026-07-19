@@ -87,6 +87,13 @@ pub struct DataFetchingCall {
     /// `None` until merge (single-repo graphs don't carry it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
+    /// Owning service (monorepo carrick.json serviceName), tagged during
+    /// cross-repo merge exactly like `repo_name`. Carried so a matched
+    /// consumer resolves to the same `service_name ?? repo_name` id the
+    /// producer side uses — without it, monorepo match rows named the
+    /// producer by service but the consumer by repo (#368).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 /// The complete mount and endpoint graph
@@ -411,14 +418,16 @@ impl MountGraph {
                 }
 
                 // Merge data calls (deduplicate by method + target_url + file_location).
-                // Tag each consumer with its owning repo (symmetric with the
-                // endpoint tagging above) so a matched call can be attributed to
-                // its repo for cross-repo edge capture.
+                // Tag each consumer with its owning repo AND (monorepo) service
+                // (symmetric with the endpoint tagging above) so a matched call
+                // resolves to the same `service_name ?? repo_name` id producers
+                // carry when cross-repo edges are captured (#368).
                 for call in &mount_graph.data_calls {
                     let key = format!("{}:{}:{}", call.method, call.target_url, call.file_location);
                     if seen_data_calls.insert(key) {
                         let mut tagged_call = call.clone();
                         tagged_call.repo_name = Some(repo_data.repo_name.clone());
+                        tagged_call.service_name = repo_data.service_name.clone();
                         merged.data_calls.push(tagged_call);
                     }
                 }
@@ -973,5 +982,32 @@ mod tests {
             .filter(|e| e.full_path == "/health")
             .count();
         assert_eq!(health, 2, "endpoints from different repos must be kept");
+    }
+
+    #[test]
+    fn test_merge_tags_data_calls_with_repo_and_service() {
+        // Consumer calls must be tagged with BOTH repo and service, so the
+        // matcher resolves them to the same `service_name ?? repo_name` id
+        // producers carry (#368) — repo-only tagging left match rows naming
+        // the producer by service but the consumer by repo.
+        let mut repo = cloud_repo_with_health("platform", Some("web"));
+        repo.mount_graph
+            .as_mut()
+            .unwrap()
+            .data_calls
+            .push(DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "/api/orders".to_string(),
+                canonical_path: "/api/orders".to_string(),
+                client: "fetch".to_string(),
+                file_location: "apps/web/src/orders.ts:4".to_string(),
+                call_kind: None,
+                repo_name: None,
+                service_name: None,
+            });
+        let merged = MountGraph::merge_from_repos(&[repo]);
+        assert_eq!(merged.data_calls.len(), 1);
+        assert_eq!(merged.data_calls[0].repo_name.as_deref(), Some("platform"));
+        assert_eq!(merged.data_calls[0].service_name.as_deref(), Some("web"));
     }
 }

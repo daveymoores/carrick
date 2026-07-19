@@ -4524,6 +4524,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
                 file_location: file.to_string(),
                 call_kind: None,
                 repo_name: None,
+                service_name: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -4657,6 +4658,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             file_location: "operations/create-widget.ts:14".to_string(),
             call_kind: None,
             repo_name: None,
+            service_name: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -5840,6 +5842,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             file_location: file_location.to_string(),
             call_kind: None,
             repo_name: None,
+            service_name: None,
         }
     }
 
@@ -5890,6 +5893,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             file_location: "src/gql.ts:25".to_string(),
             call_kind: None,
             repo_name: None,
+            service_name: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
