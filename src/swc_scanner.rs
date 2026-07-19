@@ -1062,6 +1062,29 @@ impl CandidateVisitor {
         })
     }
 
+    /// Property name of a member-expression callee (`axios.post(...)` ->
+    /// "post", `w['post'](...)` -> "post"). `None` for non-member callees and
+    /// non-literal computed properties. Used by the structural signals (URL
+    /// scheme, awaited stringish call) so the candidate hint carries the full
+    /// `object.property` callee even when the package is absent from the
+    /// LLM-detected `data_fetchers` list — without this, the same call site's
+    /// hint flips between `axios.post` and bare `axios` depending on a per-run
+    /// LLM detection output, which is exactly the kind of prompt variance the
+    /// candidate layer exists to prevent.
+    fn callee_member_prop(expr: &Expr) -> Option<String> {
+        let Expr::Member(member) = expr else {
+            return None;
+        };
+        match &member.prop {
+            MemberProp::Ident(id) => Some(id.sym.to_string()),
+            MemberProp::Computed(c) => match &*c.expr {
+                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+                _ => None,
+            },
+            MemberProp::PrivateName(_) => None,
+        }
+    }
+
     /// Extract callee object name from expression
     fn extract_callee_object(expr: &Expr) -> Option<String> {
         match expr {
@@ -1277,36 +1300,35 @@ impl Visit for CandidateVisitor {
             && let Some(root) = Self::callee_root_ident(callee_expr)
             && self.network_import_locals.contains(&root)
         {
-            let property = match &**callee_expr {
-                Expr::Member(member) => match &member.prop {
-                    MemberProp::Ident(id) => Some(id.sym.to_string()),
-                    _ => None,
-                },
-                _ => None,
-            };
+            // Same member-property extraction as Signals 3/4 (incl. computed
+            // string properties like `client["post"](url)`), so every signal
+            // that can emit this span first labels it identically.
+            let property = Self::callee_member_prop(callee_expr);
             self.push_candidate(call, root, property);
         }
 
         // Signal 3: first argument is a URL with a network scheme.
         if Self::first_arg_has_url_scheme(call) {
-            let obj = match &call.callee {
-                Callee::Expr(e) => {
-                    Self::extract_callee_object(e).unwrap_or_else(|| "<url-call>".to_string())
-                }
-                _ => "<url-call>".to_string(),
+            let (obj, prop) = match &call.callee {
+                Callee::Expr(e) => (
+                    Self::extract_callee_object(e).unwrap_or_else(|| "<url-call>".to_string()),
+                    Self::callee_member_prop(e),
+                ),
+                _ => ("<url-call>".to_string(), None),
             };
-            self.push_candidate(call, obj, None);
+            self.push_candidate(call, obj, prop);
         }
 
         // Signal 4: awaited call with a string/template argument.
         if self.await_depth > 0 && Self::first_arg_is_stringish(call) {
-            let obj = match &call.callee {
-                Callee::Expr(e) => {
-                    Self::extract_callee_object(e).unwrap_or_else(|| "<awaited-call>".to_string())
-                }
-                _ => "<awaited-call>".to_string(),
+            let (obj, prop) = match &call.callee {
+                Callee::Expr(e) => (
+                    Self::extract_callee_object(e).unwrap_or_else(|| "<awaited-call>".to_string()),
+                    Self::callee_member_prop(e),
+                ),
+                _ => ("<awaited-call>".to_string(), None),
             };
-            self.push_candidate(call, obj, None);
+            self.push_candidate(call, obj, prop);
         }
 
         // Signal 5 (existing): method calls matching the API name heuristics.
@@ -1641,6 +1663,84 @@ mod tests {
         let healthy = scan_test_content("const x = 1;");
         assert!(!healthy.parse_failed);
         assert!(healthy.candidates.is_empty());
+    }
+
+    #[test]
+    fn candidate_hint_is_stable_across_data_fetcher_detection() {
+        // carrick#359: the candidate for a member call must carry the same
+        // `object.property` callee whether or not the package appears in the
+        // LLM-detected data_fetchers list. Before this guard, `axios.post`
+        // (Signal 2, import-gated) degraded to bare `axios` with a null
+        // property (Signal 4, awaited-stringish) whenever a scan's detect
+        // output omitted axios — a per-run LLM output mutating the candidate
+        // hint the file-analyzer prompt presents.
+        let content = r#"
+import axios from "axios";
+export async function record(event: unknown): Promise<void> {
+  await axios.post(`${process.env.HOOK_URL ?? "http://localhost:3099"}/audit/events`, event);
+}
+"#;
+
+        let with_fetcher = scan_test_content_with_fetchers(content, &["axios".to_string()]);
+        let without_fetcher = scan_test_content(content);
+
+        let pick = |r: &ScanResult| {
+            let c = r
+                .candidates
+                .iter()
+                .find(|c| c.callee_object == "axios")
+                .expect("axios candidate must be emitted")
+                .clone();
+            (
+                c.candidate_id.clone(),
+                c.callee_object.clone(),
+                c.callee_property.clone(),
+                c.path_snippet.clone(),
+            )
+        };
+        let a = pick(&with_fetcher);
+        let b = pick(&without_fetcher);
+        assert_eq!(a, b, "candidate must not depend on data_fetchers");
+        assert_eq!(a.2.as_deref(), Some("post"));
+    }
+
+    #[test]
+    fn imported_fetcher_computed_property_call_carries_property() {
+        // Signal 2 (import-gated) must extract computed string properties the
+        // same way Signals 3/4 do, so whichever signal emits a span first
+        // labels it identically.
+        let content = r#"
+import client from "client-lib";
+export async function load() {
+  await client["post"]("/things", {});
+}
+"#;
+        let result = scan_test_content_with_fetchers(content, &["client-lib".to_string()]);
+        let c = result
+            .candidates
+            .iter()
+            .find(|c| c.callee_object == "client")
+            .expect("imported-fetcher candidate must be emitted");
+        assert_eq!(c.callee_property.as_deref(), Some("post"));
+    }
+
+    #[test]
+    fn url_scheme_candidate_carries_member_property() {
+        // Signal 3 (URL-scheme first arg) on a member callee that is neither a
+        // known API object nor a detected data-fetcher import: the hint should
+        // still name the full callee, not just the root object.
+        let content = r#"
+export function ping(myTransport: { fire(u: string): void }) {
+  myTransport.fire("https://example.com/ping");
+}
+"#;
+        let result = scan_test_content(content);
+        let c = result
+            .candidates
+            .iter()
+            .find(|c| c.callee_object == "myTransport")
+            .expect("url-scheme candidate must be emitted");
+        assert_eq!(c.callee_property.as_deref(), Some("fire"));
     }
 
     #[test]
