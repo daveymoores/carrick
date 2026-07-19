@@ -567,12 +567,16 @@ impl FileAnalyzerAgent {
         expects_graphql && result.graphql_operations.is_empty()
     }
 
+    /// Count every top-level result section, so the best-of selection sees a
+    /// difference in ANY of them (the pre-#403 version only counted the three
+    /// HTTP sections, letting a retry that lost graphql/pubsub findings tie).
     fn result_score(result: &FileAnalysisResult) -> usize {
         result.mounts.len()
             + result.endpoints.len()
             + result.data_calls.len()
             + result.graphql_operations.len()
             + result.pubsub_operations.len()
+            + result.graphql_consumer_locates.len()
     }
 
     /// Pick between the initial sample and the single retry sample.
@@ -2024,14 +2028,19 @@ mod tests {
 
     #[test]
     fn test_result_score_counts_graphql_and_pubsub_sections() {
+        let consumer_locate: GraphqlConsumerLocate = serde_json::from_str(
+            r#"{"kind":"query","field":"order","result_type_symbol":"Order","result_type_source":null}"#,
+        )
+        .unwrap();
         let result = FileAnalysisResult {
             data_calls: vec![test_data_call("/users")],
             graphql_operations: vec![test_graphql_op("order"), test_graphql_op("orders")],
             pubsub_operations: vec![test_pubsub_op("jobs.created")],
+            graphql_consumer_locates: vec![consumer_locate],
             ..Default::default()
         };
-        // 1 data call + 2 graphql ops + 1 pubsub op.
-        assert_eq!(FileAnalyzerAgent::result_score(&result), 4);
+        // 1 data call + 2 graphql ops + 1 pubsub op + 1 consumer locate.
+        assert_eq!(FileAnalyzerAgent::result_score(&result), 5);
     }
 
     #[test]
