@@ -1066,6 +1066,16 @@ impl FileOrchestrator {
 
                     let mut adjusted = result;
                     Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
+                    // Collapse inline env-var fallbacks the model rendered
+                    // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
+                    // carrick#399) BEFORE alias resolution: a local alias with
+                    // a rendered fallback must become the bare `${alias}` for
+                    // the alias-map lookup to rewrite it. This fold is the
+                    // single entry point for LLM data calls, so every
+                    // downstream reader (route-shape gate, canonical call key,
+                    // env-var classification, uploads) sees one normalized
+                    // form.
+                    Self::normalize_fallback_targets(&mut adjusted);
                     Self::resolve_env_var_aliases(&mut adjusted, &pf.env_alias_map);
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
@@ -3090,6 +3100,30 @@ impl FileOrchestrator {
         });
     }
 
+    /// Collapse inline env-var fallbacks in data-call targets (carrick#399):
+    /// `${A ?? <expr>}` / `${A || <expr>}` -> `${A}`. The model intermittently
+    /// (~1/3 of scans, guidance-correlated) copies the template literal
+    /// verbatim including its fallback; the whitespace inside the
+    /// interpolation then fails `is_valid_route_shape` and the call is
+    /// silently dropped — the residual #359 recall flake. The env-var NAME is
+    /// the classification signal (#294); the fallback expression is noise.
+    /// Pure string normalization, no re-parse; see
+    /// [`crate::analyzer::normalize_env_fallback_target`] for the exact rules
+    /// (non-fallback expressions stay verbatim and stay rejected).
+    fn normalize_fallback_targets(result: &mut FileAnalysisResult) {
+        for data_call in &mut result.data_calls {
+            if let Some(normalized) =
+                crate::analyzer::normalize_env_fallback_target(&data_call.target)
+            {
+                debug!(
+                    "Collapsed inline fallback in data-call target: {} -> {}",
+                    data_call.target, normalized
+                );
+                data_call.target = normalized;
+            }
+        }
+    }
+
     fn resolve_env_var_aliases(result: &mut FileAnalysisResult, env_alias_map: &EnvAliasMap) {
         if env_alias_map.is_empty() {
             return;
@@ -4688,6 +4722,89 @@ mod tests {
             "https://api.example.com/data"
         );
         assert_eq!(graph.data_calls[0].method, "POST");
+    }
+
+    /// Pre-fix-failing case for carrick#399 (eval run 29677844107): the model
+    /// rendered the audit call target verbatim with its inline fallback, the
+    /// whitespace inside the interpolation failed `is_valid_route_shape`, and
+    /// the fifth-pass gate silently dropped the call. After the fold-time
+    /// collapse, the call survives with the same canonical key the clean
+    /// `${AUDIT_WEBHOOK_URL}/audit/events` rendering produces.
+    #[test]
+    fn test_fallback_target_survives_graph_build_with_clean_canonical_key() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let make_result = |target: &str| FileAnalysisResult {
+            data_calls: vec![DataCallResult {
+                call_kind: None,
+                candidate_id: "span:1002-1107".to_string(),
+                line_number: 42,
+                target: target.to_string(),
+                method: Some("POST".to_string()),
+                pattern_matched: "axios.post(".to_string(),
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                call_expression_text: None,
+                call_expression_line: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            }],
+            ..Default::default()
+        };
+
+        let config = Config {
+            internal_env_vars: ["AUDIT_WEBHOOK_URL"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Config::default()
+        };
+        let normalizer = UrlNormalizer::new(&config);
+
+        let build = |result: FileAnalysisResult| {
+            let mut file_results = HashMap::new();
+            file_results.insert("lib/audit.ts".to_string(), result);
+            orchestrator.build_mount_graph(&file_results, &normalizer, Path::new(""))
+        };
+
+        // The verbatim rendering, run through the fold-time normalization the
+        // orchestrator applies to every LLM result.
+        let mut verbatim =
+            make_result(r#"${AUDIT_WEBHOOK_URL ?? "http://localhost:3099"}/audit/events"#);
+        FileOrchestrator::normalize_fallback_targets(&mut verbatim);
+        let graph = build(verbatim);
+        assert_eq!(
+            graph.data_calls.len(),
+            1,
+            "normalized fallback target must survive the route-shape gate"
+        );
+        assert_eq!(
+            graph.data_calls[0].target_url,
+            "${AUDIT_WEBHOOK_URL}/audit/events"
+        );
+        assert_eq!(graph.data_calls[0].canonical_path, "/audit/events");
+
+        // The clean rendering keys identically (fallback vs clean is the only
+        // difference between the hit and miss eval runs).
+        let clean = build(make_result("${AUDIT_WEBHOOK_URL}/audit/events"));
+        assert_eq!(
+            clean.data_calls[0].canonical_path,
+            graph.data_calls[0].canonical_path
+        );
+        assert_eq!(
+            clean.data_calls[0].target_url,
+            graph.data_calls[0].target_url
+        );
+
+        // A non-fallback whitespace target stays dropped: normalization does
+        // not touch it and the guard still rejects it.
+        let mut junk = make_result("${base + path}/audit/events");
+        FileOrchestrator::normalize_fallback_targets(&mut junk);
+        let graph = build(junk);
+        assert!(graph.data_calls.is_empty());
     }
 
     /// A data call to the service's OWN endpoint (same mount graph) is a
