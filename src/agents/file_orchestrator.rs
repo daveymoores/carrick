@@ -579,6 +579,11 @@ impl FileOrchestrator {
             /// (carrick#387), merged in after the LLM pass so an extraction
             /// omission cannot lose them. Empty when Signal 7's gates are off.
             pubsub_anchor_ops: Vec<PubsubAnchorOp>,
+            /// True when this file was routed as a GraphQL resolver file
+            /// (`is_graphql_resolver_file`). Arms the #403 expectation-guarded
+            /// retry in the file-analyzer: a response omitting the whole
+            /// `graphql_operations` section is re-sampled once.
+            expects_graphql: bool,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -862,6 +867,7 @@ impl FileOrchestrator {
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
+                expects_graphql: is_graphql_resolver_file,
             });
         }
 
@@ -994,6 +1000,10 @@ impl FileOrchestrator {
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
                 pubsub_anchor_ops: Vec::new(),
+                // Resolver files never reach the deferred-skip path (they fall
+                // through to the LLM pass directly), so a wrapper-rescued file
+                // is by construction not a resolver file.
+                expects_graphql: false,
             });
         }
 
@@ -1048,6 +1058,7 @@ impl FileOrchestrator {
                         &pf.graphql_producer_hints,
                         &pf.graphql_consumer_hints,
                         &pf.wrapper_context,
+                        pf.expects_graphql,
                     )
                     .await
                     .map_err(|e| e.to_string());

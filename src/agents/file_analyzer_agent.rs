@@ -370,6 +370,7 @@ impl FileAnalyzerAgent {
             &[],
             &[],
             &[],
+            false,
         )
         .await
     }
@@ -387,6 +388,10 @@ impl FileAnalyzerAgent {
     /// * `guidance` - Framework-specific patterns to use for matching
     /// * `candidate_hints` - AST-detected candidate lines (formatted hints from SWC Scanner)
     /// * `candidate_contexts` - Structured candidate details (JSON strings)
+    /// * `expects_graphql` - true when the orchestrator routed this file as a
+    ///   GraphQL resolver file (the deterministic SDL/producer-hint gate). Arms
+    ///   the #403 expectation-guarded retry: a response with an empty/absent
+    ///   `graphql_operations` section is re-sampled once, same request bytes.
     ///
     /// # Returns
     /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
@@ -396,7 +401,17 @@ impl FileAnalyzerAgent {
     /// `raw_response` to `<dir>/<file>.attemptN.json`. This makes prompt-hardening
     /// evidence-driven: we read what the model actually emitted (owner_node,
     /// mount_path, whether the endpoint was extracted at all) rather than guess.
-    fn dump_eval_artifact(file_path: &str, attempt: u8, user_message: &str, response: &str) {
+    /// `retry_reason` is `None` on attempt 1 and names the trigger on attempt 2
+    /// (`"graphql_omission"`, `"suspicious_fields"`, or both joined with `+`),
+    /// so attempt pairs are distinguishable in the dumps and gate runs can
+    /// measure sample independence for the #403 expectation-guarded retry.
+    fn dump_eval_artifact(
+        file_path: &str,
+        attempt: u8,
+        user_message: &str,
+        response: &str,
+        retry_reason: Option<&str>,
+    ) {
         let Ok(dir) = std::env::var("CARRICK_EVAL_DUMP_DIR") else {
             return;
         };
@@ -408,6 +423,7 @@ impl FileAnalyzerAgent {
         let payload = serde_json::json!({
             "file_path": file_path,
             "attempt": attempt,
+            "retry_reason": retry_reason,
             "request_user_message": user_message,
             "raw_response": response,
         });
@@ -428,6 +444,7 @@ impl FileAnalyzerAgent {
         graphql_producer_hints: &[String],
         graphql_consumer_hints: &[String],
         wrapper_context: &[String],
+        expects_graphql: bool,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
         if file_content.trim().is_empty() {
@@ -472,7 +489,7 @@ impl FileAnalyzerAgent {
         // capture mode), persist the analyzer's input (the guidance/candidates it
         // received) and raw output so prompt-hardening can be driven by what the
         // model actually emitted, not by guesswork. Off unless the env is set.
-        Self::dump_eval_artifact(file_path, 1, &user_message, &response);
+        Self::dump_eval_artifact(file_path, 1, &user_message, &response, None);
 
         let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
             format!(
@@ -482,10 +499,25 @@ impl FileAnalyzerAgent {
         })?;
 
         // Sanitize LLM response: Gemini sometimes returns "+null" as a string instead of null
-        let needs_retry = Self::sanitize_result(&mut result);
+        let suspicious_fields = Self::sanitize_result(&mut result);
+        // #403 expectation-guarded retry: flash-lite sometimes omits the whole
+        // `graphql_operations` section for a routed resolver file (~2/8 live c1
+        // runs), zeroing every gateway GraphQL producer locator. When the
+        // orchestrator expected the section and the model omitted it, take one
+        // more sample of the SAME request (no prompt or schema change).
+        let graphql_omission = Self::graphql_section_omitted(expects_graphql, &result);
+        let needs_retry = suspicious_fields || graphql_omission;
         let initial_result = result.clone();
         if needs_retry {
-            warn!("[FileAnalyzerAgent] Suspicious fields detected in LLM output; retrying once");
+            let retry_reason = match (suspicious_fields, graphql_omission) {
+                (true, true) => "suspicious_fields+graphql_omission",
+                (true, false) => "suspicious_fields",
+                _ => "graphql_omission",
+            };
+            warn!(
+                "[FileAnalyzerAgent] Retrying analyze call once ({}) for {}",
+                retry_reason, file_path
+            );
             let response = self
                 .agent_service
                 .analyze_with_lambda("/analyze-file", &user_message, Some(schema))
@@ -495,7 +527,7 @@ impl FileAnalyzerAgent {
             trace!("{}", response);
             trace!("=== END RAW RESPONSE ===");
             debug!("File analysis retry response: {} chars", response.len());
-            Self::dump_eval_artifact(file_path, 2, &user_message, &response);
+            Self::dump_eval_artifact(file_path, 2, &user_message, &response, Some(retry_reason));
 
             let mut retry_result: FileAnalysisResult =
                 serde_json::from_str(&response).map_err(|e| {
@@ -506,7 +538,7 @@ impl FileAnalyzerAgent {
                 })?;
 
             Self::sanitize_result(&mut retry_result);
-            let chosen = Self::choose_best_result(initial_result, retry_result);
+            let chosen = Self::choose_best_result(initial_result, retry_result, expects_graphql);
 
             debug!(
                 "File analysis complete: {} mounts, {} endpoints, {} data_calls",
@@ -528,21 +560,72 @@ impl FileAnalyzerAgent {
         Ok(result)
     }
 
-    fn result_score(result: &FileAnalysisResult) -> usize {
-        result.mounts.len() + result.endpoints.len() + result.data_calls.len()
+    /// The #403 guard trip condition: the orchestrator expected this file to
+    /// carry `graphql_operations` (deterministic resolver-file routing) but the
+    /// model's response has none — the whole-section omission signature.
+    fn graphql_section_omitted(expects_graphql: bool, result: &FileAnalysisResult) -> bool {
+        expects_graphql && result.graphql_operations.is_empty()
     }
 
+    fn result_score(result: &FileAnalysisResult) -> usize {
+        result.mounts.len()
+            + result.endpoints.len()
+            + result.data_calls.len()
+            + result.graphql_operations.len()
+            + result.pubsub_operations.len()
+    }
+
+    /// Pick between the initial sample and the single retry sample.
+    ///
+    /// Guard-aware, not max-over-samples (#403 adversarial review): when the
+    /// file was routed as a GraphQL resolver file, the expected section decides
+    /// first — a retry that recovered an omitted `graphql_operations` section
+    /// wins; a retry that lost a section the original had loses; when neither
+    /// sample has the section, the original is kept (preferring the larger
+    /// sample there would reward hallucination on decoy files). Only then does
+    /// the count score compare, and ties keep the ORIGINAL for the same reason.
     fn choose_best_result(
         initial: FileAnalysisResult,
         retry: FileAnalysisResult,
+        expects_graphql: bool,
     ) -> FileAnalysisResult {
+        if expects_graphql {
+            let initial_has_section = !initial.graphql_operations.is_empty();
+            let retry_has_section = !retry.graphql_operations.is_empty();
+            match (initial_has_section, retry_has_section) {
+                (false, true) => {
+                    debug!(
+                        "[FileAnalyzerAgent] Retry recovered omitted graphql_operations section"
+                    );
+                    return retry;
+                }
+                (true, false) => {
+                    warn!(
+                        "[FileAnalyzerAgent] Retry lost the graphql_operations section; \
+                         keeping original result"
+                    );
+                    return initial;
+                }
+                (false, false) => {
+                    warn!(
+                        "[FileAnalyzerAgent] Retry also lacks graphql_operations; \
+                         keeping original result"
+                    );
+                    return initial;
+                }
+                (true, true) => {}
+            }
+        }
+
         let initial_score = Self::result_score(&initial);
         let retry_score = Self::result_score(&retry);
 
-        if retry_score >= initial_score {
+        if retry_score > initial_score {
             retry
         } else {
-            warn!("[FileAnalyzerAgent] Retry produced fewer findings; keeping original result");
+            if retry_score < initial_score {
+                warn!("[FileAnalyzerAgent] Retry produced fewer findings; keeping original result");
+            }
             initial
         }
     }
@@ -1876,10 +1959,148 @@ mod tests {
             pubsub_operations: vec![],
         };
 
-        let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry);
+        let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry, false);
         assert_eq!(chosen.mounts.len(), initial.mounts.len());
         assert_eq!(chosen.endpoints.len(), initial.endpoints.len());
         assert_eq!(chosen.data_calls.len(), initial.data_calls.len());
+    }
+
+    /// A resolver linkage as the model emits it for the c1 gateway file (#403).
+    fn test_graphql_op(field: &str) -> GraphqlOperation {
+        serde_json::from_str(&format!(
+            r#"{{"kind":"query","field":"{field}","resolver_function":"resolve","resolver_line":38,"primary_type_symbol":null,"type_import_source":null}}"#
+        ))
+        .unwrap()
+    }
+
+    fn test_pubsub_op(topic: &str) -> PubsubOperation {
+        serde_json::from_str(&format!(
+            r#"{{"topic":"{topic}","role":"publisher","line_number":1}}"#
+        ))
+        .unwrap()
+    }
+
+    fn test_data_call(target: &str) -> DataCallResult {
+        DataCallResult {
+            call_kind: None,
+            candidate_id: "span:190-240".to_string(),
+            line_number: 3,
+            target: target.to_string(),
+            method: Some("GET".to_string()),
+            pattern_matched: "fetch(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    #[test]
+    fn test_graphql_section_omitted_trips_only_when_expected_and_absent() {
+        let empty = FileAnalysisResult::default();
+        let with_section = FileAnalysisResult {
+            graphql_operations: vec![test_graphql_op("order")],
+            ..Default::default()
+        };
+
+        // Expected + absent: the #403 omission signature — trips.
+        assert!(FileAnalyzerAgent::graphql_section_omitted(true, &empty));
+        // Expected + present: no trip.
+        assert!(!FileAnalyzerAgent::graphql_section_omitted(
+            true,
+            &with_section
+        ));
+        // Not expected (non-resolver file): never trips, present or not.
+        assert!(!FileAnalyzerAgent::graphql_section_omitted(false, &empty));
+        assert!(!FileAnalyzerAgent::graphql_section_omitted(
+            false,
+            &with_section
+        ));
+    }
+
+    #[test]
+    fn test_result_score_counts_graphql_and_pubsub_sections() {
+        let result = FileAnalysisResult {
+            data_calls: vec![test_data_call("/users")],
+            graphql_operations: vec![test_graphql_op("order"), test_graphql_op("orders")],
+            pubsub_operations: vec![test_pubsub_op("jobs.created")],
+            ..Default::default()
+        };
+        // 1 data call + 2 graphql ops + 1 pubsub op.
+        assert_eq!(FileAnalyzerAgent::result_score(&result), 4);
+    }
+
+    #[test]
+    fn test_choose_best_result_guard_retry_with_section_wins() {
+        // Initial omitted the expected section; retry recovered it. The retry
+        // must win even though its overall count is not higher elsewhere.
+        let initial = FileAnalysisResult {
+            data_calls: vec![test_data_call("/a"), test_data_call("/b")],
+            ..Default::default()
+        };
+        let retry = FileAnalysisResult {
+            graphql_operations: vec![test_graphql_op("order")],
+            ..Default::default()
+        };
+        let chosen = FileAnalyzerAgent::choose_best_result(initial, retry, true);
+        assert_eq!(chosen.graphql_operations.len(), 1);
+    }
+
+    #[test]
+    fn test_choose_best_result_guard_retry_without_section_loses_to_original() {
+        // Original had the expected section; the retry lost it. Selection must
+        // never replace an original that had the section, whatever the counts.
+        let initial = FileAnalysisResult {
+            graphql_operations: vec![test_graphql_op("order")],
+            ..Default::default()
+        };
+        let retry = FileAnalysisResult {
+            data_calls: vec![test_data_call("/a"), test_data_call("/b")],
+            ..Default::default()
+        };
+        let chosen = FileAnalyzerAgent::choose_best_result(initial, retry, true);
+        assert_eq!(chosen.graphql_operations.len(), 1);
+        assert!(chosen.data_calls.is_empty());
+    }
+
+    #[test]
+    fn test_choose_best_result_both_lack_section_keeps_original() {
+        // Neither sample has the expected section: keep the original even when
+        // the retry scores higher (hallucination-bias guard on decoy files).
+        let initial = FileAnalysisResult {
+            data_calls: vec![test_data_call("/a")],
+            ..Default::default()
+        };
+        let retry = FileAnalysisResult {
+            data_calls: vec![test_data_call("/a"), test_data_call("/b")],
+            ..Default::default()
+        };
+        let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry, true);
+        assert_eq!(chosen.data_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_choose_best_result_tie_keeps_original() {
+        // Equal scores (both with the section, or no guard): the original wins.
+        let initial = FileAnalysisResult {
+            graphql_operations: vec![test_graphql_op("order")],
+            data_calls: vec![test_data_call("/original")],
+            ..Default::default()
+        };
+        let retry = FileAnalysisResult {
+            graphql_operations: vec![test_graphql_op("order")],
+            data_calls: vec![test_data_call("/retry")],
+            ..Default::default()
+        };
+        let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry.clone(), true);
+        assert_eq!(chosen.data_calls[0].target, "/original");
+        // Same tie rule without the guard armed.
+        let chosen = FileAnalyzerAgent::choose_best_result(initial, retry, false);
+        assert_eq!(chosen.data_calls[0].target, "/original");
     }
 
     #[test]
