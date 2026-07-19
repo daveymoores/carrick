@@ -1582,6 +1582,17 @@ fn overall_correctness(cap: &TierScore, compat_scored: bool) -> f64 {
     dims.iter().sum::<f64>() / dims.len() as f64
 }
 
+/// Whether a run's per-edge diagnostics block should print. Run 1 always prints
+/// (the healthy reference to diff a dip against); any later run prints only when
+/// it dipped: a scored dimension below full marks (surfaced as OVERALL < 100%,
+/// exact because a mean of exact 1.0s is exactly 1.0), a decoy leak, or an
+/// absent compat verdict (§7). Keeps CI output sane — a clean N-run eval prints
+/// one block, while a dip run captures its own failing signature in the log it
+/// happened in instead of forcing a manual re-root-cause next session.
+fn run_needs_diag(cap: &TierScore, compat_scored: bool, decoy_leak: usize) -> bool {
+    !compat_scored || decoy_leak > 0 || overall_correctness(cap, compat_scored) < 1.0
+}
+
 fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_absent: bool) {
     let (ep_p, ep_p_sd) = agg(scores, tier, |t| t.ep_prf.0);
     let (ep_r, ep_r_sd) = agg(scores, tier, |t| t.ep_prf.1);
@@ -1680,16 +1691,29 @@ fn xrepo_live_scorer() {
     let mut scores: Vec<RunScore> = Vec::new();
     for run_idx in 1..=runs_n {
         let proj = run_two_phase(&bin, &corpus, false);
-        // Extraction diagnostic (report-only, run 1 only). A cross-repo match
-        // metric of 0 (or endpoint recall < 1) is otherwise opaque: surface the
-        // ENDPOINT SET, the calls, and the edges so a miss is attributable — which
-        // producer endpoint failed to extract, what URL the consumer called, and
-        // which repo identities the edges carry.
-        if run_idx == 1 {
+        // Score the FULL vector unconditionally (#226). The §7 compat-presence
+        // check no longer panics inside the scorer: it rides `score.compat`, so
+        // owner / anchor / resolution / deps / decoys still print even when
+        // cross-repo type checking produced no verdict. When compat is absent the
+        // compat-verdict number is meaningless — print `UNSCORED` (never a fake
+        // "compat 1.00"), and red the whole run at the end. Scored BEFORE the
+        // diag block so the diag trigger below can see this run's numbers.
+        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        let compat_absent = score.compat.is_err();
+        let cap = score.by_tier.get(TIER_CAPABILITY).expect("capability tier");
+        // Extraction diagnostic (report-only; run 1 + any dipped run). A
+        // cross-repo match metric of 0 (or endpoint recall < 1) is otherwise
+        // opaque: surface the ENDPOINT SET, the calls, and the edges so a miss is
+        // attributable — which producer endpoint failed to extract, what URL the
+        // consumer called, and which repo identities the edges carry. Run 1 gives
+        // the healthy reference; a dipped run (`run_needs_diag`) prints its own
+        // block so recurring dip signatures land in the CI log instead of needing
+        // a manual re-root-cause. Passing runs after run 1 stay silent.
+        if run_idx == 1 || run_needs_diag(cap, !compat_absent, score.decoy_leak) {
             let found_eps = projection_endpoint_set(&proj);
             let expected_eps = expected_endpoint_set(&repo_expected, TIER_CAPABILITY);
             eprintln!(
-                "[diag] run 1 projection: {} endpoints, {} calls, {} cross_repo_matches, \
+                "[diag] run {run_idx} projection: {} endpoints, {} calls, {} cross_repo_matches, \
                  {} dependency_conflicts",
                 proj.endpoints.len(),
                 proj.calls.len(),
@@ -1821,15 +1845,6 @@ fn xrepo_live_scorer() {
                 },
             );
         }
-        // Score the FULL vector unconditionally (#226). The §7 compat-presence
-        // check no longer panics inside the scorer: it rides `score.compat`, so
-        // owner / anchor / resolution / deps / decoys still print even when
-        // cross-repo type checking produced no verdict. When compat is absent the
-        // compat-verdict number is meaningless — print `UNSCORED` (never a fake
-        // "compat 1.00"), and red the whole run at the end.
-        let score = score_corpus(&proj, &repo_expected, &expected_output);
-        let compat_absent = score.compat.is_err();
-        let cap = score.by_tier.get(TIER_CAPABILITY).expect("capability tier");
         let compat_cell = if compat_absent {
             "UNSCORED".to_string()
         } else {
@@ -2161,6 +2176,48 @@ mod scoring_tests {
         assert_eq!(prf(3, 3, 3), (1.0, 1.0, 1.0));
         let (p, r, _) = prf(1, 1, 2);
         assert_eq!((p, r), (1.0, 0.5));
+    }
+
+    fn full_marks_tier() -> TierScore {
+        TierScore {
+            ep_prf: (1.0, 1.0, 1.0),
+            call_prf: (1.0, 1.0, 1.0),
+            match_prf: (1.0, 1.0, 1.0),
+            owner: 1.0,
+            type_anchor: 1.0,
+            type_resolution: 1.0,
+            compat_verdict: 1.0,
+            dep_prf: (1.0, 1.0, 1.0),
+            orphan_prf: (1.0, 1.0, 1.0),
+        }
+    }
+
+    #[test]
+    fn run_needs_diag_silent_on_full_marks() {
+        assert!(!run_needs_diag(&full_marks_tier(), true, 0));
+    }
+
+    #[test]
+    fn run_needs_diag_fires_on_any_dimension_dip() {
+        let mut cap = full_marks_tier();
+        cap.type_resolution = 0.93;
+        assert!(run_needs_diag(&cap, true, 0));
+
+        let mut cap = full_marks_tier();
+        cap.compat_verdict = 0.5;
+        assert!(run_needs_diag(&cap, true, 0));
+
+        let mut cap = full_marks_tier();
+        cap.match_prf.2 = 0.99;
+        assert!(run_needs_diag(&cap, true, 0));
+    }
+
+    #[test]
+    fn run_needs_diag_fires_on_decoy_leak_and_absent_compat() {
+        assert!(run_needs_diag(&full_marks_tier(), true, 1));
+        // §7 compat-absent: the compat_verdict number is meaningless, so the
+        // absence itself is the dip signal regardless of the other dimensions.
+        assert!(run_needs_diag(&full_marks_tier(), false, 0));
     }
 
     #[test]
