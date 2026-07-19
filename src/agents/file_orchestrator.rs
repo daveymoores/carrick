@@ -3116,7 +3116,7 @@ impl FileOrchestrator {
                 crate::analyzer::normalize_env_fallback_target(&data_call.target)
             {
                 debug!(
-                    "Collapsed inline fallback in data-call target: {} -> {}",
+                    "Collapsed inline fallback in data-call target: {:?} -> {:?}",
                     data_call.target, normalized
                 );
                 data_call.target = normalized;

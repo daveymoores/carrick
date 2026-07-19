@@ -609,16 +609,21 @@ pub fn normalize_env_fallback_target(target: &str) -> Option<String> {
 }
 
 /// Byte index of the `}` closing an interpolation whose `${` was already
-/// consumed. Brace-depth and quote aware, so a `}` inside a quoted fallback
-/// string or a nested `${...}` inside a backtick template does not terminate
-/// the scan early.
+/// consumed. Brace-depth, quote, and escape aware, so a `}` inside a quoted
+/// fallback string (including behind an escaped quote, `"\"}"`) or a nested
+/// `${...}` inside a backtick template does not terminate the scan early.
 fn interpolation_end(s: &str) -> Option<usize> {
     let mut depth = 1usize;
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for (i, c) in s.char_indices() {
         match quote {
             Some(q) => {
-                if c == q {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
                     quote = None;
                 }
             }
@@ -655,17 +660,24 @@ fn fallback_reference(content: &str) -> Option<&str> {
 }
 
 /// Byte index of the first `??` or `||` outside quotes and outside any
-/// bracket/paren/brace nesting. Single `?`/`|` (ternary, optional chaining,
-/// bitwise-or) never match.
+/// bracket/paren/brace nesting. Escape aware inside quotes, so an escaped
+/// quote never ends the string early and a `??`/`||` inside a string literal
+/// never counts. Single `?`/`|` (ternary, optional chaining, bitwise-or)
+/// never match.
 fn top_level_fallback_op(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth = 0usize;
     let mut quote: Option<u8> = None;
+    let mut escaped = false;
     for i in 0..bytes.len() {
         let b = bytes[i];
         match quote {
             Some(q) => {
-                if b == q {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == q {
                     quote = None;
                 }
             }
@@ -2968,6 +2980,10 @@ mod tests {
             ("${BASE ?? `http://localhost:${PORT}`}/p", "${BASE}/p"),
             // Quoted `}` and `||` inside the fallback string are inert.
             (r#"${BASE ?? "a||b}c"}/p"#, "${BASE}/p"),
+            // Escaped quote inside the fallback string does not end the
+            // string early, so the `}` and `||` behind it stay inert.
+            (r#"${BASE ?? "it\"s}fine"}/p"#, "${BASE}/p"),
+            (r#"${BASE ?? "\" || junk"}/p"#, "${BASE}/p"),
             // Backtick-wrapped template with a mid-path param: only the
             // fallback interpolation collapses, the `${id}` param survives.
             (
