@@ -66,7 +66,7 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
   - M: one agent working session, roughly 1-3 hours to a merged PR, usually one or two review/rebase cycles.
   - L: a sustained orchestrated session (parallel agents where the work decomposes), roughly a day.
 - Converting older docs or human-calibrated estimates: a human-week of focused work is roughly one L session; a human-month is roughly 3-5 sustained sessions spread over about a week of elapsed time.
-- Elapsed calendar time is set by the serialization points, not implementation speed: CI runs, review latency, dependency chains between workpackages, same-release bundles, batched paid eval gates, and owner-gated actions (terraform applies, deploys, releases, fleet re-scans). Estimates should name their serialization points.
+- Elapsed calendar time is set by the serialization points, not implementation speed: CI runs, review latency, dependency chains between work packages, same-release bundles, batched paid eval gates, and owner-gated actions (terraform applies in carrick-cloud, deploys, releases, fleet re-scans). Estimates should name their serialization points.
 - Calibration (2026-07-18/19): nine scoped S/M tickets merged in one overnight session; a six-item tier including an L-sized prototype spike completed in about three hours of wall clock.
 
 ## Configuration & Infrastructure Notes
