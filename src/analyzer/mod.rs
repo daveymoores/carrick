@@ -555,6 +555,150 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
 /// `unknown`) — is rejected. Pure string-shape logic: it names no framework,
 /// client, or SDK. The shape-blind residue (a bare `${TABLE_NAME}` that is
 /// really a datastore resource, not a base URL) is handled on the prompt side.
+/// Collapse an inline fallback inside a template interpolation to the bare
+/// reference: `${A ?? <expr>}` / `${A || <expr>}` -> `${A}` (equivalently
+/// `${process.env.A ?? <expr>}` and dotted alias forms like
+/// `${config.baseUrl || <expr>}`). Applies to every interpolation in the
+/// target, so a mid-path `${id ?? 0}` also collapses to the plain `${id}`
+/// param form.
+///
+/// The file-analyzer LLM sometimes renders a call target verbatim with its
+/// source-level fallback (`${AUDIT_WEBHOOK_URL ?? "http://localhost:3099"}
+/// /audit/events`, carrick#399); the whitespace inside the interpolation then
+/// fails [`is_valid_route_shape`] and the call is silently dropped. The
+/// env-var NAME is the classification signal (carrick#294) and the fallback
+/// expression is noise, so both observed renderings of the same call site
+/// normalize to the identical canonical key.
+///
+/// Deliberately tight: the collapse happens only when the left-hand side of a
+/// top-level `??`/`||` (outside quotes, brackets, and parens) is a clean
+/// reference (ASCII alphanumerics, `_`, `$`, `.`). Anything else — call
+/// expressions, concatenation, plain whitespace junk — is left verbatim so
+/// [`is_valid_route_shape`] still rejects it.
+///
+/// Returns `Some(normalized)` when at least one interpolation was collapsed,
+/// `None` when the target has no collapsible fallback.
+pub fn normalize_env_fallback_target(target: &str) -> Option<String> {
+    let mut out = String::with_capacity(target.len());
+    let mut rest = target;
+    let mut changed = false;
+    while let Some(start) = rest.find("${") {
+        let (before, after) = rest.split_at(start);
+        out.push_str(before);
+        let inner = &after[2..];
+        let Some(end) = interpolation_end(inner) else {
+            // Unterminated interpolation: keep the tail verbatim.
+            out.push_str(after);
+            rest = "";
+            break;
+        };
+        let content = &inner[..end];
+        match fallback_reference(content) {
+            Some(reference) => {
+                out.push_str("${");
+                out.push_str(reference);
+                out.push('}');
+                changed = true;
+            }
+            None => out.push_str(&after[..end + 3]),
+        }
+        rest = &inner[end + 1..];
+    }
+    out.push_str(rest);
+    changed.then_some(out)
+}
+
+/// Byte index of the `}` closing an interpolation whose `${` was already
+/// consumed. Brace-depth, quote, and escape aware, so a `}` inside a quoted
+/// fallback string (including behind an escaped quote, `"\"}"`) or a nested
+/// `${...}` inside a backtick template does not terminate the scan early.
+fn interpolation_end(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' | '`' => quote = Some(c),
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// If the interpolation content is `<reference> ?? <expr>` or
+/// `<reference> || <expr>` with the operator at the top level, return the
+/// trimmed reference. `None` means "not a collapsible fallback" — the caller
+/// keeps the content verbatim.
+fn fallback_reference(content: &str) -> Option<&str> {
+    let op = top_level_fallback_op(content)?;
+    let reference = content[..op].trim();
+    let expr = content[op + 2..].trim();
+    (!reference.is_empty()
+        && !expr.is_empty()
+        && reference
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.')))
+    .then_some(reference)
+}
+
+/// Byte index of the first `??` or `||` outside quotes and outside any
+/// bracket/paren/brace nesting. Escape aware inside quotes, so an escaped
+/// quote never ends the string early and a `??`/`||` inside a string literal
+/// never counts. Single `?`/`|` (ternary, optional chaining, bitwise-or)
+/// never match.
+fn top_level_fallback_op(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for i in 0..bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' | b'`' => quote = Some(b),
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+                b'?' | b'|' if depth == 0 && bytes.get(i + 1) == Some(&b) => {
+                    // Match only the START of a `??`/`||` run.
+                    if i > 0 && bytes[i - 1] == b {
+                        continue;
+                    }
+                    return Some(i);
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 pub fn is_valid_route_shape(route: &str) -> bool {
     let route = route.trim();
     if route.is_empty() {
@@ -2807,6 +2951,134 @@ mod tests {
                 "expected route to be kept: {route:?}"
             );
         }
+    }
+
+    /// carrick#399: the file-analyzer sometimes renders a call target verbatim
+    /// with its inline fallback; the collapse must yield the exact clean form
+    /// so both renderings of the same call site produce one canonical key.
+    #[test]
+    fn normalize_env_fallback_collapses_inline_fallbacks() {
+        let cases = [
+            // The exact verbatim rendering from the #399 evidence
+            // (eval run 29677844107).
+            (
+                r#"${AUDIT_WEBHOOK_URL ?? "http://localhost:3099"}/audit/events"#,
+                "${AUDIT_WEBHOOK_URL}/audit/events",
+            ),
+            ("${A || 'x'}/p", "${A}/p"),
+            (
+                r#"${process.env.AUDIT_WEBHOOK_URL ?? "http://localhost:3099"}/audit/events"#,
+                "${process.env.AUDIT_WEBHOOK_URL}/audit/events",
+            ),
+            // Dotted config-alias form (#218 shape) with a fallback.
+            (
+                r#"${config.catalogUrl ?? "http://localhost:4001"}/api/products"#,
+                "${config.catalogUrl}/api/products",
+            ),
+            // Fallback expression carrying a nested interpolation inside a
+            // backtick template: the inner `${PORT}` must not end the scan.
+            ("${BASE ?? `http://localhost:${PORT}`}/p", "${BASE}/p"),
+            // Quoted `}` and `||` inside the fallback string are inert.
+            (r#"${BASE ?? "a||b}c"}/p"#, "${BASE}/p"),
+            // Escaped quote inside the fallback string does not end the
+            // string early, so the `}` and `||` behind it stay inert.
+            (r#"${BASE ?? "it\"s}fine"}/p"#, "${BASE}/p"),
+            (r#"${BASE ?? "\" || junk"}/p"#, "${BASE}/p"),
+            // Backtick-wrapped template with a mid-path param: only the
+            // fallback interpolation collapses, the `${id}` param survives.
+            (
+                "`${ORDERS_BASE || 'http://localhost:3001'}/orders/${id}`",
+                "`${ORDERS_BASE}/orders/${id}`",
+            ),
+            // Mid-path param fallback collapses to the plain param form.
+            ("/orders/${id ?? 0}", "/orders/${id}"),
+            // Chained fallback keeps the first reference.
+            ("${A ?? B ?? C}/p", "${A}/p"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                normalize_env_fallback_target(raw).as_deref(),
+                Some(want),
+                "for {raw:?}"
+            );
+        }
+        // The collapsed forms are valid route shapes; the verbatim forms are
+        // not (that rejection was the #359 recall flake).
+        assert!(!is_valid_route_shape(
+            r#"${AUDIT_WEBHOOK_URL ?? "http://localhost:3099"}/audit/events"#
+        ));
+        assert!(is_valid_route_shape("${AUDIT_WEBHOOK_URL}/audit/events"));
+        assert!(is_valid_route_shape("${A}/p"));
+        assert!(is_valid_route_shape(
+            "${process.env.AUDIT_WEBHOOK_URL}/audit/events"
+        ));
+    }
+
+    /// The whitespace guard in `is_valid_route_shape` exists for a reason:
+    /// only clean-reference fallbacks become valid. Everything else stays
+    /// verbatim and stays rejected.
+    #[test]
+    fn normalize_env_fallback_leaves_non_fallback_expressions_rejected() {
+        let untouched_and_rejected = [
+            // Plain whitespace junk: no fallback operator at all.
+            "${a b}/p",
+            // Call-expression left-hand side is not an env reference.
+            r#"${getUrl() ?? "x"}/p"#,
+            // Concatenation is not a fallback.
+            "${base + path}/p",
+            // Optional chaining on the left-hand side is not a clean reference.
+            "${cfg?.url ?? 'x'}/p",
+            // Fallback with an empty right-hand side is not collapsible.
+            "${A ??}/p",
+            // Operator OUTSIDE the interpolation (historical dropped case).
+            "${API_KEYS_TABLE}||CarrickApiKeys",
+        ];
+        for target in untouched_and_rejected {
+            assert_eq!(
+                normalize_env_fallback_target(target),
+                None,
+                "expected no normalization for {target:?}"
+            );
+            assert!(
+                !is_valid_route_shape(target),
+                "expected route to stay dropped: {target:?}"
+            );
+        }
+        // Already-clean targets are untouched (no-op, not Some(identical)).
+        for target in ["${AUDIT_WEBHOOK_URL}/audit/events", "/plain/path"] {
+            assert_eq!(normalize_env_fallback_target(target), None);
+        }
+    }
+
+    /// Acceptance from carrick#399: feeding the run-29677844107 verbatim target
+    /// through the consumer-call path yields canonical `/audit/events` with
+    /// env-var base `AUDIT_WEBHOOK_URL` — byte-identical to the clean
+    /// `${AUDIT_WEBHOOK_URL}/audit/events` rendering's key.
+    #[test]
+    fn normalized_fallback_target_produces_the_clean_canonical_key() {
+        let config = crate::config::Config {
+            internal_env_vars: ["AUDIT_WEBHOOK_URL"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..crate::config::Config::default()
+        };
+        let normalizer = crate::url_normalizer::UrlNormalizer::new(&config);
+
+        let verbatim = r#"${AUDIT_WEBHOOK_URL ?? "http://localhost:3099"}/audit/events"#;
+        let clean = "${AUDIT_WEBHOOK_URL}/audit/events";
+
+        let normalized = normalize_env_fallback_target(verbatim).expect("collapses");
+        assert!(is_valid_route_shape(&normalized));
+        assert_eq!(
+            normalizer.consumer_call_path(&normalized),
+            normalizer.consumer_call_path(clean)
+        );
+        assert_eq!(normalizer.consumer_call_path(&normalized), "/audit/events");
+        assert_eq!(
+            Analyzer::extract_env_var_name(&normalized),
+            "AUDIT_WEBHOOK_URL"
+        );
     }
 
     #[test]
