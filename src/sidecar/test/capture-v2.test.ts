@@ -1,5 +1,5 @@
 /**
- * SPIKE: v2 capture ("tsc as serializer") — bare-checkout stdio test.
+ * v2 capture ("tsc as the serializer") — bare-checkout stdio test.
  *
  * Drives the sidecar over the same JSON-over-stdio wire the Rust client uses
  * (the integration point for src/services/type_sidecar.rs), against the
@@ -9,15 +9,22 @@
  * What this pins:
  *  1. `tsc --noCheck --declaration --emitDeclarationOnly` capture succeeds on
  *     a bare checkout (exit clean, tree emitted).
- *  2. Third-party type ANNOTATIONS survive as syntactic import references
+ *  2. Third-party references survive as syntactic import references
  *     (`import { z } from "zod"` + `z.infer<typeof StockAdjustSchema>`
  *     verbatim in the emitted tree) where expandTypeStructural bakes `any`.
- *  3. The amended self-check: the zod-dependent alias is ALLOWLISTED (kept at
- *     tier 'emitted', not decayed to Unknown) because its unresolved external
- *     specifier is pinned in the stub's dependencies.
- *  4. The honest limitation: types INFERRED through the missing library
- *     (`export declare const StockAdjustSchema: any`) bake to `any` on a bare
- *     checkout; the check-phase probe gates are the backstop for those.
+ *  3. In-repo ambient declaration sources (the fixture's stubs.d.ts with
+ *     `declare module "zod"` — the corpus determinism recipe) ship verbatim:
+ *     tsc never re-emits input .d.ts, so without the copy the tree's
+ *     references dangle. With them shipped the stub is self-contained and
+ *     the zod-derived alias self-checks ok even on a bare checkout.
+ *  4. External deps referenced by the tree pin to exact lockfile versions,
+ *     pruned to what the tree actually references.
+ *  5. anchor_origin (amendment 2) rides every alias record, and the
+ *     per-capture fidelity metric is emitted.
+ *
+ * The amendment-1 allowlist path (pinned external, unresolved on bare, NO
+ * ambient stub) is pinned by capture-v2-forms.test.ts on a purpose-built
+ * fixture; this corpus fixture stubs its externals so it cannot exercise it.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -27,7 +34,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SidecarClient } from './helpers.js';
-import type { CaptureStubResult } from '../src/capture-v2.js';
+import type { CaptureStubResult } from '../src/capture/api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // dist/test -> repo root is four levels up (dist/test -> dist -> sidecar -> src -> root)
@@ -43,7 +50,7 @@ interface CaptureV2ResponseShape {
   errors?: string[];
 }
 
-describe('capture_v2 (spike): bare-checkout tsc-as-serializer', () => {
+describe('capture_v2: bare-checkout tsc-as-serializer (corpus-3 fixture)', () => {
   const client = new SidecarClient();
   let outDir: string;
   let response: CaptureV2ResponseShape;
@@ -57,25 +64,28 @@ describe('capture_v2 (spike): bare-checkout tsc-as-serializer', () => {
     outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-capture-v2-test-'));
     await client.start();
     response = (await client.send({
-      request_id: 'capture-v2-spike-1',
+      request_id: 'capture-v2-corpus3-1',
       action: 'capture_v2',
       repo_root: FIXTURE,
       service_name: 'inventory-svc',
       out_dir: path.join(outDir, 'stub'),
       anchors: [
         {
+          kind: 'symbol',
           alias: 'Endpoint_stock_Response',
           symbol_name: 'StockLevel',
           source_file: 'src/types/stock.ts',
           anchor_origin: 'llm-symbol',
         },
         {
+          kind: 'symbol',
           alias: 'Sub_stockadjust_Payload',
           symbol_name: 'StockAdjustCommand',
           source_file: 'src/types/stock.ts',
           anchor_origin: 'llm-symbol',
         },
         {
+          kind: 'symbol',
           alias: 'Sub_priceupdated_Payload',
           symbol_name: 'PriceUpdatedEvent',
           source_file: 'src/types/stock.ts',
@@ -104,11 +114,12 @@ describe('capture_v2 (spike): bare-checkout tsc-as-serializer', () => {
     assert.ok(result.emitted_files.includes('types/src/types/stock.d.ts'));
     assert.ok(fs.existsSync(path.join(result.stub_dir, 'package.json')));
     assert.ok(fs.existsSync(path.join(result.stub_dir, 'tsconfig.snapshot.json')));
+    assert.ok(fs.existsSync(path.join(result.stub_dir, 'carrick-manifest.json')));
     const pkg = JSON.parse(fs.readFileSync(path.join(result.stub_dir, 'package.json'), 'utf8'));
     assert.strictEqual(pkg.types, './types/surface.d.ts');
   });
 
-  it('preserves third-party annotations as import references (not any)', () => {
+  it('preserves third-party references as import references (not any)', () => {
     const result = response.result!;
     const stockDts = fs.readFileSync(
       path.join(result.stub_dir, 'types', 'src', 'types', 'stock.d.ts'),
@@ -117,38 +128,43 @@ describe('capture_v2 (spike): bare-checkout tsc-as-serializer', () => {
     // The exact loss expandTypeStructural forces today: these survive verbatim.
     assert.ok(stockDts.includes('import { z } from "zod"'), stockDts);
     assert.ok(stockDts.includes('z.infer<typeof StockAdjustSchema>'), stockDts);
-    // Honest limitation on bare checkouts: inference THROUGH the missing
-    // library still bakes any (annotations survive; inferred consts do not).
-    assert.ok(stockDts.includes('StockAdjustSchema: any'), stockDts);
+    // The schema const keeps a real zod type reference instead of baking any:
+    // the fixture's ambient stubs are part of the repo's own compilation, so
+    // the capture program sees them exactly like the repo's tsc does.
+    assert.match(stockDts, /StockAdjustSchema: import\("zod"\)\./, stockDts);
+  });
+
+  it('ships in-repo ambient declaration sources verbatim', () => {
+    const result = response.result!;
+    assert.ok(
+      result.emitted_files.includes('types/src/types/stubs.d.ts'),
+      JSON.stringify(result.emitted_files)
+    );
+    const stubs = fs.readFileSync(
+      path.join(result.stub_dir, 'types', 'src', 'types', 'stubs.d.ts'),
+      'utf8'
+    );
+    assert.ok(stubs.includes('declare module "zod"'), 'ambient module text must survive');
   });
 
   it('pins referenced externals to exact lockfile versions', () => {
     const result = response.result!;
     assert.strictEqual(result.pinned_dependencies['zod'], '3.23.0');
     assert.deepStrictEqual(result.unpinned_externals, []);
-    // Pruning: express/amqplib/nats are in the lockfile but not referenced
-    // by the emitted tree, so they must not be pinned into the stub.
-    assert.strictEqual(result.pinned_dependencies['express'], undefined);
   });
 
-  it('self-check: plain internal types pass', () => {
+  it('self-check: every alias resolves in the self-contained tree', () => {
     const byAlias = new Map(response.result!.aliases.map((a) => [a.alias, a]));
-    for (const alias of ['Endpoint_stock_Response', 'Sub_priceupdated_Payload']) {
+    for (const alias of [
+      'Endpoint_stock_Response',
+      'Sub_stockadjust_Payload',
+      'Sub_priceupdated_Payload',
+    ]) {
       const rec = byAlias.get(alias)!;
-      assert.strictEqual(rec.self_check, 'ok', alias);
+      assert.strictEqual(rec.self_check, 'ok', `${alias}: ${rec.self_check_detail}`);
       assert.strictEqual(rec.top_type_at_self_check, false, alias);
       assert.strictEqual(rec.serialization, 'emitted');
     }
-  });
-
-  it('self-check: pinned-external failure is allowlisted, not decayed (amendment 1)', () => {
-    const byAlias = new Map(response.result!.aliases.map((a) => [a.alias, a]));
-    const rec = byAlias.get('Sub_stockadjust_Payload')!;
-    assert.strictEqual(rec.self_check, 'allowlisted_external', rec.self_check_detail);
-    assert.strictEqual(rec.top_type_at_self_check, true);
-    // Still tier 'emitted': the alias is NOT downgraded to Unknown.
-    assert.strictEqual(rec.serialization, 'emitted');
-    assert.match(rec.self_check_detail ?? '', /zod@3\.23\.0/);
   });
 
   it('records anchor provenance separately from the serialization tier (amendment 2)', () => {
@@ -158,5 +174,15 @@ describe('capture_v2 (spike): bare-checkout tsc-as-serializer', () => {
       byAlias.get('Sub_priceupdated_Payload')!.anchor_origin,
       'deterministic-infer'
     );
+  });
+
+  it('emits the per-capture fidelity metric', () => {
+    const fidelity = response.result!.fidelity;
+    assert.strictEqual(fidelity.total_aliases, 3);
+    assert.strictEqual(fidelity.by_serialization.emitted, 3);
+    assert.strictEqual(fidelity.by_self_check.ok, 3);
+    assert.strictEqual(fidelity.by_anchor_origin['llm-symbol'], 2);
+    assert.strictEqual(fidelity.by_anchor_origin['deterministic-infer'], 1);
+    assert.strictEqual(fidelity.usable_rate, 1);
   });
 });

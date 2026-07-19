@@ -221,21 +221,42 @@ export const EmitSurfaceRequestSchema = BaseRequestSchema.extend({
   output_path: z.string().min(1, 'Output path cannot be empty'),
 });
 
-/** SPIKE: v2 "tsc as serializer" capture (see capture-v2.ts). */
+/** v2 "tsc as serializer" capture (contract in ./capture/api.ts). */
+const AnchorOriginSchema = z.enum(['llm-symbol', 'deterministic-infer', 'anchor-backfill']);
+
+const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('symbol'),
+    alias: z.string().min(1),
+    symbol_name: z.string().min(1),
+    source_file: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
+  }),
+  z.object({
+    kind: z.literal('handler_return'),
+    alias: z.string().min(1),
+    symbol_name: z.string().min(1),
+    source_file: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
+  }),
+  z.object({
+    kind: z.literal('infer'),
+    alias: z.string().min(1),
+    source_file: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
+    span_start: z.number().int().nonnegative().optional(),
+    span_end: z.number().int().nonnegative().optional(),
+    line_number: z.number().int().positive().optional(),
+    expression_text: z.string().optional(),
+    unwrap: z.enum(['awaited', 'none']).optional(),
+  }),
+]);
+
 export const CaptureV2RequestSchema = BaseRequestSchema.extend({
   action: z.literal('capture_v2'),
   repo_root: z.string().min(1, 'Repo root cannot be empty'),
   service_name: z.string().min(1, 'Service name cannot be empty'),
-  anchors: z
-    .array(
-      z.object({
-        alias: z.string().min(1),
-        symbol_name: z.string().min(1),
-        source_file: z.string().min(1),
-        anchor_origin: z.enum(['llm-symbol', 'deterministic-infer', 'anchor-backfill']),
-      })
-    )
-    .min(1, 'At least one anchor is required'),
+  anchors: z.array(CaptureAnchorRequestSchema).min(1, 'At least one anchor is required'),
   out_dir: z.string().min(1, 'Output dir cannot be empty'),
   tsconfig_path: z.string().optional(),
 });

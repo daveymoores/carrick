@@ -19,7 +19,7 @@ import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { MonorepoBuilder } from './monorepo-builder.js';
 import { DefinitionResolver } from './definition-resolver.js';
-import { captureStub } from './capture-v2.js';
+import { captureStub } from './capture/index.js';
 import type {
   SidecarRequest,
   SidecarResponse,
@@ -217,9 +217,11 @@ function handleEmitSurface(request: SidecarRequest & { action: 'emit_surface' })
 }
 
 /**
- * SPIKE: handle the 'capture_v2' action - v2 "tsc as serializer" capture.
+ * Handle the 'capture_v2' action - v2 "tsc as serializer" capture.
  * Stateless by design: unlike bundle/infer it needs no init'd ts-morph
- * project, only the repo's own tsconfig — this is the point of v2.
+ * project, only the repo's own tsconfig — this is the point of v2. The
+ * capture bundle behind this action is the seam ("seam, not split"): this
+ * dispatcher call is the only non-type reach-in.
  */
 function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): CaptureV2Response {
   try {

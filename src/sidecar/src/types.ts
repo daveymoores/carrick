@@ -217,9 +217,11 @@ export interface PayloadDefinition {
 }
 
 /**
- * SPIKE: request to run the v2 "tsc as serializer" capture for one service.
+ * Request to run the v2 "tsc as serializer" capture for one service.
  * Produces a types-only stub package (compiler-emitted declaration tree +
- * pinned deps) instead of a flattened structural string. See capture-v2.ts.
+ * pinned deps) instead of a flattened structural string. The full contract
+ * lives in ./capture/api.ts -- the seam between the sidecar and the v2
+ * capture bundle.
  */
 export interface CaptureV2Request extends BaseRequest {
   action: 'capture_v2';
@@ -227,8 +229,8 @@ export interface CaptureV2Request extends BaseRequest {
   repo_root: string;
   /** Service name used for the @carrick/<service> stub package */
   service_name: string;
-  /** Explicit-symbol anchors to alias in the surface entry */
-  anchors: import('./capture-v2.js').CaptureAnchorRequest[];
+  /** Anchors to alias in the surface entry (symbol / handler_return / infer) */
+  anchors: import('./capture/api.js').CaptureAnchorRequest[];
   /** Directory to write the stub package into */
   out_dir: string;
   /** Optional explicit tsconfig path (defaults to <repo_root>/tsconfig.json) */
@@ -236,10 +238,10 @@ export interface CaptureV2Request extends BaseRequest {
 }
 
 /**
- * Response for the capture_v2 action (spike)
+ * Response for the capture_v2 action
  */
 export interface CaptureV2Response extends BaseResponse {
-  result?: import('./capture-v2.js').CaptureStubResult;
+  result?: import('./capture/api.js').CaptureStubResult;
   errors?: string[];
 }
 
