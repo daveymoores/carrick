@@ -1759,21 +1759,27 @@ fn merge_graphql_resolver_locations(
             // it through here would wrongly take the FunctionReturn path and
             // block the type-locate fallback below, leaving the producer
             // unanchored.
-            if llm_op
+            // The FunctionReturn path needs BOTH a real resolver name AND a
+            // usable line: `collect_graphql_producer_infer_requests` skips any
+            // producer missing either, so taking this branch with a dead
+            // locator would leave the producer with no type request of any
+            // kind. The LLM line is a 1-based source line; clamp non-positive
+            // values to None rather than wrapping into a bogus u32 (the infer
+            // request's line_number is u32, and a 0/negative line can't anchor
+            // a fn), and treat a clamped-out line exactly like a missing
+            // resolver: fall through to the backing-type fallback.
+            let resolver_line = llm_op
                 .resolver_function
                 .as_deref()
-                .is_some_and(|f| !f.trim().is_empty())
-            {
+                .filter(|f| !f.trim().is_empty())
+                .and(llm_op.resolver_line)
+                .and_then(|line| u32::try_from(line).ok())
+                .filter(|&line| line > 0);
+            if resolver_line.is_some() {
                 // Resolver located: its concrete return type carries the
                 // wrappers (Promise / ApiResponse envelope / async-iterator) the
-                // bare SDL-backed type can't, so the FunctionReturn path wins. The
-                // LLM line is a 1-based source line; clamp non-positive values to
-                // None rather than wrapping into a bogus u32 (the infer request's
-                // line_number is u32, and a 0/negative line can't anchor a fn).
-                producer.resolver_line = llm_op
-                    .resolver_line
-                    .and_then(|line| u32::try_from(line).ok())
-                    .filter(|&line| line > 0);
+                // bare SDL-backed type can't, so the FunctionReturn path wins.
+                producer.resolver_line = resolver_line;
             } else if let Some(symbol) = llm_op.backing_type_symbol.clone() {
                 // No resolver function: fall back to the co-located backing type
                 // the LLM located (#248). Keyed on the dedicated
@@ -6229,6 +6235,103 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
         assert_eq!(orders.resolver_line, None);
         // The type-locate fallback still fires (the producer stays anchored).
         assert_eq!(orders.response_type_symbol.as_deref(), Some("Order"));
+    }
+
+    /// A named `resolver_function` whose `resolver_line` is unusable (absent,
+    /// or non-positive so it clamps to `None`) must NOT take the
+    /// FunctionReturn path with a dead locator:
+    /// `collect_graphql_producer_infer_requests` requires BOTH `resolver_file`
+    /// and `resolver_line`, so the op would emit no infer request, and the
+    /// skipped backing-type fallback would emit no `SymbolRequest` either —
+    /// the producer ends up with no type request of any kind. When the line
+    /// is unusable, the backing-type fallback must fire instead.
+    #[test]
+    fn merge_graphql_unusable_resolver_line_falls_back_to_backing_type() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![
+                graphql_op(GraphqlOperationKind::Query, "order", Some("Order")),
+                graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
+            ],
+            consumers: vec![],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "packages/gateway/src/orders.resolver.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![],
+                graphql_operations: vec![
+                    // Named resolver, but the model omitted the line.
+                    GraphqlOperation {
+                        kind: GraphqlOperationKind::Query,
+                        field: "order".to_string(),
+                        resolver_function: Some("resolveOrder".to_string()),
+                        resolver_line: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                        backing_type_symbol: Some("Order".to_string()),
+                        backing_type_source: None,
+                    },
+                    // Named resolver with a non-positive line (clamps to None).
+                    GraphqlOperation {
+                        kind: GraphqlOperationKind::Query,
+                        field: "orders".to_string(),
+                        resolver_function: Some("resolveOrders".to_string()),
+                        resolver_line: Some(0),
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                        backing_type_symbol: Some("Order".to_string()),
+                        backing_type_source: None,
+                    },
+                ],
+                pubsub_operations: vec![],
+            },
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        for field in ["order", "orders"] {
+            let producer = graphql
+                .producers
+                .iter()
+                .find(|op| op.key.canonical() == format!("graphql|query|{field}"))
+                .expect("producer");
+            // No FunctionReturn: an unusable line cannot anchor a resolver.
+            assert_eq!(
+                producer.resolver_line, None,
+                "{field}: an unusable resolver_line must stay None"
+            );
+            // The backing-type fallback must fire so the producer stays anchored.
+            assert_eq!(
+                producer.response_type_symbol.as_deref(),
+                Some("Order"),
+                "{field}: the backing-type fallback must fire when the \
+                 resolver line is unusable"
+            );
+        }
+
+        // End to end: no dead FunctionReturn infer requests, and each producer
+        // gets a backing-type SymbolRequest — a type request of SOME kind.
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        assert!(
+            orchestrator
+                .collect_graphql_producer_infer_requests(&graphql, ".")
+                .is_empty(),
+            "no resolver line means no FunctionReturn infer request"
+        );
+        let requests = orchestrator.collect_graphql_type_requests(&graphql, ".");
+        assert_eq!(
+            requests.len(),
+            2,
+            "each producer must emit a backing-type SymbolRequest, got: {:?}",
+            requests
+        );
     }
 
     /// #268 isolation guard: a consumer op with an explicit call-site generic
