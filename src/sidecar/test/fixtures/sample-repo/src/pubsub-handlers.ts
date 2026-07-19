@@ -94,3 +94,11 @@ export function publishOrder(): void {
   const order: OrderPlacedPayload = { orderId: "o1", totalCents: 100 };
   void send("orders.placed", order);
 }
+
+// Payload type imported through the barrel: the anchor source must be the
+// DECLARING file (pubsub-barrel-types.ts), never the barrel.
+import type { ReExportedPayload } from "./pubsub-barrel.js";
+
+export function onShipment(evt: ReExportedPayload): void {
+  void evt;
+}

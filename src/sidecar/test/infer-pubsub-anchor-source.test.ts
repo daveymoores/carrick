@@ -113,6 +113,35 @@ describe('pub/sub infer kinds report the payload anchor and its declaration sour
     );
   });
 
+  it('a barrel-re-exported payload reports the DECLARING file, never the barrel', async () => {
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: 'pas-4',
+      requests: [
+        {
+          file_path: FIXTURE,
+          line_number: 102,
+          infer_kind: 'function_param',
+          param_name: 'evt',
+          alias: 'PubsubBarrelAnchor',
+        },
+      ],
+    });
+
+    assert.ok(
+      response.inferred_types && response.inferred_types.length > 0,
+      `expected inferred_types, got ${JSON.stringify(response)}`
+    );
+    const inferred = response.inferred_types[0];
+    assert.strictEqual(inferred.primary_type_symbol, 'ReExportedPayload');
+    assert.ok(
+      inferred.primary_type_symbol_source?.endsWith('pubsub-barrel-types.ts'),
+      `anchor source must be the declaring file, got ${JSON.stringify(
+        inferred.primary_type_symbol_source
+      )}`
+    );
+  });
+
   it('an anonymous destructured payload stays anchor-less', async () => {
     const response = await client.send<InferResponseShape>({
       action: 'infer',

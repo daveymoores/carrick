@@ -1849,13 +1849,31 @@ export class TypeInferrer {
    * demoted explicit bundle request: the bundler resolves a `SymbolRequest`
    * only against declarations IN its `source_file`, so the request must
    * point at the file that actually declares the tsc-witnessed payload type.
+   *
+   * Only declaration kinds the bundler's `validateSymbols` can resolve
+   * (interface, type alias, class, enum, function, variable) count. A
+   * symbol's declaration list can also contain re-export machinery — a
+   * barrel's `ExportSpecifier` (`export { Foo } from './foo'`) points at a
+   * file that does not DECLARE the type, and a request re-aimed there would
+   * fail validation, turning a resolvable explicit type into `unknown`.
+   * With no declaring node, no source is reported and the arbitration
+   * fails closed to the explicit anchor.
    */
   private primaryTypeSymbolSource(type: Type): string | undefined {
     if (this.primaryTypeSymbol(type) === undefined) {
       return undefined;
     }
-    const decl = (type.getSymbol() || type.getAliasSymbol())?.getDeclarations()?.[0];
-    return decl?.getSourceFile().getFilePath();
+    const decls = (type.getSymbol() || type.getAliasSymbol())?.getDeclarations() ?? [];
+    const declaring = decls.find(
+      (d) =>
+        Node.isInterfaceDeclaration(d) ||
+        Node.isTypeAliasDeclaration(d) ||
+        Node.isClassDeclaration(d) ||
+        Node.isEnumDeclaration(d) ||
+        Node.isFunctionDeclaration(d) ||
+        Node.isVariableDeclaration(d)
+    );
+    return declaring?.getSourceFile().getFilePath();
   }
 
   /**
