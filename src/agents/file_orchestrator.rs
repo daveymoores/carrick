@@ -2640,16 +2640,81 @@ impl FileOrchestrator {
             );
         }
 
-        // Pub/sub type hints intentionally skip the reject-on-mismatch `validate`
-        // above (their payload symbols come from many messaging libraries whose
-        // shapes the import-table check is not tuned for), but the spurious
-        // source-file extension is a universal model artifact, so normalize it.
+        // Pub/sub parity for the reject check above, with two deliberate
+        // deviations from the HTTP closure (which stays byte-identical):
+        //
+        // 1. AST source-overwrite (pub/sub ONLY): when the symbol root passes
+        //    the AST check, the import table is the source of truth for
+        //    `type_import_source`, so we overwrite it instead of rejecting on
+        //    a source mismatch. The HTTP side must NOT get this overwrite: it
+        //    would turn null-to-infer into keep-explicit and could rescue
+        //    borrowed symbols, which needs a decoy-fixture A/B first.
+        //
+        // 2. Guarded demote: a failing symbol is demoted (symbol AND source
+        //    both to null) ONLY when the op carries a payload locator that the
+        //    envelope guard in `collect_pubsub_infer_requests` will accept
+        //    (text present and not containing the op's own topic), so the
+        //    demoted op is guaranteed to fall through to location-based
+        //    inference rather than being dropped. Otherwise the suspect
+        //    symbol is kept as the recall floor. This targets the measured
+        //    wrong-symbol borrow class (13/20 on the c1 decoy prompt): a
+        //    present symbol takes the explicit path and is never rescued by
+        //    inference, so a confidently wrong resolve was previously
+        //    unrecoverable.
         for op in &mut result.pubsub_operations {
             Self::normalize_import_extension(
                 &op.primary_type_symbol,
                 &mut op.type_import_source,
                 symbol_table,
             );
+
+            let Some(symbol) = op.primary_type_symbol.as_ref() else {
+                // Hygiene parity with the HTTP closure and the schema
+                // invariant (source is null whenever the symbol is null): a
+                // source with no symbol anchors nothing, so clear it rather
+                // than leave an inconsistent pair.
+                op.type_import_source = None;
+                continue;
+            };
+
+            let (root, has_member) = symbol
+                .split_once('.')
+                .map(|(root, _)| (root, true))
+                .unwrap_or((symbol.as_str(), false));
+
+            if symbol_table.local_types.contains(root) {
+                if !has_member {
+                    // Locally declared: by definition there is no import
+                    // source. Overwrite whatever the model said.
+                    op.type_import_source = None;
+                    continue;
+                }
+            } else if let Some(imported) = symbol_table.imported_symbols.get(root) {
+                let namespace_ok = if imported.kind == SymbolKind::Namespace {
+                    has_member
+                } else {
+                    !has_member
+                };
+                if namespace_ok {
+                    op.type_import_source = Some(imported.source.clone());
+                    continue;
+                }
+            }
+
+            let demote_survives_envelope_guard = op
+                .payload_expression_text
+                .as_deref()
+                .is_some_and(|text| !text.contains(op.topic.as_str()));
+            if demote_survives_envelope_guard {
+                debug!(
+                    topic = %op.topic,
+                    symbol = %symbol,
+                    "pub/sub type symbol failed the AST check and a usable \
+                     payload locator exists; demoting to location-based inference"
+                );
+                op.primary_type_symbol = None;
+                op.type_import_source = None;
+            }
         }
     }
 
@@ -5673,8 +5738,10 @@ mod tests {
                     payload_expression_text: None,
                     payload_expression_line: None,
                 },
-                // (c) `.ts` whose stripped form is NOT in the import table -> left as-is
-                //     (we normalize only against evidence, never guess).
+                // (c) `.ts` whose stripped form does not match the import-table
+                //     entry -> extension normalization leaves it alone, then the
+                //     pub/sub AST source-overwrite corrects it to the import
+                //     table's source (the symbol itself passes the check).
                 PubsubOperation {
                     topic: "other".to_string(),
                     role: Some(PubsubRole::Publisher),
@@ -5739,9 +5806,292 @@ mod tests {
             Some("@metamask/keyring-internal-api")
         );
         assert_eq!(
-            result.pubsub_operations[2].type_import_source.as_deref(),
-            Some("../wrong/path.ts")
+            result.pubsub_operations[2].primary_type_symbol.as_deref(),
+            Some("OrderPlacedEvent")
         );
+        assert_eq!(
+            result.pubsub_operations[2].type_import_source.as_deref(),
+            Some("../types/events")
+        );
+    }
+
+    fn pubsub_op(
+        topic: &str,
+        role: crate::operation::PubsubRole,
+        symbol: Option<&str>,
+        source: Option<&str>,
+        locator: Option<&str>,
+    ) -> crate::agents::file_analyzer_agent::PubsubOperation {
+        crate::agents::file_analyzer_agent::PubsubOperation {
+            topic: topic.to_string(),
+            role: Some(role),
+            line_number: 20,
+            primary_type_symbol: symbol.map(str::to_string),
+            type_import_source: source.map(str::to_string),
+            broker: None,
+            payload_expression_text: locator.map(str::to_string),
+            payload_expression_line: locator.map(|_| 21),
+        }
+    }
+
+    fn pubsub_only_result(
+        ops: Vec<crate::agents::file_analyzer_agent::PubsubOperation>,
+    ) -> FileAnalysisResult {
+        FileAnalysisResult {
+            graphql_consumer_locates: vec![],
+            mounts: vec![],
+            endpoints: vec![],
+            data_calls: vec![],
+            graphql_operations: vec![],
+            pubsub_operations: ops,
+        }
+    }
+
+    /// (a) A pub/sub symbol that fails the AST check while a usable
+    /// (non-envelope) payload locator exists is demoted, and the demoted op
+    /// then flows through `collect_pubsub_infer_requests` to an
+    /// `InferRequestItem` — the end-to-end rescue path for the wrong-symbol
+    /// borrow class.
+    #[test]
+    fn test_validate_pubsub_type_hints_demotes_wrong_symbol_into_infer_path() {
+        use crate::operation::PubsubRole;
+
+        let mut result = pubsub_only_result(vec![
+            pubsub_op(
+                "order.placed",
+                PubsubRole::Publisher,
+                Some("BorrowedDecoy"),
+                Some("./decoys"),
+                Some("payload"),
+            ),
+            // Model emitted a source with no symbol: cleared for hygiene
+            // (schema invariant: source is null whenever the symbol is null).
+            pubsub_op(
+                "order.cancelled",
+                PubsubRole::Publisher,
+                None,
+                Some("./ghost"),
+                None,
+            ),
+        ]);
+        let symbol_table = SymbolTable {
+            local_types: HashSet::new(),
+            imported_symbols: HashMap::new(),
+        };
+
+        FileOrchestrator::validate_type_hints(&mut result, &symbol_table);
+
+        let op = &result.pubsub_operations[0];
+        assert!(op.primary_type_symbol.is_none(), "symbol must be demoted");
+        assert!(op.type_import_source.is_none(), "source must be demoted");
+        assert!(
+            result.pubsub_operations[1].type_import_source.is_none(),
+            "a dangling source with no symbol must be cleared"
+        );
+
+        // The demoted op must fall through to the infer path.
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let mut file_results = HashMap::new();
+        file_results.insert("src/pub.ts".to_string(), result);
+        let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
+        assert_eq!(requests.len(), 1, "demoted op must emit an infer request");
+        let item = &requests[0];
+        assert_eq!(item.infer_kind, InferKind::Expression);
+        assert_eq!(item.expression_text.as_deref(), Some("payload"));
+        assert_eq!(item.expression_line, Some(21));
+    }
+
+    /// (b) A symbol naming a class or enum declared in the same file passes
+    /// the AST check and is KEPT — through the real `extract_symbol_table`
+    /// path, so this pins the `TypeSymbolExtractor` class/enum extension the
+    /// demote depends on.
+    #[test]
+    fn test_validate_pubsub_type_hints_keeps_local_class_and_enum_symbols() {
+        use crate::operation::PubsubRole;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp.path().join("events.ts");
+        std::fs::write(
+            &file_path,
+            "export class OrderPlacedEvent { id: string; }\n\
+             export enum OrderStatus { Placed, Shipped }\n",
+        )
+        .expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+        let (symbol_table, _) = FileOrchestrator::extract_symbol_table(&file_path, &cm, &handler);
+        assert!(
+            symbol_table.local_types.contains("OrderPlacedEvent"),
+            "class declarations must be collected as local types"
+        );
+        assert!(
+            symbol_table.local_types.contains("OrderStatus"),
+            "enum declarations must be collected as local types"
+        );
+
+        let mut result = pubsub_only_result(vec![
+            pubsub_op(
+                "order.placed",
+                PubsubRole::Publisher,
+                Some("OrderPlacedEvent"),
+                // Model hallucinated an import source for a local class: the
+                // AST overwrite corrects it to None instead of demoting.
+                Some("./events"),
+                Some("event"),
+            ),
+            pubsub_op(
+                "order.status",
+                PubsubRole::Subscriber,
+                Some("OrderStatus"),
+                None,
+                Some("status"),
+            ),
+        ]);
+
+        FileOrchestrator::validate_type_hints(&mut result, &symbol_table);
+
+        assert_eq!(
+            result.pubsub_operations[0].primary_type_symbol.as_deref(),
+            Some("OrderPlacedEvent"),
+            "local class symbol must be kept"
+        );
+        assert!(
+            result.pubsub_operations[0].type_import_source.is_none(),
+            "local class symbol's source must be overwritten to None"
+        );
+        assert_eq!(
+            result.pubsub_operations[1].primary_type_symbol.as_deref(),
+            Some("OrderStatus"),
+            "local enum symbol must be kept"
+        );
+        assert!(result.pubsub_operations[1].type_import_source.is_none());
+    }
+
+    /// (c) A failing symbol whose locator contains the op's own topic (the
+    /// envelope case `collect_pubsub_infer_requests` would drop) is KEPT, not
+    /// demoted: demoting would strand the op with no anchor at all. Same for
+    /// an op with no locator (the recall floor).
+    #[test]
+    fn test_validate_pubsub_type_hints_keeps_symbol_when_demote_target_unusable() {
+        use crate::operation::PubsubRole;
+
+        let mut result = pubsub_only_result(vec![
+            pubsub_op(
+                "order.placed",
+                PubsubRole::Publisher,
+                Some("WrongSymbol"),
+                Some("./somewhere"),
+                // Envelope copy: contains the topic literal, so the infer
+                // path's envelope guard would drop it.
+                Some("{ topic: 'order.placed', data }"),
+            ),
+            pubsub_op(
+                "order.shipped",
+                PubsubRole::Subscriber,
+                Some("AnotherWrongSymbol"),
+                None,
+                None,
+            ),
+        ]);
+        let symbol_table = SymbolTable {
+            local_types: HashSet::new(),
+            imported_symbols: HashMap::new(),
+        };
+
+        FileOrchestrator::validate_type_hints(&mut result, &symbol_table);
+
+        assert_eq!(
+            result.pubsub_operations[0].primary_type_symbol.as_deref(),
+            Some("WrongSymbol"),
+            "envelope-locator op must keep its symbol"
+        );
+        assert_eq!(
+            result.pubsub_operations[0].type_import_source.as_deref(),
+            Some("./somewhere")
+        );
+        assert_eq!(
+            result.pubsub_operations[1].primary_type_symbol.as_deref(),
+            Some("AnotherWrongSymbol"),
+            "locator-less op must keep its symbol as the recall floor"
+        );
+    }
+
+    /// (d) Regression pin: HTTP ops must NOT inherit the pub/sub AST
+    /// source-overwrite. An imported symbol with a mismatched source is still
+    /// nulled (null-to-infer), never rescued by rewriting the source; a local
+    /// type with a claimed import source is still nulled.
+    #[test]
+    fn test_validate_type_hints_http_behaviour_unchanged_no_source_overwrite() {
+        let mut result = FileAnalysisResult {
+            graphql_consumer_locates: vec![],
+            mounts: vec![],
+            endpoints: vec![EndpointResult {
+                candidate_id: "span:1-2".to_string(),
+                line_number: 10,
+                owner_node: "app".to_string(),
+                method: "GET".to_string(),
+                path: "/users".to_string(),
+                handler_name: "handler".to_string(),
+                pattern_matched: "app.get".to_string(),
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                response_expression_text: None,
+                response_expression_line: None,
+                emission_style: None,
+                // Imported symbol, wrong source: HTTP must null, not rewrite.
+                primary_type_symbol: Some("User".to_string()),
+                type_import_source: Some("./wrong".to_string()),
+            }],
+            data_calls: vec![DataCallResult {
+                call_kind: None,
+                candidate_id: "span:3-4".to_string(),
+                line_number: 12,
+                target: "/users".to_string(),
+                method: Some("GET".to_string()),
+                pattern_matched: "fetch(".to_string(),
+                call_expression_span_start: None,
+                call_expression_span_end: None,
+                call_expression_text: None,
+                call_expression_line: None,
+                payload_expression_text: None,
+                payload_expression_line: None,
+                // Local type with a claimed import source: HTTP must null.
+                primary_type_symbol: Some("LocalType".to_string()),
+                type_import_source: Some("./local".to_string()),
+            }],
+            graphql_operations: vec![],
+            pubsub_operations: vec![],
+        };
+
+        let mut imported_symbols = HashMap::new();
+        imported_symbols.insert(
+            "User".to_string(),
+            ImportedSymbol {
+                local_name: "User".to_string(),
+                imported_name: "User".to_string(),
+                source: "./types".to_string(),
+                kind: SymbolKind::Named,
+            },
+        );
+        let symbol_table = SymbolTable {
+            local_types: HashSet::from(["LocalType".to_string()]),
+            imported_symbols,
+        };
+
+        FileOrchestrator::validate_type_hints(&mut result, &symbol_table);
+
+        assert!(
+            result.endpoints[0].primary_type_symbol.is_none(),
+            "HTTP imported symbol with mismatched source must still be nulled"
+        );
+        assert!(result.endpoints[0].type_import_source.is_none());
+        assert!(
+            result.data_calls[0].primary_type_symbol.is_none(),
+            "HTTP local type with claimed import source must still be nulled"
+        );
+        assert!(result.data_calls[0].type_import_source.is_none());
     }
 
     #[test]

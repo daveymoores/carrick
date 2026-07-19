@@ -264,7 +264,12 @@ impl Visit for ImportSymbolExtractor {
     }
 }
 
-/// Extracts locally-declared type symbols for validation.
+/// Extracts locally-declared type symbols for validation. Collects every
+/// declaration form that a payload type annotation can legitimately name:
+/// type aliases, interfaces, classes, and enums. Classes and enums matter for
+/// pub/sub payloads in particular, where event payloads are often declared as
+/// local event classes; missing them would make the AST reject check null
+/// legitimate same-file symbols.
 #[derive(Debug, Default)]
 pub struct TypeSymbolExtractor {
     pub type_symbols: HashSet<String>,
@@ -287,6 +292,16 @@ impl Visit for TypeSymbolExtractor {
     fn visit_ts_interface_decl(&mut self, interface: &TsInterfaceDecl) {
         self.type_symbols.insert(interface.id.sym.to_string());
         interface.visit_children_with(self);
+    }
+
+    fn visit_class_decl(&mut self, class: &ClassDecl) {
+        self.type_symbols.insert(class.ident.sym.to_string());
+        class.visit_children_with(self);
+    }
+
+    fn visit_ts_enum_decl(&mut self, ts_enum: &TsEnumDecl) {
+        self.type_symbols.insert(ts_enum.id.sym.to_string());
+        ts_enum.visit_children_with(self);
     }
 }
 
@@ -869,6 +884,33 @@ mod tests {
         module.visit_with(&mut extractor);
         extractor.finalize_exports();
         extractor.function_definitions
+    }
+
+    #[test]
+    fn type_symbol_extractor_collects_all_type_declaration_forms() {
+        let (_cm, module) = parse_ts(
+            "type Alias = string;\n\
+             interface Shape { x: number }\n\
+             export class OrderPlacedEvent { id: string; }\n\
+             class LocalEvent { n: number; }\n\
+             export enum OrderStatus { Placed }\n\
+             const enum Inline { A }\n",
+        );
+        let mut extractor = TypeSymbolExtractor::new();
+        module.visit_with(&mut extractor);
+        for symbol in [
+            "Alias",
+            "Shape",
+            "OrderPlacedEvent",
+            "LocalEvent",
+            "OrderStatus",
+            "Inline",
+        ] {
+            assert!(
+                extractor.type_symbols.contains(symbol),
+                "should collect {symbol}"
+            );
+        }
     }
 
     #[test]
