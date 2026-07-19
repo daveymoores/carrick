@@ -149,6 +149,13 @@ describe('capture_v2: all anchor forms (bare fixture)', () => {
           anchor_origin: 'deterministic-infer',
           expression_text: "{ orderId: '1', eta: 'soon' }",
         },
+        {
+          kind: 'infer',
+          alias: 'Pub_shipmentsync_Payload',
+          source_file: 'src/events/pub.ts',
+          anchor_origin: 'deterministic-infer',
+          expression_text: 'fetchShipment()',
+        },
       ],
     })) as CaptureV2ResponseShape;
     byAlias = new Map((response.result?.aliases ?? []).map((a) => [a.alias, a]));
@@ -237,6 +244,21 @@ describe('capture_v2: all anchor forms (bare fixture)', () => {
     assert.match(surface, /Pub_ordershipped_Payload = \{\s*orderId: string;\s*eta: string;\s*\}/);
   });
 
+  it('infer default unwraps Promise transport (design-doc machinery unwrap)', () => {
+    const rec = byAlias.get('Pub_shipmentsync_Payload')!;
+    assert.strictEqual(rec.serialization, 'node_builder');
+    assert.strictEqual(rec.self_check, 'ok', rec.self_check_detail);
+    const surface = fs.readFileSync(
+      path.join(response.result!.stub_dir, 'types', 'surface.d.ts'),
+      'utf8'
+    );
+    // The awaited payload, not Promise<...>.
+    assert.match(
+      surface,
+      /Pub_shipmentsync_Payload = \{\s*shipmentId: string;\s*ok: boolean;\s*\}/
+    );
+  });
+
   it('rewrites tsconfig-paths specifiers to tree-relative ones', () => {
     const routesDts = fs.readFileSync(
       path.join(response.result!.stub_dir, 'types', 'http', 'routes.d.ts'),
@@ -267,15 +289,15 @@ describe('capture_v2: all anchor forms (bare fixture)', () => {
 
   it('emits a fidelity metric that separates tiers, outcomes, and anchor origins', () => {
     const fidelity = response.result!.fidelity;
-    assert.strictEqual(fidelity.total_aliases, 10);
+    assert.strictEqual(fidelity.total_aliases, 11);
     assert.strictEqual(fidelity.by_serialization.structural_fallback, 2);
-    assert.strictEqual(fidelity.by_serialization.node_builder, 2);
+    assert.strictEqual(fidelity.by_serialization.node_builder, 3);
     assert.strictEqual(fidelity.by_serialization.emitted, 6);
     assert.strictEqual(fidelity.by_self_check.allowlisted_external, 2);
     assert.strictEqual(fidelity.by_self_check.decayed_internal, 2);
-    assert.strictEqual(fidelity.by_self_check.ok, 6);
+    assert.strictEqual(fidelity.by_self_check.ok, 7);
     assert.strictEqual(fidelity.by_anchor_origin['anchor-backfill'], 1);
-    assert.strictEqual(fidelity.usable_rate, 0.8);
+    assert.strictEqual(fidelity.usable_rate, 0.818);
   });
 });
 

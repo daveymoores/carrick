@@ -13,3 +13,11 @@ export type DerivedConfigType = typeof DerivedConfig;
 export function run(publish: (topic: string, payload: unknown) => void): void {
   publish('order.shipped', { orderId: '1', eta: 'soon' });
 }
+
+async function fetchShipment(): Promise<{ shipmentId: string; ok: boolean }> {
+  return { shipmentId: 's1', ok: true };
+}
+
+export function runAsync(publish: (topic: string, payload: unknown) => void): void {
+  publish('shipment.sync', fetchShipment());
+}
