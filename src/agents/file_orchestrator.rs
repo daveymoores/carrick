@@ -2669,6 +2669,11 @@ impl FileOrchestrator {
             );
 
             let Some(symbol) = op.primary_type_symbol.as_ref() else {
+                // Hygiene parity with the HTTP closure and the schema
+                // invariant (source is null whenever the symbol is null): a
+                // source with no symbol anchors nothing, so clear it rather
+                // than leave an inconsistent pair.
+                op.type_import_source = None;
                 continue;
             };
 
@@ -5851,13 +5856,24 @@ mod tests {
     fn test_validate_pubsub_type_hints_demotes_wrong_symbol_into_infer_path() {
         use crate::operation::PubsubRole;
 
-        let mut result = pubsub_only_result(vec![pubsub_op(
-            "order.placed",
-            PubsubRole::Publisher,
-            Some("BorrowedDecoy"),
-            Some("./decoys"),
-            Some("payload"),
-        )]);
+        let mut result = pubsub_only_result(vec![
+            pubsub_op(
+                "order.placed",
+                PubsubRole::Publisher,
+                Some("BorrowedDecoy"),
+                Some("./decoys"),
+                Some("payload"),
+            ),
+            // Model emitted a source with no symbol: cleared for hygiene
+            // (schema invariant: source is null whenever the symbol is null).
+            pubsub_op(
+                "order.cancelled",
+                PubsubRole::Publisher,
+                None,
+                Some("./ghost"),
+                None,
+            ),
+        ]);
         let symbol_table = SymbolTable {
             local_types: HashSet::new(),
             imported_symbols: HashMap::new(),
@@ -5868,6 +5884,10 @@ mod tests {
         let op = &result.pubsub_operations[0];
         assert!(op.primary_type_symbol.is_none(), "symbol must be demoted");
         assert!(op.type_import_source.is_none(), "source must be demoted");
+        assert!(
+            result.pubsub_operations[1].type_import_source.is_none(),
+            "a dangling source with no symbol must be cleared"
+        );
 
         // The demoted op must fall through to the infer path.
         let orchestrator = FileOrchestrator::new(AgentService::new());

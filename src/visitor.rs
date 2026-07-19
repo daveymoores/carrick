@@ -265,8 +265,8 @@ impl Visit for ImportSymbolExtractor {
 }
 
 /// Extracts locally-declared type symbols for validation. Collects every
-/// declaration form a payload type annotation can legitimately name: type
-/// aliases, interfaces, classes, and enums. Classes and enums matter for
+/// declaration form that a payload type annotation can legitimately name:
+/// type aliases, interfaces, classes, and enums. Classes and enums matter for
 /// pub/sub payloads in particular, where event payloads are often declared as
 /// local event classes; missing them would make the AST reject check null
 /// legitimate same-file symbols.
