@@ -5,8 +5,8 @@
 fact-check — every file/line reference verified; migration/ops). See
 "Review record" at the end.
 **Supersedes (on completion):** the flat-bundle + `ts_check` comparison path
-**Builds on:** `docs/research/compiler-sidecar-architecture/` (Phase 3, "Synthetic
-Monorepo / Stub Snapshot"), `docs/research/type-checking-flow.md`
+**Builds on:** `docs/archive/compiler-sidecar-architecture/` (Phase 3, "Synthetic
+Monorepo / Stub Snapshot"), `docs/reference/type-checking-flow.md`
 
 ## Executive summary
 
@@ -214,7 +214,16 @@ Generation:
    to `structural_fallback`. `expandTypeStructural` survives only as that
    last-resort tier, and every alias records its tier in the manifest
    (`serialization: emitted | node_builder | structural_fallback`) so fidelity
-   is measurable and ratchetable.
+   is measurable and ratchetable. Alongside `serialization`, every alias
+   records how its anchor was produced: `anchor_origin: llm-symbol |
+   deterministic-infer | anchor-backfill`. (Named `anchor_origin` because
+   `provenance` is already taken by the op-level producer-provenance fields
+   in `src/eval_output.rs`.) The two dimensions answer different questions:
+   `anchor_origin` measures anchor recall (did we point at the right symbol
+   at all), `serialization` measures capture fidelity (did the anchored
+   symbol survive emission). A fidelity ratchet keyed on `serialization`
+   alone would let an anchor-recall regression masquerade as an emit-tier
+   improvement, and vice versa.
 6. **Machinery unwrapping stays at capture time** where the real `Type` is in
    hand: transport generics (`Promise`, async iterables), agent-generated
    `ExtractionConfig` wrapper rules, and — moved here from the checker — the
@@ -225,13 +234,35 @@ Generation:
    stripped), pruned to specifiers actually referenced by the emitted tree.
 8. **Capture-time self-check (new gate), keyed on diagnostics, not artifact
    existence** (emit succeeds even when poisoned): the stub package must
-   typecheck standalone (module resolution pointed at the source repo's
-   `node_modules` — no extra install), every internal specifier must resolve
-   inside the tree, and no exported alias may resolve to `any`, `unknown`, or
-   `never`. Failures downgrade the alias to `type_state: Unknown` *with a
-   recorded reason* at capture time — converting today's silent degradation
-   (discovered at match time as a confusing "unverifiable") into a per-repo,
-   per-alias capture error.
+   typecheck standalone, with module resolution pointed at the source repo's
+   `node_modules` when present. Classification is three-way:
+   - **ok**: the alias resolves to a concrete type.
+   - **allowlisted external**: resolution failed only through external
+     specifiers whose package is pinned in the stub's `dependencies` and the
+     checkout is bare (no `node_modules` at capture time). The alias is kept
+     at its serialization tier with `capture_env: bare` and the failed
+     specifier recorded; it is NOT downgraded. These specifiers resolve at
+     check time against the stub's own installed pins, and the probe gates
+     (`any`/`unknown`/`never`, both sides) remain the backstop for any alias
+     that still decays there, so optimism here can produce unverifiable but
+     never a false compatible. Known instance of the backstop firing: a type
+     inferred *through* the missing library, such as `z.infer<typeof Schema>`
+     where the schema const has no annotation; the const's inferred type
+     bakes to `any` in the emitted tree, spike-verified as
+     `export declare const StockAdjustSchema: any`.
+   - **decayed**: a dangling internal specifier, an unpinned external, or a
+     top-type resolution not explained by an allowlisted external failure
+     downgrades the alias to `type_state: Unknown` *with a recorded reason*
+     at capture time. The decay rule is thereby kept only for fully-internal
+     closures and genuinely unexplained top types
+
+   converting today's silent degradation (discovered at match time as a
+   confusing "unverifiable") into a per-repo, per-alias capture error.
+   Implementation note, spike-verified: the self-check program must set
+   `skipLibCheck: false`; the stub tree is entirely `.d.ts`, and with
+   `skipLibCheck: true` the checker skips declaration files wholesale,
+   producing zero diagnostics and a vacuous gate (the same reason Check-phase
+   step 7 mandates `skipLibCheck: false` for stub trees).
 9. **JS-heavy services:** declaration emit from `allowJs` sources produces
    `any`-saturated declarations that will mass-fail the self-check. This is
    expected and honest — record it as capture degradation
@@ -533,6 +564,13 @@ Policy: do not gate the migration on TS7. Pin the judge, measure the spike on
 both 6.x and the 7.0 RC, take the faster one that passes diagnostic-parity,
 and revisit the sidecar's API usage at 7.1.
 
+Freshness note (2026-07-18): TypeScript 7.0 went GA on 2026-07-08 and remains
+CLI-only until the stable programmatic API lands in 7.1+, so the split above
+(capture on 6, judge free to move to 7) stands unchanged. One earlier worry is
+retired: typescript-go issue #972 (declaration emit failing under type errors,
+which would have broken the `--noCheck` capture emit) was fixed in May 2025
+and is not a blocker.
+
 ## Future hook: wire-truth vs type-truth
 
 TS assignability is a proxy for what Carrick actually claims: **wire
@@ -560,7 +598,9 @@ into independently measurable stages:
    `Explicit`/`Implicit`.
 2. **Surface fidelity (new):** stub self-check pass rate + per-alias
    `serialization` histogram (`emitted` > `node_builder` >
-   `structural_fallback`). Ratchet in the Tier-A baseline. Note: this is a
+   `structural_fallback`), reported split by `anchor_origin` so anchor-recall
+   loss and serialization loss ratchet independently. Ratchet in the Tier-A
+   baseline. Note: this is a
    *new* metric with a different denominator than resolution rate — an alias
    can be `Explicit` today *and* decay to `any` at check time, so today's
    resolution rate overstates today's fidelity; do not treat the two as
