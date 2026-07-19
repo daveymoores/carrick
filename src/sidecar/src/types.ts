@@ -217,6 +217,33 @@ export interface PayloadDefinition {
 }
 
 /**
+ * SPIKE: request to run the v2 "tsc as serializer" capture for one service.
+ * Produces a types-only stub package (compiler-emitted declaration tree +
+ * pinned deps) instead of a flattened structural string. See capture-v2.ts.
+ */
+export interface CaptureV2Request extends BaseRequest {
+  action: 'capture_v2';
+  /** Absolute path to the producer repo root */
+  repo_root: string;
+  /** Service name used for the @carrick/<service> stub package */
+  service_name: string;
+  /** Explicit-symbol anchors to alias in the surface entry */
+  anchors: import('./capture-v2.js').CaptureAnchorRequest[];
+  /** Directory to write the stub package into */
+  out_dir: string;
+  /** Optional explicit tsconfig path (defaults to <repo_root>/tsconfig.json) */
+  tsconfig_path?: string;
+}
+
+/**
+ * Response for the capture_v2 action (spike)
+ */
+export interface CaptureV2Response extends BaseResponse {
+  result?: import('./capture-v2.js').CaptureStubResult;
+  errors?: string[];
+}
+
+/**
  * Request to infer implicit types at specific locations
  */
 export interface InferRequest extends BaseRequest {
@@ -296,6 +323,7 @@ export type SidecarRequest =
   | InitRequest
   | BundleRequest
   | EmitSurfaceRequest
+  | CaptureV2Request
   | InferRequest
   | BuildWorkspaceRequest
   | CheckCompatibilityRequest
@@ -511,6 +539,7 @@ export type SidecarResponse =
   | InitResponse
   | BundleResponse
   | EmitSurfaceResponse
+  | CaptureV2Response
   | InferResponse
   | BuildWorkspaceResponse
   | CheckCompatibilityResponse
