@@ -94,11 +94,13 @@ fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
 
 /// A structured producer→consumer edge captured at the matching site. This is
 /// the load-bearing cross-repo signal the eval scorer reads (contract §2): an
-/// endpoint in one repo matched by an outbound call in another repo, with the
-/// type-compatibility verdict for that producer endpoint. Same-identity pairs
-/// (producer_repo == consumer_repo on the `service_name ?? repo_name` id) are
-/// dropped by every matcher (#397): a service exercising its own contract is
-/// not a cross-service edge.
+/// endpoint owned by one service identity matched by an outbound call from
+/// another, with the type-compatibility verdict for that producer endpoint.
+/// Both sides are identified by the `service_name ?? repo_name` id (#368), so
+/// in a monorepo the two sides can be different services of ONE git repo and
+/// still form a real edge. Same-identity pairs (producer_repo ==
+/// consumer_repo) are dropped by every matcher (#397): a service exercising
+/// its own contract is not a cross-service edge.
 ///
 /// `type_compatible == None` is deliberate and load-bearing: it means compat
 /// was never evaluated for this edge (e.g. `ts_check_dir` was absent, so type
