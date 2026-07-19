@@ -72,7 +72,8 @@ describe('capture_v2: all anchor forms (bare fixture)', () => {
       path.join(BARE, 'src', 'events', 'pub.ts'),
       "{ orderId: '1', eta: 'soon' }"
     );
-    response = (await client.send({
+    response = (await client.send(
+      {
       request_id: 'capture-v2-forms-bare',
       action: 'capture_v2',
       repo_root: BARE,
@@ -157,7 +158,10 @@ describe('capture_v2: all anchor forms (bare fixture)', () => {
           expression_text: 'fetchShipment()',
         },
       ],
-    })) as CaptureV2ResponseShape;
+      },
+      // Compiler-heavy action: CI runners need far more than the 10s default.
+      120000
+    )) as CaptureV2ResponseShape;
     byAlias = new Map((response.result?.aliases ?? []).map((a) => [a.alias, a]));
   });
 
@@ -318,7 +322,8 @@ describe('capture_v2: all anchor forms (installed fixture)', () => {
       path.join(INSTALLED, 'src', 'service.ts'),
       "{ widget: w, at: 'now' }"
     );
-    response = (await client.send({
+    response = (await client.send(
+      {
       request_id: 'capture-v2-forms-installed',
       action: 'capture_v2',
       repo_root: INSTALLED,
@@ -347,7 +352,10 @@ describe('capture_v2: all anchor forms (installed fixture)', () => {
           ...literal,
         },
       ],
-    })) as CaptureV2ResponseShape;
+      },
+      // Compiler-heavy action: CI runners need far more than the 10s default.
+      120000
+    )) as CaptureV2ResponseShape;
     byAlias = new Map((response.result?.aliases ?? []).map((a) => [a.alias, a]));
   });
 

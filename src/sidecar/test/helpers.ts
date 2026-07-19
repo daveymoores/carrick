@@ -83,7 +83,10 @@ export class SidecarClient {
   /**
    * Send a request and wait for response
    */
-  async send<T = unknown>(request: Record<string, unknown>): Promise<T> {
+  async send<T = unknown>(
+    request: Record<string, unknown>,
+    timeoutMs: number = 10000
+  ): Promise<T> {
     if (!this.process) {
       throw new Error('Sidecar not started');
     }
@@ -94,14 +97,16 @@ export class SidecarClient {
       const json = JSON.stringify(request);
       this.process!.stdin.write(json + '\n');
 
-      // Timeout after 10 seconds
-      setTimeout(() => {
+      // Timeout (default 10s; compiler-heavy actions like capture_v2 build
+      // multiple ts programs and need longer on slow CI runners).
+      const timer = setTimeout(() => {
         const index = this.responsePromises.findIndex((p) => p.resolve === resolve);
         if (index !== -1) {
           this.responsePromises.splice(index, 1);
           reject(new Error('Request timeout'));
         }
-      }, 10000);
+      }, timeoutMs);
+      timer.unref();
     });
   }
 

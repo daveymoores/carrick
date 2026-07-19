@@ -63,7 +63,8 @@ describe('capture_v2: bare-checkout tsc-as-serializer (corpus-3 fixture)', () =>
     );
     outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-capture-v2-test-'));
     await client.start();
-    response = (await client.send({
+    response = (await client.send(
+      {
       request_id: 'capture-v2-corpus3-1',
       action: 'capture_v2',
       repo_root: FIXTURE,
@@ -92,7 +93,10 @@ describe('capture_v2: bare-checkout tsc-as-serializer (corpus-3 fixture)', () =>
           anchor_origin: 'deterministic-infer',
         },
       ],
-    })) as CaptureV2ResponseShape;
+      },
+      // Compiler-heavy action: CI runners need far more than the 10s default.
+      120000
+    )) as CaptureV2ResponseShape;
   });
 
   after(async () => {
