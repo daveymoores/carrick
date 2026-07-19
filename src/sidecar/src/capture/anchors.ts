@@ -134,7 +134,7 @@ export function resolveAnchor(
   if (!args.placeholder) {
     return demote('internal: no placeholder destination for infer anchor');
   }
-  const printed = printTypeForDestination(checker, type, args.placeholder);
+  const printed = printTypeForDestination(program, type, args.placeholder);
   if (!printed.text) {
     return demote(printed.failure ?? 'node builder print failed');
   }

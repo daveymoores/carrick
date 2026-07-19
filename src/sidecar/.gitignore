@@ -3,6 +3,11 @@ node_modules/
 !test/fixtures/sample-repo/node_modules/
 !test/fixtures/sample-repo/node_modules/wrapper-lib/
 !test/fixtures/sample-repo/node_modules/wrapper-lib/index.d.ts
+!test/fixtures/capture-v2-installed/node_modules/
+!test/fixtures/capture-v2-installed/node_modules/@acme/
+!test/fixtures/capture-v2-installed/node_modules/@acme/models/
+!test/fixtures/capture-v2-installed/node_modules/@acme/models/package.json
+!test/fixtures/capture-v2-installed/node_modules/@acme/models/index.d.ts
 
 # Build output
 dist/

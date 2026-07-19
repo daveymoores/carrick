@@ -71,7 +71,9 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
   try {
     return runSelfCheck(args, treeFiles);
   } finally {
-    if (linked) fs.rmSync(linkPath, { force: true });
+    // unlinkSync, not rmSync: the link target is a directory and rmSync
+    // refuses symlinks-to-directories with EISDIR.
+    if (linked) fs.unlinkSync(linkPath);
   }
 }
 

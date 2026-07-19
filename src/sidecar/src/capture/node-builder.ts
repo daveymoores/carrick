@@ -59,16 +59,51 @@ interface InternalTypeChecker extends ts.TypeChecker {
   ): ts.TypeNode | undefined;
 }
 
+interface InternalTs {
+  createModuleSpecifierResolutionHost?: (
+    program: ts.Program,
+    host: {
+      fileExists: (path: string) => boolean;
+      readFile: (path: string) => string | undefined;
+      directoryExists?: (path: string) => boolean;
+      getCurrentDirectory: () => string;
+      useCaseSensitiveFileNames?: () => boolean;
+    }
+  ) => unknown;
+}
+
+/**
+ * The node builder can only print out-of-scope symbols as `import("...")`
+ * type references when the tracker carries a moduleResolverHost -- without
+ * one it returns no node at all for external-package symbols
+ * (probe-verified on TS 5.8). Hand-rolling the host is a losing game (it
+ * needs a dozen emit-host internals); TS's own factory builds it from the
+ * program, which is exactly the "route through the emitter's machinery, not
+ * a bare typeToTypeNode" guidance from the derisk sweep.
+ */
+function moduleResolverHostFor(program: ts.Program): unknown {
+  const factory = (ts as unknown as InternalTs).createModuleSpecifierResolutionHost;
+  if (!factory) return undefined;
+  return factory(program, {
+    fileExists: ts.sys.fileExists,
+    readFile: ts.sys.readFile,
+    directoryExists: ts.sys.directoryExists,
+    getCurrentDirectory: () => program.getCurrentDirectory(),
+    useCaseSensitiveFileNames: () => ts.sys.useCaseSensitiveFileNames,
+  });
+}
+
 /**
  * Print `type` as a type node anchored at `destination` (a declaration inside
  * the surface entry file). Returns untrusted-failure instead of text whenever
  * any referenced symbol is not plainly accessible from the destination.
  */
 export function printTypeForDestination(
-  checker: ts.TypeChecker,
+  program: ts.Program,
   type: ts.Type,
   destination: ts.Node
 ): NodeBuilderPrintResult {
+  const checker = program.getTypeChecker();
   const inaccessible: string[] = [];
   const seen = new Set<ts.Symbol>();
 
@@ -93,6 +128,7 @@ export function printTypeForDestination(
   // local interfaces, unique-symbol keys, local recursive aliases) but are
   // kept as recorders in case other shapes reach them.
   const tracker = {
+    moduleResolverHost: moduleResolverHostFor(program),
     trackSymbol: (symbol: ts.Symbol, enclosing: ts.Node | undefined, meaning: ts.SymbolFlags) => {
       void enclosing;
       record(symbol, meaning);
