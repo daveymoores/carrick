@@ -94,8 +94,13 @@ fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
 
 /// A structured producer→consumer edge captured at the matching site. This is
 /// the load-bearing cross-repo signal the eval scorer reads (contract §2): an
-/// endpoint in one repo matched by an outbound call in another (or the same)
-/// repo, with the type-compatibility verdict for that producer endpoint.
+/// endpoint owned by one service identity matched by an outbound call from
+/// another, with the type-compatibility verdict for that producer endpoint.
+/// Both sides are identified by the `service_name ?? repo_name` id (#368), so
+/// in a monorepo the two sides can be different services of ONE git repo and
+/// still form a real edge. Same-identity pairs (producer_repo ==
+/// consumer_repo) are dropped by every matcher (#397): a service exercising
+/// its own contract is not a cross-service edge.
 ///
 /// `type_compatible == None` is deliberate and load-bearing: it means compat
 /// was never evaluated for this edge (e.g. `ts_check_dir` was absent, so type
@@ -1722,7 +1727,20 @@ impl Analyzer {
                         };
                         match edge.relationship {
                             carrick_match::MatchRelationship::ProducerConsumer => {
-                                cross_repo_matches.push(edge);
+                                // #397: a service calling its own endpoint
+                                // (through an env-var base; localhost
+                                // self-calls are dropped at extraction) is
+                                // real behaviour but not a cross-service
+                                // contract edge. Drop the self-pair on repo
+                                // identity alone, the same structural rule
+                                // `analyze_exact_key_matches` applies. The
+                                // endpoint was already marked matched above,
+                                // so it still surfaces as a verified
+                                // endpoint — only the degenerate self-edge
+                                // is dropped.
+                                if edge.producer_repo != edge.consumer_repo {
+                                    cross_repo_matches.push(edge);
+                                }
                             }
                             carrick_match::MatchRelationship::SharedExternalContract => {
                                 // Both sides are call-site encodings of the
@@ -5341,6 +5359,64 @@ mod tests {
             )]
         );
         assert!(findings.is_empty(), "got {findings:?}");
+    }
+
+    /// KILL (#397): a service calling its OWN endpoint through an env-var base
+    /// (localhost self-calls are dropped at extraction, so this is the shape
+    /// that reaches the matcher) must not emit a producer==consumer self-pair
+    /// edge — the same structural rule `analyze_exact_key_matches` applies.
+    /// The endpoint itself stays visible: it is verified by the self-call,
+    /// not orphaned. Pins the monorepo shape from the issue, where both
+    /// sides carry the same `service_name ?? repo_name` id (#368).
+    #[test]
+    fn http_self_pair_emits_no_edge_but_endpoint_stays_visible() {
+        let config = Config {
+            internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
+            ..Config::default()
+        };
+        let cm = Lrc::new(SourceMap::default());
+        let mut analyzer = Analyzer::new(config, cm);
+
+        analyzer.calls.push(http_call(
+            "GET",
+            "ENV_VAR:API_URL:/api/self-status",
+            "apps/web/src/status.ts:7",
+        ));
+
+        let mut mount_graph = MountGraph::new();
+        // Producer: the `web` service of monorepo `acme-mono`.
+        let mut producer = resolved_in("GET", "/api/self-status", "acme-mono");
+        producer.service_name = Some("web".to_string());
+        mount_graph.endpoints.push(producer);
+        // Consumer: the SAME `web` service calling its own endpoint.
+        let mut consumer = data_call_in(
+            "GET",
+            "ENV_VAR:API_URL:/api/self-status",
+            "apps/web/src/status.ts:7",
+            "acme-mono",
+        );
+        consumer.service_name = Some("web".to_string());
+        mount_graph.data_calls.push(consumer);
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(
+            edges.is_empty(),
+            "a producer==consumer pair is not a cross-repo edge, got {edges:?}"
+        );
+        assert_eq!(
+            verified,
+            vec![(
+                "GET".to_string(),
+                "/api/self-status".to_string(),
+                crate::operation::EndpointProvenance::Route
+            )],
+            "the endpoint stays visible as a verified endpoint"
+        );
+        assert!(
+            findings.is_empty(),
+            "matched means neither missing nor orphaned, got {findings:?}"
+        );
     }
 
     /// KEEP: literal paths keep pairing on their own signal — a

@@ -207,8 +207,10 @@ impl EvalProjection {
     /// on that key.
     ///
     /// HTTP ops are excluded — they get repo provenance from the mount graph, not
-    /// from `repo_name`, and localhost self-calls are already dropped at
-    /// extraction. A non-HTTP op with no repo attribution is skipped (self-loop is
+    /// from `repo_name`; localhost self-calls are already dropped at extraction,
+    /// and the HTTP matcher drops self-pair EDGES on repo identity (#397) while
+    /// keeping the ops visible as endpoint/call. A non-HTTP op with no repo
+    /// attribution is skipped (self-loop is
     /// undecidable without both repo ids), on both sides: it neither votes here
     /// nor gets dropped by the filter.
     fn intra_repo_self_loops(result: &ApiAnalysisResult) -> HashMap<String, String> {
