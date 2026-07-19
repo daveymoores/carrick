@@ -396,7 +396,17 @@ impl FileAnalyzerAgent {
     /// `raw_response` to `<dir>/<file>.attemptN.json`. This makes prompt-hardening
     /// evidence-driven: we read what the model actually emitted (owner_node,
     /// mount_path, whether the endpoint was extracted at all) rather than guess.
-    fn dump_eval_artifact(file_path: &str, attempt: u8, user_message: &str, response: &str) {
+    /// `retry_reason` is `None` on attempt 1 and names the trigger on attempt 2
+    /// (currently always `"suspicious_fields"`), so attempt pairs are
+    /// distinguishable in the dumps and harness runs can measure how often the
+    /// retry fires and what it changes.
+    fn dump_eval_artifact(
+        file_path: &str,
+        attempt: u8,
+        user_message: &str,
+        response: &str,
+        retry_reason: Option<&str>,
+    ) {
         let Ok(dir) = std::env::var("CARRICK_EVAL_DUMP_DIR") else {
             return;
         };
@@ -408,6 +418,7 @@ impl FileAnalyzerAgent {
         let payload = serde_json::json!({
             "file_path": file_path,
             "attempt": attempt,
+            "retry_reason": retry_reason,
             "request_user_message": user_message,
             "raw_response": response,
         });
@@ -472,7 +483,7 @@ impl FileAnalyzerAgent {
         // capture mode), persist the analyzer's input (the guidance/candidates it
         // received) and raw output so prompt-hardening can be driven by what the
         // model actually emitted, not by guesswork. Off unless the env is set.
-        Self::dump_eval_artifact(file_path, 1, &user_message, &response);
+        Self::dump_eval_artifact(file_path, 1, &user_message, &response, None);
 
         let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
             format!(
@@ -495,7 +506,13 @@ impl FileAnalyzerAgent {
             trace!("{}", response);
             trace!("=== END RAW RESPONSE ===");
             debug!("File analysis retry response: {} chars", response.len());
-            Self::dump_eval_artifact(file_path, 2, &user_message, &response);
+            Self::dump_eval_artifact(
+                file_path,
+                2,
+                &user_message,
+                &response,
+                Some("suspicious_fields"),
+            );
 
             let mut retry_result: FileAnalysisResult =
                 serde_json::from_str(&response).map_err(|e| {
@@ -528,8 +545,18 @@ impl FileAnalyzerAgent {
         Ok(result)
     }
 
+    /// Count every top-level result section, so the best-of selection sees a
+    /// difference in ANY of them. The previous version only counted the three
+    /// HTTP sections, so a retry that lost graphql/pubsub/consumer-locate
+    /// findings could still tie on the HTTP counts and be selected, silently
+    /// dropping those findings.
     fn result_score(result: &FileAnalysisResult) -> usize {
-        result.mounts.len() + result.endpoints.len() + result.data_calls.len()
+        result.mounts.len()
+            + result.endpoints.len()
+            + result.data_calls.len()
+            + result.graphql_operations.len()
+            + result.pubsub_operations.len()
+            + result.graphql_consumer_locates.len()
     }
 
     fn choose_best_result(
@@ -1880,6 +1907,94 @@ mod tests {
         assert_eq!(chosen.mounts.len(), initial.mounts.len());
         assert_eq!(chosen.endpoints.len(), initial.endpoints.len());
         assert_eq!(chosen.data_calls.len(), initial.data_calls.len());
+    }
+
+    /// A resolver linkage as the model emits it for a gateway resolver file.
+    fn test_graphql_op(field: &str) -> GraphqlOperation {
+        serde_json::from_str(&format!(
+            r#"{{"kind":"query","field":"{field}","resolver_function":"resolve","resolver_line":38,"primary_type_symbol":null,"type_import_source":null}}"#
+        ))
+        .unwrap()
+    }
+
+    fn test_pubsub_op(topic: &str) -> PubsubOperation {
+        serde_json::from_str(&format!(
+            r#"{{"topic":"{topic}","role":"publisher","line_number":1}}"#
+        ))
+        .unwrap()
+    }
+
+    fn test_data_call(target: &str) -> DataCallResult {
+        DataCallResult {
+            call_kind: None,
+            candidate_id: "span:190-240".to_string(),
+            line_number: 3,
+            target: target.to_string(),
+            method: Some("GET".to_string()),
+            pattern_matched: "fetch(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    #[test]
+    fn test_result_score_counts_all_six_sections() {
+        let consumer_locate: GraphqlConsumerLocate = serde_json::from_str(
+            r#"{"kind":"query","field":"order","result_type_symbol":"Order","result_type_source":null}"#,
+        )
+        .unwrap();
+        let result = FileAnalysisResult {
+            data_calls: vec![test_data_call("/users")],
+            graphql_operations: vec![test_graphql_op("order"), test_graphql_op("orders")],
+            pubsub_operations: vec![test_pubsub_op("jobs.created")],
+            graphql_consumer_locates: vec![consumer_locate],
+            ..Default::default()
+        };
+        // 1 data call + 2 graphql ops + 1 pubsub op + 1 consumer locate.
+        assert_eq!(FileAnalyzerAgent::result_score(&result), 5);
+    }
+
+    #[test]
+    fn test_choose_best_result_counts_non_http_sections() {
+        // The retry ties on the three HTTP sections but lost the graphql and
+        // pubsub findings the original had. Before result_score counted all
+        // six sections, this tie selected the retry and silently dropped them.
+        let initial = FileAnalysisResult {
+            data_calls: vec![test_data_call("/users")],
+            graphql_operations: vec![test_graphql_op("order")],
+            pubsub_operations: vec![test_pubsub_op("jobs.created")],
+            ..Default::default()
+        };
+        let retry = FileAnalysisResult {
+            data_calls: vec![test_data_call("/users")],
+            ..Default::default()
+        };
+        let chosen = FileAnalyzerAgent::choose_best_result(initial, retry);
+        assert_eq!(chosen.graphql_operations.len(), 1);
+        assert_eq!(chosen.pubsub_operations.len(), 1);
+    }
+
+    #[test]
+    fn test_choose_best_result_retry_recovering_graphql_section_wins() {
+        // The retry recovered graphql findings the original lacked; the fixed
+        // score sees the difference and selects the retry.
+        let initial = FileAnalysisResult {
+            data_calls: vec![test_data_call("/users")],
+            ..Default::default()
+        };
+        let retry = FileAnalysisResult {
+            data_calls: vec![test_data_call("/users")],
+            graphql_operations: vec![test_graphql_op("order")],
+            ..Default::default()
+        };
+        let chosen = FileAnalyzerAgent::choose_best_result(initial, retry);
+        assert_eq!(chosen.graphql_operations.len(), 1);
     }
 
     #[test]
