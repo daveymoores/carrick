@@ -221,6 +221,25 @@ export const EmitSurfaceRequestSchema = BaseRequestSchema.extend({
   output_path: z.string().min(1, 'Output path cannot be empty'),
 });
 
+/** SPIKE: v2 "tsc as serializer" capture (see capture-v2.ts). */
+export const CaptureV2RequestSchema = BaseRequestSchema.extend({
+  action: z.literal('capture_v2'),
+  repo_root: z.string().min(1, 'Repo root cannot be empty'),
+  service_name: z.string().min(1, 'Service name cannot be empty'),
+  anchors: z
+    .array(
+      z.object({
+        alias: z.string().min(1),
+        symbol_name: z.string().min(1),
+        source_file: z.string().min(1),
+        anchor_origin: z.enum(['llm-symbol', 'deterministic-infer', 'anchor-backfill']),
+      })
+    )
+    .min(1, 'At least one anchor is required'),
+  out_dir: z.string().min(1, 'Output dir cannot be empty'),
+  tsconfig_path: z.string().optional(),
+});
+
 export const InferRequestSchema = BaseRequestSchema.extend({
   action: z.literal('infer'),
   requests: z.array(InferRequestItemSchema).min(1, 'At least one infer request is required'),
@@ -264,6 +283,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   InitRequestSchema,
   BundleRequestSchema,
   EmitSurfaceRequestSchema,
+  CaptureV2RequestSchema,
   InferRequestSchema,
   BuildWorkspaceRequestSchema,
   CheckCompatibilityRequestSchema,

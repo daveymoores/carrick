@@ -19,12 +19,14 @@ import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { MonorepoBuilder } from './monorepo-builder.js';
 import { DefinitionResolver } from './definition-resolver.js';
+import { captureStub } from './capture-v2.js';
 import type {
   SidecarRequest,
   SidecarResponse,
   InitResponse,
   BundleResponse,
   EmitSurfaceResponse,
+  CaptureV2Response,
   InferResponse,
   BuildWorkspaceResponse,
   CheckCompatibilityResponse,
@@ -206,6 +208,38 @@ function handleEmitSurface(request: SidecarRequest & { action: 'emit_surface' })
     const error = err instanceof Error ? err.message : String(err);
     logError(`Surface emission failed: ${error}`);
 
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    };
+  }
+}
+
+/**
+ * SPIKE: handle the 'capture_v2' action - v2 "tsc as serializer" capture.
+ * Stateless by design: unlike bundle/infer it needs no init'd ts-morph
+ * project, only the repo's own tsconfig — this is the point of v2.
+ */
+function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): CaptureV2Response {
+  try {
+    log(`capture_v2 for service '${request.service_name}' (${request.anchors.length} anchor(s))`);
+    const result = captureStub({
+      repoRoot: request.repo_root,
+      serviceName: request.service_name,
+      anchors: request.anchors,
+      outDir: request.out_dir,
+      tsconfigPath: request.tsconfig_path,
+    });
+    return {
+      request_id: request.request_id,
+      status: result.success ? 'success' : 'error',
+      result,
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`capture_v2 failed: ${error}`);
     return {
       request_id: request.request_id,
       status: 'error',
@@ -421,6 +455,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleBundle(request);
     case 'emit_surface':
       return handleEmitSurface(request);
+    case 'capture_v2':
+      return handleCaptureV2(request);
     case 'infer':
       return handleInfer(request);
     case 'build_workspace':
