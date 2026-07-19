@@ -128,6 +128,19 @@ pub struct PubsubAnchorOp {
     pub role: PubsubRole,
     /// 1-based line number of the call site.
     pub line_number: usize,
+    /// First parameter of an inline handler function passed alongside the
+    /// topic (`subscribe("topic", (msg) => …)`, carrick#402 shape c) — the one
+    /// shape where the handler param IS the decoded payload binding, so the
+    /// backfill records it as a FunctionParam payload locator. Recorded only
+    /// when the param is a simple identifier. `None` for every other anchor
+    /// shape: the single-arg call has no handler, and the options-object /
+    /// constructor-worker shapes (kafkajs `eachMessage`, BullMQ `Job`) pass an
+    /// ENVELOPE to the handler, where a deterministic param locator would
+    /// replace an honest Unknown with a wrong type.
+    pub handler_param: Option<String>,
+    /// 1-based line of that parameter (the handler may start on a later line
+    /// than the call the op is keyed on).
+    pub handler_param_line: Option<usize>,
 }
 
 /// A value exported from a module. Used by file-based routing to recover the
@@ -235,10 +248,11 @@ impl SwcScanner {
         };
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
-            network_import_locals(&module, data_fetchers),
+            package_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_values,
             repo_has_messaging_clients,
+            package_import_locals(&module, messaging_clients),
         );
         module.visit_with(&mut visitor);
 
@@ -351,10 +365,11 @@ impl SwcScanner {
         };
         let mut visitor = CandidateVisitor::new(
             file_source_map,
-            network_import_locals(&module, data_fetchers),
+            package_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_values,
             repo_has_messaging_clients,
+            package_import_locals(&module, messaging_clients),
         );
         module.visit_with(&mut visitor);
 
@@ -656,6 +671,15 @@ struct CandidateVisitor {
     /// string. Collected alongside the Signal 7 candidates (same gates, same
     /// position rule) and merged into the file's extraction after the LLM pass.
     pubsub_anchor_ops: Vec<PubsubAnchorOp>,
+    /// Local binding names imported from a package the framework-detect step
+    /// flagged as a messaging client (`Worker` from `import { Worker } from
+    /// 'bullmq'`). Gate for the NewExpr subscriber anchor (carrick#402 shape
+    /// b): `new X("literal", fn)` anchors only when `X` is one of these
+    /// bindings — resolution to a detected messaging-client IMPORT, not merely
+    /// any file-level import, which is what keeps `new CronJob("0 * * * *",
+    /// fn)` from becoming a phantom subscriber. Empty when the repo detected
+    /// no messaging clients.
+    messaging_import_locals: HashSet<String>,
 }
 
 impl CandidateVisitor {
@@ -665,6 +689,7 @@ impl CandidateVisitor {
         file_imports_messaging_client: bool,
         const_string_values: HashMap<String, String>,
         repo_has_messaging_clients: bool,
+        messaging_import_locals: HashSet<String>,
     ) -> Self {
         Self {
             candidates: Vec::new(),
@@ -678,6 +703,7 @@ impl CandidateVisitor {
             in_pubsub_call_position: false,
             repo_has_messaging_clients,
             pubsub_anchor_ops: Vec::new(),
+            messaging_import_locals,
         }
     }
 
@@ -891,6 +917,112 @@ impl CandidateVisitor {
                 }
                 Some(resolved)
             }
+            _ => None,
+        }
+    }
+
+    /// Does this expression occupy a Signal-7 position when it forms a whole
+    /// statement expression or variable initializer? Directly a call or a
+    /// constructor (`nc.publish(SUBJECT, payload);`, `const w = new
+    /// Worker("q", fn)`), or either under a single `await` (`await
+    /// consumer.subscribe({ topic });`) — the idiom every promise-returning
+    /// subscribe API forces, which the bare-call check missed (carrick#402).
+    fn is_pubsub_positioned_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Call(_) | Expr::New(_) => true,
+            Expr::Await(awaited) => matches!(&*awaited.arg, Expr::Call(_) | Expr::New(_)),
+            _ => false,
+        }
+    }
+
+    /// The first argument as an object literal (`subscribe({ topic: 'x',
+    /// fromBeginning: false })`), or `None` when absent, spread, or any other
+    /// shape.
+    fn first_arg_object_literal(call: &CallExpr) -> Option<&ObjectLit> {
+        let arg = call.args.first()?;
+        if arg.spread.is_some() {
+            return None;
+        }
+        match &*arg.expr {
+            Expr::Object(obj) => Some(obj),
+            _ => None,
+        }
+    }
+
+    /// Topic values carried by a publish/subscribe options object (carrick#402
+    /// shape a): a `topic: <t>` property or a `topics: [<t>, …]` array, where
+    /// each `<t>` resolves via [`Self::resolve_topic_string`]. Returns `Some`
+    /// when the object carries a protocol-vocabulary topic key at all — the
+    /// shape that qualifies the site as a candidate — with the vec holding
+    /// only the deterministically resolvable values (used for anchor ops; may
+    /// be empty when e.g. the topic is a parameter). Sibling properties
+    /// (`fromBeginning`, `groupId`, …) are deliberately tolerated: the key
+    /// vocabulary is the signal, not the whole object shape.
+    fn object_literal_topic_values(&self, obj: &ObjectLit) -> Option<Vec<String>> {
+        let mut has_topic_key = false;
+        let mut topics = Vec::new();
+        for prop in &obj.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            match &**prop {
+                Prop::KeyValue(kv) => {
+                    let name = match &kv.key {
+                        PropName::Ident(id) => id.sym.to_string(),
+                        PropName::Str(s) => s.value.to_string(),
+                        _ => continue,
+                    };
+                    match name.as_str() {
+                        "topic" => {
+                            has_topic_key = true;
+                            if let Some(topic) = self.resolve_topic_string(&kv.value) {
+                                topics.push(topic);
+                            }
+                        }
+                        "topics" => {
+                            has_topic_key = true;
+                            if let Expr::Array(arr) = &*kv.value {
+                                for elem in arr.elems.iter().flatten() {
+                                    if elem.spread.is_none()
+                                        && let Some(topic) = self.resolve_topic_string(&elem.expr)
+                                    {
+                                        topics.push(topic);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Shorthand `{ topic }` references a local binding; resolvable
+                // exactly when it is a recorded top-level const string.
+                Prop::Shorthand(id) => {
+                    if matches!(id.sym.as_ref(), "topic" | "topics") {
+                        has_topic_key = true;
+                        if let Some(value) = self.const_string_values.get(id.sym.as_ref()) {
+                            topics.push(value.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        has_topic_key.then_some(topics)
+    }
+
+    /// First parameter of an inline handler function expression, when it is a
+    /// simple identifier (`(msg) => …`, `function (msg) { … }`, incl. a typed
+    /// `(msg: T)`). `None` for non-function expressions, param-less handlers,
+    /// and destructured params — a deterministic locator is only recorded for
+    /// the binding shape the sidecar matches by name.
+    fn handler_first_ident_param(expr: &Expr) -> Option<(String, swc_common::Span)> {
+        let pat = match expr {
+            Expr::Arrow(arrow) => arrow.params.first(),
+            Expr::Fn(fn_expr) => fn_expr.function.params.first().map(|p| &p.pat),
+            _ => None,
+        }?;
+        match pat {
+            Pat::Ident(binding) => Some((binding.id.sym.to_string(), binding.id.span)),
             _ => None,
         }
     }
@@ -1180,7 +1312,7 @@ impl Visit for CandidateVisitor {
         // is one of the two Signal-7 positions. Mark it so the call expr it wraps
         // is eligible; `visit_call_expr` clears the flag before descending so
         // nested calls don't inherit the position.
-        if matches!(&*node.expr, Expr::Call(_)) {
+        if Self::is_pubsub_positioned_expr(&node.expr) {
             self.in_pubsub_call_position = true;
         }
         node.visit_children_with(self);
@@ -1191,7 +1323,11 @@ impl Visit for CandidateVisitor {
         // A variable initializer that *is* a call (`const sub = nc.subscribe("topic");`)
         // is the other Signal-7 position. Same flag-clearing discipline as
         // `visit_expr_stmt`.
-        if matches!(node.init.as_deref(), Some(Expr::Call(_))) {
+        if node
+            .init
+            .as_deref()
+            .is_some_and(Self::is_pubsub_positioned_expr)
+        {
             self.in_pubsub_call_position = true;
         }
         node.visit_children_with(self);
@@ -1199,6 +1335,59 @@ impl Visit for CandidateVisitor {
     }
 
     fn visit_new_expr(&mut self, node: &NewExpr) {
+        // Snapshot-and-clear the Signal-7 position flag exactly like
+        // `visit_call_expr`: the constructor-worker anchor below only fires
+        // when the NewExpr itself is the statement expression or variable
+        // initializer, and calls nested inside its arguments must not inherit
+        // the position.
+        let in_pubsub_call_position = self.in_pubsub_call_position;
+        self.in_pubsub_call_position = false;
+
+        // Constructor-registered subscriber (carrick#402 shape b): `new
+        // X("literal", fn, …)` — the BullMQ `new Worker(queueName, handler)`
+        // idiom, where the queue name is the contract topic. GATED on the
+        // constructor identifier being an import binding resolved from a
+        // framework-detect `messaging_clients` package — NOT merely any
+        // file-level import — which is what keeps `new CronJob("0 * * * *",
+        // fn)` from becoming a phantom subscriber. The second argument must be
+        // an inline function (a reference identifier could be an options
+        // object). Payload-less by policy: the handler receives a job ENVELOPE
+        // (`Job`), so a deterministic param locator would replace an honest
+        // Unknown with a wrong type.
+        if in_pubsub_call_position
+            && let Expr::Ident(ident) = &*node.callee
+            && self.messaging_import_locals.contains(ident.sym.as_ref())
+            && let Some(args) = node.args.as_ref()
+            && args.len() >= 2
+            && args[0].spread.is_none()
+            && args[1].spread.is_none()
+            && matches!(&*args[1].expr, Expr::Arrow(_) | Expr::Fn(_))
+            && let Some(topic) = self.resolve_topic_string(&args[0].expr)
+        {
+            let path_snippet = self
+                .source_map
+                .span_to_snippet(args[0].expr.span())
+                .ok()
+                .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect());
+            self.push_span_candidate(
+                node.span,
+                // Same routing as the Signal 7 call-site candidates: the
+                // pub/sub guidance lives in the HTTP analyze-file prompt, so
+                // this must reach it rather than be set aside as unrouted.
+                Protocol::Http,
+                ident.sym.to_string(),
+                None,
+                path_snippet,
+            );
+            self.pubsub_anchor_ops.push(PubsubAnchorOp {
+                topic,
+                role: PubsubRole::Subscriber,
+                line_number: self.get_line_number(node.span),
+                handler_param: None,
+                handler_param_line: None,
+            });
+        }
+
         // Network primitives constructed with `new`: `new WebSocket(url)`,
         // `new EventSource(url)`, `new XMLHttpRequest()`. Emitting these as
         // candidates keeps files using them from being skipped by the gate.
@@ -1448,7 +1637,6 @@ impl Visit for CandidateVisitor {
             // Receiver must not be a string/number literal — that would be a
             // `"str".method()` / `(123).method()` chain, not a pub/sub client.
             && !matches!(&*member.obj, Expr::Lit(Lit::Str(_)) | Expr::Lit(Lit::Num(_)))
-            && self.first_arg_is_stringish_or_const_string(call)
         {
             let method = match &member.prop {
                 MemberProp::Ident(id) => Some(id.sym.to_string()),
@@ -1458,6 +1646,26 @@ impl Visit for CandidateVisitor {
                 },
                 MemberProp::PrivateName(_) => None,
             };
+            let role = match method.as_deref() {
+                Some("publish") => Some(PubsubRole::Publisher),
+                Some("subscribe") => Some(PubsubRole::Subscriber),
+                _ => None,
+            };
+            // First-argument shapes that qualify the site: the direct
+            // stringish/const-string topic (unchanged), or — on calls literally
+            // named publish/subscribe only — an options object carrying a
+            // protocol-vocabulary `topic`/`topics` key, the kafkajs
+            // `subscribe({ topic, fromBeginning })` idiom (carrick#402 shape a).
+            // Restricting the object shape to the vocabulary-named methods
+            // keeps `client.run({ eachMessage })` / arbitrary `configure({...})`
+            // config calls inert.
+            let stringish_topic = self.first_arg_is_stringish_or_const_string(call);
+            let object_topics = if role.is_some() {
+                Self::first_arg_object_literal(call)
+                    .and_then(|obj| self.object_literal_topic_values(obj))
+            } else {
+                None
+            };
             // Two-tier gate (carrick#317). Tier 1: the file imports a detected
             // messaging client — any member-call shape qualifies (unchanged).
             // Tier 2: the file has NO gating import (injected/inherited client,
@@ -1466,39 +1674,80 @@ impl Visit for CandidateVisitor {
             // pub/sub protocol vocabulary itself (`publish`/`subscribe`), which
             // keeps `logger.info('msg')` / `socket.emit('evt')` / RxJS
             // `.subscribe(fn)` (function arg, already excluded by the
-            // stringish-first-arg check) inert.
-            let gates_in = self.file_imports_messaging_client
-                || method
-                    .as_deref()
-                    .is_some_and(|m| m == "publish" || m == "subscribe");
-            if gates_in {
+            // first-argument shape checks) inert.
+            let gates_in = self.file_imports_messaging_client || role.is_some();
+            if (stringish_topic || object_topics.is_some()) && gates_in {
                 let obj_name = Self::extract_callee_object(&member.obj)
                     .unwrap_or_else(|| "<pubsub>".to_string());
 
-                // Anchor-op path (carrick#387), a strict subset of the sites
-                // gated in above: when the call is literally named
+                // Anchor-op path (carrick#387 + #402), a strict subset of the
+                // sites gated in above: only calls literally named
                 // publish/subscribe (the protocol vocabulary — stricter than
-                // tier 1's any-method candidate), carries NO payload argument,
-                // and its only argument resolves to a literal topic, the whole
-                // operation is a structural fact. Assert it deterministically
-                // so an LLM extraction omission cannot lose it; payload-carrying
-                // calls stay LLM-owned (locator judgment, envelope unwrapping).
-                let role = match method.as_deref() {
-                    Some("publish") => Some(PubsubRole::Publisher),
-                    Some("subscribe") => Some(PubsubRole::Subscriber),
-                    _ => None,
-                };
-                if let Some(role) = role
-                    && call.args.len() == 1
-                    && call.args[0].spread.is_none()
-                    && let Some(topic) = self.resolve_topic_string(&call.args[0].expr)
-                {
+                // tier 1's any-method candidate) whose topic resolves to a
+                // literal are structural facts. Assert them deterministically
+                // so an LLM extraction omission cannot lose them;
+                // payload-carrying calls stay LLM-owned (locator judgment,
+                // envelope unwrapping).
+                if let Some(role) = role {
                     let line_number = self.get_line_number(call.span);
-                    self.pubsub_anchor_ops.push(PubsubAnchorOp {
-                        topic,
-                        role,
-                        line_number,
-                    });
+                    if let Some(topics) = &object_topics {
+                        // Options-object shape (#402 a): every resolvable
+                        // topic anchors, payload-less — the message handler is
+                        // registered elsewhere (`run({ eachMessage })`) and
+                        // receives an envelope, so there is no deterministic
+                        // payload locator to record. SUBSCRIBER role only
+                        // (Copilot review on #409): a `publish({ topic, ... })`
+                        // options object may carry the payload as a sibling
+                        // property, so a payload-less publisher assertion could
+                        // put a typeless op on the wire where the LLM's locator
+                        // judgment should own the site. Publisher object shapes
+                        // keep the candidate below but stay LLM-owned.
+                        if role == PubsubRole::Subscriber && call.args.len() == 1 {
+                            for topic in topics {
+                                self.pubsub_anchor_ops.push(PubsubAnchorOp {
+                                    topic: topic.clone(),
+                                    role,
+                                    line_number,
+                                    handler_param: None,
+                                    handler_param_line: None,
+                                });
+                            }
+                        }
+                    } else if call.args.len() == 1
+                        && call.args[0].spread.is_none()
+                        && let Some(topic) = self.resolve_topic_string(&call.args[0].expr)
+                    {
+                        // Payload-less single-arg call (#387, unchanged).
+                        self.pubsub_anchor_ops.push(PubsubAnchorOp {
+                            topic,
+                            role,
+                            line_number,
+                            handler_param: None,
+                            handler_param_line: None,
+                        });
+                    } else if role == PubsubRole::Subscriber
+                        && call.args.len() == 2
+                        && call.args.iter().all(|a| a.spread.is_none())
+                        && matches!(&*call.args[1].expr, Expr::Arrow(_) | Expr::Fn(_))
+                        && let Some(topic) = self.resolve_topic_string(&call.args[0].expr)
+                    {
+                        // Two-arg `subscribe("topic", handler)` (#402 c): the
+                        // inline function second argument is a handler, not a
+                        // payload, so the op is still structurally certain.
+                        // Its first param — when a simple identifier — is the
+                        // decoded-payload binding, recorded as a FunctionParam
+                        // locator for the sidecar. A function REFERENCE second
+                        // arg stays LLM-owned: an identifier could be an
+                        // options object.
+                        let handler = Self::handler_first_ident_param(&call.args[1].expr);
+                        self.pubsub_anchor_ops.push(PubsubAnchorOp {
+                            topic,
+                            role,
+                            line_number,
+                            handler_param: handler.as_ref().map(|(name, _)| name.clone()),
+                            handler_param_line: handler.map(|(_, span)| self.get_line_number(span)),
+                        });
+                    }
                 }
 
                 self.push_candidate(call, obj_name, method);
@@ -1589,17 +1838,21 @@ fn collect_const_string_values(module: &Module) -> HashMap<String, String> {
 }
 
 /// Collect the local binding names introduced by imports from any of the
-/// `data_fetchers` packages, covering default, named (incl. aliases), and
-/// namespace imports. Matched exactly or as a scope/subpath prefix
+/// listed packages, covering default, named (incl. aliases), and namespace
+/// imports. Matched exactly or as a scope/subpath prefix
 /// (`pkg`, `@scope/pkg`, `pkg/sub`).
 ///
-/// `data_fetchers` comes from framework detection — the LLM decides which of the
-/// repo's dependencies are data-fetching libraries — so the scanner carries no
-/// hardcoded package list. This is a recall booster for the gatekeeper, not an
-/// authoritative classification: the LLM still decides what each call is.
-fn network_import_locals(module: &Module, data_fetchers: &[String]) -> HashSet<String> {
-    let is_data_fetcher = |src: &str| {
-        data_fetchers
+/// The package list comes from framework detection — the LLM decides which of
+/// the repo's dependencies are data-fetching libraries / messaging clients —
+/// so the scanner carries no hardcoded package list. Called with
+/// `data_fetchers` for the network-call Signal 2 and with `messaging_clients`
+/// for the NewExpr subscriber gate (carrick#402). This is a recall booster for
+/// the gatekeeper, not an authoritative classification: the LLM still decides
+/// what each call is. Matching is the same exact-or-`"<pkg>/"`-prefix
+/// convention as `file_imports_messaging_client`.
+fn package_import_locals(module: &Module, packages: &[String]) -> HashSet<String> {
+    let is_listed = |src: &str| {
+        packages
             .iter()
             .any(|pkg| src == pkg || src.starts_with(&format!("{}/", pkg)))
     };
@@ -1608,7 +1861,7 @@ fn network_import_locals(module: &Module, data_fetchers: &[String]) -> HashSet<S
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
         };
-        if !is_data_fetcher(import.src.value.as_ref()) {
+        if !is_listed(import.src.value.as_ref()) {
             continue;
         }
         for spec in &import.specifiers {
@@ -2783,6 +3036,242 @@ bus.publish('plain.topic');
             gated_out.pubsub_anchor_ops.is_empty(),
             "empty messaging_clients must keep the anchor path inert, got {:?}",
             gated_out.pubsub_anchor_ops
+        );
+    }
+
+    /// carrick#402 shape a, on the exact corpus-2 file that flaked (kafkajs
+    /// `await consumer.subscribe({ topic: TOPIC, fromBeginning: false })` with
+    /// a const-ref topic): the site must surface as a candidate AND emit a
+    /// payload-less subscriber anchor op, so an LLM extraction miss is
+    /// backfilled deterministically. With no detected messaging clients the
+    /// file stays fully inert.
+    #[test]
+    fn kafkajs_object_literal_subscribe_is_candidate_and_anchor() {
+        use crate::operation::PubsubRole;
+        use std::fs;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/xrepo-corpus-2/notifications-svc/src/kafka/consumer.ts");
+        let src =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let scanner = SwcScanner::new();
+
+        let gated_in = scanner.scan_content(&path, &src, &[], &["kafkajs".to_string()]);
+        assert!(
+            gated_in
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("subscribe")),
+            "awaited consumer.subscribe({{ topic }}) must surface as a candidate, got {:?}",
+            gated_in.candidates
+        );
+        let ops = &gated_in.pubsub_anchor_ops;
+        assert_eq!(
+            ops.len(),
+            1,
+            "expected exactly the subscribe anchor, got {ops:?}"
+        );
+        let op = &ops[0];
+        assert_eq!(op.topic, "order.placed");
+        assert_eq!(op.role, PubsubRole::Subscriber);
+        assert_eq!(
+            (op.handler_param.as_deref(), op.handler_param_line),
+            (None, None),
+            "options-object subscribe registers its handler elsewhere; the anchor must be payload-less"
+        );
+
+        let gated_out = scanner.scan_content(&path, &src, &[], &[]);
+        assert!(
+            gated_out.pubsub_anchor_ops.is_empty(),
+            "empty messaging_clients must keep the kafkajs file anchor-inert, got {:?}",
+            gated_out.pubsub_anchor_ops
+        );
+    }
+
+    /// carrick#402 shape a: `subscribe({ topics: ['a','b'] })` anchors every
+    /// resolvable topic; a vocabulary key on a NON-vocabulary method
+    /// (`configure({ topic })`), the handler-registration object
+    /// (`run({ eachMessage })`), and a `publish({ topic, ... })` options
+    /// object (whose sibling property may be the payload — Copilot review on
+    /// #409) stay anchor-inert. The publish object shape still surfaces as a
+    /// candidate so the LLM owns the site.
+    #[test]
+    fn object_literal_topics_array_anchors_each_topic() {
+        use crate::operation::PubsubRole;
+
+        let src = r#"
+import { Kafka } from 'fakekafka';
+const consumer = new Kafka({ brokers: [] }).consumer({ groupId: 'g' });
+declare const bus: { publish: (opts: object) => void };
+export async function start(): Promise<void> {
+  await consumer.subscribe({ topics: ['order.created', 'order.cancelled'], fromBeginning: true });
+  await consumer.configure({ topic: 'not.a.subscription' });
+  await consumer.run({ eachMessage: async () => {} });
+  bus.publish({ topic: 'order.audited', payload: { id: 1 } });
+}
+"#;
+        let scanner = SwcScanner::new();
+        let result = scanner.scan_content(
+            &PathBuf::from("consumer.ts"),
+            src,
+            &[],
+            &["fakekafka".to_string()],
+        );
+        let ops = &result.pubsub_anchor_ops;
+        assert_eq!(
+            ops.len(),
+            2,
+            "expected one anchor per topics[] entry and nothing else, got {ops:?}"
+        );
+        for topic in ["order.created", "order.cancelled"] {
+            assert!(
+                ops.iter()
+                    .any(|op| op.topic == topic && op.role == PubsubRole::Subscriber),
+                "topics[] entry {topic} must anchor, got {ops:?}"
+            );
+        }
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("publish")),
+            "publish({{ topic }}) must still surface as a candidate, got {:?}",
+            result.candidates
+        );
+    }
+
+    /// carrick#402 shape b, on the exact corpus-3 file that flaked (BullMQ
+    /// `export const dispatchWorker = new Worker("shipments.dispatch", async
+    /// (job) => {...})`): the constructor site must surface as a candidate AND
+    /// emit a payload-less subscriber anchor, gated on `Worker` being an
+    /// import binding from a detected messaging-client package.
+    #[test]
+    fn bullmq_new_worker_is_candidate_and_anchor() {
+        use crate::operation::PubsubRole;
+        use std::fs;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/xrepo-corpus-3/fulfillment-worker/src/worker.ts");
+        let src =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let scanner = SwcScanner::new();
+
+        let gated_in = scanner.scan_content(&path, &src, &[], &["bullmq".to_string()]);
+        assert!(
+            gated_in
+                .candidates
+                .iter()
+                .any(|c| c.callee_object == "Worker"),
+            "new Worker(queue, handler) must surface as a candidate, got {:?}",
+            gated_in.candidates
+        );
+        assert!(
+            gated_in.pubsub_anchor_ops.iter().any(|op| {
+                op.topic == "shipments.dispatch"
+                    && op.role == PubsubRole::Subscriber
+                    && op.handler_param.is_none()
+            }),
+            "new Worker must emit a payload-less subscriber anchor (the handler \
+             param is a Job envelope, never a payload locator), got {:?}",
+            gated_in.pubsub_anchor_ops
+        );
+
+        let gated_out = scanner.scan_content(&path, &src, &[], &[]);
+        assert!(
+            gated_out.pubsub_anchor_ops.is_empty(),
+            "empty messaging_clients must keep the worker file anchor-inert, got {:?}",
+            gated_out.pubsub_anchor_ops
+        );
+    }
+
+    /// carrick#402 shape b negative: the NewExpr gate is IMPORT-BINDING
+    /// resolution, not method shape and not any file-level import. A
+    /// `new CronJob("literal", fn)` whose binding comes from a package the
+    /// detect step did NOT flag as a messaging client must not anchor — even
+    /// when the repo has detected messaging clients, and even when the same
+    /// file also imports one.
+    #[test]
+    fn new_expr_gate_rejects_non_messaging_constructors() {
+        let src = r#"
+import { Worker } from 'bullmq';
+import { CronJob } from 'cron';
+export const job = new CronJob('0 * * * *', () => {});
+export const unused = Worker;
+"#;
+        let scanner = SwcScanner::new();
+        let result = scanner.scan_content(
+            &PathBuf::from("scheduler.ts"),
+            src,
+            &[],
+            &["bullmq".to_string()],
+        );
+        assert!(
+            result.pubsub_anchor_ops.is_empty(),
+            "new CronJob('lit', fn) must NOT anchor: cron is not a detected \
+             messaging client, got {:?}",
+            result.pubsub_anchor_ops
+        );
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|c| c.callee_object == "CronJob"),
+            "CronJob must not surface as a pub/sub candidate, got {:?}",
+            result.candidates
+        );
+    }
+
+    /// carrick#402 shape c: two-arg `subscribe("topic", handler)` with an
+    /// INLINE function anchors and records the handler's first param (simple
+    /// identifier only) as the FunctionParam payload locator; a destructured
+    /// param anchors payload-less; a function REFERENCE second arg (could be
+    /// an options object) does not anchor at all.
+    #[test]
+    fn two_arg_subscribe_records_inline_handler_param() {
+        use crate::operation::PubsubRole;
+
+        let src = r#"
+import { bus } from 'fakebus';
+declare function handlerRef(msg: unknown): void;
+bus.subscribe('user.created', (msg) => { console.log(msg); });
+bus.subscribe('user.updated', function (payload: { id: string }) { void payload; });
+bus.subscribe('user.enriched', ({ data }) => { void data; });
+bus.subscribe('user.deleted', handlerRef);
+"#;
+        let scanner = SwcScanner::new();
+        let result = scanner.scan_content(
+            &PathBuf::from("subscriber.ts"),
+            src,
+            &[],
+            &["fakebus".to_string()],
+        );
+        let ops = &result.pubsub_anchor_ops;
+        assert_eq!(
+            ops.len(),
+            3,
+            "expected the three inline-handler anchors, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op.topic == "user.created"
+                && op.role == PubsubRole::Subscriber
+                && op.handler_param.as_deref() == Some("msg")
+                && op.handler_param_line == Some(4)),
+            "arrow handler's ident param must be recorded, got {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.topic == "user.updated"
+                    && op.handler_param.as_deref() == Some("payload")),
+            "function-expression handler's typed ident param must be recorded, got {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.topic == "user.enriched" && op.handler_param.is_none()),
+            "destructured handler param must anchor payload-less, got {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.topic == "user.deleted"),
+            "a function-reference second arg must not anchor, got {ops:?}"
         );
     }
 }

@@ -2899,9 +2899,14 @@ impl FileOrchestrator {
     /// pub/sub ops, and an extracted op that shares the anchor's line but not
     /// its topic (e.g. a template the model kept verbatim) does not put the
     /// resolved topic on the wire — the anchor still must (Copilot review on
-    /// #389). Backfilled ops are payload-less by construction, so every
-    /// judgment field is `None`: there is no type to capture and no locator to
-    /// emit — pure topic recall.
+    /// #389). Backfilled ops carry no type judgment: `primary_type_symbol` /
+    /// `broker` stay `None`. The two-arg `subscribe("topic", handler)` shape
+    /// (carrick#402 c) additionally recorded its inline handler's first param,
+    /// which lands here as the FunctionParam payload locator
+    /// (`payload_expression_text`/`_line`) that
+    /// `collect_pubsub_infer_requests` routes through the sidecar; every other
+    /// anchor shape is payload-less and keeps all judgment fields `None` —
+    /// pure topic recall.
     fn merge_pubsub_anchor_ops(
         result: &mut FileAnalysisResult,
         anchor_ops: Vec<PubsubAnchorOp>,
@@ -2927,8 +2932,10 @@ impl FileOrchestrator {
                 primary_type_symbol: None,
                 type_import_source: None,
                 broker: None,
-                payload_expression_text: None,
-                payload_expression_line: None,
+                payload_expression_text: anchor.handler_param,
+                payload_expression_line: anchor
+                    .handler_param_line
+                    .and_then(|l| i32::try_from(l).ok()),
             });
             added += 1;
         }
@@ -7183,18 +7190,24 @@ const ESCALATE_MUTATION = gql`
                 topic: "PollController:pollingStarted".to_string(),
                 role: PubsubRole::Publisher,
                 line_number: 182,
+                handler_param: None,
+                handler_param_line: None,
             },
             // (b) same (topic, role) as an extracted op at another line -> skipped.
             PubsubAnchorOp {
                 topic: "PollController:stateChange".to_string(),
                 role: PubsubRole::Publisher,
                 line_number: 95,
+                handler_param: None,
+                handler_param_line: None,
             },
             // (c) genuinely missed -> backfilled.
             PubsubAnchorOp {
                 topic: "PollController:pollingStopped".to_string(),
                 role: PubsubRole::Publisher,
                 line_number: 201,
+                handler_param: None,
+                handler_param_line: None,
             },
         ];
 
@@ -7249,11 +7262,15 @@ const ESCALATE_MUTATION = gql`
                 topic: "jobs.retry".to_string(),
                 role: PubsubRole::Publisher,
                 line_number: 7,
+                handler_param: None,
+                handler_param_line: None,
             },
             PubsubAnchorOp {
                 topic: "jobs.completed".to_string(),
                 role: PubsubRole::Subscriber,
                 line_number: 7,
+                handler_param: None,
+                handler_param_line: None,
             },
             // Same line, same role, DIFFERENT topic (the extraction kept a
             // template verbatim, say) -> the resolved-topic anchor must
@@ -7262,6 +7279,8 @@ const ESCALATE_MUTATION = gql`
                 topic: "jobs.failed".to_string(),
                 role: PubsubRole::Publisher,
                 line_number: 7,
+                handler_param: None,
+                handler_param_line: None,
             },
         ];
 
@@ -7316,6 +7335,8 @@ const ESCALATE_MUTATION = gql`
                 topic: "jobs.retry".to_string(),
                 role: PubsubRole::Subscriber,
                 line_number: 25,
+                handler_param: None,
+                handler_param_line: None,
             }],
         );
         assert_eq!(added, 1);
@@ -7326,6 +7347,36 @@ const ESCALATE_MUTATION = gql`
                 .any(|op| op.topic == "jobs.retry" && op.role == Some(PubsubRole::Subscriber)),
             "subscriber anchor must be backfilled alongside the publisher extraction"
         );
+    }
+
+    /// carrick#402 shape c: an anchor from the two-arg
+    /// `subscribe("topic", (msg) => …)` form carries its inline handler's
+    /// first param, and the backfill must land it as the FunctionParam payload
+    /// locator (`payload_expression_text`/`_line`) so
+    /// `collect_pubsub_infer_requests` routes it through the sidecar. Type
+    /// judgment fields stay `None`.
+    #[test]
+    fn merge_pubsub_anchor_ops_carries_handler_param_locator() {
+        use crate::operation::PubsubRole;
+        use crate::swc_scanner::PubsubAnchorOp;
+
+        let mut result = FileAnalysisResult::default();
+        let added = FileOrchestrator::merge_pubsub_anchor_ops(
+            &mut result,
+            vec![PubsubAnchorOp {
+                topic: "user.created".to_string(),
+                role: PubsubRole::Subscriber,
+                line_number: 12,
+                handler_param: Some("msg".to_string()),
+                handler_param_line: Some(12),
+            }],
+        );
+        assert_eq!(added, 1);
+        let op = &result.pubsub_operations[0];
+        assert_eq!(op.payload_expression_text.as_deref(), Some("msg"));
+        assert_eq!(op.payload_expression_line, Some(12));
+        assert_eq!(op.primary_type_symbol, None);
+        assert_eq!(op.broker, None);
     }
 
     /// Test-local pub/sub op constructor for the phantom-topic guard tests.
