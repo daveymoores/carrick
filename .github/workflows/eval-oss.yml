@@ -33,6 +33,10 @@ on:
         description: "N repeated cross-repo scans"
         required: false
         default: "1"
+      install_corpus_deps:
+        description: "install each corpus repo's deps before scanning (false = bare checkout, the Action's default posture)"
+        required: false
+        default: "true"
 
 permissions:
   id-token: write
@@ -120,6 +124,7 @@ jobs:
       # repos and must not execute arbitrary code on the runner (yarn-berry
       # skips builds via --mode=skip-build; classic yarn via --ignore-scripts).
       - name: Install corpus dependencies (yarn/pnpm/npm-aware, tolerant)
+        if: ${{ inputs.install_corpus_deps != 'false' }}
         run: |
           corepack enable || true
           # Log-file capture instead of a pipe: without pipefail a
