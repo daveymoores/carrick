@@ -7,6 +7,16 @@
  * conditional-type relation diverges around `any`, and because the compiler's
  * elaborated assignment error is the user-facing mismatch report.
  *
+ * GraphQL pairs additionally unwrap the producer's resolver-return ENVELOPE
+ * before the assignment (see the `graphql` branch in `buildProbe`): a GraphQL
+ * producer's captured type is the resolver function's return type with
+ * transport layers (Promise / async-iterator) already peeled at inference
+ * time, which for wrapper-returning resolvers is a single-payload envelope
+ * (`{ data: Order; errors: string[] }`) — not the SDL field payload the
+ * consumer's selection set reads. The v1 checker unwrapped this structurally
+ * at compare time (ts_check type-checker `unwrapGraphqlPayload`, deleted in
+ * WP8); the type-level port here is its v2-native equivalent.
+ *
  * Seam: node builtins + `typescript` + this bundle only. No imports needed here.
  */
 
@@ -151,7 +161,63 @@ export function buildProbe(
   );
   gateLines.set(push(`type _G_expected_never = Assert<Not<IsNever<Expected>>>;`), 'expected:never');
   push(`declare const sent: Sent;`);
-  const assignmentLine = push(`const expected: Expected = sent;`);
+
+  let assignmentLine: number;
+  if (spec.protocol === 'graphql') {
+    // GraphQL selection-set semantics (v1 `unwrapGraphqlPayload` parity): the
+    // producer side (always `sent` for graphql — see the direction table) is
+    // the resolver's return type. When that return is a single-payload
+    // ENVELOPE — exactly one property whose type is payload-shaped (an
+    // object, an array of objects, or a union of objects), every sibling a
+    // scalar or scalar array (`errors: string[]`) — the consumer's selection
+    // reads the payload, not the envelope, so the payload is the comparand.
+    //
+    // Fail-closed by construction:
+    //   - `Sent` already assignable to `Expected` short-circuits to `Sent`
+    //     (plain structural subset selection stays exactly as before);
+    //   - zero payload-shaped properties (already-bare payloads of scalars)
+    //     or several (ambiguous envelope, or a bare payload whose own fields
+    //     include more than one object-shaped property) keep the whole type —
+    //     the unwrap never fires on anything but an unambiguous envelope;
+    //   - `GqlObjLike` can never select `any`/`unknown`/`never` (top/bottom
+    //     types fail both its array and its object arm), and the comparand is
+    //     re-gated below anyway — the v2 port of v1's comparand re-guard, so
+    //     a payload decayed to a top type can never read compatible.
+    push(
+      `type GqlObjLike<V> = [V] extends [readonly unknown[]] ? ([V] extends [readonly (infer E)[]] ? ([E] extends [readonly unknown[]] ? false : ([E] extends [object] ? true : false)) : false) : ([V] extends [object] ? true : false);`
+    );
+    push(
+      `type GqlIsUnion<T, U = T> = [T extends unknown ? ([U] extends [T] ? false : true) : never] extends [false] ? false : true;`
+    );
+    push(
+      `type GqlPayloadKeys<T> = { [K in keyof T]-?: [GqlObjLike<T[K]>] extends [true] ? K : never }[keyof T];`
+    );
+    push(
+      `type GqlSingleKey<K> = [K] extends [never] ? never : ([GqlIsUnion<K>] extends [false] ? K : never);`
+    );
+    push(
+      `type GqlPayloadOf<S> = [S] extends [readonly unknown[]] ? never : [GqlIsUnion<S>] extends [true] ? never : [S] extends [object] ? ([GqlSingleKey<GqlPayloadKeys<S>>] extends [never] ? never : S[GqlSingleKey<GqlPayloadKeys<S>> & keyof S]) : never;`
+    );
+    push(
+      `type GqlComparand = [Sent] extends [Expected] ? Sent : ([GqlPayloadOf<Sent>] extends [never] ? Sent : GqlPayloadOf<Sent>);`
+    );
+    gateLines.set(
+      push(`type _G_comparand_any = Assert<Not<IsAny<GqlComparand>>>;`),
+      'sent:any'
+    );
+    gateLines.set(
+      push(`type _G_comparand_unknown = Assert<Not<IsUnknown<GqlComparand>>>;`),
+      'sent:unknown'
+    );
+    gateLines.set(
+      push(`type _G_comparand_never = Assert<Not<IsNever<GqlComparand>>>;`),
+      'sent:never'
+    );
+    push(`declare const sentComparand: GqlComparand;`);
+    assignmentLine = push(`const expected: Expected = sentComparand;`);
+  } else {
+    assignmentLine = push(`const expected: Expected = sent;`);
+  }
 
   return {
     pairId: id,

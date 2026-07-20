@@ -85,6 +85,37 @@ describe('pair IDs', () => {
   });
 });
 
+describe('graphql probe shape (resolver-return envelope unwrap)', () => {
+  it('graphql pairs assign a comparand that unwraps a single-payload envelope', () => {
+    const plan = buildProbe(spec({ protocol: 'graphql' }), PKG);
+    assert.ok(plan.source.includes('type GqlComparand ='), plan.source);
+    assert.ok(plan.source.includes('const expected: Expected = sentComparand;'));
+    // The comparand short-circuits to Sent when it already satisfies Expected
+    // (plain subset selection), and falls back to Sent when no unambiguous
+    // single payload property exists.
+    assert.ok(plan.source.includes('[Sent] extends [Expected] ? Sent'));
+    // Comparand re-gates (the v2 port of v1's post-unwrap top-type re-guard)
+    // classify through the standard sent-side gate names.
+    const names = [...plan.gateLines.values()];
+    assert.strictEqual(names.filter((n) => n === 'sent:any').length, 2);
+    assert.strictEqual(names.filter((n) => n === 'sent:unknown').length, 2);
+    assert.strictEqual(names.filter((n) => n === 'sent:never').length, 2);
+    // The assignment line bookkeeping still points at the real assignment.
+    const lines = plan.source.split('\n');
+    assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: Expected = sentComparand;');
+  });
+
+  it('non-graphql pairs keep the raw sent assignment and six gates', () => {
+    for (const protocol of ['http', 'socket', 'pubsub'] as const) {
+      const plan = buildProbe(spec({ protocol }), PKG);
+      assert.ok(!plan.source.includes('GqlComparand'), protocol);
+      assert.strictEqual(plan.gateLines.size, 6, protocol);
+      const lines = plan.source.split('\n');
+      assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: Expected = sent;');
+    }
+  });
+});
+
 describe('four-bucket classifier precedence', () => {
   const plan = buildProbe(spec(), PKG);
   const scrubCtx = { workspaceRoot: '/tmp/ws', packageLabelOf: () => undefined };
