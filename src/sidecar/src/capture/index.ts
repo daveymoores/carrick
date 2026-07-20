@@ -194,6 +194,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // hand-written declarations in the import closure) are never re-emitted by
   // tsc; they must ship verbatim or the tree's references to them dangle.
   const declarationSources = new Map<string, string>();
+  let emitPartial = false;
   try {
     fs.writeFileSync(entryPath, entryLines.join('\n') + '\n');
     const emitOptions: ts.CompilerOptions = {
@@ -217,9 +218,15 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       undefined,
       /* emitOnlyDtsFiles */ true
     );
-    if (emitResult.emitSkipped) {
+    // emitSkipped is PER-PROGRAM even when only one file's declaration emit
+    // failed (e.g. TS4023 from a hand-rolled ambient stub shadowing a real
+    // package): every other file's .d.ts was still written to the callback.
+    // Fail wholesale only when nothing at all emitted; otherwise keep the
+    // emitted subset and demote exactly the aliases it cannot support.
+    if (emitResult.emitSkipped && emitted.size === 0) {
       return fail(stubDir, packageName, ['declaration emit was skipped']);
     }
+    emitPartial = emitResult.emitSkipped;
     for (const d of emitResult.diagnostics) {
       errors.push(ts.flattenDiagnosticMessageText(d.messageText, '\n'));
     }
@@ -235,6 +242,24 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   } finally {
     if (fs.existsSync(entryPath)) fs.unlinkSync(entryPath);
     fs.rmSync(staging, { recursive: true, force: true });
+  }
+
+  // ---- Partial-emit recovery ----
+  // The corpus-2 notifications-svc shape: one file's declaration emit was
+  // skipped but the rest of the tree emitted fine. Keep the tree; demote any
+  // alias whose surface reference would dangle (its module produced no .d.ts)
+  // and rewrite its surface line to `unknown` so the kept tree carries no
+  // dangling specifiers that would smear the healthy aliases at self-check or
+  // poison the whole service at check time. Fail-closed: a demoted alias is
+  // `unknown` at the surface, so the check phase's IsUnknown probe gate (or
+  // the poison rule, for unemitted modules still referenced by kept files)
+  // decays it to unverifiable — it can never read compatible.
+  if (emitPartial) {
+    errors.push(
+      `declaration emit was partial: kept ${emitted.size} emitted file(s); ` +
+        'aliases referencing unemitted modules are demoted to structural_fallback'
+    );
+    resolved = demoteDanglingAliases({ resolved, emitted, declarationSources, staging });
   }
 
   // ---- Relocate the emitted tree into the stub package ----
@@ -382,6 +407,90 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     ts_version: ts.version,
     errors,
   };
+}
+
+/**
+ * Partial-emit demotion: with the set of modules that DID reach the tree
+ * (emitted .d.ts plus verbatim declaration sources), demote every anchor
+ * whose alias text references a relative module absent from that set, and
+ * rewrite the demoted aliases' lines in the emitted surface to `unknown`.
+ * Anchors already demoted stay as they are; anchors whose text is
+ * self-contained (node-builder structural prints, literal object text) are
+ * untouched even when their source file failed to emit — their surface line
+ * references nothing that can dangle.
+ */
+function demoteDanglingAliases(args: {
+  resolved: ResolvedAnchor[];
+  /** Staging-absolute emitted file -> text. Surface text is patched in place. */
+  emitted: Map<string, string>;
+  /** entryDir-relative verbatim .d.ts sources that will ship with the tree. */
+  declarationSources: Map<string, string>;
+  staging: string;
+}): ResolvedAnchor[] {
+  // Extensionless, entryDir-relative POSIX module ids present in the tree.
+  const treeModules = new Set<string>();
+  let surfaceKey: string | undefined;
+  for (const fileName of args.emitted.keys()) {
+    const rel = path.relative(args.staging, fileName).split(path.sep).join('/');
+    if (rel === `${SURFACE_ENTRY_BASENAME}.d.ts`) surfaceKey = fileName;
+    if (rel.endsWith('.d.ts')) treeModules.add(rel.slice(0, -'.d.ts'.length));
+  }
+  for (const rel of args.declarationSources.keys()) {
+    if (rel.endsWith('.d.ts')) treeModules.add(rel.slice(0, -'.d.ts'.length));
+  }
+  // The surface sits at the tree root, so its relative specifiers resolve
+  // against the root; anything escaping the root cannot be in the tree.
+  const moduleInTree = (spec: string): boolean => {
+    const id = path.posix.normalize(spec);
+    if (id.startsWith('..')) return false;
+    return treeModules.has(id) || treeModules.has(`${id}/index`);
+  };
+
+  const demoted = new Set<string>();
+  const next = args.resolved.map((anchor): ResolvedAnchor => {
+    if (anchor.failureReason !== undefined) return anchor;
+    const dangling = [...collectSpecifiers(anchor.aliasText)].find(
+      (spec) => isRelative(spec) && !moduleInTree(spec)
+    );
+    if (dangling === undefined) return anchor;
+    demoted.add(anchor.request.alias);
+    return {
+      request: anchor.request,
+      aliasText: 'unknown',
+      serialization: 'structural_fallback',
+      failureReason:
+        `declaration emit was skipped for module '${dangling}'; ` +
+        'alias demoted to keep the partially emitted tree usable',
+    };
+  });
+
+  if (surfaceKey !== undefined && demoted.size > 0) {
+    args.emitted.set(
+      surfaceKey,
+      rewriteSurfaceAliasesToUnknown(args.emitted.get(surfaceKey)!, demoted)
+    );
+  }
+  return next;
+}
+
+/** Replace `export type <name> = ...;` with `= unknown` for each demoted
+ * alias in the emitted surface text (span-accurate, statement-level). */
+function rewriteSurfaceAliasesToUnknown(text: string, demoted: Set<string>): string {
+  const sf = ts.createSourceFile('surface.d.ts', text, ts.ScriptTarget.Latest, true);
+  const spans: Array<{ start: number; end: number; name: string }> = [];
+  for (const stmt of sf.statements) {
+    if (ts.isTypeAliasDeclaration(stmt) && demoted.has(stmt.name.text)) {
+      spans.push({ start: stmt.getStart(sf), end: stmt.getEnd(), name: stmt.name.text });
+    }
+  }
+  let out = text;
+  for (const span of spans.reverse()) {
+    out =
+      out.slice(0, span.start) +
+      `export type ${span.name} = unknown;` +
+      out.slice(span.end);
+  }
+  return out;
 }
 
 /** Phase A: build the placeholder entry, then resolve every anchor. */
