@@ -692,7 +692,7 @@ fn test_path_normalization() {
 /// terminal-use walk anchored on `number`, so the bundle rendered
 /// `export interface <alias> {...}` with the `[]` gone and every scan reported
 /// a false `{...}[] not assignable` contract risk. This asserts the rendered
-/// definition — the artifact the manifest stores and ts_check compares — not
+/// definition — the artifact the manifest stores for the check phase — not
 /// the intermediate inference.
 #[test]
 fn test_multiline_call_result_bundles_array_definition() {

@@ -92,7 +92,7 @@ pub struct CrossRepoMatch {
     pub match_score: f64,
     /// `None` = compat NOT evaluated for this edge; `Some(b)` = evaluated.
     /// Omitted from JSON when `None` so the scorer never reads absent compat
-    /// data as a verdict (the `ts_check_dir` trap, contract §7).
+    /// data as a verdict (the silently-skipped-check trap, contract §7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_compatible: Option<bool>,
     /// `Some(..)` iff `type_compatible == Some(false)`; omitted otherwise.

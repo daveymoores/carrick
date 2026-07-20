@@ -113,7 +113,7 @@ runs:
         fi
 
         # Extract into a scratch directory: extracting into the workspace
-        # would clobber any carrick/ts_check/sidecar paths in the user's repo
+        # would clobber any carrick/sidecar paths in the user's repo
         # and pollute their scan root.
         DIST_DIR="$RUNNER_TEMP/carrick-dist"
         mkdir -p "$DIST_DIR"
@@ -122,11 +122,6 @@ runs:
         tar -xzf "$DIST_DIR/$ASSET" -C "$DIST_DIR"
         chmod +x "$DIST_DIR/carrick"
         echo "dist-dir=$DIST_DIR" >> "$GITHUB_OUTPUT"
-
-    - name: Install ts_check dependencies
-      if: steps.fork-check.outputs.skip != 'true'
-      shell: bash
-      run: cd "${{ steps.download.outputs.dist-dir }}/ts_check" && npm ci
 
     - name: Install sidecar dependencies
       if: steps.fork-check.outputs.skip != 'true'

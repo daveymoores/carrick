@@ -61,13 +61,9 @@ jobs:
           cache: "npm"
           cache-dependency-path: |
             src/sidecar/package-lock.json
-            ts_check/package-lock.json
 
       - name: Build type sidecar
         run: cd src/sidecar && npm ci && npm run build
-
-      - name: Install ts_check type checker
-        run: cd ts_check && npm ci
 
       - name: Materialize remote corpus at pinned SHAs
         env:
@@ -175,14 +171,6 @@ jobs:
         run: |
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture
-
-      - name: Upload ts_check output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ts_check-output
-          path: ts_check/output/
-          if-no-files-found: warn
 
       - name: Upload eval run records
         if: always()

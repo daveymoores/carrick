@@ -1,6 +1,3 @@
 {
-  "services": [
-    { "name": "ts-check", "directory": "ts_check" },
-    { "name": "type-sidecar", "directory": "src/sidecar" }
-  ]
+  "services": [{ "name": "type-sidecar", "directory": "src/sidecar" }]
 }

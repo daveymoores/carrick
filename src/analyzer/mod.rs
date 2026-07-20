@@ -103,8 +103,8 @@ fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
 /// its own contract is not a cross-service edge.
 ///
 /// `type_compatible == None` is deliberate and load-bearing: it means compat
-/// was never evaluated for this edge (e.g. `ts_check_dir` was absent, so type
-/// checking did not run), as distinct from `Some(true)` "evaluated, compatible".
+/// was never evaluated for this edge (e.g. the type sidecar was unavailable, so
+/// the check did not run), as distinct from `Some(true)` "evaluated, compatible".
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CrossRepoMatch {
     /// Repo id of the producer endpoint (service_name ?? repo_name).
@@ -122,12 +122,11 @@ pub struct CrossRepoMatch {
     /// smearing one producer's first verdict across all its consumers (#260). It
     /// shares the consumer manifest entry's source — both derive from the same
     /// call `file_location` — so after `parse_file_location` normalization the
-    /// edge and the ts_check `consumerLocation` agree on `(path, line)`. Set for
-    /// every edge a consumer call backs, HTTP and exact-key protocol edges
+    /// edge and the outcome's consumer location agree on `(path, line)`. Set
+    /// for every edge a consumer call backs, HTTP and exact-key protocol edges
     /// alike: both constructors fill it from the call's `file_path`, and the
-    /// overlay iterates all of them. A non-HTTP producer key simply leaves
-    /// `type_compatible` `None` (ts_check is HTTP-only); the location is still
-    /// recorded. `Option` only to leave room for an edge source with no call.
+    /// overlay iterates all of them. `Option` only to leave room for an edge
+    /// source with no call.
     pub consumer_location: Option<String>,
     /// Matcher confidence in `[0, 1]`. `1.0` for an exact normalized-key match
     /// (the only kind captured today; there is no finer score yet).
@@ -155,7 +154,7 @@ pub struct CrossRepoMatch {
     /// the `producer_*`/`consumer_*` field names carry NO role meaning (they
     /// only say which side sat in the endpoint index vs the call index);
     /// renderers must not label either side producer or consumer, and
-    /// ts_check verdicts are never overlaid on these edges (they would be
+    /// type-compat verdicts are never overlaid on these edges (they would be
     /// request-vs-request comparisons mislabelled as producer-contract
     /// verdicts).
     pub relationship: carrick_match::MatchRelationship,
@@ -300,12 +299,12 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
 }
 
 /// Canonicalize a consumer source location (`"<file>:<line>[:<col>]"`) to the
-/// `(path, line)` pair that joins a `CrossRepoMatch` edge to its ts_check
-/// per-pair verdict (#260). Both sides feed the same `call.file_location` here:
-/// the edge stores it verbatim (`path:line:col`), while ts_check reassembles
-/// `consumerLocation` as `parse_file_location(...).path : line`. Reducing both
-/// through `parse_file_location` strips the divergent column/format suffix so
-/// the verdict for one consumer can no longer smear onto another consumer of the
+/// `(path, line)` pair that joins a `CrossRepoMatch` edge to its per-pair
+/// verdict (#260). Both sides feed the same `call.file_location` here: the
+/// edge stores it verbatim (`path:line:col`), while the outcome carries the
+/// manifest entry's `consumer_file`/`consumer_line`. Reducing both through
+/// `parse_file_location` strips the divergent column/format suffix so the
+/// verdict for one consumer can no longer smear onto another consumer of the
 /// same producer endpoint.
 fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
@@ -327,11 +326,12 @@ fn strip_ci_workspace_prefix(location: &str) -> &str {
 
 /// Collapse any dynamic path segment (`:id`, `{id}`, `[id]`) to `:param` so the
 /// compat verdict join is param-NAME-agnostic. The cross-repo edge's
-/// `producer_key` keeps the source param name (`/orders/:id`), while ts_check's
-/// `endpoint` is built from the normalized manifest (`/orders/:param`). Without
-/// collapsing BOTH sides, the join misses on every parameterized route and the
-/// edge falls back to the optimistic `Some(true)` default — the live cause of
-/// compat being pinned regardless of the actual ts_check verdicts.
+/// `producer_key` keeps the source param name (`/orders/:id`), while the
+/// outcome's `identity` is built from the normalized manifest
+/// (`/orders/:param`). Without collapsing BOTH sides, the join misses on every
+/// parameterized route and the edge falls back to the optimistic `Some(true)`
+/// default — the historical cause of compat being pinned regardless of the
+/// actual verdicts.
 fn normalize_compat_path(path: &str) -> String {
     path.split('/')
         .map(|seg| {
@@ -1996,7 +1996,7 @@ impl Analyzer {
             // The consumer call's source location — the per-pair join key for the
             // compat verdict (#260). Shares the consumer manifest entry's source
             // (both come from this call's `file_location`), so the overlay can
-            // attribute ts_check's `consumerLocation` to THIS edge.
+            // attribute the outcome's consumer location to THIS edge.
             consumer_location: Some(call.file_path.display().to_string()),
             match_score: 1.0,
             type_compatible: None,
@@ -2111,10 +2111,10 @@ impl Analyzer {
                                 carrick_match::MatchEvidence::RouteDefinition,
                                 carrick_match::MatchEvidence::CallSite,
                             ),
-                            // Exact-key protocols (GraphQL/socket) ARE type-checked
-                            // by ts_check now, so this consumer location feeds the
-                            // compat overlay (`apply_compat_verdicts`) and also keeps
-                            // the dedup identity precise.
+                            // Exact-key protocols (GraphQL/socket) ARE
+                            // type-checked, so this consumer location feeds the
+                            // compat overlay (`apply_pair_outcomes`) and also
+                            // keeps the dedup identity precise.
                             consumer_location: Some(call.file_path.display().to_string()),
                             match_score: 1.0,
                             type_compatible: None,
@@ -2321,10 +2321,10 @@ impl Analyzer {
         // rather than sharing the producer's first verdict across all consumers
         // (#260).
         //
-        // `type_compatible` stays `None` when compat was not evaluated
-        // (`check_type_compatibility` returns `Err`: ts_check_dir absent, results
-        // file missing, or type checking failed). This `None` is load-bearing:
-        // the scorer must never read absent compat data as "compatible".
+        // `type_compatible` stays `None` when compat was not evaluated (no
+        // sidecar, so no pair outcomes were computed). This `None` is
+        // load-bearing: the scorer must never read absent compat data as
+        // "compatible".
         self.overlay_compat_verdicts(&mut cross_repo_matches);
 
         let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
@@ -2463,7 +2463,7 @@ impl Analyzer {
             .collect()
     }
 
-    /// Provenance of the producer behind a ts_check verdict, joined against
+    /// Provenance of the producer behind a compat verdict, joined against
     /// the mount graph's resolved endpoints by `(METHOD, path)` — the same
     /// param-name-agnostic path normalization the compat overlay uses. When
     /// several producers share the key, route-wins (`.min()`); an unmatched
@@ -2532,9 +2532,9 @@ impl Analyzer {
             .replace("' is not assignable to type '", " not assignable to ")
             .replace("'.", "");
 
-        // ts_check's own errorDetails wrapper has no trailing period
-        // ("... type 'Y'"), so the "'." replacement above never fires on the
-        // closing quote; drop the unbalanced closer here.
+        // A diagnostic ending mid-sentence ("... type 'Y'") has no trailing
+        // period, so the "'." replacement above never fires on the closing
+        // quote; drop the unbalanced closer here.
         if let Some(stripped) = cleaned.strip_suffix('\'') {
             cleaned = stripped.to_string();
         }

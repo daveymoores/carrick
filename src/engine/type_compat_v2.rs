@@ -821,7 +821,8 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
 
 /// Materialize every artifact-carrying service's stub into `dest_root` and
 /// return the check inputs. Stub dir names are keyed on the sanitized
-/// service id (collisions suffixed) — same intent as `bundle_file_stems`.
+/// service id (collisions suffixed) so two services of one monorepo can
+/// never clobber each other's stub.
 pub(crate) fn materialize_stubs(
     all_repo_data: &[CloudRepoData],
     dest_root: &Path,

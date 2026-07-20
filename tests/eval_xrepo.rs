@@ -992,11 +992,12 @@ fn score_compat_verdict_accuracy(
     fraction(correct, total)
 }
 
-/// The §7 `ts_check_dir` guard (load-bearing). If the answer key expects ≥1 edge
-/// to carry a non-null compat verdict, the actual matches MUST contain ≥1 edge
-/// with `type_compatible.is_some()` — otherwise compat data was silently absent
-/// (a forgotten `ts_check/`) and the scorer must FAIL LOUD rather than score the
-/// absence as "all compatible". Returns `Err(msg)` to fail; `Ok(())` to proceed.
+/// The §7 compat-absence guard (load-bearing). If the answer key expects ≥1
+/// edge to carry a non-null compat verdict, the actual matches MUST contain ≥1
+/// edge with `type_compatible.is_some()` — otherwise compat data was silently
+/// absent (the type check never ran) and the scorer must FAIL LOUD rather than
+/// score the absence as "all compatible". Returns `Err(msg)` to fail; `Ok(())`
+/// to proceed.
 fn compat_guard(expected: &ExpectedOutput, found: &[EvalCrossRepoMatch]) -> Result<(), String> {
     let expects_verdict = expected.matches.iter().any(|m| m.type_compatible.is_some());
     if !expects_verdict {
@@ -1007,10 +1008,10 @@ fn compat_guard(expected: &ExpectedOutput, found: &[EvalCrossRepoMatch]) -> Resu
         Ok(())
     } else {
         Err(format!(
-            "§7 ts_check_dir guard: {} expected edge(s) carry a non-null compat verdict, but \
+            "§7 compat-absence guard: {} expected edge(s) carry a non-null compat verdict, but \
              NO actual cross_repo_match has type_compatible.is_some(). Cross-repo type checking \
-             was silently skipped (a forgotten ts_check/ dir). Refusing to score absent compat \
-             data as a verdict.",
+             was silently skipped (the v2 capture/check never ran). Refusing to score absent \
+             compat data as a verdict.",
             expected
                 .matches
                 .iter()
@@ -1429,10 +1430,10 @@ fn assert_phase_a_persisted(repo: &Path, cache_dir: &Path) {
     );
 }
 
-/// Phase B: join the cached repos and emit the merged projection. `ts_check_dir`
-/// is auto-discovered by the binary (contract §7 seam), so cross-repo type
-/// checking *runs* and the compat-verdict metric is scored over real data. Fails
-/// loud if type checking was silently skipped (a missing `ts_check/`), per §7.
+/// Phase B: join the cached repos and emit the merged projection. The type
+/// sidecar is auto-discovered by the binary (contract §7 seam), so cross-repo
+/// type checking *runs* and the compat-verdict metric is scored over real data.
+/// Fails loud if type checking was silently skipped (no sidecar), per §7.
 fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path, mock: bool) -> EvalProjection {
     let mut cmd = Command::new(bin);
     cmd.arg(repo)
@@ -1457,13 +1458,13 @@ fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path, mock: bool) -> EvalProject
         output.status.success(),
         "Phase B scan exited non-zero:\n{stderr}"
     );
-    // Contract §7 ts_check_dir seam: type checking only runs when the dir is
-    // Some. Fail loud if it was silently skipped — the compat-verdict metric must
+    // Contract §7 seam: type checking only runs when the sidecar is available.
+    // Fail loud if it was silently skipped — the compat-verdict metric must
     // never be built on silently-absent compat data.
     assert!(
         !stderr.contains("Skipping type checking"),
-        "ts_check/ was not found, so cross-repo type checking was silently skipped. \
-         Ensure ts_check/ ships at the repo root.\n{stderr}"
+        "the type sidecar was not found, so cross-repo type checking was silently \
+         skipped. Ensure src/sidecar is built (npm ci && npm run build).\n{stderr}"
     );
     let stdout = String::from_utf8(output.stdout).expect("Phase B stdout was not UTF-8");
     parse_projection(&stdout).unwrap_or_else(|| {
@@ -1760,11 +1761,11 @@ fn xrepo_live_scorer() {
                 );
             }
             // Per-op type pipeline state (#226 disambiguator). The compat-verdict
-            // metric and the §7 guard depend on cross-repo `ts_check`; the
+            // metric and the §7 guard depend on the cross-repo check; the
             // type_state / resolved_definition fields below are independent —
-            // they ride the per-repo sidecar manifest, not ts_check. So if these
+            // they ride the per-repo sidecar manifest, not the check. So if these
             // show resolved types but every edge above is `compat=None`, inference
-            // WAS reached and the gap is the cross-repo ts_check / verdict step
+            // WAS reached and the gap is the cross-repo check / verdict step
             // (cause (b)); if these are empty too, the per-repo type pipeline
             // never resolved (cause (a)).
             let resolved_ops = proj
@@ -1776,7 +1777,7 @@ fn xrepo_live_scorer() {
             eprintln!(
                 "[diag] type pipeline: {} of {} ops carry a resolved_definition / \
                  expanded_definition (>0 ⇒ inference reached ⇒ a compat=None gap is \
-                 the ts_check/verdict step, not the type pipeline)",
+                 the check/verdict step, not the type pipeline)",
                 resolved_ops,
                 proj.endpoints.len() + proj.calls.len(),
             );
@@ -1977,7 +1978,7 @@ fn xrepo_live_scorer() {
     // run (non-zero exit) so it is still flagged, without hiding owner / anchor /
     // resolution / deps / decoys behind an early panic. The diag dump above
     // disambiguates the cause: type-resolution acc > 0 ⇒ inference WAS reached ⇒
-    // the gap is the cross-repo ts_check / verdict step (not the type pipeline).
+    // the gap is the cross-repo check / verdict step (not the type pipeline).
     if let Some(msg) = compat_err_msg {
         panic!(
             "[eval] §7 compat-absence guard tripped (run flagged RED, but the full \

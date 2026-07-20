@@ -114,7 +114,7 @@ decoy count is trivially 0.
   the 2 HTTP edges (Fastify/Hono — Hono is medium-confidence, real framework-agnostic
   headroom if it misses); the HTTP orphans.
 - **Start near 0 → climb as the pub/sub slice + extraction land**: all 4 pub/sub edges
-  (ep/call/match/anchor/resolution), then pub/sub compat **last** (needs the ts_check
+  (ep/call/match/anchor/resolution), then pub/sub compat **last** (needs the check-phase
   direction + codec-unwrap path; until then pub/sub matches return `None` and the
   compat dimension reads as absent, exactly the corpus-1 graphql/socket arc).
 - **`roadmap`, partitioned out**: the 2 code-first-GraphQL edges (Pothos detection +

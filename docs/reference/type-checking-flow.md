@@ -1,5 +1,10 @@
 # Type Checking Flow (Manifest-Based)
 
+> **LEGACY — deleted in the v2 flip.** The `ts_check/` comparison path this
+> document describes was removed when capture_v2/check_v2 ("tsc as
+> serializer/judge", `docs/reference/type-compat-synthetic-monorepo.md`) became
+> the only runtime type-check path. Kept as historical reference.
+
 This document explains how cross-repo type checking works, the inputs it uses,
 and where mismatches or missing matches can be introduced.
 

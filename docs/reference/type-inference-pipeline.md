@@ -3,6 +3,12 @@
 **Repo:** `carrick` (branch `main`)
 **Scope:** READ-ONLY trace, current code as of 2026-06-26. Citations are `file:line` against the working tree.
 
+> **v2-flip note (2026-07).** Stage 5 below (cross-repo bundle + `ts_check`)
+> was deleted in the v2 flip: cross-repo compat now runs through the sidecar's
+> capture_v2/check_v2 actions (`src/engine/type_compat_v2.rs`,
+> `docs/reference/type-compat-synthetic-monorepo.md`). Stages 1-4 (capture-side
+> anchoring, sidecar resolution, manifest enrichment) remain broadly accurate.
+
 > **Doc-vs-code provenance note.** Of the prior notes, only one is current. `docs/reference/type-checking-flow.md` (Mar 2026) predates the sidecar entirely — it still describes `infer_types` aliases stored as `Response<{...}>` and ts_check `manifest-matcher` as the whole world; treat it as historical. `docs/archive/compiler-sidecar-architecture/ARCHITECTURE.md` correctly carries a 2026-06 "this shipped" banner but its code listings are the *original proposal* (a `services/type_sidecar.rs` with only `bundle`/`infer`, a `generateDtsBundle` bundler, and `collect_type_requests` returning a 2-tuple) — the real code has diverged (4 actions, a 3-tuple, no `dts-bundle-generator` in the live bundler). `protocol-expansion-deep-dive.md` (Jun 2026) is accurate and load-bearing for the GraphQL/socket determinism story. `type-checking-improvements-plan.md` is the span/evidence plan; Stages 0–7 are largely realised in the code traced here.
 
 ---

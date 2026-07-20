@@ -35,7 +35,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use serde::Serialize;
 use swc_common::{
     SourceMap,
     errors::{ColorConfig, Handler},
@@ -270,7 +269,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
     //    until after cross-repo analysis (step 6) so every payload can carry the
-    //    per-pair ts_check compat verdicts that analysis computes (#351). Every
+    //    per-pair type-compat verdicts that analysis computes (#351). Every
     //    payload is materialised now (cheap clones), so a serialization problem
     //    can't surface halfway through a multi-service upload.
     //
@@ -422,7 +421,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
             Ok(analyzer) => analyzer,
             Err(e) => {
-                // Cross-repo analysis (which is what runs ts_check) failed. Close
+                // Cross-repo analysis (which is what runs the type check) failed. Close
                 // the spinner with a warning first so the upload's own spinner
                 // and log lines don't interleave with an unfinished one in
                 // non-TTY CI logs, then preserve the prior behavior where the
@@ -452,11 +451,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         return Ok(());
     }
 
-    // 6b. Upload each service's data, now carrying the per-pair ts_check compat
+    // 6b. Upload each service's data, now carrying the per-pair type-compat
     //     verdicts cross-repo analysis just computed for the edges this repo's
     //     calls consume (#351). Keyed by canonical pair identity so the cloud
     //     MCP `check_compatibility` tool can surface the real verdict instead of
-    //     structural-matching-only. Absent for edges ts_check didn't evaluate,
+    //     structural-matching-only. Absent for edges the check didn't evaluate,
     //     which the cloud reads as "not compared" (fail closed, #324).
     if let Some(mut payloads) = upload_payloads {
         crate::cloud_storage::attach_compat_verdicts(&mut payloads, &results.cross_repo_matches);
@@ -1692,8 +1691,8 @@ fn append_pubsub_manifest_entries(
             let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
             // Publishers (consumers) disambiguate by call site. Two repos
             // publishing to the same topic (fan-in — the common event-driven
-            // shape) otherwise hash to ONE consumer alias, and ts_check's bundled
-            // `cross-repo-consumers` types then declare that interface twice with
+            // shape) otherwise hash to ONE consumer alias, and the merged
+            // consumer declarations then define that interface twice with
             // different bodies — one publisher's payload masks the other's,
             // yielding a spurious compat mismatch on whichever loses. Mirror the
             // HTTP consumer path (`add_manifest_pair` + `build_call_site_id`).
@@ -2608,18 +2607,8 @@ fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::
 }
 
 /// Build-artifact directories to skip everywhere.
-///
-/// `ts_check` is the scanner's own bundled type-checker, which sits at the scan
-/// root when the GitHub Action runs `./carrick .`. It's only ignored for the
-/// implicit whole-repo scan (`directory: None`); an explicitly declared service
-/// directory is honoured even if it is named `ts_check`, so a repo can index
-/// such a directory on purpose.
-fn service_ignore_patterns(service: &Config) -> Vec<&'static str> {
-    let mut patterns = vec!["node_modules", "dist", "build", ".next"];
-    if service.directory.is_none() {
-        patterns.push("ts_check");
-    }
-    patterns
+fn service_ignore_patterns(_service: &Config) -> Vec<&'static str> {
+    vec!["node_modules", "dist", "build", ".next"]
 }
 
 /// Load the package data for a single service, scoped to its own
@@ -2724,7 +2713,7 @@ fn build_type_manifest_entries(
         }
         // Call-site-evidence entries (#379) never anchor Producer types: they
         // are client encodings of an external contract, and a producer
-        // manifest entry would make ts_check run a request-vs-request
+        // manifest entry would make the type check run a request-vs-request
         // comparison mislabelled as a producer-contract verdict. Their pairs
         // are verdict-exempt at the source; the site's Consumer entry is
         // still emitted from the twin data call below.
@@ -3004,7 +2993,7 @@ fn enrich_manifest_with_type_resolution(
 
             if is_unknown_type {
                 // Downgrade to Unknown so the `= unknown` placeholder gate
-                // (resolve_per_endpoint_definitions, ts_check) stays shut and the
+                // (resolve_per_endpoint_definitions, check_v2 pre-gates) stays shut and the
                 // edge is reported unverifiable rather than falsely compatible.
                 entry.is_explicit = false;
                 entry.type_state = ManifestTypeState::Unknown;
@@ -3051,13 +3040,6 @@ fn enrich_manifest_with_type_resolution(
         "Manifest enrichment: {} explicit, {} implicit, {} unknown",
         explicit_count, implicit_count, unknown_count
     );
-}
-
-#[derive(Serialize)]
-struct TypeManifestFile {
-    repo_name: String,
-    commit_hash: String,
-    entries: Vec<TypeManifestEntry>,
 }
 
 async fn analyze_current_repo(
@@ -3331,158 +3313,6 @@ async fn build_cross_repo_analyzer(
     }
 
     Ok(analyzer)
-}
-
-/// Compute the cross-repo bundle file stem (`<stem>_types.d.ts`) for each
-/// `CloudRepoData`, parallel to `all_repo_data`.
-///
-/// A monorepo `carrick.json` declares N services under one git repo, so N
-/// `CloudRepoData` share the same `repo_name` and differ only by `service_name`.
-/// Keying the bundle file by `repo_name` alone made every service in the repo
-/// write to the same `<repo>_types.d.ts`, so the last service silently clobbered
-/// the earlier ones — and a producer whose type lived in a clobbered service
-/// (e.g. orders-pkg `GET /orders/:id` → `Order`) vanished from the bundle
-/// entirely, not even leaving the `= unknown` placeholder. ts_check then
-/// reported "Producer type not found in project" and the edge's compat verdict
-/// collapsed to unverifiable.
-///
-/// Key the stem by `service_name ?? repo_name` (the same attribution convention
-/// `build_cross_repo_analyzer` uses for packages) so each service gets its own
-/// bundle. The type aliases inside are globally unique (`Endpoint_<hash>` keyed
-/// on the operation) and ts_check loads every `*.d.ts` in the output dir, so one
-/// file per service is exactly what it needs. Collisions (two services resolving
-/// to the same base stem, e.g. both missing a `service_name`) are suffixed so no
-/// write clobbers a prior one.
-/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
-#[allow(dead_code)]
-fn bundle_file_stems(all_repo_data: &[CloudRepoData]) -> Vec<String> {
-    let mut used_stems: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    all_repo_data
-        .iter()
-        .map(|repo_data| {
-            let base_stem = repo_data
-                .service_name
-                .as_deref()
-                .unwrap_or(&repo_data.repo_name)
-                .replace(['/', '\\'], "_");
-            match used_stems.entry(base_stem.clone()) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let n = e.get_mut();
-                    *n += 1;
-                    format!("{base_stem}_{n}")
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(0);
-                    base_stem
-                }
-            }
-        })
-        .collect()
-}
-
-/// Write each repo/service's bundled `.d.ts` into `output_dir`, one file per
-/// service (see `bundle_file_stems`). The per-service split is what stops a
-/// monorepo's services from clobbering each other down to a single bundle file
-/// and silently dropping a whole service's producer types. ts_check loads every
-/// `*.d.ts` in `output_dir`, so the cross-file `Endpoint_<hash>` aliases still
-/// resolve regardless of which service-file each lives in.
-/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
-#[allow(dead_code)]
-fn write_bundle_files(all_repo_data: &[CloudRepoData], output_dir: &std::path::Path) {
-    let stems = bundle_file_stems(all_repo_data);
-    for (repo_data, stem) in all_repo_data.iter().zip(stems) {
-        if let Some(bundled_types) = &repo_data.bundled_types {
-            let file_name = format!("{stem}_types.d.ts");
-            let file_path = output_dir.join(&file_name);
-            let content =
-                append_missing_aliases(bundled_types.clone(), repo_data.type_manifest.as_ref());
-
-            if let Err(e) = std::fs::write(&file_path, content) {
-                warn!("Failed to write type file {}: {}", file_name, e);
-            } else {
-                debug!("Created bundled type file: {}", file_path.display());
-            }
-        } else {
-            debug!(
-                "No bundled types available for repo: {}",
-                repo_data.repo_name
-            );
-        }
-    }
-}
-
-/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
-#[allow(dead_code)]
-fn write_manifest_files(
-    all_repo_data: &[CloudRepoData],
-    output_dir: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut producer_entries = Vec::new();
-    let mut consumer_entries = Vec::new();
-
-    for repo_data in all_repo_data {
-        if let Some(entries) = &repo_data.type_manifest {
-            for entry in entries {
-                // HTTP, socket, and graphql entries all reach the ts_check manifest
-                // unfiltered. ts_check checks HTTP by `method`/`path`, socket by the
-                // canonical `OperationKey` (event+direction), and graphql by
-                // (kind+field), reusing the same `TypeCompatibilityChecker`
-                // assignability for all three. The matcher drops any stray
-                // non-checkable entry defensively rather than throwing (#253).
-                //
-                // An UNRESOLVED entry — `type_state == Unknown`, or an alias that
-                // dangles to `any`/`unknown` in the bundle — is NOT dropped here.
-                // ts_check still matches its pair and reports it as an `unknownPair`
-                // (unverifiable), which `apply_compat_verdicts` maps to a `None`
-                // verdict. Dropping it instead removes the pair from ts_check's
-                // output entirely, and `apply_compat_verdicts` treats an edge absent
-                // from BOTH `mismatches` and `unknownPairs` as compatible — a FALSE
-                // `Some(true)`. That was the `graphql|subscription|orderUpdated`
-                // false-positive: the consumer's only alias is the synthetic
-                // `Endpoint_<hash> = unknown` missing-alias fallback, so the entry
-                // was dropped, the edge went absent, and the verdict defaulted to
-                // compatible. Keeping it lets the `any`/`unknown` comparand guard in
-                // `type-checker.ts` route the pair to `unknownPairs` → `None`. This
-                // is exactly how HTTP/socket Unknown entries have always been
-                // handled; graphql is no longer a special case.
-                match entry.role {
-                    ManifestRole::Producer => producer_entries.push(entry.clone()),
-                    ManifestRole::Consumer => consumer_entries.push(entry.clone()),
-                }
-            }
-        }
-    }
-
-    let producer_manifest = TypeManifestFile {
-        repo_name: "cross-repo-producers".to_string(),
-        commit_hash: "mixed".to_string(),
-        entries: producer_entries,
-    };
-    let consumer_manifest = TypeManifestFile {
-        repo_name: "cross-repo-consumers".to_string(),
-        commit_hash: "mixed".to_string(),
-        entries: consumer_entries,
-    };
-
-    let producer_path = output_dir.join("producer-manifest.json");
-    let consumer_path = output_dir.join("consumer-manifest.json");
-
-    std::fs::write(
-        &producer_path,
-        serde_json::to_string_pretty(&producer_manifest)?,
-    )?;
-    std::fs::write(
-        &consumer_path,
-        serde_json::to_string_pretty(&consumer_manifest)?,
-    )?;
-
-    debug!(
-        "Wrote manifest files: {} producers, {} consumers",
-        producer_manifest.entries.len(),
-        consumer_manifest.entries.len()
-    );
-
-    Ok(())
 }
 
 /// Trailing marker stamped onto every `= unknown` alias that
@@ -4034,9 +3864,9 @@ mod tests {
     }
 
     /// #379: a call-site-evidence entry never anchors Producer manifest
-    /// types — a producer entry would make ts_check run a request-vs-request
-    /// comparison mislabelled as a producer-contract verdict. The twin data
-    /// call's Consumer entries are unaffected.
+    /// types — a producer entry would make the type check run a
+    /// request-vs-request comparison mislabelled as a producer-contract
+    /// verdict. The twin data call's Consumer entries are unaffected.
     #[test]
     fn test_call_site_evidence_endpoint_emits_no_producer_manifest_entries() {
         let config = Config::default();
@@ -5116,8 +4946,8 @@ mod tests {
     /// Carrick marker and must NOT be mistaken for the injected placeholder, so
     /// the entry keeps its state rather than being downgraded to `Unknown`
     /// (#244). The genuine `unknown` shape is still surfaced as unverifiable
-    /// downstream by ts_check's compiler-level `isUnknown()` gate, not by a
-    /// silent recall-losing downgrade here.
+    /// downstream by the check-phase top-type gates, not by a silent
+    /// recall-losing downgrade here.
     #[test]
     fn enrich_does_not_downgrade_developer_authored_unknown() {
         // No resolution entry and no marker: the alias is "defined" in the
@@ -6295,8 +6125,8 @@ mod tests {
     /// Fan-in regression (the corpus-2 compat false-negative): two publishers on
     /// the SAME topic but in different repos/files must get DISTINCT consumer
     /// aliases. They previously hashed to one alias (`build_manifest_type_alias`
-    /// keys only on `topic|consumer|Response`), so ts_check's bundled
-    /// `cross-repo-consumers` declared that interface twice with different bodies
+    /// keys only on `topic|consumer|Response`), so the merged consumer
+    /// declarations defined that interface twice with different bodies
     /// — one publisher's payload type masked the other's and the masked edge
     /// reported a spurious compat mismatch. The publisher alias now disambiguates
     /// by call site, and each publisher's SymbolRequest alias still byte-matches
@@ -6349,7 +6179,7 @@ mod tests {
             manifest_aliases.len(),
             2,
             "two fan-in publishers must yield two DISTINCT consumer aliases, not \
-             one collided alias (which masks one payload type in ts_check)"
+             one collided alias (which masks one payload type at check time)"
         );
 
         // Each publisher's SymbolRequest alias must byte-match its manifest alias
@@ -7054,317 +6884,6 @@ mod tests {
         );
     }
 
-    /// `write_manifest_files` feeds the ts_check matcher, which checks HTTP,
-    /// socket, AND graphql. Every entry passes through unfiltered, including an
-    /// UNRESOLVED graphql entry (`type_state == Unknown`, e.g. a subscription
-    /// consumer with no `request<T>` call site). Such an entry must reach ts_check
-    /// so its pair is reported as an `unknownPair` (→ `None`); dropping it would
-    /// make the edge absent and `apply_compat_verdicts` would default it to a
-    /// false `Some(true)`. The #253 throw-guard lives in the matcher, which drops
-    /// any stray non-checkable entry defensively rather than crashing the run.
-    #[test]
-    fn write_manifest_files_emits_http_socket_and_all_graphql() {
-        use crate::cloud_storage::TypeEvidence;
-        use crate::operation::{GraphqlOperationKind, OperationKey, SocketDirection};
-        use crate::services::type_sidecar::InferKind;
-
-        fn entry_with_state(
-            key: OperationKey,
-            alias: &str,
-            type_state: ManifestTypeState,
-        ) -> TypeManifestEntry {
-            let is_explicit = type_state == ManifestTypeState::Explicit;
-            TypeManifestEntry {
-                key,
-                role: ManifestRole::Producer,
-                type_kind: ManifestTypeKind::Response,
-                type_alias: alias.to_string(),
-                file_path: "src/x.ts".to_string(),
-                line_number: 1,
-                is_explicit,
-                type_state,
-                evidence: TypeEvidence {
-                    file_path: "src/x.ts".to_string(),
-                    span_start: None,
-                    span_end: None,
-                    line_number: 1,
-                    infer_kind: InferKind::ResponseBody,
-                    is_explicit,
-                    type_state,
-                },
-                resolved_definition: None,
-                expanded_definition: None,
-                primary_type_symbol: None,
-            }
-        }
-
-        fn entry(key: OperationKey, alias: &str) -> TypeManifestEntry {
-            entry_with_state(key, alias, ManifestTypeState::Explicit)
-        }
-
-        let manifest = vec![
-            entry(OperationKey::http("GET", "/orders/:id"), "OrderResponse"),
-            // Resolved graphql producer (anchor reached the bundle) → KEPT.
-            entry(
-                OperationKey::graphql(GraphqlOperationKind::Query, "order"),
-                "OrderQueryResult",
-            ),
-            // Unresolved graphql producer (Unknown anchor) → KEPT so ts_check can
-            // report its pair as an unknownPair (→ None); dropping it would make
-            // the edge absent and default the verdict to a false Some(true).
-            entry_with_state(
-                OperationKey::graphql(GraphqlOperationKind::Subscription, "orderUpdated"),
-                "OrderUpdatedUnknown",
-                ManifestTypeState::Unknown,
-            ),
-            entry(
-                OperationKey::socket("order.created", SocketDirection::ServerToClient),
-                "OrderCreatedEvent",
-            ),
-        ];
-
-        let repo_data = CloudRepoData {
-            repo_name: "orders-svc".to_string(),
-            service_name: None,
-            endpoints: vec![],
-            calls: vec![],
-            mounts: vec![],
-            apps: std::collections::HashMap::new(),
-            imported_handlers: vec![],
-            function_definitions: std::collections::HashMap::new(),
-            config_json: None,
-            package_json: None,
-            packages: None,
-            last_updated: chrono::Utc::now(),
-            commit_hash: "test-hash".to_string(),
-            mount_graph: None,
-            bundled_types: None,
-            type_manifest: Some(manifest),
-            file_results: None,
-            cached_detection: None,
-            cached_guidance: None,
-            cached_extraction_config: None,
-            package_json_hash: None,
-            cache_version: None,
-            type_extraction_status: None,
-            compat_verdicts: None,
-            capture_stub: None,
-        };
-
-        // Local mirror of TypeManifestFile for reading back the written JSON
-        // (the production struct is serialize-only).
-        #[derive(serde::Deserialize)]
-        struct ManifestFileForTest {
-            entries: Vec<TypeManifestEntry>,
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_manifest_files(std::slice::from_ref(&repo_data), dir.path())
-            .expect("write_manifest_files");
-
-        let producer: ManifestFileForTest = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("producer-manifest.json")).unwrap(),
-        )
-        .unwrap();
-
-        // HTTP, socket, and BOTH graphql producers (resolved and Unknown) survive:
-        // the Unknown one must reach ts_check to be reported as an unknownPair.
-        assert_eq!(
-            producer.entries.len(),
-            4,
-            "HTTP + socket + both graphql producers reach the manifest; the \
-             Unknown graphql entry is kept, not dropped"
-        );
-        assert!(
-            producer
-                .entries
-                .iter()
-                .any(|e| e.key.protocol() == crate::operation::Protocol::Http),
-            "the HTTP producer must reach the manifest"
-        );
-        assert!(
-            producer
-                .entries
-                .iter()
-                .any(|e| e.key.protocol() == crate::operation::Protocol::Websocket),
-            "the socket producer must reach the manifest"
-        );
-        let graphql_entries: Vec<_> = producer
-            .entries
-            .iter()
-            .filter(|e| e.key.protocol() == crate::operation::Protocol::Graphql)
-            .collect();
-        assert_eq!(
-            graphql_entries.len(),
-            2,
-            "both graphql producers reach the manifest (resolved + Unknown)"
-        );
-        assert!(
-            graphql_entries
-                .iter()
-                .any(|e| e.type_alias == "OrderQueryResult"),
-            "the resolved graphql producer is kept"
-        );
-        assert!(
-            graphql_entries
-                .iter()
-                .any(|e| e.type_state == ManifestTypeState::Unknown),
-            "the Unknown graphql producer is kept so ts_check can mark it \
-             unverifiable rather than the edge defaulting to compatible"
-        );
-    }
-
-    /// The `graphql|subscription|orderUpdated` false-positive fix: an UNRESOLVED
-    /// graphql CONSUMER must REACH the consumer manifest, so ts_check reports its
-    /// pair as an `unknownPair` (→ `None`). Dropping it instead removed the pair
-    /// from ts_check's output, and `apply_compat_verdicts` defaulted the absent
-    /// edge to a false `Some(true)` (`producer ⊑ any` was never actually run — the
-    /// edge just looked compatible because nothing contradicted it).
-    ///
-    /// All three consumer shapes are KEPT — `type_state == Unknown`, an `Implicit`
-    /// consumer with no resolved anchor symbol (the synthetic missing-alias case),
-    /// and a genuinely resolved consumer. ts_check's `any`/`unknown` comparand
-    /// guard distinguishes the unverifiable ones at verdict time, not here.
-    #[test]
-    fn write_manifest_files_keeps_unresolved_graphql_consumer() {
-        use crate::cloud_storage::TypeEvidence;
-        use crate::operation::{GraphqlOperationKind, OperationKey};
-        use crate::services::type_sidecar::InferKind;
-
-        fn consumer(
-            field: &str,
-            alias: &str,
-            type_state: ManifestTypeState,
-            primary_type_symbol: Option<&str>,
-        ) -> TypeManifestEntry {
-            let is_explicit = type_state == ManifestTypeState::Explicit;
-            let key = OperationKey::graphql(GraphqlOperationKind::Subscription, field);
-            TypeManifestEntry {
-                key,
-                role: ManifestRole::Consumer,
-                type_kind: ManifestTypeKind::Response,
-                type_alias: alias.to_string(),
-                file_path: "lib/graphql.ts".to_string(),
-                line_number: 1,
-                is_explicit,
-                type_state,
-                evidence: TypeEvidence {
-                    file_path: "lib/graphql.ts".to_string(),
-                    span_start: None,
-                    span_end: None,
-                    line_number: 1,
-                    infer_kind: InferKind::CallResult,
-                    is_explicit,
-                    type_state,
-                },
-                resolved_definition: None,
-                expanded_definition: None,
-                primary_type_symbol: primary_type_symbol.map(str::to_string),
-            }
-        }
-
-        let manifest = vec![
-            // Clean unresolved consumer (type_state Unknown) → KEPT (ts_check
-            // reports its pair as an unknownPair → None).
-            consumer(
-                "orderUpdated",
-                "Endpoint_unknown_Response",
-                ManifestTypeState::Unknown,
-                None,
-            ),
-            // Enrichment wrongly promoted the synthetic alias to Implicit, but no
-            // real anchor was ever resolved (primary_type_symbol still None) →
-            // KEPT; its alias dangles to `any`/`unknown` in the bundle so the
-            // ts_check comparand guard marks the pair unverifiable.
-            consumer(
-                "orderPromoted",
-                "Endpoint_promoted_Response",
-                ManifestTypeState::Implicit,
-                None,
-            ),
-            // Genuinely resolved consumer (real anchor symbol) → KEPT.
-            consumer(
-                "orderResolved",
-                "Endpoint_resolved_Response",
-                ManifestTypeState::Implicit,
-                Some("OrderView"),
-            ),
-        ];
-
-        let repo_data = CloudRepoData {
-            repo_name: "web-frontend".to_string(),
-            service_name: None,
-            endpoints: vec![],
-            calls: vec![],
-            mounts: vec![],
-            apps: std::collections::HashMap::new(),
-            imported_handlers: vec![],
-            function_definitions: std::collections::HashMap::new(),
-            config_json: None,
-            package_json: None,
-            packages: None,
-            last_updated: chrono::Utc::now(),
-            commit_hash: "test-hash".to_string(),
-            mount_graph: None,
-            bundled_types: None,
-            type_manifest: Some(manifest),
-            file_results: None,
-            cached_detection: None,
-            cached_guidance: None,
-            cached_extraction_config: None,
-            package_json_hash: None,
-            cache_version: None,
-            type_extraction_status: None,
-            compat_verdicts: None,
-            capture_stub: None,
-        };
-
-        #[derive(serde::Deserialize)]
-        struct ManifestFileForTest {
-            entries: Vec<TypeManifestEntry>,
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_manifest_files(std::slice::from_ref(&repo_data), dir.path())
-            .expect("write_manifest_files");
-
-        let consumers: ManifestFileForTest = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("consumer-manifest.json")).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            consumers.entries.len(),
-            3,
-            "all graphql consumers reach the manifest — the Unknown one and the \
-             anchorless wrongly-promoted one are KEPT so ts_check can mark their \
-             pairs unverifiable (→ None) instead of the edge defaulting to a \
-             false Some(true)"
-        );
-        assert!(
-            consumers
-                .entries
-                .iter()
-                .any(|e| e.type_alias == "Endpoint_resolved_Response"),
-            "the genuinely-resolved consumer is kept"
-        );
-        assert!(
-            consumers
-                .entries
-                .iter()
-                .any(|e| e.type_state == ManifestTypeState::Unknown),
-            "the Unknown consumer is kept (unverifiable, not dropped)"
-        );
-        assert!(
-            consumers
-                .entries
-                .iter()
-                .any(|e| e.primary_type_symbol.is_none()),
-            "the anchorless wrongly-promoted consumer is kept (unverifiable, not \
-             dropped)"
-        );
-    }
-
     /// Minimal `CloudRepoData` carrying just a repo/service identity and a
     /// bundled `.d.ts`, for the bundle-file-emission tests below.
     fn repo_with_bundle(
@@ -7399,114 +6918,5 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
         }
-    }
-
-    /// `bundle_file_stems` must give every `(repo, service)` a distinct stem so
-    /// the per-service `.d.ts` files don't collide. The clobbering bug was that
-    /// a monorepo's services share a `repo_name`, so a `repo_name`-only stem made
-    /// them all map to one file.
-    #[test]
-    fn bundle_file_stems_are_unique_per_service_in_a_monorepo() {
-        let repos = vec![
-            repo_with_bundle("orders-monorepo", Some("orders-pkg"), "// a"),
-            repo_with_bundle("orders-monorepo", Some("gateway"), "// b"),
-            // A service id containing a path separator must be sanitised, not
-            // allowed to escape the output dir.
-            repo_with_bundle("orders-monorepo", Some("scope/pkg"), "// c"),
-            // Two services with no service_name fall back to the shared repo_name
-            // and would still collide — the collision suffix must separate them.
-            repo_with_bundle("other-repo", None, "// d"),
-            repo_with_bundle("other-repo", None, "// e"),
-        ];
-
-        let stems = bundle_file_stems(&repos);
-
-        assert_eq!(
-            stems,
-            vec![
-                "orders-pkg".to_string(),
-                "gateway".to_string(),
-                "scope_pkg".to_string(),
-                "other-repo".to_string(),
-                "other-repo_1".to_string(),
-            ]
-        );
-        let unique: std::collections::HashSet<&String> = stems.iter().collect();
-        assert_eq!(
-            unique.len(),
-            stems.len(),
-            "every service must get a distinct bundle stem so no write clobbers another"
-        );
-    }
-
-    /// A-producer-bundle-gap regression: in a monorepo, the producer service's
-    /// explicit response type (orders-pkg `GET /orders/:id` → `Order`) must land
-    /// in the cross-repo bundle, resolvable — not get clobbered out by a sibling
-    /// service (gateway) sharing the repo name. Before the per-service split,
-    /// both wrote `orders-monorepo_types.d.ts` and the gateway write erased the
-    /// `Order` shape entirely (not even a `= unknown` placeholder), so ts_check
-    /// reported "Producer type not found in project" and the compat verdict
-    /// collapsed to unverifiable.
-    #[test]
-    fn monorepo_producer_explicit_type_survives_into_bundle() {
-        // orders-pkg's bundle: the explicit `Order` shape under its manifest
-        // alias. This is the producer type both consumers (payments-svc,
-        // web-frontend) need to resolve.
-        let orders_alias = "Endpoint_5d19c4207b67a294_Response";
-        let orders_bundle = format!(
-            "export type {orders_alias} = {{ id: number; amountCents: number; currency: string }};\n"
-        );
-        // gateway's bundle: a different alias. Under the old repo_name-only
-        // naming this write would clobber orders-pkg's file.
-        let gateway_alias = "Endpoint_aaaaaaaaaaaaaaaa_Response";
-        let gateway_bundle = format!("export type {gateway_alias} = {{ status: string }};\n");
-
-        let repos = vec![
-            repo_with_bundle("orders-monorepo", Some("orders-pkg"), &orders_bundle),
-            repo_with_bundle("orders-monorepo", Some("gateway"), &gateway_bundle),
-        ];
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_bundle_files(&repos, dir.path());
-
-        // ts_check loads every *.d.ts in the dir; concatenate them the same way
-        // and assert BOTH services' producer aliases resolve to a real shape.
-        let mut combined = String::new();
-        let mut dts_files = 0usize;
-        for entry in std::fs::read_dir(dir.path()).expect("read_dir") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|s| s.to_str()) == Some("ts")
-                && path.to_string_lossy().ends_with(".d.ts")
-            {
-                dts_files += 1;
-                combined.push_str(&std::fs::read_to_string(&path).expect("read d.ts"));
-                combined.push('\n');
-            }
-        }
-
-        assert_eq!(
-            dts_files, 2,
-            "each service must get its own bundle file, not share one (got {dts_files})"
-        );
-
-        // The producer's `Order` shape is present, resolvable, and NOT a dangling
-        // `= unknown` placeholder — proving the type reaches ts_check.
-        assert!(
-            combined.contains(&format!(
-                "export type {orders_alias} = {{ id: number; amountCents: number; currency: string }}"
-            )),
-            "the orders-pkg producer's explicit Order shape must survive into the bundle, got:\n{combined}"
-        );
-        assert!(
-            !combined.contains(&format!("export type {orders_alias} = unknown")),
-            "the producer alias must resolve to its real members, not a dangling = unknown placeholder"
-        );
-        // The sibling service's types must coexist, not have been clobbered.
-        assert!(
-            combined.contains(&format!(
-                "export type {gateway_alias} = {{ status: string }}"
-            )),
-            "the gateway sibling's types must coexist in its own bundle file"
-        );
     }
 }
