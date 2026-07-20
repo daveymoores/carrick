@@ -27,8 +27,9 @@ use crate::cloud_storage::{
 use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
-    AnchorOrigin, CaptureAnchor, CheckPairEndpoint, CheckPairSpec, CheckStubInput,
-    InferRequestItem, ProbeProtocol, ProbeTypeKind, SymbolRequest, VerdictBucket,
+    AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CheckPairEndpoint, CheckPairSpec,
+    CheckStubInput, InferRequestItem, ManifestEntry, ProbeProtocol, ProbeTypeKind, SymbolRequest,
+    VerdictBucket,
 };
 
 // ===========================================================================
@@ -249,11 +250,24 @@ pub(crate) fn derive_capture_anchors(
 /// artifact. Returns the on-disk stub dir (for the definitions re-point;
 /// caller owns cleanup) alongside the artifact. `None` = capture degraded;
 /// the service ships without a surface and its pairs verdict unverifiable.
+///
+/// When the first capture DEMOTES an alias (a `capture_failure_reason` on its
+/// record — e.g. TS4023 skipped its file's declaration emit, so its surface
+/// line was rewritten to `unknown`) and the scanner holds a usable literal
+/// type text for that alias in `backfill_texts`, ONE backfill re-capture runs
+/// with those anchors replaced by literal anchors (`anchor_origin:
+/// anchor-backfill`). The re-captured artifact is adopted only when every
+/// backfilled alias passes its self-check clean AND no sibling alias degraded
+/// relative to the first run; otherwise the demoted (honest-unknown) artifact
+/// is kept. The backfill is strictly post-hoc — it never enters the capture's
+/// anchor arbitration, it only replaces an anchor whose capture already
+/// demoted.
 pub(crate) fn run_capture(
     sidecar: &TypeSidecar,
     repo_path: &str,
     service_id: &str,
     anchors: &[CaptureAnchor],
+    backfill_texts: &HashMap<String, String>,
 ) -> Option<(PathBuf, CaptureStubArtifact)> {
     if anchors.is_empty() {
         return None;
@@ -262,6 +276,53 @@ pub(crate) fn run_capture(
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
 
+    let (stub_dir, artifact, records) = capture_once(sidecar, &repo_root, service_id, anchors)?;
+
+    let Some((rerun_anchors, backfilled)) = backfill_anchors(anchors, &records, backfill_texts)
+    else {
+        return Some((stub_dir, artifact));
+    };
+    debug!(
+        "v2 capture for {}: literal backfill attempt for {} demoted alias(es)",
+        service_id,
+        backfilled.len()
+    );
+    match capture_once(sidecar, &repo_root, service_id, &rerun_anchors) {
+        Some((rerun_dir, rerun_artifact, rerun_records))
+            if backfill_accepted(&backfilled, &records, &rerun_records) =>
+        {
+            debug!(
+                "v2 capture for {}: backfill adopted ({} alias(es) re-anchored)",
+                service_id,
+                backfilled.len()
+            );
+            let _ = std::fs::remove_dir_all(&stub_dir);
+            Some((rerun_dir, rerun_artifact))
+        }
+        Some((rerun_dir, _, _)) => {
+            // Fail-closed: the backfill result failed its self-check or
+            // degraded a sibling alias — keep the demoted/unknown surface
+            // (honest unverifiable), never a backfill that didn't verify.
+            debug!(
+                "v2 capture for {}: backfill rejected by self-check; keeping demoted surface",
+                service_id
+            );
+            let _ = std::fs::remove_dir_all(&rerun_dir);
+            Some((stub_dir, artifact))
+        }
+        None => Some((stub_dir, artifact)),
+    }
+}
+
+/// One `capture_v2` round-trip: run the capture into a fresh scratch dir and
+/// read the stub package into the wire artifact, keeping the per-alias
+/// records (the demotion signal the backfill decision needs).
+fn capture_once(
+    sidecar: &TypeSidecar,
+    repo_root: &Path,
+    service_id: &str,
+    anchors: &[CaptureAnchor],
+) -> Option<(PathBuf, CaptureStubArtifact, Vec<CaptureAliasRecord>)> {
     let unique = format!(
         "carrick-capture-{}-{}",
         std::process::id(),
@@ -302,13 +363,159 @@ pub(crate) fn run_capture(
         &result.ts_version,
         result.bare_checkout,
     ) {
-        Ok(artifact) => Some((stub_dir, artifact)),
+        Ok(artifact) => Some((stub_dir, artifact, result.aliases)),
         Err(e) => {
             warn!("failed to read capture stub for {}: {}", service_id, e);
             let _ = std::fs::remove_dir_all(&stub_dir);
             None
         }
     }
+}
+
+/// A scanner-held type text is usable as a BACKFILL literal anchor when it is
+/// a real type EXPRESSION carrying an actual shape: the shared
+/// disqualifying-top-type scan rejects any/unknown at any position (same rule
+/// as the v1-inference literal tier), and declaration-shaped text is rejected
+/// because the v1 bundle's fallback branches return whole declarations
+/// (`interface X { ... }`, `export type X = ...`) that cannot sit on the
+/// right-hand side of `export type A = ...;`.
+fn usable_backfill_text(text: &str) -> Option<&str> {
+    let trimmed = usable_inferred_text(text)?;
+    const DECLARATION_PREFIXES: [&str; 8] = [
+        "interface ",
+        "class ",
+        "enum ",
+        "namespace ",
+        "declare ",
+        "export ",
+        "abstract ",
+        "function ",
+    ];
+    if DECLARATION_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Alias -> literal type text the scanner can stand behind for a backfill
+/// re-anchor, from the SAME v1 resolution results the enrich join consumes.
+/// Precedence mirrors that join: the explicit bundle's structural expansion
+/// wins over the inference result for the same alias; first usable text wins
+/// within each source.
+pub(crate) fn derive_backfill_texts(
+    explicit_manifest: &[ManifestEntry],
+    inferred: &[crate::services::type_sidecar::InferredType],
+) -> HashMap<String, String> {
+    let mut texts: HashMap<String, String> = HashMap::new();
+    for entry in explicit_manifest {
+        if let Some(text) = usable_backfill_text(&entry.type_string) {
+            texts
+                .entry(entry.alias.clone())
+                .or_insert_with(|| text.to_string());
+        }
+    }
+    for inf in inferred {
+        if let Some(text) = usable_backfill_text(&inf.type_string) {
+            texts
+                .entry(inf.alias.clone())
+                .or_insert_with(|| text.to_string());
+        }
+    }
+    texts
+}
+
+/// Decide the backfill re-run's anchor set: every alias whose first-run
+/// record shows a capture demotion (`capture_failure_reason` is present
+/// exactly for demoted anchors) and for which a usable literal text exists
+/// has its anchor replaced by a literal anchor at `anchor-backfill` origin.
+/// Already-literal anchors are never re-anchored (the literal tier IS the
+/// text tier — there is nothing better to fall back to). `None` = no
+/// backfillable alias, skip the re-run entirely.
+pub(crate) fn backfill_anchors(
+    anchors: &[CaptureAnchor],
+    records: &[CaptureAliasRecord],
+    texts: &HashMap<String, String>,
+) -> Option<(Vec<CaptureAnchor>, HashSet<String>)> {
+    let mut backfilled: HashSet<String> = HashSet::new();
+    for record in records {
+        if record.capture_failure_reason.is_none() || record.anchor_kind == "literal" {
+            continue;
+        }
+        if texts.contains_key(&record.alias) {
+            backfilled.insert(record.alias.clone());
+        }
+    }
+    if backfilled.is_empty() {
+        return None;
+    }
+    let rerun = anchors
+        .iter()
+        .map(|anchor| {
+            let alias = anchor.alias();
+            if backfilled.contains(alias) {
+                CaptureAnchor::Literal {
+                    alias: alias.to_string(),
+                    type_text: texts[alias].clone(),
+                    anchor_origin: AnchorOrigin::AnchorBackfill,
+                }
+            } else {
+                anchor.clone()
+            }
+        })
+        .collect();
+    Some((rerun, backfilled))
+}
+
+/// Fail-closed acceptance for a backfill re-capture. Adopt only when:
+///  - every backfilled alias re-captured CLEAN: no failure reason, self-check
+///    `ok` (not merely allowlisted), no top type, no deep any/unknown; and
+///  - no sibling alias degraded relative to the first run (usable stays
+///    usable, no new failure reason, no new deep top type), so a backfill can
+///    never smear the healthy part of the surface.
+///
+/// Anything else keeps the first (demoted, honest-unknown) artifact.
+pub(crate) fn backfill_accepted(
+    backfilled: &HashSet<String>,
+    first: &[CaptureAliasRecord],
+    rerun: &[CaptureAliasRecord],
+) -> bool {
+    let rerun_by_alias: HashMap<&str, &CaptureAliasRecord> =
+        rerun.iter().map(|r| (r.alias.as_str(), r)).collect();
+    let usable =
+        |r: &CaptureAliasRecord| matches!(r.self_check.as_str(), "ok" | "allowlisted_external");
+
+    for alias in backfilled {
+        let Some(record) = rerun_by_alias.get(alias.as_str()) else {
+            return false;
+        };
+        if record.capture_failure_reason.is_some()
+            || record.self_check != "ok"
+            || record.top_type_at_self_check
+            || record.deep_top_type_kind.is_some()
+        {
+            return false;
+        }
+    }
+    for record in first {
+        if backfilled.contains(&record.alias) {
+            continue;
+        }
+        let Some(rerun_record) = rerun_by_alias.get(record.alias.as_str()) else {
+            return false;
+        };
+        if usable(record) && !usable(rerun_record) {
+            return false;
+        }
+        if record.capture_failure_reason.is_none() && rerun_record.capture_failure_reason.is_some()
+        {
+            return false;
+        }
+        if record.deep_top_type_kind.is_none() && rerun_record.deep_top_type_kind.is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 // ===========================================================================
@@ -1129,6 +1336,255 @@ mod tests {
         }
     }
 
+    // ---- literal backfill (demoted-at-capture re-anchor) ------------------
+
+    fn record(
+        alias: &str,
+        anchor_kind: &str,
+        self_check: &str,
+        failure: Option<&str>,
+    ) -> CaptureAliasRecord {
+        CaptureAliasRecord {
+            alias: alias.to_string(),
+            anchor_kind: anchor_kind.to_string(),
+            symbol_name: None,
+            source_file: "src/routes.ts".to_string(),
+            anchor_origin: "llm-symbol".to_string(),
+            serialization: if failure.is_some() {
+                "structural_fallback"
+            } else {
+                "emitted"
+            }
+            .to_string(),
+            self_check: self_check.to_string(),
+            self_check_detail: None,
+            capture_failure_reason: failure.map(str::to_string),
+            top_type_at_self_check: failure.is_some(),
+            deep_top_type_kind: None,
+            deep_top_type_path: None,
+        }
+    }
+
+    fn symbol_anchor(alias: &str) -> CaptureAnchor {
+        CaptureAnchor::Symbol {
+            alias: alias.to_string(),
+            symbol_name: "Notification".to_string(),
+            source_file: "src/routes.ts".to_string(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+            array_depth: None,
+        }
+    }
+
+    /// Only a DEMOTED alias (capture_failure_reason present) with an
+    /// available literal text is re-anchored, as a literal at
+    /// `anchor-backfill` origin; healthy siblings, demoted aliases without
+    /// text, and already-literal anchors pass through untouched.
+    #[test]
+    fn backfill_anchors_replaces_only_demoted_with_text() {
+        let anchors = vec![
+            symbol_anchor("A_demoted"),
+            symbol_anchor("B_healthy"),
+            symbol_anchor("C_demoted_no_text"),
+            CaptureAnchor::Literal {
+                alias: "D_literal_demoted".to_string(),
+                type_text: "{ ok: boolean }".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+            },
+        ];
+        let records = vec![
+            record(
+                "A_demoted",
+                "symbol",
+                "decayed_internal",
+                Some("emit skipped"),
+            ),
+            record("B_healthy", "symbol", "ok", None),
+            record(
+                "C_demoted_no_text",
+                "symbol",
+                "decayed_internal",
+                Some("emit skipped"),
+            ),
+            record(
+                "D_literal_demoted",
+                "literal",
+                "decayed_internal",
+                Some("bad text"),
+            ),
+        ];
+        let mut texts = HashMap::new();
+        texts.insert(
+            "A_demoted".to_string(),
+            "{ id: string; read: boolean; }".to_string(),
+        );
+        texts.insert(
+            "B_healthy".to_string(),
+            "{ never: string }".to_string(), // healthy alias: text must be ignored
+        );
+        texts.insert(
+            "D_literal_demoted".to_string(),
+            "{ ok: boolean }".to_string(), // literal anchors are never re-anchored
+        );
+
+        let (rerun, backfilled) =
+            backfill_anchors(&anchors, &records, &texts).expect("one backfillable alias");
+        assert_eq!(backfilled.len(), 1);
+        assert!(backfilled.contains("A_demoted"));
+        assert_eq!(rerun.len(), anchors.len());
+        match &rerun[0] {
+            CaptureAnchor::Literal {
+                alias,
+                type_text,
+                anchor_origin,
+            } => {
+                assert_eq!(alias, "A_demoted");
+                assert_eq!(type_text, "{ id: string; read: boolean; }");
+                assert_eq!(*anchor_origin, AnchorOrigin::AnchorBackfill);
+            }
+            other => panic!("demoted alias must become a backfill literal, got {other:?}"),
+        }
+        assert_eq!(rerun[1], anchors[1], "healthy anchor untouched");
+        assert_eq!(rerun[2], anchors[2], "no-text demotion keeps its anchor");
+        assert_eq!(rerun[3], anchors[3], "literal anchor never re-anchored");
+    }
+
+    /// No demoted alias with text -> no re-run at all.
+    #[test]
+    fn backfill_anchors_none_without_candidates() {
+        let anchors = vec![symbol_anchor("A")];
+        let healthy = vec![record("A", "symbol", "ok", None)];
+        let mut texts = HashMap::new();
+        texts.insert("A".to_string(), "{ ok: boolean }".to_string());
+        assert!(backfill_anchors(&anchors, &healthy, &texts).is_none());
+
+        let demoted = vec![record(
+            "A",
+            "symbol",
+            "decayed_internal",
+            Some("emit skipped"),
+        )];
+        assert!(backfill_anchors(&anchors, &demoted, &HashMap::new()).is_none());
+    }
+
+    /// Acceptance is fail-closed: adopt only a clean backfill self-check with
+    /// no sibling degradation; any miss keeps the demoted artifact.
+    #[test]
+    fn backfill_accepted_rules() {
+        let backfilled: HashSet<String> = ["A".to_string()].into();
+        let first = vec![
+            record("A", "symbol", "decayed_internal", Some("emit skipped")),
+            record("B", "symbol", "ok", None),
+        ];
+
+        // Clean re-run: backfilled alias ok, sibling unchanged.
+        let clean = vec![
+            record("A", "literal", "ok", None),
+            record("B", "symbol", "ok", None),
+        ];
+        assert!(backfill_accepted(&backfilled, &first, &clean));
+
+        // Backfilled alias still demoted (e.g. its text dangled) -> reject.
+        let still_demoted = vec![
+            record("A", "literal", "decayed_internal", Some("dangling")),
+            record("B", "symbol", "ok", None),
+        ];
+        assert!(!backfill_accepted(&backfilled, &first, &still_demoted));
+
+        // Backfilled alias merely allowlisted (not a clean ok) -> reject.
+        let allowlisted = vec![
+            record("A", "literal", "allowlisted_external", None),
+            record("B", "symbol", "ok", None),
+        ];
+        assert!(!backfill_accepted(&backfilled, &first, &allowlisted));
+
+        // Backfilled alias resolves but carries a top type -> reject.
+        let mut top_typed = vec![
+            record("A", "literal", "ok", None),
+            record("B", "symbol", "ok", None),
+        ];
+        top_typed[0].top_type_at_self_check = true;
+        assert!(!backfill_accepted(&backfilled, &first, &top_typed));
+
+        // Backfilled alias carries a DEEP any/unknown -> reject.
+        let mut deep = vec![
+            record("A", "literal", "ok", None),
+            record("B", "symbol", "ok", None),
+        ];
+        deep[0].deep_top_type_kind = Some("any".to_string());
+        assert!(!backfill_accepted(&backfilled, &first, &deep));
+
+        // A previously-usable sibling degrades in the re-run -> reject.
+        let sibling_degraded = vec![
+            record("A", "literal", "ok", None),
+            record("B", "symbol", "decayed_internal", None),
+        ];
+        assert!(!backfill_accepted(&backfilled, &first, &sibling_degraded));
+
+        // A sibling record vanishes from the re-run -> reject.
+        let sibling_missing = vec![record("A", "literal", "ok", None)];
+        assert!(!backfill_accepted(&backfilled, &first, &sibling_missing));
+
+        // The backfilled record vanishes from the re-run -> reject.
+        let backfilled_missing = vec![record("B", "symbol", "ok", None)];
+        assert!(!backfill_accepted(&backfilled, &first, &backfilled_missing));
+    }
+
+    /// Text sourcing mirrors the enrich join (explicit bundle text wins over
+    /// inference) and rejects everything the scanner cannot stand behind:
+    /// any/unknown at any position, and declaration-shaped bundle fallbacks
+    /// that are not type expressions.
+    #[test]
+    fn derive_backfill_texts_precedence_and_filters() {
+        let manifest_entry = |alias: &str, text: &str| ManifestEntry {
+            alias: alias.to_string(),
+            original_name: "T".to_string(),
+            source_file: "src/types.ts".to_string(),
+            type_string: text.to_string(),
+            is_explicit: true,
+        };
+        let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
+            alias: alias.to_string(),
+            type_string: text.to_string(),
+            is_explicit: false,
+            source_location: crate::services::type_sidecar::SourceLocation {
+                file_path: "src/routes.ts".to_string(),
+                start_line: 4,
+                end_line: 4,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::ResponseBody,
+            primary_type_symbol: None,
+            array_depth: None,
+        };
+
+        let explicit = vec![
+            manifest_entry("A", "{ id: string; read: boolean; }"),
+            manifest_entry("B", "interface Notification { id: string; }"), // declaration text
+            manifest_entry("C", "{ metadata: any }"),                      // poisoned
+        ];
+        let inferred = vec![
+            inferred_type("A", "{ id: string }"), // loses to the explicit text
+            inferred_type("B", "{ id: string; }"),
+            inferred_type("C", "unknown"),
+            inferred_type("D", "{ ok: boolean; }"),
+        ];
+
+        let texts = derive_backfill_texts(&explicit, &inferred);
+        assert_eq!(
+            texts.get("A").map(String::as_str),
+            Some("{ id: string; read: boolean; }"),
+            "explicit bundle text wins"
+        );
+        assert_eq!(
+            texts.get("B").map(String::as_str),
+            Some("{ id: string; }"),
+            "declaration-shaped explicit text is rejected; inference fills in"
+        );
+        assert!(!texts.contains_key("C"), "poisoned texts never backfill");
+        assert_eq!(texts.get("D").map(String::as_str), Some("{ ok: boolean; }"));
+    }
+
     // ---- build_check_pairs ------------------------------------------------
 
     /// HTTP pairing is method + route-aware path + type_kind, cross-service
@@ -1379,6 +1835,7 @@ mod tests {
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
             }],
+            &HashMap::new(),
         )
         .expect("orders-engine capture");
         let (billing_stub, billing_artifact) = run_capture(
@@ -1392,6 +1849,7 @@ mod tests {
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
             }],
+            &HashMap::new(),
         )
         .expect("billing-svc capture");
         let _ = std::fs::remove_dir_all(&orders_stub);
@@ -1485,6 +1943,214 @@ mod tests {
             flat(&outcomes),
             flat(&outcomes_again),
             "check outcomes must be byte-stable across runs"
+        );
+    }
+
+    /// The corpus-2 notifications-svc 4th-edge shape, end-to-end against the
+    /// real sidecar ($0, no LLM):
+    ///
+    /// The routes file's declaration emit is skipped (TS4023: `export
+    /// default app` is unnameable through the hand-rolled fastify
+    /// `export =` ambient stub), so the first capture demotes the http
+    /// producer alias to `unknown` (f2700a9 partial-emit keep). With the
+    /// scanner's v1 literal text available, ONE backfill re-capture
+    /// re-anchors the alias as a literal at `anchor-backfill` origin, and
+    /// the GET /notifications/:id pair lands a REAL verdict (compatible
+    /// against web-dashboard's matching Notification). Without the text
+    /// the demoted surface ships as-is and the pair stays honestly
+    /// unverifiable — never compatible.
+    #[test]
+    fn demoted_alias_literal_backfill_end_to_end() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let notif_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/notifications-svc");
+        let dash_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/web-dashboard");
+        assert!(notif_repo.exists(), "fixture missing: {notif_repo:?}");
+        assert!(dash_repo.exists(), "fixture missing: {dash_repo:?}");
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&notif_repo, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(60))
+            .expect("sidecar init");
+
+        let key = OperationKey::http("GET", "/notifications/:id");
+        let producer_alias =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let consumer_call_id = crate::type_manifest::build_call_site_id(
+            "lib/api.ts",
+            30,
+            &key,
+            dash_repo.to_str().unwrap(),
+        );
+        let consumer_alias = build_manifest_type_alias_with_call_id(
+            &key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&consumer_call_id),
+        );
+
+        // The producer anchors mirror the real scan: the http alias's symbol
+        // lives in the TS4023-poisoned routes file; a pub/sub sibling lives
+        // in the healthy events file.
+        let producer_anchors = [
+            CaptureAnchor::Symbol {
+                alias: producer_alias.clone(),
+                symbol_name: "Notification".to_string(),
+                source_file: "src/http/routes.ts".to_string(),
+                anchor_origin: AnchorOrigin::LlmSymbol,
+                array_depth: None,
+            },
+            CaptureAnchor::Symbol {
+                alias: "Pub_OrderPlacedEvent".to_string(),
+                symbol_name: "OrderPlacedEvent".to_string(),
+                source_file: "src/types/events.ts".to_string(),
+                anchor_origin: AnchorOrigin::LlmSymbol,
+                array_depth: None,
+            },
+        ];
+        // The scanner-side literal text for the operation (what v1 resolution
+        // knows for this alias — see the fixture's expected.json).
+        let mut backfill_texts = HashMap::new();
+        backfill_texts.insert(
+            producer_alias.clone(),
+            "{ id: string; message: string; read: boolean; }".to_string(),
+        );
+
+        // ---- Backfill path: the demoted alias is re-anchored ----
+        let (notif_stub, notif_artifact) = run_capture(
+            &sidecar,
+            notif_repo.to_str().unwrap(),
+            "notifications-svc",
+            &producer_anchors,
+            &backfill_texts,
+        )
+        .expect("notifications-svc capture");
+        let surface = notif_artifact
+            .files
+            .get("types/surface.d.ts")
+            .expect("surface in artifact");
+        assert!(
+            surface.contains(&format!("export type {} = {{", producer_alias))
+                && surface.contains("read: boolean"),
+            "backfilled alias must carry the literal shape, got:\n{surface}"
+        );
+        assert!(
+            !surface.contains(&format!("export type {} = unknown;", producer_alias)),
+            "backfilled alias must not stay unknown:\n{surface}"
+        );
+        assert!(
+            surface.contains("OrderPlacedEvent"),
+            "healthy sibling keeps its emitted import reference:\n{surface}"
+        );
+
+        // ---- Control: no literal text -> the demoted surface ships as-is ----
+        let (control_stub, control_artifact) = run_capture(
+            &sidecar,
+            notif_repo.to_str().unwrap(),
+            "notifications-svc",
+            &producer_anchors,
+            &HashMap::new(),
+        )
+        .expect("control capture");
+        let control_surface = control_artifact
+            .files
+            .get("types/surface.d.ts")
+            .expect("surface in control artifact");
+        assert!(
+            control_surface.contains(&format!("export type {} = unknown;", producer_alias)),
+            "without literal text the demotion must stand:\n{control_surface}"
+        );
+
+        // ---- Consumer capture (web-dashboard's matching Notification) ----
+        let (dash_stub, dash_artifact) = run_capture(
+            &sidecar,
+            dash_repo.to_str().unwrap(),
+            "web-dashboard",
+            &[CaptureAnchor::Symbol {
+                alias: consumer_alias.clone(),
+                symbol_name: "Notification".to_string(),
+                source_file: "lib/api.ts".to_string(),
+                anchor_origin: AnchorOrigin::LlmSymbol,
+                array_depth: None,
+            }],
+            &HashMap::new(),
+        )
+        .expect("web-dashboard capture");
+        let _ = std::fs::remove_dir_all(&notif_stub);
+        let _ = std::fs::remove_dir_all(&control_stub);
+        let _ = std::fs::remove_dir_all(&dash_stub);
+
+        let producer_entry = entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            &producer_alias,
+            "src/http/routes.ts",
+            18,
+            ManifestTypeState::Explicit,
+        );
+        let consumer_repo_data = repo(
+            "web-dashboard",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                &consumer_alias,
+                "lib/api.ts",
+                30,
+                ManifestTypeState::Explicit,
+            )],
+            Some(dash_artifact),
+        );
+
+        // Backfilled producer: the pair lands a REAL verdict.
+        let outcomes = run_check(
+            &sidecar,
+            &[
+                repo(
+                    "notifications-svc",
+                    None,
+                    vec![producer_entry.clone()],
+                    Some(notif_artifact),
+                ),
+                consumer_repo_data.clone(),
+            ],
+        );
+        assert_eq!(outcomes.len(), 1, "exactly one matched pair");
+        assert_eq!(
+            outcomes[0].bucket,
+            VerdictBucket::Compatible,
+            "the backfilled Notification shape must verdict compatible; \
+             diagnostic: {:?}",
+            outcomes[0].diagnostic
+        );
+
+        // Control producer: the demoted alias stays honestly unverifiable.
+        let control_outcomes = run_check(
+            &sidecar,
+            &[
+                repo(
+                    "notifications-svc",
+                    None,
+                    vec![producer_entry],
+                    Some(control_artifact),
+                ),
+                consumer_repo_data,
+            ],
+        );
+        assert_eq!(control_outcomes.len(), 1);
+        assert_eq!(
+            control_outcomes[0].bucket,
+            VerdictBucket::Unverifiable,
+            "without a backfill the demotion must never read compatible; \
+             diagnostic: {:?}",
+            control_outcomes[0].diagnostic
         );
     }
 }

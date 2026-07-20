@@ -2305,7 +2305,15 @@ fn run_capture_for_service(
         .service_name
         .clone()
         .unwrap_or_else(|| cloud_data.repo_name.clone());
-    match type_compat_v2::run_capture(sidecar, repo_path, &service_id, &anchors) {
+    // Literal texts for the last-resort backfill re-anchor: when capture
+    // demotes an alias (e.g. its file's declaration emit was skipped), the
+    // scanner's own v1 resolution text for the same alias — when it carries a
+    // real shape — re-anchors it as a literal at `anchor-backfill` origin.
+    let backfill_texts = type_compat_v2::derive_backfill_texts(
+        &type_resolution.explicit_manifest,
+        &type_resolution.inferred_types,
+    );
+    match type_compat_v2::run_capture(sidecar, repo_path, &service_id, &anchors, &backfill_texts) {
         Some((stub_dir, artifact)) => {
             cloud_data.capture_stub = Some(artifact);
             Some(stub_dir)
