@@ -2845,10 +2845,14 @@ fn enrich_manifest_with_type_resolution(
         }
 
         if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
-            // Check if the type is actually resolved (not "unknown")
-            let is_unknown_type = type_string.trim() == "unknown"
-                || type_string.trim() == "any"
-                || type_string.is_empty()
+            // Check if the type is actually resolved. The shared
+            // disqualifying-top-type notion (adversarial-review finding 2)
+            // rejects not just whole-string "any"/"unknown" but any/unknown
+            // at ANY position — `any[]`, `Promise<any>`, `Record<string,
+            // any>`, `{ metadata: any }` — matching the capture self-check's
+            // deep walk, so the two layers agree on what counts as resolved.
+            let is_unknown_type = type_string.trim().is_empty()
+                || type_compat_v2::contains_disqualifying_top_type(type_string)
                 || dts_trivially_unknown(&entry.type_alias);
 
             if is_unknown_type {

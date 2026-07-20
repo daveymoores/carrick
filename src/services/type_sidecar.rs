@@ -295,6 +295,14 @@ pub struct CaptureAliasRecord {
     #[serde(default)]
     pub capture_failure_reason: Option<String>,
     pub top_type_at_self_check: bool,
+    /// Set when the self-check found a disqualifying `any`/`unknown` at
+    /// DEPTH (member / element / index signature / type argument) with no
+    /// failing-external explanation; the check phase pre-gates these pairs.
+    #[serde(default)]
+    pub deep_top_type_kind: Option<String>,
+    /// Member path of the deep find, e.g. `metadata` or `items<0>.meta`.
+    #[serde(default)]
+    pub deep_top_type_path: Option<String>,
 }
 
 /// Aggregate fidelity metric for one service's capture.

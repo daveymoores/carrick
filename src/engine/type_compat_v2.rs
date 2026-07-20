@@ -51,11 +51,90 @@ fn repo_relative(file_path: &str, repo_root: &str) -> String {
     stripped.strip_prefix("./").unwrap_or(stripped).to_string()
 }
 
+/// One shared notion of a "disqualifying top type" in printed TypeScript
+/// type text (adversarial-review finding 2, aligned with the capture
+/// self-check's deep walk): `any` or `unknown` appearing as a TYPE token at
+/// ANY position — the whole text, an element (`any[]`), a type argument
+/// (`Promise<any>`, `Record<string, any>`), a member
+/// (`{ metadata: any }`), or an index signature (`{ [k: string]: any }`).
+/// Such text must never anchor a literal capture or count as a resolved
+/// shape: `any` is bidirectionally assignable, so an arbitrary counterparty
+/// shape would read compatible, and `unknown` is the scrubbers' failed-
+/// inference placeholder.
+///
+/// String-literal types are stripped first (`{ kind: "any" }` is fine) and
+/// property-NAME positions are excluded (`{ any: string }`, `{ any?: T }`).
+/// The error direction is deliberate: a false positive only demotes toward
+/// unverifiable; a false negative is a false-compatible.
+pub(crate) fn contains_disqualifying_top_type(text: &str) -> bool {
+    let scrubbed = strip_string_literal_contents(text);
+    let bytes = scrubbed.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    for keyword in ["any", "unknown"] {
+        let mut search_from = 0;
+        while let Some(pos) = scrubbed[search_from..].find(keyword) {
+            let begin = search_from + pos;
+            let end = begin + keyword.len();
+            search_from = begin + 1;
+            // Identifier boundaries (`company`, `unknownField`, `Anything`).
+            if begin > 0 && is_ident(bytes[begin - 1]) {
+                continue;
+            }
+            if end < bytes.len() && is_ident(bytes[end]) {
+                continue;
+            }
+            // Property-name position: printers emit `name: T` / `name?: T`
+            // with the colon immediately after the name.
+            let rest = &bytes[end..];
+            let rest = if rest.first() == Some(&b'?') {
+                &rest[1..]
+            } else {
+                rest
+            };
+            if rest.first() == Some(&b':') {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Replace the CONTENTS of string-literal types with nothing, keeping the
+/// quotes, so `{ kind: "any" }` cannot false-positive the token scan.
+fn strip_string_literal_contents(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '\'' || c == '"' || c == '`' {
+            let quote = c;
+            let mut escaped = false;
+            for inner in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if inner == '\\' {
+                    escaped = true;
+                } else if inner == quote {
+                    out.push(quote);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A v1 inferred type text is usable as a literal anchor when it carries an
-/// actual shape (not the unknown/any placeholders the scrubbers leave).
+/// actual shape: not the unknown/any placeholders the scrubbers leave, and
+/// not container-decayed text (`any[]`, `Promise<any>`, `Record<string,
+/// any>`, `{ metadata: any }`) — a rejected text falls back to the
+/// locator-based infer anchor, whose result the capture self-check owns.
 fn usable_inferred_text(text: &str) -> Option<&str> {
     let trimmed = text.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() || trimmed == "unknown" || trimmed == "any" {
+    if trimmed.is_empty() || contains_disqualifying_top_type(trimmed) {
         None
     } else {
         Some(trimmed)
@@ -869,6 +948,123 @@ mod tests {
                 assert_eq!(type_text, "{ ok: boolean }");
             }
             other => panic!("expected literal anchor, got {:?}", other),
+        }
+    }
+
+    // ---- contains_disqualifying_top_type ----------------------------------
+
+    /// The shared notion: any/unknown as a TYPE token at any position
+    /// disqualifies (adversarial-review finding 2); property names, string
+    /// literals, and ordinary identifiers containing the words do not.
+    #[test]
+    fn disqualifying_top_type_token_scan() {
+        for text in [
+            "any",
+            "unknown",
+            "any[]",
+            "Array<any>",
+            "Promise<any>",
+            "Record<string, any>",
+            "{ [k: string]: any }",
+            "{ orderId: string; metadata: any }",
+            "{ a: { b: unknown } }",
+            "{ items: any[] }",
+            "Promise<{ data: unknown }>",
+            "(string | any)[]",
+        ] {
+            assert!(
+                contains_disqualifying_top_type(text),
+                "must disqualify: {text}"
+            );
+        }
+        for text in [
+            "{ ok: boolean }",
+            "string[]",
+            "Promise<{ a: string }>",
+            "{ kind: \"any\" }",
+            "{ kind: 'unknown' }",
+            "{ any: string }",
+            "{ any?: string }",
+            "{ unknown: number }",
+            "{ company: string }",
+            "Anything",
+            "{ unknownField: number; anyhow: string }",
+        ] {
+            assert!(
+                !contains_disqualifying_top_type(text),
+                "must NOT disqualify: {text}"
+            );
+        }
+    }
+
+    /// Container-decayed v1 inference text (`Promise<any>`, `any[]`, member
+    /// any) must NOT ride a literal anchor: pre-fix it became a literal
+    /// surface alias that probed clean and read compatible. Rejected text
+    /// falls back to the locator-based infer anchor.
+    #[test]
+    fn derive_anchors_rejects_container_decayed_inferred_text() {
+        let infer_item = |alias: &str| crate::services::type_sidecar::InferRequestItem {
+            file_path: "src/bus.ts".to_string(),
+            line_number: 4,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("payload".to_string()),
+            expression_line: Some(4),
+            infer_kind: InferKind::Expression,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        };
+        let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
+            alias: alias.to_string(),
+            type_string: text.to_string(),
+            is_explicit: false,
+            source_location: crate::services::type_sidecar::SourceLocation {
+                file_path: "src/bus.ts".to_string(),
+                start_line: 4,
+                end_line: 4,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::Expression,
+            primary_type_symbol: None,
+            array_depth: None,
+        };
+
+        let infer = vec![
+            infer_item("Pub_PromiseAny"),
+            infer_item("Pub_ArrayAny"),
+            infer_item("Pub_MemberAny"),
+            infer_item("Pub_Clean"),
+        ];
+        let inferred = vec![
+            inferred_type("Pub_PromiseAny", "Promise<any>"),
+            inferred_type("Pub_ArrayAny", "any[]"),
+            inferred_type("Pub_MemberAny", "{ orderId: string; metadata: any }"),
+            inferred_type("Pub_Clean", "{ ok: boolean }"),
+        ];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &inferred, ".");
+        assert_eq!(anchors.len(), 4);
+        for (anchor, alias) in
+            anchors
+                .iter()
+                .zip(["Pub_PromiseAny", "Pub_ArrayAny", "Pub_MemberAny"])
+        {
+            match anchor {
+                CaptureAnchor::Infer { alias: a, .. } => assert_eq!(a, alias),
+                other => {
+                    panic!("{alias}: decayed text must fall back to an infer anchor, got {other:?}")
+                }
+            }
+        }
+        match &anchors[3] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Pub_Clean");
+                assert_eq!(type_text, "{ ok: boolean }");
+            }
+            other => panic!("clean text must stay a literal anchor, got {other:?}"),
         }
     }
 
