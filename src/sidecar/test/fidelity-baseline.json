@@ -1,0 +1,204 @@
+{
+  "fixtures": [
+    {
+      "id": "capture-v2-bare",
+      "bare_checkout": true,
+      "total_aliases": 10,
+      "by_serialization": {
+        "emitted": 6,
+        "node_builder": 2,
+        "structural_fallback": 2
+      },
+      "by_self_check": {
+        "ok": 6,
+        "allowlisted_external": 2,
+        "decayed_internal": 2
+      },
+      "by_anchor_origin": {
+        "llm-symbol": 7,
+        "deterministic-infer": 2,
+        "anchor-backfill": 1
+      },
+      "usable_rate": 0.8,
+      "aliases": [
+        {
+          "alias": "Endpoint_generic_Handler",
+          "serialization": "structural_fallback",
+          "self_check": "decayed_internal",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": true
+        },
+        {
+          "alias": "Endpoint_getorder_Handler",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Endpoint_order_Request",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Endpoint_order_Response",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Endpoint_overloaded_Handler",
+          "serialization": "structural_fallback",
+          "self_check": "decayed_internal",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": true
+        },
+        {
+          "alias": "Graphql_orderquery_Result",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Pub_derivedconfig_Payload",
+          "serialization": "emitted",
+          "self_check": "allowlisted_external",
+          "anchor_origin": "anchor-backfill",
+          "top_type_at_self_check": true
+        },
+        {
+          "alias": "Pub_ordershipped_Payload",
+          "serialization": "node_builder",
+          "self_check": "ok",
+          "anchor_origin": "deterministic-infer",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Pub_shipmentsync_Payload",
+          "serialization": "node_builder",
+          "self_check": "ok",
+          "anchor_origin": "deterministic-infer",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Pub_shipmentthing_Payload",
+          "serialization": "emitted",
+          "self_check": "allowlisted_external",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": true
+        }
+      ]
+    },
+    {
+      "id": "capture-v2-installed",
+      "bare_checkout": false,
+      "total_aliases": 3,
+      "by_serialization": {
+        "emitted": 2,
+        "node_builder": 1,
+        "structural_fallback": 0
+      },
+      "by_self_check": {
+        "ok": 3,
+        "allowlisted_external": 0,
+        "decayed_internal": 0
+      },
+      "by_anchor_origin": {
+        "llm-symbol": 2,
+        "deterministic-infer": 1,
+        "anchor-backfill": 0
+      },
+      "usable_rate": 1,
+      "aliases": [
+        {
+          "alias": "Endpoint_listwidgets_Handler",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Endpoint_widget_Response",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Pub_widgetupdated_Payload",
+          "serialization": "node_builder",
+          "self_check": "ok",
+          "anchor_origin": "deterministic-infer",
+          "top_type_at_self_check": false
+        }
+      ]
+    },
+    {
+      "id": "xrepo-corpus-3-inventory-svc",
+      "bare_checkout": true,
+      "total_aliases": 3,
+      "by_serialization": {
+        "emitted": 3,
+        "node_builder": 0,
+        "structural_fallback": 0
+      },
+      "by_self_check": {
+        "ok": 3,
+        "allowlisted_external": 0,
+        "decayed_internal": 0
+      },
+      "by_anchor_origin": {
+        "llm-symbol": 2,
+        "deterministic-infer": 1,
+        "anchor-backfill": 0
+      },
+      "usable_rate": 1,
+      "aliases": [
+        {
+          "alias": "Endpoint_stock_Response",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Sub_priceupdated_Payload",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "deterministic-infer",
+          "top_type_at_self_check": false
+        },
+        {
+          "alias": "Sub_stockadjust_Payload",
+          "serialization": "emitted",
+          "self_check": "ok",
+          "anchor_origin": "llm-symbol",
+          "top_type_at_self_check": false
+        }
+      ]
+    }
+  ],
+  "aggregate": {
+    "total_aliases": 16,
+    "by_serialization": {
+      "emitted": 11,
+      "node_builder": 3,
+      "structural_fallback": 2
+    },
+    "by_self_check": {
+      "ok": 12,
+      "allowlisted_external": 2,
+      "decayed_internal": 2
+    },
+    "by_anchor_origin": {
+      "llm-symbol": 11,
+      "deterministic-infer": 4,
+      "anchor-backfill": 1
+    },
+    "usable_rate": 0.875
+  }
+}
