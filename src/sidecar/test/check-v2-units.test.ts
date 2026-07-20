@@ -248,4 +248,14 @@ describe('semver dedupe overrides', () => {
     ]);
     assert.deepStrictEqual(overrides, {});
   });
+
+  it('0.0.x pins are each their own breaking boundary (no override)', () => {
+    // Semver: every 0.0.x patch is breaking. Collapsing 0.0.3 onto 0.0.5
+    // would force one physical copy and manufacture a false-compatible.
+    const overrides = computeDedupeOverrides([
+      { dependencies: { pkg: '0.0.3' } },
+      { dependencies: { pkg: '0.0.5' } },
+    ]);
+    assert.deepStrictEqual(overrides, {});
+  });
 });

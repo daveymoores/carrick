@@ -61,9 +61,17 @@ function parseVersion(v: string): ParsedVersion {
   };
 }
 
-/** Semver compat key: same key => dedupe candidates. 0.x is minor-scoped. */
+/**
+ * Semver compat key: same key => dedupe candidates. 0.x is minor-scoped, and
+ * 0.0.x is patch-scoped: semver treats every 0.0.x release as its own
+ * breaking boundary, so 0.0.3 and 0.0.5 must never collapse onto one
+ * physical copy (that would manufacture a false-compatible for by-reference
+ * library types).
+ */
 function compatKey(v: ParsedVersion): string {
-  return v.major > 0 ? `${v.major}` : `0.${v.minor}`;
+  if (v.major > 0) return `${v.major}`;
+  if (v.minor > 0) return `0.${v.minor}`;
+  return `0.0.${v.patch}`;
 }
 
 function versionGreater(a: ParsedVersion, b: ParsedVersion): boolean {
