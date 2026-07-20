@@ -22,7 +22,7 @@ function tempDir(): string {
 }
 
 describe('lockfileVersions', () => {
-  it('parses npm lockfile v3 packages map, first entry wins', () => {
+  it('parses npm lockfile v3 packages map, direct entry wins', () => {
     const dir = tempDir();
     fs.writeFileSync(
       path.join(dir, 'package-lock.json'),
@@ -39,6 +39,77 @@ describe('lockfileVersions', () => {
     const versions = lockfileVersions(dir);
     assert.strictEqual(versions.get('zod'), '3.23.0');
     assert.strictEqual(versions.get('@scope/pkg'), '2.0.1');
+  });
+
+  it('npm: prefers the direct dependency when a nested copy sorts first', () => {
+    // npm sorts `node_modules/a/node_modules/b` BEFORE `node_modules/b`, so
+    // first-match-wins pinned the nested version the emitted tree never
+    // resolves against (adversarial-review finding 4).
+    const dir = tempDir();
+    fs.writeFileSync(
+      path.join(dir, 'package-lock.json'),
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          '': {},
+          'node_modules/aaa': { version: '1.0.0' },
+          'node_modules/aaa/node_modules/zod': { version: '2.9.9' },
+          'node_modules/zod': { version: '3.23.0' },
+          // Nested-only package: the nested copy is the only install.
+          'node_modules/aaa/node_modules/nested-only': { version: '5.5.5' },
+        },
+      })
+    );
+    const versions = lockfileVersions(dir);
+    assert.strictEqual(versions.get('zod'), '3.23.0');
+    assert.strictEqual(versions.get('nested-only'), '5.5.5');
+  });
+
+  it('pnpm: prefers the importer-resolved (direct) version over the packages map', () => {
+    // The pnpm packages map is name-sorted, so a multi-version package's
+    // first entry is its LOWEST version; the importers section carries the
+    // resolved direct-dependency version (adversarial-review finding 4).
+    const dir = tempDir();
+    fs.writeFileSync(
+      path.join(dir, 'pnpm-lock.yaml'),
+      [
+        'lockfileVersion: 9.0',
+        '',
+        'importers:',
+        '  .:',
+        '    dependencies:',
+        '      zod:',
+        "        specifier: ^3.24.0",
+        "        version: 3.24.1",
+        '  packages/member:',
+        '    dependencies:',
+        '      redis:',
+        "        specifier: ^4.6.0",
+        "        version: 4.6.7(peer@1.0.0)",
+        '',
+        'packages:',
+        '',
+        // Lower version of a transitive copy sorts first.
+        "  zod@3.22.0:",
+        "    resolution: {integrity: sha512-a}",
+        '',
+        "  zod@3.24.1:",
+        "    resolution: {integrity: sha512-b}",
+        '',
+        "  redis@4.6.7:",
+        "    resolution: {integrity: sha512-c}",
+        '',
+        "  transitive-only@1.2.3:",
+        "    resolution: {integrity: sha512-d}",
+        '',
+      ].join('\n')
+    );
+    const versions = lockfileVersions(dir);
+    assert.strictEqual(versions.get('zod'), '3.24.1');
+    // Peer suffix stripped from the importer-resolved version.
+    assert.strictEqual(versions.get('redis'), '4.6.7');
+    // Non-direct packages still pin from the packages map.
+    assert.strictEqual(versions.get('transitive-only'), '1.2.3');
   });
 
   it('parses npm lockfile v1 dependencies fallback', () => {
