@@ -47,6 +47,13 @@ export class DefinitionResolver {
   /**
    * Resolve surface aliases from a capture stub package directory
    * (`<stub_dir>/types/surface.d.ts` + its declaration tree).
+   *
+   * Uses a DEDICATED project with `moduleResolution: Bundler`, not the
+   * repo's own project: the stub tree's relative import-types are
+   * extensionless, which a NodeNext-configured repo project silently fails
+   * to resolve (the alias then reads as `any`). Bundler resolution accepts
+   * both extensionless and `.js`-suffixed specifiers — the same policy the
+   * check-phase workspace uses.
    */
   resolveFromStub(stubDir: string, aliases: string[]): ResolvedDefinition[] {
     const typesDir = path.join(stubDir, 'types');
@@ -56,15 +63,21 @@ export class DefinitionResolver {
       return [];
     }
 
-    // Add the whole tree so the surface's relative import-types resolve.
-    const added: SourceFile[] = [];
     try {
+      const stubProject = new Project({
+        compilerOptions: {
+          target: 99, // ESNext
+          module: 99, // ESNext
+          moduleResolution: 100, // Bundler
+          strict: true,
+          skipLibCheck: true,
+        },
+        skipAddingFilesFromTsConfig: true,
+      });
       for (const filePath of walkDtsFiles(typesDir)) {
-        if (!this.project.getSourceFile(filePath)) {
-          added.push(this.project.addSourceFileAtPath(filePath));
-        }
+        stubProject.addSourceFileAtPath(filePath);
       }
-      const surface = this.project.getSourceFile(surfacePath);
+      const surface = stubProject.getSourceFile(surfacePath);
       if (!surface) {
         this.logError(`Failed to load ${surfacePath}`);
         return [];
@@ -85,10 +98,6 @@ export class DefinitionResolver {
         `Resolution failed: ${err instanceof Error ? err.message : String(err)}`,
       );
       return [];
-    } finally {
-      for (const file of added) {
-        this.project.removeSourceFile(file);
-      }
     }
   }
 

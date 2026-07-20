@@ -150,6 +150,41 @@ describe('capture v2 WP3 anchors: array_depth + literal', () => {
   });
 });
 
+describe('capture v2 WP3: tsconfig-less repo fallback', () => {
+  it('captures with synthesized default options when the repo has no tsconfig', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-wp3-notsconfig-'));
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-wp3-notsconfig-stub-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src', 'types.ts'),
+        'export interface Health { status: string; }\n'
+      );
+      const result = captureStub({
+        repoRoot: dir,
+        serviceName: 'no-tsconfig-svc',
+        outDir: path.join(out, 'stub'),
+        anchors: [
+          {
+            kind: 'symbol',
+            alias: 'Health_Response',
+            symbol_name: 'Health',
+            source_file: 'src/types.ts',
+            anchor_origin: 'llm-symbol',
+          },
+        ],
+      });
+      assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+      const r = result.aliases.find((a) => a.alias === 'Health_Response');
+      assert.ok(r);
+      assert.strictEqual(r.self_check, 'ok');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('capture v2 WP3 anchors: validator shapes', () => {
   it('accepts array_depth on symbol anchors and literal anchors', async () => {
     const { parseRequest } = await import('../src/validators.js');

@@ -113,21 +113,45 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const configPath = opts.tsconfigPath
     ? path.resolve(opts.tsconfigPath)
     : path.join(repoRoot, 'tsconfig.json');
-  if (!fs.existsSync(configPath)) {
-    return fail(stubDir, packageName, [`tsconfig not found at ${configPath}`]);
-  }
 
-  const configHost: ts.ParseConfigFileHost = {
-    ...ts.sys,
-    onUnRecoverableConfigFileDiagnostic: (d) => {
-      throw new Error(ts.flattenDiagnosticMessageText(d.messageText, '\n'));
-    },
-  };
   let parsed: ts.ParsedCommandLine | undefined;
-  try {
-    parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, configHost) ?? undefined;
-  } catch (err) {
-    return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
+  if (!fs.existsSync(configPath)) {
+    if (opts.tsconfigPath) {
+      // An explicitly named tsconfig that does not exist is a caller bug.
+      return fail(stubDir, packageName, [`tsconfig not found at ${configPath}`]);
+    }
+    // No tsconfig in the repo: synthesize defaults (parity with the v1
+    // project loader's DEFAULT_COMPILER_OPTIONS) so tsconfig-less repos
+    // still capture instead of shipping no surface at all.
+    parsed = ts.parseJsonConfigFileContent(
+      {
+        compilerOptions: {
+          target: 'ESNext',
+          module: 'ESNext',
+          moduleResolution: 'Bundler',
+          strict: true,
+          esModuleInterop: true,
+          skipLibCheck: true,
+          allowJs: true,
+          checkJs: false,
+          resolveJsonModule: true,
+        },
+      },
+      ts.sys,
+      repoRoot
+    );
+  } else {
+    const configHost: ts.ParseConfigFileHost = {
+      ...ts.sys,
+      onUnRecoverableConfigFileDiagnostic: (d) => {
+        throw new Error(ts.flattenDiagnosticMessageText(d.messageText, '\n'));
+      },
+    };
+    try {
+      parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, configHost) ?? undefined;
+    } catch (err) {
+      return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
+    }
   }
   if (!parsed) {
     return fail(stubDir, packageName, [`failed to parse ${configPath}`]);
