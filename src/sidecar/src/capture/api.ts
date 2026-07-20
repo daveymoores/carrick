@@ -298,6 +298,10 @@ export interface CheckOptions {
   /** Absolute path to the vendored pnpm binary. Defaults to the sidecar's
    * own node_modules/.bin/pnpm resolved from this bundle's location. */
   pnpmPath?: string;
+  /** Absolute path to the tsc CLI. Defaults to the sidecar's own
+   * node_modules/.bin/tsc. Tests inject a stand-in to pin the
+   * abnormal-termination path. */
+  tscPath?: string;
   /** Delete the scratch workspace before returning (default true). Tests that
    * inspect the assembled tree pass false. */
   cleanup?: boolean;

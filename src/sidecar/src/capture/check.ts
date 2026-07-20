@@ -105,7 +105,7 @@ export async function runCheck(
   const progress: CheckProgress = onProgress ?? (() => {});
   const cleanup = opts.cleanup !== false;
   const pnpmPath = opts.pnpmPath ?? binPath('pnpm');
-  const tscPath = binPath('tsc');
+  const tscPath = opts.tscPath ?? binPath('tsc');
   const tsVersion = ts.version;
 
   // Isolation is non-negotiable: without the vendored pnpm we would fall back
@@ -216,6 +216,49 @@ export async function runCheck(
     ws.workspaceDir
   );
   const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
+
+  // Abnormal tsc termination: OOM/SIGKILL (exit code null), an internal
+  // crash, or a fileless config error (e.g. TS18003, printed without a
+  // (line,col) prefix) all yield ZERO parseable diagnostics — and an empty
+  // diagnostic set must never fall through to "compatible". A non-zero exit
+  // WITH parsed diagnostics is the legitimate incompatible path (tsc exits 1
+  // on ordinary type errors) and stays untouched. Mirrors the install step's
+  // `code === 0` guard.
+  if (tsc.code !== 0 && diagnostics.length === 0) {
+    const excerpt = scrubPaths(
+      (tsc.stderr || tsc.stdout).trim().slice(0, 2000),
+      scrubCtx
+    );
+    errors.push(
+      `tsc terminated abnormally (exit code ${tsc.code ?? 'null'}) ` +
+        `with no parseable diagnostics${excerpt ? `: ${excerpt}` : ''}`
+    );
+    for (const s of opts.stubs) {
+      degraded.push({
+        service_name: s.service_name,
+        reason: 'type checker terminated abnormally',
+      });
+    }
+    const verdicts = sortVerdicts([
+      ...unverifiableAll(
+        plans,
+        'tsc:abnormal-termination',
+        'the type checker terminated abnormally; compatibility cannot be verified.'
+      ),
+      ...unresolved,
+    ]);
+    if (cleanup) safeRm(ws.workspaceDir);
+    return {
+      success: false,
+      workspace_dir: cleanup ? '' : ws.workspaceDir,
+      isolation: 'pnpm',
+      install_ok: true,
+      ts_version: tsVersion,
+      verdicts,
+      degraded_services: dedupeDegraded(degraded),
+      errors,
+    };
+  }
 
   const { probeDiagsByPair, poison, globalErrors } = attributeDiagnostics(
     diagnostics,
