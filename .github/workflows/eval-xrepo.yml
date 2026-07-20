@@ -56,17 +56,9 @@ jobs:
           cache: "npm"
           cache-dependency-path: |
             src/sidecar/package-lock.json
-            ts_check/package-lock.json
 
       - name: Build type sidecar
         run: cd src/sidecar && npm ci && npm run build
-
-      # Cross-repo type-compat checking shells out to `ts-node run-type-checking.ts`
-      # via ts_check/. Without its node_modules, ts-node can't resolve ts-morph /
-      # @types/node, fails to compile, never writes type-check-results.json, and
-      # every cross_repo_match stays type_compatible=None (the #226 root cause).
-      - name: Install ts_check type checker
-        run: cd ts_check && npm ci
 
       - name: Install corpus dependencies
         if: ${{ inputs.install_corpus_deps }}
@@ -114,21 +106,6 @@ jobs:
         with:
           name: analyzer-dump
           path: target/eval-dump/
-          if-no-files-found: warn
-
-      # Archive the cross-repo type-check artifacts so compat verdicts are
-      # inspectable post-run. The release binary auto-discovers ts_check/ via
-      # CARGO_MANIFEST_DIR and `recreate_type_files_and_check` writes the bundled
-      # `<repo>_types.d.ts` files, producer-/consumer-manifest.json, and
-      # type-check-results.json under the repo's ts_check/output/. `if: always()`
-      # captures even when the eval's §7 compat-absence guard reds the run — that
-      # is exactly when these artifacts are needed to diagnose the false-negative.
-      - name: Upload ts_check output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ts_check-output
-          path: ts_check/output/
           if-no-files-found: warn
 
       # Push the run's record to the durable Axiom history (carrick-cloud

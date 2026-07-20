@@ -12,7 +12,7 @@
       "line": 6,
       "type_alias": "Endpoint_a9cce7d0d8d0d9e6_Response",
       "type_state": "Explicit",
-      "resolved_definition": "export type Endpoint_a9cce7d0d8d0d9e6_Response = { id: number; name: string; email: string; }[];",
+      "resolved_definition": "export type Endpoint_a9cce7d0d8d0d9e6_Response = import('./src/types').User[];",
       "expanded_definition": "{ id: number; name: string; email: string; }[]",
       "is_explicit": true,
       "primary_type_symbol": "User"
@@ -43,7 +43,7 @@
       "line": 8,
       "type_alias": "Endpoint_2a10f0dfd8c3cde7_Response",
       "type_state": "Implicit",
-      "resolved_definition": "export type Endpoint_2a10f0dfd8c3cde7_Response = { status: string; };",
+      "resolved_definition": "export type Endpoint_2a10f0dfd8c3cde7_Response = {\n    status: string;\n};",
       "expanded_definition": "{ status: string; }",
       "is_explicit": false
     },
@@ -59,7 +59,7 @@
       "line": 5,
       "type_alias": "Endpoint_97b757a2c4112fad_Response",
       "type_state": "Implicit",
-      "resolved_definition": "export type Endpoint_97b757a2c4112fad_Response = { total: number; };",
+      "resolved_definition": "export type Endpoint_97b757a2c4112fad_Response = {\n    total: number;\n};",
       "expanded_definition": "{ total: number; }",
       "is_explicit": false
     },
@@ -75,8 +75,8 @@
       "line": 11,
       "type_alias": "Endpoint_e8e423d0a20a7bde_Response",
       "type_state": "Implicit",
-      "resolved_definition": "export type Endpoint_e8e423d0a20a7bde_Response = User;",
-      "expanded_definition": "User",
+      "resolved_definition": "export interface User {\n    id: number;\n    name: string;\n    email: string;\n}",
+      "expanded_definition": "{ id: number; name: string; email: string; }",
       "is_explicit": false,
       "primary_type_symbol": "User"
     }
@@ -94,7 +94,7 @@
       "line": 4,
       "type_alias": "Endpoint_4022e5b76e4552db_Response_Calle64c9717ada550f1",
       "type_state": "Explicit",
-      "resolved_definition": "export interface Endpoint_4022e5b76e4552db_Response_Calle64c9717ada550f1 { id: number; userId: number; total: number; }",
+      "resolved_definition": "export interface Order {\n    id: number;\n    userId: number;\n    total: number;\n}",
       "expanded_definition": "{ id: number; userId: number; total: number; }",
       "is_explicit": true,
       "primary_type_symbol": "Order"

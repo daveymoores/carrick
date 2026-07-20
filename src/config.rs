@@ -1,7 +1,6 @@
 use std::{collections::HashSet, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Classification + location for a single service.
 ///
@@ -140,77 +139,6 @@ impl Config {
             .iter()
             .any(|domain| route.starts_with(domain))
     }
-}
-
-/// Creates a standard TypeScript configuration for type checking only
-pub fn create_standard_tsconfig() -> Value {
-    serde_json::json!({
-        "compilerOptions": {
-            "target": "ES2020",
-            "module": "commonjs",
-            "strict": true,
-            "esModuleInterop": true,
-            "skipLibCheck": true,
-            "forceConsistentCasingInFileNames": true,
-            "resolveJsonModule": true,
-            "noEmit": true,
-            "baseUrl": ".",
-            "paths": {
-                "*-types": ["./*_types"]
-            }
-        },
-        "include": [
-            "*.ts",
-            "**/*.ts"
-        ],
-        "exclude": [
-            "node_modules"
-        ]
-    })
-}
-
-pub fn create_dynamic_tsconfig(output_dir: &std::path::Path) -> Value {
-    use std::collections::HashMap;
-
-    let mut paths = HashMap::new();
-
-    // Add the generic pattern
-    paths.insert("*-types".to_string(), vec!["./*_types".to_string()]);
-
-    // Scan for actual type files and create specific mappings
-    if let Ok(entries) = std::fs::read_dir(output_dir) {
-        for entry in entries.flatten() {
-            if let Some(file_name) = entry.file_name().to_str()
-                && (file_name.ends_with("_types.ts") || file_name.ends_with("_types.d.ts"))
-            {
-                let base_name = file_name.trim_end_matches(".d.ts").trim_end_matches(".ts");
-                let module_name = base_name.replace("_", "-");
-                paths.insert(module_name, vec![format!("./{}", base_name)]);
-            }
-        }
-    }
-
-    serde_json::json!({
-        "compilerOptions": {
-            "target": "ES2020",
-            "module": "commonjs",
-            "strict": true,
-            "esModuleInterop": true,
-            "skipLibCheck": true,
-            "forceConsistentCasingInFileNames": true,
-            "resolveJsonModule": true,
-            "noEmit": true,
-            "baseUrl": ".",
-            "paths": paths
-        },
-        "include": [
-            "*.ts",
-            "**/*.ts"
-        ],
-        "exclude": [
-            "node_modules"
-        ]
-    })
 }
 
 #[cfg(test)]

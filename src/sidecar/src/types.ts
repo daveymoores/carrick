@@ -217,6 +217,62 @@ export interface PayloadDefinition {
 }
 
 /**
+ * Request to run the v2 "tsc as serializer" capture for one service.
+ * Produces a types-only stub package (compiler-emitted declaration tree +
+ * pinned deps) instead of a flattened structural string. The full contract
+ * lives in ./capture/api.ts -- the seam between the sidecar and the v2
+ * capture bundle.
+ */
+export interface CaptureV2Request extends BaseRequest {
+  action: 'capture_v2';
+  /** Absolute path to the producer repo root */
+  repo_root: string;
+  /** Service name used for the @carrick/<service> stub package */
+  service_name: string;
+  /** Anchors to alias in the surface entry (symbol / handler_return / infer) */
+  anchors: import('./capture/api.js').CaptureAnchorRequest[];
+  /** Directory to write the stub package into */
+  out_dir: string;
+  /** Optional explicit tsconfig path (defaults to <repo_root>/tsconfig.json) */
+  tsconfig_path?: string;
+}
+
+/**
+ * Response for the capture_v2 action
+ */
+export interface CaptureV2Response extends BaseResponse {
+  result?: import('./capture/api.js').CaptureStubResult;
+  errors?: string[];
+}
+
+/**
+ * Request to run the v2 "tsc as judge" check for a set of matched pairs.
+ * Assembles the given capture stubs into a scratch synthetic monorepo and
+ * returns one verdict per pair. The full contract lives in ./capture/api.ts --
+ * the seam between the sidecar and the v2 capture/check bundle.
+ */
+export interface CheckV2Request extends BaseRequest {
+  action: 'check_v2';
+  /** Capture stub packages to assemble (one per participating service). */
+  stubs: import('./capture/api.js').CheckStubInput[];
+  /** Matched pairs to verify. */
+  pairs: import('./capture/api.js').CheckPairSpec[];
+  /** Parent dir for the scratch workspace (default: OS temp dir). */
+  workspace_root?: string;
+  /** Keep the assembled workspace on disk (default false; tests set true). */
+  keep_workspace?: boolean;
+}
+
+/**
+ * Response for the check_v2 action. Emitted as the terminal frame; the async
+ * install protocol emits `status: 'progress'` keepalive frames before it.
+ */
+export interface CheckV2Response extends BaseResponse {
+  result?: import('./capture/api.js').CheckResult;
+  errors?: string[];
+}
+
+/**
  * Request to infer implicit types at specific locations
  */
 export interface InferRequest extends BaseRequest {
@@ -278,14 +334,17 @@ export interface ShutdownRequest extends BaseRequest {
 }
 
 /**
- * Request to resolve type definitions from bundled .d.ts content.
- * Returns both the original declaration and the compiler-expanded form.
+ * Request to resolve type definitions from a v2 capture stub package.
+ * Returns both the original declaration and the compiler-expanded form for
+ * each surface alias (design doc: `resolve_per_endpoint_definitions` is
+ * re-pointed at the surface tree, a strictly richer source than the old
+ * flattened bundle string).
  */
 export interface ResolveDefinitionsRequest extends BaseRequest {
   action: 'resolve_definitions';
-  /** The bundled .d.ts content to resolve aliases from */
-  bundled_dts: string;
-  /** Type alias names to resolve */
+  /** Absolute path to the capture stub dir (package.json + types/ tree). */
+  stub_dir: string;
+  /** Surface type alias names to resolve */
   aliases: string[];
 }
 
@@ -296,6 +355,8 @@ export type SidecarRequest =
   | InitRequest
   | BundleRequest
   | EmitSurfaceRequest
+  | CaptureV2Request
+  | CheckV2Request
   | InferRequest
   | BuildWorkspaceRequest
   | CheckCompatibilityRequest
@@ -511,6 +572,8 @@ export type SidecarResponse =
   | InitResponse
   | BundleResponse
   | EmitSurfaceResponse
+  | CaptureV2Response
+  | CheckV2Response
   | InferResponse
   | BuildWorkspaceResponse
   | CheckCompatibilityResponse

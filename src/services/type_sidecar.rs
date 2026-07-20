@@ -173,6 +173,244 @@ pub struct InferRequestItem {
 }
 
 // ============================================================================
+// v2 capture/check wire types (the stdio seam to the capture bundle)
+// ============================================================================
+
+/// How an anchor was produced upstream (design-doc amendment 2). Mirrors the
+/// sidecar's `AnchorOrigin` (src/sidecar/src/capture/api.ts).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AnchorOrigin {
+    #[serde(rename = "llm-symbol")]
+    LlmSymbol,
+    #[serde(rename = "deterministic-infer")]
+    DeterministicInfer,
+    #[serde(rename = "anchor-backfill")]
+    AnchorBackfill,
+}
+
+/// One anchor for the `capture_v2` action. Mirrors the sidecar's
+/// `CaptureAnchorRequest` union — the stdio action surface is the only
+/// contract Rust sees (seam, not split).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CaptureAnchor {
+    /// Explicit exported symbol: `export type A = import('./m').Sym;`
+    Symbol {
+        alias: String,
+        symbol_name: String,
+        source_file: String,
+        anchor_origin: AnchorOrigin,
+        /// Use-site `[]` levels around the element symbol (#248/#306).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        array_depth: Option<u32>,
+    },
+    /// Addressable handler: `Awaited<ReturnType<typeof import('./m').fn>>`.
+    HandlerReturn {
+        alias: String,
+        symbol_name: String,
+        source_file: String,
+        anchor_origin: AnchorOrigin,
+    },
+    /// Anonymous inferred type at a source location (span / text / line).
+    Infer {
+        alias: String,
+        source_file: String,
+        anchor_origin: AnchorOrigin,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        span_start: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        span_end: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line_number: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expression_text: Option<String>,
+    },
+    /// Inline literal type text (the v1 inline-alias path).
+    Literal {
+        alias: String,
+        type_text: String,
+        anchor_origin: AnchorOrigin,
+    },
+}
+
+impl CaptureAnchor {
+    pub fn alias(&self) -> &str {
+        match self {
+            CaptureAnchor::Symbol { alias, .. }
+            | CaptureAnchor::HandlerReturn { alias, .. }
+            | CaptureAnchor::Infer { alias, .. }
+            | CaptureAnchor::Literal { alias, .. } => alias,
+        }
+    }
+}
+
+/// Wire protocol of a matched pair (drives the sidecar's direction table).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeProtocol {
+    Http,
+    Graphql,
+    Socket,
+    Pubsub,
+}
+
+/// Type kind of a matched pair. Socket/pubsub pairs are `Both` (the direction
+/// table inverts them regardless of kind).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeTypeKind {
+    Request,
+    Response,
+    Both,
+}
+
+/// One capture stub package to assemble into the check workspace.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckStubInput {
+    pub service_name: String,
+    /// Absolute path to the capture stub dir (package.json + types/ tree).
+    pub stub_dir: String,
+}
+
+/// One side of a matched pair: a service + the surface alias to probe.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckPairEndpoint {
+    pub service_name: String,
+    pub alias: String,
+}
+
+/// One matched pair for the `check_v2` action. Callers pass semantic
+/// producer/consumer roles; the (protocol, type_kind) direction table lives
+/// sidecar-side, in one place.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckPairSpec {
+    /// Stable caller key echoed back on the verdict (the WP3 join key).
+    pub pair_key: String,
+    pub protocol: ProbeProtocol,
+    pub type_kind: ProbeTypeKind,
+    pub producer: CheckPairEndpoint,
+    pub consumer: CheckPairEndpoint,
+}
+
+/// Per-alias capture record (serialization tier + self-check outcome).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaptureAliasRecord {
+    pub alias: String,
+    pub anchor_kind: String,
+    #[serde(default)]
+    pub symbol_name: Option<String>,
+    pub source_file: String,
+    pub anchor_origin: String,
+    pub serialization: String,
+    pub self_check: String,
+    #[serde(default)]
+    pub self_check_detail: Option<String>,
+    #[serde(default)]
+    pub capture_failure_reason: Option<String>,
+    pub top_type_at_self_check: bool,
+    /// Set when the self-check found a disqualifying `any`/`unknown` at
+    /// DEPTH (member / element / index signature / type argument) with no
+    /// failing-external explanation; the check phase pre-gates these pairs.
+    #[serde(default)]
+    pub deep_top_type_kind: Option<String>,
+    /// Member path of the deep find, e.g. `metadata` or `items<0>.meta`.
+    #[serde(default)]
+    pub deep_top_type_path: Option<String>,
+}
+
+/// Aggregate fidelity metric for one service's capture.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaptureFidelity {
+    pub total_aliases: u32,
+    pub by_serialization: HashMap<String, u32>,
+    pub by_self_check: HashMap<String, u32>,
+    pub by_anchor_origin: HashMap<String, u32>,
+    pub usable_rate: f64,
+}
+
+/// Result of a `capture_v2` action (mirrors `CaptureStubResult`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaptureV2Result {
+    pub success: bool,
+    pub stub_dir: String,
+    pub package_name: String,
+    #[serde(default)]
+    pub emitted_files: Vec<String>,
+    #[serde(default)]
+    pub pinned_dependencies: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub unpinned_externals: Vec<String>,
+    #[serde(default)]
+    pub aliases: Vec<CaptureAliasRecord>,
+    pub fidelity: CaptureFidelity,
+    #[serde(default)]
+    pub augmentation_files: Vec<String>,
+    #[serde(default)]
+    pub specifier_rewrites: u32,
+    pub bare_checkout: bool,
+    pub ts_version: String,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// Four-bucket verdict classifier output (pinned decision 7).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictBucket {
+    Compatible,
+    Incompatible,
+    Unverifiable,
+    GateCaughtBakedAny,
+}
+
+/// One structured verdict from `check_v2`, keyed by pair identity.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckVerdict {
+    /// Deterministic FNV-1a hash of the pair (never a temp path).
+    pub pair_id: String,
+    /// Caller key, echoed for the verdict join.
+    pub pair_key: String,
+    pub bucket: VerdictBucket,
+    /// For gate/import buckets: which side and which gate fired.
+    #[serde(default)]
+    pub gate: Option<String>,
+    /// Scrubbed user-facing message (never absolute paths / scan internals).
+    #[serde(default)]
+    pub diagnostic: Option<String>,
+    /// TS diagnostic codes attributed to this pair's probe, sorted.
+    #[serde(default)]
+    pub codes: Vec<i64>,
+}
+
+/// A service whose pairs are degraded wholesale (install failure or poison).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DegradedService {
+    pub service_name: String,
+    pub reason: String,
+}
+
+/// Result of a `check_v2` action (mirrors `CheckResult`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckV2Result {
+    pub success: bool,
+    #[serde(default)]
+    pub workspace_dir: String,
+    /// `pnpm` when isolation held; `unavailable` when the vendored pnpm is
+    /// missing (soundness over availability — never a silent npm fallback).
+    pub isolation: String,
+    pub install_ok: bool,
+    #[serde(default)]
+    pub install_error: Option<String>,
+    pub ts_version: String,
+    #[serde(default)]
+    pub verdicts: Vec<CheckVerdict>,
+    #[serde(default)]
+    pub degraded_services: Vec<DegradedService>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+// ============================================================================
 // Internal Request Messages
 // ============================================================================
 
@@ -198,10 +436,28 @@ enum SidecarRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         extraction_config: Option<ExtractionConfig>,
     },
+    #[serde(rename = "capture_v2")]
+    CaptureV2 {
+        request_id: String,
+        repo_root: String,
+        service_name: String,
+        anchors: Vec<CaptureAnchor>,
+        out_dir: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tsconfig_path: Option<String>,
+    },
+    #[serde(rename = "check_v2")]
+    CheckV2 {
+        request_id: String,
+        stubs: Vec<CheckStubInput>,
+        pairs: Vec<CheckPairSpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<String>,
+    },
     #[serde(rename = "resolve_definitions")]
     ResolveDefinitions {
         request_id: String,
-        bundled_dts: String,
+        stub_dir: String,
         aliases: Vec<String>,
     },
     #[serde(rename = "health")]
@@ -647,17 +903,17 @@ impl TypeSidecar {
         self.read_response_with_timeout(Duration::from_secs(60))
     }
 
-    /// Resolve type definitions from bundled .d.ts content.
+    /// Resolve surface type definitions from a v2 capture stub package.
     ///
     /// For each alias, returns both the original declaration text and the
     /// compiler-expanded form with all types fully inlined.
     ///
     /// # Arguments
-    /// * `bundled_dts` - The bundled .d.ts content
-    /// * `aliases` - Type alias names to resolve
+    /// * `stub_dir` - Absolute path to the capture stub dir (types/ tree)
+    /// * `aliases` - Surface type alias names to resolve
     pub fn resolve_definitions(
         &self,
-        bundled_dts: &str,
+        stub_dir: &str,
         aliases: &[String],
     ) -> Result<Vec<ResolvedDefinitionResult>, SidecarError> {
         self.ensure_ready()?;
@@ -668,7 +924,7 @@ impl TypeSidecar {
 
         let request = SidecarRequest::ResolveDefinitions {
             request_id: self.next_request_id(),
-            bundled_dts: bundled_dts.to_string(),
+            stub_dir: stub_dir.to_string(),
             aliases: aliases.to_vec(),
         };
 
@@ -681,6 +937,113 @@ impl TypeSidecar {
         }
 
         Ok(response.definitions.unwrap_or_default())
+    }
+
+    /// Run the v2 "tsc as serializer" capture for one service, producing a
+    /// types-only stub package under `out_dir`.
+    ///
+    /// The action is stateless sidecar-side (it parses the repo's own
+    /// tsconfig), but `ensure_ready` is still required: the stdio transport
+    /// matches requests to responses by strict ordering, so an unconsumed
+    /// init response would otherwise be read as ours.
+    pub fn capture_v2(
+        &self,
+        repo_root: &str,
+        service_name: &str,
+        anchors: &[CaptureAnchor],
+        out_dir: &str,
+    ) -> Result<CaptureV2Result, SidecarError> {
+        self.ensure_ready()?;
+
+        if anchors.is_empty() {
+            return Err(SidecarError::CaptureFailed(
+                "no anchors to capture".to_string(),
+            ));
+        }
+
+        let request_id = self.next_request_id();
+        let request = SidecarRequest::CaptureV2 {
+            request_id: request_id.clone(),
+            repo_root: repo_root.to_string(),
+            service_name: service_name.to_string(),
+            anchors: anchors.to_vec(),
+            out_dir: out_dir.to_string(),
+            tsconfig_path: None,
+        };
+
+        self.send_request(&request)?;
+        // Compiler-heavy: declaration emit + per-alias self-check over the
+        // whole anchor closure. Sized like the sidecar's own CI budget.
+        let value = self.read_result_value(&request_id, Duration::from_secs(300))?;
+        if value.get("status").and_then(|s| s.as_str()) != Some("success") {
+            return Err(SidecarError::CaptureFailed(frame_errors(&value)));
+        }
+        let result: CaptureV2Result = serde_json::from_value(
+            value
+                .get("result")
+                .cloned()
+                .ok_or_else(|| SidecarError::CaptureFailed("no result in response".into()))?,
+        )
+        .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
+        if !result.success {
+            return Err(SidecarError::CaptureFailed(result.errors.join("; ")));
+        }
+        Ok(result)
+    }
+
+    /// Run the v2 "tsc as the judge" check over assembled capture stubs.
+    ///
+    /// The sidecar runs this async (spawned pnpm install + tsc) and emits
+    /// `status: "progress"` keepalive frames before the terminal frame;
+    /// `read_result_value` skips them, so the per-frame deadline only has to
+    /// outlive the keepalive interval, not the whole install.
+    pub fn check_v2(
+        &self,
+        stubs: &[CheckStubInput],
+        pairs: &[CheckPairSpec],
+    ) -> Result<CheckV2Result, SidecarError> {
+        self.ensure_ready()?;
+
+        if stubs.is_empty() || pairs.is_empty() {
+            return Err(SidecarError::CheckFailed(
+                "check_v2 requires at least one stub and one pair".to_string(),
+            ));
+        }
+
+        let request_id = self.next_request_id();
+        let request = SidecarRequest::CheckV2 {
+            request_id: request_id.clone(),
+            stubs: stubs.to_vec(),
+            pairs: pairs.to_vec(),
+            workspace_root: None,
+        };
+
+        self.send_request(&request)?;
+        // Keepalives arrive every ~1.5s during install/check, so a 120s
+        // per-frame deadline detects a dead sidecar without capping the
+        // install itself.
+        let value = self.read_result_value(&request_id, Duration::from_secs(120))?;
+        if value.get("status").and_then(|s| s.as_str()) != Some("success") {
+            return Err(SidecarError::CheckFailed(frame_errors(&value)));
+        }
+        let result: CheckV2Result = serde_json::from_value(
+            value
+                .get("result")
+                .cloned()
+                .ok_or_else(|| SidecarError::CheckFailed("no result in response".into()))?,
+        )
+        .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
+        if !result.success {
+            let mut detail = result.errors.join("; ");
+            if let Some(install_error) = &result.install_error {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(install_error);
+            }
+            return Err(SidecarError::CheckFailed(detail));
+        }
+        Ok(result)
     }
 
     /// Resolve all types (explicit + inferred) in a single operation.
@@ -928,6 +1291,54 @@ impl TypeSidecar {
         Ok(())
     }
 
+    /// Read the terminal JSON frame for `request_id`, skipping the async
+    /// install protocol's `status: "progress"` keepalive frames. `timeout` is
+    /// PER FRAME: each keepalive resets it, so a long pnpm install stays
+    /// alive while a dead sidecar still trips the deadline. Frames for other
+    /// request ids are skipped defensively (strict ordering makes them
+    /// unexpected, but a stale line must not be parsed as our result).
+    fn read_result_value(
+        &self,
+        request_id: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, SidecarError> {
+        let mut stdout = self.stdout.lock().unwrap();
+        let mut line = String::new();
+        let mut frame_start = Instant::now();
+
+        loop {
+            if frame_start.elapsed() > timeout {
+                return Err(SidecarError::Timeout);
+            }
+            line.clear();
+            match stdout.read_line(&mut line) {
+                Ok(0) => return Err(SidecarError::ProcessDied),
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                        SidecarError::DeserializationError(format!("{}: {}", e, trimmed))
+                    })?;
+                    if value.get("request_id").and_then(|id| id.as_str()) != Some(request_id) {
+                        continue;
+                    }
+                    if value.get("status").and_then(|s| s.as_str()) == Some("progress") {
+                        frame_start = Instant::now();
+                        continue;
+                    }
+                    return Ok(value);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => return Err(SidecarError::IoError(e.to_string())),
+            }
+        }
+    }
+
     fn read_response_with_timeout(
         &self,
         timeout: Duration,
@@ -977,6 +1388,22 @@ impl TypeSidecar {
     }
 }
 
+/// Join the `errors` array of a terminal sidecar frame into one message.
+fn frame_errors(value: &serde_json::Value) -> String {
+    value
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "sidecar returned an error with no detail".to_string())
+}
+
 /// Two-anchor arbitration for pub/sub payload anchors (#413, the #403/#359
 /// borrow-class lineage): demote a witnessed-borrowed explicit request when
 /// the same alias's location-based inference resolved a DIFFERENT named root.
@@ -1024,7 +1451,7 @@ impl TypeSidecar {
 ///   machinery as a payload);
 /// - requests without the witness flag — every HTTP/socket/GraphQL request,
 ///   making this function structurally inert outside pub/sub.
-fn demote_witnessed_borrowed_anchors(
+pub(crate) fn demote_witnessed_borrowed_anchors(
     explicit: &[SymbolRequest],
     inferred: &[InferredType],
 ) -> Vec<SymbolRequest> {
@@ -1114,7 +1541,7 @@ fn demote_witnessed_borrowed_anchors(
 /// SDL list marker, #248) are never overwritten; a symbol disagreement means
 /// the anchor doesn't describe the inferred type, so the request is left
 /// untouched.
-fn apply_inferred_array_depth(
+pub(crate) fn apply_inferred_array_depth(
     explicit: &[SymbolRequest],
     inferred: &[InferredType],
 ) -> Vec<SymbolRequest> {
@@ -1187,6 +1614,10 @@ pub enum SidecarError {
     DeserializationError(String),
     /// Definition resolution failed
     ResolutionFailed(String),
+    /// v2 capture failed
+    CaptureFailed(String),
+    /// v2 check failed
+    CheckFailed(String),
 }
 
 impl std::fmt::Display for SidecarError {
@@ -1201,6 +1632,8 @@ impl std::fmt::Display for SidecarError {
             SidecarError::SerializationError(e) => write!(f, "Serialization error: {}", e),
             SidecarError::DeserializationError(e) => write!(f, "Deserialization error: {}", e),
             SidecarError::ResolutionFailed(e) => write!(f, "Definition resolution failed: {}", e),
+            SidecarError::CaptureFailed(e) => write!(f, "v2 capture failed: {}", e),
+            SidecarError::CheckFailed(e) => write!(f, "v2 check failed: {}", e),
         }
     }
 }
@@ -1296,6 +1729,87 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""action":"bundle""#));
         assert!(json.contains(r#""symbols""#));
+    }
+
+    /// The capture-anchor wire tags must match the sidecar validator's
+    /// discriminated union exactly (kind: symbol/handler_return/infer/literal,
+    /// origin strings hyphenated).
+    #[test]
+    fn capture_anchor_wire_shapes() {
+        let symbol = CaptureAnchor::Symbol {
+            alias: "A".into(),
+            symbol_name: "Widget".into(),
+            source_file: "src/types.ts".into(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+            array_depth: Some(2),
+        };
+        let json = serde_json::to_string(&symbol).unwrap();
+        assert!(json.contains(r#""kind":"symbol""#));
+        assert!(json.contains(r#""anchor_origin":"llm-symbol""#));
+        assert!(json.contains(r#""array_depth":2"#));
+
+        let infer = CaptureAnchor::Infer {
+            alias: "B".into(),
+            source_file: "src/pub.ts".into(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            span_start: Some(10),
+            span_end: Some(20),
+            line_number: None,
+            expression_text: None,
+        };
+        let json = serde_json::to_string(&infer).unwrap();
+        assert!(json.contains(r#""kind":"infer""#));
+        assert!(json.contains(r#""anchor_origin":"deterministic-infer""#));
+        assert!(!json.contains("line_number"));
+
+        let literal = CaptureAnchor::Literal {
+            alias: "C".into(),
+            type_text: "{ id: string }".into(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+        };
+        let json = serde_json::to_string(&literal).unwrap();
+        assert!(json.contains(r#""kind":"literal""#));
+        assert!(json.contains(r#""type_text":"{ id: string }""#));
+    }
+
+    /// Check-pair wire shapes: lowercase protocol/type_kind enums, and the
+    /// verdict bucket parses all four classifier values.
+    #[test]
+    fn check_pair_and_verdict_wire_shapes() {
+        let spec = CheckPairSpec {
+            pair_key: "p".into(),
+            protocol: ProbeProtocol::Pubsub,
+            type_kind: ProbeTypeKind::Both,
+            producer: CheckPairEndpoint {
+                service_name: "a".into(),
+                alias: "A".into(),
+            },
+            consumer: CheckPairEndpoint {
+                service_name: "b".into(),
+                alias: "B".into(),
+            },
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains(r#""protocol":"pubsub""#));
+        assert!(json.contains(r#""type_kind":"both""#));
+
+        for (wire, bucket) in [
+            ("compatible", VerdictBucket::Compatible),
+            ("incompatible", VerdictBucket::Incompatible),
+            ("unverifiable", VerdictBucket::Unverifiable),
+            ("gate_caught_baked_any", VerdictBucket::GateCaughtBakedAny),
+        ] {
+            let parsed: VerdictBucket = serde_json::from_str(&format!(r#""{}""#, wire)).unwrap();
+            assert_eq!(parsed, bucket);
+        }
+    }
+
+    #[test]
+    fn frame_errors_joins_and_defaults() {
+        let value = serde_json::json!({"errors": ["a", "b"]});
+        assert_eq!(frame_errors(&value), "a; b");
+        let empty = serde_json::json!({});
+        assert!(frame_errors(&empty).contains("no detail"));
     }
 
     #[test]

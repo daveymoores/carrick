@@ -70,7 +70,7 @@ pub struct TypeEvidence {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TypeManifestEntry {
     /// Operation identity. Flattened so the JSON keeps the flat
-    /// `protocol`/`method`/`path` fields the ts_check matcher reads.
+    /// `protocol`/`method`/`path` fields the manifest matcher reads.
     #[serde(flatten)]
     pub key: OperationKey,
     /// Whether this is a producer or consumer
@@ -110,10 +110,10 @@ pub struct TypeManifestEntry {
 /// identity (never display labels — that is the #324 fail-open trap). Emitted at
 /// scan time from the cross-repo [`crate::analyzer::CrossRepoMatch`] edges this
 /// repo's calls participate in as the consumer, so the cloud MCP
-/// `check_compatibility` tool can surface the REAL ts_check verdict CI already
-/// computes instead of a structural-matching-only answer.
+/// `check_compatibility` tool can surface the REAL type-compat verdict CI
+/// already computes instead of a structural-matching-only answer.
 ///
-/// Only edges ts_check actually EVALUATED are persisted (`type_compatible`
+/// Only edges the check actually EVALUATED are persisted (`type_compatible`
 /// `Some(_)`), so `compatible` is never a fabricated `true`: a pair with no
 /// stored verdict is "not compared", never "compatible". The four key fields are
 /// the exact `OperationKey::canonical()` / `service_name ?? repo_name` strings
@@ -131,12 +131,12 @@ pub struct CompatVerdict {
     /// equal to the persisted `DataFetchingCall::canonical_path` for every edge
     /// that yields a match).
     pub consumer_key: String,
-    /// `true` = ts_check found the request/response types compatible, `false` =
-    /// incompatible. Only evaluated edges reach here, so this is never a
-    /// fabricated `true`.
+    /// `true` = the type check found the request/response types compatible,
+    /// `false` = incompatible. Only evaluated edges reach here, so this is
+    /// never a fabricated `true`.
     pub compatible: bool,
-    /// Populated iff `!compatible`: the human-readable mismatch reason ts_check
-    /// emitted.
+    /// Populated iff `!compatible`: the human-readable mismatch reason the
+    /// check emitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mismatch_reason: Option<String>,
     /// Scanner release that produced this verdict (`CARGO_PKG_VERSION`), so a
@@ -194,7 +194,7 @@ pub struct CloudRepoData {
     /// of that being indistinguishable from "endpoints have no types".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_extraction_status: Option<String>,
-    /// Per-pair ts_check type-compat verdicts for cross-repo edges where THIS
+    /// Per-pair type-compat verdicts for cross-repo edges where THIS
     /// repo's calls are the consumer, keyed by canonical pair identity (#351).
     /// Additive and optional: blobs scanned before this field carry `None`, and
     /// the MCP `check_compatibility` tool falls back to structural-matching-only
@@ -202,6 +202,95 @@ pub struct CloudRepoData {
     /// cross-repo type checking by `attach_compat_verdicts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat_verdicts: Option<Vec<CompatVerdict>>,
+    /// v2 capture stub package for this service ("tsc as the serializer"):
+    /// the compiler-emitted declaration tree + pinned deps, captured at scan
+    /// time and re-assembled into the synthetic check workspace at cross-repo
+    /// time. Inline file map for now; WP5 replaces the transport with
+    /// content-addressed S3 tarballs + descriptors. A peer with `None` (or a
+    /// mismatched `artifact_version`) is treated as having no surface: its
+    /// pairs verdict unverifiable with a re-scan reason, never compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_stub: Option<CaptureStubArtifact>,
+}
+
+/// Version of the v2 capture stub artifact schema. Bumped on incompatible
+/// changes; the check phase treats a peer scanned with a different version as
+/// having no surface (its pairs are unverifiable with a re-scan reason).
+pub const CAPTURE_ARTIFACT_VERSION: u32 = 1;
+
+/// The v2 capture stub package as it travels between scan time and check
+/// time: a types-only npm package (package.json + tsconfig.snapshot.json +
+/// carrick-manifest.json + types/ declaration tree) flattened to a file map.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CaptureStubArtifact {
+    pub artifact_version: u32,
+    /// `@carrick/<sanitized-service>` package name the stub was emitted as.
+    pub package_name: String,
+    pub ts_version: String,
+    /// True when the source repo had no node_modules at capture time.
+    pub bare_checkout: bool,
+    /// Stub-relative path -> file content. BTreeMap for stable serialization.
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+impl CaptureStubArtifact {
+    /// Read a capture stub directory (as produced by `capture_v2`) into the
+    /// wire artifact.
+    pub fn from_stub_dir(
+        stub_dir: &std::path::Path,
+        package_name: &str,
+        ts_version: &str,
+        bare_checkout: bool,
+    ) -> std::io::Result<Self> {
+        let mut files = std::collections::BTreeMap::new();
+        collect_stub_files(stub_dir, stub_dir, &mut files)?;
+        Ok(Self {
+            artifact_version: CAPTURE_ARTIFACT_VERSION,
+            package_name: package_name.to_string(),
+            ts_version: ts_version.to_string(),
+            bare_checkout,
+            files,
+        })
+    }
+
+    /// Write the artifact back out as a stub directory under `dest`.
+    pub fn materialize(&self, dest: &std::path::Path) -> std::io::Result<()> {
+        for (rel, content) in &self.files {
+            let path = dest.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, content)?;
+        }
+        Ok(())
+    }
+}
+
+fn collect_stub_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    files: &mut std::collections::BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // node_modules only appears transiently (self-check symlink); it
+            // must never ride the artifact.
+            if entry.file_name() == "node_modules" {
+                continue;
+            }
+            collect_stub_files(root, &path, files)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.insert(rel, std::fs::read_to_string(&path)?);
+        }
+    }
+    Ok(())
 }
 
 impl CloudRepoData {
@@ -277,6 +366,7 @@ impl CloudRepoData {
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }
     }
 }
@@ -401,12 +491,12 @@ pub trait CloudStorage {
     ) -> Result<(), StorageError>;
 }
 
-/// Attach per-pair ts_check verdicts to each service payload, for the cross-repo
+/// Attach per-pair type-compat verdicts to each service payload, for the cross-repo
 /// edges where that service is the CONSUMER. Reads the verdicts off the
 /// `CrossRepoMatch` edges `get_results` produced (compat already overlaid), and
 /// keys each by the canonical pair identity the cloud reconstructs (#351/#324).
 ///
-/// Fail-closed by construction: only edges ts_check actually evaluated
+/// Fail-closed by construction: only edges the check actually evaluated
 /// (`type_compatible.is_some()`) become a `CompatVerdict`; an unevaluated or
 /// unmatched pair simply has no stored verdict, which the cloud reads as "not
 /// compared", never "compatible". Multiple call sites collapsing onto one
@@ -434,7 +524,7 @@ pub fn attach_compat_verdicts(
                 continue;
             }
             let Some(compatible) = m.type_compatible else {
-                // ts_check did not evaluate this edge — persist nothing so the
+                // The check did not evaluate this edge — persist nothing so the
                 // cloud falls back to structural-matching-only (fail closed).
                 continue;
             };
@@ -498,9 +588,9 @@ mod tests {
     use super::*;
     use crate::services::type_sidecar::InferKind;
 
-    /// The flattened key is the wire contract with ts_check's manifest
-    /// matcher: entries must serialize with flat `protocol`/`method`/`path`
-    /// fields, and round-trip back into the tagged key.
+    /// The flattened key is the wire contract with the manifest matcher:
+    /// entries must serialize with flat `protocol`/`method`/`path` fields,
+    /// and round-trip back into the tagged key.
     #[test]
     fn manifest_entry_serializes_flat_protocol_fields() {
         let key = OperationKey::http("GET", "/api/users/:id");
@@ -596,6 +686,7 @@ mod tests {
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }
     }
 

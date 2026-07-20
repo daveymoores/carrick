@@ -19,12 +19,11 @@
 //! (`CARRICK_MOCK_FIXTURE_DIR`), so the run is deterministic, network-free and
 //! OIDC-free — it runs under plain `cargo test`.
 //!
-//! `ts_check_dir` is auto-discovered by the binary (it resolves
-//! `<CARGO_MANIFEST_DIR>/ts_check`), so Phase B supplies it and cross-repo type
-//! checking *runs* rather than being silently skipped. The corpus fixtures here
-//! carry no resolvable `.d.ts`, so the check itself only `warn!`s — but the
-//! `ts_check_dir` path is wired, which is the load-bearing seam the contract's
-//! §7 guard depends on (see the doc-comment on `phase_b`).
+//! The type sidecar is auto-discovered by the binary, so Phase B runs
+//! cross-repo type checking rather than silently skipping it. The corpus
+//! fixtures here carry no resolvable types, so the check itself finds nothing
+//! to verify — but the sidecar seam is wired, which is the load-bearing seam
+//! the contract's §7 guard depends on (see the doc-comment on `phase_b`).
 //!
 //! INTEGRATION SEAM (S1, #200): today's `EvalProjection` carries only
 //! `endpoints` + `calls`, so Phase B asserts the merged set spans all repos.
@@ -171,9 +170,9 @@ fn phase_a(bin: &Path, repo: &Path, cache_dir: &Path) {
 /// `build_cross_repo_analyzer` joins them. `CARRICK_OUTPUT_JSON` makes the
 /// engine emit the merged `EvalProjection` to stdout.
 ///
-/// `ts_check_dir` is auto-discovered by the binary, so cross-repo type checking
-/// *runs* (the contract's §7 trap is that a missing dir silently absents compat
-/// data). The harness asserts type checking was not silently skipped.
+/// The type sidecar is auto-discovered by the binary, so cross-repo type
+/// checking *runs* (the contract's §7 trap is that a missing sidecar silently
+/// absents compat data). The harness asserts type checking was not skipped.
 fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path) -> (EvalProjection, String) {
     let cassettes = cassette_dir(repo);
     let mut cmd = Command::new(bin);
@@ -198,17 +197,15 @@ fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path) -> (EvalProjection, String
         "Phase B scan exited non-zero:\n{stderr}"
     );
 
-    // The §7 ts_check_dir guard: cross-repo type checking only runs when
-    // ts_check_dir is Some. If the binary couldn't find ts_check/ it logs a
+    // The §7 guard: cross-repo type checking only runs when the type sidecar
+    // is available. If the binary couldn't find it, the engine logs a
     // "Skipping type checking" warning — fail loud rather than let a future
     // compat scorer misread silently-absent verdicts as "all compatible".
     assert!(
         !stderr.contains("Skipping type checking"),
-        "ts_check/ was not found, so cross-repo type checking was silently \
-         skipped — compat data would be absent, not 'all compatible'. \
-         discover_ts_check_path() resolves ts_check/run-type-checking.ts; \
-         ensure the ts_check/ dir is present at the repo root (it ships with \
-         the checkout).\n{stderr}"
+        "the type sidecar was not found, so cross-repo type checking was \
+         silently skipped — compat data would be absent, not 'all compatible'. \
+         Ensure src/sidecar is built (npm ci && npm run build).\n{stderr}"
     );
 
     let stdout = String::from_utf8(output.stdout).expect("Phase B stdout was not UTF-8");

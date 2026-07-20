@@ -58,12 +58,11 @@ jobs:
         run: |
           mkdir -p release/sidecar
           cp target/x86_64-unknown-linux-gnu/release/carrick release/
-          cp -r ts_check release/
           cp -r src/sidecar/dist release/sidecar/dist
           cp src/sidecar/package.json release/sidecar/
           cp src/sidecar/package-lock.json release/sidecar/
           cd release
-          tar -czf carrick-action-linux.tar.gz carrick ts_check sidecar
+          tar -czf carrick-action-linux.tar.gz carrick sidecar
 
       - name: Upload release artifact
         uses: softprops/action-gh-release@v2

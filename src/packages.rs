@@ -202,19 +202,6 @@ impl Packages {
         &self.merged_dependencies
     }
 
-    /// Names the scanned repo declares itself (loaded package.json files plus
-    /// the tree-walked `internal_names`, which covers non-service workspace
-    /// members). A dependency on one of these is an internal,
-    /// registry-unresolvable link (e.g. an npm-workspaces package like
-    /// `@meridian/contracts`), not an installable third-party package.
-    pub fn internal_package_names(&self) -> std::collections::HashSet<String> {
-        self.package_jsons
-            .iter()
-            .filter_map(|p| p.name.clone())
-            .chain(self.internal_names.iter().cloned())
-            .collect()
-    }
-
     /// Merged dependency names cleaned for cloud requests: the cloud drops
     /// entries with whitespace or longer than 256 chars and caps the list at
     /// [`DEPENDENCY_NAME_CAP`], so filter here and send only well-formed

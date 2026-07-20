@@ -43,7 +43,6 @@ jobs:
             tests/fixtures/fastify-api/package.json
             tests/fixtures/koa-api/package.json
             src/sidecar/package-lock.json
-            ts_check/package-lock.json
 
       - name: Install test dependencies
         run: |
@@ -92,12 +91,9 @@ jobs:
       - name: Run sidecar unit tests
         run: cd src/sidecar && npm test
 
-      - name: Run ts_check unit tests
-        run: cd ts_check && npm ci && npm test
-
-      # After the ts_check step: this test spawns the real binary over the
-      # pubsub-wrapper-monorepo fixture (cassette-mocked LLM, real sidecar) and
-      # the scan drives ts_check, so its node_modules must exist.
+      # After the sidecar build: this test spawns the real binary over the
+      # pubsub-wrapper-monorepo fixture (cassette-mocked LLM, real sidecar), so
+      # the sidecar's dist + node_modules must exist.
       - name: Run pub/sub wrapper type-capture test
         run: cargo test --test pubsub_wrapper_type_capture_test --verbose
 

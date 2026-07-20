@@ -1,0 +1,9 @@
+{
+  "name": "capture-v2-bare",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fakelib": "^1.4.0",
+    "leftpad-never-referenced": "^9.9.9"
+  }
+}

@@ -221,6 +221,79 @@ export const EmitSurfaceRequestSchema = BaseRequestSchema.extend({
   output_path: z.string().min(1, 'Output path cannot be empty'),
 });
 
+/** v2 "tsc as serializer" capture (contract in ./capture/api.ts). */
+const AnchorOriginSchema = z.enum(['llm-symbol', 'deterministic-infer', 'anchor-backfill']);
+
+const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('symbol'),
+    alias: z.string().min(1),
+    symbol_name: z.string().min(1),
+    source_file: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
+    array_depth: z.number().int().nonnegative().optional(),
+  }),
+  z.object({
+    kind: z.literal('handler_return'),
+    alias: z.string().min(1),
+    symbol_name: z.string().min(1),
+    source_file: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
+  }),
+  z.object({
+    kind: z.literal('infer'),
+    alias: z.string().min(1),
+    source_file: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
+    span_start: z.number().int().nonnegative().optional(),
+    span_end: z.number().int().nonnegative().optional(),
+    line_number: z.number().int().positive().optional(),
+    expression_text: z.string().optional(),
+    unwrap: z.enum(['awaited', 'none']).optional(),
+  }),
+  z.object({
+    kind: z.literal('literal'),
+    alias: z.string().min(1),
+    type_text: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
+  }),
+]);
+
+export const CaptureV2RequestSchema = BaseRequestSchema.extend({
+  action: z.literal('capture_v2'),
+  repo_root: z.string().min(1, 'Repo root cannot be empty'),
+  service_name: z.string().min(1, 'Service name cannot be empty'),
+  anchors: z.array(CaptureAnchorRequestSchema).min(1, 'At least one anchor is required'),
+  out_dir: z.string().min(1, 'Output dir cannot be empty'),
+  tsconfig_path: z.string().optional(),
+});
+
+const CheckStubInputSchema = z.object({
+  service_name: z.string().min(1),
+  stub_dir: z.string().min(1),
+});
+
+const CheckPairEndpointSchema = z.object({
+  service_name: z.string().min(1),
+  alias: z.string().min(1),
+});
+
+const CheckPairSpecSchema = z.object({
+  pair_key: z.string().min(1),
+  protocol: z.enum(['http', 'graphql', 'socket', 'pubsub']),
+  type_kind: z.enum(['request', 'response', 'both']),
+  producer: CheckPairEndpointSchema,
+  consumer: CheckPairEndpointSchema,
+});
+
+export const CheckV2RequestSchema = BaseRequestSchema.extend({
+  action: z.literal('check_v2'),
+  stubs: z.array(CheckStubInputSchema).min(1, 'At least one stub is required'),
+  pairs: z.array(CheckPairSpecSchema).min(1, 'At least one pair is required'),
+  workspace_root: z.string().optional(),
+  keep_workspace: z.boolean().optional(),
+});
+
 export const InferRequestSchema = BaseRequestSchema.extend({
   action: z.literal('infer'),
   requests: z.array(InferRequestItemSchema).min(1, 'At least one infer request is required'),
@@ -249,7 +322,7 @@ export const ShutdownRequestSchema = BaseRequestSchema.extend({
 
 export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('resolve_definitions'),
-  bundled_dts: z.string().min(1, 'Bundled .d.ts content cannot be empty'),
+  stub_dir: z.string().min(1, 'Stub dir cannot be empty'),
   aliases: z.array(z.string().min(1)).min(1, 'At least one alias is required'),
 });
 
@@ -264,6 +337,8 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   InitRequestSchema,
   BundleRequestSchema,
   EmitSurfaceRequestSchema,
+  CaptureV2RequestSchema,
+  CheckV2RequestSchema,
   InferRequestSchema,
   BuildWorkspaceRequestSchema,
   CheckCompatibilityRequestSchema,

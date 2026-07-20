@@ -55,8 +55,8 @@ see the scorer header in `tests/eval_xrepo.rs` and the contract in
 - Offline harness: `tests/xrepo_harness_test.rs` (corpus via
   `CARRICK_XREPO_CORPUS`, no LLM calls).
 
-Local live invocation (corpus repo deps installed, sidecar + ts_check built —
-the workflow steps in `.github/workflows/eval-xrepo.yml` are the reference
+Local live invocation (corpus repo deps installed, sidecar built — the
+workflow steps in `.github/workflows/eval-xrepo.yml` are the reference
 sequence):
 
 ```bash
@@ -105,8 +105,8 @@ recall per edge from the `[diag]` lines, never the run mean.
 
 ## Where results go
 
-- CI logs print the score report; workflow artifacts carry `ts_check/output/`
-  and `target/eval-runs/*.jsonl` for post-run diagnosis.
+- CI logs print the score report; workflow artifacts carry
+  `target/eval-runs/*.jsonl` for post-run diagnosis.
 - Tier-A / xrepo corpus history is durable in the Axiom `carrick-evals`
   dataset (carrick-cloud `eval-ingest`).
 - OSS runs are deliberately NOT pushed to Axiom; findings are logged in the

@@ -6,7 +6,7 @@ use crate::cloud_storage::{
     CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
     TypeManifestEntry, get_current_commit_hash, mount_graph_to_api_details,
 };
-use crate::config::{Config, create_dynamic_tsconfig};
+use crate::config::Config;
 use crate::file_finder::find_service_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::intent_generator::{generate_function_intents, intents_by_hash};
@@ -35,13 +35,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use serde::Serialize;
 use swc_common::{
     SourceMap,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
 use swc_ecma_visit::VisitWith;
+
+mod type_compat_v2;
 
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
 /// 4: EndpointResult gained `emission_style` — pre-4 cached results would
@@ -143,7 +144,7 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_analysis_engine_with_sidecar(storage, repo_path, None, false, None).await
+    run_analysis_engine_with_sidecar(storage, repo_path, None, false).await
 }
 
 /// Run analysis engine with optional sidecar for type extraction.
@@ -157,10 +158,8 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     no_cache: bool,
-    ts_check_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result =
-        run_analysis_engine_inner(&storage, repo_path, sidecar, no_cache, ts_check_dir).await;
+    let result = run_analysis_engine_inner(&storage, repo_path, sidecar, no_cache).await;
     upload_run_logs(&storage, repo_path).await;
     result
 }
@@ -170,7 +169,6 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     no_cache: bool,
-    ts_check_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let should_upload = should_upload_data();
     debug!(upload = should_upload, "Running Carrick in CI mode");
@@ -271,7 +269,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
     //    until after cross-repo analysis (step 6) so every payload can carry the
-    //    per-pair ts_check compat verdicts that analysis computes (#351). Every
+    //    per-pair type-compat verdicts that analysis computes (#351). Every
     //    payload is materialised now (cheap clones), so a serialization problem
     //    can't surface halfway through a multi-service upload.
     //
@@ -420,10 +418,10 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
-        match build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await {
+        match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
             Ok(analyzer) => analyzer,
             Err(e) => {
-                // Cross-repo analysis (which is what runs ts_check) failed. Close
+                // Cross-repo analysis (which is what runs the type check) failed. Close
                 // the spinner with a warning first so the upload's own spinner
                 // and log lines don't interleave with an unfinished one in
                 // non-TTY CI logs, then preserve the prior behavior where the
@@ -453,11 +451,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         return Ok(());
     }
 
-    // 6b. Upload each service's data, now carrying the per-pair ts_check compat
+    // 6b. Upload each service's data, now carrying the per-pair type-compat
     //     verdicts cross-repo analysis just computed for the edges this repo's
     //     calls consume (#351). Keyed by canonical pair identity so the cloud
     //     MCP `check_compatibility` tool can surface the real verdict instead of
-    //     structural-matching-only. Absent for edges ts_check didn't evaluate,
+    //     structural-matching-only. Absent for edges the check didn't evaluate,
     //     which the cloud reads as "not compared" (fail closed, #324).
     if let Some(mut payloads) = upload_payloads {
         crate::cloud_storage::attach_compat_verdicts(&mut payloads, &results.cross_repo_matches);
@@ -1199,8 +1197,8 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator.collect_pubsub_infer_requests(&merged_results, repo_path),
             );
 
-            // Type resolution via sidecar
-            resolve_types_if_available(
+            // Type resolution via sidecar (+ v2 capture stub for this service)
+            let stub_dir = resolve_types_if_available(
                 sidecar,
                 &file_orchestrator,
                 &merged_results,
@@ -1219,9 +1217,12 @@ async fn analyze_current_repo_incremental(
                 cloud_data.bundled_types = Some(updated);
             }
 
-            // Resolve per-endpoint definitions via compiler
-            if let Some(sidecar) = sidecar {
-                resolve_per_endpoint_definitions(sidecar, &mut cloud_data);
+            // Resolve per-endpoint definitions from the capture stub tree
+            if let (Some(sidecar), Some(stub_dir)) = (sidecar, stub_dir.as_deref()) {
+                resolve_per_endpoint_definitions(sidecar, &mut cloud_data, stub_dir);
+            }
+            if let Some(stub_dir) = stub_dir {
+                let _ = std::fs::remove_dir_all(&stub_dir);
             }
 
             return Ok(cloud_data);
@@ -1690,8 +1691,8 @@ fn append_pubsub_manifest_entries(
             let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
             // Publishers (consumers) disambiguate by call site. Two repos
             // publishing to the same topic (fan-in — the common event-driven
-            // shape) otherwise hash to ONE consumer alias, and ts_check's bundled
-            // `cross-repo-consumers` types then declare that interface twice with
+            // shape) otherwise hash to ONE consumer alias, and the merged
+            // consumer declarations then define that interface twice with
             // different bodies — one publisher's payload masks the other's,
             // yielding a spurious compat mismatch on whichever loses. Mirror the
             // HTTP consumer path (`add_manifest_pair` + `build_call_site_id`).
@@ -1728,20 +1729,70 @@ fn append_pubsub_manifest_entries(
 /// (logged at debug): without an SDL producer there is no manifest entry to join
 /// back to, so a resolver location alone is inert.
 ///
+/// Two deterministic guards harden the join against misattributed claims (the
+/// corpus-3 `query ticket` live-eval false-incompatible: the model linked a
+/// NestJS HTTP handler returning a ticket-SHAPED object as the field's
+/// resolver, and its inferred return then rode the producer's type surface
+/// into a confidently wrong verdict):
+///
+/// 1. **HTTP-handler borrow witness**: a claim whose `resolver_function`
+///    names a function the SAME file's analysis bound as an HTTP endpoint
+///    handler (`endpoints[].handler_name`) is dropped. The witness is the
+///    model's own output — a function it identified as the handler of an
+///    HTTP route is that route's contract, not a schema field's resolver.
+///    Framework-agnostic: no framework names, only structural agreement
+///    within one `FileAnalysisResult`.
+/// 2. **Cross-claim ambiguity fails closed**: claims are collected over a
+///    SORTED file order (never `HashMap` iteration order, which previously
+///    let the last writer win nondeterministically), and when two surviving
+///    claims for one producer key disagree on `(file, function)` — or two
+///    backing-type claims disagree on `(file, symbol)` — the location is
+///    dropped entirely. An unlocated producer abstains (type_state stays
+///    `Unknown`, its pairs verdict unverifiable) — never a coin-flip between
+///    a right and a wrong site.
+///
+/// A resolver-location claim beats a backing-type claim for the same key
+/// (the resolver-first gate, 186cb27), now across files as well as within
+/// one op — previously a backing-only claim from a later file could smear
+/// its `resolver_file` under another file's `resolver_line`.
+///
 /// Consumers are never touched — they anchor on `payload_type_symbol`.
 fn merge_graphql_resolver_locations(
     graphql: &mut crate::graphql::GraphqlExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) {
     // Canonical producer key -> index, so each LLM op joins in O(1) without an
-    // N×M scan. A schema field has at most one root producer, so the last write
-    // wins is moot (keys are unique across producers).
+    // N×M scan (keys are unique across producers).
     let mut by_key: HashMap<String, usize> = HashMap::new();
     for (idx, op) in graphql.producers.iter().enumerate() {
         by_key.insert(op.key.canonical(), idx);
     }
 
-    for (path, result) in file_results {
+    // Claims are collected fully before anything is applied, so a conflicting
+    // later claim voids the location instead of racing for it.
+    // producer idx -> (file, resolver function, 1-based line).
+    let mut resolver_claims: HashMap<usize, (String, String, u32)> = HashMap::new();
+    let mut resolver_conflicts: HashSet<usize> = HashSet::new();
+    // producer idx -> (file, backing symbol, backing source).
+    #[allow(clippy::type_complexity)]
+    let mut backing_claims: HashMap<usize, (String, String, Option<String>)> = HashMap::new();
+    let mut backing_conflicts: HashSet<usize> = HashSet::new();
+
+    let mut paths: Vec<&String> = file_results.keys().collect();
+    paths.sort();
+    for path in paths {
+        let result = &file_results[path];
+        if result.graphql_operations.is_empty() {
+            continue;
+        }
+        // Borrow witness evidence: every function name this file's analysis
+        // bound as an HTTP endpoint handler.
+        let handler_names: HashSet<&str> = result
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.handler_name.trim())
+            .filter(|name| !name.is_empty())
+            .collect();
         for llm_op in &result.graphql_operations {
             let key = OperationKey::graphql(llm_op.kind, llm_op.field.clone());
             let Some(&idx) = by_key.get(&key.canonical()) else {
@@ -1752,13 +1803,29 @@ fn merge_graphql_resolver_locations(
                 );
                 continue;
             };
-            let producer = &mut graphql.producers[idx];
-            producer.resolver_file = Some(PathBuf::from(path));
             // Trim before the emptiness check: a whitespace-only string (e.g.
-            // " ") from the model is not a resolver function name, and letting
-            // it through here would wrongly take the FunctionReturn path and
-            // block the type-locate fallback below, leaving the producer
-            // unanchored.
+            // " ") from the model is not a resolver function name.
+            let resolver_name = llm_op
+                .resolver_function
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            // Guard 1: the claimed resolver is an HTTP endpoint handler in the
+            // same file analysis — the misattribution class. Drop the whole
+            // claim (a resolver-named op carries no backing type by schema
+            // contract, and a contract-violating one must not smuggle one in).
+            if let Some(name) = resolver_name
+                && handler_names.contains(name)
+            {
+                debug!(
+                    op = %key.canonical(),
+                    file = %path,
+                    function = %name,
+                    "graphql resolver claim names an HTTP endpoint handler from the \
+                     same file's analysis; dropping the claim (borrow witness)"
+                );
+                continue;
+            }
             // The FunctionReturn path needs BOTH a real resolver name AND a
             // usable line: `collect_graphql_producer_infer_requests` skips any
             // producer missing either, so taking this branch with a dead
@@ -1768,28 +1835,92 @@ fn merge_graphql_resolver_locations(
             // request's line_number is u32, and a 0/negative line can't anchor
             // a fn), and treat a clamped-out line exactly like a missing
             // resolver: fall through to the backing-type fallback.
-            let resolver_line = llm_op
-                .resolver_function
-                .as_deref()
-                .filter(|f| !f.trim().is_empty())
+            let resolver_line = resolver_name
                 .and(llm_op.resolver_line)
                 .and_then(|line| u32::try_from(line).ok())
                 .filter(|&line| line > 0);
-            if resolver_line.is_some() {
-                // Resolver located: its concrete return type carries the
-                // wrappers (Promise / ApiResponse envelope / async-iterator) the
-                // bare SDL-backed type can't, so the FunctionReturn path wins.
-                producer.resolver_line = resolver_line;
+            if let Some(line) = resolver_line {
+                let name = resolver_name.unwrap_or_default().to_string();
+                match resolver_claims.get(&idx) {
+                    Some((prev_file, prev_name, _))
+                        if prev_file != path.as_str() || prev_name != &name =>
+                    {
+                        // Guard 2: two files (or two ops) disagree on where the
+                        // resolver lives — ambiguous, fail closed below.
+                        resolver_conflicts.insert(idx);
+                        debug!(
+                            op = %key.canonical(),
+                            first = %format!("{prev_file}:{prev_name}"),
+                            second = %format!("{path}:{name}"),
+                            "conflicting graphql resolver claims"
+                        );
+                    }
+                    Some(_) => {} // Duplicate of the accepted claim.
+                    None => {
+                        resolver_claims.insert(idx, (path.clone(), name, line));
+                    }
+                }
             } else if let Some(symbol) = llm_op.backing_type_symbol.clone() {
-                // No resolver function: fall back to the co-located backing type
-                // the LLM located (#248). Keyed on the dedicated
-                // `backing_type_symbol` (never `primary_type_symbol`, which
-                // describes a resolver's return type) so this can only fire for a
-                // genuinely resolver-less field. The sidecar bundles + structurally
-                // expands it and wraps it in the SDL list depth.
-                producer.response_type_symbol = Some(symbol);
-                producer.response_type_source = llm_op.backing_type_source.clone();
+                // No resolver function: the co-located backing type the LLM
+                // located (#248). Keyed on the dedicated `backing_type_symbol`
+                // (never `primary_type_symbol`, which describes a resolver's
+                // return type) so this can only fire for a genuinely
+                // resolver-less field.
+                match backing_claims.get(&idx) {
+                    Some((prev_file, prev_symbol, _))
+                        if prev_file != path.as_str() || prev_symbol != &symbol =>
+                    {
+                        backing_conflicts.insert(idx);
+                        debug!(
+                            op = %key.canonical(),
+                            first = %format!("{prev_file}:{prev_symbol}"),
+                            second = %format!("{path}:{symbol}"),
+                            "conflicting graphql backing-type claims"
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        backing_claims.insert(
+                            idx,
+                            (path.clone(), symbol, llm_op.backing_type_source.clone()),
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    for (idx, producer) in graphql.producers.iter_mut().enumerate() {
+        if resolver_conflicts.contains(&idx) {
+            debug!(
+                op = %producer.key.canonical(),
+                "conflicting resolver locations; leaving the producer unlocated (fail closed)"
+            );
+            continue;
+        }
+        if let Some((file, _name, line)) = resolver_claims.get(&idx) {
+            // Resolver located: its concrete return type carries the wrappers
+            // (Promise / ApiResponse envelope / async-iterator) the bare
+            // SDL-backed type can't, so the FunctionReturn path wins — and a
+            // backing-type claim for the same key (from any file) never
+            // applies alongside it.
+            producer.resolver_file = Some(PathBuf::from(file));
+            producer.resolver_line = Some(*line);
+            continue;
+        }
+        if backing_conflicts.contains(&idx) {
+            debug!(
+                op = %producer.key.canonical(),
+                "conflicting backing-type claims; leaving the producer unlocated (fail closed)"
+            );
+            continue;
+        }
+        if let Some((file, symbol, source)) = backing_claims.get(&idx) {
+            // The sidecar bundles + structurally expands the backing type and
+            // wraps it in the SDL list depth.
+            producer.resolver_file = Some(PathBuf::from(file));
+            producer.response_type_symbol = Some(symbol.clone());
+            producer.response_type_source = source.clone();
         }
     }
 }
@@ -2098,6 +2229,7 @@ fn build_cloud_data_from_mount_graph(
         cache_version: None,
         type_extraction_status: None,
         compat_verdicts: None,
+        capture_stub: None,
     }
 }
 
@@ -2153,6 +2285,9 @@ fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, serv
 
 /// Resolve types via sidecar if available (shared logic for full and incremental paths).
 #[allow(clippy::too_many_arguments)]
+/// Resolve types through the sidecar and run the v2 capture for this
+/// service. Returns the on-disk capture stub dir when capture succeeded (the
+/// definitions re-point reads from it; the caller owns cleanup).
 fn resolve_types_if_available(
     sidecar: Option<&TypeSidecar>,
     file_orchestrator: &FileOrchestrator,
@@ -2164,14 +2299,14 @@ fn resolve_types_if_available(
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     cloud_data: &mut CloudRepoData,
-) {
+) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
         cloud_data.type_extraction_status = Some(
             "type extraction skipped: sidecar unavailable (not found, failed to start, \
              or failed to initialize)"
                 .to_string(),
         );
-        return;
+        return None;
     };
 
     debug!("Starting sidecar type resolution");
@@ -2218,12 +2353,33 @@ fn resolve_types_if_available(
                                 .to_string(),
                         );
                     }
+
+                    // v2 capture ("tsc as the serializer"): derive anchors
+                    // from the SAME collected requests the bundle path used —
+                    // collect_type_requests is deterministic over the same
+                    // inputs, so the aliases are byte-identical to the
+                    // manifest join keys. The #413 borrow-witness demotion and
+                    // the inference-resolved array depths are applied exactly
+                    // as resolve_all_types does (#306).
+                    run_capture_for_service(
+                        sidecar,
+                        file_orchestrator,
+                        file_results,
+                        repo_path,
+                        mount_graph,
+                        config,
+                        extra_explicit,
+                        extra_infer,
+                        &type_resolution,
+                        cloud_data,
+                    )
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
                     debug!("Continuing without bundled types");
                     cloud_data.type_extraction_status =
                         Some(format!("type resolution failed: {}", e));
+                    None
                 }
             }
         }
@@ -2232,6 +2388,83 @@ fn resolve_types_if_available(
             debug!("Skipping type resolution");
             cloud_data.type_extraction_status =
                 Some(format!("type extraction skipped: sidecar not ready: {}", e));
+            None
+        }
+    }
+}
+
+/// Derive capture anchors and run `capture_v2` for one service, storing the
+/// stub artifact on its `CloudRepoData`. Returns the on-disk stub dir for
+/// the definitions re-point (caller cleans it up). Non-fatal: a degraded
+/// capture leaves `capture_stub` unset — the service's cross-repo pairs then
+/// verdict unverifiable, never silently compatible.
+#[allow(clippy::too_many_arguments)]
+fn run_capture_for_service(
+    sidecar: &TypeSidecar,
+    file_orchestrator: &FileOrchestrator,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
+    mount_graph: &MountGraph,
+    config: &Config,
+    extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
+    extra_infer: &[crate::services::type_sidecar::InferRequestItem],
+    type_resolution: &TypeResolutionResult,
+    cloud_data: &mut CloudRepoData,
+) -> Option<PathBuf> {
+    let (mut explicit, mut infer, inline_aliases) =
+        file_orchestrator.collect_type_requests(file_results, repo_path, mount_graph, config);
+    explicit.extend_from_slice(extra_explicit);
+    infer.extend_from_slice(extra_infer);
+    // Mirror resolve_all_types' post-processing exactly: the #413 two-anchor
+    // arbitration re-aims witnessed-borrowed pub/sub anchors at the
+    // tsc-witnessed payload root BEFORE depths apply, so v2 capture anchors
+    // the same symbol the v1 bundle defines the alias from.
+    let explicit = crate::services::type_sidecar::demote_witnessed_borrowed_anchors(
+        &explicit,
+        &type_resolution.inferred_types,
+    );
+    let explicit = crate::services::type_sidecar::apply_inferred_array_depth(
+        &explicit,
+        &type_resolution.inferred_types,
+    );
+
+    let anchors = type_compat_v2::derive_capture_anchors(
+        &explicit,
+        &infer,
+        &inline_aliases,
+        &type_resolution.inferred_types,
+        repo_path,
+    );
+    if anchors.is_empty() {
+        return None;
+    }
+
+    let service_id = cloud_data
+        .service_name
+        .clone()
+        .unwrap_or_else(|| cloud_data.repo_name.clone());
+    // Literal texts for the last-resort backfill re-anchor: when capture
+    // demotes an alias (e.g. its file's declaration emit was skipped), the
+    // scanner's own v1 resolution text for the same alias — when it carries a
+    // real shape — re-anchors it as a literal at `anchor-backfill` origin.
+    let backfill_texts = type_compat_v2::derive_backfill_texts(
+        &type_resolution.explicit_manifest,
+        &type_resolution.inferred_types,
+    );
+    match type_compat_v2::run_capture(sidecar, repo_path, &service_id, &anchors, &backfill_texts) {
+        Some((stub_dir, artifact)) => {
+            cloud_data.capture_stub = Some(artifact);
+            Some(stub_dir)
+        }
+        None => {
+            if cloud_data.type_extraction_status.is_none() {
+                cloud_data.type_extraction_status = Some(
+                    "v2 type capture degraded: no stub package was produced; cross-repo \
+                     type compatibility for this service will report unverifiable"
+                        .to_string(),
+                );
+            }
+            None
         }
     }
 }
@@ -2374,18 +2607,8 @@ fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::
 }
 
 /// Build-artifact directories to skip everywhere.
-///
-/// `ts_check` is the scanner's own bundled type-checker, which sits at the scan
-/// root when the GitHub Action runs `./carrick .`. It's only ignored for the
-/// implicit whole-repo scan (`directory: None`); an explicitly declared service
-/// directory is honoured even if it is named `ts_check`, so a repo can index
-/// such a directory on purpose.
-fn service_ignore_patterns(service: &Config) -> Vec<&'static str> {
-    let mut patterns = vec!["node_modules", "dist", "build", ".next"];
-    if service.directory.is_none() {
-        patterns.push("ts_check");
-    }
-    patterns
+fn service_ignore_patterns(_service: &Config) -> Vec<&'static str> {
+    vec!["node_modules", "dist", "build", ".next"]
 }
 
 /// Load the package data for a single service, scoped to its own
@@ -2415,13 +2638,14 @@ fn load_packages_for_service(
     Ok(packages)
 }
 
-/// Resolve per-endpoint type definitions using the sidecar's compiler.
+/// Resolve per-endpoint type definitions from the v2 capture stub tree.
 /// Populates `resolved_definition` and `expanded_definition` on each manifest entry.
 /// Non-fatal: if resolution fails, entries keep their None values and the MCP falls back to regex.
-fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut CloudRepoData) {
-    let Some(ref bundled_types) = cloud_data.bundled_types else {
-        return;
-    };
+fn resolve_per_endpoint_definitions(
+    sidecar: &TypeSidecar,
+    cloud_data: &mut CloudRepoData,
+    stub_dir: &Path,
+) {
     let Some(ref mut manifest) = cloud_data.type_manifest else {
         return;
     };
@@ -2444,7 +2668,7 @@ fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut Clou
         aliases.len()
     );
 
-    match sidecar.resolve_definitions(bundled_types, &aliases) {
+    match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
         Ok(resolved) => {
             let lookup: std::collections::HashMap<String, _> = resolved
                 .into_iter()
@@ -2489,7 +2713,7 @@ fn build_type_manifest_entries(
         }
         // Call-site-evidence entries (#379) never anchor Producer types: they
         // are client encodings of an external contract, and a producer
-        // manifest entry would make ts_check run a request-vs-request
+        // manifest entry would make the type check run a request-vs-request
         // comparison mislabelled as a producer-contract verdict. Their pairs
         // are verdict-exempt at the source; the site's Consumer entry is
         // still emitted from the twin data call below.
@@ -2757,15 +2981,19 @@ fn enrich_manifest_with_type_resolution(
         }
 
         if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
-            // Check if the type is actually resolved (not "unknown")
-            let is_unknown_type = type_string.trim() == "unknown"
-                || type_string.trim() == "any"
-                || type_string.is_empty()
+            // Check if the type is actually resolved. The shared
+            // disqualifying-top-type notion (adversarial-review finding 2)
+            // rejects not just whole-string "any"/"unknown" but any/unknown
+            // at ANY position — `any[]`, `Promise<any>`, `Record<string,
+            // any>`, `{ metadata: any }` — matching the capture self-check's
+            // deep walk, so the two layers agree on what counts as resolved.
+            let is_unknown_type = type_string.trim().is_empty()
+                || type_compat_v2::contains_disqualifying_top_type(type_string)
                 || dts_trivially_unknown(&entry.type_alias);
 
             if is_unknown_type {
                 // Downgrade to Unknown so the `= unknown` placeholder gate
-                // (resolve_per_endpoint_definitions, ts_check) stays shut and the
+                // (resolve_per_endpoint_definitions, check_v2 pre-gates) stays shut and the
                 // edge is reported unverifiable rather than falsely compatible.
                 entry.is_explicit = false;
                 entry.type_state = ManifestTypeState::Unknown;
@@ -2812,13 +3040,6 @@ fn enrich_manifest_with_type_resolution(
         "Manifest enrichment: {} explicit, {} implicit, {} unknown",
         explicit_count, implicit_count, unknown_count
     );
-}
-
-#[derive(Serialize)]
-struct TypeManifestFile {
-    repo_name: String,
-    commit_hash: String,
-    entries: Vec<TypeManifestEntry>,
 }
 
 async fn analyze_current_repo(
@@ -2992,7 +3213,7 @@ async fn analyze_current_repo(
         file_orchestrator.collect_pubsub_infer_requests(&analysis_result.file_results, repo_path),
     );
 
-    resolve_types_if_available(
+    let stub_dir = resolve_types_if_available(
         sidecar,
         &file_orchestrator,
         &analysis_result.file_results,
@@ -3010,9 +3231,12 @@ async fn analyze_current_repo(
         cloud_data.bundled_types = Some(updated);
     }
 
-    // 6b. Resolve per-endpoint definitions via compiler
-    if let Some(sidecar) = sidecar {
-        resolve_per_endpoint_definitions(sidecar, &mut cloud_data);
+    // 6b. Resolve per-endpoint definitions from the capture stub tree
+    if let (Some(sidecar), Some(stub_dir)) = (sidecar, stub_dir.as_deref()) {
+        resolve_per_endpoint_definitions(sidecar, &mut cloud_data, stub_dir);
+    }
+    if let Some(stub_dir) = &stub_dir {
+        let _ = std::fs::remove_dir_all(stub_dir);
     }
 
     // 7. Populate cache fields for future incremental runs
@@ -3033,14 +3257,14 @@ async fn analyze_current_repo(
 async fn build_cross_repo_analyzer(
     mut all_repo_data: Vec<CloudRepoData>,
     current_repos: Vec<CloudRepoData>,
-    ts_check_dir: Option<&std::path::Path>,
+    sidecar: Option<&TypeSidecar>,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
     // Add the freshly-analyzed local services (one per service) to the mix
     all_repo_data.extend(current_repos);
-    // 1. Merge configs and packages using generic function
+    // 1. Merge configs using generic function. (The v1 merged-packages value
+    //    fed only the deleted ts_check install; the v2 check workspace pins
+    //    each stub's own deps instead.)
     let combined_config = merge_serialized_data(&all_repo_data, |data| data.config_json.as_ref())?;
-    let combined_packages =
-        merge_serialized_data(&all_repo_data, |data| data.package_json.as_ref())?;
 
     // 2. Build analyzer using shared logic (skip type resolution for cross-repo)
     let cm: Lrc<SourceMap> = Default::default();
@@ -3065,205 +3289,30 @@ async fn build_cross_repo_analyzer(
         }
     }
 
-    // 5. Recreate type files from S3 and run type checking
-    if let Some(ts_check_dir) = ts_check_dir {
-        analyzer.set_ts_check_dir(ts_check_dir.to_path_buf());
-        recreate_type_files_and_check(&all_repo_data, &combined_packages, ts_check_dir)?;
+    // 5. Merged manifests power the alias -> display-name map for findings.
+    let merged_manifests: Vec<TypeManifestEntry> = all_repo_data
+        .iter()
+        .filter_map(|repo| repo.type_manifest.as_ref())
+        .flat_map(|entries| entries.iter().cloned())
+        .collect();
+    analyzer.set_type_manifests(merged_manifests);
 
-        // 6. Run final type checking
-        if let Err(e) = analyzer.run_final_type_checking() {
-            warn!("Type checking failed: {}", e);
-        }
+    // 6. Run the v2 type check (capture stubs -> synthetic workspace -> tsc
+    //    probes) and store the structured pair outcomes for the verdict
+    //    overlay. Without a sidecar, compat is NOT evaluated: outcomes stay
+    //    unset and every edge keeps `type_compatible: None` — the harness
+    //    greps for this exact "Skipping type checking" trap (§7).
+    if let Some(sidecar) = sidecar {
+        let outcomes = type_compat_v2::run_check(sidecar, &all_repo_data);
+        analyzer.set_pair_outcomes(outcomes);
     } else {
         warn!(
-            "Skipping type checking: ts_check/ directory was not found adjacent to the \
-             carrick binary. Expected at <exe_dir>/ts_check or <exe_dir>/../lib/ts_check."
+            "Skipping type checking: the type sidecar is unavailable, so v2 \
+             capture/check cannot run. Compat verdicts will be absent, not 'compatible'."
         );
     }
 
     Ok(analyzer)
-}
-
-/// Compute the cross-repo bundle file stem (`<stem>_types.d.ts`) for each
-/// `CloudRepoData`, parallel to `all_repo_data`.
-///
-/// A monorepo `carrick.json` declares N services under one git repo, so N
-/// `CloudRepoData` share the same `repo_name` and differ only by `service_name`.
-/// Keying the bundle file by `repo_name` alone made every service in the repo
-/// write to the same `<repo>_types.d.ts`, so the last service silently clobbered
-/// the earlier ones — and a producer whose type lived in a clobbered service
-/// (e.g. orders-pkg `GET /orders/:id` → `Order`) vanished from the bundle
-/// entirely, not even leaving the `= unknown` placeholder. ts_check then
-/// reported "Producer type not found in project" and the edge's compat verdict
-/// collapsed to unverifiable.
-///
-/// Key the stem by `service_name ?? repo_name` (the same attribution convention
-/// `build_cross_repo_analyzer` uses for packages) so each service gets its own
-/// bundle. The type aliases inside are globally unique (`Endpoint_<hash>` keyed
-/// on the operation) and ts_check loads every `*.d.ts` in the output dir, so one
-/// file per service is exactly what it needs. Collisions (two services resolving
-/// to the same base stem, e.g. both missing a `service_name`) are suffixed so no
-/// write clobbers a prior one.
-fn bundle_file_stems(all_repo_data: &[CloudRepoData]) -> Vec<String> {
-    let mut used_stems: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    all_repo_data
-        .iter()
-        .map(|repo_data| {
-            let base_stem = repo_data
-                .service_name
-                .as_deref()
-                .unwrap_or(&repo_data.repo_name)
-                .replace(['/', '\\'], "_");
-            match used_stems.entry(base_stem.clone()) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let n = e.get_mut();
-                    *n += 1;
-                    format!("{base_stem}_{n}")
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(0);
-                    base_stem
-                }
-            }
-        })
-        .collect()
-}
-
-/// Write each repo/service's bundled `.d.ts` into `output_dir`, one file per
-/// service (see `bundle_file_stems`). The per-service split is what stops a
-/// monorepo's services from clobbering each other down to a single bundle file
-/// and silently dropping a whole service's producer types. ts_check loads every
-/// `*.d.ts` in `output_dir`, so the cross-file `Endpoint_<hash>` aliases still
-/// resolve regardless of which service-file each lives in.
-fn write_bundle_files(all_repo_data: &[CloudRepoData], output_dir: &std::path::Path) {
-    let stems = bundle_file_stems(all_repo_data);
-    for (repo_data, stem) in all_repo_data.iter().zip(stems) {
-        if let Some(bundled_types) = &repo_data.bundled_types {
-            let file_name = format!("{stem}_types.d.ts");
-            let file_path = output_dir.join(&file_name);
-            let content =
-                append_missing_aliases(bundled_types.clone(), repo_data.type_manifest.as_ref());
-
-            if let Err(e) = std::fs::write(&file_path, content) {
-                warn!("Failed to write type file {}: {}", file_name, e);
-            } else {
-                debug!("Created bundled type file: {}", file_path.display());
-            }
-        } else {
-            debug!(
-                "No bundled types available for repo: {}",
-                repo_data.repo_name
-            );
-        }
-    }
-}
-
-// End-to-end flow and failure modes of manifest-based cross-repo type
-// checking: docs/reference/type-checking-flow.md
-fn recreate_type_files_and_check(
-    all_repo_data: &[CloudRepoData],
-    packages: &Packages,
-    ts_check_dir: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let output_dir_buf = ts_check_dir.join("output");
-    let output_dir = output_dir_buf.as_path();
-    if output_dir.exists() {
-        debug!("Cleaning output directory: {}", output_dir.display());
-        if let Err(e) = std::fs::remove_dir_all(output_dir) {
-            warn!("Failed to clean output directory: {}", e);
-        }
-    }
-
-    if let Err(e) = std::fs::create_dir_all(output_dir) {
-        warn!("Failed to create output directory: {}", e);
-    } else {
-        debug!("Created clean output directory: {}", output_dir.display());
-    }
-
-    write_bundle_files(all_repo_data, output_dir);
-
-    write_manifest_files(all_repo_data, output_dir)?;
-
-    // Recreate package.json and tsconfig.json after writing type files
-    recreate_package_and_tsconfig(
-        output_dir,
-        packages,
-        &corpus_internal_package_names(all_repo_data),
-    )?;
-
-    Ok(())
-}
-
-fn write_manifest_files(
-    all_repo_data: &[CloudRepoData],
-    output_dir: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut producer_entries = Vec::new();
-    let mut consumer_entries = Vec::new();
-
-    for repo_data in all_repo_data {
-        if let Some(entries) = &repo_data.type_manifest {
-            for entry in entries {
-                // HTTP, socket, and graphql entries all reach the ts_check manifest
-                // unfiltered. ts_check checks HTTP by `method`/`path`, socket by the
-                // canonical `OperationKey` (event+direction), and graphql by
-                // (kind+field), reusing the same `TypeCompatibilityChecker`
-                // assignability for all three. The matcher drops any stray
-                // non-checkable entry defensively rather than throwing (#253).
-                //
-                // An UNRESOLVED entry — `type_state == Unknown`, or an alias that
-                // dangles to `any`/`unknown` in the bundle — is NOT dropped here.
-                // ts_check still matches its pair and reports it as an `unknownPair`
-                // (unverifiable), which `apply_compat_verdicts` maps to a `None`
-                // verdict. Dropping it instead removes the pair from ts_check's
-                // output entirely, and `apply_compat_verdicts` treats an edge absent
-                // from BOTH `mismatches` and `unknownPairs` as compatible — a FALSE
-                // `Some(true)`. That was the `graphql|subscription|orderUpdated`
-                // false-positive: the consumer's only alias is the synthetic
-                // `Endpoint_<hash> = unknown` missing-alias fallback, so the entry
-                // was dropped, the edge went absent, and the verdict defaulted to
-                // compatible. Keeping it lets the `any`/`unknown` comparand guard in
-                // `type-checker.ts` route the pair to `unknownPairs` → `None`. This
-                // is exactly how HTTP/socket Unknown entries have always been
-                // handled; graphql is no longer a special case.
-                match entry.role {
-                    ManifestRole::Producer => producer_entries.push(entry.clone()),
-                    ManifestRole::Consumer => consumer_entries.push(entry.clone()),
-                }
-            }
-        }
-    }
-
-    let producer_manifest = TypeManifestFile {
-        repo_name: "cross-repo-producers".to_string(),
-        commit_hash: "mixed".to_string(),
-        entries: producer_entries,
-    };
-    let consumer_manifest = TypeManifestFile {
-        repo_name: "cross-repo-consumers".to_string(),
-        commit_hash: "mixed".to_string(),
-        entries: consumer_entries,
-    };
-
-    let producer_path = output_dir.join("producer-manifest.json");
-    let consumer_path = output_dir.join("consumer-manifest.json");
-
-    std::fs::write(
-        &producer_path,
-        serde_json::to_string_pretty(&producer_manifest)?,
-    )?;
-    std::fs::write(
-        &consumer_path,
-        serde_json::to_string_pretty(&consumer_manifest)?,
-    )?;
-
-    debug!(
-        "Wrote manifest files: {} producers, {} consumers",
-        producer_manifest.entries.len(),
-        consumer_manifest.entries.len()
-    );
-
-    Ok(())
 }
 
 /// Trailing marker stamped onto every `= unknown` alias that
@@ -3330,407 +3379,6 @@ fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
         Ok(re) => re.is_match(content),
         Err(_) => false,
     }
-}
-
-/// Dependencies for the synthetic `carrick-type-check` package.json: the
-/// merged repo dependencies with (a) unusable versions dropped (empty, the
-/// literal "undefined", or digit-less — npm turns `typescript@undefined` into
-/// a hard ERESOLVE that aborts the whole cross-repo type pass), and (b)
-/// packages the scanned repos declare THEMSELVES dropped — a workspace-internal
-/// package (a monorepo's `@meridian/contracts`) resolves via the workspace
-/// link, not the registry, so `npm install` 404s and (per the #149 fail-loud)
-/// would abort type checking. Nothing is lost by dropping it: the bundle
-/// carries its shapes structurally inlined.
-///
-/// `corpus_internal` extends (b) across the whole scanned corpus: a repo that
-/// depends on a package which IS another repo/service in the corpus (an org
-/// depending on its own, possibly unpublished, workspace package) gets that
-/// dependency excluded too — its types arrive via that service's sidecar
-/// `.d.ts` bundle, and the registry copy ETARGETs when the version was never
-/// published (#390).
-fn synthetic_type_check_dependencies(
-    packages: &Packages,
-    corpus_internal: &std::collections::HashSet<String>,
-) -> std::collections::HashMap<String, String> {
-    let mut internal = packages.internal_package_names();
-    internal.extend(corpus_internal.iter().cloned());
-    // Version specs npm cannot (or must not) resolve from the registry. These
-    // are package-manager resolution protocols (yarn/pnpm/npm define them, not
-    // the scanned frameworks): a digit-containing spec like
-    // `patch:@scope/pkg@npm%3A1.2.3#…` or `workspace:^1.2.3` passes the digit
-    // filter below but 404s/EUSAGEs the whole install (and per the #149
-    // fail-loud, aborts type checking). Remote tarball/git URL specs (`https:`,
-    // `ssh:`) are npm-installable but fetch arbitrary URLs from an untrusted
-    // repo's dependency list — dropped on the same security stance as
-    // --ignore-scripts. Dropping loses nothing: the bundle carries the shapes
-    // structurally. `npm:` aliases are NOT listed — npm resolves those from
-    // the registry.
-    const NON_REGISTRY_PROTOCOLS: &[&str] = &[
-        "workspace:",
-        "patch:",
-        "portal:",
-        "link:",
-        "file:",
-        "catalog:",
-        "git+",
-        "git:",
-        "github:",
-        "http:",
-        "https:",
-        "ssh:",
-    ];
-    // yarn/pnpm `resolutions` npm-aliases remap locally-invented dependency
-    // names to real registry packages (`"@types/readable-stream-2":
-    // "npm:@types/readable-stream@^2.3.15"`). The merged version for such a
-    // name is the bare range, so installing `name@range` 404s — apply the
-    // alias spec instead (npm installs `npm:` aliases natively). Resolution
-    // keys may carry a `@range` selector suffix; scoped names keep their
-    // leading `@`, so the selector is everything after the LAST `@` at
-    // index > 0.
-    let mut resolution_aliases: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for package_json in &packages.package_jsons {
-        for (key, value) in &package_json.resolutions {
-            if !value.starts_with("npm:") {
-                continue;
-            }
-            let name = match key.rfind('@') {
-                Some(pos) if pos > 0 => &key[..pos],
-                _ => key.as_str(),
-            };
-            resolution_aliases.insert(name.to_string(), value.clone());
-        }
-    }
-    let mut dependencies = std::collections::HashMap::new();
-    for (name, package_info) in packages.get_dependencies() {
-        let version = package_info.version.trim();
-        if version.is_empty()
-            || version == "undefined"
-            || !version.chars().any(|c| c.is_ascii_digit())
-        {
-            debug!("Skipping dependency {name} with unusable version {version:?}");
-            continue;
-        }
-        if NON_REGISTRY_PROTOCOLS
-            .iter()
-            .any(|proto| version.starts_with(proto))
-        {
-            debug!("Skipping dependency {name} with non-registry version protocol {version:?}");
-            continue;
-        }
-        if let Some(alias) = resolution_aliases.get(name) {
-            // Validate the alias TARGET too: `npm:<real-name>@<range>` must
-            // carry a registry-resolvable range — an alias like
-            // `npm:pkg@github:user/repo` would smuggle a non-registry spec
-            // past the protocol filter above. The range is everything after
-            // the LAST `@` past the `npm:` prefix (the target name itself may
-            // be scoped).
-            let target = &alias["npm:".len()..];
-            let range = match target.rfind('@') {
-                Some(pos) if pos > 0 => &target[pos + 1..],
-                _ => target,
-            };
-            let range_ok = range.chars().any(|c| c.is_ascii_digit())
-                && !NON_REGISTRY_PROTOCOLS
-                    .iter()
-                    .any(|proto| range.starts_with(proto));
-            if range_ok {
-                debug!("Applying resolutions alias for {name}: {alias}");
-                dependencies.insert(name.clone(), alias.clone());
-            } else {
-                debug!(
-                    "Skipping dependency {name}: resolutions alias {alias:?} has a non-registry target"
-                );
-            }
-            continue;
-        }
-        if internal.contains(name) {
-            debug!(
-                "Skipping workspace-internal dependency {name} (declared by a scanned \
-                 package.json; not registry-resolvable)"
-            );
-            continue;
-        }
-        dependencies.insert(name.clone(), version.to_string());
-    }
-    dependencies
-}
-
-/// Package names declared by ANY package.json of ANY repo/service in the
-/// scanned corpus (each service's `Packages` carries its own tree-walked
-/// `internal_names`; older cloud payloads without the structured `packages`
-/// field fall back to the serialized `package_json`). A dependency on one of
-/// these is a link to a sibling service in the corpus, not an installable
-/// third-party package — its types arrive via that service's sidecar `.d.ts`
-/// bundle, so the npm copy is redundant, and (an org's own unpublished
-/// workspace package) often ETARGETs, which used to abort the whole type pass.
-fn corpus_internal_package_names(
-    all_repo_data: &[CloudRepoData],
-) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-    for repo_data in all_repo_data {
-        if let Some(packages) = &repo_data.packages {
-            names.extend(packages.internal_package_names());
-        } else if let Some(json) = &repo_data.package_json
-            && let Ok(packages) = serde_json::from_str::<Packages>(json)
-        {
-            names.extend(packages.internal_package_names());
-        }
-    }
-    names
-}
-
-/// Package names npm's OWN resolution-failure output blames for an install
-/// failure. Two message shapes, stable across npm major versions (only the
-/// `npm ERR!` vs `npm error` line prefix differs, which this deliberately
-/// keys past):
-///
-///   ETARGET: `notarget No matching version found for <name>@<spec>.`
-///   E404:    `404  '<name>@<spec>' is not in this registry.`
-///
-/// The `<name>@<spec>` split is at the LAST `@` at index > 0 so scoped names
-/// keep their leading `@`. No name heuristics beyond what npm itself states:
-/// any other failure class (ERESOLVE, network, EUSAGE, …) parses to empty,
-/// so the caller keeps the hard-fail path — dropping packages cannot fix
-/// those.
-fn npm_unresolvable_packages(stderr: &str) -> Vec<String> {
-    let etarget =
-        regex::Regex::new(r"No matching version found for\s+(\S+)").expect("static regex");
-    let e404 = regex::Regex::new(r"'([^']+)'\s+is not in this registry").expect("static regex");
-    let mut names: Vec<String> = Vec::new();
-    for caps in etarget
-        .captures_iter(stderr)
-        .chain(e404.captures_iter(stderr))
-    {
-        let spec = caps[1].trim_end_matches(['.', ',']);
-        let name = match spec.rfind('@') {
-            Some(pos) if pos > 0 => &spec[..pos],
-            _ => spec,
-        };
-        if !name.is_empty() && !names.iter().any(|n| n == name) {
-            names.push(name.to_string());
-        }
-    }
-    names
-}
-
-/// Manifest keys to drop for the packages npm blamed: a key matches when it
-/// IS the blamed name, or when its value is an `npm:` alias whose target is
-/// the blamed name (npm's resolution errors report the alias TARGET, not the
-/// manifest key it hangs off). A blamed name matching neither is a transitive
-/// dependency this manifest cannot drop. Sorted for deterministic drop
-/// order and logs.
-fn unresolvable_manifest_keys(
-    dependencies: &std::collections::HashMap<String, String>,
-    blamed: &[String],
-) -> Vec<String> {
-    let mut keys: Vec<String> = dependencies
-        .iter()
-        .filter(|(key, value)| {
-            blamed.iter().any(|name| {
-                key.as_str() == name
-                    || value.strip_prefix("npm:").is_some_and(|target| {
-                        let target_name = match target.rfind('@') {
-                            Some(pos) if pos > 0 => &target[..pos],
-                            _ => target,
-                        };
-                        target_name == name
-                    })
-            })
-        })
-        .map(|(key, _)| key.clone())
-        .collect();
-    keys.sort();
-    keys
-}
-
-/// Write the synthetic `carrick-type-check` package.json. Called once at
-/// assembly and again after each retry-drop so the manifest on disk always
-/// matches the dependency map npm is asked to install.
-fn write_type_check_package_json(
-    output_dir: &std::path::Path,
-    dependencies: &std::collections::HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let package_json_content = serde_json::json!({
-        "name": "carrick-type-check",
-        "version": "1.0.0",
-        "dependencies": dependencies
-    });
-    std::fs::write(
-        output_dir.join("package.json"),
-        serde_json::to_string_pretty(&package_json_content)?,
-    )?;
-    Ok(())
-}
-
-/// Last ~2000 chars of npm stderr, for error messages.
-fn stderr_tail(stderr: &str) -> &str {
-    let tail_start = stderr
-        .char_indices()
-        .rev()
-        .nth(1999)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    &stderr[tail_start..]
-}
-
-/// Retry-drop rounds allowed when npm's resolution errors name specific
-/// packages. Each round drops only what npm itself blamed and reinstalls.
-const MAX_INSTALL_DROP_ROUNDS: usize = 3;
-
-/// `npm install` for the synthetic type-check package, degrading gracefully
-/// on per-package resolution failures instead of all-or-nothing (#390):
-///
-/// - On ETARGET/E404 the offending package(s) — exactly the ones npm's own
-///   error output names, no heuristics — are dropped from the manifest and
-///   the install retried, at most [`MAX_INSTALL_DROP_ROUNDS`] times, each
-///   drop logged loudly. Types that then dangle resolve to `any`/`unknown`
-///   in ts_check and are reported as unverifiable (the existing abstain
-///   semantics), NOT compatible.
-/// - Every other failure class, and exhausted retries, keep the #149
-///   fail-loud hard error — with the drop history in the message — because a
-///   swallowed install failure used to let the run print "✓ Cross-repo
-///   analysis complete" while type checking silently degraded.
-fn install_type_check_dependencies(
-    output_dir: &std::path::Path,
-    dependencies: &mut std::collections::HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-    let mut rounds_left = MAX_INSTALL_DROP_ROUNDS;
-    let mut dropped: Vec<String> = Vec::new();
-    loop {
-        debug!("Installing dependencies...");
-
-        // `--legacy-peer-deps` so a transitive peer-range disagreement (e.g.
-        // ts-node's `typescript@>=2.7` vs a repo's pinned major) can't abort
-        // the install. This package only feeds ts-morph type extraction, so a
-        // looser peer graph is harmless.
-        //
-        // `--ignore-scripts` because only the installed packages' .d.ts files
-        // are consumed — lifecycle scripts add nothing here, execute untrusted
-        // code from the scanned repos' dependency trees on the scanning
-        // machine, and security-guard packages (e.g. LavaMoat's
-        // @lavamoat/preinstall-always-fail, shipped by MetaMask repos)
-        // DELIBERATELY fail any install that runs scripts.
-        let install_output = Command::new("npm")
-            .arg("install")
-            .arg("--legacy-peer-deps")
-            .arg("--ignore-scripts")
-            .current_dir(output_dir)
-            .output()
-            .map_err(|e| format!("Failed to run npm install: {}", e))?;
-
-        if install_output.status.success() {
-            if dropped.is_empty() {
-                debug!("Dependencies installed successfully");
-            } else {
-                warn!(
-                    "Cross-repo type-check install succeeded after dropping unresolvable \
-                     dependencies: {}. Types resolving through them will be reported as \
-                     unverifiable, not compatible.",
-                    dropped.join(", ")
-                );
-            }
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&install_output.stderr).into_owned();
-
-        if rounds_left > 0 {
-            let blamed = npm_unresolvable_packages(&stderr);
-            let drop_keys = unresolvable_manifest_keys(dependencies, &blamed);
-            if !drop_keys.is_empty() {
-                for key in &drop_keys {
-                    warn!(
-                        "npm cannot resolve dependency {key} (ETARGET/E404) — dropping it \
-                         from the cross-repo type-check package and retrying. Its types will \
-                         be reported as unverifiable, not compatible."
-                    );
-                    dependencies.remove(key);
-                    dropped.push(key.clone());
-                }
-                write_type_check_package_json(output_dir, dependencies)?;
-                // A lockfile written during the failed attempt could still pin
-                // the dropped names.
-                let _ = std::fs::remove_file(output_dir.join("package-lock.json"));
-                rounds_left -= 1;
-                continue;
-            }
-        }
-
-        let drop_history = if dropped.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " Dropped unresolvable dependencies before failing: {}.",
-                dropped.join(", ")
-            )
-        };
-        return Err(format!(
-            "npm install failed for the cross-repo type-check package — type checking \
-             cannot run. Set CARRICK_SKIP_NPM_INSTALL=1 to bypass (type checking will \
-             be skipped).{drop_history} npm stderr (tail):\n{}",
-            stderr_tail(&stderr)
-        )
-        .into());
-    }
-}
-
-/// Recreate package.json and tsconfig.json in the output directory
-fn recreate_package_and_tsconfig(
-    output_dir: &std::path::Path,
-    packages: &Packages,
-    corpus_internal: &std::collections::HashSet<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Create package.json
-    let package_json_path = output_dir.join("package.json");
-    let mut dependencies = synthetic_type_check_dependencies(packages, corpus_internal);
-
-    // Pin the TypeScript toolchain we control for this synthetic type-check
-    // package. Overwrite (not insert-if-missing): a merged repo may pin a
-    // different/older typescript that conflicts with ts-node's peer range, so
-    // forcing a known-good pair is what keeps `npm install` resolvable. These
-    // match ts_check/package.json's pins.
-    dependencies.insert("typescript".to_string(), "5.8.3".to_string());
-    dependencies.insert("ts-node".to_string(), "10.9.2".to_string());
-
-    write_type_check_package_json(output_dir, &dependencies)?;
-    debug!("Recreated package.json at {}", package_json_path.display());
-
-    let skip_npm_install = std::env::var("CARRICK_SKIP_NPM_INSTALL").is_ok()
-        || std::env::var("CARRICK_MOCK_ALL").is_ok();
-
-    if skip_npm_install {
-        debug!("Skipping npm install (mock mode or CARRICK_SKIP_NPM_INSTALL set)");
-    } else {
-        // Clean any existing node_modules and package-lock.json to avoid conflicts
-        let node_modules_path = output_dir.join("node_modules");
-        let package_lock_path = output_dir.join("package-lock.json");
-
-        if node_modules_path.exists() {
-            debug!("Removing existing node_modules directory");
-            std::fs::remove_dir_all(&node_modules_path).ok();
-        }
-
-        if package_lock_path.exists() {
-            debug!("Removing existing package-lock.json");
-            std::fs::remove_file(&package_lock_path).ok();
-        }
-
-        install_type_check_dependencies(output_dir, &mut dependencies)?;
-    }
-
-    // Create tsconfig.json with dynamic path mappings based on actual type files
-    let tsconfig_path = output_dir.join("tsconfig.json");
-    let tsconfig_content = create_dynamic_tsconfig(output_dir);
-
-    std::fs::write(
-        &tsconfig_path,
-        serde_json::to_string_pretty(&tsconfig_content)?,
-    )?;
-    debug!("Recreated tsconfig.json at {}", tsconfig_path.display());
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3832,429 +3480,6 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_type_check_deps_exclude_workspace_internal_packages() {
-        // catalog-api depends on the workspace package @meridian/contracts.
-        // Installing that from the registry 404s and (fail-loud #149) aborts
-        // the whole type pass — the synthetic package must exclude any name a
-        // scanned package.json declares itself, while keeping real deps from
-        // both sides of the workspace.
-        use crate::packages::{PackageJson, Packages};
-        use std::collections::HashMap;
-
-        let mut packages = Packages::default();
-        packages.package_jsons.push(PackageJson {
-            name: Some("@meridian/contracts".to_string()),
-            version: Some("0.1.0".to_string()),
-            dependencies: HashMap::from([("zod".to_string(), "3.23.0".to_string())]),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
-        });
-        packages.package_jsons.push(PackageJson {
-            name: Some("catalog-api".to_string()),
-            version: Some("1.0.0".to_string()),
-            dependencies: HashMap::from([
-                ("@meridian/contracts".to_string(), "0.1.0".to_string()),
-                ("koa".to_string(), "2.15.3".to_string()),
-            ]),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
-        });
-        packages
-            .source_paths
-            .push(PathBuf::from("packages/contracts/package.json"));
-        packages
-            .source_paths
-            .push(PathBuf::from("packages/catalog-api/package.json"));
-        packages.resolve_dependencies();
-
-        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
-        assert!(
-            !deps.contains_key("@meridian/contracts"),
-            "workspace-internal package must not be npm-installed"
-        );
-        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
-        assert_eq!(deps.get("zod").map(String::as_str), Some("3.23.0"));
-    }
-
-    #[test]
-    fn synthetic_type_check_deps_exclude_non_registry_version_protocols() {
-        // yarn/pnpm resolution-protocol specs pass the digit filter when they
-        // embed a version (`patch:…@npm%3A11.1.0#…`, `workspace:^1.2.3`) but
-        // npm cannot resolve them from the registry — the install 404s/EUSAGEs
-        // and (fail-loud #149) aborts the whole type pass. Real-world case:
-        // metamask-extension's `patch:` specs killed the first external-OSS
-        // eval probe. Registry-resolvable specs, including `npm:` aliases,
-        // must survive.
-        use crate::packages::{PackageJson, Packages};
-        use std::collections::HashMap;
-
-        let mut packages = Packages::default();
-        packages.package_jsons.push(PackageJson {
-            name: Some("app".to_string()),
-            version: Some("1.0.0".to_string()),
-            dependencies: HashMap::from([
-                (
-                    "@metamask/controller-utils".to_string(),
-                    "patch:@metamask/controller-utils@npm%3A11.1.0#~/.yarn/patches/x.patch"
-                        .to_string(),
-                ),
-                ("shared-lib".to_string(), "workspace:^1.2.3".to_string()),
-                ("linked".to_string(), "portal:../linked-1.0".to_string()),
-                ("local".to_string(), "file:../local-2.0".to_string()),
-                ("pinned".to_string(), "github:user/repo#v1.2.3".to_string()),
-                (
-                    "tarball".to_string(),
-                    "https://example.com/pkg-1.2.3.tgz".to_string(),
-                ),
-                (
-                    "sshgit".to_string(),
-                    "ssh://git@example.com/org/repo.git#semver:1.2.3".to_string(),
-                ),
-                ("aliased".to_string(), "npm:real-pkg@2.1.0".to_string()),
-                ("koa".to_string(), "2.15.3".to_string()),
-            ]),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
-        });
-        packages.source_paths.push(PathBuf::from("package.json"));
-        packages.resolve_dependencies();
-
-        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
-        for dropped in [
-            "@metamask/controller-utils",
-            "shared-lib",
-            "linked",
-            "local",
-            "pinned",
-            "tarball",
-            "sshgit",
-        ] {
-            assert!(
-                !deps.contains_key(dropped),
-                "non-registry protocol spec for {dropped} must be dropped, got {:?}",
-                deps.get(dropped)
-            );
-        }
-        assert_eq!(
-            deps.get("aliased").map(String::as_str),
-            Some("npm:real-pkg@2.1.0"),
-            "npm: aliases are registry-resolvable and must survive"
-        );
-        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
-    }
-
-    #[test]
-    fn synthetic_type_check_deps_apply_resolutions_npm_aliases() {
-        // metamask-extension declares invented dependency names
-        // (`@types/readable-stream-2@^2.3.15`) that only resolve through a
-        // yarn `resolutions` npm-alias. The merged version is the bare range,
-        // so installing `name@range` 404s (killed the second external-OSS
-        // probe) — the synthetic install must carry the alias spec instead.
-        // Resolution keys may be `name@range` selectors (scoped names keep
-        // their leading @) or plain names.
-        use crate::packages::{PackageJson, Packages};
-        use std::collections::HashMap;
-
-        let mut packages = Packages::default();
-        packages.package_jsons.push(PackageJson {
-            name: Some("app".to_string()),
-            version: Some("1.0.0".to_string()),
-            dependencies: HashMap::from([
-                (
-                    "@types/readable-stream-2".to_string(),
-                    "^2.3.15".to_string(),
-                ),
-                ("readable-stream-3".to_string(), "^3.6.2".to_string()),
-                ("koa".to_string(), "2.15.3".to_string()),
-                ("sneaky".to_string(), "^1.0.0".to_string()),
-            ]),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::from([
-                (
-                    "@types/readable-stream-2@^2.3.15".to_string(),
-                    "npm:@types/readable-stream@^2.3.15".to_string(),
-                ),
-                (
-                    "readable-stream-3".to_string(),
-                    "npm:readable-stream@^3.6.2".to_string(),
-                ),
-                ("koa".to_string(), "2.15.3".to_string()),
-                // alias whose TARGET is itself a non-registry spec: must NOT
-                // be applied (would smuggle a git spec past the filter)
-                ("sneaky".to_string(), "npm:pkg@github:user/repo".to_string()),
-            ]),
-        });
-        packages.source_paths.push(PathBuf::from("package.json"));
-        packages.resolve_dependencies();
-
-        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
-        assert_eq!(
-            deps.get("@types/readable-stream-2").map(String::as_str),
-            Some("npm:@types/readable-stream@^2.3.15"),
-            "selector-keyed resolutions alias must replace the bare range"
-        );
-        assert_eq!(
-            deps.get("readable-stream-3").map(String::as_str),
-            Some("npm:readable-stream@^3.6.2"),
-            "plain-keyed resolutions alias must replace the bare range"
-        );
-        assert_eq!(
-            deps.get("koa").map(String::as_str),
-            Some("2.15.3"),
-            "non-alias resolutions (plain version pins) must not remap"
-        );
-        assert!(
-            !deps.values().any(|v| v.contains("github:")),
-            "an npm: alias with a non-registry target must not be applied, got {deps:?}"
-        );
-    }
-
-    #[test]
-    fn synthetic_type_check_deps_exclude_tree_walked_internal_names() {
-        // Production shape (the corpus-3 baseline failure): only the
-        // SERVICE's package.json is loaded into package_jsons — a workspace
-        // member like packages/contracts never is — so the exclusion must
-        // also honour the tree-walked internal_names set.
-        use crate::packages::{PackageJson, Packages};
-        use std::collections::HashMap;
-
-        let mut packages = Packages::default();
-        packages.package_jsons.push(PackageJson {
-            name: Some("catalog-api".to_string()),
-            version: Some("1.0.0".to_string()),
-            dependencies: HashMap::from([
-                ("@meridian/contracts".to_string(), "0.1.0".to_string()),
-                ("koa".to_string(), "2.15.3".to_string()),
-            ]),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
-        });
-        packages
-            .source_paths
-            .push(PathBuf::from("packages/catalog-api/package.json"));
-        packages.resolve_dependencies();
-        packages
-            .internal_names
-            .insert("@meridian/contracts".to_string());
-
-        let deps = synthetic_type_check_dependencies(&packages, &Default::default());
-        assert!(
-            !deps.contains_key("@meridian/contracts"),
-            "tree-walked internal name must not be npm-installed"
-        );
-        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
-    }
-
-    /// Test-local CloudRepoData with only the package-related fields set.
-    fn repo_data_with_packages(
-        repo_name: &str,
-        packages: Option<crate::packages::Packages>,
-        package_json: Option<String>,
-    ) -> CloudRepoData {
-        CloudRepoData {
-            repo_name: repo_name.to_string(),
-            service_name: None,
-            endpoints: vec![],
-            calls: vec![],
-            mounts: vec![],
-            apps: std::collections::HashMap::new(),
-            imported_handlers: vec![],
-            function_definitions: std::collections::HashMap::new(),
-            config_json: None,
-            package_json,
-            packages,
-            last_updated: chrono::Utc::now(),
-            commit_hash: "deadbeef".to_string(),
-            mount_graph: None,
-            bundled_types: None,
-            type_manifest: None,
-            file_results: None,
-            cached_detection: None,
-            cached_guidance: None,
-            cached_extraction_config: None,
-            package_json_hash: None,
-            cache_version: None,
-            type_extraction_status: None,
-            compat_verdicts: None,
-        }
-    }
-
-    #[test]
-    fn synthetic_type_check_deps_exclude_corpus_repo_packages() {
-        // repo-a depends on @acme/shared-contracts at a version that was never
-        // published to the registry — the package IS another repo/service in
-        // the same scanned corpus. Its types arrive via that service's sidecar
-        // .d.ts bundle, so the npm copy is redundant AND unresolvable (the
-        // ETARGET used to abort the whole type pass, #390). The assembly must
-        // exclude any name declared by any package.json in the corpus, not
-        // just the current repo's own.
-        use crate::packages::{PackageJson, Packages};
-        use std::collections::HashMap;
-
-        let mut packages = Packages::default();
-        packages.package_jsons.push(PackageJson {
-            name: Some("repo-a-api".to_string()),
-            version: Some("1.0.0".to_string()),
-            dependencies: HashMap::from([
-                ("@acme/shared-contracts".to_string(), "0.4.2".to_string()),
-                ("koa".to_string(), "2.15.3".to_string()),
-            ]),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
-        });
-        packages.source_paths.push(PathBuf::from("package.json"));
-        packages.resolve_dependencies();
-
-        let corpus_internal =
-            std::collections::HashSet::from(["@acme/shared-contracts".to_string()]);
-        let deps = synthetic_type_check_dependencies(&packages, &corpus_internal);
-        assert!(
-            !deps.contains_key("@acme/shared-contracts"),
-            "a package that is itself a repo/service in the scanned corpus must not be \
-             npm-installed"
-        );
-        assert_eq!(deps.get("koa").map(String::as_str), Some("2.15.3"));
-    }
-
-    #[test]
-    fn corpus_internal_names_union_all_repos_with_serialized_fallback() {
-        use crate::packages::{PackageJson, Packages};
-        use std::collections::HashMap;
-
-        // Repo A: structured `packages` with a declared name + tree-walked
-        // workspace member.
-        let mut packages_a = Packages::default();
-        packages_a.package_jsons.push(PackageJson {
-            name: Some("@acme/shared-contracts".to_string()),
-            version: Some("0.4.2".to_string()),
-            dependencies: HashMap::new(),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
-        });
-        packages_a
-            .internal_names
-            .insert("@acme/shared-tooling".to_string());
-
-        // Repo B: pre-`packages`-field payload — only the serialized
-        // `package_json` string is available.
-        let mut packages_b = Packages::default();
-        packages_b.package_jsons.push(PackageJson {
-            name: Some("repo-b-api".to_string()),
-            version: Some("1.0.0".to_string()),
-            dependencies: HashMap::new(),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
-        });
-        let serialized_b = serde_json::to_string(&packages_b).unwrap();
-
-        let all_repo_data = vec![
-            repo_data_with_packages("acme/repo-a", Some(packages_a), None),
-            repo_data_with_packages("acme/repo-b", None, Some(serialized_b)),
-        ];
-
-        let names = corpus_internal_package_names(&all_repo_data);
-        assert!(names.contains("@acme/shared-contracts"));
-        assert!(names.contains("@acme/shared-tooling"));
-        assert!(
-            names.contains("repo-b-api"),
-            "serialized fallback must count"
-        );
-    }
-
-    #[test]
-    fn npm_unresolvable_packages_parses_etarget_stderr() {
-        // Synthetic stderr in npm 10's format (generic package names).
-        let stderr = "\
-npm error code ETARGET
-npm error notarget No matching version found for @acme/shared-contracts@0.4.2.
-npm error notarget In most cases you or one of your dependencies are requesting
-npm error notarget a package version that doesn't exist.
-npm error A complete log of this run can be found in: /home/user/.npm/_logs/debug-0.log
-";
-        assert_eq!(
-            npm_unresolvable_packages(stderr),
-            vec!["@acme/shared-contracts".to_string()]
-        );
-    }
-
-    #[test]
-    fn npm_unresolvable_packages_parses_unscoped_and_legacy_prefix() {
-        // npm 8/9 prefix lines with `npm ERR!` instead of `npm error`; the
-        // parser keys on the message text, not the prefix. Also dedupes.
-        let stderr = "\
-npm ERR! code ETARGET
-npm ERR! notarget No matching version found for left-pad-utils@9.9.9.
-npm ERR! notarget No matching version found for left-pad-utils@9.9.9.
-";
-        assert_eq!(
-            npm_unresolvable_packages(stderr),
-            vec!["left-pad-utils".to_string()]
-        );
-    }
-
-    #[test]
-    fn npm_unresolvable_packages_parses_e404_stderr() {
-        let stderr = "\
-npm error code E404
-npm error 404 Not Found - GET https://registry.npmjs.org/@acme%2fghost-pkg - Not found
-npm error 404
-npm error 404  '@acme/ghost-pkg@^1.0.0' is not in this registry.
-npm error 404
-npm error 404 Note that you can also install from a
-npm error 404 tarball, folder, http url, or git url.
-";
-        assert_eq!(
-            npm_unresolvable_packages(stderr),
-            vec!["@acme/ghost-pkg".to_string()]
-        );
-    }
-
-    #[test]
-    fn npm_unresolvable_packages_ignores_other_failure_classes() {
-        // An ERESOLVE conflict names packages too, but is NOT a resolution
-        // 404/ETARGET — dropping deps can't fix it, so it must stay a hard
-        // error (empty parse → no retry).
-        let stderr = "\
-npm error code ERESOLVE
-npm error ERESOLVE unable to resolve dependency tree
-npm error Found: typescript@5.8.3
-npm error Could not resolve dependency:
-npm error peer typescript@\">=4.2\" from ts-node@10.9.2
-";
-        assert!(npm_unresolvable_packages(stderr).is_empty());
-    }
-
-    #[test]
-    fn unresolvable_manifest_keys_match_direct_and_alias_targets() {
-        use std::collections::HashMap;
-
-        let deps = HashMap::from([
-            ("@acme/ghost-pkg".to_string(), "1.0.0".to_string()),
-            ("aliased".to_string(), "npm:ghost-target@2.0.0".to_string()),
-            ("koa".to_string(), "2.15.3".to_string()),
-        ]);
-        let blamed = vec![
-            "@acme/ghost-pkg".to_string(),
-            // npm blames the alias TARGET, not the manifest key.
-            "ghost-target".to_string(),
-            // Transitive dependency (not a manifest key): nothing to drop.
-            "not-in-manifest".to_string(),
-        ];
-        assert_eq!(
-            unresolvable_manifest_keys(&deps, &blamed),
-            vec!["@acme/ghost-pkg".to_string(), "aliased".to_string()]
-        );
-    }
-
-    #[test]
     fn test_ast_stripping_removes_nodes() {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
@@ -4309,6 +3534,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -4350,6 +3576,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }];
 
         // Test Config merging
@@ -4428,6 +3655,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -4636,9 +3864,9 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
     }
 
     /// #379: a call-site-evidence entry never anchors Producer manifest
-    /// types — a producer entry would make ts_check run a request-vs-request
-    /// comparison mislabelled as a producer-contract verdict. The twin data
-    /// call's Consumer entries are unaffected.
+    /// types — a producer entry would make the type check run a
+    /// request-vs-request comparison mislabelled as a producer-contract
+    /// verdict. The twin data call's Consumer entries are unaffected.
     #[test]
     fn test_call_site_evidence_endpoint_emits_no_producer_manifest_entries() {
         let config = Config::default();
@@ -5020,6 +4248,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -5064,6 +4293,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -5111,6 +4341,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -5310,6 +4541,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -5382,6 +4614,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -5713,8 +4946,8 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
     /// Carrick marker and must NOT be mistaken for the injected placeholder, so
     /// the entry keeps its state rather than being downgraded to `Unknown`
     /// (#244). The genuine `unknown` shape is still surfaced as unverifiable
-    /// downstream by ts_check's compiler-level `isUnknown()` gate, not by a
-    /// silent recall-losing downgrade here.
+    /// downstream by the check-phase top-type gates, not by a silent
+    /// recall-losing downgrade here.
     #[test]
     fn enrich_does_not_downgrade_developer_authored_unknown() {
         // No resolution entry and no marker: the alias is "defined" in the
@@ -6337,6 +5570,191 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
         );
     }
 
+    /// A minimal endpoint the file-analyzer would emit alongside a
+    /// misattributed resolver claim: only `handler_name` matters to the
+    /// borrow witness.
+    fn endpoint_with_handler(handler_name: &str) -> EndpointResult {
+        EndpointResult {
+            candidate_id: "span:1-2".to_string(),
+            line_number: 7,
+            owner_node: "TicketsController".to_string(),
+            method: "GET".to_string(),
+            path: "/tickets/:id".to_string(),
+            handler_name: handler_name.to_string(),
+            pattern_matched: "@Get(\":id\")".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    /// The corpus-3 `query ticket` live-eval false-incompatible, reduced: the
+    /// file-analyzer links an HTTP endpoint HANDLER (`findOne`, which returns
+    /// a ticket-shaped object) as the field's resolver from the controller
+    /// file, while the real resolver file claims `resolveTicket`. The borrow
+    /// witness — the claimed function is an `endpoints[].handler_name` in the
+    /// SAME file's analysis — must drop the controller claim deterministically,
+    /// so the resolver file's claim wins in every run (never a `HashMap`-order
+    /// coin flip whose losing side rides the wrong inferred return into a
+    /// confidently wrong verdict).
+    #[test]
+    fn merge_graphql_resolver_locations_drops_http_handler_claims() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "ticket",
+                Some("Ticket"),
+            )],
+            consumers: vec![],
+        };
+
+        let claim = |function: &str, line: i32| GraphqlOperation {
+            kind: GraphqlOperationKind::Query,
+            field: "ticket".to_string(),
+            resolver_function: Some(function.to_string()),
+            resolver_line: Some(line),
+            primary_type_symbol: None,
+            type_import_source: None,
+            backing_type_symbol: None,
+            backing_type_source: None,
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        // Sorted-order note: "src/tickets.controller.ts" sorts BEFORE
+        // "src/tickets.resolver.ts", so without the witness the controller
+        // claim would be the accepted first claim and the resolver claim would
+        // read as a conflict — the assertion below fails either way unless the
+        // witness drops the controller claim outright.
+        file_results.insert(
+            "src/tickets.controller.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![endpoint_with_handler("findOne")],
+                data_calls: vec![],
+                graphql_operations: vec![claim("findOne", 8)],
+                pubsub_operations: vec![],
+            },
+        );
+        file_results.insert(
+            "src/tickets.resolver.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![],
+                graphql_operations: vec![claim("resolveTicket", 4)],
+                pubsub_operations: vec![],
+            },
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let ticket = &graphql.producers[0];
+        assert_eq!(
+            ticket.resolver_file,
+            Some(PathBuf::from("src/tickets.resolver.ts")),
+            "the HTTP-handler claim must be dropped; the resolver file's claim wins"
+        );
+        assert_eq!(ticket.resolver_line, Some(4));
+        // The dropped claim must not smuggle in a backing type either.
+        assert_eq!(ticket.response_type_symbol, None);
+    }
+
+    /// Two files claim DIFFERENT resolver locations for the same producer key
+    /// and neither claim is witnessed as an HTTP handler: the location is
+    /// ambiguous, and ambiguity fails closed — the producer stays unlocated
+    /// (no FunctionReturn infer request, type_state stays `Unknown`, its pairs
+    /// verdict unverifiable) instead of the previous last-write-wins over
+    /// nondeterministic `HashMap` iteration order, where the losing run
+    /// shipped the WRONG file's inferred return as the producer's contract.
+    #[test]
+    fn merge_graphql_resolver_locations_conflicting_claims_fail_closed() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "ticket",
+                Some("Ticket"),
+            )],
+            consumers: vec![],
+        };
+
+        let claim = |function: &str, line: i32| GraphqlOperation {
+            kind: GraphqlOperationKind::Query,
+            field: "ticket".to_string(),
+            resolver_function: Some(function.to_string()),
+            resolver_line: Some(line),
+            primary_type_symbol: None,
+            type_import_source: None,
+            backing_type_symbol: None,
+            backing_type_source: None,
+        };
+        let result_with = |ops: Vec<GraphqlOperation>| FileAnalysisResult {
+            graphql_consumer_locates: vec![],
+            mounts: vec![],
+            endpoints: vec![],
+            data_calls: vec![],
+            graphql_operations: ops,
+            pubsub_operations: vec![],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "src/a.resolver.ts".to_string(),
+            result_with(vec![claim("resolveTicketA", 4)]),
+        );
+        file_results.insert(
+            "src/b.resolver.ts".to_string(),
+            result_with(vec![claim("resolveTicketB", 9)]),
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let ticket = &graphql.producers[0];
+        assert_eq!(
+            ticket.resolver_file, None,
+            "conflicting claims must clear the location, not race for it"
+        );
+        assert_eq!(ticket.resolver_line, None);
+        assert_eq!(ticket.response_type_symbol, None);
+        // The SDL anchor is untouched by the conflict handling.
+        assert_eq!(ticket.primary_type_symbol.as_deref(), Some("Ticket"));
+
+        // Duplicate claims that AGREE are not a conflict: the shared claim is
+        // applied.
+        let mut agreeing = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "ticket",
+                Some("Ticket"),
+            )],
+            consumers: vec![],
+        };
+        let mut agreeing_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        agreeing_results.insert(
+            "src/a.resolver.ts".to_string(),
+            result_with(vec![claim("resolveTicket", 4), claim("resolveTicket", 4)]),
+        );
+        merge_graphql_resolver_locations(&mut agreeing, &agreeing_results);
+        assert_eq!(
+            agreeing.producers[0].resolver_file,
+            Some(PathBuf::from("src/a.resolver.ts"))
+        );
+        assert_eq!(agreeing.producers[0].resolver_line, Some(4));
+    }
+
     /// #268 isolation guard: a consumer op with an explicit call-site generic
     /// (`payload_type_symbol` already set by the deterministic
     /// `TaggedTplVisitor::capture_request_call` pass) must keep that anchor
@@ -6707,8 +6125,8 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
     /// Fan-in regression (the corpus-2 compat false-negative): two publishers on
     /// the SAME topic but in different repos/files must get DISTINCT consumer
     /// aliases. They previously hashed to one alias (`build_manifest_type_alias`
-    /// keys only on `topic|consumer|Response`), so ts_check's bundled
-    /// `cross-repo-consumers` declared that interface twice with different bodies
+    /// keys only on `topic|consumer|Response`), so the merged consumer
+    /// declarations defined that interface twice with different bodies
     /// — one publisher's payload type masked the other's and the masked edge
     /// reported a spurious compat mismatch. The publisher alias now disambiguates
     /// by call site, and each publisher's SymbolRequest alias still byte-matches
@@ -6761,7 +6179,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             manifest_aliases.len(),
             2,
             "two fan-in publishers must yield two DISTINCT consumer aliases, not \
-             one collided alias (which masks one payload type in ts_check)"
+             one collided alias (which masks one payload type at check time)"
         );
 
         // Each publisher's SymbolRequest alias must byte-match its manifest alias
@@ -7466,315 +6884,6 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
         );
     }
 
-    /// `write_manifest_files` feeds the ts_check matcher, which checks HTTP,
-    /// socket, AND graphql. Every entry passes through unfiltered, including an
-    /// UNRESOLVED graphql entry (`type_state == Unknown`, e.g. a subscription
-    /// consumer with no `request<T>` call site). Such an entry must reach ts_check
-    /// so its pair is reported as an `unknownPair` (→ `None`); dropping it would
-    /// make the edge absent and `apply_compat_verdicts` would default it to a
-    /// false `Some(true)`. The #253 throw-guard lives in the matcher, which drops
-    /// any stray non-checkable entry defensively rather than crashing the run.
-    #[test]
-    fn write_manifest_files_emits_http_socket_and_all_graphql() {
-        use crate::cloud_storage::TypeEvidence;
-        use crate::operation::{GraphqlOperationKind, OperationKey, SocketDirection};
-        use crate::services::type_sidecar::InferKind;
-
-        fn entry_with_state(
-            key: OperationKey,
-            alias: &str,
-            type_state: ManifestTypeState,
-        ) -> TypeManifestEntry {
-            let is_explicit = type_state == ManifestTypeState::Explicit;
-            TypeManifestEntry {
-                key,
-                role: ManifestRole::Producer,
-                type_kind: ManifestTypeKind::Response,
-                type_alias: alias.to_string(),
-                file_path: "src/x.ts".to_string(),
-                line_number: 1,
-                is_explicit,
-                type_state,
-                evidence: TypeEvidence {
-                    file_path: "src/x.ts".to_string(),
-                    span_start: None,
-                    span_end: None,
-                    line_number: 1,
-                    infer_kind: InferKind::ResponseBody,
-                    is_explicit,
-                    type_state,
-                },
-                resolved_definition: None,
-                expanded_definition: None,
-                primary_type_symbol: None,
-            }
-        }
-
-        fn entry(key: OperationKey, alias: &str) -> TypeManifestEntry {
-            entry_with_state(key, alias, ManifestTypeState::Explicit)
-        }
-
-        let manifest = vec![
-            entry(OperationKey::http("GET", "/orders/:id"), "OrderResponse"),
-            // Resolved graphql producer (anchor reached the bundle) → KEPT.
-            entry(
-                OperationKey::graphql(GraphqlOperationKind::Query, "order"),
-                "OrderQueryResult",
-            ),
-            // Unresolved graphql producer (Unknown anchor) → KEPT so ts_check can
-            // report its pair as an unknownPair (→ None); dropping it would make
-            // the edge absent and default the verdict to a false Some(true).
-            entry_with_state(
-                OperationKey::graphql(GraphqlOperationKind::Subscription, "orderUpdated"),
-                "OrderUpdatedUnknown",
-                ManifestTypeState::Unknown,
-            ),
-            entry(
-                OperationKey::socket("order.created", SocketDirection::ServerToClient),
-                "OrderCreatedEvent",
-            ),
-        ];
-
-        let repo_data = CloudRepoData {
-            repo_name: "orders-svc".to_string(),
-            service_name: None,
-            endpoints: vec![],
-            calls: vec![],
-            mounts: vec![],
-            apps: std::collections::HashMap::new(),
-            imported_handlers: vec![],
-            function_definitions: std::collections::HashMap::new(),
-            config_json: None,
-            package_json: None,
-            packages: None,
-            last_updated: chrono::Utc::now(),
-            commit_hash: "test-hash".to_string(),
-            mount_graph: None,
-            bundled_types: None,
-            type_manifest: Some(manifest),
-            file_results: None,
-            cached_detection: None,
-            cached_guidance: None,
-            cached_extraction_config: None,
-            package_json_hash: None,
-            cache_version: None,
-            type_extraction_status: None,
-            compat_verdicts: None,
-        };
-
-        // Local mirror of TypeManifestFile for reading back the written JSON
-        // (the production struct is serialize-only).
-        #[derive(serde::Deserialize)]
-        struct ManifestFileForTest {
-            entries: Vec<TypeManifestEntry>,
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_manifest_files(std::slice::from_ref(&repo_data), dir.path())
-            .expect("write_manifest_files");
-
-        let producer: ManifestFileForTest = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("producer-manifest.json")).unwrap(),
-        )
-        .unwrap();
-
-        // HTTP, socket, and BOTH graphql producers (resolved and Unknown) survive:
-        // the Unknown one must reach ts_check to be reported as an unknownPair.
-        assert_eq!(
-            producer.entries.len(),
-            4,
-            "HTTP + socket + both graphql producers reach the manifest; the \
-             Unknown graphql entry is kept, not dropped"
-        );
-        assert!(
-            producer
-                .entries
-                .iter()
-                .any(|e| e.key.protocol() == crate::operation::Protocol::Http),
-            "the HTTP producer must reach the manifest"
-        );
-        assert!(
-            producer
-                .entries
-                .iter()
-                .any(|e| e.key.protocol() == crate::operation::Protocol::Websocket),
-            "the socket producer must reach the manifest"
-        );
-        let graphql_entries: Vec<_> = producer
-            .entries
-            .iter()
-            .filter(|e| e.key.protocol() == crate::operation::Protocol::Graphql)
-            .collect();
-        assert_eq!(
-            graphql_entries.len(),
-            2,
-            "both graphql producers reach the manifest (resolved + Unknown)"
-        );
-        assert!(
-            graphql_entries
-                .iter()
-                .any(|e| e.type_alias == "OrderQueryResult"),
-            "the resolved graphql producer is kept"
-        );
-        assert!(
-            graphql_entries
-                .iter()
-                .any(|e| e.type_state == ManifestTypeState::Unknown),
-            "the Unknown graphql producer is kept so ts_check can mark it \
-             unverifiable rather than the edge defaulting to compatible"
-        );
-    }
-
-    /// The `graphql|subscription|orderUpdated` false-positive fix: an UNRESOLVED
-    /// graphql CONSUMER must REACH the consumer manifest, so ts_check reports its
-    /// pair as an `unknownPair` (→ `None`). Dropping it instead removed the pair
-    /// from ts_check's output, and `apply_compat_verdicts` defaulted the absent
-    /// edge to a false `Some(true)` (`producer ⊑ any` was never actually run — the
-    /// edge just looked compatible because nothing contradicted it).
-    ///
-    /// All three consumer shapes are KEPT — `type_state == Unknown`, an `Implicit`
-    /// consumer with no resolved anchor symbol (the synthetic missing-alias case),
-    /// and a genuinely resolved consumer. ts_check's `any`/`unknown` comparand
-    /// guard distinguishes the unverifiable ones at verdict time, not here.
-    #[test]
-    fn write_manifest_files_keeps_unresolved_graphql_consumer() {
-        use crate::cloud_storage::TypeEvidence;
-        use crate::operation::{GraphqlOperationKind, OperationKey};
-        use crate::services::type_sidecar::InferKind;
-
-        fn consumer(
-            field: &str,
-            alias: &str,
-            type_state: ManifestTypeState,
-            primary_type_symbol: Option<&str>,
-        ) -> TypeManifestEntry {
-            let is_explicit = type_state == ManifestTypeState::Explicit;
-            let key = OperationKey::graphql(GraphqlOperationKind::Subscription, field);
-            TypeManifestEntry {
-                key,
-                role: ManifestRole::Consumer,
-                type_kind: ManifestTypeKind::Response,
-                type_alias: alias.to_string(),
-                file_path: "lib/graphql.ts".to_string(),
-                line_number: 1,
-                is_explicit,
-                type_state,
-                evidence: TypeEvidence {
-                    file_path: "lib/graphql.ts".to_string(),
-                    span_start: None,
-                    span_end: None,
-                    line_number: 1,
-                    infer_kind: InferKind::CallResult,
-                    is_explicit,
-                    type_state,
-                },
-                resolved_definition: None,
-                expanded_definition: None,
-                primary_type_symbol: primary_type_symbol.map(str::to_string),
-            }
-        }
-
-        let manifest = vec![
-            // Clean unresolved consumer (type_state Unknown) → KEPT (ts_check
-            // reports its pair as an unknownPair → None).
-            consumer(
-                "orderUpdated",
-                "Endpoint_unknown_Response",
-                ManifestTypeState::Unknown,
-                None,
-            ),
-            // Enrichment wrongly promoted the synthetic alias to Implicit, but no
-            // real anchor was ever resolved (primary_type_symbol still None) →
-            // KEPT; its alias dangles to `any`/`unknown` in the bundle so the
-            // ts_check comparand guard marks the pair unverifiable.
-            consumer(
-                "orderPromoted",
-                "Endpoint_promoted_Response",
-                ManifestTypeState::Implicit,
-                None,
-            ),
-            // Genuinely resolved consumer (real anchor symbol) → KEPT.
-            consumer(
-                "orderResolved",
-                "Endpoint_resolved_Response",
-                ManifestTypeState::Implicit,
-                Some("OrderView"),
-            ),
-        ];
-
-        let repo_data = CloudRepoData {
-            repo_name: "web-frontend".to_string(),
-            service_name: None,
-            endpoints: vec![],
-            calls: vec![],
-            mounts: vec![],
-            apps: std::collections::HashMap::new(),
-            imported_handlers: vec![],
-            function_definitions: std::collections::HashMap::new(),
-            config_json: None,
-            package_json: None,
-            packages: None,
-            last_updated: chrono::Utc::now(),
-            commit_hash: "test-hash".to_string(),
-            mount_graph: None,
-            bundled_types: None,
-            type_manifest: Some(manifest),
-            file_results: None,
-            cached_detection: None,
-            cached_guidance: None,
-            cached_extraction_config: None,
-            package_json_hash: None,
-            cache_version: None,
-            type_extraction_status: None,
-            compat_verdicts: None,
-        };
-
-        #[derive(serde::Deserialize)]
-        struct ManifestFileForTest {
-            entries: Vec<TypeManifestEntry>,
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_manifest_files(std::slice::from_ref(&repo_data), dir.path())
-            .expect("write_manifest_files");
-
-        let consumers: ManifestFileForTest = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("consumer-manifest.json")).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            consumers.entries.len(),
-            3,
-            "all graphql consumers reach the manifest — the Unknown one and the \
-             anchorless wrongly-promoted one are KEPT so ts_check can mark their \
-             pairs unverifiable (→ None) instead of the edge defaulting to a \
-             false Some(true)"
-        );
-        assert!(
-            consumers
-                .entries
-                .iter()
-                .any(|e| e.type_alias == "Endpoint_resolved_Response"),
-            "the genuinely-resolved consumer is kept"
-        );
-        assert!(
-            consumers
-                .entries
-                .iter()
-                .any(|e| e.type_state == ManifestTypeState::Unknown),
-            "the Unknown consumer is kept (unverifiable, not dropped)"
-        );
-        assert!(
-            consumers
-                .entries
-                .iter()
-                .any(|e| e.primary_type_symbol.is_none()),
-            "the anchorless wrongly-promoted consumer is kept (unverifiable, not \
-             dropped)"
-        );
-    }
-
     /// Minimal `CloudRepoData` carrying just a repo/service identity and a
     /// bundled `.d.ts`, for the bundle-file-emission tests below.
     fn repo_with_bundle(
@@ -7807,115 +6916,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }
-    }
-
-    /// `bundle_file_stems` must give every `(repo, service)` a distinct stem so
-    /// the per-service `.d.ts` files don't collide. The clobbering bug was that
-    /// a monorepo's services share a `repo_name`, so a `repo_name`-only stem made
-    /// them all map to one file.
-    #[test]
-    fn bundle_file_stems_are_unique_per_service_in_a_monorepo() {
-        let repos = vec![
-            repo_with_bundle("orders-monorepo", Some("orders-pkg"), "// a"),
-            repo_with_bundle("orders-monorepo", Some("gateway"), "// b"),
-            // A service id containing a path separator must be sanitised, not
-            // allowed to escape the output dir.
-            repo_with_bundle("orders-monorepo", Some("scope/pkg"), "// c"),
-            // Two services with no service_name fall back to the shared repo_name
-            // and would still collide — the collision suffix must separate them.
-            repo_with_bundle("other-repo", None, "// d"),
-            repo_with_bundle("other-repo", None, "// e"),
-        ];
-
-        let stems = bundle_file_stems(&repos);
-
-        assert_eq!(
-            stems,
-            vec![
-                "orders-pkg".to_string(),
-                "gateway".to_string(),
-                "scope_pkg".to_string(),
-                "other-repo".to_string(),
-                "other-repo_1".to_string(),
-            ]
-        );
-        let unique: std::collections::HashSet<&String> = stems.iter().collect();
-        assert_eq!(
-            unique.len(),
-            stems.len(),
-            "every service must get a distinct bundle stem so no write clobbers another"
-        );
-    }
-
-    /// A-producer-bundle-gap regression: in a monorepo, the producer service's
-    /// explicit response type (orders-pkg `GET /orders/:id` → `Order`) must land
-    /// in the cross-repo bundle, resolvable — not get clobbered out by a sibling
-    /// service (gateway) sharing the repo name. Before the per-service split,
-    /// both wrote `orders-monorepo_types.d.ts` and the gateway write erased the
-    /// `Order` shape entirely (not even a `= unknown` placeholder), so ts_check
-    /// reported "Producer type not found in project" and the compat verdict
-    /// collapsed to unverifiable.
-    #[test]
-    fn monorepo_producer_explicit_type_survives_into_bundle() {
-        // orders-pkg's bundle: the explicit `Order` shape under its manifest
-        // alias. This is the producer type both consumers (payments-svc,
-        // web-frontend) need to resolve.
-        let orders_alias = "Endpoint_5d19c4207b67a294_Response";
-        let orders_bundle = format!(
-            "export type {orders_alias} = {{ id: number; amountCents: number; currency: string }};\n"
-        );
-        // gateway's bundle: a different alias. Under the old repo_name-only
-        // naming this write would clobber orders-pkg's file.
-        let gateway_alias = "Endpoint_aaaaaaaaaaaaaaaa_Response";
-        let gateway_bundle = format!("export type {gateway_alias} = {{ status: string }};\n");
-
-        let repos = vec![
-            repo_with_bundle("orders-monorepo", Some("orders-pkg"), &orders_bundle),
-            repo_with_bundle("orders-monorepo", Some("gateway"), &gateway_bundle),
-        ];
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_bundle_files(&repos, dir.path());
-
-        // ts_check loads every *.d.ts in the dir; concatenate them the same way
-        // and assert BOTH services' producer aliases resolve to a real shape.
-        let mut combined = String::new();
-        let mut dts_files = 0usize;
-        for entry in std::fs::read_dir(dir.path()).expect("read_dir") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|s| s.to_str()) == Some("ts")
-                && path.to_string_lossy().ends_with(".d.ts")
-            {
-                dts_files += 1;
-                combined.push_str(&std::fs::read_to_string(&path).expect("read d.ts"));
-                combined.push('\n');
-            }
-        }
-
-        assert_eq!(
-            dts_files, 2,
-            "each service must get its own bundle file, not share one (got {dts_files})"
-        );
-
-        // The producer's `Order` shape is present, resolvable, and NOT a dangling
-        // `= unknown` placeholder — proving the type reaches ts_check.
-        assert!(
-            combined.contains(&format!(
-                "export type {orders_alias} = {{ id: number; amountCents: number; currency: string }}"
-            )),
-            "the orders-pkg producer's explicit Order shape must survive into the bundle, got:\n{combined}"
-        );
-        assert!(
-            !combined.contains(&format!("export type {orders_alias} = unknown")),
-            "the producer alias must resolve to its real members, not a dangling = unknown placeholder"
-        );
-        // The sibling service's types must coexist, not have been clobbered.
-        assert!(
-            combined.contains(&format!(
-                "export type {gateway_alias} = {{ status: string }}"
-            )),
-            "the gateway sibling's types must coexist in its own bundle file"
-        );
     }
 }

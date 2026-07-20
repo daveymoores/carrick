@@ -1,0 +1,8 @@
+{
+  "name": "capture-v2-installed",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@acme/models": "^2.0.0"
+  }
+}

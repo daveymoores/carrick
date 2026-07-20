@@ -129,40 +129,6 @@ else
     exit 1
 fi
 
-# Run ts_check tests
-echo ""
-echo "Running ts_check test suite..."
-echo ""
-
-if [ ! -d "$REPO_ROOT/ts_check" ]; then
-    echo "⚠️  ts_check directory not found, skipping."
-    exit 0
-fi
-
-if [ ! -d "$REPO_ROOT/ts_check/node_modules" ]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "❌ ts_check/node_modules not found! Commit blocked."
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "Run '(cd ts_check && npm install)' to install dependencies."
-    echo "To bypass this hook (not recommended): git commit --no-verify"
-    echo ""
-    exit 1
-fi
-
-if ! (cd "$REPO_ROOT/ts_check" && npm test); then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "❌ ts_check tests failed! Commit blocked."
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "Fix the failing ts_check tests and try again."
-    echo "To bypass this hook (not recommended): git commit --no-verify"
-    echo ""
-    exit 1
-fi
-
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "✅ All tests passed!"

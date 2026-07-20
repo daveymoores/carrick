@@ -19,12 +19,15 @@ import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { MonorepoBuilder } from './monorepo-builder.js';
 import { DefinitionResolver } from './definition-resolver.js';
+import { captureStub, runCheck } from './capture/index.js';
 import type {
   SidecarRequest,
   SidecarResponse,
   InitResponse,
   BundleResponse,
   EmitSurfaceResponse,
+  CaptureV2Response,
+  CheckV2Response,
   InferResponse,
   BuildWorkspaceResponse,
   CheckCompatibilityResponse,
@@ -215,6 +218,90 @@ function handleEmitSurface(request: SidecarRequest & { action: 'emit_surface' })
 }
 
 /**
+ * Handle the 'capture_v2' action - v2 "tsc as serializer" capture.
+ * Stateless by design: unlike bundle/infer it needs no init'd ts-morph
+ * project, only the repo's own tsconfig — this is the point of v2. The
+ * capture bundle behind this action is the seam ("seam, not split"): this
+ * dispatcher call is the only non-type reach-in.
+ */
+function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): CaptureV2Response {
+  try {
+    log(`capture_v2 for service '${request.service_name}' (${request.anchors.length} anchor(s))`);
+    const result = captureStub({
+      repoRoot: request.repo_root,
+      serviceName: request.service_name,
+      anchors: request.anchors,
+      outDir: request.out_dir,
+      tsconfigPath: request.tsconfig_path,
+    });
+    return {
+      request_id: request.request_id,
+      status: result.success ? 'success' : 'error',
+      result,
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`capture_v2 failed: ${error}`);
+    return {
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    };
+  }
+}
+
+/**
+ * Handle the 'check_v2' action - v2 "tsc as judge" compatibility check.
+ *
+ * Async by necessity: the vendored pnpm install can exceed the Rust client's
+ * read deadline, and running it off the event loop (spawn, not execSync) keeps
+ * the sidecar responsive. Emits `status: 'progress'` keepalive frames during
+ * install/check and one terminal `success`/`error` frame. Writes its own
+ * frames, so processLine hands off and does not write a response for it.
+ */
+async function handleCheckV2Async(
+  request: SidecarRequest & { action: 'check_v2' }
+): Promise<void> {
+  let phase = 'assembling';
+  const keepalive = setInterval(() => {
+    writeProgress(request.request_id, phase, `check ${phase}`);
+  }, 1500);
+  keepalive.unref();
+  try {
+    log(`check_v2: ${request.stubs.length} stub(s), ${request.pairs.length} pair(s)`);
+    const result = await runCheck(
+      {
+        stubs: request.stubs,
+        pairs: request.pairs,
+        workspaceRoot: request.workspace_root,
+        cleanup: request.keep_workspace !== true,
+      },
+      (p) => {
+        phase = p;
+      }
+    );
+    clearInterval(keepalive);
+    const response: CheckV2Response = {
+      request_id: request.request_id,
+      status: result.success ? 'success' : 'error',
+      result,
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    };
+    writeResponse(response);
+  } catch (err) {
+    clearInterval(keepalive);
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`check_v2 failed: ${error}`);
+    writeResponse({
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    });
+  }
+}
+
+/**
  * Handle the 'infer' action - infer implicit types
  */
 function handleInfer(request: SidecarRequest & { action: 'infer' }): InferResponse {
@@ -333,7 +420,8 @@ function handleCheckCompatibility(request: SidecarRequest & { action: 'check_com
 }
 
 /**
- * Handle the 'resolve_definitions' action - resolve type aliases from bundled .d.ts
+ * Handle the 'resolve_definitions' action - resolve surface aliases from a
+ * v2 capture stub package's declaration tree.
  */
 function handleResolveDefinitions(
   request: SidecarRequest & { action: 'resolve_definitions' },
@@ -347,10 +435,10 @@ function handleResolveDefinitions(
   }
 
   try {
-    log(`Resolving ${request.aliases.length} type alias(es)`);
+    log(`Resolving ${request.aliases.length} type alias(es) from ${request.stub_dir}`);
 
-    const results = definitionResolver.resolve(
-      request.bundled_dts,
+    const results = definitionResolver.resolveFromStub(
+      request.stub_dir,
       request.aliases,
     );
 
@@ -421,6 +509,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleBundle(request);
     case 'emit_surface':
       return handleEmitSurface(request);
+    case 'capture_v2':
+      return handleCaptureV2(request);
     case 'infer':
       return handleInfer(request);
     case 'build_workspace':
@@ -453,6 +543,17 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
 function writeResponse(response: SidecarResponse): void {
   const json = JSON.stringify(response);
   process.stdout.write(json + '\n');
+}
+
+/**
+ * Write a non-terminal progress/keepalive frame (async install protocol).
+ * Distinct `status: 'progress'` so clients skip it and wait for the terminal
+ * success/error frame.
+ */
+function writeProgress(requestId: string, phase: string, message: string): void {
+  process.stdout.write(
+    JSON.stringify({ request_id: requestId, status: 'progress', phase, message }) + '\n'
+  );
 }
 
 /**
@@ -509,6 +610,13 @@ function processLine(line: string): void {
       (json as { request_id?: string })?.request_id || 'unknown',
       parseResult.error
     );
+    return;
+  }
+
+  // check_v2 runs async (spawned pnpm install + tsc) and writes its own
+  // progress + terminal frames; hand off and return.
+  if (parseResult.request.action === 'check_v2') {
+    void handleCheckV2Async(parseResult.request);
     return;
   }
 
