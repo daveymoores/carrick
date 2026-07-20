@@ -21,11 +21,14 @@ export type AnchorOrigin = 'llm-symbol' | 'deterministic-infer' | 'anchor-backfi
  *  - emitted: compiler declaration emit of an addressable symbol (best)
  *  - node_builder: SymbolTracker-verified node-builder print of an anonymous
  *    inferred type
- *  - structural_fallback: the capture-native paths failed (guard failure,
- *    locator failure, inaccessible symbol during node-builder printing).
- *    In WP1 this tier emits `unknown` with a recorded reason -- visibly
- *    degraded, never a silently wrong .d.ts. Wiring the legacy structural
- *    expander text under this tier is a WP3 integration decision.
+ *  - structural_fallback: the legacy hand-text tier. Two shapes share it:
+ *    (a) literal anchors — the WP3 wiring of v1 inference/inline text into
+ *    the surface (self-checked like any other alias, so decay is still
+ *    caught), and (b) demotions from the capture-native paths (guard
+ *    failure, locator failure, inaccessible symbols), which emit `unknown`
+ *    with a recorded `capture_failure_reason`. Keeping both at one tier is
+ *    what makes the remaining legacy-text dependence measurable and
+ *    ratchetable.
  */
 export type SerializationTier = 'emitted' | 'node_builder' | 'structural_fallback';
 
@@ -124,9 +127,10 @@ export interface CaptureAliasRecord {
   /** Human-readable reason when self_check is not 'ok'. */
   self_check_detail?: string;
   /**
-   * Recorded when the alias never reached a capture-native tier (guard
-   * failure, locator failure, inaccessible symbols during node-builder
-   * printing). Always present when serialization === 'structural_fallback'.
+   * Recorded when the alias never reached a usable tier (guard failure,
+   * locator failure, inaccessible symbols during node-builder printing).
+   * Present exactly for demoted anchors; a successful literal anchor sits
+   * at the structural_fallback tier WITHOUT a failure reason.
    */
   capture_failure_reason?: string;
   /** True when the alias resolved to any/unknown/never during self-check.

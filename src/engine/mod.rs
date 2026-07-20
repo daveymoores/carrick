@@ -2290,8 +2290,13 @@ fn run_capture_for_service(
         &type_resolution.inferred_types,
     );
 
-    let anchors =
-        type_compat_v2::derive_capture_anchors(&explicit, &infer, &inline_aliases, repo_path);
+    let anchors = type_compat_v2::derive_capture_anchors(
+        &explicit,
+        &infer,
+        &inline_aliases,
+        &type_resolution.inferred_types,
+        repo_path,
+    );
     if anchors.is_empty() {
         return None;
     }

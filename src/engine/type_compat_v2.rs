@@ -51,6 +51,17 @@ fn repo_relative(file_path: &str, repo_root: &str) -> String {
     stripped.strip_prefix("./").unwrap_or(stripped).to_string()
 }
 
+/// A v1 inferred type text is usable as a literal anchor when it carries an
+/// actual shape (not the unknown/any placeholders the scrubbers leave).
+fn usable_inferred_text(text: &str) -> Option<&str> {
+    let trimmed = text.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() || trimmed == "unknown" || trimmed == "any" {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 /// Derive one capture anchor per alias from the collected v1 type requests.
 ///
 /// Precedence mirrors the v1 bundle: an explicit symbol request wins over an
@@ -58,17 +69,36 @@ fn repo_relative(file_path: &str, repo_root: &str) -> String {
 /// alias strings are consumed as-is — this function never re-derives or
 /// rewrites an alias, so the manifest join keys stay byte-identical.
 ///
+/// For an infer-request alias, the v1 inference RESULT (when it produced a
+/// real shape) rides a literal anchor at the structural_fallback tier: the
+/// v1 inferrer is kind-aware (payload args, params, wrapper unwrapping via
+/// the extraction config), which the capture-native locator is not yet — a
+/// raw locator re-run resolves the wrong node for exactly those cases
+/// (e.g. a `bus.emit(...)` boolean instead of its payload). The tier keeps
+/// the legacy-text dependence measured and ratchetable; the locator-based
+/// infer anchor remains the path for aliases v1 inference could not resolve.
+///
 /// `anchor_origin` mapping is pragmatic for WP3: symbol/literal anchors are
-/// LLM-sourced (`llm-symbol`), infer anchors are locator-driven
+/// LLM-sourced (`llm-symbol`), infer-derived anchors are locator-driven
 /// (`deterministic-infer`). Refining backfill attribution is follow-up work.
 pub(crate) fn derive_capture_anchors(
     explicit: &[SymbolRequest],
     infer: &[InferRequestItem],
     inline_aliases: &[(String, String)],
+    inferred: &[crate::services::type_sidecar::InferredType],
     repo_root: &str,
 ) -> Vec<CaptureAnchor> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut anchors: Vec<CaptureAnchor> = Vec::new();
+
+    // First usable inferred text per alias (mirrors the enrich join's
+    // first-wins `or_insert`).
+    let mut inferred_text: HashMap<&str, &str> = HashMap::new();
+    for inf in inferred {
+        if let Some(text) = usable_inferred_text(&inf.type_string) {
+            inferred_text.entry(inf.alias.as_str()).or_insert(text);
+        }
+    }
 
     for request in explicit {
         let Some(alias) = request.alias.as_deref() else {
@@ -92,6 +122,15 @@ pub(crate) fn derive_capture_anchors(
             continue;
         };
         if !seen.insert(alias.to_string()) {
+            continue;
+        }
+        // Kind-aware v1 inference result wins over a raw locator re-run.
+        if let Some(text) = inferred_text.get(alias) {
+            anchors.push(CaptureAnchor::Literal {
+                alias: alias.to_string(),
+                type_text: (*text).to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+            });
             continue;
         }
         // The capture locator prefers span, then expression text (from its
@@ -371,16 +410,17 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                         method: cm,
                         path: cp,
                     },
-                ) => {
-                    if pm.eq_ignore_ascii_case(cm) && paths_match(pp, cp) {
-                        candidates.push((producer, match_score(pp, cp)));
-                    }
+                ) if pm.eq_ignore_ascii_case(cm) && paths_match(pp, cp) => {
+                    candidates.push((producer, match_score(pp, cp)));
                 }
-                (p, c) if p == c => {
-                    // Exact-key protocols: socket / graphql / pubsub.
-                    if !matches!(p, OperationKey::Http { .. }) {
-                        candidates.push((producer, 100));
-                    }
+                // Exact-key protocols: socket / graphql / pubsub.
+                (
+                    p @ (OperationKey::Socket { .. }
+                    | OperationKey::Graphql { .. }
+                    | OperationKey::Pubsub { .. }),
+                    c,
+                ) if p == c => {
+                    candidates.push((producer, 100));
                 }
                 _ => {}
             }
@@ -795,7 +835,7 @@ mod tests {
             ),
         ];
 
-        let anchors = derive_capture_anchors(&explicit, &infer, &inline, "/repo");
+        let anchors = derive_capture_anchors(&explicit, &infer, &inline, &[], "/repo");
         assert_eq!(anchors.len(), 3);
 
         match &anchors[0] {
@@ -829,6 +869,67 @@ mod tests {
                 assert_eq!(type_text, "{ ok: boolean }");
             }
             other => panic!("expected literal anchor, got {:?}", other),
+        }
+    }
+
+    /// An infer-request alias whose v1 inference produced a real shape rides
+    /// a LITERAL anchor carrying that text (the kind-aware inference result);
+    /// a placeholder text (`unknown`) keeps the locator-based infer anchor.
+    #[test]
+    fn derive_anchors_prefers_v1_inferred_text_for_infer_aliases() {
+        let infer_item = |alias: &str| crate::services::type_sidecar::InferRequestItem {
+            file_path: "src/bus.ts".to_string(),
+            line_number: 4,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("payload".to_string()),
+            expression_line: Some(4),
+            infer_kind: InferKind::Expression,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        };
+        let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
+            alias: alias.to_string(),
+            type_string: text.to_string(),
+            is_explicit: false,
+            source_location: crate::services::type_sidecar::SourceLocation {
+                file_path: "src/bus.ts".to_string(),
+                start_line: 4,
+                end_line: 4,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::Expression,
+            primary_type_symbol: None,
+            array_depth: None,
+        };
+
+        let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
+        let inferred = vec![
+            inferred_type("Pub_Resolved", "{ time: string; item: string; }"),
+            inferred_type("Pub_Unresolved", "unknown"),
+        ];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &inferred, ".");
+        assert_eq!(anchors.len(), 2);
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias,
+                type_text,
+                anchor_origin,
+            } => {
+                assert_eq!(alias, "Pub_Resolved");
+                assert_eq!(type_text, "{ time: string; item: string; }");
+                assert_eq!(*anchor_origin, AnchorOrigin::DeterministicInfer);
+            }
+            other => panic!(
+                "expected literal anchor from inferred text, got {:?}",
+                other
+            ),
+        }
+        match &anchors[1] {
+            CaptureAnchor::Infer { alias, .. } => assert_eq!(alias, "Pub_Unresolved"),
+            other => panic!("expected locator infer anchor, got {:?}", other),
         }
     }
 

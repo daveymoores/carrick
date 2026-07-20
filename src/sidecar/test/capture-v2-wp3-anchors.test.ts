@@ -132,11 +132,16 @@ describe('capture v2 WP3 anchors: array_depth + literal', () => {
     assert.strictEqual(r.anchor_kind, 'literal');
     assert.strictEqual(r.self_check, 'ok');
     assert.strictEqual(r.source_file, '<inline>');
+    // Literal anchors sit at the legacy-text tier, self-checked but counted
+    // as structural_fallback so the legacy dependence stays measurable.
+    assert.strictEqual(r.serialization, 'structural_fallback');
+    assert.strictEqual(r.capture_failure_reason, undefined);
   });
 
   it('emits an inline object literal verbatim and self-checks ok', () => {
     const r = record('Lit_Object');
     assert.strictEqual(r.self_check, 'ok');
+    assert.strictEqual(r.serialization, 'structural_fallback');
     assert.ok(
       /Lit_Object = \{\s*ok: boolean;?\s*count: number;?\s*\};/.test(surface),
       `surface should carry the inline object:\n${surface}`

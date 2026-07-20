@@ -133,8 +133,12 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
 
   const records: CaptureAliasRecord[] = [];
   for (const anchor of args.resolved) {
+    // Demotions (failureReason present) never reached the surface with a
+    // real type; everything else — including successful literal anchors,
+    // which sit at the structural_fallback TIER but did produce text — is
+    // classified by the real self-check.
     records.push(
-      anchor.serialization === 'structural_fallback'
+      anchor.failureReason !== undefined
         ? demotedRecord(anchor)
         : checkedRecord(anchor, {
             args,

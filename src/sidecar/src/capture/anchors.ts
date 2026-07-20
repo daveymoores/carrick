@@ -15,7 +15,7 @@ export interface ResolvedAnchor {
   /** RHS of `export type <alias> = ...;` in the surface entry. */
   aliasText: string;
   serialization: 'emitted' | 'node_builder' | 'structural_fallback';
-  /** Present when serialization is structural_fallback. */
+  /** Present exactly for demotions (the alias line is `unknown`). */
   failureReason?: string;
 }
 
@@ -85,7 +85,12 @@ export function resolveAnchor(
     return {
       request,
       aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : text,
-      serialization: 'emitted',
+      // Literal anchors ARE the legacy-text tier (WP3 wiring of the design's
+      // structural_fallback): hand-produced type text riding the surface.
+      // The self-check still classifies decay; the fidelity metric counts
+      // them at this tier so the legacy dependence stays measurable and
+      // ratchetable. Demotions are distinguished by failureReason.
+      serialization: 'structural_fallback',
     };
   }
 
