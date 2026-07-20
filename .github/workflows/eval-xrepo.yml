@@ -29,6 +29,10 @@ on:
         description: "corpus fixture dir name under tests/fixtures/"
         required: false
         default: "xrepo-corpus-1"
+      install_corpus_deps:
+        description: "npm-install each corpus repo before scanning (false = bare checkout, the Action's default posture)"
+        required: false
+        default: "true"
 
 permissions:
   id-token: write
@@ -64,6 +68,7 @@ jobs:
         run: cd ts_check && npm ci
 
       - name: Install corpus dependencies
+        if: ${{ inputs.install_corpus_deps != 'false' }}
         env:
           CORPUS_INPUT: ${{ inputs.corpus }}
         run: |
