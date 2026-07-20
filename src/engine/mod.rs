@@ -1730,20 +1730,70 @@ fn append_pubsub_manifest_entries(
 /// (logged at debug): without an SDL producer there is no manifest entry to join
 /// back to, so a resolver location alone is inert.
 ///
+/// Two deterministic guards harden the join against misattributed claims (the
+/// corpus-3 `query ticket` live-eval false-incompatible: the model linked a
+/// NestJS HTTP handler returning a ticket-SHAPED object as the field's
+/// resolver, and its inferred return then rode the producer's type surface
+/// into a confidently wrong verdict):
+///
+/// 1. **HTTP-handler borrow witness**: a claim whose `resolver_function`
+///    names a function the SAME file's analysis bound as an HTTP endpoint
+///    handler (`endpoints[].handler_name`) is dropped. The witness is the
+///    model's own output — a function it identified as the handler of an
+///    HTTP route is that route's contract, not a schema field's resolver.
+///    Framework-agnostic: no framework names, only structural agreement
+///    within one `FileAnalysisResult`.
+/// 2. **Cross-claim ambiguity fails closed**: claims are collected over a
+///    SORTED file order (never `HashMap` iteration order, which previously
+///    let the last writer win nondeterministically), and when two surviving
+///    claims for one producer key disagree on `(file, function)` — or two
+///    backing-type claims disagree on `(file, symbol)` — the location is
+///    dropped entirely. An unlocated producer abstains (type_state stays
+///    `Unknown`, its pairs verdict unverifiable) — never a coin-flip between
+///    a right and a wrong site.
+///
+/// A resolver-location claim beats a backing-type claim for the same key
+/// (the resolver-first gate, 186cb27), now across files as well as within
+/// one op — previously a backing-only claim from a later file could smear
+/// its `resolver_file` under another file's `resolver_line`.
+///
 /// Consumers are never touched — they anchor on `payload_type_symbol`.
 fn merge_graphql_resolver_locations(
     graphql: &mut crate::graphql::GraphqlExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) {
     // Canonical producer key -> index, so each LLM op joins in O(1) without an
-    // N×M scan. A schema field has at most one root producer, so the last write
-    // wins is moot (keys are unique across producers).
+    // N×M scan (keys are unique across producers).
     let mut by_key: HashMap<String, usize> = HashMap::new();
     for (idx, op) in graphql.producers.iter().enumerate() {
         by_key.insert(op.key.canonical(), idx);
     }
 
-    for (path, result) in file_results {
+    // Claims are collected fully before anything is applied, so a conflicting
+    // later claim voids the location instead of racing for it.
+    // producer idx -> (file, resolver function, 1-based line).
+    let mut resolver_claims: HashMap<usize, (String, String, u32)> = HashMap::new();
+    let mut resolver_conflicts: HashSet<usize> = HashSet::new();
+    // producer idx -> (file, backing symbol, backing source).
+    #[allow(clippy::type_complexity)]
+    let mut backing_claims: HashMap<usize, (String, String, Option<String>)> = HashMap::new();
+    let mut backing_conflicts: HashSet<usize> = HashSet::new();
+
+    let mut paths: Vec<&String> = file_results.keys().collect();
+    paths.sort();
+    for path in paths {
+        let result = &file_results[path];
+        if result.graphql_operations.is_empty() {
+            continue;
+        }
+        // Borrow witness evidence: every function name this file's analysis
+        // bound as an HTTP endpoint handler.
+        let handler_names: HashSet<&str> = result
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.handler_name.trim())
+            .filter(|name| !name.is_empty())
+            .collect();
         for llm_op in &result.graphql_operations {
             let key = OperationKey::graphql(llm_op.kind, llm_op.field.clone());
             let Some(&idx) = by_key.get(&key.canonical()) else {
@@ -1754,13 +1804,29 @@ fn merge_graphql_resolver_locations(
                 );
                 continue;
             };
-            let producer = &mut graphql.producers[idx];
-            producer.resolver_file = Some(PathBuf::from(path));
             // Trim before the emptiness check: a whitespace-only string (e.g.
-            // " ") from the model is not a resolver function name, and letting
-            // it through here would wrongly take the FunctionReturn path and
-            // block the type-locate fallback below, leaving the producer
-            // unanchored.
+            // " ") from the model is not a resolver function name.
+            let resolver_name = llm_op
+                .resolver_function
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            // Guard 1: the claimed resolver is an HTTP endpoint handler in the
+            // same file analysis — the misattribution class. Drop the whole
+            // claim (a resolver-named op carries no backing type by schema
+            // contract, and a contract-violating one must not smuggle one in).
+            if let Some(name) = resolver_name
+                && handler_names.contains(name)
+            {
+                debug!(
+                    op = %key.canonical(),
+                    file = %path,
+                    function = %name,
+                    "graphql resolver claim names an HTTP endpoint handler from the \
+                     same file's analysis; dropping the claim (borrow witness)"
+                );
+                continue;
+            }
             // The FunctionReturn path needs BOTH a real resolver name AND a
             // usable line: `collect_graphql_producer_infer_requests` skips any
             // producer missing either, so taking this branch with a dead
@@ -1770,28 +1836,92 @@ fn merge_graphql_resolver_locations(
             // request's line_number is u32, and a 0/negative line can't anchor
             // a fn), and treat a clamped-out line exactly like a missing
             // resolver: fall through to the backing-type fallback.
-            let resolver_line = llm_op
-                .resolver_function
-                .as_deref()
-                .filter(|f| !f.trim().is_empty())
+            let resolver_line = resolver_name
                 .and(llm_op.resolver_line)
                 .and_then(|line| u32::try_from(line).ok())
                 .filter(|&line| line > 0);
-            if resolver_line.is_some() {
-                // Resolver located: its concrete return type carries the
-                // wrappers (Promise / ApiResponse envelope / async-iterator) the
-                // bare SDL-backed type can't, so the FunctionReturn path wins.
-                producer.resolver_line = resolver_line;
+            if let Some(line) = resolver_line {
+                let name = resolver_name.unwrap_or_default().to_string();
+                match resolver_claims.get(&idx) {
+                    Some((prev_file, prev_name, _))
+                        if prev_file != path.as_str() || prev_name != &name =>
+                    {
+                        // Guard 2: two files (or two ops) disagree on where the
+                        // resolver lives — ambiguous, fail closed below.
+                        resolver_conflicts.insert(idx);
+                        debug!(
+                            op = %key.canonical(),
+                            first = %format!("{prev_file}:{prev_name}"),
+                            second = %format!("{path}:{name}"),
+                            "conflicting graphql resolver claims"
+                        );
+                    }
+                    Some(_) => {} // Duplicate of the accepted claim.
+                    None => {
+                        resolver_claims.insert(idx, (path.clone(), name, line));
+                    }
+                }
             } else if let Some(symbol) = llm_op.backing_type_symbol.clone() {
-                // No resolver function: fall back to the co-located backing type
-                // the LLM located (#248). Keyed on the dedicated
-                // `backing_type_symbol` (never `primary_type_symbol`, which
-                // describes a resolver's return type) so this can only fire for a
-                // genuinely resolver-less field. The sidecar bundles + structurally
-                // expands it and wraps it in the SDL list depth.
-                producer.response_type_symbol = Some(symbol);
-                producer.response_type_source = llm_op.backing_type_source.clone();
+                // No resolver function: the co-located backing type the LLM
+                // located (#248). Keyed on the dedicated `backing_type_symbol`
+                // (never `primary_type_symbol`, which describes a resolver's
+                // return type) so this can only fire for a genuinely
+                // resolver-less field.
+                match backing_claims.get(&idx) {
+                    Some((prev_file, prev_symbol, _))
+                        if prev_file != path.as_str() || prev_symbol != &symbol =>
+                    {
+                        backing_conflicts.insert(idx);
+                        debug!(
+                            op = %key.canonical(),
+                            first = %format!("{prev_file}:{prev_symbol}"),
+                            second = %format!("{path}:{symbol}"),
+                            "conflicting graphql backing-type claims"
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        backing_claims.insert(
+                            idx,
+                            (path.clone(), symbol, llm_op.backing_type_source.clone()),
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    for (idx, producer) in graphql.producers.iter_mut().enumerate() {
+        if resolver_conflicts.contains(&idx) {
+            debug!(
+                op = %producer.key.canonical(),
+                "conflicting resolver locations; leaving the producer unlocated (fail closed)"
+            );
+            continue;
+        }
+        if let Some((file, _name, line)) = resolver_claims.get(&idx) {
+            // Resolver located: its concrete return type carries the wrappers
+            // (Promise / ApiResponse envelope / async-iterator) the bare
+            // SDL-backed type can't, so the FunctionReturn path wins — and a
+            // backing-type claim for the same key (from any file) never
+            // applies alongside it.
+            producer.resolver_file = Some(PathBuf::from(file));
+            producer.resolver_line = Some(*line);
+            continue;
+        }
+        if backing_conflicts.contains(&idx) {
+            debug!(
+                op = %producer.key.canonical(),
+                "conflicting backing-type claims; leaving the producer unlocated (fail closed)"
+            );
+            continue;
+        }
+        if let Some((file, symbol, source)) = backing_claims.get(&idx) {
+            // The sidecar bundles + structurally expands the backing type and
+            // wraps it in the SDL list depth.
+            producer.resolver_file = Some(PathBuf::from(file));
+            producer.response_type_symbol = Some(symbol.clone());
+            producer.response_type_source = source.clone();
         }
     }
 }
@@ -6468,6 +6598,191 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             "each producer must emit a backing-type SymbolRequest, got: {:?}",
             requests
         );
+    }
+
+    /// A minimal endpoint the file-analyzer would emit alongside a
+    /// misattributed resolver claim: only `handler_name` matters to the
+    /// borrow witness.
+    fn endpoint_with_handler(handler_name: &str) -> EndpointResult {
+        EndpointResult {
+            candidate_id: "span:1-2".to_string(),
+            line_number: 7,
+            owner_node: "TicketsController".to_string(),
+            method: "GET".to_string(),
+            path: "/tickets/:id".to_string(),
+            handler_name: handler_name.to_string(),
+            pattern_matched: "@Get(\":id\")".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    /// The corpus-3 `query ticket` live-eval false-incompatible, reduced: the
+    /// file-analyzer links an HTTP endpoint HANDLER (`findOne`, which returns
+    /// a ticket-shaped object) as the field's resolver from the controller
+    /// file, while the real resolver file claims `resolveTicket`. The borrow
+    /// witness — the claimed function is an `endpoints[].handler_name` in the
+    /// SAME file's analysis — must drop the controller claim deterministically,
+    /// so the resolver file's claim wins in every run (never a `HashMap`-order
+    /// coin flip whose losing side rides the wrong inferred return into a
+    /// confidently wrong verdict).
+    #[test]
+    fn merge_graphql_resolver_locations_drops_http_handler_claims() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "ticket",
+                Some("Ticket"),
+            )],
+            consumers: vec![],
+        };
+
+        let claim = |function: &str, line: i32| GraphqlOperation {
+            kind: GraphqlOperationKind::Query,
+            field: "ticket".to_string(),
+            resolver_function: Some(function.to_string()),
+            resolver_line: Some(line),
+            primary_type_symbol: None,
+            type_import_source: None,
+            backing_type_symbol: None,
+            backing_type_source: None,
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        // Sorted-order note: "src/tickets.controller.ts" sorts BEFORE
+        // "src/tickets.resolver.ts", so without the witness the controller
+        // claim would be the accepted first claim and the resolver claim would
+        // read as a conflict — the assertion below fails either way unless the
+        // witness drops the controller claim outright.
+        file_results.insert(
+            "src/tickets.controller.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![endpoint_with_handler("findOne")],
+                data_calls: vec![],
+                graphql_operations: vec![claim("findOne", 8)],
+                pubsub_operations: vec![],
+            },
+        );
+        file_results.insert(
+            "src/tickets.resolver.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![],
+                graphql_operations: vec![claim("resolveTicket", 4)],
+                pubsub_operations: vec![],
+            },
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let ticket = &graphql.producers[0];
+        assert_eq!(
+            ticket.resolver_file,
+            Some(PathBuf::from("src/tickets.resolver.ts")),
+            "the HTTP-handler claim must be dropped; the resolver file's claim wins"
+        );
+        assert_eq!(ticket.resolver_line, Some(4));
+        // The dropped claim must not smuggle in a backing type either.
+        assert_eq!(ticket.response_type_symbol, None);
+    }
+
+    /// Two files claim DIFFERENT resolver locations for the same producer key
+    /// and neither claim is witnessed as an HTTP handler: the location is
+    /// ambiguous, and ambiguity fails closed — the producer stays unlocated
+    /// (no FunctionReturn infer request, type_state stays `Unknown`, its pairs
+    /// verdict unverifiable) instead of the previous last-write-wins over
+    /// nondeterministic `HashMap` iteration order, where the losing run
+    /// shipped the WRONG file's inferred return as the producer's contract.
+    #[test]
+    fn merge_graphql_resolver_locations_conflicting_claims_fail_closed() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind;
+
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "ticket",
+                Some("Ticket"),
+            )],
+            consumers: vec![],
+        };
+
+        let claim = |function: &str, line: i32| GraphqlOperation {
+            kind: GraphqlOperationKind::Query,
+            field: "ticket".to_string(),
+            resolver_function: Some(function.to_string()),
+            resolver_line: Some(line),
+            primary_type_symbol: None,
+            type_import_source: None,
+            backing_type_symbol: None,
+            backing_type_source: None,
+        };
+        let result_with = |ops: Vec<GraphqlOperation>| FileAnalysisResult {
+            graphql_consumer_locates: vec![],
+            mounts: vec![],
+            endpoints: vec![],
+            data_calls: vec![],
+            graphql_operations: ops,
+            pubsub_operations: vec![],
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "src/a.resolver.ts".to_string(),
+            result_with(vec![claim("resolveTicketA", 4)]),
+        );
+        file_results.insert(
+            "src/b.resolver.ts".to_string(),
+            result_with(vec![claim("resolveTicketB", 9)]),
+        );
+
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let ticket = &graphql.producers[0];
+        assert_eq!(
+            ticket.resolver_file, None,
+            "conflicting claims must clear the location, not race for it"
+        );
+        assert_eq!(ticket.resolver_line, None);
+        assert_eq!(ticket.response_type_symbol, None);
+        // The SDL anchor is untouched by the conflict handling.
+        assert_eq!(ticket.primary_type_symbol.as_deref(), Some("Ticket"));
+
+        // Duplicate claims that AGREE are not a conflict: the shared claim is
+        // applied.
+        let mut agreeing = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(
+                GraphqlOperationKind::Query,
+                "ticket",
+                Some("Ticket"),
+            )],
+            consumers: vec![],
+        };
+        let mut agreeing_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        agreeing_results.insert(
+            "src/a.resolver.ts".to_string(),
+            result_with(vec![claim("resolveTicket", 4), claim("resolveTicket", 4)]),
+        );
+        merge_graphql_resolver_locations(&mut agreeing, &agreeing_results);
+        assert_eq!(
+            agreeing.producers[0].resolver_file,
+            Some(PathBuf::from("src/a.resolver.ts"))
+        );
+        assert_eq!(agreeing.producers[0].resolver_line, Some(4));
     }
 
     /// #268 isolation guard: a consumer op with an explicit call-site generic
