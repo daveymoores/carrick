@@ -154,3 +154,126 @@ export interface CaptureStubOptions {
   outDir: string;
   tsconfigPath?: string;
 }
+
+// ===========================================================================
+// Check phase ("tsc as the judge") — WP2
+//
+// The check phase assembles two or more capture stub packages into a scratch
+// synthetic monorepo (pnpm, node-linker=isolated), installs their pinned deps,
+// generates one probe file per matched pair, runs the vendored `tsc` CLI over
+// the probes, and classifies the diagnostics into four buckets. It imports
+// only node builtins + `typescript` + itself — same seam as capture.
+// ===========================================================================
+
+/** Wire protocol of a matched pair (drives the direction table). */
+export type ProbeProtocol = 'http' | 'graphql' | 'socket' | 'pubsub';
+
+/**
+ * Type kind of a matched pair. `request`/`response` disambiguate HTTP body
+ * direction (the confirmed inversion the direction table fixes); socket/pubsub
+ * pairs are `both`.
+ */
+export type ProbeTypeKind = 'request' | 'response' | 'both';
+
+/** One capture stub package to assemble into the check workspace. */
+export interface CheckStubInput {
+  /** Service name (used for scrub labels + pair endpoints). */
+  service_name: string;
+  /** Absolute path to the capture stub dir (package.json + types/ tree). */
+  stub_dir: string;
+}
+
+/** One side of a matched pair: a service + the surface alias to probe. */
+export interface CheckPairEndpoint {
+  service_name: string;
+  alias: string;
+}
+
+/**
+ * One matched pair to verify. The direction table maps (protocol, type_kind)
+ * to which endpoint is the `sent` value and which is the `expected` binding,
+ * so callers pass semantic producer/consumer roles and never a raw direction.
+ * (WP3 in Rust feeds protocol + type_kind; the table stays here, one place.)
+ */
+export interface CheckPairSpec {
+  /** Stable caller key echoed back on the verdict; the pair_id is derived from it. */
+  pair_key: string;
+  protocol: ProbeProtocol;
+  type_kind: ProbeTypeKind;
+  producer: CheckPairEndpoint;
+  consumer: CheckPairEndpoint;
+}
+
+/**
+ * Four-bucket classifier output (pinned decision 7):
+ *  - compatible: no diagnostics; the value-level assignment holds.
+ *  - incompatible: an assignment-class diagnostic (TS2322/2741/...) — real
+ *    compiler text is the report.
+ *  - unverifiable: a side decayed to unknown/never, a surface export is
+ *    missing/renamed, or a stub tree carries its own diagnostics (poison).
+ *  - gate_caught_baked_any: a side resolved to `any` (the IsAny probe gate
+ *    fired) — the backstop that stops a baked-any reading as compatible.
+ */
+export type VerdictBucket =
+  | 'compatible'
+  | 'incompatible'
+  | 'unverifiable'
+  | 'gate_caught_baked_any';
+
+export interface CheckVerdict {
+  /** Deterministic FNV-1a hash of the pair (never a temp path). */
+  pair_id: string;
+  /** Caller key, echoed for the WP3 verdict join. */
+  pair_key: string;
+  bucket: VerdictBucket;
+  /**
+   * For gate/import buckets: which side and which gate fired, e.g.
+   * `producer:any`, `consumer:unknown`, `import:producer`. Absent for
+   * compatible.
+   */
+  gate?: string;
+  /** User-facing message: scrubbed real TS text, or a synthesized reason.
+   * Never contains absolute paths or scan internals. Absent for compatible. */
+  diagnostic?: string;
+  /** TS diagnostic codes attributed to this pair's probe, sorted. */
+  codes: number[];
+}
+
+/** A service whose pairs are degraded wholesale (install failure or poison). */
+export interface DegradedService {
+  service_name: string;
+  reason: string;
+}
+
+export interface CheckResult {
+  success: boolean;
+  /** Scratch workspace directory (kept unless caller cleans it). */
+  workspace_dir: string;
+  /** `pnpm` when isolation held; `unavailable` when the vendored pnpm is
+   * missing (soundness over availability — pinned design, Check step 2). */
+  isolation: 'pnpm' | 'unavailable';
+  install_ok: boolean;
+  /** Scrubbed install-failure summary when install_ok is false. */
+  install_error?: string;
+  ts_version: string;
+  /** Verdicts, sorted by pair_id for byte-stable output. */
+  verdicts: CheckVerdict[];
+  degraded_services: DegradedService[];
+  errors: string[];
+}
+
+export interface CheckOptions {
+  stubs: CheckStubInput[];
+  pairs: CheckPairSpec[];
+  /** Parent dir for the scratch workspace (default: os.tmpdir()). */
+  workspaceRoot?: string;
+  /** Absolute path to the vendored pnpm binary. Defaults to the sidecar's
+   * own node_modules/.bin/pnpm resolved from this bundle's location. */
+  pnpmPath?: string;
+  /** Delete the scratch workspace before returning (default true). Tests that
+   * inspect the assembled tree pass false. */
+  cleanup?: boolean;
+}
+
+/** Progress phases emitted over the async install protocol. */
+export type CheckProgressPhase = 'assembling' | 'installing' | 'checking';

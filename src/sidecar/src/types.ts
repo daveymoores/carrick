@@ -246,6 +246,33 @@ export interface CaptureV2Response extends BaseResponse {
 }
 
 /**
+ * Request to run the v2 "tsc as judge" check for a set of matched pairs.
+ * Assembles the given capture stubs into a scratch synthetic monorepo and
+ * returns one verdict per pair. The full contract lives in ./capture/api.ts --
+ * the seam between the sidecar and the v2 capture/check bundle.
+ */
+export interface CheckV2Request extends BaseRequest {
+  action: 'check_v2';
+  /** Capture stub packages to assemble (one per participating service). */
+  stubs: import('./capture/api.js').CheckStubInput[];
+  /** Matched pairs to verify. */
+  pairs: import('./capture/api.js').CheckPairSpec[];
+  /** Parent dir for the scratch workspace (default: OS temp dir). */
+  workspace_root?: string;
+  /** Keep the assembled workspace on disk (default false; tests set true). */
+  keep_workspace?: boolean;
+}
+
+/**
+ * Response for the check_v2 action. Emitted as the terminal frame; the async
+ * install protocol emits `status: 'progress'` keepalive frames before it.
+ */
+export interface CheckV2Response extends BaseResponse {
+  result?: import('./capture/api.js').CheckResult;
+  errors?: string[];
+}
+
+/**
  * Request to infer implicit types at specific locations
  */
 export interface InferRequest extends BaseRequest {
@@ -326,6 +353,7 @@ export type SidecarRequest =
   | BundleRequest
   | EmitSurfaceRequest
   | CaptureV2Request
+  | CheckV2Request
   | InferRequest
   | BuildWorkspaceRequest
   | CheckCompatibilityRequest
@@ -542,6 +570,7 @@ export type SidecarResponse =
   | BundleResponse
   | EmitSurfaceResponse
   | CaptureV2Response
+  | CheckV2Response
   | InferResponse
   | BuildWorkspaceResponse
   | CheckCompatibilityResponse

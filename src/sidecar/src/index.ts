@@ -19,7 +19,7 @@ import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { MonorepoBuilder } from './monorepo-builder.js';
 import { DefinitionResolver } from './definition-resolver.js';
-import { captureStub } from './capture/index.js';
+import { captureStub, runCheck } from './capture/index.js';
 import type {
   SidecarRequest,
   SidecarResponse,
@@ -27,6 +27,7 @@ import type {
   BundleResponse,
   EmitSurfaceResponse,
   CaptureV2Response,
+  CheckV2Response,
   InferResponse,
   BuildWorkspaceResponse,
   CheckCompatibilityResponse,
@@ -247,6 +248,56 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
       status: 'error',
       errors: [error],
     };
+  }
+}
+
+/**
+ * Handle the 'check_v2' action - v2 "tsc as judge" compatibility check.
+ *
+ * Async by necessity: the vendored pnpm install can exceed the Rust client's
+ * read deadline, and running it off the event loop (spawn, not execSync) keeps
+ * the sidecar responsive. Emits `status: 'progress'` keepalive frames during
+ * install/check and one terminal `success`/`error` frame. Writes its own
+ * frames, so processLine hands off and does not write a response for it.
+ */
+async function handleCheckV2Async(
+  request: SidecarRequest & { action: 'check_v2' }
+): Promise<void> {
+  let phase = 'assembling';
+  const keepalive = setInterval(() => {
+    writeProgress(request.request_id, phase, `check ${phase}`);
+  }, 1500);
+  keepalive.unref();
+  try {
+    log(`check_v2: ${request.stubs.length} stub(s), ${request.pairs.length} pair(s)`);
+    const result = await runCheck(
+      {
+        stubs: request.stubs,
+        pairs: request.pairs,
+        workspaceRoot: request.workspace_root,
+        cleanup: request.keep_workspace !== true,
+      },
+      (p) => {
+        phase = p;
+      }
+    );
+    clearInterval(keepalive);
+    const response: CheckV2Response = {
+      request_id: request.request_id,
+      status: result.success ? 'success' : 'error',
+      result,
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    };
+    writeResponse(response);
+  } catch (err) {
+    clearInterval(keepalive);
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`check_v2 failed: ${error}`);
+    writeResponse({
+      request_id: request.request_id,
+      status: 'error',
+      errors: [error],
+    });
   }
 }
 
@@ -494,6 +545,17 @@ function writeResponse(response: SidecarResponse): void {
 }
 
 /**
+ * Write a non-terminal progress/keepalive frame (async install protocol).
+ * Distinct `status: 'progress'` so clients skip it and wait for the terminal
+ * success/error frame.
+ */
+function writeProgress(requestId: string, phase: string, message: string): void {
+  process.stdout.write(
+    JSON.stringify({ request_id: requestId, status: 'progress', phase, message }) + '\n'
+  );
+}
+
+/**
  * Write an error response for an invalid request
  */
 function writeErrorResponse(requestId: string, error: string): void {
@@ -547,6 +609,13 @@ function processLine(line: string): void {
       (json as { request_id?: string })?.request_id || 'unknown',
       parseResult.error
     );
+    return;
+  }
+
+  // check_v2 runs async (spawned pnpm install + tsc) and writes its own
+  // progress + terminal frames; hand off and return.
+  if (parseResult.request.action === 'check_v2') {
+    void handleCheckV2Async(parseResult.request);
     return;
   }
 

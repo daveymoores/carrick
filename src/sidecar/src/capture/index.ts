@@ -49,6 +49,10 @@ import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
+// v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
+// reaches it only through this door (index.js).
+export { runCheck } from './check.js';
+export type { CheckProgress } from './check.js';
 
 const SURFACE_ENTRY_BASENAME = '__carrick_surface__';
 
