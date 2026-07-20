@@ -43,7 +43,7 @@ import type {
 } from './api.js';
 import { entryRelativeSpecifier, resolveAnchor, type ResolvedAnchor } from './anchors.js';
 import { findAugmentationFiles } from './augmentations.js';
-import { lockfileVersions } from './lockfile.js';
+import { installedVersions, lockfileVersions } from './lockfile.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
 import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
@@ -311,7 +311,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     entryDir,
   });
 
-  // ---- Pin external deps from the producer repo's lockfile ----
+  // ---- Pin external deps: installed node_modules first, lockfile fallback ----
   // Externals are collected AFTER the rewrite pass: a rewritten paths
   // specifier is internal, not a dependency.
   const externalSpecs = new Set<string>();
@@ -323,11 +323,19 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       }
     }
   }
+  // Precedence: an installed checkout's node_modules is what the repo
+  // actually resolves against, so it wins over the lockfile — and it pins
+  // repos whose lockfiles we do not parse (yarn classic/berry, bun). The
+  // parsed lockfile remains the bare-checkout fallback. Both paths pin only
+  // the directly-referenced externals; transitives resolve at check-install
+  // (check-workspace NPMRC: "Direct deps are exact-pinned by the stubs;
+  // only transitives resolve").
+  const installed = installedVersions(repoRoot, externalSpecs);
   const lockVersions = lockfileVersions(repoRoot);
   const pinned: Record<string, string> = {};
   const unpinned: string[] = [];
   for (const name of [...externalSpecs].sort()) {
-    const version = lockVersions.get(name);
+    const version = installed.get(name) ?? lockVersions.get(name);
     if (version) pinned[name] = version;
     else unpinned.push(name);
   }

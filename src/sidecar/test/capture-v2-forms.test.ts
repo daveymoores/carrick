@@ -24,7 +24,9 @@
  *    the stub for the check): externals resolve, aliases classify ok
  *  - node-builder printing of an external package type as
  *    import("@acme/models").WidgetDto
- *  - exact lockfile pins for scoped packages
+ *  - exact installed-node_modules pins for scoped packages: the fixture's
+ *    package-lock.json disagrees on purpose (2.0.0) and the installed
+ *    version (2.1.0) must win
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -393,7 +395,9 @@ describe('capture_v2: all anchor forms (installed fixture)', () => {
     assert.match(surface, /widget: import\("@acme\/models"\)\.WidgetDto/);
   });
 
-  it('pins the scoped external at its exact lockfile version', () => {
+  it('pins the scoped external at its installed version, over the disagreeing lockfile', () => {
+    // node_modules/@acme/models is 2.1.0; package-lock.json says 2.0.0.
+    // Installed reality wins: it is the version the repo resolves against.
     assert.strictEqual(response.result!.pinned_dependencies['@acme/models'], '2.1.0');
     assert.deepStrictEqual(response.result!.unpinned_externals, []);
   });

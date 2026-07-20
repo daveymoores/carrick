@@ -1,7 +1,12 @@
 /**
- * Exact-version dependency pins from the producer repo's lockfile (pinned
- * decision 2: stub packages pin FROM THE LOCKFILE; npm and pnpm lockfiles in
- * scope, yarn-berry is a tracked follow-up).
+ * Exact-version dependency pins for the stub package, from two sources:
+ *
+ *  1. `installedVersions` — the repo's own node_modules, when installed.
+ *     This is the version the repo actually resolves against, so it wins
+ *     over the lockfile, and it covers repos whose lockfiles we do not
+ *     parse at all (yarn classic/berry, bun).
+ *  2. `lockfileVersions` — parsed lockfile fallback for bare checkouts
+ *     (npm v1/v2/v3 and pnpm v6/v9 in scope).
  *
  * Pin selection prefers the DIRECT (top-level) dependency version: a package
  * present at multiple versions must pin to the version the emitted tree
@@ -131,6 +136,76 @@ function pnpmLockfileVersions(lockPath: string): Map<string, string> {
   const versions = new Map<string, string>(direct);
   for (const [name, version] of fallback) {
     if (!versions.has(name)) versions.set(name, version);
+  }
+  return versions;
+}
+
+/**
+ * Published-semver gate for node_modules pins. Rejects anything a registry
+ * install could not satisfy: workspace/link protocol leakage
+ * (`workspace:*`, `link:...`) and yarn-berry's `0.0.0-use.local` local
+ * sentinel. A rejected version means "unpinned" (fail-closed abstain
+ * downstream), never a pin that would fail the synthetic-workspace install.
+ */
+function isPublishedSemver(version: string): boolean {
+  return (
+    /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version) &&
+    !version.startsWith('0.0.0-use.')
+  );
+}
+
+/**
+ * Resolve exact versions from the repo's installed node_modules by reading
+ * `node_modules/<pkg>/package.json` for each referenced external. On an
+ * installed checkout this is ground truth — the versions the repo actually
+ * runs against — and it needs no lockfile parser, which is what closes the
+ * yarn/bun coverage gap.
+ *
+ * Workspace-member guard (fail-closed): package managers link workspace
+ * siblings into node_modules as symlinks (`node_modules/@ws/member ->
+ * ../../packages/member`). Those carry unpublished versions; pinning one
+ * would make the whole synthetic-workspace install fail at check time. So a
+ * pin is taken only when the entry's realpath still lives under a
+ * node_modules directory inside the repo. pnpm's own
+ * `node_modules/<pkg> -> node_modules/.pnpm/<pkg>@<v>/node_modules/<pkg>`
+ * links pass that test and stay pinnable; realpaths inside the repo but
+ * outside every node_modules (workspace members) and realpaths outside the
+ * repo entirely (npm/yarn link to a dev checkout) are skipped — the
+ * external stays unpinned unless the lockfile supplies a version.
+ */
+export function installedVersions(
+  repoRoot: string,
+  names: Iterable<string>
+): Map<string, string> {
+  const versions = new Map<string, string>();
+  const nodeModules = path.join(path.resolve(repoRoot), 'node_modules');
+  let realRepoRoot: string;
+  try {
+    realRepoRoot = fs.realpathSync(path.resolve(repoRoot));
+  } catch {
+    return versions;
+  }
+  for (const name of names) {
+    // Package names come from bare import specifiers; anything with empty
+    // or dot segments cannot be a node_modules entry (and must not escape).
+    const segments = name.split('/');
+    if (segments.some((s) => s === '' || s === '.' || s === '..')) continue;
+    const pkgDir = path.join(nodeModules, ...segments);
+    try {
+      const real = fs.realpathSync(pkgDir);
+      const rel = path.relative(realRepoRoot, real);
+      const inRepo = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+      if (!inRepo || !rel.split(path.sep).includes('node_modules')) continue;
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8')
+      );
+      if (typeof manifest?.version === 'string' && isPublishedSemver(manifest.version)) {
+        versions.set(name, manifest.version);
+      }
+    } catch {
+      // Missing dir, dangling symlink, unreadable or corrupt package.json:
+      // the external stays unpinned here (lockfile fallback or abstain).
+    }
   }
   return versions;
 }
