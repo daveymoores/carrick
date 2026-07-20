@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "carrick"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "carrick-match",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "carrick-match"
-version = "0.3.0"
+version = "0.2.9"
 dependencies = [
  "serde",
  "wasm-bindgen",
