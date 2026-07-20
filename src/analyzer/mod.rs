@@ -258,61 +258,25 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// RUNTIME-DEAD since the v2 re-point (WP3): the verdict join now consumes
-/// structured [`PairCheckOutcome`]s and never re-parses a label. This is one
-/// of the seven string-decay compensations; its deletion (with tests proving
-/// the v2 path covers the case) is WP4, same release.
-///
-/// Parse a ts_check compat `endpoint` string back into the verdict-join
-/// `(pseudo-method, identity)` pair. ts_check builds the string as
-/// `"<METHOD> <path> (<request|response>)"` for HTTP,
-/// `"SOCKET <DIRECTION>|<event> (response)"` for socket, and
-/// `"PUBSUB <topic> (response)"` for pub/sub, so the same split — leading token
-/// off the front, trailing `" (type_kind)"` off the back — yields
-/// `("METHOD", "path")`, `("SOCKET", "DIRECTION|event")`, or
-/// `("PUBSUB", "topic")`, matching what `parse_producer_key` recovers from the
-/// edge's `producer_key`. The pub/sub topic carries no path params (and no
-/// nested `|`), so the generic split needs no protocol-specific arm. Returns
-/// `None` for an unrecognized shape.
-#[allow(dead_code)]
-fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
-    let (method, rest) = endpoint.split_once(' ')?;
-    // Drop the trailing " (request)" / " (response)" annotation if present.
-    let path = match rest.rfind(" (") {
-        Some(idx) if rest.ends_with(')') => &rest[..idx],
-        _ => rest,
-    };
-    if method.is_empty() || path.is_empty() {
-        return None;
-    }
-    Some((method.to_uppercase(), path.to_string()))
-}
-
 /// Recover the verdict-join `(pseudo-method, identity)` from a canonical
-/// producer key, for the protocols ts_check type-checks
-/// (HTTP + socket + graphql + pub/sub):
+/// producer key, for the protocols the type-compat check evaluates
+/// (HTTP + socket + graphql + pub/sub). The v2 checker builds each
+/// [`PairCheckOutcome`]'s `pseudo_method`/`identity` from the same canonical
+/// key material, so the two sides agree by construction:
 ///
 /// - HTTP (`"http|METHOD|path"`) → `("METHOD", "path")`, the HTTP join key.
-/// - Socket (`"socket|DIRECTION|event"`) → `("SOCKET", "DIRECTION|event")`. The
-///   matching ts_check endpoint label is `"SOCKET DIRECTION|event (response)"`,
-///   which `parse_compat_endpoint` reduces to the SAME pair, so a socket edge
-///   joins its ts_check verdict exactly like an HTTP one.
+/// - Socket (`"socket|DIRECTION|event"`) → `("SOCKET", "DIRECTION|event")`.
 /// - GraphQL (`"graphql|KIND|field"`) → `("GRAPHQL", "KIND|field")`. The
-///   matching ts_check endpoint label is `"GRAPHQL KIND|field (response)"`,
-///   which `parse_compat_endpoint` reduces to the SAME pair, so a graphql edge
-///   joins its verdict exactly like socket. The `KIND` (`query`/`mutation`/
-///   `subscription`) stays lowercase here AND in the ts_check label, so the two
-///   sides agree without any case folding.
+///   `KIND` (`query`/`mutation`/`subscription`) stays lowercase here AND in
+///   the outcome identity, so the two sides agree without any case folding.
 /// - Pub/Sub (`"pubsub|topic"`) → `("PUBSUB", "topic")`. Unlike the other three
 ///   this canonical is 2-segment (topic-only; the broker is not part of
-///   identity), so the third `splitn(3, '|')` field is `None`. The matching
-///   ts_check endpoint label is `"PUBSUB topic (response)"`, which
-///   `parse_compat_endpoint` reduces to the SAME pair, so a pub/sub edge joins
-///   its verdict exactly like socket. (A topic literally containing `|` would
-///   mis-split, but both sides split identically so the exact-topic match still
-///   holds; topics with `|` are pathological and left unguarded.)
+///   identity), so the third `splitn(3, '|')` field is `None`. (A topic
+///   literally containing `|` would mis-split, but both sides split identically
+///   so the exact-topic match still holds; topics with `|` are pathological and
+///   left unguarded.)
 ///
-/// Returns `None` for any other protocol: ts_check produced no verdict for it,
+/// Returns `None` for any other protocol: the check produced no verdict for it,
 /// so its edge stays `None` rather than fabricating one.
 fn parse_producer_key(key: &str) -> Option<(String, String)> {
     let mut parts = key.splitn(3, '|');
@@ -4759,12 +4723,6 @@ mod tests {
                 "subscription|orderUpdated".to_string()
             )),
         );
-        // The legacy ts_check label round-trip stays pinned while
-        // parse_compat_endpoint exists (deleted in WP4 with its tests).
-        assert_eq!(
-            parse_compat_endpoint("GRAPHQL query|order (response)"),
-            parse_producer_key("graphql|query|order"),
-        );
         // Malformed (missing field) → no join key, edge stays None.
         assert_eq!(parse_producer_key("graphql|query|"), None);
         assert_eq!(parse_producer_key("graphql|query"), None);
@@ -4835,12 +4793,6 @@ mod tests {
         assert_eq!(
             parse_producer_key("pubsub|order.placed"),
             Some(("PUBSUB".to_string(), "order.placed".to_string())),
-        );
-        // The legacy ts_check label round-trip stays pinned while
-        // parse_compat_endpoint exists (deleted in WP4 with its tests).
-        assert_eq!(
-            parse_compat_endpoint("PUBSUB order.placed (response)"),
-            parse_producer_key("pubsub|order.placed"),
         );
         // Empty topic → no join key, edge stays None.
         assert_eq!(parse_producer_key("pubsub|"), None);
