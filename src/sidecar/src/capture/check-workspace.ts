@@ -252,6 +252,14 @@ const NPMRC = [
   'strict-peer-dependencies=false',
   // Determinism: install exactly the pinned closure, no implicit peer pull-in.
   'auto-install-peers=false',
+  // Determinism: the scratch workspace has no committed lockfile, so the
+  // transitive closure would otherwise be a pure function of live registry
+  // state. prefer-offline resolves from the local store/metadata cache
+  // whenever possible (byte-stable across runs on a host), and the explicit
+  // resolution-mode pins pnpm's resolver behavior across pnpm versions.
+  // Direct deps are exact-pinned by the stubs; only transitives resolve.
+  'prefer-offline=true',
+  'resolution-mode=highest',
   '',
 ].join('\n');
 

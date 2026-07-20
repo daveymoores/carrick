@@ -9,6 +9,9 @@
 
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   buildProbe,
   directionFor,
@@ -17,7 +20,7 @@ import {
 } from '../src/capture/check-probe.js';
 import { classifyPair, parseTscOutput } from '../src/capture/check-classify.js';
 import { scrubPaths, rewriteAliases } from '../src/capture/check-scrub.js';
-import { computeDedupeOverrides } from '../src/capture/check-workspace.js';
+import { assembleWorkspace, computeDedupeOverrides } from '../src/capture/check-workspace.js';
 import type { CheckPairSpec } from '../src/capture/api.js';
 import type { RawDiagnostic } from '../src/capture/check-classify.js';
 
@@ -247,6 +250,27 @@ describe('semver dedupe overrides', () => {
       { dependencies: { zod: '3.23.0' } },
     ]);
     assert.deepStrictEqual(overrides, {});
+  });
+
+  it('assembled workspace installs deterministically (offline-first, pinned resolver)', () => {
+    // The scratch workspace has no committed lockfile; without these settings
+    // the transitive closure is a function of live registry state and the
+    // byte-stability guarantee does not hold (adversarial-review finding 6).
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-npmrc-test-'));
+    const stubDir = path.join(root, 'stub');
+    fs.mkdirSync(stubDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stubDir, 'package.json'),
+      JSON.stringify({ name: '@carrick/svc', version: '0.0.0-carrick', private: true })
+    );
+    const ws = assembleWorkspace({
+      stubs: [{ service_name: 'svc', stub_dir: stubDir }],
+      workspaceRoot: root,
+    });
+    const npmrc = fs.readFileSync(path.join(ws.workspaceDir, '.npmrc'), 'utf8');
+    assert.ok(npmrc.includes('prefer-offline=true'), npmrc);
+    assert.ok(npmrc.includes('resolution-mode=highest'), npmrc);
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   it('0.0.x pins are each their own breaking boundary (no override)', () => {
