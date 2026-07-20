@@ -441,7 +441,10 @@ function demoteDanglingAliases(args: {
   // The surface sits at the tree root, so its relative specifiers resolve
   // against the root; anything escaping the root cannot be in the tree.
   const moduleInTree = (spec: string): boolean => {
-    const id = path.posix.normalize(spec);
+    // nodenext-style source specifiers keep a runtime extension (./x.js) that
+    // tree module ids never carry; strip it so a healthy alias is not demoted
+    // for extension spelling alone.
+    const id = path.posix.normalize(spec).replace(/\.(js|mjs|cjs)$/, '');
     if (id.startsWith('..')) return false;
     return treeModules.has(id) || treeModules.has(`${id}/index`);
   };
