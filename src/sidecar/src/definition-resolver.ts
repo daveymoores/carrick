@@ -19,9 +19,9 @@
  * inference path in `type-inferrer.ts`), which walks the resolved `Type` and
  * rebuilds the inlined text.
  *
- * The stub's tree files are added to the live project for the duration of one
- * resolve call and removed afterwards, so the warm sidecar's project never
- * accumulates stale stub trees across requests.
+ * Each resolve call builds its own throwaway in-memory project over the stub
+ * tree, so the warm sidecar's long-lived project never sees stub files and
+ * cannot accumulate stale trees across requests.
  */
 
 import * as path from 'node:path';
