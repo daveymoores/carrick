@@ -321,6 +321,76 @@ impl Visit for BindingTypeCollector {
     }
 }
 
+/// Collects the per-binding annotation evidence the pub/sub borrow witness
+/// checks an explicit `primary_type_symbol` against (#413): for every
+/// annotated binding in the file (params and typed `const`/`let`), the set of
+/// type symbols MENTIONED at any nesting depth in that binding's annotation.
+///
+/// Mention-based on purpose, mirroring `call_annotated_syms` in the HTTP
+/// sibling: `envelope: Envelope<OrderPlaced>` credits BOTH `Envelope` and
+/// `OrderPlaced` to `envelope`, so an explicit anchor that correctly names
+/// the INNER contract type of a wrapped payload is never witnessed as a
+/// borrow by its own wrapper annotation (the corpus-2 `order.placed`
+/// publisher is exactly this shape). Primary-symbol equality would misfire
+/// there; membership cannot.
+#[derive(Default)]
+struct AnnotationMentionsCollector {
+    /// binding identifier -> every type symbol mentioned in its annotation.
+    /// An annotation mentioning no named type (`payload: string`) yields an
+    /// empty set — the binding still counts as annotated.
+    mentions_by_binding: HashMap<String, HashSet<String>>,
+}
+
+impl Visit for AnnotationMentionsCollector {
+    fn visit_binding_ident(&mut self, n: &BindingIdent) {
+        if let Some(type_ann) = &n.type_ann {
+            let syms = self
+                .mentions_by_binding
+                .entry(n.id.sym.to_string())
+                .or_default();
+            type_ann
+                .type_ann
+                .visit_with(&mut TypeRefIdentCollector { syms });
+        }
+        n.visit_children_with(self);
+    }
+}
+
+/// Deterministic borrow witness for a pub/sub explicit anchor (#413): AST
+/// evidence that `symbol` structurally cannot be the type of the payload the
+/// op's locator names. The pub/sub analogue of
+/// `suppress_borrowed_request_types`' binding-type check.
+///
+/// Fires only when BOTH hold:
+/// 1. The payload binding itself is annotated, and that annotation never
+///    mentions `symbol` at any depth — the file's own contract for the
+///    payload contradicts the emitted anchor. An unannotated payload proves
+///    nothing and never witnesses.
+/// 2. `symbol` IS mentioned in the annotation of a DIFFERENT binding in the
+///    file — the place the model plausibly borrowed it from.
+///
+/// A qualified symbol (`api.AuditEvent`) is compared by its rightmost ident,
+/// matching what `TypeRefIdentCollector` records. No witness means no
+/// demotion downstream (`demote_witnessed_borrowed_anchors`), so every
+/// failure mode here — unparseable file, destructured payload, missing
+/// annotation — fails closed to the current explicit-anchor behavior.
+fn pubsub_payload_borrow_witness(
+    mentions_by_binding: &HashMap<String, HashSet<String>>,
+    payload_ident: &str,
+    symbol: &str,
+) -> bool {
+    let leaf = symbol.rsplit('.').next().unwrap_or(symbol);
+    let Some(payload_mentions) = mentions_by_binding.get(payload_ident) else {
+        return false;
+    };
+    if payload_mentions.contains(leaf) {
+        return false;
+    }
+    mentions_by_binding
+        .iter()
+        .any(|(binding, syms)| binding != payload_ident && syms.contains(leaf))
+}
+
 /// Collects the textual witnesses `suppress_phantom_pubsub_topics` checks an
 /// LLM-emitted pub/sub topic against (carrick#311): every string-literal value
 /// in the file, plus the static-part shape of every composed string (template
@@ -1237,6 +1307,7 @@ impl FileOrchestrator {
                         source_file,
                         alias,
                         array_depth: None,
+                        payload_borrow_witness: false,
                     });
                 }
             };
@@ -1752,6 +1823,7 @@ impl FileOrchestrator {
                     source_file,
                     alias: Some(alias),
                     array_depth: None,
+                    payload_borrow_witness: false,
                 });
             }
         };
@@ -1797,6 +1869,13 @@ impl FileOrchestrator {
     /// already dropped from `cloud_data` and has no manifest entry to join to).
     /// An absent `type_import_source` means the symbol is declared in the op's
     /// own file, so it resolves against that file's absolute path.
+    ///
+    /// Each request additionally carries the deterministic borrow witness
+    /// (#413, `pubsub_payload_borrow_witness`): AST evidence that the emitted
+    /// symbol structurally cannot be the type of the payload the op's locator
+    /// names. The witness alone changes nothing — it only licenses
+    /// `demote_witnessed_borrowed_anchors` to prefer the locator's
+    /// tsc-resolved root over the explicit symbol when the two disagree.
     pub fn collect_pubsub_type_requests(
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
@@ -1824,6 +1903,12 @@ impl FileOrchestrator {
         paths.sort();
         for path in paths {
             let result = &file_results[path];
+            let file_abs = Self::to_absolute_path(path, &repo_root_absolute);
+            // Lazy per-file annotation-mention evidence for the borrow
+            // witness (#413): parsed at most once per file, and only when an
+            // op actually carries both anchors (an explicit symbol AND a
+            // payload locator the infer collector will accept).
+            let mut annotation_mentions: Option<Option<AnnotationMentionsCollector>> = None;
             for op in &result.pubsub_operations {
                 // Mirror the manifest-side role mapping in
                 // `append_pubsub_manifest_entries`: subscriber = producer,
@@ -1836,12 +1921,47 @@ impl FileOrchestrator {
                 let Some(symbol) = op.primary_type_symbol.as_ref() else {
                     continue;
                 };
-                let file_abs = Self::to_absolute_path(path, &repo_root_absolute);
                 let source_file = match op.type_import_source.as_ref() {
                     Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
                     // No import → same-file declaration: resolve against the file.
-                    None => file_abs,
+                    None => file_abs.clone(),
                 };
+                // Borrow witness (#413): computed only against locators the
+                // sibling infer collector will actually resolve — a bare
+                // identifier that does not contain the op's own topic (the
+                // envelope-copy guard) — because arbitration in
+                // `demote_witnessed_borrowed_anchors` needs the second
+                // anchor's inference to exist for the same alias.
+                let payload_borrow_witness = op
+                    .payload_expression_text
+                    .as_deref()
+                    .filter(|text| !text.contains(op.topic.as_str()))
+                    .and_then(payload_bare_ident)
+                    .is_some_and(|payload_ident| {
+                        let collector = annotation_mentions.get_or_insert_with(|| {
+                            let cm: Lrc<SourceMap> = Default::default();
+                            let handler = Handler::with_tty_emitter(
+                                ColorConfig::Never,
+                                false,
+                                false,
+                                Some(cm.clone()),
+                            );
+                            parse_file(std::path::Path::new(&file_abs), &cm, &handler).map(
+                                |module| {
+                                    let mut mentions = AnnotationMentionsCollector::default();
+                                    module.visit_with(&mut mentions);
+                                    mentions
+                                },
+                            )
+                        });
+                        collector.as_ref().is_some_and(|mentions| {
+                            pubsub_payload_borrow_witness(
+                                &mentions.mentions_by_binding,
+                                payload_ident,
+                                symbol,
+                            )
+                        })
+                    });
                 let key = OperationKey::pubsub(op.topic.clone());
                 // Mirror the manifest side (`append_pubsub_manifest_entries`):
                 // publishers (consumers) disambiguate by call site so fan-in
@@ -1876,6 +1996,7 @@ impl FileOrchestrator {
                         source_file,
                         alias: Some(alias),
                         array_depth: None,
+                        payload_borrow_witness,
                     });
                 }
             }
@@ -1907,10 +2028,17 @@ impl FileOrchestrator {
     /// `InferKind::FunctionParam` (the sidecar matches the param by name,
     /// whole binding pattern, or binding element — see `inferFunctionParam`).
     ///
-    /// Isolation guard (mirrors #268): an op that already carries a
-    /// `primary_type_symbol` bundles through the explicit-symbol path and must
-    /// never get a second, competing anchor here — every existing corpus pub/sub
-    /// fixture keeps its current path untouched.
+    /// Two-anchor co-emission (#413, replacing the former #268-style isolation
+    /// guard): an op that already carries a `primary_type_symbol` still emits
+    /// an infer request when it has a usable payload locator. The explicit
+    /// bundle remains authoritative for the alias — a same-alias inference
+    /// never shadows a bundled definition in `resolve_all_types` — EXCEPT
+    /// when the scanner attached a deterministic borrow witness to the
+    /// explicit request and the inferred payload root disagrees with the
+    /// emitted symbol, in which case `demote_witnessed_borrowed_anchors`
+    /// drops the explicit anchor and the inference becomes the alias's
+    /// definition (the wrong-symbol borrow class, measured 13/20 on the
+    /// honest c1 decoy fixture).
     ///
     /// The alias MUST be byte-identical to the one
     /// `append_pubsub_manifest_entries` stamped on the manifest entry — same
@@ -1949,10 +2077,15 @@ impl FileOrchestrator {
                     Some(PubsubRole::Publisher) => ManifestRole::Consumer,
                     None => continue,
                 };
-                // Isolation guard: a named anchor already owns this op.
-                if op.primary_type_symbol.is_some() {
-                    continue;
-                }
+                // No isolation guard for named anchors (#413): an op that
+                // carries a `primary_type_symbol` ALSO emits an infer request
+                // when it has a usable payload locator, so the sidecar
+                // resolves both anchors and `demote_witnessed_borrowed_anchors`
+                // can arbitrate a witnessed wrong symbol against the
+                // tsc-resolved payload root. Without a borrow witness the
+                // explicit bundle still wins unconditionally — the combine
+                // step in `resolve_all_types` never lets a same-alias
+                // inference shadow a bundled alias.
                 let Some(text) = op.payload_expression_text.as_ref() else {
                     continue;
                 };
@@ -2135,6 +2268,7 @@ impl FileOrchestrator {
                     source_file,
                     alias: Some(alias),
                     array_depth: None,
+                    payload_borrow_witness: false,
                 });
             }
         }
@@ -2178,6 +2312,7 @@ impl FileOrchestrator {
                     source_file,
                     alias: Some(alias),
                     array_depth,
+                    payload_borrow_witness: false,
                 });
             }
         }
@@ -6786,6 +6921,157 @@ export { routes };
             symbols,
             vec!["UserSignedUp", "PageViewEvent", "OrderCreated"]
         );
+    }
+
+    // ---- #413 pub/sub borrow witness ----
+
+    /// One file exercising every witness verdict: `evt: OrderPlaced` is the
+    /// annotated payload, `record: AuditRecord` is the borrow source, and
+    /// `envelope: Envelope<OrderPlaced>` is the wrapper whose annotation
+    /// MENTIONS the inner contract type.
+    fn write_witness_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/pub.ts"),
+            r#"
+import type { OrderPlaced, Envelope, AuditRecord } from "./types";
+
+export function handleOrder(evt: OrderPlaced): void {
+  void evt;
+}
+
+export function auditIt(record: AuditRecord): void {
+  void record;
+}
+
+export function publishWrapped(order: OrderPlaced): void {
+  const envelope: Envelope<OrderPlaced> = { v: 1, data: order };
+  void envelope;
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    fn witness_requests(
+        dir: &std::path::Path,
+        ops: Vec<crate::agents::file_analyzer_agent::PubsubOperation>,
+    ) -> Vec<crate::services::type_sidecar::SymbolRequest> {
+        let mut file_results = HashMap::new();
+        file_results.insert("src/pub.ts".to_string(), pubsub_only_result(ops));
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        orchestrator.collect_pubsub_type_requests(&file_results, dir.to_str().unwrap())
+    }
+
+    /// The witness fires exactly when the payload binding's annotation
+    /// contradicts the emitted symbol AND the symbol is anchored to a
+    /// different binding — and stays off in every agreement, wrapper-mention,
+    /// unannotated, non-bare-locator, and envelope-copy shape.
+    #[test]
+    fn test_pubsub_borrow_witness_verdicts() {
+        use crate::operation::PubsubRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_witness_fixture(dir.path());
+
+        let sub = |topic: &str, symbol: &str, locator: Option<&str>| {
+            pubsub_op(topic, PubsubRole::Subscriber, Some(symbol), None, locator)
+        };
+        let requests = witness_requests(
+            dir.path(),
+            vec![
+                // Borrow: payload `evt: OrderPlaced` never mentions
+                // AuditRecord, and AuditRecord annotates `record`.
+                sub("t.borrow", "AuditRecord", Some("evt")),
+                // Agreement: the symbol IS the payload annotation.
+                sub("t.agree", "OrderPlaced", Some("evt")),
+                // Wrapper mention: `envelope: Envelope<OrderPlaced>` mentions
+                // the inner contract type at depth — never a borrow, even
+                // though the primary symbol of the annotation is `Envelope`.
+                sub("t.wrapped", "OrderPlaced", Some("envelope")),
+                // Unannotated/unknown payload binding: proves nothing.
+                sub("t.unannotated", "AuditRecord", Some("mystery")),
+                // Symbol anchored to no other binding: no borrow source.
+                sub("t.ghost", "GhostType", Some("evt")),
+                // Non-bare-ident locator: the infer path can't be attributed
+                // to a binding, so no witness.
+                sub("t.encoded", "AuditRecord", Some("jc.encode(evt)")),
+                // Envelope-copy locator (contains the topic): the infer
+                // collector drops it, so there is no second anchor to
+                // arbitrate against.
+                sub(
+                    "t.copy",
+                    "AuditRecord",
+                    Some("{ topic: \"t.copy\", data: evt }"),
+                ),
+                // No locator at all.
+                sub("t.nolocator", "AuditRecord", None),
+            ],
+        );
+
+        // Every op carries a symbol, so all eight anchor a request, in op
+        // order (a single file's ops walk in vec order).
+        let witnesses: Vec<bool> = requests.iter().map(|r| r.payload_borrow_witness).collect();
+        assert_eq!(
+            witnesses,
+            vec![
+                true,  // t.borrow: witnessed borrow
+                false, // t.agree: agreement
+                false, // t.wrapped: wrapper annotation mentions the symbol
+                false, // t.unannotated: payload binding not annotated
+                false, // t.ghost: symbol anchored to no other binding
+                false, // t.encoded: non-bare-ident locator
+                false, // t.copy: envelope-copy locator (contains the topic)
+                false, // t.nolocator: no locator at all
+            ],
+            "requests: {requests:?}"
+        );
+    }
+
+    /// An unparseable (or absent) file yields no annotation evidence, so the
+    /// witness fails closed to `false` — never blocking the explicit path.
+    #[test]
+    fn test_pubsub_borrow_witness_fails_closed_without_a_parseable_file() {
+        use crate::operation::PubsubRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        // No src/pub.ts on disk at all.
+        let requests = witness_requests(
+            dir.path(),
+            vec![pubsub_op(
+                "t.borrow",
+                PubsubRole::Subscriber,
+                Some("AuditRecord"),
+                None,
+                Some("evt"),
+            )],
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].payload_borrow_witness);
+    }
+
+    /// Pure-map witness check: qualified symbols compare by rightmost ident.
+    #[test]
+    fn test_pubsub_borrow_witness_qualified_symbol_leaf() {
+        let mut mentions: HashMap<String, HashSet<String>> = HashMap::new();
+        mentions.insert(
+            "evt".to_string(),
+            ["OrderPlaced".to_string()].into_iter().collect(),
+        );
+        mentions.insert(
+            "record".to_string(),
+            ["AuditRecord".to_string()].into_iter().collect(),
+        );
+        assert!(pubsub_payload_borrow_witness(
+            &mentions,
+            "evt",
+            "api.AuditRecord"
+        ));
+        assert!(!pubsub_payload_borrow_witness(
+            &mentions,
+            "evt",
+            "api.OrderPlaced"
+        ));
     }
 
     // ---- #361 deterministic extraction-flake guards ----

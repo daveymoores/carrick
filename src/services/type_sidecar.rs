@@ -20,7 +20,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, info};
 
 // ============================================================================
 // Sidecar State
@@ -128,6 +128,19 @@ pub struct SymbolRequest {
     /// bundles the symbol as-is (the HTTP/socket/consumer default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
+    /// Deterministic borrow witness from the scanner's AST pre-pass (pub/sub
+    /// two-anchor arbitration, #413 / the #403/#359 borrow-class lineage):
+    /// `true` means the file's own annotations testify that `symbol_name`
+    /// structurally cannot be the payload this request's alias stands for —
+    /// the payload binding is annotated with a type that never mentions the
+    /// symbol, while the symbol annotates a DIFFERENT binding in the same
+    /// file (where the model borrowed it from). Only
+    /// `collect_pubsub_type_requests` ever sets this; HTTP/socket/GraphQL
+    /// requests always carry `false`, so `demote_witnessed_borrowed_anchors`
+    /// is structurally inert for every non-pub/sub path. Scanner-internal:
+    /// never serialized to the sidecar.
+    #[serde(skip)]
+    pub payload_borrow_witness: bool,
 }
 
 /// Request for type inference at a specific location
@@ -261,6 +274,14 @@ pub struct InferredType {
     /// of the bare element. Absent when 0 or when there is no anchor symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
+    /// Declaration file (absolute path) of `primary_type_symbol`, reported by
+    /// the pub/sub infer kinds (`function_param`, `expression`) only (#413).
+    /// `demote_witnessed_borrowed_anchors` uses it to re-aim a demoted
+    /// explicit `SymbolRequest`: the bundler resolves a symbol only against
+    /// declarations IN the request's `source_file`, and the inference is the
+    /// only party that knows where the tsc-witnessed payload type lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_type_symbol_source: Option<String>,
 }
 
 /// Information about a symbol that failed to resolve
@@ -701,13 +722,24 @@ impl TypeSidecar {
             }
         }
 
+        // Two-anchor arbitration (#413, pub/sub only): a request carrying the
+        // scanner's deterministic borrow witness whose alias the inference
+        // resolved to a DIFFERENT named root is demoted here — re-aimed at
+        // the tsc-witnessed root so the bundler defines the alias from the
+        // inferred payload type instead of the borrowed symbol. This must
+        // happen BEFORE the bundle runs: compat verdicts are computed from
+        // the bundled dts, so a post-hoc flag flip in
+        // `enrich_manifest_with_type_resolution` could never undo a wrong
+        // explicit definition.
+        let explicit = demote_witnessed_borrowed_anchors(explicit, &result.inferred_types);
+
         // Bundle explicit types. An LLM-extracted anchor is a bare identifier
         // by schema contract (`User[]` → `User`), so bundling it as-is erases
         // the use-site's array-ness and an array-vs-scalar mismatch scores
         // compatible (#306). Copy the inference-resolved depth onto each
         // matching request so the bundler's array_depth wrap (#248) restores
         // the `[]` levels.
-        let explicit = apply_inferred_array_depth(explicit, &result.inferred_types);
+        let explicit = apply_inferred_array_depth(&explicit, &result.inferred_types);
         if !explicit.is_empty() {
             let bundle_response = self.resolve_types(&explicit)?;
             result.dts_content = bundle_response.dts_content;
@@ -945,6 +977,130 @@ impl TypeSidecar {
     }
 }
 
+/// Two-anchor arbitration for pub/sub payload anchors (#413, the #403/#359
+/// borrow-class lineage): demote a witnessed-borrowed explicit request when
+/// the same alias's location-based inference resolved a DIFFERENT named root.
+///
+/// A pub/sub op can carry two independent anchors: the LLM's explicit
+/// `primary_type_symbol` (a judgment, measured wrong 13/20 on the honest
+/// borrow fixture) and the payload locator, which the sidecar resolves
+/// deterministically with tsc. When both resolve, the per-alias inferred root
+/// symbol is compared against the explicit request's symbol — the same
+/// alias+symbol join `apply_inferred_array_depth` performs. On a named-root
+/// disagreement the explicit request is demoted: re-aimed at the inferred
+/// root (symbol, declaration file, and array depth all from the inference),
+/// so the bundler defines the alias from the tsc-witnessed payload type
+/// instead of the borrowed one. Re-aiming rather than dropping keeps the
+/// alias's dts definition self-contained — the inferred type_string keeps
+/// named types as names (`OrderPlaced`), which would dangle if pasted in as
+/// a standalone `export type` — while still making the inferred type the
+/// alias's definition.
+///
+/// Demotion is gated on the scanner's deterministic borrow witness
+/// (`payload_borrow_witness`, computed from the file's AST in
+/// `collect_pubsub_type_requests`): no witness, no demotion — a bare
+/// tsc-vs-LLM disagreement without AST evidence keeps the explicit symbol,
+/// so a mis-anchored inference (wrong text occurrence, envelope resolution)
+/// can never displace a correct explicit anchor on its own.
+///
+/// Anonymous inferred types are NOT arbitrated: when the inference returns a
+/// structural type with no root symbol (`primary_type_symbol: None` — object
+/// literals, encoded payloads, lib-global roots), the named-root-disagreement
+/// rule cannot fire and the explicit symbol is kept, witness or not. There is
+/// deliberately no resolution for that case — a structural shape carries no
+/// identity to disagree with, and inventing a comparison (e.g. shape
+/// equality) would demote on formatting noise.
+///
+/// Further keeps, all deliberate:
+/// - an alias carried by more than one explicit request (fan-in ambiguity —
+///   the inference cannot be attributed to either request);
+/// - an inference whose type_string is not the bare named form of its own
+///   root (`Root`, `Root[]`, …): a generic instantiation
+///   (`Envelope<Order>`) or an expanded structural shape cannot be
+///   reproduced by bundling the bare root symbol, so re-aiming would change
+///   the type;
+/// - a root with no reported declaration file (the bundler could not resolve
+///   it), or a framework envelope root (demotion must never install
+///   machinery as a payload);
+/// - requests without the witness flag — every HTTP/socket/GraphQL request,
+///   making this function structurally inert outside pub/sub.
+fn demote_witnessed_borrowed_anchors(
+    explicit: &[SymbolRequest],
+    inferred: &[InferredType],
+) -> Vec<SymbolRequest> {
+    // First inference per alias wins, mirroring `apply_inferred_array_depth`
+    // and the `or_insert` join in `enrich_manifest_with_type_resolution`.
+    let mut inferred_by_alias: HashMap<&str, &InferredType> = HashMap::new();
+    for inf in inferred {
+        inferred_by_alias.entry(inf.alias.as_str()).or_insert(inf);
+    }
+
+    let mut alias_counts: HashMap<&str, usize> = HashMap::new();
+    for req in explicit {
+        if let Some(alias) = req.alias.as_deref() {
+            *alias_counts.entry(alias).or_insert(0) += 1;
+        }
+    }
+
+    explicit
+        .iter()
+        .map(|req| {
+            if !req.payload_borrow_witness {
+                return req.clone();
+            }
+            let Some(alias) = req.alias.as_deref() else {
+                return req.clone();
+            };
+            if alias_counts.get(alias).copied().unwrap_or(0) > 1 {
+                return req.clone();
+            }
+            let Some(inf) = inferred_by_alias.get(alias) else {
+                return req.clone();
+            };
+            // Anonymous inferred type: no root to disagree with — keep.
+            let Some(root) = inf.primary_type_symbol.as_deref() else {
+                return req.clone();
+            };
+            if root == req.symbol_name {
+                return req.clone();
+            }
+            // Re-aiming needs the root's declaration file.
+            let Some(root_source) = inf.primary_type_symbol_source.as_deref() else {
+                return req.clone();
+            };
+            // Never install machinery as a payload.
+            if TypeSidecar::is_untyped_response_type(root) {
+                return req.clone();
+            }
+            // The inference must BE the bare named form of its root (modulo
+            // array suffixes), or bundling the root would change the type.
+            let mut named_form = inf.type_string.trim();
+            while let Some(stripped) = named_form.strip_suffix("[]") {
+                named_form = stripped.trim_end();
+            }
+            if named_form != root {
+                return req.clone();
+            }
+            info!(
+                alias = %alias,
+                explicit_symbol = %req.symbol_name,
+                inferred_root = %root,
+                inferred_root_source = %root_source,
+                "[type_sidecar] pub/sub anchor arbitration: witnessed borrowed \
+                 symbol disagrees with the tsc-resolved payload root; demoting \
+                 the explicit anchor to the inferred type"
+            );
+            SymbolRequest {
+                symbol_name: root.to_string(),
+                source_file: root_source.to_string(),
+                alias: req.alias.clone(),
+                array_depth: inf.array_depth,
+                payload_borrow_witness: false,
+            }
+        })
+        .collect()
+}
+
 /// Copy inference-resolved array depths onto explicit symbol requests (#306).
 ///
 /// An LLM-extracted anchor is a bare identifier by schema contract (`User[]` →
@@ -1081,6 +1237,7 @@ mod tests {
             source_file: "src/types.ts".to_string(),
             alias: Some("UserResponse".to_string()),
             array_depth: None,
+            payload_borrow_witness: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""symbol_name":"User""#));
@@ -1133,6 +1290,7 @@ mod tests {
                 source_file: "src/types.ts".to_string(),
                 alias: None,
                 array_depth: None,
+                payload_borrow_witness: false,
             }],
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -1169,6 +1327,7 @@ mod tests {
             source_file: "src/types.ts".to_string(),
             alias: Some(alias.to_string()),
             array_depth,
+            payload_borrow_witness: false,
         }
     }
 
@@ -1187,6 +1346,7 @@ mod tests {
             infer_kind: InferKind::FunctionReturn,
             primary_type_symbol: symbol.map(str::to_string),
             array_depth,
+            primary_type_symbol_source: None,
         }
     }
 
@@ -1245,6 +1405,232 @@ mod tests {
 
         assert_eq!(adjusted[0].array_depth, None);
         assert_eq!(adjusted[1].array_depth, None);
+    }
+
+    // ---- #413 two-anchor arbitration (pub/sub borrow demotion) ----
+
+    fn witnessed(mut req: SymbolRequest) -> SymbolRequest {
+        req.payload_borrow_witness = true;
+        req
+    }
+
+    fn inferred_with_anchor(
+        alias: &str,
+        symbol: Option<&str>,
+        type_string: &str,
+        symbol_source: Option<&str>,
+    ) -> InferredType {
+        let mut inf = inferred(alias, symbol, None);
+        inf.type_string = type_string.to_string();
+        inf.primary_type_symbol_source = symbol_source.map(str::to_string);
+        inf
+    }
+
+    /// Witnessed wrong symbol + named-root disagreement + bare named inferred
+    /// form → the explicit request is demoted: re-aimed at the inferred root
+    /// (symbol + declaration file), so the bundler defines the alias from the
+    /// tsc-witnessed payload type.
+    #[test]
+    fn arbitration_demotes_witnessed_wrong_symbol() {
+        let explicit = vec![witnessed(symbol_request(
+            "AuditRecord",
+            "Alias_Response",
+            None,
+        ))];
+        let inferred = vec![inferred_with_anchor(
+            "Alias_Response",
+            Some("OrderPlaced"),
+            "OrderPlaced",
+            Some("/repo/src/orders.ts"),
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "OrderPlaced", "re-aimed at the root");
+        assert_eq!(kept[0].source_file, "/repo/src/orders.ts");
+        assert_eq!(kept[0].alias.as_deref(), Some("Alias_Response"));
+        assert_eq!(kept[0].array_depth, None);
+        assert!(!kept[0].payload_borrow_witness, "witness consumed");
+    }
+
+    /// An array-form inference (`Root[]`) demotes with the inferred depth so
+    /// the bundler's array wrap restores the `[]` levels.
+    #[test]
+    fn arbitration_demotes_array_form_with_depth() {
+        let explicit = vec![witnessed(symbol_request(
+            "AuditRecord",
+            "Alias_Response",
+            None,
+        ))];
+        let mut inf = inferred_with_anchor(
+            "Alias_Response",
+            Some("OrderPlaced"),
+            "OrderPlaced[]",
+            Some("/repo/src/orders.ts"),
+        );
+        inf.array_depth = Some(1);
+        let inferred = vec![inf];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept[0].symbol_name, "OrderPlaced");
+        assert_eq!(kept[0].array_depth, Some(1));
+    }
+
+    /// The same disagreement WITHOUT the scanner's borrow witness keeps the
+    /// explicit request: a bare tsc-vs-LLM disagreement never demotes.
+    #[test]
+    fn arbitration_keeps_unwitnessed_disagreement() {
+        let explicit = vec![symbol_request("AuditRecord", "Alias_Response", None)];
+        let inferred = vec![inferred_with_anchor(
+            "Alias_Response",
+            Some("OrderPlaced"),
+            "OrderPlaced",
+            Some("/repo/src/orders.ts"),
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "AuditRecord");
+    }
+
+    /// Root agreement keeps the explicit request even with a witness (the
+    /// witness was evidently wrong or vacuous — tsc confirms the anchor).
+    #[test]
+    fn arbitration_keeps_agreement() {
+        let explicit = vec![witnessed(symbol_request(
+            "OrderPlaced",
+            "Alias_Response",
+            None,
+        ))];
+        let inferred = vec![inferred_with_anchor(
+            "Alias_Response",
+            Some("OrderPlaced"),
+            "OrderPlaced",
+            Some("/repo/src/orders.ts"),
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "OrderPlaced");
+        assert_eq!(kept[0].source_file, "src/types.ts", "request untouched");
+    }
+
+    /// Anonymous inferred type (no root symbol): the named-root-disagreement
+    /// rule cannot fire, so the explicit symbol is kept — witness or not.
+    /// There is deliberately no resolution for this case.
+    #[test]
+    fn arbitration_keeps_explicit_on_anonymous_inference() {
+        let explicit = vec![witnessed(symbol_request(
+            "OrderPlaced",
+            "Alias_Response",
+            None,
+        ))];
+        let inferred = vec![inferred_with_anchor(
+            "Alias_Response",
+            None,
+            "{ id: string; }",
+            None,
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "OrderPlaced");
+    }
+
+    /// A disagreeing inference whose type_string is not the bare named form
+    /// of its root (generic instantiation, expanded structural shape) never
+    /// demotes: bundling the bare root would change the type. Same for a
+    /// missing declaration source or a framework-machinery root.
+    #[test]
+    fn arbitration_keeps_explicit_when_reaim_would_change_the_type() {
+        let cases: Vec<InferredType> = vec![
+            // Generic instantiation: bundling bare `Envelope` loses the arg.
+            inferred_with_anchor(
+                "Alias_Response",
+                Some("Envelope"),
+                "Envelope<OrderPlaced>",
+                Some("/repo/src/types.ts"),
+            ),
+            // Structural expansion with a named root: not the bare form.
+            inferred_with_anchor(
+                "Alias_Response",
+                Some("OrderPlaced"),
+                "{ id: string; }",
+                Some("/repo/src/orders.ts"),
+            ),
+            // No declaration source: the bundler could not resolve the root.
+            inferred_with_anchor("Alias_Response", Some("OrderPlaced"), "OrderPlaced", None),
+            // Framework machinery root.
+            inferred_with_anchor(
+                "Alias_Response",
+                Some("FastifyReply"),
+                "FastifyReply",
+                Some("/repo/node_modules/fastify/types.d.ts"),
+            ),
+        ];
+        for inf in cases {
+            let explicit = vec![witnessed(symbol_request(
+                "AuditRecord",
+                "Alias_Response",
+                None,
+            ))];
+            let type_string = inf.type_string.clone();
+            let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]);
+
+            assert_eq!(kept.len(), 1);
+            assert_eq!(
+                kept[0].symbol_name, "AuditRecord",
+                "shape {type_string:?} must not demote"
+            );
+        }
+    }
+
+    /// An alias carried by more than one explicit request is fan-in
+    /// ambiguous: the inference cannot be attributed, so nothing is demoted.
+    #[test]
+    fn arbitration_keeps_fan_in_ambiguous_alias() {
+        let explicit = vec![
+            witnessed(symbol_request("AuditRecord", "Alias_Response", None)),
+            symbol_request("OtherThing", "Alias_Response", None),
+        ];
+        let inferred = vec![inferred_with_anchor(
+            "Alias_Response",
+            Some("OrderPlaced"),
+            "OrderPlaced",
+            Some("/repo/src/orders.ts"),
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].symbol_name, "AuditRecord");
+        assert_eq!(kept[1].symbol_name, "OtherThing");
+    }
+
+    /// No inference for the alias at all → keep (nothing to arbitrate with).
+    #[test]
+    fn arbitration_keeps_explicit_without_matching_inference() {
+        let explicit = vec![witnessed(symbol_request(
+            "AuditRecord",
+            "Alias_Response",
+            None,
+        ))];
+        let inferred = vec![inferred_with_anchor(
+            "Other_Response",
+            Some("OrderPlaced"),
+            "OrderPlaced",
+            Some("/repo/src/orders.ts"),
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "AuditRecord");
     }
 
     #[test]
@@ -1306,6 +1692,7 @@ mod tests {
             source_file: "src/types.ts".to_string(),
             alias: Some("Endpoint_abc_Response".to_string()),
             array_depth: None,
+            payload_borrow_witness: false,
         }];
 
         if had_explicit_dts {
