@@ -633,6 +633,17 @@ export interface InferredType {
    * compatible, #306). Omitted when 0 or when there is no anchor symbol.
    */
   array_depth?: number;
+  /**
+   * Declaration file of `primary_type_symbol` (absolute path), when the
+   * anchor symbol has a resolvable source declaration. Lets the scanner's
+   * pub/sub two-anchor arbitration (carrick#413) re-aim a demoted explicit
+   * `SymbolRequest` at the tsc-witnessed payload type: the bundler requires
+   * the symbol to be DECLARED in the request's `source_file`, and the
+   * inference is the only party that knows where that is. Reported only by
+   * the pub/sub infer kinds (`function_param`, `expression`); other kinds
+   * omit it.
+   */
+  primary_type_symbol_source?: string;
 }
 
 /**

@@ -1088,6 +1088,7 @@ mod tests {
             source_file: "src/types.ts".to_string(),
             alias: Some("Endpoint_a_Response".to_string()),
             array_depth: Some(1),
+            payload_borrow_witness: false,
         }];
         let infer = vec![
             crate::services::type_sidecar::InferRequestItem {
@@ -1235,6 +1236,7 @@ mod tests {
             infer_kind: InferKind::Expression,
             primary_type_symbol: None,
             array_depth: None,
+            primary_type_symbol_source: None,
         };
 
         let infer = vec![
@@ -1305,6 +1307,7 @@ mod tests {
             infer_kind: InferKind::Expression,
             primary_type_symbol: None,
             array_depth: None,
+            primary_type_symbol_source: None,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -1556,6 +1559,7 @@ mod tests {
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: None,
             array_depth: None,
+            primary_type_symbol_source: None,
         };
 
         let explicit = vec![

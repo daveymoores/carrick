@@ -2359,8 +2359,9 @@ fn resolve_types_if_available(
                     // from the SAME collected requests the bundle path used —
                     // collect_type_requests is deterministic over the same
                     // inputs, so the aliases are byte-identical to the
-                    // manifest join keys. The inference-resolved array depths
-                    // are applied exactly as resolve_all_types does (#306).
+                    // manifest join keys. The #413 borrow-witness demotion and
+                    // the inference-resolved array depths are applied exactly
+                    // as resolve_all_types does (#306).
                     run_capture_for_service(
                         sidecar,
                         file_orchestrator,
@@ -2415,6 +2416,14 @@ fn run_capture_for_service(
         file_orchestrator.collect_type_requests(file_results, repo_path, mount_graph, config);
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
+    // Mirror resolve_all_types' post-processing exactly: the #413 two-anchor
+    // arbitration re-aims witnessed-borrowed pub/sub anchors at the
+    // tsc-witnessed payload root BEFORE depths apply, so v2 capture anchors
+    // the same symbol the v1 bundle defines the alias from.
+    let explicit = crate::services::type_sidecar::demote_witnessed_borrowed_anchors(
+        &explicit,
+        &type_resolution.inferred_types,
+    );
     let explicit = crate::services::type_sidecar::apply_inferred_array_depth(
         &explicit,
         &type_resolution.inferred_types,
@@ -5853,6 +5862,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
             array_depth: None,
+            primary_type_symbol_source: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -5881,6 +5891,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
             array_depth: None,
+            primary_type_symbol_source: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -5909,6 +5920,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: Some(symbol.to_string()),
             array_depth: None,
+            primary_type_symbol_source: None,
         }
     }
 
@@ -7232,8 +7244,9 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
     /// `append_pubsub_manifest_entries` — same plain alias for subscribers
     /// (producers), same call-site-disambiguated alias for publishers
     /// (consumers) — or the resolved payload type never joins back and the op
-    /// stays `Unknown`, silently. Also pins the role → InferKind routing and
-    /// the isolation guard (a named anchor suppresses the infer request).
+    /// stays `Unknown`, silently. Also pins the role → InferKind routing, the
+    /// two-anchor co-emission (#413: a named anchor no longer suppresses the
+    /// infer request — the sidecar arbitrates), and the envelope-copy guard.
     #[test]
     fn pubsub_infer_request_alias_matches_manifest_alias() {
         use crate::operation::PubsubRole;
@@ -7270,8 +7283,11 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             FileAnalysisResult {
                 pubsub_operations: vec![
                     locator_op("itemArchived", PubsubRole::Publisher, 9, "event"),
-                    // Named anchor present → the bundle path owns this op; the
-                    // infer collector must emit NOTHING for it.
+                    // Named anchor present WITH a usable locator → the op
+                    // co-emits an infer request (#413) so the sidecar can
+                    // arbitrate the two anchors; the explicit bundle still
+                    // wins unless a borrow witness plus a root disagreement
+                    // demotes it.
                     crate::agents::file_analyzer_agent::PubsubOperation {
                         topic: "orders.placed".to_string(),
                         role: Some(PubsubRole::Publisher),
@@ -7314,16 +7330,16 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
         let orchestrator = FileOrchestrator::new(AgentService::new());
         let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
 
-        // Isolation + envelope guards: only the two locator-anchored
-        // itemArchived ops produce requests; the named-anchor op and the
-        // topic-containing envelope copy are both excluded.
-        assert_eq!(requests.len(), 2, "requests: {requests:?}");
+        // Co-emission + envelope guard: the two locator-anchored itemArchived
+        // ops AND the named-anchor orders.placed op produce requests (#413);
+        // only the topic-containing envelope copy is excluded.
+        assert_eq!(requests.len(), 3, "requests: {requests:?}");
         assert!(
-            !requests
+            requests
                 .iter()
-                .any(|r| r.param_name.as_deref() == Some("order")
-                    || r.expression_text.as_deref() == Some("order")),
-            "an op with a primary_type_symbol must not also get an infer request"
+                .any(|r| r.expression_text.as_deref() == Some("order")),
+            "an op with a primary_type_symbol and a usable locator must ALSO \
+             emit an infer request so the sidecar can arbitrate the anchors"
         );
         assert!(
             !requests.iter().any(|r| r

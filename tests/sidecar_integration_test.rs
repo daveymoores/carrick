@@ -800,6 +800,7 @@ export async function getOrderCount(): Promise<number> {
         source_file: repo.join("src/types.ts").to_string_lossy().to_string(),
         alias: Some(alias.to_string()),
         array_depth: None,
+        payload_borrow_witness: false,
     }];
     // The LLM's compact single-line locator for the multi-line call.
     let infer = vec![InferRequestItem {
@@ -1001,6 +1002,7 @@ notificationRouter.get('/status', async () => {
         source_file: repo.join("src/types.ts").to_string_lossy().to_string(),
         alias: Some(alias.to_string()),
         array_depth: None,
+        payload_borrow_witness: false,
     }];
     // Span locator only — the live data_call carried no expression text.
     let infer = vec![InferRequestItem {
@@ -1176,6 +1178,7 @@ notificationRouter.get('/status', async () => {
         source_file: repo.join("src/types.ts").to_string_lossy().to_string(),
         alias: Some(alias.to_string()),
         array_depth: None,
+        payload_borrow_witness: false,
     }];
     let infer = vec![InferRequestItem {
         file_path: repo.join("src/api.ts").to_string_lossy().to_string(),
@@ -1296,6 +1299,198 @@ fn test_full_carrick_analysis_with_sidecar() {
         stdout.contains("🪢 CARRICK") || stdout.contains("CARRICK"),
         "Should have CARRICK output. Got: {}",
         stdout
+    );
+}
+
+/// carrick#413 two-anchor arbitration, end to end through the real sidecar:
+/// a pub/sub explicit anchor carrying the scanner's borrow witness whose
+/// alias the location-based inference resolves to a DIFFERENT named root is
+/// demoted — the bundle request is re-aimed at the tsc-witnessed payload
+/// type, so the alias's dts definition (the thing compat verdicts are
+/// computed from) is the real payload shape, not the borrowed one. The same
+/// disagreement WITHOUT the witness keeps the explicit symbol untouched.
+#[test]
+fn test_pubsub_witnessed_borrow_demotes_to_inferred_payload_type() {
+    use carrick::services::type_sidecar::{
+        InferKind, InferRequestItem, SymbolRequest, TypeSidecar,
+    };
+    use std::time::Duration;
+
+    if !is_node_available() {
+        eprintln!("Skipping test: Node.js not available");
+        return;
+    }
+    let sidecar_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    if !sidecar_path.exists() {
+        eprintln!("Skipping test: Sidecar not built (run: cd src/sidecar && npm run build)");
+        return;
+    }
+
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let repo = temp_dir.path().join("subscriber-svc");
+    fs::create_dir_all(repo.join("src")).expect("Failed to create src");
+    fs::write(
+        repo.join("package.json"),
+        r#"{ "name": "subscriber-svc", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("tsconfig.json"),
+        r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"]
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("src/types.ts"),
+        r#"export interface OrderPlaced {
+  orderId: string;
+  totalCents: number;
+}
+
+export interface AuditRecord {
+  auditId: string;
+  note: string;
+}
+"#,
+    )
+    .unwrap();
+    // The borrow shape: the handler's payload is annotated `OrderPlaced`,
+    // while `AuditRecord` (the borrowed symbol) annotates a different
+    // binding in the same file.
+    fs::write(
+        repo.join("src/subscriber.ts"),
+        r#"import { OrderPlaced, AuditRecord } from "./types";
+
+export function onOrderPlaced(evt: OrderPlaced): void {
+  const record: AuditRecord = { auditId: "a1", note: "seen" };
+  void record;
+  void evt;
+}
+"#,
+    )
+    .unwrap();
+
+    let sidecar = TypeSidecar::spawn(&sidecar_path).expect("Failed to spawn sidecar");
+    sidecar.start_init(&repo, None);
+    sidecar
+        .wait_ready(Duration::from_secs(60))
+        .expect("Sidecar failed to initialize");
+
+    let types_file = repo.join("src/types.ts").to_string_lossy().to_string();
+    let subscriber_file = repo.join("src/subscriber.ts").to_string_lossy().to_string();
+
+    let demoted_alias = "Pubsub_Demoted_Response";
+    let kept_alias = "Pubsub_Kept_Response";
+    let explicit = vec![
+        // The borrowed anchor WITH the scanner's AST witness: must demote.
+        SymbolRequest {
+            symbol_name: "AuditRecord".to_string(),
+            source_file: types_file.clone(),
+            alias: Some(demoted_alias.to_string()),
+            array_depth: None,
+            payload_borrow_witness: true,
+        },
+        // The same borrowed anchor WITHOUT a witness: must stay explicit.
+        SymbolRequest {
+            symbol_name: "AuditRecord".to_string(),
+            source_file: types_file.clone(),
+            alias: Some(kept_alias.to_string()),
+            array_depth: None,
+            payload_borrow_witness: false,
+        },
+    ];
+    let infer_item = |alias: &str| InferRequestItem {
+        file_path: subscriber_file.clone(),
+        line_number: 4,
+        span_start: None,
+        span_end: None,
+        expression_text: None,
+        expression_line: None,
+        infer_kind: InferKind::FunctionParam,
+        alias: Some(alias.to_string()),
+        param_name: Some("evt".to_string()),
+    };
+    let infer = vec![infer_item(demoted_alias), infer_item(kept_alias)];
+
+    let result = sidecar
+        .resolve_all_types(&explicit, &infer, None)
+        .expect("resolve_all_types failed");
+
+    // The inference reported the deterministic anchor + declaration source
+    // (the fields the arbitration runs on).
+    let inf = result
+        .inferred_types
+        .iter()
+        .find(|i| i.alias == demoted_alias)
+        .expect("expected an inference for the demoted alias");
+    assert_eq!(inf.primary_type_symbol.as_deref(), Some("OrderPlaced"));
+    assert!(
+        inf.primary_type_symbol_source
+            .as_deref()
+            .is_some_and(|s| s.ends_with("types.ts")),
+        "anchor source must be the declaration file, got {:?}",
+        inf.primary_type_symbol_source
+    );
+
+    // Witnessed borrow: the alias is bundled from the tsc-witnessed payload
+    // type (OrderPlaced), not the borrowed AuditRecord.
+    let demoted_entry = result
+        .explicit_manifest
+        .iter()
+        .find(|e| e.alias == demoted_alias)
+        .expect("demoted alias must still be bundled (re-aimed, not dropped)");
+    assert_eq!(
+        demoted_entry.original_name, "OrderPlaced",
+        "witnessed borrow must be re-aimed at the inferred root"
+    );
+
+    // Unwitnessed disagreement: explicit stays authoritative.
+    let kept_entry = result
+        .explicit_manifest
+        .iter()
+        .find(|e| e.alias == kept_alias)
+        .expect("kept alias must be bundled");
+    assert_eq!(
+        kept_entry.original_name, "AuditRecord",
+        "without a witness the explicit symbol must win"
+    );
+
+    // And the dts — the artifact compat verdicts are computed from — carries
+    // the payload shape for the demoted alias and the explicit shape for the
+    // kept one.
+    let dts = result.dts_content.expect("expected bundled dts content");
+    let demoted_def = dts
+        .split("export")
+        .find(|chunk| chunk.contains(demoted_alias))
+        .expect("demoted alias definition in dts");
+    assert!(
+        demoted_def.contains("orderId"),
+        "demoted alias must carry the payload shape:\n{}",
+        dts
+    );
+    assert!(
+        !demoted_def.contains("auditId"),
+        "demoted alias must not carry the borrowed shape:\n{}",
+        dts
+    );
+    let kept_def = dts
+        .split("export")
+        .find(|chunk| chunk.contains(kept_alias))
+        .expect("kept alias definition in dts");
+    assert!(
+        kept_def.contains("auditId"),
+        "kept alias must stay the explicit shape:\n{}",
+        dts
     );
 }
 
