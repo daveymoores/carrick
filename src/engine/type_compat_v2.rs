@@ -657,3 +657,537 @@ fn outcome_for(
         consumer_service: pair.consumer_service.clone(),
     }
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud_storage::TypeEvidence;
+    use crate::services::type_sidecar::InferKind;
+    use crate::type_manifest::{build_manifest_type_alias, build_manifest_type_alias_with_call_id};
+
+    fn entry(
+        key: OperationKey,
+        role: ManifestRole,
+        type_kind: ManifestTypeKind,
+        type_alias: &str,
+        file_path: &str,
+        line_number: u32,
+        type_state: ManifestTypeState,
+    ) -> TypeManifestEntry {
+        TypeManifestEntry {
+            key,
+            role,
+            type_kind,
+            type_alias: type_alias.to_string(),
+            file_path: file_path.to_string(),
+            line_number,
+            is_explicit: type_state == ManifestTypeState::Explicit,
+            type_state,
+            evidence: TypeEvidence {
+                file_path: file_path.to_string(),
+                span_start: None,
+                span_end: None,
+                line_number,
+                infer_kind: InferKind::ResponseBody,
+                is_explicit: false,
+                type_state,
+            },
+            resolved_definition: None,
+            expanded_definition: None,
+            primary_type_symbol: None,
+        }
+    }
+
+    fn repo(
+        repo_name: &str,
+        service_name: Option<&str>,
+        manifest: Vec<TypeManifestEntry>,
+        capture_stub: Option<CaptureStubArtifact>,
+    ) -> CloudRepoData {
+        CloudRepoData {
+            repo_name: repo_name.to_string(),
+            service_name: service_name.map(str::to_string),
+            endpoints: Vec::new(),
+            calls: Vec::new(),
+            mounts: Vec::new(),
+            apps: HashMap::new(),
+            imported_handlers: Vec::new(),
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: if manifest.is_empty() {
+                None
+            } else {
+                Some(manifest)
+            },
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+            compat_verdicts: None,
+            capture_stub,
+        }
+    }
+
+    fn fake_artifact() -> CaptureStubArtifact {
+        CaptureStubArtifact {
+            artifact_version: CAPTURE_ARTIFACT_VERSION,
+            package_name: "@carrick/test".to_string(),
+            ts_version: "5.8.3".to_string(),
+            bare_checkout: true,
+            files: BTreeMap::new(),
+        }
+    }
+
+    // ---- derive_capture_anchors -------------------------------------------
+
+    /// Precedence per alias mirrors the v1 bundle: symbol wins over infer,
+    /// infer wins over literal; aliases pass through byte-identical.
+    #[test]
+    fn derive_anchors_precedence_and_alias_passthrough() {
+        let explicit = vec![SymbolRequest {
+            symbol_name: "Order".to_string(),
+            source_file: "src/types.ts".to_string(),
+            alias: Some("Endpoint_a_Response".to_string()),
+            array_depth: Some(1),
+        }];
+        let infer = vec![
+            crate::services::type_sidecar::InferRequestItem {
+                file_path: "/repo/src/handler.ts".to_string(),
+                line_number: 7,
+                span_start: Some(10),
+                span_end: Some(20),
+                expression_text: None,
+                expression_line: None,
+                infer_kind: InferKind::ResponseBody,
+                alias: Some("Endpoint_a_Response".to_string()),
+                param_name: None,
+            },
+            crate::services::type_sidecar::InferRequestItem {
+                file_path: "/repo/src/handler.ts".to_string(),
+                line_number: 9,
+                span_start: None,
+                span_end: None,
+                expression_text: Some("payload".to_string()),
+                expression_line: Some(9),
+                infer_kind: InferKind::ResponseBody,
+                alias: Some("Endpoint_b_Response".to_string()),
+                param_name: None,
+            },
+        ];
+        let inline = vec![
+            ("Endpoint_b_Response".to_string(), "Widget".to_string()),
+            (
+                "Endpoint_c_Response".to_string(),
+                "{ ok: boolean }".to_string(),
+            ),
+        ];
+
+        let anchors = derive_capture_anchors(&explicit, &infer, &inline, "/repo");
+        assert_eq!(anchors.len(), 3);
+
+        match &anchors[0] {
+            CaptureAnchor::Symbol {
+                alias,
+                array_depth,
+                source_file,
+                ..
+            } => {
+                assert_eq!(alias, "Endpoint_a_Response");
+                assert_eq!(*array_depth, Some(1));
+                assert_eq!(source_file, "src/types.ts");
+            }
+            other => panic!("expected symbol anchor, got {:?}", other),
+        }
+        match &anchors[1] {
+            CaptureAnchor::Infer {
+                alias, source_file, ..
+            } => {
+                assert_eq!(alias, "Endpoint_b_Response");
+                // Absolute path under the repo root is relativized for the wire.
+                assert_eq!(source_file, "src/handler.ts");
+            }
+            other => panic!("expected infer anchor, got {:?}", other),
+        }
+        match &anchors[2] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_c_Response");
+                assert_eq!(type_text, "{ ok: boolean }");
+            }
+            other => panic!("expected literal anchor, got {:?}", other),
+        }
+    }
+
+    // ---- build_check_pairs ------------------------------------------------
+
+    /// HTTP pairing is method + route-aware path + type_kind, cross-service
+    /// only, and a literal producer outranks a parameterized one for the same
+    /// consumer (the ts_check specificity rule).
+    #[test]
+    fn build_pairs_http_specificity_and_cross_service_only() {
+        let key_param = OperationKey::http("GET", "/users/:id");
+        let key_literal = OperationKey::http("GET", "/users/me");
+        let consumer_key = OperationKey::http("GET", "/users/me");
+
+        let producer_repo = repo(
+            "api",
+            None,
+            vec![
+                entry(
+                    key_param.clone(),
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Response,
+                    "P_param",
+                    "src/routes.ts",
+                    3,
+                    ManifestTypeState::Explicit,
+                ),
+                entry(
+                    key_literal.clone(),
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Response,
+                    "P_literal",
+                    "src/routes.ts",
+                    9,
+                    ManifestTypeState::Explicit,
+                ),
+            ],
+            Some(fake_artifact()),
+        );
+        let consumer_repo = repo(
+            "web",
+            None,
+            vec![entry(
+                consumer_key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C_me",
+                "src/client.ts",
+                12,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        // A same-identity repo carrying both sides must produce no pair.
+        let self_repo = repo(
+            "web",
+            None,
+            vec![entry(
+                key_literal.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P_self",
+                "src/self.ts",
+                1,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+
+        let pairs = build_check_pairs(&[producer_repo, consumer_repo, self_repo]);
+        assert_eq!(pairs.len(), 1, "one pair: the most specific producer wins");
+        let pair = &pairs[0];
+        assert_eq!(pair.producer_alias, "P_literal");
+        assert_eq!(pair.consumer_alias, "C_me");
+        assert_eq!(pair.pseudo_method, "GET");
+        assert_eq!(pair.identity, "/users/me");
+        assert_eq!(pair.consumer_file, "src/client.ts");
+        assert_eq!(pair.consumer_line, 12);
+        assert!(pair.pre_verdict.is_none());
+        assert_eq!(pair.spec.protocol, ProbeProtocol::Http);
+        assert_eq!(pair.spec.type_kind, ProbeTypeKind::Response);
+    }
+
+    /// Exact-key protocols pair on equal operation keys; socket/pubsub pairs
+    /// probe as `both` (the direction table inverts them), and the identity
+    /// matches what `parse_producer_key` recovers from an edge.
+    #[test]
+    fn build_pairs_exact_key_protocols() {
+        let topic = OperationKey::pubsub("order.placed");
+        let producer_repo = repo(
+            "worker",
+            Some("billing"),
+            vec![entry(
+                topic.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P_topic",
+                "src/subscriber.ts",
+                4,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        let consumer_repo = repo(
+            "orders",
+            Some("orders-engine"),
+            vec![entry(
+                topic.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C_topic",
+                "src/publisher.ts",
+                21,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+
+        let pairs = build_check_pairs(&[producer_repo, consumer_repo]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].pseudo_method, "PUBSUB");
+        assert_eq!(pairs[0].identity, "order.placed");
+        assert_eq!(pairs[0].spec.protocol, ProbeProtocol::Pubsub);
+        assert_eq!(pairs[0].spec.type_kind, ProbeTypeKind::Both);
+        assert_eq!(pairs[0].producer_service, "billing");
+        assert_eq!(pairs[0].consumer_service, "orders-engine");
+    }
+
+    /// An unresolved side or a missing capture surface pre-verdicts the pair
+    /// unverifiable — it never reaches a probe, and the reason travels.
+    #[test]
+    fn build_pairs_pre_verdicts_unresolved_and_surfaceless() {
+        let key = OperationKey::http("GET", "/orders");
+        let no_surface_producer = repo(
+            "api",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P",
+                "src/routes.ts",
+                3,
+                ManifestTypeState::Explicit,
+            )],
+            None, // no capture stub: older scan or degraded capture
+        );
+        let consumer_ok = repo(
+            "web",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C",
+                "src/client.ts",
+                8,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        let pairs = build_check_pairs(&[no_surface_producer, consumer_ok.clone()]);
+        assert_eq!(pairs.len(), 1);
+        let (bucket, reason) = pairs[0].pre_verdict.as_ref().expect("pre-verdict");
+        assert_eq!(*bucket, VerdictBucket::Unverifiable);
+        assert!(reason.contains("no v2 type surface"), "{reason}");
+
+        // Unknown type_state on a side with a surface: unresolved anchors
+        // generate no probe (design, Check step 9).
+        let unresolved_producer = repo(
+            "api",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P",
+                "src/routes.ts",
+                3,
+                ManifestTypeState::Unknown,
+            )],
+            Some(fake_artifact()),
+        );
+        let pairs = build_check_pairs(&[unresolved_producer, consumer_ok]);
+        assert_eq!(pairs.len(), 1);
+        let (bucket, reason) = pairs[0].pre_verdict.as_ref().expect("pre-verdict");
+        assert_eq!(*bucket, VerdictBucket::Unverifiable);
+        assert!(reason.contains("not resolved at capture time"), "{reason}");
+    }
+
+    // ---- end-to-end: capture_v2 -> check_v2 -> pair outcomes -> edge join --
+
+    /// Full deterministic integration of the WP3 path against the corpus-2
+    /// fixture pair (orders-engine's OrderPlaced.total is a Money object;
+    /// billing-svc expects a bare number — the deliberate incompatibility):
+    ///
+    ///   1. capture_v2 both services through the Rust client,
+    ///   2. artifacts ride CloudRepoData.capture_stub,
+    ///   3. run_check builds the pair, materializes stubs, runs check_v2,
+    ///   4. the incompatible verdict joins the CrossRepoMatch edge by
+    ///      structured identity (pair-ID join, no label parsing), and
+    ///   5. outcomes are stable across two independent check runs.
+    ///
+    /// The check path is deterministic given the anchors (no LLM anywhere);
+    /// the pnpm install is local-only for these bare fixtures.
+    #[test]
+    fn corpus_capture_check_join_end_to_end() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let orders_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/orders-engine");
+        let billing_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/billing-svc");
+        assert!(orders_repo.exists(), "fixture missing: {orders_repo:?}");
+        assert!(billing_repo.exists(), "fixture missing: {billing_repo:?}");
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&orders_repo, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(60))
+            .expect("sidecar init");
+
+        // Aliases exactly as the manifest builder derives them.
+        let key = OperationKey::http("GET", "/orders/latest");
+        let producer_alias =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let consumer_call_id = crate::type_manifest::build_call_site_id(
+            "src/billing-call.ts",
+            5,
+            &key,
+            billing_repo.to_str().unwrap(),
+        );
+        let consumer_alias = build_manifest_type_alias_with_call_id(
+            &key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&consumer_call_id),
+        );
+
+        // Capture both services (symbol anchors on each side's OrderPlaced).
+        let (orders_stub, orders_artifact) = run_capture(
+            &sidecar,
+            orders_repo.to_str().unwrap(),
+            "orders-engine",
+            &[CaptureAnchor::Symbol {
+                alias: producer_alias.clone(),
+                symbol_name: "OrderPlaced".to_string(),
+                source_file: "src/types/order.ts".to_string(),
+                anchor_origin: AnchorOrigin::LlmSymbol,
+                array_depth: None,
+            }],
+        )
+        .expect("orders-engine capture");
+        let (billing_stub, billing_artifact) = run_capture(
+            &sidecar,
+            billing_repo.to_str().unwrap(),
+            "billing-svc",
+            &[CaptureAnchor::Symbol {
+                alias: consumer_alias.clone(),
+                symbol_name: "OrderPlaced".to_string(),
+                source_file: "src/types/billing.ts".to_string(),
+                anchor_origin: AnchorOrigin::LlmSymbol,
+                array_depth: None,
+            }],
+        )
+        .expect("billing-svc capture");
+        let _ = std::fs::remove_dir_all(&orders_stub);
+        let _ = std::fs::remove_dir_all(&billing_stub);
+
+        let all_repo_data = vec![
+            repo(
+                "orders-engine",
+                None,
+                vec![entry(
+                    key.clone(),
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Response,
+                    &producer_alias,
+                    "src/routes.ts",
+                    3,
+                    ManifestTypeState::Explicit,
+                )],
+                Some(orders_artifact),
+            ),
+            repo(
+                "billing-svc",
+                None,
+                vec![entry(
+                    key.clone(),
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Response,
+                    &consumer_alias,
+                    "src/billing-call.ts",
+                    5,
+                    ManifestTypeState::Explicit,
+                )],
+                Some(billing_artifact),
+            ),
+        ];
+
+        let outcomes = run_check(&sidecar, &all_repo_data);
+        assert_eq!(outcomes.len(), 1, "exactly one matched pair");
+        let outcome = &outcomes[0];
+        assert_eq!(
+            outcome.bucket,
+            VerdictBucket::Incompatible,
+            "the corpus-2 Money-object vs number mismatch must verdict \
+             incompatible; diagnostic: {:?}",
+            outcome.diagnostic
+        );
+        let diagnostic = outcome.diagnostic.as_deref().unwrap_or("");
+        assert!(
+            !diagnostic.contains("/tmp/") && !diagnostic.contains("/private/"),
+            "diagnostic leaked a scratch path: {diagnostic}"
+        );
+
+        // Pair-ID join onto the CrossRepoMatch edge — structured identity,
+        // no label parsing anywhere.
+        let mut edges = vec![crate::analyzer::CrossRepoMatch {
+            producer_repo: "orders-engine".to_string(),
+            producer_key: key.canonical(),
+            consumer_repo: "billing-svc".to_string(),
+            consumer_key: key.canonical(),
+            consumer_location: Some("src/billing-call.ts:5:9".to_string()),
+            match_score: 1.0,
+            type_compatible: None,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+        }];
+        crate::analyzer::apply_pair_outcomes(&outcomes, &mut edges);
+        assert_eq!(
+            edges[0].type_compatible,
+            Some(false),
+            "the incompatible verdict must land on the edge"
+        );
+        assert!(edges[0].mismatch_reason.is_some());
+
+        // Determinism: a second independent check run yields the same
+        // outcomes (pair keys, buckets, diagnostics).
+        let outcomes_again = run_check(&sidecar, &all_repo_data);
+        let flat = |v: &[PairCheckOutcome]| {
+            v.iter()
+                .map(|o| {
+                    format!(
+                        "{}|{:?}|{}",
+                        o.pair_key,
+                        o.bucket,
+                        o.diagnostic.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            flat(&outcomes),
+            flat(&outcomes_again),
+            "check outcomes must be byte-stable across runs"
+        );
+    }
+}

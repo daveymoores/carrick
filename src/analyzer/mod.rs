@@ -390,7 +390,7 @@ fn normalize_compat_path(path: &str) -> String {
 /// produced NO pair outcome stays `None` — compat was never evaluated for
 /// it, and the old optimistic `Some(true)` default is gone: `Some(true)` now
 /// requires an explicit compatible verdict.
-fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [CrossRepoMatch]) {
+pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [CrossRepoMatch]) {
     // The per-pair verdict key: producer `(METHOD, normalized identity)` plus
     // the consumer call-site identity `(file, line)`.
     type VerdictKey = (String, String, (String, u32));
