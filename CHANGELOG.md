@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.2.9](https://github.com/carrick-tools/carrick/compare/carrick-v0.2.8...carrick-v0.2.9) (2026-07-20)
+
+
+### Features
+
+* fail fast on Deno-native projects + inclusive requirements copy ([#366](https://github.com/carrick-tools/carrick/issues/366)) ([cc5e4b4](https://github.com/carrick-tools/carrick/commit/cc5e4b4542f11b912bb9e617431ab062935ddf19))
+* pub/sub payload type capture via expression locators ([#386](https://github.com/carrick-tools/carrick/issues/386)) ([5e767d4](https://github.com/carrick-tools/carrick/commit/5e767d4658b2587a5312e8414aeb7089a9ef4940))
+* **scanner:** deterministic subscriber anchors for object-literal, constructor, and two-arg subscribe shapes ([#409](https://github.com/carrick-tools/carrick/issues/409)) ([d78deaa](https://github.com/carrick-tools/carrick/commit/d78deaa239e5dbe638b1658d32fe238a3d54fd38))
+* **scanner:** two-anchor arbitration for pub/sub payload anchors (witnessed borrow demotion) ([#414](https://github.com/carrick-tools/carrick/issues/414)) ([69cc7dd](https://github.com/carrick-tools/carrick/commit/69cc7dd0e50d8d98809808042e040b75b0298543))
+* surface web-platform postMessage channel as pub/sub candidates ([#372](https://github.com/carrick-tools/carrick/issues/372)) ([75f5619](https://github.com/carrick-tools/carrick/commit/75f5619b800e657cc8010c6d78b37fb831adcae7))
+* tag endpoint evidence with provenance (route vs mock/test handler) ([#384](https://github.com/carrick-tools/carrick/issues/384)) ([41b1b55](https://github.com/carrick-tools/carrick/commit/41b1b550281159b65ffb3d7a3df861588e3c6201))
+
+
+### Bug Fixes
+
+* **analyzer:** drop HTTP producer==consumer self-pair edges ([#410](https://github.com/carrick-tools/carrick/issues/410)) ([1fbbaa7](https://github.com/carrick-tools/carrick/commit/1fbbaa7adc39d99e1eb53bd1a81508614e36f861))
+* apply symbol validation parity to pub/sub operations ([#406](https://github.com/carrick-tools/carrick/issues/406)) ([69d74b8](https://github.com/carrick-tools/carrick/commit/69d74b868ab7e2451d9130dd4f5521320cea33a1))
+* backfill payload-less pub/sub ops from deterministic AST anchors ([#389](https://github.com/carrick-tools/carrick/issues/389)) ([26e4945](https://github.com/carrick-tools/carrick/commit/26e49451cf12142bd6e9d0ff9dc253d9752f5188))
+* carry the member property on URL-scheme and awaited-call candidates ([#398](https://github.com/carrick-tools/carrick/issues/398)) ([23ac705](https://github.com/carrick-tools/carrick/commit/23ac705c071f77216642d3131dfe7225a23377e2))
+* classify call-site-only match pairs as shared external contracts ([#385](https://github.com/carrick-tools/carrick/issues/385)) ([f29e095](https://github.com/carrick-tools/carrick/commit/f29e095ec6170880a541d5e9df3d7a254d051639))
+* collapse inline env-var fallbacks in data-call targets ([#401](https://github.com/carrick-tools/carrick/issues/401)) ([75f8eee](https://github.com/carrick-tools/carrick/commit/75f8eee2c8dd7af5ba3794d2147d77be4aceeb8a))
+* degrade gracefully when a type-check dependency is unresolvable ([#391](https://github.com/carrick-tools/carrick/issues/391)) ([99cb2ab](https://github.com/carrick-tools/carrick/commit/99cb2abf3ee7117b4540c5e0734285d185998bb8)), closes [#390](https://github.com/carrick-tools/carrick/issues/390)
+* drop LLM pub/sub ops whose topic has no literal witness in the file ([#395](https://github.com/carrick-tools/carrick/issues/395)) ([2283bb2](https://github.com/carrick-tools/carrick/commit/2283bb22e25f2f6e78c7a8afcc9b65e774d0662e))
+* fall back to backing type when graphql resolver_line is unusable ([#404](https://github.com/carrick-tools/carrick/issues/404)) ([5095d3f](https://github.com/carrick-tools/carrick/commit/5095d3fb22592da6956677bab40f1b3914ac7af9))
+* fan mount-alias prefixes out into one endpoint per alias ([#393](https://github.com/carrick-tools/carrick/issues/393)) ([b740898](https://github.com/carrick-tools/carrick/commit/b7408983ab71e9bec6242a6972b2bb8d4421111c)), closes [#373](https://github.com/carrick-tools/carrick/issues/373)
+* hash repo-relative call-site paths so scanner output is machine-independent ([#394](https://github.com/carrick-tools/carrick/issues/394)) ([8701fa1](https://github.com/carrick-tools/carrick/commit/8701fa1757406a0a7805296c8b30d7fc8777877d)), closes [#355](https://github.com/carrick-tools/carrick/issues/355)
+* match ignore patterns against path segments, not substrings ([#382](https://github.com/carrick-tools/carrick/issues/382)) ([64cdf17](https://github.com/carrick-tools/carrick/commit/64cdf171bd956e2ebe1d2ea3be9a713a125e3944))
+* **match:** gate cross-repo pairing on literal path agreement ([#383](https://github.com/carrick-tools/carrick/issues/383)) ([4443280](https://github.com/carrick-tools/carrick/commit/4443280dbb4fb382148ffd07bbb1587297c35868))
+* name both sides of cross-repo match rows by the service-qualified id ([#396](https://github.com/carrick-tools/carrick/issues/396)) ([9ac5202](https://github.com/carrick-tools/carrick/commit/9ac52023000545f89dce2860acd01209b43ec8cf)), closes [#368](https://github.com/carrick-tools/carrick/issues/368)
+* resolve env-var aliases through imported config-object properties ([#388](https://github.com/carrick-tools/carrick/issues/388)) ([319b497](https://github.com/carrick-tools/carrick/commit/319b497970046fc9611227f8756c00b130bec776))
+* **scanner:** count all six response sections in result_score ([#412](https://github.com/carrick-tools/carrick/issues/412)) ([b5a8c73](https://github.com/carrick-tools/carrick/commit/b5a8c730439b2a198d739591974f411e1db7755a))
+
+
+### Documentation
+
+* add estimation conventions in agent execution time to AGENTS.md ([#408](https://github.com/carrick-tools/carrick/issues/408)) ([7c5c002](https://github.com/carrick-tools/carrick/commit/7c5c002a4dca8bc4e25983877ec8c0d887835f11))
+* document crates/carrick-match and its wasm release artifact ([#331](https://github.com/carrick-tools/carrick/issues/331)) ([ccb057d](https://github.com/carrick-tools/carrick/commit/ccb057d0f887dd09e697b6fc88eb3fd25b19707f))
+* restructure docs/ into reference/archive with a map and eval runbook ([#392](https://github.com/carrick-tools/carrick/issues/392)) ([2b42b93](https://github.com/carrick-tools/carrick/commit/2b42b9314ca99a9399770954f5cdb2aa7583dca0))
+* type-compat v2 design — compiler-native artifacts in a synthetic monorepo ([#299](https://github.com/carrick-tools/carrick/issues/299)) ([2e09a25](https://github.com/carrick-tools/carrick/commit/2e09a25c69ae549a04c0a2bfc1590a55cfc68b40))
+* user-scoped MCP install; refresh agent guidance to the workflow loop ([#375](https://github.com/carrick-tools/carrick/issues/375)) ([5f71f68](https://github.com/carrick-tools/carrick/commit/5f71f685a0d11825c93888913ba16d435714b2fe))
+
 ## [0.2.8](https://github.com/daveymoores/carrick/compare/carrick-v0.2.7...carrick-v0.2.8) (2026-07-12)
 
 
