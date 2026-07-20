@@ -231,6 +231,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     symbol_name: z.string().min(1),
     source_file: z.string().min(1),
     anchor_origin: AnchorOriginSchema,
+    array_depth: z.number().int().nonnegative().optional(),
   }),
   z.object({
     kind: z.literal('handler_return'),
@@ -249,6 +250,12 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     line_number: z.number().int().positive().optional(),
     expression_text: z.string().optional(),
     unwrap: z.enum(['awaited', 'none']).optional(),
+  }),
+  z.object({
+    kind: z.literal('literal'),
+    alias: z.string().min(1),
+    type_text: z.string().min(1),
+    anchor_origin: AnchorOriginSchema,
   }),
 ]);
 
@@ -315,7 +322,7 @@ export const ShutdownRequestSchema = BaseRequestSchema.extend({
 
 export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('resolve_definitions'),
-  bundled_dts: z.string().min(1, 'Bundled .d.ts content cannot be empty'),
+  stub_dir: z.string().min(1, 'Stub dir cannot be empty'),
   aliases: z.array(z.string().min(1)).min(1, 'At least one alias is required'),
 });
 

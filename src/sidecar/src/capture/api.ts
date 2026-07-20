@@ -39,6 +39,28 @@ export interface SymbolAnchorRequest {
   /** Declaring module, repo-root-relative, e.g. src/types/stock.ts */
   source_file: string;
   anchor_origin: AnchorOrigin;
+  /**
+   * Wrap the captured symbol in this many TS array levels (#248/#306): an
+   * anchor is the ELEMENT symbol by contract (`User[]` -> `User`), so the
+   * use-site's array-ness rides here and the surface alias becomes
+   * `import('./m').Sym[]`. Omitted/0 captures the symbol as-is.
+   */
+  array_depth?: number;
+}
+
+/**
+ * Inline literal type text with no addressable symbol (the v1 inline-alias
+ * path): the surface entry gets `export type A = <type_text>;`. A bare
+ * identifier that names a sibling symbol anchor's symbol resolves through
+ * that anchor's module specifier so it does not dangle in the entry file;
+ * any other text is emitted verbatim and the self-check owns the verdict.
+ */
+export interface LiteralAnchorRequest {
+  kind: 'literal';
+  alias: string;
+  /** Verbatim TS type text (a bare symbol name or an inline object type). */
+  type_text: string;
+  anchor_origin: AnchorOrigin;
 }
 
 /**
@@ -85,7 +107,8 @@ export interface InferAnchorRequest {
 export type CaptureAnchorRequest =
   | SymbolAnchorRequest
   | HandlerReturnAnchorRequest
-  | InferAnchorRequest;
+  | InferAnchorRequest
+  | LiteralAnchorRequest;
 
 export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal';
 
@@ -93,6 +116,7 @@ export interface CaptureAliasRecord {
   alias: string;
   anchor_kind: CaptureAnchorRequest['kind'];
   symbol_name?: string;
+  /** Repo-root-relative declaring module; `<inline>` for literal anchors. */
   source_file: string;
   anchor_origin: AnchorOrigin;
   serialization: SerializationTier;

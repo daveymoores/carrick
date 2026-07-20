@@ -8,7 +8,7 @@
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as path from 'node:path';
-import { SidecarClient, FIXTURES_PATH } from './helpers.js';
+import { SidecarClient, FIXTURES_PATH, stubDirFor } from './helpers.js';
 
 // ===========================================================================
 // Tests
@@ -1343,7 +1343,7 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'resolve_definitions',
         request_id: 'resolve-1',
-        bundled_dts: bundledDts,
+        stub_dir: stubDirFor(bundledDts),
         aliases: ['User'],
       });
 
@@ -1378,7 +1378,7 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'resolve_definitions',
         request_id: 'resolve-2',
-        bundled_dts: bundledDts,
+        stub_dir: stubDirFor(bundledDts),
         aliases: ['UserRole'],
       });
 
@@ -1404,7 +1404,7 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'resolve_definitions',
         request_id: 'resolve-3',
-        bundled_dts: bundledDts,
+        stub_dir: stubDirFor(bundledDts),
         aliases: ['UserProfile'],
       });
 
@@ -1452,7 +1452,7 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'resolve_definitions',
         request_id: 'resolve-4',
-        bundled_dts: bundledDts,
+        stub_dir: stubDirFor(bundledDts),
         aliases: ['User', 'Order', 'OrderStatus'],
       });
 
@@ -1483,7 +1483,7 @@ describe('Type Sidecar Integration Tests', () => {
       }>({
         action: 'resolve_definitions',
         request_id: 'resolve-5',
-        bundled_dts: bundledDts,
+        stub_dir: stubDirFor(bundledDts),
         aliases: ['User', 'NonExistentType'],
       });
 
@@ -1528,7 +1528,7 @@ describe('Type Sidecar Integration Tests', () => {
         }>({
           action: 'resolve_definitions',
           request_id: requestId,
-          bundled_dts: corpusDts,
+          stub_dir: stubDirFor(corpusDts),
           aliases: [alias],
         });
         assert.strictEqual(response.status, 'success');
@@ -1606,7 +1606,7 @@ describe('Type Sidecar Integration Tests', () => {
         }>({
           action: 'resolve_definitions',
           request_id: 'resolve-uninit',
-          bundled_dts: 'export type Foo = string;',
+          stub_dir: stubDirFor('export type Foo = string;'),
           aliases: ['Foo'],
         });
 
@@ -1752,7 +1752,7 @@ describe('Validator Unit Tests', () => {
     const result = parseRequest({
       action: 'resolve_definitions',
       request_id: 'test-resolve-1',
-      bundled_dts: 'export type Foo = string;',
+      stub_dir: stubDirFor('export type Foo = string;'),
       aliases: ['Foo'],
     });
 
@@ -1765,20 +1765,20 @@ describe('Validator Unit Tests', () => {
     const result = parseRequest({
       action: 'resolve_definitions',
       request_id: 'test-resolve-2',
-      bundled_dts: 'export type Foo = string;',
+      stub_dir: stubDirFor('export type Foo = string;'),
       aliases: [],
     });
 
     assert.strictEqual(result.success, false);
   });
 
-  it('should reject resolve_definitions with empty bundled_dts', async () => {
+  it('should reject resolve_definitions with empty stub_dir', async () => {
     const { parseRequest } = await import('../src/validators.js');
 
     const result = parseRequest({
       action: 'resolve_definitions',
       request_id: 'test-resolve-3',
-      bundled_dts: '',
+      stub_dir: '',
       aliases: ['Foo'],
     });
 

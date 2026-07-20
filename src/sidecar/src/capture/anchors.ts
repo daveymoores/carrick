@@ -57,6 +57,12 @@ export function resolveAnchor(
     repoRoot: string;
     entryDir: string;
     placeholder: ts.TypeAliasDeclaration | undefined;
+    /**
+     * symbol_name -> entry-relative specifier for every sibling `symbol`
+     * anchor. A literal anchor whose text is a bare identifier naming one of
+     * these resolves through that module instead of dangling in the entry.
+     */
+    siblingSymbolSpecs?: Map<string, string>;
   }
 ): ResolvedAnchor {
   const checker = program.getTypeChecker();
@@ -66,6 +72,22 @@ export function resolveAnchor(
     serialization: 'structural_fallback',
     failureReason: reason,
   });
+
+  if (request.kind === 'literal') {
+    const text = request.type_text.trim();
+    if (!text) {
+      return demote('empty literal type text');
+    }
+    const bareIdentifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text);
+    const siblingSpec = bareIdentifier
+      ? args.siblingSymbolSpecs?.get(text)
+      : undefined;
+    return {
+      request,
+      aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : text,
+      serialization: 'emitted',
+    };
+  }
 
   const sourceAbs = path.join(args.repoRoot, request.source_file);
   const sourceFile = program.getSourceFile(sourceAbs);
@@ -81,9 +103,12 @@ export function resolveAnchor(
         `'${request.symbol_name}' is not an export of ${request.source_file}`
       );
     }
+    // The anchor is the ELEMENT symbol; array_depth restores the use-site's
+    // `[]` levels (#248/#306) so an array-vs-scalar mismatch stays visible.
+    const arraySuffix = '[]'.repeat(Math.max(0, request.array_depth ?? 0));
     return {
       request,
-      aliasText: `import('${spec}').${request.symbol_name}`,
+      aliasText: `import('${spec}').${request.symbol_name}${arraySuffix}`,
       serialization: 'emitted',
     };
   }

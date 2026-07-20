@@ -420,7 +420,8 @@ function handleCheckCompatibility(request: SidecarRequest & { action: 'check_com
 }
 
 /**
- * Handle the 'resolve_definitions' action - resolve type aliases from bundled .d.ts
+ * Handle the 'resolve_definitions' action - resolve surface aliases from a
+ * v2 capture stub package's declaration tree.
  */
 function handleResolveDefinitions(
   request: SidecarRequest & { action: 'resolve_definitions' },
@@ -434,10 +435,10 @@ function handleResolveDefinitions(
   }
 
   try {
-    log(`Resolving ${request.aliases.length} type alias(es)`);
+    log(`Resolving ${request.aliases.length} type alias(es) from ${request.stub_dir}`);
 
-    const results = definitionResolver.resolve(
-      request.bundled_dts,
+    const results = definitionResolver.resolveFromStub(
+      request.stub_dir,
       request.aliases,
     );
 

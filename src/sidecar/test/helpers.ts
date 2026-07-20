@@ -3,6 +3,8 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,6 +20,18 @@ export const FIXTURES_PATH = path.join(
   'fixtures',
   'sample-repo'
 );
+
+/**
+ * Write .d.ts content into a minimal capture-stub-shaped temp dir
+ * (`<dir>/types/surface.d.ts`) for the stub-based `resolve_definitions`
+ * action. Callers own cleanup (or leave it to the OS temp dir).
+ */
+export function stubDirFor(dts: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-defres-'));
+  fs.mkdirSync(path.join(dir, 'types'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'types', 'surface.d.ts'), dts);
+  return dir;
+}
 
 /**
  * Helper class to manage sidecar process communication

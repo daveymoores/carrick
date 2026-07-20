@@ -14,7 +14,7 @@
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as path from 'node:path';
-import { SidecarClient, FIXTURES_PATH } from './helpers.js';
+import { SidecarClient, FIXTURES_PATH, stubDirFor } from './helpers.js';
 
 const TYPES_FIXTURE = path.join(FIXTURES_PATH, 'src/types.ts');
 const noWs = (s: string) => s.replace(/\s/g, '');
@@ -86,7 +86,7 @@ describe('array_depth wraps a bundled symbol in TS array levels (#248)', () => {
     const resolved = await client.send<ResolveResponseShape>({
       action: 'resolve_definitions',
       request_id: 'arr-resolve',
-      bundled_dts: bundle.dts_content ?? '',
+      stub_dir: stubDirFor(bundle.dts_content ?? ''),
       aliases: [ALIAS],
     });
     assert.strictEqual(resolved.status, 'success', `resolve failed: ${JSON.stringify(resolved.errors)}`);

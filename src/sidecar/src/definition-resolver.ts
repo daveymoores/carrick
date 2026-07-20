@@ -1,9 +1,14 @@
 /**
- * DefinitionResolver - Resolves type aliases from bundled .d.ts content
- * using the TypeScript compiler.
+ * DefinitionResolver - Resolves surface type aliases from a v2 capture stub
+ * package's declaration tree using the TypeScript compiler.
  *
  * Two forms are produced per alias:
- *  - `definition`: the declaration *as written* (named refs preserved).
+ *  - `definition`: the declaration *as written* (named refs preserved). For a
+ *    surface alias `export type A = import('./m').Order;` this follows the
+ *    alias to its target declaration in the stub tree (`interface Order {...}`)
+ *    so the definition keeps its real name and members; when the target is
+ *    anonymous (inline object types, node-builder prints) the surface alias
+ *    line itself is the as-written form.
  *  - `expanded`: the fully *structural* form, with every named member type
  *    inlined to its member structure, recursively.
  *
@@ -13,9 +18,15 @@
  * The structural form is produced by `expandTypeStructural` (shared with the
  * inference path in `type-inferrer.ts`), which walks the resolved `Type` and
  * rebuilds the inlined text.
+ *
+ * The stub's tree files are added to the live project for the duration of one
+ * resolve call and removed afterwards, so the warm sidecar's project never
+ * accumulates stale stub trees across requests.
  */
 
-import { Project, type SourceFile } from 'ts-morph';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { Project, Node, type SourceFile } from 'ts-morph';
 import { expandTypeStructural } from './type-structural-expander.js';
 
 export interface ResolvedDefinition {
@@ -34,29 +45,40 @@ export class DefinitionResolver {
   }
 
   /**
-   * Resolve multiple type aliases from a bundled .d.ts string.
-   * Returns both the original declaration and the structural form.
+   * Resolve surface aliases from a capture stub package directory
+   * (`<stub_dir>/types/surface.d.ts` + its declaration tree).
    */
-  resolve(bundledDts: string, aliases: string[]): ResolvedDefinition[] {
-    const tempFileName = `__carrick_resolve_${Date.now()}.d.ts`;
-    let tempFile: SourceFile | undefined;
+  resolveFromStub(stubDir: string, aliases: string[]): ResolvedDefinition[] {
+    const typesDir = path.join(stubDir, 'types');
+    const surfacePath = path.join(typesDir, 'surface.d.ts');
+    if (!fs.existsSync(surfacePath)) {
+      this.log(`No surface.d.ts under ${stubDir}; nothing to resolve`);
+      return [];
+    }
 
+    // Add the whole tree so the surface's relative import-types resolve.
+    const added: SourceFile[] = [];
     try {
-      tempFile = this.project.createSourceFile(tempFileName, bundledDts, {
-        overwrite: true,
-      });
+      for (const filePath of walkDtsFiles(typesDir)) {
+        if (!this.project.getSourceFile(filePath)) {
+          added.push(this.project.addSourceFileAtPath(filePath));
+        }
+      }
+      const surface = this.project.getSourceFile(surfacePath);
+      if (!surface) {
+        this.logError(`Failed to load ${surfacePath}`);
+        return [];
+      }
 
       const results: ResolvedDefinition[] = [];
-
       for (const alias of aliases) {
-        const result = this.resolveAlias(tempFile, alias);
+        const result = this.resolveAlias(surface, alias);
         if (result) {
           results.push(result);
         } else {
           this.log(`Could not resolve alias: ${alias}`);
         }
       }
-
       return results;
     } catch (err) {
       this.logError(
@@ -64,8 +86,8 @@ export class DefinitionResolver {
       );
       return [];
     } finally {
-      if (tempFile) {
-        this.project.removeSourceFile(tempFile);
+      for (const file of added) {
+        this.project.removeSourceFile(file);
       }
     }
   }
@@ -86,11 +108,28 @@ export class DefinitionResolver {
     if (!decl) return null;
 
     try {
-      // Original declaration text as written.
-      const definition = decl.getText();
+      const type = decl.getType();
+
+      // As-written form: prefer the alias target's own declaration (the real
+      // `interface Order {...}` in the tree) over the surface's import-type
+      // line, so named shapes read naturally. Fall back to the alias line for
+      // anonymous targets or lib/external declarations outside the stub tree.
+      let definition = decl.getText();
+      const targetSymbol = type.getAliasSymbol() ?? type.getSymbol();
+      const targetDecl = targetSymbol?.getDeclarations()?.[0];
+      if (
+        targetDecl &&
+        (Node.isInterfaceDeclaration(targetDecl) ||
+          Node.isTypeAliasDeclaration(targetDecl) ||
+          Node.isClassDeclaration(targetDecl) ||
+          Node.isEnumDeclaration(targetDecl)) &&
+        !targetDecl.getSourceFile().getFilePath().includes('node_modules')
+      ) {
+        definition = targetDecl.getText();
+      }
 
       // Structural form — every named member inlined to its shape.
-      const expanded = expandTypeStructural(decl.getType());
+      const expanded = expandTypeStructural(type);
 
       return { type_alias: alias, definition, expanded };
     } catch (err) {
@@ -108,4 +147,21 @@ export class DefinitionResolver {
   private logError(message: string): void {
     console.error(`[sidecar:definition-resolver:error] ${message}`);
   }
+}
+
+/** All .d.ts files under a directory, depth-first, deterministic order. */
+function walkDtsFiles(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (current: string) => {
+    const entries = fs
+      .readdirSync(current, { withFileTypes: true })
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      const p = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(p);
+      else if (entry.name.endsWith('.d.ts')) out.push(p);
+    }
+  };
+  walk(dir);
+  return out;
 }

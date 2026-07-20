@@ -334,14 +334,17 @@ export interface ShutdownRequest extends BaseRequest {
 }
 
 /**
- * Request to resolve type definitions from bundled .d.ts content.
- * Returns both the original declaration and the compiler-expanded form.
+ * Request to resolve type definitions from a v2 capture stub package.
+ * Returns both the original declaration and the compiler-expanded form for
+ * each surface alias (design doc: `resolve_per_endpoint_definitions` is
+ * re-pointed at the surface tree, a strictly richer source than the old
+ * flattened bundle string).
  */
 export interface ResolveDefinitionsRequest extends BaseRequest {
   action: 'resolve_definitions';
-  /** The bundled .d.ts content to resolve aliases from */
-  bundled_dts: string;
-  /** Type alias names to resolve */
+  /** Absolute path to the capture stub dir (package.json + types/ tree). */
+  stub_dir: string;
+  /** Surface type alias names to resolve */
   aliases: string[];
 }
 

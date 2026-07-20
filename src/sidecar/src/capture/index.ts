@@ -41,7 +41,7 @@ import type {
   SelfCheckOutcome,
   SerializationTier,
 } from './api.js';
-import { resolveAnchor, type ResolvedAnchor } from './anchors.js';
+import { entryRelativeSpecifier, resolveAnchor, type ResolvedAnchor } from './anchors.js';
 import { findAugmentationFiles } from './augmentations.js';
 import { lockfileVersions } from './lockfile.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
@@ -374,7 +374,11 @@ function resolveAnchors(
   fs.writeFileSync(ctx.entryPath, placeholderLines.join('\n') + '\n');
   try {
     const anchorSources = [
-      ...new Set(opts.anchors.map((a) => path.join(ctx.repoRoot, a.source_file))),
+      ...new Set(
+        opts.anchors
+          .filter((a) => a.kind !== 'literal')
+          .map((a) => path.join(ctx.repoRoot, a.source_file))
+      ),
     ].filter((f) => fs.existsSync(f));
     const program = ts.createProgram([ctx.entryPath, ...anchorSources], {
       ...parsed.options,
@@ -387,11 +391,24 @@ function resolveAnchors(
         if (ts.isTypeAliasDeclaration(stmt)) placeholders.set(stmt.name.text, stmt);
       }
     }
+    // A literal anchor whose text is a bare identifier resolves through a
+    // sibling symbol anchor's module when one names the same symbol.
+    const siblingSymbolSpecs = new Map<string, string>();
+    for (const anchor of opts.anchors) {
+      if (anchor.kind !== 'symbol') continue;
+      if (!siblingSymbolSpecs.has(anchor.symbol_name)) {
+        siblingSymbolSpecs.set(
+          anchor.symbol_name,
+          entryRelativeSpecifier(ctx.entryDir, ctx.repoRoot, anchor.source_file)
+        );
+      }
+    }
     return opts.anchors.map((request) =>
       resolveAnchor(program, request, {
         repoRoot: ctx.repoRoot,
         entryDir: ctx.entryDir,
         placeholder: placeholders.get(request.alias),
+        siblingSymbolSpecs,
       })
     );
   } finally {
