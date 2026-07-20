@@ -141,6 +141,17 @@ async function captureFixture(
     `capture_v2 failed for ${fixture.id}: ${JSON.stringify(response.errors)}`,
   );
   assert.ok(response.result, `no result for ${fixture.id}`);
+  // Guard the fixture's installed-vs-bare state before any fidelity count is
+  // derived: a fixture that silently gains or loses node_modules shifts the
+  // self-check outcomes (bare -> allowlisted_external vs installed -> ok) and
+  // would otherwise be laundered into a "legitimate" baseline update. The
+  // capture result records this as bare_checkout.
+  assert.strictEqual(
+    response.result.bare_checkout,
+    fixture.bareExpected,
+    `${fixture.id}: bare_checkout drifted (expected ${fixture.bareExpected}, ` +
+      `got ${response.result.bare_checkout}) — the fixture gained or lost node_modules`,
+  );
   return response.result;
 }
 

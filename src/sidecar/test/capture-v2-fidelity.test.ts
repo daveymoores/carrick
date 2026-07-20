@@ -35,7 +35,9 @@ const UPDATE = process.env.UPDATE_FIDELITY_BASELINE === '1';
 
 describe('capture fidelity corpus (WP6)', () => {
   const client = new SidecarClient();
-  let outDir: string;
+  // Nullable: if before() throws before this is assigned, after() must not
+  // rmSync an undefined path and mask the original failure.
+  let outDir: string | undefined;
   let run: FidelityRun;
   let computed: string;
 
@@ -48,7 +50,7 @@ describe('capture fidelity corpus (WP6)', () => {
 
   after(async () => {
     await client.stop();
-    fs.rmSync(outDir, { recursive: true, force: true });
+    if (outDir) fs.rmSync(outDir, { recursive: true, force: true });
   });
 
   it('matches the checked-in fidelity baseline', () => {
@@ -73,6 +75,7 @@ describe('capture fidelity corpus (WP6)', () => {
   });
 
   it('is byte-stable across two runs', async () => {
+    assert.ok(outDir, 'outDir must be set by before()');
     const second = await runCaptureFidelity(client, outDir);
     assert.strictEqual(serializeBaseline(second.baseline), computed);
   });
