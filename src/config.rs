@@ -143,6 +143,9 @@ impl Config {
 }
 
 /// Creates a standard TypeScript configuration for type checking only
+/// RUNTIME-DEAD since the v2 re-point (WP3): the ts_check spawn that used
+/// this tsconfig is gone; deleted in WP4/WP8, same release.
+#[allow(dead_code)]
 pub fn create_standard_tsconfig() -> Value {
     serde_json::json!({
         "compilerOptions": {

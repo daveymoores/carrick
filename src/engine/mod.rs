@@ -43,6 +43,8 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 
+mod type_compat_v2;
+
 /// Current cache format version. Increment when FileAnalysisResult schema changes.
 /// 4: EndpointResult gained `emission_style` — pre-4 cached results would
 /// replay with `None` forever and never take the return-value/no-payload
@@ -143,7 +145,7 @@ pub async fn run_analysis_engine<T: CloudStorage>(
     storage: T,
     repo_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_analysis_engine_with_sidecar(storage, repo_path, None, false, None).await
+    run_analysis_engine_with_sidecar(storage, repo_path, None, false).await
 }
 
 /// Run analysis engine with optional sidecar for type extraction.
@@ -157,10 +159,8 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     no_cache: bool,
-    ts_check_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result =
-        run_analysis_engine_inner(&storage, repo_path, sidecar, no_cache, ts_check_dir).await;
+    let result = run_analysis_engine_inner(&storage, repo_path, sidecar, no_cache).await;
     upload_run_logs(&storage, repo_path).await;
     result
 }
@@ -170,7 +170,6 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
     no_cache: bool,
-    ts_check_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let should_upload = should_upload_data();
     debug!(upload = should_upload, "Running Carrick in CI mode");
@@ -420,7 +419,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
-        match build_cross_repo_analyzer(all_repo_data, current_services_data, ts_check_dir).await {
+        match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
             Ok(analyzer) => analyzer,
             Err(e) => {
                 // Cross-repo analysis (which is what runs ts_check) failed. Close
@@ -1199,8 +1198,8 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator.collect_pubsub_infer_requests(&merged_results, repo_path),
             );
 
-            // Type resolution via sidecar
-            resolve_types_if_available(
+            // Type resolution via sidecar (+ v2 capture stub for this service)
+            let stub_dir = resolve_types_if_available(
                 sidecar,
                 &file_orchestrator,
                 &merged_results,
@@ -1219,9 +1218,12 @@ async fn analyze_current_repo_incremental(
                 cloud_data.bundled_types = Some(updated);
             }
 
-            // Resolve per-endpoint definitions via compiler
-            if let Some(sidecar) = sidecar {
-                resolve_per_endpoint_definitions(sidecar, &mut cloud_data);
+            // Resolve per-endpoint definitions from the capture stub tree
+            if let (Some(sidecar), Some(stub_dir)) = (sidecar, stub_dir.as_deref()) {
+                resolve_per_endpoint_definitions(sidecar, &mut cloud_data, stub_dir);
+            }
+            if let Some(stub_dir) = stub_dir {
+                let _ = std::fs::remove_dir_all(&stub_dir);
             }
 
             return Ok(cloud_data);
@@ -2098,6 +2100,7 @@ fn build_cloud_data_from_mount_graph(
         cache_version: None,
         type_extraction_status: None,
         compat_verdicts: None,
+        capture_stub: None,
     }
 }
 
@@ -2153,6 +2156,9 @@ fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, serv
 
 /// Resolve types via sidecar if available (shared logic for full and incremental paths).
 #[allow(clippy::too_many_arguments)]
+/// Resolve types through the sidecar and run the v2 capture for this
+/// service. Returns the on-disk capture stub dir when capture succeeded (the
+/// definitions re-point reads from it; the caller owns cleanup).
 fn resolve_types_if_available(
     sidecar: Option<&TypeSidecar>,
     file_orchestrator: &FileOrchestrator,
@@ -2164,14 +2170,14 @@ fn resolve_types_if_available(
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     cloud_data: &mut CloudRepoData,
-) {
+) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
         cloud_data.type_extraction_status = Some(
             "type extraction skipped: sidecar unavailable (not found, failed to start, \
              or failed to initialize)"
                 .to_string(),
         );
-        return;
+        return None;
     };
 
     debug!("Starting sidecar type resolution");
@@ -2218,12 +2224,32 @@ fn resolve_types_if_available(
                                 .to_string(),
                         );
                     }
+
+                    // v2 capture ("tsc as the serializer"): derive anchors
+                    // from the SAME collected requests the bundle path used —
+                    // collect_type_requests is deterministic over the same
+                    // inputs, so the aliases are byte-identical to the
+                    // manifest join keys. The inference-resolved array depths
+                    // are applied exactly as resolve_all_types does (#306).
+                    run_capture_for_service(
+                        sidecar,
+                        file_orchestrator,
+                        file_results,
+                        repo_path,
+                        mount_graph,
+                        config,
+                        extra_explicit,
+                        extra_infer,
+                        &type_resolution,
+                        cloud_data,
+                    )
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
                     debug!("Continuing without bundled types");
                     cloud_data.type_extraction_status =
                         Some(format!("type resolution failed: {}", e));
+                    None
                 }
             }
         }
@@ -2232,6 +2258,62 @@ fn resolve_types_if_available(
             debug!("Skipping type resolution");
             cloud_data.type_extraction_status =
                 Some(format!("type extraction skipped: sidecar not ready: {}", e));
+            None
+        }
+    }
+}
+
+/// Derive capture anchors and run `capture_v2` for one service, storing the
+/// stub artifact on its `CloudRepoData`. Returns the on-disk stub dir for
+/// the definitions re-point (caller cleans it up). Non-fatal: a degraded
+/// capture leaves `capture_stub` unset — the service's cross-repo pairs then
+/// verdict unverifiable, never silently compatible.
+#[allow(clippy::too_many_arguments)]
+fn run_capture_for_service(
+    sidecar: &TypeSidecar,
+    file_orchestrator: &FileOrchestrator,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
+    mount_graph: &MountGraph,
+    config: &Config,
+    extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
+    extra_infer: &[crate::services::type_sidecar::InferRequestItem],
+    type_resolution: &TypeResolutionResult,
+    cloud_data: &mut CloudRepoData,
+) -> Option<PathBuf> {
+    let (mut explicit, mut infer, inline_aliases) =
+        file_orchestrator.collect_type_requests(file_results, repo_path, mount_graph, config);
+    explicit.extend_from_slice(extra_explicit);
+    infer.extend_from_slice(extra_infer);
+    let explicit = crate::services::type_sidecar::apply_inferred_array_depth(
+        &explicit,
+        &type_resolution.inferred_types,
+    );
+
+    let anchors =
+        type_compat_v2::derive_capture_anchors(&explicit, &infer, &inline_aliases, repo_path);
+    if anchors.is_empty() {
+        return None;
+    }
+
+    let service_id = cloud_data
+        .service_name
+        .clone()
+        .unwrap_or_else(|| cloud_data.repo_name.clone());
+    match type_compat_v2::run_capture(sidecar, repo_path, &service_id, &anchors) {
+        Some((stub_dir, artifact)) => {
+            cloud_data.capture_stub = Some(artifact);
+            Some(stub_dir)
+        }
+        None => {
+            if cloud_data.type_extraction_status.is_none() {
+                cloud_data.type_extraction_status = Some(
+                    "v2 type capture degraded: no stub package was produced; cross-repo \
+                     type compatibility for this service will report unverifiable"
+                        .to_string(),
+                );
+            }
+            None
         }
     }
 }
@@ -2415,13 +2497,14 @@ fn load_packages_for_service(
     Ok(packages)
 }
 
-/// Resolve per-endpoint type definitions using the sidecar's compiler.
+/// Resolve per-endpoint type definitions from the v2 capture stub tree.
 /// Populates `resolved_definition` and `expanded_definition` on each manifest entry.
 /// Non-fatal: if resolution fails, entries keep their None values and the MCP falls back to regex.
-fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut CloudRepoData) {
-    let Some(ref bundled_types) = cloud_data.bundled_types else {
-        return;
-    };
+fn resolve_per_endpoint_definitions(
+    sidecar: &TypeSidecar,
+    cloud_data: &mut CloudRepoData,
+    stub_dir: &Path,
+) {
     let Some(ref mut manifest) = cloud_data.type_manifest else {
         return;
     };
@@ -2444,7 +2527,7 @@ fn resolve_per_endpoint_definitions(sidecar: &TypeSidecar, cloud_data: &mut Clou
         aliases.len()
     );
 
-    match sidecar.resolve_definitions(bundled_types, &aliases) {
+    match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
         Ok(resolved) => {
             let lookup: std::collections::HashMap<String, _> = resolved
                 .into_iter()
@@ -2992,7 +3075,7 @@ async fn analyze_current_repo(
         file_orchestrator.collect_pubsub_infer_requests(&analysis_result.file_results, repo_path),
     );
 
-    resolve_types_if_available(
+    let stub_dir = resolve_types_if_available(
         sidecar,
         &file_orchestrator,
         &analysis_result.file_results,
@@ -3010,9 +3093,12 @@ async fn analyze_current_repo(
         cloud_data.bundled_types = Some(updated);
     }
 
-    // 6b. Resolve per-endpoint definitions via compiler
-    if let Some(sidecar) = sidecar {
-        resolve_per_endpoint_definitions(sidecar, &mut cloud_data);
+    // 6b. Resolve per-endpoint definitions from the capture stub tree
+    if let (Some(sidecar), Some(stub_dir)) = (sidecar, stub_dir.as_deref()) {
+        resolve_per_endpoint_definitions(sidecar, &mut cloud_data, stub_dir);
+    }
+    if let Some(stub_dir) = &stub_dir {
+        let _ = std::fs::remove_dir_all(stub_dir);
     }
 
     // 7. Populate cache fields for future incremental runs
@@ -3033,14 +3119,14 @@ async fn analyze_current_repo(
 async fn build_cross_repo_analyzer(
     mut all_repo_data: Vec<CloudRepoData>,
     current_repos: Vec<CloudRepoData>,
-    ts_check_dir: Option<&std::path::Path>,
+    sidecar: Option<&TypeSidecar>,
 ) -> Result<Analyzer, Box<dyn std::error::Error>> {
     // Add the freshly-analyzed local services (one per service) to the mix
     all_repo_data.extend(current_repos);
-    // 1. Merge configs and packages using generic function
+    // 1. Merge configs using generic function. (The v1 merged-packages value
+    //    fed only the deleted ts_check install; the v2 check workspace pins
+    //    each stub's own deps instead.)
     let combined_config = merge_serialized_data(&all_repo_data, |data| data.config_json.as_ref())?;
-    let combined_packages =
-        merge_serialized_data(&all_repo_data, |data| data.package_json.as_ref())?;
 
     // 2. Build analyzer using shared logic (skip type resolution for cross-repo)
     let cm: Lrc<SourceMap> = Default::default();
@@ -3065,19 +3151,26 @@ async fn build_cross_repo_analyzer(
         }
     }
 
-    // 5. Recreate type files from S3 and run type checking
-    if let Some(ts_check_dir) = ts_check_dir {
-        analyzer.set_ts_check_dir(ts_check_dir.to_path_buf());
-        recreate_type_files_and_check(&all_repo_data, &combined_packages, ts_check_dir)?;
+    // 5. Merged manifests power the alias -> display-name map for findings.
+    let merged_manifests: Vec<TypeManifestEntry> = all_repo_data
+        .iter()
+        .filter_map(|repo| repo.type_manifest.as_ref())
+        .flat_map(|entries| entries.iter().cloned())
+        .collect();
+    analyzer.set_type_manifests(merged_manifests);
 
-        // 6. Run final type checking
-        if let Err(e) = analyzer.run_final_type_checking() {
-            warn!("Type checking failed: {}", e);
-        }
+    // 6. Run the v2 type check (capture stubs -> synthetic workspace -> tsc
+    //    probes) and store the structured pair outcomes for the verdict
+    //    overlay. Without a sidecar, compat is NOT evaluated: outcomes stay
+    //    unset and every edge keeps `type_compatible: None` — the harness
+    //    greps for this exact "Skipping type checking" trap (§7).
+    if let Some(sidecar) = sidecar {
+        let outcomes = type_compat_v2::run_check(sidecar, &all_repo_data);
+        analyzer.set_pair_outcomes(outcomes);
     } else {
         warn!(
-            "Skipping type checking: ts_check/ directory was not found adjacent to the \
-             carrick binary. Expected at <exe_dir>/ts_check or <exe_dir>/../lib/ts_check."
+            "Skipping type checking: the type sidecar is unavailable, so v2 \
+             capture/check cannot run. Compat verdicts will be absent, not 'compatible'."
         );
     }
 
@@ -3104,6 +3197,8 @@ async fn build_cross_repo_analyzer(
 /// file per service is exactly what it needs. Collisions (two services resolving
 /// to the same base stem, e.g. both missing a `service_name`) are suffixed so no
 /// write clobbers a prior one.
+/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
+#[allow(dead_code)]
 fn bundle_file_stems(all_repo_data: &[CloudRepoData]) -> Vec<String> {
     let mut used_stems: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     all_repo_data
@@ -3135,6 +3230,8 @@ fn bundle_file_stems(all_repo_data: &[CloudRepoData]) -> Vec<String> {
 /// and silently dropping a whole service's producer types. ts_check loads every
 /// `*.d.ts` in `output_dir`, so the cross-file `Endpoint_<hash>` aliases still
 /// resolve regardless of which service-file each lives in.
+/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
+#[allow(dead_code)]
 fn write_bundle_files(all_repo_data: &[CloudRepoData], output_dir: &std::path::Path) {
     let stems = bundle_file_stems(all_repo_data);
     for (repo_data, stem) in all_repo_data.iter().zip(stems) {
@@ -3160,6 +3257,13 @@ fn write_bundle_files(all_repo_data: &[CloudRepoData], output_dir: &std::path::P
 
 // End-to-end flow and failure modes of manifest-based cross-repo type
 // checking: docs/reference/type-checking-flow.md
+//
+// RUNTIME-DEAD since the v2 re-point (WP3): the check path is capture_v2 ->
+// check_v2 through the sidecar stdio seam; nothing calls this chain anymore.
+// The bodies (and the string-decay compensations they carry: the merged
+// package.json install, the missing-alias padding at check time) are deleted
+// in WP4/WP8, same release.
+#[allow(dead_code)]
 fn recreate_type_files_and_check(
     all_repo_data: &[CloudRepoData],
     packages: &Packages,
@@ -3194,6 +3298,8 @@ fn recreate_type_files_and_check(
     Ok(())
 }
 
+/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
+#[allow(dead_code)]
 fn write_manifest_files(
     all_repo_data: &[CloudRepoData],
     output_dir: &std::path::Path,
@@ -3464,6 +3570,8 @@ fn synthetic_type_check_dependencies(
 /// third-party package — its types arrive via that service's sidecar `.d.ts`
 /// bundle, so the npm copy is redundant, and (an org's own unpublished
 /// workspace package) often ETARGETs, which used to abort the whole type pass.
+/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
+#[allow(dead_code)]
 fn corpus_internal_package_names(
     all_repo_data: &[CloudRepoData],
 ) -> std::collections::HashSet<String> {
@@ -3677,6 +3785,8 @@ fn install_type_check_dependencies(
 }
 
 /// Recreate package.json and tsconfig.json in the output directory
+/// RUNTIME-DEAD since the v2 re-point (WP3); deleted in WP4/WP8.
+#[allow(dead_code)]
 fn recreate_package_and_tsconfig(
     output_dir: &std::path::Path,
     packages: &Packages,
@@ -4081,6 +4191,7 @@ mod tests {
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }
     }
 
@@ -4309,6 +4420,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -4350,6 +4462,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }];
 
         // Test Config merging
@@ -4428,6 +4541,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -5020,6 +5134,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -5064,6 +5179,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -5111,6 +5227,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -5310,6 +5427,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -5382,6 +5500,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -7553,6 +7672,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         // Local mirror of TypeManifestFile for reading back the written JSON
@@ -7720,6 +7840,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         };
 
         #[derive(serde::Deserialize)]
@@ -7800,6 +7921,7 @@ npm error peer typescript@\">=4.2\" from ts-node@10.9.2
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }
     }
 

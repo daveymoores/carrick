@@ -5,7 +5,7 @@ use swc_ecma_ast::TsTypeAnn;
 
 use crate::{
     app_context::AppContext,
-    config::{Config, create_standard_tsconfig},
+    config::Config,
     extractor::CoreExtractor,
     findings::{Finding, PackageVersionRef, tier},
     mount_graph::MountGraph,
@@ -258,6 +258,11 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// RUNTIME-DEAD since the v2 re-point (WP3): the verdict join now consumes
+/// structured [`PairCheckOutcome`]s and never re-parses a label. This is one
+/// of the seven string-decay compensations; its deletion (with tests proving
+/// the v2 path covers the case) is WP4, same release.
+///
 /// Parse a ts_check compat `endpoint` string back into the verdict-join
 /// `(pseudo-method, identity)` pair. ts_check builds the string as
 /// `"<METHOD> <path> (<request|response>)"` for HTTP,
@@ -269,6 +274,7 @@ pub fn filter_graphql_libraries(data_fetchers: &[String]) -> Vec<String> {
 /// edge's `producer_key`. The pub/sub topic carries no path params (and no
 /// nested `|`), so the generic split needs no protocol-specific arm. Returns
 /// `None` for an unrecognized shape.
+#[allow(dead_code)]
 fn parse_compat_endpoint(endpoint: &str) -> Option<(String, String)> {
     let (method, rest) = endpoint.split_once(' ')?;
     // Drop the trailing " (request)" / " (response)" annotation if present.
@@ -374,76 +380,64 @@ fn normalize_compat_path(path: &str) -> String {
         .join("/")
 }
 
-/// Map ts_check's compatibility `result` onto each cross-repo edge's
-/// `type_compatible`, keyed per consumer (#260) and param-name-agnostic on the
-/// path ([`normalize_compat_path`]). Pure over `(result, matches)` so the
-/// verdict join is unit-testable without spawning ts_check.
-fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMatch]) {
-    // The per-pair verdict key: producer `(METHOD, normalized path)` plus the
-    // consumer identity `(path, line)` recovered from `consumerLocation`.
+/// Map the structured v2 pair outcomes onto each cross-repo edge's
+/// `type_compatible`, keyed per consumer (#260) and param-name-agnostic on
+/// the path ([`normalize_compat_path`]). Pure over `(outcomes, matches)` so
+/// the verdict join is unit-testable without running the checker.
+///
+/// Verdict precedence per edge key (multiple type_kinds collapse):
+/// incompatible > unverifiable/gate-caught > compatible. An edge whose key
+/// produced NO pair outcome stays `None` — compat was never evaluated for
+/// it, and the old optimistic `Some(true)` default is gone: `Some(true)` now
+/// requires an explicit compatible verdict.
+fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [CrossRepoMatch]) {
+    // The per-pair verdict key: producer `(METHOD, normalized identity)` plus
+    // the consumer call-site identity `(file, line)`.
     type VerdictKey = (String, String, (String, u32));
 
-    // Map verdict key → mismatch reason. Multiple type_kinds for one pair
-    // collapse to the first reason seen — the edge only records incompatibility.
     let mut incompatible: HashMap<VerdictKey, String> = HashMap::new();
-    if let Some(mismatch_list) = result.get("mismatches").and_then(|m| m.as_array()) {
-        for mismatch in mismatch_list {
-            let Some(endpoint) = mismatch.get("endpoint").and_then(|e| e.as_str()) else {
-                continue;
-            };
-            let Some((method, path)) = parse_compat_endpoint(endpoint) else {
-                continue;
-            };
-            let Some(consumer) = mismatch
-                .get("consumerLocation")
-                .and_then(|c| c.as_str())
-                .map(consumer_identity)
-            else {
-                continue;
-            };
-            let reason = mismatch
-                .get("error")
-                .and_then(|e| e.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("producer and consumer types are incompatible")
-                .to_string();
-            incompatible
-                .entry((method, normalize_compat_path(&path), consumer))
-                .or_insert(reason);
-        }
-    }
-
-    // Pairs ts_check matched but could not verify (a side resolved to
-    // `any`/`unknown`). The compat verdict is genuinely unknown for these edges —
-    // leaving the optimistic `Some(true)` default would assert a compatibility
-    // ts_check never established.
     let mut unverifiable: HashSet<VerdictKey> = HashSet::new();
-    if let Some(unknown_list) = result.get("unknownPairs").and_then(|u| u.as_array()) {
-        for pair in unknown_list {
-            let Some(endpoint) = pair.get("endpoint").and_then(|e| e.as_str()) else {
-                continue;
-            };
-            let Some((method, path)) = parse_compat_endpoint(endpoint) else {
-                continue;
-            };
-            let Some(consumer) = pair
-                .get("consumerLocation")
-                .and_then(|c| c.as_str())
-                .map(consumer_identity)
-            else {
-                continue;
-            };
-            unverifiable.insert((method, normalize_compat_path(&path), consumer));
+    let mut compatible: HashSet<VerdictKey> = HashSet::new();
+    for outcome in outcomes {
+        let line = if outcome.consumer_line == 0 {
+            1
+        } else {
+            outcome.consumer_line
+        };
+        let key = (
+            outcome.pseudo_method.clone(),
+            normalize_compat_path(&outcome.identity),
+            (outcome.consumer_file.clone(), line),
+        );
+        match outcome.bucket {
+            crate::services::type_sidecar::VerdictBucket::Incompatible => {
+                // Multiple type_kinds for one pair collapse to the first
+                // reason in outcome order (sorted by pair_key upstream).
+                incompatible.entry(key).or_insert_with(|| {
+                    outcome
+                        .diagnostic
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| {
+                            "producer and consumer types are incompatible".to_string()
+                        })
+                });
+            }
+            crate::services::type_sidecar::VerdictBucket::Unverifiable
+            | crate::services::type_sidecar::VerdictBucket::GateCaughtBakedAny => {
+                unverifiable.insert(key);
+            }
+            crate::services::type_sidecar::VerdictBucket::Compatible => {
+                compatible.insert(key);
+            }
         }
     }
 
     for edge in matches.iter_mut() {
         // A shared-external-contract edge has no producer contract to verify:
-        // both sides are call sites, so any ts_check comparison keyed on the
-        // same (method, path, consumer) would be request-vs-request — and the
-        // optimistic `Some(true)` fallback below would otherwise fabricate a
-        // "compatible" verdict for a check that never ran. These edges are
-        // verdict-exempt: `type_compatible` stays `None` (#379), and the
+        // both sides are call sites, so any comparison keyed on the same
+        // (method, path, consumer) would be request-vs-request. These edges
+        // are verdict-exempt: `type_compatible` stays `None` (#379), and the
         // reason is cleared with it — `mismatch_reason` is only ever present
         // alongside `type_compatible == Some(false)`.
         if edge.relationship != carrick_match::MatchRelationship::ProducerConsumer {
@@ -451,12 +445,10 @@ fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMat
             edge.mismatch_reason = None;
             continue;
         }
-        // Recover the join key from the producer_key. ts_check type-checks HTTP
-        // (`http|METHOD|path`), socket (`socket|DIRECTION|event`), and graphql
-        // (`graphql|KIND|field`), so all three join here. A key for any other
-        // protocol is not checked by ts_check, so its verdict is genuinely
-        // unknown — leave it `None` rather than fabricate `Some(true)`
-        // (#260, part 2).
+        // Recover the join key from the producer_key: HTTP, socket, graphql,
+        // and pubsub all join here. Any other protocol was never checked, so
+        // its verdict is genuinely unknown — leave it `None` rather than
+        // fabricate `Some(true)` (#260, part 2).
         let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
             edge.type_compatible = None;
             continue;
@@ -475,8 +467,12 @@ fn apply_compat_verdicts(result: &serde_json::Value, matches: &mut [CrossRepoMat
         } else if unverifiable.contains(&key) {
             // Matched but unverifiable — compat undetermined, NOT compatible.
             edge.type_compatible = None;
-        } else {
+        } else if compatible.contains(&key) {
             edge.type_compatible = Some(true);
+        } else {
+            // No pair outcome reached this edge: compat was not evaluated
+            // for it. `None`, never a fabricated `Some(true)`.
+            edge.type_compatible = None;
         }
     }
 }
@@ -766,7 +762,49 @@ pub struct Analyzer {
     detected_frameworks: Vec<String>,
     detected_data_fetchers: Vec<String>,
     mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
-    ts_check_dir: Option<PathBuf>,   // Resolved ts_check/ directory; set by the CLI entry point
+    /// Structured v2 check outcomes, one per matched manifest pair, set by
+    /// the engine after `check_v2` runs. `None` = type compat was NOT
+    /// evaluated this run (load-bearing: every edge stays `None`, and the
+    /// scorer must never read absent compat data as "compatible").
+    pair_outcomes: Option<Vec<PairCheckOutcome>>,
+    /// Merged manifest entries across every participating repo, for the
+    /// alias -> display-name map the findings projection uses.
+    type_manifests: Vec<crate::cloud_storage::TypeManifestEntry>,
+}
+
+/// One structured type-compat outcome for a matched (producer, consumer,
+/// type_kind) manifest pair — the v2 replacement for ts_check's label-keyed
+/// verdict JSON. Carries the full join identity, so the overlay matches an
+/// edge by `(pseudo_method, normalized identity, consumer location)` without
+/// re-parsing any human-readable string.
+#[derive(Clone, Debug)]
+pub struct PairCheckOutcome {
+    /// Stable pair key (`<producer_service>/<producer_alias>~<consumer_service>/<consumer_alias>`).
+    pub pair_key: String,
+    /// `GET`/`POST`/... for HTTP; `SOCKET`/`GRAPHQL`/`PUBSUB` otherwise —
+    /// exactly what `parse_producer_key` recovers from an edge.
+    pub pseudo_method: String,
+    /// Producer path (HTTP) or exact operation-key tail (other protocols).
+    pub identity: String,
+    /// Consumer call-site file, as recorded on the manifest entry.
+    pub consumer_file: String,
+    pub consumer_line: u32,
+    /// Kept on the outcome for the WP4 structured-findings swap and the
+    /// integration tests; the edge join collapses kinds deliberately.
+    #[allow(dead_code)]
+    pub type_kind: crate::cloud_storage::ManifestTypeKind,
+    pub bucket: crate::services::type_sidecar::VerdictBucket,
+    /// For gate buckets: which side and which gate fired.
+    #[allow(dead_code)]
+    pub gate: Option<String>,
+    /// Scrubbed compiler diagnostic or synthesized reason.
+    pub diagnostic: Option<String>,
+    pub producer_alias: String,
+    pub consumer_alias: String,
+    #[allow(dead_code)]
+    pub producer_service: String,
+    #[allow(dead_code)]
+    pub consumer_service: String,
 }
 
 impl CoreExtractor for Analyzer {
@@ -792,7 +830,8 @@ impl Analyzer {
             detected_frameworks: Vec::new(),
             detected_data_fetchers: Vec::new(),
             mount_graph: None,
-            ts_check_dir: None,
+            pair_outcomes: None,
+            type_manifests: Vec::new(),
         }
     }
 
@@ -801,15 +840,15 @@ impl Analyzer {
         self.mount_graph = Some(mount_graph);
     }
 
-    /// Set the resolved ts_check/ directory. The CLI entry point discovers this
-    /// via `discover_ts_check_path`; tests and callers that don't need type
-    /// checking can leave it unset.
-    pub fn set_ts_check_dir(&mut self, ts_check_dir: PathBuf) {
-        self.ts_check_dir = Some(ts_check_dir);
+    /// Store the structured v2 check outcomes for this run. Not calling this
+    /// leaves compat unevaluated: every edge keeps `type_compatible: None`.
+    pub fn set_pair_outcomes(&mut self, outcomes: Vec<PairCheckOutcome>) {
+        self.pair_outcomes = Some(outcomes);
     }
 
-    fn ts_check_output_dir(&self) -> Option<PathBuf> {
-        self.ts_check_dir.as_ref().map(|d| d.join("output"))
+    /// Store the merged manifest entries (all repos) for display-name mapping.
+    pub fn set_type_manifests(&mut self, entries: Vec<crate::cloud_storage::TypeManifestEntry>) {
+        self.type_manifests = entries;
     }
 
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
@@ -2272,104 +2311,6 @@ impl Analyzer {
         self.endpoint_router = Some(router);
     }
 
-    pub fn check_type_compatibility(&self) -> Result<serde_json::Value, String> {
-        use std::fs;
-
-        let output_dir = self.ts_check_output_dir().ok_or_else(|| {
-            "ts_check/ directory was not discovered. Ensure the carrick install \
-             includes ts_check/ adjacent to the binary."
-                .to_string()
-        })?;
-
-        // Ensure the output directory exists
-        if !output_dir.exists() {
-            return Err(format!(
-                "Output directory {} does not exist",
-                output_dir.display()
-            ));
-        }
-
-        // Check for type-check-results.json file created by the integrated type checker
-        let results_file = output_dir.join("type-check-results.json");
-
-        if !results_file.exists() {
-            return Err("Type check results file not found. Type checking may have failed during extraction.".to_string());
-        }
-
-        // Read the type check results
-        let contents = fs::read_to_string(results_file)
-            .map_err(|e| format!("Failed to read type check results: {}", e))?;
-
-        // Parse the JSON output
-        let result: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
-            format!(
-                "Failed to parse type checking result: {}. Raw content: '{}'",
-                e, contents
-            )
-        })?;
-
-        // Check for error in the result
-        if let Some(error) = result.get("error") {
-            return Err(format!("Type checking failed: {}", error));
-        }
-
-        // Transform result to match expected format
-        self.transform_type_check_result(result)
-    }
-
-    fn transform_type_check_result(
-        &self,
-        result: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let mismatches = result.get("mismatches")
-            .and_then(|m| m.as_array())
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|mismatch| {
-                // `consumerLocation` is the per-consumer join key the overlay
-                // needs to attribute this verdict to a single (producer, consumer)
-                // edge rather than smearing it across all consumers (#260) — it
-                // must survive this transform.
-                serde_json::json!({
-                    "endpoint": mismatch.get("endpoint").unwrap_or(&serde_json::Value::Null),
-                    "producerType": mismatch.get("producerType").unwrap_or(&serde_json::Value::Null),
-                    "consumerType": mismatch.get("consumerType").unwrap_or(&serde_json::Value::Null),
-                    "producerLocation": mismatch.get("producerLocation").unwrap_or(&serde_json::Value::Null),
-                    "consumerLocation": mismatch.get("consumerLocation").unwrap_or(&serde_json::Value::Null),
-                    "error": mismatch.get("error").unwrap_or(&serde_json::Value::Null)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // Edges ts_check matched but could not verify — a side resolved to
-        // `any`/`unknown` (e.g. the type never reached the bundled .d.ts). These
-        // are NOT compatible; they are unverifiable, and the overlay must leave
-        // their verdict `None` rather than optimistically claiming `Some(true)`.
-        let unknown_pairs = result
-            .get("unknownPairs")
-            .and_then(|u| u.as_array())
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|pair| {
-                // Carry `consumerLocation` for the same per-consumer keying (#260).
-                serde_json::json!({
-                    "endpoint": pair.get("endpoint").unwrap_or(&serde_json::Value::Null),
-                    "producerLocation": pair.get("producerLocation").unwrap_or(&serde_json::Value::Null),
-                    "consumerLocation": pair.get("consumerLocation").unwrap_or(&serde_json::Value::Null),
-                    "reason": pair.get("reason").unwrap_or(&serde_json::Value::Null)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok(serde_json::json!({
-            "mismatches": mismatches,
-            "unknownPairs": unknown_pairs,
-            "totalChecked": result.get("totalChecked").unwrap_or(&serde_json::Value::Number(serde_json::Number::from(0))),
-            "compatiblePairs": result.get("compatibleCount").unwrap_or(&serde_json::Value::Number(serde_json::Number::from(0))),
-            "incompatiblePairs": mismatches.len()
-        }))
-    }
-
     pub fn get_results(&self) -> ApiAnalysisResult {
         // Framework-agnostic analysis using mount graph (required)
         let mount_graph = self.mount_graph.as_ref()
@@ -2464,255 +2405,96 @@ impl Analyzer {
     }
 
     /// Overlay the type-compatibility verdict onto each captured cross-repo
-    /// edge, keyed by the producer's `(METHOD, full_path)` AND the consumer's
+    /// edge, keyed by the producer's `(METHOD, identity)` AND the consumer's
     /// source location — so each `(producer, consumer)` pair gets ITS OWN
-    /// verdict.
+    /// verdict (#260).
     ///
-    /// ts_check emits one mismatch/unknownPair entry per matched producer↔
-    /// consumer pair, each carrying `consumerLocation` (`"<file>:<line>"`). Keying
-    /// only on the producer `(METHOD, path)` collapsed all consumers of a producer
-    /// into one verdict: when one producer had ≥2 consumers of differing
-    /// compatibility, the first verdict smeared onto every edge (#260 — the
-    /// flagship false-negative). The key now includes the consumer identity
-    /// (`parse_file_location(consumerLocation)`), which the edge mirrors in
-    /// `consumer_location` (both derive from the same call `file_location`).
-    ///
-    /// If `check_type_compatibility` returns `Err`, type checking did not run
-    /// (or failed) for this scan: every edge keeps `type_compatible: None`
-    /// (load-bearing — see [`CrossRepoMatch`]). On `Ok`, an edge whose
-    /// `(producer, consumer)` pair appears in the mismatch set gets `Some(false)`
-    /// with the reason. A pair ts_check matched but could NOT verify (a side
-    /// resolved to `any`/`unknown`, e.g. the type never reached the bundled
-    /// `.d.ts`) keeps `None` — unverifiable, not compatible. Everything else
-    /// (genuinely checked and compatible) gets `Some(true)`.
+    /// When no pair outcomes were stored (the engine never ran `check_v2` —
+    /// sidecar unavailable, or the run failed before checking), every edge
+    /// keeps `type_compatible: None` (load-bearing — see [`CrossRepoMatch`]).
     fn overlay_compat_verdicts(&self, matches: &mut [CrossRepoMatch]) {
-        let result = match self.check_type_compatibility() {
-            Ok(result) => result,
+        let Some(outcomes) = self.pair_outcomes.as_ref() else {
             // Compat was not evaluated for this run — leave every edge `None`.
-            Err(_) => return,
+            return;
         };
-        apply_compat_verdicts(&result, matches);
+        apply_pair_outcomes(outcomes, matches);
     }
 
-    pub fn run_final_type_checking(&self) -> Result<(), String> {
-        use std::fs;
-        use std::process::Command;
-
-        // Resolve the ts_check/ directory (discovered at CLI entry time).
-        let ts_check_dir = self.ts_check_dir.as_ref().ok_or_else(|| {
-            "ts_check/ directory was not discovered. The carrick binary could not \
-             locate ts_check/run-type-checking.ts adjacent to itself. Expected \
-             layouts: <exe_dir>/ts_check, <exe_dir>/../ts_check, or \
-             <exe_dir>/../lib/ts_check. This usually means the install is incomplete."
-                .to_string()
-        })?;
-
-        let script_path = ts_check_dir.join("run-type-checking.ts");
-        if !script_path.exists() {
-            return Err(format!(
-                "Type checking script not found at {}. Expected a complete ts_check/ \
-                 directory adjacent to the carrick binary.",
-                script_path.display()
-            ));
-        }
-
-        // Create minimal tsconfig.json in output directory
-        let output_dir = ts_check_dir.join("output");
-        fs::create_dir_all(&output_dir)
-            .map_err(|e| format!("Failed to create output directory: {}", e))?;
-
-        // Check if there are any bundled .d.ts files to check
-        let type_files: Vec<_> = fs::read_dir(&output_dir)
-            .map_err(|e| format!("Failed to read output directory: {}", e))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().ends_with(".d.ts"))
-            })
-            .collect();
-
-        if type_files.is_empty() {
-            debug!(
-                "No bundled .d.ts files found in {} - skipping type checking",
-                output_dir.display()
-            );
-            debug!("   This may happen if:");
-            debug!("   - Source code lacks explicit TypeScript type annotations");
-            debug!("   - Type extraction agents couldn't identify response/request types");
-            debug!("   - This is the first run and no cross-repo data exists yet");
-            debug!("   Type checking will work when type annotations are present in the source.");
-            return Ok(());
-        }
-
-        debug!(
-            "Found {} type file(s) to check: {:?}",
-            type_files.len(),
-            type_files.iter().map(|f| f.file_name()).collect::<Vec<_>>()
-        );
-
-        let tsconfig_path = output_dir.join("tsconfig.json");
-        let tsconfig_content = create_standard_tsconfig();
-
-        fs::write(
-            &tsconfig_path,
-            serde_json::to_string_pretty(&tsconfig_content).unwrap(),
-        )
-        .map_err(|e| format!("Failed to create tsconfig.json: {}", e))?;
-
-        let producer_manifest = output_dir.join("producer-manifest.json");
-        let consumer_manifest = output_dir.join("consumer-manifest.json");
-
-        if !producer_manifest.exists() || !consumer_manifest.exists() {
-            return Err(format!(
-                "Producer/consumer manifest files not found in {}",
-                output_dir.display()
-            ));
-        }
-
-        // Run the type checking script with the minimal tsconfig.
-        //
-        // - `current_dir(ts_check_dir)`: resolve `npx ts-node` against
-        //   `ts_check/node_modules/.bin` instead of letting npx download a
-        //   transient ts-node that can't see ts-morph / @types/node and fails to
-        //   compile (the #226 root cause: ts_check deps weren't installed, so the
-        //   checker never ran and every verdict stayed None).
-        // - `-o <output_dir>` (absolute): the script otherwise defaults its
-        //   output to the CWD-relative `ts_check/output`, which need not coincide
-        //   with the discovered, absolute output dir this analyzer reads back from
-        //   in `check_type_compatibility`. Pin it so the results file always lands
-        //   where the verdict overlay looks for it.
-        let output = Command::new("npx")
-            .current_dir(ts_check_dir)
-            .arg("ts-node")
-            .arg(&script_path)
-            .arg(&tsconfig_path)
-            .arg("--producer")
-            .arg(&producer_manifest)
-            .arg("--consumer")
-            .arg(&consumer_manifest)
-            .arg("--types-dir")
-            .arg(&output_dir)
-            .arg("-o")
-            .arg(&output_dir)
-            .output()
-            .map_err(|e| format!("Failed to run type checking: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Log type checking output at debug level
-        if !stdout.trim().is_empty() {
-            for line in stdout.lines() {
-                debug!("{}", line);
-            }
-        }
-        if !stderr.trim().is_empty() && !output.status.success() {
-            for line in stderr.lines() {
-                debug!("{}", line);
-            }
-        }
-
-        if !output.status.success() {
-            // Surface a stderr tail in the error: a bare exit code hides the
-            // common failure mode (ts-node can't resolve ts_check deps), which is
-            // exactly what made #226 opaque. The caller only `warn!`s this, so the
-            // detail must travel with the message.
-            let tail: String = stderr.lines().rev().take(8).collect::<Vec<_>>().join(" | ");
-            return Err(format!(
-                "Type checking script failed with exit code: {:?}. stderr tail: {}",
-                output.status.code(),
-                tail
-            ));
-        }
-
-        Ok(())
-    }
-
+    /// Alias -> human display name (`GET /users → Response`) from the merged
+    /// manifests, for scrubbing synthetic `Endpoint_<hash>` names out of
+    /// user-facing type/error strings.
     fn build_display_name_map(&self) -> HashMap<String, String> {
-        use std::fs;
-
         let mut map = HashMap::new();
-        let Some(output_dir) = self.ts_check_output_dir() else {
-            return map;
-        };
-
-        for manifest_path in &[
-            output_dir.join("producer-manifest.json"),
-            output_dir.join("consumer-manifest.json"),
-        ] {
-            let Ok(contents) = fs::read_to_string(manifest_path) else {
-                continue;
+        for entry in &self.type_manifests {
+            let type_kind = match entry.type_kind {
+                crate::cloud_storage::ManifestTypeKind::Request => "request",
+                crate::cloud_storage::ManifestTypeKind::Response => "response",
             };
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) else {
-                continue;
-            };
-            let Some(entries) = parsed.get("entries").and_then(|e| e.as_array()) else {
-                continue;
-            };
-            for entry in entries {
-                let Ok(entry) = serde_json::from_value::<crate::cloud_storage::TypeManifestEntry>(
-                    entry.clone(),
-                ) else {
-                    continue;
-                };
-                let type_kind = match entry.type_kind {
-                    crate::cloud_storage::ManifestTypeKind::Request => "request",
-                    crate::cloud_storage::ManifestTypeKind::Response => "response",
-                };
-                let display = crate::type_manifest::build_display_name(&entry.key, type_kind);
-                map.insert(entry.type_alias.clone(), display);
-            }
+            let display = crate::type_manifest::build_display_name(&entry.key, type_kind);
+            map.insert(entry.type_alias.clone(), display);
         }
-
         map
     }
 
-    /// Project ts_check's mismatch list into typed [`Finding::TypeMismatch`]s.
-    /// Returns empty when compat was not evaluated for this run (ts_check_dir
-    /// absent, results file missing, or type checking failed).
+    /// Project the incompatible v2 pair outcomes into typed
+    /// [`Finding::TypeMismatch`]s. Returns empty when compat was not
+    /// evaluated for this run. The producer/consumer type labels come from
+    /// the manifest entries (real anchor symbol, else the expanded
+    /// definition, else the display name); the detail is the scrubbed
+    /// compiler diagnostic.
     fn get_type_mismatch_findings(&self) -> Vec<Finding> {
-        let Ok(result) = self.check_type_compatibility() else {
+        let Some(outcomes) = self.pair_outcomes.as_ref() else {
             return Vec::new();
         };
         let display_names = self.build_display_name_map();
-        let Some(mismatches) = result.get("mismatches").and_then(|m| m.as_array()) else {
-            return Vec::new();
-        };
-        mismatches
+        let manifest_by_alias: HashMap<&str, &crate::cloud_storage::TypeManifestEntry> = self
+            .type_manifests
             .iter()
-            .filter_map(|mismatch| {
-                let endpoint = mismatch.get("endpoint")?.as_str()?;
-                let producer = mismatch.get("producerType")?.as_str()?;
-                let consumer = mismatch.get("consumerType")?.as_str()?;
-                let error = mismatch.get("error")?.as_str()?;
-                // "GET /users (response)" → ("GET", "/users"); socket/graphql
-                // labels reduce the same way ("SOCKET", "DIRECTION|event").
-                let (method, path) = parse_compat_endpoint(endpoint)
-                    .unwrap_or_else(|| ("UNKNOWN".to_string(), endpoint.to_string()));
+            .map(|e| (e.type_alias.as_str(), e))
+            .collect();
+        let type_label = |alias: &str| -> String {
+            if let Some(entry) = manifest_by_alias.get(alias) {
+                if let Some(symbol) = entry.primary_type_symbol.as_deref() {
+                    return symbol.to_string();
+                }
+                if let Some(expanded) = entry.expanded_definition.as_deref() {
+                    return expanded.to_string();
+                }
+            }
+            display_names
+                .get(alias)
+                .cloned()
+                .unwrap_or_else(|| alias.to_string())
+        };
+
+        outcomes
+            .iter()
+            .filter(|o| o.bucket == crate::services::type_sidecar::VerdictBucket::Incompatible)
+            .map(|outcome| {
+                let method = outcome.pseudo_method.clone();
+                let path = outcome.identity.clone();
                 // The consumer call site is the actionable location — it's
                 // where the broken read/write happens. In CI the manifest
                 // carries the runner's absolute checkout path; strip it so
                 // the risk row cites the repo-relative file.
-                let call_sites = mismatch
-                    .get("consumerLocation")
-                    .and_then(|c| c.as_str())
-                    .map(|loc| vec![strip_ci_workspace_prefix(loc).to_string()])
-                    .unwrap_or_default();
+                let location = format!("{}:{}", outcome.consumer_file, outcome.consumer_line);
+                let call_sites = vec![strip_ci_workspace_prefix(&location).to_string()];
                 let producer_provenance = self.producer_provenance_for(&method, &path);
-                Some(
-                    Finding::type_mismatch(
-                        method,
-                        path,
-                        None,
-                        call_sites,
-                        self.clean_type_string(producer, &display_names),
-                        self.clean_type_string(consumer, &display_names),
-                        &self.clean_error_message(error, &display_names),
-                    )
-                    .with_producer_provenance(producer_provenance),
+                let detail = outcome
+                    .diagnostic
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "producer and consumer types are incompatible".to_string());
+                Finding::type_mismatch(
+                    method,
+                    path,
+                    None,
+                    call_sites,
+                    self.clean_type_string(&type_label(&outcome.producer_alias), &display_names),
+                    self.clean_type_string(&type_label(&outcome.consumer_alias), &display_names),
+                    &self.clean_error_message(&detail, &display_names),
                 )
+                .with_producer_provenance(producer_provenance)
             })
             .collect()
     }
@@ -4397,29 +4179,57 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // overlay_compat_verdicts — the S1 verdict-attachment step (#226). These
-    // tests are deterministic: they craft a `type-check-results.json` in a temp
-    // ts_check output dir and assert how its verdicts land on the edges. No
-    // ts-node, no sidecar, no LLM — just the Rust overlay logic that #226's
-    // offline harness exercises end-to-end.
+    // overlay_compat_verdicts — the verdict-attachment step, re-pointed at
+    // the structured v2 pair outcomes (WP3). These tests are deterministic:
+    // they craft `PairCheckOutcome`s and assert how they land on the edges.
+    // No sidecar, no tsc, no LLM — just the Rust join logic. The join
+    // semantics they pin (#226/#260, param normalization, per-consumer
+    // keying, unverifiable-stays-None) are unchanged from the ts_check era;
+    // what changed is the input shape (structured outcomes, no label
+    // parsing) and that `Some(true)` now requires an EXPLICIT compatible
+    // verdict instead of falling out of an optimistic default.
     // -----------------------------------------------------------------------
 
-    /// Minimal analyzer with `ts_check_dir` pointed at `dir`, and `results_json`
-    /// written to `dir/output/type-check-results.json` (when `Some`).
-    fn analyzer_with_results(dir: &std::path::Path, results_json: Option<&str>) -> Analyzer {
+    use crate::services::type_sidecar::VerdictBucket;
+
+    /// Minimal analyzer carrying the given structured pair outcomes.
+    fn analyzer_with_outcomes(outcomes: Vec<PairCheckOutcome>) -> Analyzer {
         let mut analyzer = Analyzer::new(Config::default(), Default::default());
-        analyzer.set_ts_check_dir(dir.to_path_buf());
-        if let Some(json) = results_json {
-            let out = dir.join("output");
-            std::fs::create_dir_all(&out).expect("create output dir");
-            std::fs::write(out.join("type-check-results.json"), json).expect("write results");
-        }
+        analyzer.set_pair_outcomes(outcomes);
         analyzer
     }
 
+    /// Build one structured pair outcome. `consumer_location` is
+    /// `"<file>:<line>[:<col>]"`, reduced through `parse_file_location`
+    /// exactly like the manifest side does.
+    fn outcome(
+        pseudo_method: &str,
+        identity: &str,
+        consumer_location: &str,
+        bucket: VerdictBucket,
+        diagnostic: Option<&str>,
+    ) -> PairCheckOutcome {
+        let (consumer_file, consumer_line) = parse_file_location(consumer_location);
+        PairCheckOutcome {
+            pair_key: format!("p/{identity}~c/{consumer_location}#{pseudo_method}"),
+            pseudo_method: pseudo_method.to_string(),
+            identity: identity.to_string(),
+            consumer_file,
+            consumer_line,
+            type_kind: crate::cloud_storage::ManifestTypeKind::Response,
+            bucket,
+            gate: None,
+            diagnostic: diagnostic.map(str::to_string),
+            producer_alias: "Producer_Alias".to_string(),
+            consumer_alias: "Consumer_Alias".to_string(),
+            producer_service: "producer-svc".to_string(),
+            consumer_service: "consumer-svc".to_string(),
+        }
+    }
+
     /// A `payments-svc` consumer edge against `producer_key`, with a default
-    /// consumer call site. The overlay now keys per-consumer, so the verdict
-    /// fixtures must carry a `consumerLocation` matching this location.
+    /// consumer call site. The overlay keys per-consumer, so outcome
+    /// fixtures must carry a consumer location matching this one.
     const PAYMENTS_CONSUMER_LOC: &str = "payments-svc/src/client.ts:12:1";
 
     fn edge(producer_key: &str) -> CrossRepoMatch {
@@ -4443,25 +4253,27 @@ mod tests {
         }
     }
 
-    /// With a results file present, every edge gets a verdict: the producer named
-    /// in the mismatch list → `Some(false)` + reason; all others → `Some(true)`.
-    /// This is the #226 happy path — the offline harness reaches HERE once
-    /// ts_check actually runs and writes its results.
+    /// With outcomes stored, every covered edge gets a verdict: the pair in
+    /// the incompatible bucket → `Some(false)` + reason; an explicitly
+    /// compatible pair → `Some(true)`.
     #[test]
-    fn overlay_compat_verdicts_attaches_from_results_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // GET /orders/:id is incompatible; POST /payments is not in the mismatch
-        // list, so it is compatible.
-        let results = r#"{
-            "mismatches": [
-                { "endpoint": "GET /orders/:id (response)",
-                  "consumerLocation": "payments-svc/src/client.ts:12",
-                  "error": "id: number is not assignable to string" }
-            ],
-            "totalChecked": 2,
-            "compatibleCount": 1
-        }"#;
-        let analyzer = analyzer_with_results(dir.path(), Some(results));
+    fn overlay_compat_verdicts_attaches_from_outcomes() {
+        let analyzer = analyzer_with_outcomes(vec![
+            outcome(
+                "GET",
+                "/orders/:id",
+                "payments-svc/src/client.ts:12",
+                VerdictBucket::Incompatible,
+                Some("id: number is not assignable to string"),
+            ),
+            outcome(
+                "POST",
+                "/payments",
+                "payments-svc/src/client.ts:12",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ]);
 
         let mut matches = vec![edge("http|GET|/orders/:id"), edge("http|POST|/payments")];
         analyzer.overlay_compat_verdicts(&mut matches);
@@ -4469,7 +4281,7 @@ mod tests {
         assert_eq!(
             matches[0].type_compatible,
             Some(false),
-            "the producer in the mismatch list is incompatible"
+            "the incompatible pair's edge is incompatible"
         );
         assert_eq!(
             matches[0].mismatch_reason.as_deref(),
@@ -4478,23 +4290,24 @@ mod tests {
         assert_eq!(
             matches[1].type_compatible,
             Some(true),
-            "a producer absent from the mismatch list is compatible (verdict reached)"
+            "an explicitly compatible pair's edge is compatible"
         );
         assert!(matches[1].mismatch_reason.is_none());
     }
 
     /// #379: a shared-external-contract edge is verdict-exempt. Both sides
-    /// are call sites, so any ts_check comparison on the same key would be
-    /// request-vs-request — and without the guard the overlay's optimistic
-    /// fallback would stamp `Some(true)` on an edge ts_check never verified
-    /// as a producer contract.
+    /// are call sites, so any comparison on the same key would be
+    /// request-vs-request — the guard keeps the verdict `None` even when a
+    /// compatible outcome exists for the same join key.
     #[test]
-    fn apply_compat_verdicts_leaves_shared_external_contract_edges_unevaluated() {
-        // No mismatch entry for this key: the fallback would say Some(true).
-        let results: serde_json::Value = serde_json::from_str(
-            r#"{ "mismatches": [], "totalChecked": 1, "compatibleCount": 1 }"#,
-        )
-        .unwrap();
+    fn apply_pair_outcomes_leaves_shared_external_contract_edges_unevaluated() {
+        let outcomes = vec![outcome(
+            "POST",
+            "/v2/widgets",
+            PAYMENTS_CONSUMER_LOC,
+            VerdictBucket::Compatible,
+            None,
+        )];
 
         let mut shared = edge("http|POST|/v2/widgets");
         shared.relationship = carrick_match::MatchRelationship::SharedExternalContract;
@@ -4503,7 +4316,7 @@ mod tests {
         // alongside `type_compatible == Some(false)`.
         shared.mismatch_reason = Some("stale request-vs-request reason".to_string());
         let mut matches = vec![shared, edge("http|POST|/v2/widgets")];
-        apply_compat_verdicts(&results, &mut matches);
+        apply_pair_outcomes(&outcomes, &mut matches);
 
         assert_eq!(
             matches[0].type_compatible, None,
@@ -4522,22 +4335,16 @@ mod tests {
 
     /// PR-comment polish (#337): the risk row's call site must not leak the CI
     /// runner workspace prefix, and the assignability detail must not end with
-    /// an unbalanced quote. ts_check builds its own errorDetails as
-    /// `Type 'X' is not assignable to type 'Y'` with no trailing period, so
-    /// `clean_error_message`'s `"'."` replacement never fires on the closer.
+    /// an unbalanced quote (`clean_error_message` on the raw compiler text).
     #[test]
     fn type_mismatch_finding_strips_runner_prefix_and_trailing_quote() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let results = r#"{
-            "mismatches": [
-                { "endpoint": "GET /api/notifications/status (response)",
-                  "producerType": "NotificationStatus",
-                  "consumerType": "StatusView",
-                  "consumerLocation": "/home/runner/work/user-service/user-service/server.ts:66",
-                  "error": "Type 'NotificationStatus' is not assignable to type 'StatusView'" }
-            ]
-        }"#;
-        let analyzer = analyzer_with_results(dir.path(), Some(results));
+        let analyzer = analyzer_with_outcomes(vec![outcome(
+            "GET",
+            "/api/notifications/status",
+            "/home/runner/work/user-service/user-service/server.ts:66",
+            VerdictBucket::Incompatible,
+            Some("Type 'NotificationStatus' is not assignable to type 'StatusView'"),
+        )]);
 
         let findings = analyzer.get_type_mismatch_findings();
         assert_eq!(findings.len(), 1);
@@ -4570,47 +4377,44 @@ mod tests {
         );
     }
 
-    /// No results file → `check_type_compatibility` errs → every edge keeps
-    /// `None` (the load-bearing absent verdict, NOT a fake `Some(true)`). This is
-    /// exactly the state #226's live run was stuck in: ts_check never wrote
-    /// results, so the verdicts were all absent and the §7 guard tripped.
+    /// No outcomes stored → compat was not evaluated → every edge keeps
+    /// `None` (the load-bearing absent verdict, NOT a fake `Some(true)`).
     #[test]
-    fn overlay_compat_verdicts_leaves_none_when_results_absent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // output dir exists but no results file written.
-        std::fs::create_dir_all(dir.path().join("output")).unwrap();
-        let analyzer = analyzer_with_results(dir.path(), None);
+    fn overlay_compat_verdicts_leaves_none_when_outcomes_absent() {
+        let analyzer = Analyzer::new(Config::default(), Default::default());
 
         let mut matches = vec![edge("http|GET|/orders/:id")];
         analyzer.overlay_compat_verdicts(&mut matches);
 
         assert_eq!(
             matches[0].type_compatible, None,
-            "no results file → compat not evaluated → verdict stays None (never fake true)"
+            "no outcomes → compat not evaluated → verdict stays None (never fake true)"
         );
     }
 
-    /// An edge ts_check matched but could NOT verify (a side resolved to
-    /// `any`/`unknown`) lands in `unknownPairs`, not `mismatches`. Its verdict
-    /// must stay `None` (unverifiable) rather than the optimistic `Some(true)` —
-    /// asserting compatibility ts_check never established would mask a real
-    /// shape mismatch hidden behind an `= unknown` placeholder (#235).
+    /// An edge whose pair was matched but could NOT be verified (a side
+    /// decayed, or the probe gates fired) stays `None` (unverifiable) rather
+    /// than compatible — asserting a compatibility the checker never
+    /// established would mask a real shape mismatch (#235). The baked-any
+    /// gate bucket lands identically.
     #[test]
     fn overlay_compat_verdicts_leaves_unverifiable_edge_none() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // GET /orders/:id is unverifiable (consumer resolved to `unknown`);
-        // POST /payments was genuinely checked and is compatible.
-        let results = r#"{
-            "mismatches": [],
-            "unknownPairs": [
-                { "endpoint": "GET /orders/:id (response)",
-                  "consumerLocation": "payments-svc/src/client.ts:12",
-                  "reason": "consumer type resolves to unknown (type missing from bundled types?)" }
-            ],
-            "totalChecked": 1,
-            "compatibleCount": 1
-        }"#;
-        let analyzer = analyzer_with_results(dir.path(), Some(results));
+        let analyzer = analyzer_with_outcomes(vec![
+            outcome(
+                "GET",
+                "/orders/:id",
+                "payments-svc/src/client.ts:12",
+                VerdictBucket::Unverifiable,
+                Some("consumer type resolves to unknown"),
+            ),
+            outcome(
+                "POST",
+                "/payments",
+                "payments-svc/src/client.ts:12",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ]);
 
         let mut matches = vec![edge("http|GET|/orders/:id"), edge("http|POST|/payments")];
         analyzer.overlay_compat_verdicts(&mut matches);
@@ -4623,31 +4427,57 @@ mod tests {
         assert_eq!(
             matches[1].type_compatible,
             Some(true),
-            "a genuinely-checked edge absent from both lists is compatible"
+            "a genuinely-checked compatible edge is compatible"
         );
     }
 
-    /// The `graphql|subscription|orderUpdated` false-positive at the verdict-join
-    /// layer. Its consumer alias dangles to `unknown` in the bundle, so ts_check
-    /// reports the pair in `unknownPairs` with the graphql endpoint label
-    /// `"GRAPHQL subscription|orderUpdated (response)"`. That must join the edge
-    /// whose `producer_key` is `"graphql|subscription|orderUpdated"` and pin the
-    /// verdict to `None` — NOT the optimistic `Some(true)` the edge would default
-    /// to if the unresolved consumer had been dropped from the manifest (so the
-    /// pair never reached ts_check at all). This is the join the live eval's
-    /// resolved graphql edges never exercise (they are compatible by default).
+    /// The gate-caught baked-any bucket (a side decayed to `any` and the
+    /// probe gate fired) maps to `None` exactly like unverifiable: the pair
+    /// was NOT verified, and `any` must never read as compatible.
     #[test]
-    fn apply_compat_verdicts_graphql_unverifiable_edge_none() {
-        let result = serde_json::json!({
-            "mismatches": [],
-            "unknownPairs": [{
-                "endpoint": "GRAPHQL subscription|orderUpdated (response)",
-                "consumerLocation": "web-frontend/lib/graphql.ts:84",
-                "reason": "consumer type resolves to unknown (type missing from bundled types?)"
-            }],
-            "totalChecked": 1,
-            "compatibleCount": 0
-        });
+    fn overlay_compat_verdicts_gate_caught_baked_any_edge_none() {
+        let analyzer = analyzer_with_outcomes(vec![outcome(
+            "GET",
+            "/orders/:id",
+            "payments-svc/src/client.ts:12",
+            VerdictBucket::GateCaughtBakedAny,
+            Some("producer side resolved to any (baked at capture time)"),
+        )]);
+
+        let mut matches = vec![edge("http|GET|/orders/:id")];
+        analyzer.overlay_compat_verdicts(&mut matches);
+
+        assert_eq!(
+            matches[0].type_compatible, None,
+            "a gate-caught baked-any edge stays None — any is never compatible"
+        );
+        assert!(matches[0].mismatch_reason.is_none());
+    }
+
+    /// The `graphql|subscription|orderUpdated` false-positive class at the
+    /// verdict-join layer: an unresolved consumer makes the pair
+    /// unverifiable, and that must pin the edge to `None` — NOT a
+    /// compatible-by-absence. With explicit verdicts the absence default is
+    /// gone entirely, but the unverifiable pin is still the load-bearing
+    /// half.
+    #[test]
+    fn apply_pair_outcomes_graphql_unverifiable_edge_none() {
+        let outcomes = vec![
+            outcome(
+                "GRAPHQL",
+                "subscription|orderUpdated",
+                "web-frontend/lib/graphql.ts:84",
+                VerdictBucket::Unverifiable,
+                Some("consumer type was not resolved at capture time"),
+            ),
+            outcome(
+                "GRAPHQL",
+                "query|order",
+                "web-frontend/lib/graphql.ts:76",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ];
         let mut matches = vec![
             edge_at(
                 "graphql|subscription|orderUpdated",
@@ -4660,41 +4490,58 @@ mod tests {
                 "web-frontend/lib/graphql.ts:76",
             ),
         ];
-        apply_compat_verdicts(&result, &mut matches);
+        apply_pair_outcomes(&outcomes, &mut matches);
 
         assert_eq!(
             matches[0].type_compatible, None,
             "an unresolved graphql consumer makes the edge unverifiable (None), \
-             never a fake Some(true) from being dropped + absent"
+             never a fake Some(true)"
         );
         assert!(matches[0].mismatch_reason.is_none());
         assert_eq!(
             matches[1].type_compatible,
             Some(true),
-            "the resolved graphql edge, absent from both lists, stays compatible"
+            "the resolved graphql edge with an explicit compatible verdict reads Some(true)"
         );
     }
 
-    /// THE live compat=1/6 regression. ts_check builds its `endpoint` from the
-    /// normalized manifest (`/orders/:param`), while the cross-repo edge's
-    /// `producer_key` keeps the SOURCE param name (`/orders/:id`). The verdict
-    /// join must collapse both to `:param`; otherwise the incompatible verdict
-    /// misses the edge and it falls back to a fake `Some(true)`. With both sides
-    /// using the same param name (as the older tests do), this asymmetry is
-    /// invisible — which is exactly why it survived to the live eval.
+    /// THE live compat=1/6 regression class. The pair outcome may carry the
+    /// producer path in normalized form (`/orders/:param`) while the edge's
+    /// `producer_key` keeps the SOURCE param name (`/orders/:id`). The join
+    /// must collapse both to `:param`; otherwise the incompatible verdict
+    /// misses the edge.
     #[test]
-    fn apply_compat_verdicts_joins_across_param_name_normalization() {
-        let result = serde_json::json!({
-            "mismatches": [{
-                "endpoint": "GET /orders/:param (response)",
-                "consumerLocation": "web-frontend/lib/api.ts:36",
-                "error": "Order is not assignable to OrderView"
-            }],
-            "unknownPairs": [{
-                "endpoint": "POST /payments (request)",
-                "consumerLocation": "web-frontend/lib/api.ts:48"
-            }]
-        });
+    fn apply_pair_outcomes_joins_across_param_name_normalization() {
+        let outcomes = vec![
+            outcome(
+                "GET",
+                "/orders/:param",
+                "web-frontend/lib/api.ts:36",
+                VerdictBucket::Incompatible,
+                Some("Order is not assignable to OrderView"),
+            ),
+            outcome(
+                "GET",
+                "/orders/:param",
+                "payments-svc/clients/orders.client.ts:13",
+                VerdictBucket::Compatible,
+                None,
+            ),
+            outcome(
+                "POST",
+                "/payments",
+                "web-frontend/lib/api.ts:48",
+                VerdictBucket::Unverifiable,
+                None,
+            ),
+            outcome(
+                "GRAPHQL",
+                "query|order",
+                "web-frontend/lib/graphql.ts:50",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ];
         let mut matches = vec![
             edge_at(
                 "http|GET|/orders/:id",
@@ -4718,7 +4565,7 @@ mod tests {
             ),
         ];
 
-        apply_compat_verdicts(&result, &mut matches);
+        apply_pair_outcomes(&outcomes, &mut matches);
 
         assert_eq!(
             matches[0].type_compatible,
@@ -4737,8 +4584,7 @@ mod tests {
         assert_eq!(
             matches[3].type_compatible,
             Some(true),
-            "a graphql edge is now ts_check-verifiable and is absent from both \
-             lists → genuinely-checked compatible (Some(true)), not None"
+            "a graphql edge with an explicit compatible verdict reads Some(true)"
         );
     }
 
@@ -4752,31 +4598,27 @@ mod tests {
     }
 
     /// THE #260 regression. One producer endpoint (`GET /orders/:id`) with TWO
-    /// consumers of differing compatibility: `payments-svc` (compatible) and
-    /// `web-frontend` (incompatible — `Order.id:number` vs `OrderView.id:string`).
-    /// ts_check emits one entry per pair, each carrying its own `consumerLocation`.
-    /// Before the fix the overlay keyed verdicts on the producer `(METHOD, path)`
-    /// alone, so whichever verdict landed first smeared onto BOTH edges — the
-    /// `payments` `compatible` verdict masked the real `web-frontend` mismatch as
-    /// `Some(true)` (the flagship false-negative). The verdicts must now be
-    /// distinct and correctly attributed to each consumer's edge.
+    /// consumers of differing compatibility. Each pair outcome carries its own
+    /// consumer identity, so the verdicts must be distinct and correctly
+    /// attributed to each consumer's edge — never smeared.
     #[test]
     fn overlay_compat_verdicts_keys_per_consumer_no_smear() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // Only the web-frontend pair mismatches; the payments pair is genuinely
-        // checked-and-compatible (absent from both lists). Both pairs share the
-        // SAME producer endpoint — the exact collapse the old keying caused.
-        let results = r#"{
-            "mismatches": [
-                { "endpoint": "GET /orders/:id (response)",
-                  "consumerLocation": "web-frontend/src/orders.ts:42:3",
-                  "error": "Order.id: number is not assignable to OrderView.id: string" }
-            ],
-            "unknownPairs": [],
-            "totalChecked": 2,
-            "compatibleCount": 1
-        }"#;
-        let analyzer = analyzer_with_results(dir.path(), Some(results));
+        let analyzer = analyzer_with_outcomes(vec![
+            outcome(
+                "GET",
+                "/orders/:id",
+                "web-frontend/src/orders.ts:42:3",
+                VerdictBucket::Incompatible,
+                Some("Order.id: number is not assignable to OrderView.id: string"),
+            ),
+            outcome(
+                "GET",
+                "/orders/:id",
+                "payments-svc/src/orders-client.ts:18:5",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ]);
 
         // Two edges into the SAME producer endpoint, distinguished only by their
         // consumer identity (repo + call-site location).
@@ -4793,7 +4635,7 @@ mod tests {
         let mut matches = vec![payments, web];
         analyzer.overlay_compat_verdicts(&mut matches);
 
-        // payments-svc: compatible (its pair is in neither list).
+        // payments-svc: compatible, from its own explicit verdict.
         assert_eq!(
             matches[0].consumer_repo, "payments-svc",
             "fixture ordering sanity"
@@ -4820,19 +4662,16 @@ mod tests {
         );
     }
 
-    /// A GraphQL edge is now type-checked by ts_check (the graphql-compat
-    /// machinery), so its `producer_key` joins a verdict just like socket. With
-    /// the edge absent from both the mismatch and unknown lists, ts_check
-    /// genuinely checked it and found it compatible, so the overlay reads
-    /// `Some(true)` — NOT the old `None` (which meant "never checked") and NOT a
-    /// fabricated true. The incompatible direction is pinned by
-    /// `apply_compat_verdicts_joins_graphql_edge`.
+    /// A GraphQL edge joins its explicit compatible verdict just like HTTP.
     #[test]
     fn overlay_compat_verdicts_graphql_edge_joins_compatible() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let results = r#"{ "mismatches": [], "unknownPairs": [],
-                           "totalChecked": 1, "compatibleCount": 1 }"#;
-        let analyzer = analyzer_with_results(dir.path(), Some(results));
+        let analyzer = analyzer_with_outcomes(vec![outcome(
+            "GRAPHQL",
+            "query|order",
+            "web-frontend/src/query.ts:7",
+            VerdictBucket::Compatible,
+            None,
+        )]);
 
         let mut matches = vec![edge_at(
             "graphql|query|order",
@@ -4844,35 +4683,33 @@ mod tests {
         assert_eq!(
             matches[0].type_compatible,
             Some(true),
-            "a GraphQL edge genuinely checked and absent from both lists is \
-             compatible (Some(true)), now that graphql joins its verdict"
+            "a GraphQL edge with an explicit compatible verdict reads Some(true)"
         );
         assert!(matches[0].mismatch_reason.is_none());
     }
 
-    /// The socket cross-repo join (this PR). A `socket|DIRECTION|event` edge is
-    /// now type-checked by ts_check, which emits its verdict under the endpoint
-    /// label `"SOCKET <DIRECTION>|<event> (response)"`. `parse_producer_key`
-    /// recovers `("SOCKET", "<DIRECTION>|<event>")` from the edge and
-    /// `parse_compat_endpoint` recovers the SAME pair from the label, so the
-    /// verdict lands on the socket edge — `Some(false)` + reason when ts_check
-    /// reports a mismatch, `Some(true)` when it doesn't.
+    /// The socket cross-repo join. A `socket|DIRECTION|event` edge joins its
+    /// outcome by the `("SOCKET", "<DIRECTION>|<event>")` identity that
+    /// `parse_producer_key` recovers from the edge — `Some(false)` + reason
+    /// on a mismatch, `Some(true)` on an explicit compatible.
     #[test]
-    fn apply_compat_verdicts_joins_socket_edge() {
-        // The xrepo-corpus-1 `payment:settled` edge: producer (listener) is
-        // web-frontend, consumer (emitter) is payments-svc. The compatible case
-        // is absent from both lists, so it reads Some(true). The mismatch case
-        // (a second event) lands on its edge with the reason.
-        let result = serde_json::json!({
-            "mismatches": [{
-                "endpoint": "SOCKET CLIENT->SERVER|chat:bad (response)",
-                "consumerLocation": "client/src/chat.ts:20",
-                "error": "Sent type is not assignable to listener type"
-            }],
-            "unknownPairs": [],
-            "totalChecked": 2,
-            "compatibleCount": 1
-        });
+    fn apply_pair_outcomes_joins_socket_edge() {
+        let outcomes = vec![
+            outcome(
+                "SOCKET",
+                "CLIENT->SERVER|chat:bad",
+                "client/src/chat.ts:20",
+                VerdictBucket::Incompatible,
+                Some("Sent type is not assignable to listener type"),
+            ),
+            outcome(
+                "SOCKET",
+                "SERVER->CLIENT|payment:settled",
+                "payments-svc/realtime/server.ts:27",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ];
 
         let mut matches = vec![
             edge_at(
@@ -4886,19 +4723,19 @@ mod tests {
                 "client/src/chat.ts:20:5",
             ),
         ];
-        apply_compat_verdicts(&result, &mut matches);
+        apply_pair_outcomes(&outcomes, &mut matches);
 
         assert_eq!(
             matches[0].type_compatible,
             Some(true),
-            "the compatible socket edge (absent from both lists) reads Some(true)"
+            "the compatible socket edge reads Some(true) from its explicit verdict"
         );
         assert!(matches[0].mismatch_reason.is_none());
 
         assert_eq!(
             matches[1].type_compatible,
             Some(false),
-            "the socket edge in the mismatch list reads Some(false)"
+            "the socket edge with an incompatible outcome reads Some(false)"
         );
         assert_eq!(
             matches[1].mismatch_reason.as_deref(),
@@ -4907,9 +4744,8 @@ mod tests {
     }
 
     /// `parse_producer_key` recovers the `(pseudo-method, identity)` join pair
-    /// from a graphql canonical key. The KIND stays lowercase on BOTH the key and
-    /// the ts_check endpoint label (`GRAPHQL query|order (response)`), so the two
-    /// sides agree with no case folding on the identity tail.
+    /// from a graphql canonical key. The KIND stays lowercase on both the key
+    /// and the v2 pair identity, so the two sides agree with no case folding.
     #[test]
     fn parse_producer_key_recovers_graphql_pair() {
         assert_eq!(
@@ -4923,8 +4759,8 @@ mod tests {
                 "subscription|orderUpdated".to_string()
             )),
         );
-        // A round-trip through the ts_check endpoint label must yield the SAME
-        // pair, so a graphql verdict joins its edge.
+        // The legacy ts_check label round-trip stays pinned while
+        // parse_compat_endpoint exists (deleted in WP4 with its tests).
         assert_eq!(
             parse_compat_endpoint("GRAPHQL query|order (response)"),
             parse_producer_key("graphql|query|order"),
@@ -4934,28 +4770,27 @@ mod tests {
         assert_eq!(parse_producer_key("graphql|query"), None);
     }
 
-    /// The graphql cross-repo join (the graphql-compat machinery). A
-    /// `graphql|KIND|field` edge is type-checked by ts_check, which emits its
-    /// verdict under the endpoint label `"GRAPHQL <KIND>|<field> (response)"`.
-    /// `parse_producer_key` recovers `("GRAPHQL", "<KIND>|<field>")` from the edge
-    /// and `parse_compat_endpoint` recovers the SAME pair from the label, so the
-    /// verdict lands on the graphql edge — `Some(true)` when ts_check finds it
-    /// compatible, `Some(false)` + reason when it reports a mismatch.
+    /// The graphql cross-repo join: incompatible direction. The outcome's
+    /// `("GRAPHQL", "<kind>|<field>")` identity joins the edge's canonical
+    /// key, landing `Some(false)` + reason.
     #[test]
-    fn apply_compat_verdicts_joins_graphql_edge() {
-        // The xrepo-corpus-1 graphql edges: `query|order` is compatible (absent
-        // from both lists → Some(true)); a second field is in the mismatch list
-        // and lands on its edge with the reason.
-        let result = serde_json::json!({
-            "mismatches": [{
-                "endpoint": "GRAPHQL subscription|orderUpdated (response)",
-                "consumerLocation": "web-frontend/lib/graphql.ts:80",
-                "error": "note?: optional producer field is not assignable to required consumer field"
-            }],
-            "unknownPairs": [],
-            "totalChecked": 2,
-            "compatibleCount": 1
-        });
+    fn apply_pair_outcomes_joins_graphql_edge() {
+        let outcomes = vec![
+            outcome(
+                "GRAPHQL",
+                "subscription|orderUpdated",
+                "web-frontend/lib/graphql.ts:80",
+                VerdictBucket::Incompatible,
+                Some("note?: optional producer field is not assignable to required consumer field"),
+            ),
+            outcome(
+                "GRAPHQL",
+                "query|order",
+                "web-frontend/lib/graphql.ts:76",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ];
 
         let mut matches = vec![
             edge_at(
@@ -4969,19 +4804,19 @@ mod tests {
                 "web-frontend/lib/graphql.ts:80:5",
             ),
         ];
-        apply_compat_verdicts(&result, &mut matches);
+        apply_pair_outcomes(&outcomes, &mut matches);
 
         assert_eq!(
             matches[0].type_compatible,
             Some(true),
-            "the compatible graphql edge (absent from both lists) reads Some(true)"
+            "the compatible graphql edge reads Some(true) from its explicit verdict"
         );
         assert!(matches[0].mismatch_reason.is_none());
 
         assert_eq!(
             matches[1].type_compatible,
             Some(false),
-            "the graphql edge in the mismatch list reads Some(false)"
+            "the graphql edge with an incompatible outcome reads Some(false)"
         );
         assert_eq!(
             matches[1].mismatch_reason.as_deref(),
@@ -4991,10 +4826,8 @@ mod tests {
 
     /// Pub/sub canonical keys are 2-segment (`pubsub|<topic>`, broker excluded
     /// from identity), so the third `splitn(3, '|')` field is `None`.
-    /// `parse_producer_key` must still recover `("PUBSUB", "<topic>")`, and a
-    /// round-trip through the ts_check endpoint label (`PUBSUB <topic>
-    /// (response)`) must yield the SAME pair so a pub/sub verdict joins its edge.
-    /// A topic carries no path params, so `normalize_compat_path` leaves it
+    /// `parse_producer_key` must still recover `("PUBSUB", "<topic>")`. A
+    /// topic carries no path params, so `normalize_compat_path` leaves it
     /// unchanged — guarding a future param-collapse refactor from silently
     /// breaking the pub/sub join.
     #[test]
@@ -5003,7 +4836,8 @@ mod tests {
             parse_producer_key("pubsub|order.placed"),
             Some(("PUBSUB".to_string(), "order.placed".to_string())),
         );
-        // Round-trip through the ts_check endpoint label yields the same pair.
+        // The legacy ts_check label round-trip stays pinned while
+        // parse_compat_endpoint exists (deleted in WP4 with its tests).
         assert_eq!(
             parse_compat_endpoint("PUBSUB order.placed (response)"),
             parse_producer_key("pubsub|order.placed"),
@@ -5015,26 +4849,27 @@ mod tests {
         assert_eq!(normalize_compat_path("order.placed"), "order.placed");
     }
 
-    /// The pub/sub cross-repo join. A `pubsub|<topic>` edge is type-checked by
-    /// ts_check on the Socket.IO inverted direction (subscriber=producer accepts
-    /// what publisher=consumer sends); ts_check emits its verdict under the
-    /// endpoint label `"PUBSUB <topic> (response)"`. `parse_producer_key`
-    /// recovers `("PUBSUB", "<topic>")` from the edge and `parse_compat_endpoint`
-    /// recovers the SAME pair from the label, so the verdict lands on the
-    /// pub/sub edge — `Some(true)` when compatible, `Some(false)` + reason on a
-    /// reported mismatch (the incompatible Kafka `order.placed` edge).
+    /// The pub/sub cross-repo join. The outcome's `("PUBSUB", "<topic>")`
+    /// identity joins the edge's canonical key — `Some(true)` on an explicit
+    /// compatible, `Some(false)` + reason on a reported mismatch.
     #[test]
-    fn apply_compat_verdicts_joins_pubsub_edge() {
-        let result = serde_json::json!({
-            "mismatches": [{
-                "endpoint": "PUBSUB order.placed (response)",
-                "consumerLocation": "orders-svc/src/publisher.ts:42",
-                "error": "Type 'WideOrder' is not assignable to type 'StrictOrder'"
-            }],
-            "unknownPairs": [],
-            "totalChecked": 2,
-            "compatibleCount": 1
-        });
+    fn apply_pair_outcomes_joins_pubsub_edge() {
+        let outcomes = vec![
+            outcome(
+                "PUBSUB",
+                "order.placed",
+                "orders-svc/src/publisher.ts:42",
+                VerdictBucket::Incompatible,
+                Some("Type 'WideOrder' is not assignable to type 'StrictOrder'"),
+            ),
+            outcome(
+                "PUBSUB",
+                "metrics.page_view",
+                "analytics-svc/src/track.ts:10",
+                VerdictBucket::Compatible,
+                None,
+            ),
+        ];
 
         let mut matches = vec![
             edge_at(
@@ -5048,19 +4883,19 @@ mod tests {
                 "orders-svc/src/publisher.ts:42",
             ),
         ];
-        apply_compat_verdicts(&result, &mut matches);
+        apply_pair_outcomes(&outcomes, &mut matches);
 
         assert_eq!(
             matches[0].type_compatible,
             Some(true),
-            "the compatible pub/sub edge (absent from the mismatch list) reads Some(true)"
+            "the compatible pub/sub edge reads Some(true) from its explicit verdict"
         );
         assert!(matches[0].mismatch_reason.is_none());
 
         assert_eq!(
             matches[1].type_compatible,
             Some(false),
-            "the pub/sub edge in the mismatch list reads Some(false)"
+            "the pub/sub edge with an incompatible outcome reads Some(false)"
         );
         assert_eq!(
             matches[1].mismatch_reason.as_deref(),
@@ -5068,21 +4903,25 @@ mod tests {
         );
     }
 
-    /// A results file carrying an `error` key (ts_check's catch-block output, e.g.
-    /// the compile failure when its deps aren't installed) is treated as compat
-    /// NOT evaluated → edges stay `None`, never scored as compatible.
+    /// When the check itself failed, the engine degrades every probing pair
+    /// to unverifiable with the failure as the reason — the edge reads
+    /// `None`, never compatible.
     #[test]
-    fn overlay_compat_verdicts_treats_error_result_as_unevaluated() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let results = r#"{ "mismatches": [], "error": "Cannot find module 'ts-morph'" }"#;
-        let analyzer = analyzer_with_results(dir.path(), Some(results));
+    fn overlay_compat_verdicts_treats_check_failure_as_unverifiable() {
+        let analyzer = analyzer_with_outcomes(vec![outcome(
+            "POST",
+            "/payments",
+            PAYMENTS_CONSUMER_LOC,
+            VerdictBucket::Unverifiable,
+            Some("type check did not run: v2 check failed: pnpm missing"),
+        )]);
 
         let mut matches = vec![edge("http|POST|/payments")];
         analyzer.overlay_compat_verdicts(&mut matches);
 
         assert_eq!(
             matches[0].type_compatible, None,
-            "an error result is not a verdict — edges stay None"
+            "a failed check is not a verdict — edges stay None"
         );
     }
 

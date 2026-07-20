@@ -137,15 +137,9 @@ async fn incremental_path_populates_intent() {
 
     // Scan #1 — full path. Populates cache fields so scan #2 takes the
     // incremental branch.
-    run_analysis_engine_with_sidecar(
-        storage.clone(),
-        repo_path.to_str().unwrap(),
-        None,
-        false,
-        None,
-    )
-    .await
-    .expect("scan #1 failed");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #1 failed");
 
     // Make a trivial change so HEAD differs from the previous commit_hash —
     // git diff in the incremental path needs a non-empty diff target.
@@ -154,15 +148,9 @@ async fn incremental_path_populates_intent() {
     run_git(&repo_path, &["commit", "-q", "-m", "noop"]);
 
     // Scan #2 — should take the incremental branch.
-    run_analysis_engine_with_sidecar(
-        storage.clone(),
-        repo_path.to_str().unwrap(),
-        None,
-        false,
-        None,
-    )
-    .await
-    .expect("scan #2 failed");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #2 failed");
 
     // Inspect the most-recently uploaded payload for this repo.
     let (uploaded, _) = storage
@@ -238,15 +226,9 @@ async fn incremental_path_reuses_intents_from_previous_scan() {
     const SENTINEL: &str = "SENTINEL_REUSED_INTENT";
 
     // Scan #1 — full path. Populates cache fields used by scan #2.
-    run_analysis_engine_with_sidecar(
-        storage.clone(),
-        repo_path.to_str().unwrap(),
-        None,
-        false,
-        None,
-    )
-    .await
-    .expect("scan #1 failed");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #1 failed");
 
     // Inject sentinel intents onto scan #1's stored payload. Scan #2 will
     // pick this up as `previous_data`.
@@ -276,15 +258,9 @@ async fn incremental_path_reuses_intents_from_previous_scan() {
     run_git(&repo_path, &["add", "-A"]);
     run_git(&repo_path, &["commit", "-q", "-m", "noop"]);
 
-    run_analysis_engine_with_sidecar(
-        storage.clone(),
-        repo_path.to_str().unwrap(),
-        None,
-        false,
-        None,
-    )
-    .await
-    .expect("scan #2 failed");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #2 failed");
 
     let repos = storage.repos.lock().unwrap();
     let scan2 = repos

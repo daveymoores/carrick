@@ -202,6 +202,95 @@ pub struct CloudRepoData {
     /// cross-repo type checking by `attach_compat_verdicts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat_verdicts: Option<Vec<CompatVerdict>>,
+    /// v2 capture stub package for this service ("tsc as the serializer"):
+    /// the compiler-emitted declaration tree + pinned deps, captured at scan
+    /// time and re-assembled into the synthetic check workspace at cross-repo
+    /// time. Inline file map for now; WP5 replaces the transport with
+    /// content-addressed S3 tarballs + descriptors. A peer with `None` (or a
+    /// mismatched `artifact_version`) is treated as having no surface: its
+    /// pairs verdict unverifiable with a re-scan reason, never compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_stub: Option<CaptureStubArtifact>,
+}
+
+/// Version of the v2 capture stub artifact schema. Bumped on incompatible
+/// changes; the check phase treats a peer scanned with a different version as
+/// having no surface (its pairs are unverifiable with a re-scan reason).
+pub const CAPTURE_ARTIFACT_VERSION: u32 = 1;
+
+/// The v2 capture stub package as it travels between scan time and check
+/// time: a types-only npm package (package.json + tsconfig.snapshot.json +
+/// carrick-manifest.json + types/ declaration tree) flattened to a file map.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CaptureStubArtifact {
+    pub artifact_version: u32,
+    /// `@carrick/<sanitized-service>` package name the stub was emitted as.
+    pub package_name: String,
+    pub ts_version: String,
+    /// True when the source repo had no node_modules at capture time.
+    pub bare_checkout: bool,
+    /// Stub-relative path -> file content. BTreeMap for stable serialization.
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+impl CaptureStubArtifact {
+    /// Read a capture stub directory (as produced by `capture_v2`) into the
+    /// wire artifact.
+    pub fn from_stub_dir(
+        stub_dir: &std::path::Path,
+        package_name: &str,
+        ts_version: &str,
+        bare_checkout: bool,
+    ) -> std::io::Result<Self> {
+        let mut files = std::collections::BTreeMap::new();
+        collect_stub_files(stub_dir, stub_dir, &mut files)?;
+        Ok(Self {
+            artifact_version: CAPTURE_ARTIFACT_VERSION,
+            package_name: package_name.to_string(),
+            ts_version: ts_version.to_string(),
+            bare_checkout,
+            files,
+        })
+    }
+
+    /// Write the artifact back out as a stub directory under `dest`.
+    pub fn materialize(&self, dest: &std::path::Path) -> std::io::Result<()> {
+        for (rel, content) in &self.files {
+            let path = dest.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, content)?;
+        }
+        Ok(())
+    }
+}
+
+fn collect_stub_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    files: &mut std::collections::BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // node_modules only appears transiently (self-check symlink); it
+            // must never ride the artifact.
+            if entry.file_name() == "node_modules" {
+                continue;
+            }
+            collect_stub_files(root, &path, files)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.insert(rel, std::fs::read_to_string(&path)?);
+        }
+    }
+    Ok(())
 }
 
 impl CloudRepoData {
@@ -277,6 +366,7 @@ impl CloudRepoData {
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }
     }
 }
@@ -596,6 +686,7 @@ mod tests {
             cache_version: None,
             type_extraction_status: None,
             compat_verdicts: None,
+            capture_stub: None,
         }
     }
 

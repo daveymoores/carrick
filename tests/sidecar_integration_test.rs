@@ -362,6 +362,25 @@ fn test_consumer_fixture_creation() {
 // Sidecar Integration Tests
 // ============================================================================
 
+/// Write bundled .d.ts content into a minimal capture-stub-shaped temp dir
+/// (`<dir>/types/surface.d.ts`) for the stub-based `resolve_definitions`
+/// action. Returns the stub dir root (owned by the caller's TempDir-free
+/// lifetime; std::env::temp_dir cleanup is the OS's).
+fn stub_dir_for(dts: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "carrick-test-defres-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let types = dir.join("types");
+    fs::create_dir_all(&types).expect("create stub types dir");
+    fs::write(types.join("surface.d.ts"), dts).expect("write stub surface");
+    dir
+}
+
 /// Check if Node.js is available
 fn is_node_available() -> bool {
     Command::new("node")
@@ -833,8 +852,9 @@ export async function getOrderCount(): Promise<number> {
 
     // And the definition the manifest stores (resolved_definition /
     // expanded_definition) must resolve to the same array form.
+    let stub = stub_dir_for(&dts);
     let definitions = sidecar
-        .resolve_definitions(&dts, &[alias.to_string()])
+        .resolve_definitions(&stub.to_string_lossy(), &[alias.to_string()])
         .expect("resolve_definitions failed");
     let def = definitions
         .iter()
@@ -1028,8 +1048,9 @@ notificationRouter.get('/status', async () => {
         alias_line
     );
 
+    let stub = stub_dir_for(&dts);
     let definitions = sidecar
-        .resolve_definitions(&dts, &[alias.to_string()])
+        .resolve_definitions(&stub.to_string_lossy(), &[alias.to_string()])
         .expect("resolve_definitions failed");
     let def = definitions
         .iter()
@@ -1203,8 +1224,9 @@ notificationRouter.get('/status', async () => {
         alias_line
     );
 
+    let stub = stub_dir_for(&dts);
     let definitions = sidecar
-        .resolve_definitions(&dts, &[alias.to_string()])
+        .resolve_definitions(&stub.to_string_lossy(), &[alias.to_string()])
         .expect("resolve_definitions failed");
     let def = definitions
         .iter()

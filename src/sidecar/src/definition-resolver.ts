@@ -113,19 +113,23 @@ export class DefinitionResolver {
       // As-written form: prefer the alias target's own declaration (the real
       // `interface Order {...}` in the tree) over the surface's import-type
       // line, so named shapes read naturally. Fall back to the alias line for
-      // anonymous targets or lib/external declarations outside the stub tree.
+      // anonymous targets, self-referential alias symbols, or lib/external
+      // declarations outside the stub tree.
       let definition = decl.getText();
-      const targetSymbol = type.getAliasSymbol() ?? type.getSymbol();
-      const targetDecl = targetSymbol?.getDeclarations()?.[0];
-      if (
-        targetDecl &&
-        (Node.isInterfaceDeclaration(targetDecl) ||
-          Node.isTypeAliasDeclaration(targetDecl) ||
-          Node.isClassDeclaration(targetDecl) ||
-          Node.isEnumDeclaration(targetDecl)) &&
-        !targetDecl.getSourceFile().getFilePath().includes('node_modules')
-      ) {
-        definition = targetDecl.getText();
+      for (const symbol of [type.getAliasSymbol(), type.getSymbol()]) {
+        const targetDecl = symbol?.getDeclarations()?.[0];
+        if (
+          targetDecl &&
+          targetDecl !== decl &&
+          (Node.isInterfaceDeclaration(targetDecl) ||
+            Node.isTypeAliasDeclaration(targetDecl) ||
+            Node.isClassDeclaration(targetDecl) ||
+            Node.isEnumDeclaration(targetDecl)) &&
+          !targetDecl.getSourceFile().getFilePath().includes('node_modules')
+        ) {
+          definition = targetDecl.getText();
+          break;
+        }
       }
 
       // Structural form — every named member inlined to its shape.
