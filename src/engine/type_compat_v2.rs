@@ -514,6 +514,9 @@ pub(crate) fn backfill_accepted(
         if record.deep_top_type_kind.is_none() && rerun_record.deep_top_type_kind.is_some() {
             return false;
         }
+        if !record.top_type_at_self_check && rerun_record.top_type_at_self_check {
+            return false;
+        }
     }
     true
 }
@@ -1522,6 +1525,15 @@ mod tests {
             record("B", "symbol", "decayed_internal", None),
         ];
         assert!(!backfill_accepted(&backfilled, &first, &sibling_degraded));
+
+        // A sibling newly gains a root top type while staying "usable" -> reject
+        // (Copilot review on #426: still contradicts "no sibling degraded").
+        let mut sibling_top_typed = vec![
+            record("A", "literal", "ok", None),
+            record("B", "symbol", "ok", None),
+        ];
+        sibling_top_typed[1].top_type_at_self_check = true;
+        assert!(!backfill_accepted(&backfilled, &first, &sibling_top_typed));
 
         // A sibling record vanishes from the re-run -> reject.
         let sibling_missing = vec![record("A", "literal", "ok", None)];
