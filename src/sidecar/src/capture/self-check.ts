@@ -170,6 +170,100 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
   };
 }
 
+/** A disqualifying `any`/`unknown` found below the root of a captured type. */
+interface DeepTopType {
+  kind: 'any' | 'unknown';
+  /** Human-readable member path, e.g. `metadata`, `items<0>.meta`, `[index]`. */
+  path: string;
+}
+
+/**
+ * Depth-bounded structural walk for a disqualifying top type at ANY depth:
+ * a member, array element, index signature, or type argument that resolved
+ * to `any` (bidirectionally assignable — an arbitrary counterparty shape
+ * reads compatible) or `unknown` (a failed-inference bake; carries no shape
+ * information). The check phase's probe gates are WHOLE-type only, so this
+ * walk owns the depths they cannot see.
+ *
+ * Bounded (depth + node budget) and cycle-safe. Types with call/construct
+ * signatures are skipped: callable members are not wire payloads, and lib
+ * callable surfaces legitimately carry `any` parameters. A type the walk
+ * cannot cheaply finish is NOT flagged — over-demoting a legitimately
+ * fully-resolved type is the failure mode this guard must not have.
+ */
+function findDisqualifyingTopType(
+  root: ts.Type,
+  checker: ts.TypeChecker,
+  location: ts.Node
+): DeepTopType | undefined {
+  const MAX_DEPTH = 8;
+  const MAX_VISITED = 256;
+  const seen = new Set<ts.Type>();
+  let visited = 0;
+
+  const flagOf = (t: ts.Type): 'any' | 'unknown' | undefined =>
+    t.flags & ts.TypeFlags.Any
+      ? 'any'
+      : t.flags & ts.TypeFlags.Unknown
+        ? 'unknown'
+        : undefined;
+
+  const walk = (t: ts.Type, path: string, depth: number): DeepTopType | undefined => {
+    if (depth > MAX_DEPTH || visited > MAX_VISITED || seen.has(t)) return undefined;
+    seen.add(t);
+    visited++;
+
+    // Root-level top types are the caller's whole-type check (and the check
+    // phase's probe gates catch them); this walk owns depth > 0.
+    if (depth > 0) {
+      const kind = flagOf(t);
+      if (kind) return { kind, path };
+    }
+
+    if (t.flags & (ts.TypeFlags.Union | ts.TypeFlags.Intersection)) {
+      for (const part of (t as ts.UnionOrIntersectionType).types) {
+        const found = walk(part, path, depth + 1);
+        if (found) return found;
+      }
+      return undefined;
+    }
+
+    if (!(t.flags & ts.TypeFlags.Object)) return undefined;
+
+    if (t.getCallSignatures().length > 0 || t.getConstructSignatures().length > 0) {
+      return undefined;
+    }
+
+    // Type arguments: arrays, tuples, Promise<T>, Map<K, V>, ...
+    if ((t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) {
+      const args = checker.getTypeArguments(t as ts.TypeReference);
+      for (let i = 0; i < args.length; i++) {
+        const found = walk(args[i], `${path}<${i}>`, depth + 1);
+        if (found) return found;
+      }
+    }
+
+    // Index signatures: { [k: string]: T }, Record<string, T>.
+    for (const info of checker.getIndexInfosOfType(t)) {
+      const found = walk(info.type, `${path}[index]`, depth + 1);
+      if (found) return found;
+    }
+
+    for (const prop of t.getProperties()) {
+      const propType = checker.getTypeOfSymbolAtLocation(prop, location);
+      const found = walk(
+        propType,
+        path === '' ? prop.getName() : `${path}.${prop.getName()}`,
+        depth + 1
+      );
+      if (found) return found;
+    }
+    return undefined;
+  };
+
+  return walk(root, '', 0);
+}
+
 function checkedRecord(
   anchor: ResolvedAnchor,
   ctx: {
@@ -183,6 +277,7 @@ function checkedRecord(
 ): CaptureAliasRecord {
   const alias = anchor.request.alias;
   let topType = true;
+  let deep: DeepTopType | undefined;
   const seeds: string[] = [];
 
   if (ctx.surfaceSource) {
@@ -191,6 +286,9 @@ function checkedRecord(
       const type = ctx.checker.getTypeAtLocation(stmt.name);
       topType =
         (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0;
+      if (!topType) {
+        deep = findDisqualifyingTopType(type, ctx.checker, stmt.name);
+      }
       // Seed the closure with the alias's own import-type targets.
       const visit = (node: ts.Node) => {
         if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
@@ -229,23 +327,58 @@ function checkedRecord(
     if (!internalFailure) internalFailure = [...failures.internal][0];
   }
 
+  // Classification consults the closure failures REGARDLESS of the root
+  // type: a dangling internal specifier means part of this alias's closure
+  // is missing and the emitted tree is silently wrong even when the root
+  // resolves to a concrete shape (adversarial-review finding 1).
   let outcome: SelfCheckOutcome = 'ok';
   let detail: string | undefined;
-  if (topType) {
-    if (ctx.args.bareCheckout && blamedExternal && !internalFailure) {
-      const pkg = packageNameOf(blamedExternal);
-      outcome = 'allowlisted_external';
+  const allowlisted = (): void => {
+    const pkg = packageNameOf(blamedExternal!);
+    outcome = 'allowlisted_external';
+    detail =
+      `unresolved external '${blamedExternal}' is pinned ` +
+      `(${pkg}@${ctx.args.pinned[pkg]}); kept at tier ${anchor.serialization} ` +
+      'on bare checkout; probe gates are the backstop';
+  };
+  // `unexplainedDeep`: a member-level any/unknown with NO failing-external
+  // explanation (literal text or the author's own source carried it). The
+  // check phase must pre-gate exactly these — an external-blamed decay can
+  // heal when the check workspace installs the pins, and the probe gates /
+  // poison rule backstop those paths.
+  let unexplainedDeep: DeepTopType | undefined;
+  if (internalFailure) {
+    outcome = 'decayed_internal';
+    detail = `dangling internal specifier '${internalFailure}'`;
+  } else if (topType || deep) {
+    if (blamedExternal) {
+      if (ctx.args.bareCheckout) {
+        allowlisted();
+      } else {
+        outcome = 'decayed_internal';
+        detail = `unresolved pinned external '${blamedExternal}' on an installed checkout`;
+      }
+    } else if (topType) {
+      outcome = 'decayed_internal';
+      detail = 'alias resolved to a top type with no allowlisted external failure';
+    } else {
+      unexplainedDeep = deep;
+      outcome = 'decayed_internal';
       detail =
-        `unresolved external '${blamedExternal}' is pinned ` +
-        `(${pkg}@${ctx.args.pinned[pkg]}); kept at tier ${anchor.serialization} ` +
-        'on bare checkout; probe gates are the backstop';
+        `type carries '${deep!.kind}' at '${deep!.path}' with no allowlisted ` +
+        'external failure; an arbitrary counterparty shape would read compatible';
+    }
+  } else if (blamedExternal) {
+    // The alias's own type is fully concrete, but its closure has failing
+    // pinned-external specifiers — previously invisible behind the topType
+    // gate. On a bare checkout that is the expected amendment-1 shape; on an
+    // installed checkout it means the tree references something the repo's
+    // own node_modules could not resolve.
+    if (ctx.args.bareCheckout) {
+      allowlisted();
     } else {
       outcome = 'decayed_internal';
-      detail = internalFailure
-        ? `dangling internal specifier '${internalFailure}'`
-        : blamedExternal
-          ? `unresolved pinned external '${blamedExternal}' on an installed checkout`
-          : 'alias resolved to a top type with no allowlisted external failure';
+      detail = `unresolved pinned external '${blamedExternal}' on an installed checkout`;
     }
   }
 
@@ -259,6 +392,12 @@ function checkedRecord(
     self_check: outcome,
     self_check_detail: detail,
     top_type_at_self_check: topType,
+    ...(unexplainedDeep
+      ? {
+          deep_top_type_kind: unexplainedDeep.kind,
+          deep_top_type_path: unexplainedDeep.path,
+        }
+      : {}),
   };
 }
 

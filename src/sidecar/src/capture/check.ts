@@ -21,9 +21,11 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import type {
+  CaptureAliasRecord,
   CheckOptions,
   CheckProgressPhase,
   CheckResult,
+  CheckStubInput,
   CheckVerdict,
   DegradedService,
 } from './api.js';
@@ -168,7 +170,36 @@ export async function runCheck(
     const spec = opts.pairs.find((p) => p.pair_key === v.pair_key)!;
     v.pair_id = fnvOfSpec(spec);
   }
-  writeProbes(ws, plans);
+
+  // Capture-time deep-decay pre-gate (adversarial-review finding 1): a
+  // member-level `any`/`unknown` recorded by the capture self-check with no
+  // failing-external explanation. The probe gates below are WHOLE-type only
+  // — `{ orderId: string; metadata: any }` sails through IsAny and the
+  // assignment compiles clean — so such pairs must never reach a probe.
+  // `any` routes to gate_caught_baked_any, `unknown` to unverifiable; both
+  // read as None downstream, never compatible.
+  const aliasRecords = readStubAliasRecords(opts.stubs);
+  const preGated: CheckVerdict[] = [];
+  const probing: ProbePlan[] = [];
+  for (const plan of plans) {
+    const hit = deepDecayOf(plan, aliasRecords);
+    if (!hit) {
+      probing.push(plan);
+      continue;
+    }
+    preGated.push({
+      pair_id: plan.pairId,
+      pair_key: plan.spec.pair_key,
+      bucket: hit.kind === 'any' ? 'gate_caught_baked_any' : 'unverifiable',
+      gate: `capture:${hit.side}:${hit.kind}`,
+      diagnostic:
+        `the ${hit.side} type carries '${hit.kind}' at '${hit.path}' from ` +
+        `capture; compatibility cannot be verified (a partially-unresolved ` +
+        `type would let an arbitrary shape read compatible).`,
+      codes: [],
+    });
+  }
+  writeProbes(ws, probing);
 
   const errors: string[] = [];
   const degraded: DegradedService[] = [];
@@ -188,10 +219,12 @@ export async function runCheck(
     }
     const verdicts = sortVerdicts([
       ...unverifiableAll(
-        plans,
+        probing,
         'install:failed',
         'workspace dependency install failed; compatibility cannot be verified.'
       ),
+      // Capture-decay verdicts stand regardless of the install outcome.
+      ...preGated,
       ...unresolved,
     ]);
     if (cleanup) safeRm(ws.workspaceDir);
@@ -241,10 +274,11 @@ export async function runCheck(
     }
     const verdicts = sortVerdicts([
       ...unverifiableAll(
-        plans,
+        probing,
         'tsc:abnormal-termination',
         'the type checker terminated abnormally; compatibility cannot be verified.'
       ),
+      ...preGated,
       ...unresolved,
     ]);
     if (cleanup) safeRm(ws.workspaceDir);
@@ -263,7 +297,7 @@ export async function runCheck(
   const { probeDiagsByPair, poison, globalErrors } = attributeDiagnostics(
     diagnostics,
     ws,
-    plans
+    probing
   );
   for (const e of globalErrors) errors.push(scrubPaths(e, scrubCtx));
   for (const [service, reason] of poison) {
@@ -271,7 +305,7 @@ export async function runCheck(
   }
 
   const verdicts = sortVerdicts([
-    ...plans.map((plan) =>
+    ...probing.map((plan) =>
       classifyPair({
         plan,
         probeDiags: probeDiagsByPair.get(plan.pairId) ?? [],
@@ -279,6 +313,7 @@ export async function runCheck(
         scrubCtx,
       })
     ),
+    ...preGated,
     ...unresolved,
   ]);
 
@@ -295,6 +330,57 @@ export async function runCheck(
     degraded_services: dedupeDegraded(degraded),
     errors,
   };
+}
+
+/**
+ * Per-service alias records from each stub's carrick-manifest.json. Absent
+ * or unparseable manifests (e.g. hand-authored stubs in tests) contribute
+ * nothing — only positively-recorded deep decay pre-gates a pair.
+ */
+function readStubAliasRecords(
+  stubs: CheckStubInput[]
+): Map<string, Map<string, CaptureAliasRecord>> {
+  const byService = new Map<string, Map<string, CaptureAliasRecord>>();
+  for (const stub of stubs) {
+    try {
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(stub.stub_dir, 'carrick-manifest.json'), 'utf8')
+      ) as { aliases?: CaptureAliasRecord[] };
+      const byAlias = new Map<string, CaptureAliasRecord>();
+      for (const record of manifest.aliases ?? []) {
+        if (record?.alias) byAlias.set(record.alias, record);
+      }
+      byService.set(stub.service_name, byAlias);
+    } catch {
+      // No manifest: nothing to pre-gate for this stub.
+    }
+  }
+  return byService;
+}
+
+interface DeepDecayHit {
+  side: 'producer' | 'consumer';
+  kind: 'any' | 'unknown';
+  path: string;
+}
+
+/** First side (producer, then consumer) whose capture recorded a deep decay. */
+function deepDecayOf(
+  plan: ProbePlan,
+  aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
+): DeepDecayHit | undefined {
+  for (const side of ['producer', 'consumer'] as const) {
+    const endpoint = plan.spec[side];
+    const record = aliasRecords.get(endpoint.service_name)?.get(endpoint.alias);
+    if (record?.deep_top_type_kind) {
+      return {
+        side,
+        kind: record.deep_top_type_kind,
+        path: record.deep_top_type_path ?? '<unknown>',
+      };
+    }
+  }
+  return undefined;
 }
 
 /** Group diagnostics: per-probe (for classification), plus stub-tree poison. */

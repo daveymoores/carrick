@@ -137,6 +137,16 @@ export interface CaptureAliasRecord {
    * With self_check === 'allowlisted_external' this is expected on a bare
    * checkout and is NOT a decay; the probe gates own the final verdict. */
   top_type_at_self_check: boolean;
+  /**
+   * Set when the self-check found a disqualifying `any`/`unknown` at DEPTH
+   * (member / element / index signature / type argument) with no failing
+   * pinned-external explanation. The check phase pre-gates exactly these
+   * aliases: its whole-type probe gates cannot see member-level decay, and
+   * `any` at any depth lets an arbitrary counterparty shape read compatible.
+   */
+  deep_top_type_kind?: 'any' | 'unknown';
+  /** Member path of the deep find, e.g. `metadata` or `items<0>.meta`. */
+  deep_top_type_path?: string;
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */
