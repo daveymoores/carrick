@@ -51,12 +51,38 @@ describe('capture bundle seam (pinned decision 11a)', () => {
   it('capture/ imports only node builtins, typescript, and itself', () => {
     for (const file of tsFiles(CAPTURE)) {
       for (const spec of importsOf(file)) {
-        const ok =
-          spec.startsWith('node:') ||
-          spec === 'typescript' ||
-          spec.startsWith('./');
-        assert.ok(ok, `${path.basename(file)} imports '${spec}' across the seam`);
+        if (spec.startsWith('node:') || spec === 'typescript') continue;
+        // A relative specifier must RESOLVE inside capture/: a `./`-prefixed
+        // escape like `./../legacy.js` or `./sub/../../x.js` is a boundary
+        // violation the bare prefix check waved through (adversarial-review
+        // finding 7).
+        assert.ok(
+          spec.startsWith('./'),
+          `${path.basename(file)} imports '${spec}' across the seam`
+        );
+        const resolved = path.resolve(path.dirname(file), spec);
+        assert.ok(
+          resolved.startsWith(CAPTURE + path.sep),
+          `${path.basename(file)} imports '${spec}', which resolves outside capture/ (${resolved})`
+        );
       }
+    }
+  });
+
+  it('capture/ never uses require() or createRequire (invisible to the import scan)', () => {
+    for (const file of tsFiles(CAPTURE)) {
+      const text = fs
+        .readFileSync(file, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, '');
+      assert.ok(
+        !/\brequire\s*\(/.test(text),
+        `${path.basename(file)} calls require() — a seam crossing the import scan cannot see`
+      );
+      assert.ok(
+        !/\bcreateRequire\b/.test(text),
+        `${path.basename(file)} uses createRequire — a seam crossing the import scan cannot see`
+      );
     }
   });
 
