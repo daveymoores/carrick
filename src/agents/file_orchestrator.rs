@@ -3612,26 +3612,60 @@ impl FileOrchestrator {
             || path.ends_with(".jsx")
     }
 
+    /// TypeScript's NodeNext/ESM module resolution rewrites a relative
+    /// import's output-JS extension back to the input-TS extension: an
+    /// `import ... from './types.js'` written for a `types.ts` source
+    /// resolves to `types.ts` (then `.tsx`/`.d.ts`), and only falls back to a
+    /// real emitted `types.js` when no TS sibling exists. Return that ordered
+    /// candidate list for a JS-family specifier so the TS source wins, mirroring
+    /// tsc (carrick#148). `None` for specifiers without a rewritable JS
+    /// extension — those keep their existing probe behaviour.
+    fn ts_sibling_candidates(base: &str) -> Option<Vec<String>> {
+        let (stem, ts_exts): (&str, &[&str]) = if let Some(stem) = base.strip_suffix(".js") {
+            (stem, &[".ts", ".tsx", ".d.ts"])
+        } else if let Some(stem) = base.strip_suffix(".jsx") {
+            (stem, &[".tsx", ".ts", ".d.ts"])
+        } else if let Some(stem) = base.strip_suffix(".mjs") {
+            (stem, &[".mts", ".d.mts"])
+        } else if let Some(stem) = base.strip_suffix(".cjs") {
+            (stem, &[".cts", ".d.cts"])
+        } else {
+            return None;
+        };
+        let mut candidates: Vec<String> =
+            ts_exts.iter().map(|ext| format!("{stem}{ext}")).collect();
+        // The literal emitted JS is the last resort — only when no TS source
+        // sits beside it (a genuine `.js`-only module).
+        candidates.push(base.to_string());
+        Some(candidates)
+    }
+
     /// Probe a path on disk and return a canonicalized absolute string if
     /// it (or one of the standard `.ts/.tsx/.js/.jsx`/`index.*` candidates)
     /// exists. Returns `None` when nothing matches; callers decide on a
-    /// fallback. If the input already has a TS-family extension we only
-    /// probe that exact path — extension-swapping isn't TS resolver
+    /// fallback. A JS-family specifier resolves to its TS sibling first
+    /// (tsc's ESM `.js`→`.ts` rewrite, carrick#148). A TS-family specifier
+    /// is probed exactly — extension-swapping a `.ts` isn't TS resolver
     /// behaviour and would mask import bugs.
     fn canonicalize_or_probe(base: &str) -> Option<String> {
         use std::path::Path;
 
+        let probe = |candidate: &str| -> Option<String> {
+            Path::new(candidate).exists().then(|| {
+                Path::new(candidate)
+                    .canonicalize()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| candidate.to_string())
+            })
+        };
+
+        // ESM/NodeNext: `./types.js` resolves to the `types.ts` source first.
+        if let Some(candidates) = Self::ts_sibling_candidates(base) {
+            return candidates.iter().find_map(|c| probe(c));
+        }
+
         if Self::has_ts_extension(base) {
-            return if Path::new(base).exists() {
-                Some(
-                    Path::new(base)
-                        .canonicalize()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| base.to_string()),
-                )
-            } else {
-                None
-            };
+            return probe(base);
         }
 
         let candidates = [
@@ -3645,17 +3679,7 @@ impl FileOrchestrator {
             format!("{}/index.jsx", base),
         ];
 
-        for candidate in &candidates {
-            if Path::new(candidate).exists() {
-                return Some(
-                    Path::new(candidate)
-                        .canonicalize()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| candidate.clone()),
-                );
-            }
-        }
-        None
+        candidates.iter().find_map(|c| probe(c))
     }
 
     /// Walk up from `start_dir` looking for `tsconfig.json`. Return its
@@ -4613,6 +4637,66 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&resolved).canonicalize().unwrap(),
             expected,
+        );
+    }
+
+    /// carrick#148: NodeNext/ESM writes a relative import as `./types.js`
+    /// even when the source is `types.ts`. tsc resolves the `.js` specifier
+    /// to the `.ts` sibling; our resolver must too, or the `.js` path is
+    /// carried into the sidecar bundle where it `fs.existsSync`-fails and
+    /// logs "Source file not found" (losing the type).
+    #[test]
+    fn test_resolve_import_path_js_specifier_resolves_to_ts_sibling() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/types.ts"),
+            "export interface SearchByIntentResponse { hits: number }",
+        )
+        .unwrap();
+        let server = repo.path().join("src/index.ts");
+        std::fs::write(&server, "// stub").unwrap();
+
+        let resolved =
+            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "./types.js");
+
+        let resolved_path = std::path::Path::new(&resolved);
+        assert!(
+            resolved_path.is_file(),
+            "`.js` specifier should resolve to the on-disk `.ts` sibling, got `{resolved}`",
+        );
+        let expected = repo.path().join("src/types.ts").canonicalize().unwrap();
+        assert_eq!(
+            resolved_path.canonicalize().unwrap(),
+            expected,
+            "`./types.js` must resolve to `types.ts`, not a non-existent `types.js`",
+        );
+    }
+
+    /// The `.ts` sibling must win even when a real emitted `types.js` also
+    /// sits next to it — tsc prefers the TypeScript source over the JS output.
+    #[test]
+    fn test_resolve_import_path_ts_wins_over_js_sibling() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/types.ts"),
+            "export interface SearchByIntentResponse { hits: number }",
+        )
+        .unwrap();
+        // Decoy emitted output next to the source.
+        std::fs::write(repo.path().join("src/types.js"), "module.exports = {};").unwrap();
+        let server = repo.path().join("src/index.ts");
+        std::fs::write(&server, "// stub").unwrap();
+
+        let resolved =
+            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "./types.js");
+
+        let expected = repo.path().join("src/types.ts").canonicalize().unwrap();
+        assert_eq!(
+            std::path::Path::new(&resolved).canonicalize().unwrap(),
+            expected,
+            "`.ts` sibling must win over an emitted `.js` decoy",
         );
     }
 
