@@ -54,6 +54,13 @@ export class OrderModel {
 export const ZAmbiguousSchema = object({ x: 0 });
 export type TAmbiguousInput = Infer<typeof ZAmbiguousSchema>;
 export type TAmbiguousOutput = Infer<typeof ZAmbiguousSchema>;
+
+// Value-only const whose SOLE typeof-derived sibling is a WRAPPER that embeds
+// the inferred payload as a member (not \`= Infer<typeof C>\`). Re-aiming would
+// capture { data; meta } instead of { id; name } -> a false incompatible, so
+// this must fall back to the value-only DEMOTE (abstain).
+export const ZFoo = object({ id: 0, name: '' });
+export type FooEnvelope = { data: Infer<typeof ZFoo>; meta: string };
 `;
 
 function writeRepo(): void {
@@ -120,6 +127,13 @@ describe('capture v2: value-only symbol anchor guard + const->type re-aim', () =
           kind: 'symbol',
           alias: 'Amb_Schema',
           symbol_name: 'ZAmbiguousSchema',
+          source_file: 'src/schema.ts',
+          anchor_origin: 'llm-symbol',
+        },
+        {
+          kind: 'symbol',
+          alias: 'Wrapper_Foo',
+          symbol_name: 'ZFoo',
           source_file: 'src/schema.ts',
           anchor_origin: 'llm-symbol',
         },
@@ -210,5 +224,20 @@ describe('capture v2: value-only symbol anchor guard + const->type re-aim', () =
     assert.strictEqual(r.self_check, 'decayed_internal');
     assert.ok(r.capture_failure_reason, 'ambiguous re-aim must demote with a reason');
     assert.match(surface, /Amb_Schema = unknown;/);
+  });
+
+  it('B wrapper: a sibling that EMBEDS the inferred type (not `= Infer<...>`) demotes', () => {
+    // FooEnvelope = { data: Infer<typeof ZFoo>; meta: string } is a wrapper:
+    // re-aiming would capture the envelope shape and self-check concretely,
+    // manufacturing a false incompatible. The guard requires the RHS to BE the
+    // inferred type, so this abstains (demotes) instead.
+    const r = record('Wrapper_Foo');
+    assert.strictEqual(r.serialization, 'structural_fallback');
+    assert.strictEqual(r.self_check, 'decayed_internal');
+    assert.ok(r.capture_failure_reason, 'wrapper sibling must demote with a reason');
+    assert.match(surface, /Wrapper_Foo = unknown;/);
+    // Never captures the wrapper's members.
+    assert.ok(!/Wrapper_Foo = [\s\S]*FooEnvelope/.test(surface), surface);
+    assert.ok(!/Wrapper_Foo = [\s\S]*meta/.test(surface), surface);
   });
 });

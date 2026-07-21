@@ -205,7 +205,7 @@ export function resolveAnchor(
   // unambiguously — never leave the descriptor captured (the artifact behind
   // v1's false-incompatible verdicts; kept coupled with #438's containment).
   let reaimNote: string | undefined;
-  const builderReaim = reaimBuilderChainPayload(located);
+  const builderReaim = reaimBuilderChainPayload(checker, located);
   if (builderReaim.kind === 'demote') {
     return demote(builderReaim.reason);
   }
@@ -625,7 +625,7 @@ function reaimValueSymbolToTypeSibling(
     const decl = resolved.declarations?.find(ts.isTypeAliasDeclaration);
     if (!decl) continue;
     if (
-      typeNodeQueriesSymbol(checker, decl.type, ctx.request.symbol_name, ctx.valueSymbol)
+      typeAliasRhsInfersConst(checker, decl.type, ctx.request.symbol_name, ctx.valueSymbol)
     ) {
       matches.push(exported.getName());
     }
@@ -642,38 +642,60 @@ function reaimValueSymbolToTypeSibling(
 }
 
 /**
- * Does `node` contain a `typeof X` type-query whose X denotes `valueSymbol`?
- * Symbol identity is primary (resolves through re-exports and works on a bare
- * checkout: the value symbol resolves without the schema library present); a
- * textual identifier match on `symbolName` is the fallback.
+ * True iff the type alias RHS IS the inferred type derived from a
+ * `typeof <const>` query — the ordinary `export type T = z.infer<typeof C>`
+ * shape — and NOT a wrapper that merely embeds it. Structurally: the whole
+ * type node is a generic type reference (`Infer<typeof C>` /
+ * `SomeGeneric<typeof C>`) whose DIRECT type arguments include a `typeof C`
+ * query.
+ *
+ * An object / union / intersection / array that embeds the query as a member
+ * or element (`{ data: Infer<typeof C>; meta: string }`) is a WRAPPER: re-aiming
+ * at it would capture the wrapper shape, not the payload, and (since the
+ * wrapper self-checks concretely) manufacture a false incompatible. Those fall
+ * back to the value-only demotion — a guaranteed abstain, never a wrong
+ * concrete verdict. A bare `typeof C` alias is also rejected: it denotes the
+ * schema wrapper value's type, not the inferred payload. Still no library-name
+ * checks: matched purely on shape.
  */
-function typeNodeQueriesSymbol(
+function typeAliasRhsInfersConst(
   checker: ts.TypeChecker,
   node: ts.TypeNode,
   symbolName: string,
   valueSymbol: ts.Symbol
 ): boolean {
-  let found = false;
-  const visit = (n: ts.Node): void => {
-    if (found) return;
-    if (ts.isTypeQueryNode(n)) {
-      const entity = n.exprName;
-      const idNode = ts.isQualifiedName(entity) ? entity.right : entity;
-      const queried =
-        checker.getSymbolAtLocation(entity) ?? checker.getSymbolAtLocation(idNode);
-      if (queried && resolveSymbolAliases(checker, queried) === valueSymbol) {
-        found = true;
-        return;
-      }
-      if (ts.isIdentifier(idNode) && idNode.text === symbolName) {
-        found = true;
-        return;
-      }
+  if (!ts.isTypeReferenceNode(node)) return false;
+  for (const arg of node.typeArguments ?? []) {
+    let inner: ts.TypeNode = arg;
+    while (ts.isParenthesizedTypeNode(inner)) inner = inner.type;
+    if (
+      ts.isTypeQueryNode(inner) &&
+      typeQueryMatchesSymbol(checker, inner, symbolName, valueSymbol)
+    ) {
+      return true;
     }
-    n.forEachChild(visit);
-  };
-  visit(node);
-  return found;
+  }
+  return false;
+}
+
+/**
+ * Does a `typeof X` query denote `valueSymbol`? Symbol identity is primary
+ * (resolves through re-exports and works on a bare checkout: the value symbol
+ * resolves without the schema library present); a textual identifier match on
+ * `symbolName` is the fallback.
+ */
+function typeQueryMatchesSymbol(
+  checker: ts.TypeChecker,
+  query: ts.TypeQueryNode,
+  symbolName: string,
+  valueSymbol: ts.Symbol
+): boolean {
+  const entity = query.exprName;
+  const idNode = ts.isQualifiedName(entity) ? entity.right : entity;
+  const queried =
+    checker.getSymbolAtLocation(entity) ?? checker.getSymbolAtLocation(idNode);
+  if (queried && resolveSymbolAliases(checker, queried) === valueSymbol) return true;
+  return ts.isIdentifier(idNode) && idNode.text === symbolName;
 }
 
 // ===========================================================================
@@ -688,16 +710,26 @@ function typeNodeQueriesSymbol(
 // STRUCTURAL, NOT NAME-BASED: no method name (`meta` / `input` / `mutation`)
 // is consulted anywhere. The signal that the located node is a config
 // descriptor is purely that it is a non-empty, all-literal-typed object
-// literal argument of a chain of >=2 fluent calls; the payload is the lone
-// non-literal, non-inline-function chain argument.
+// literal argument of a chain of >=2 fluent calls; a payload candidate is a
+// chain argument whose RESOLVED type has object/payload meaning (a schema
+// resolves to an object; a string/number tag does not).
+//
+// SAFETY of the two outcomes:
+//   - the DEMOTE branches (no object candidate, or several) are no-worse-than
+//     the descriptor: within this trigger the locator already sat on the
+//     descriptor, so an honest `unknown` can never be worse than the concrete,
+//     wrong descriptor it replaces — a guaranteed abstain.
+//   - the single-candidate RE-AIM branch is a HEURISTIC, not a guaranteed-safe
+//     substitution: it swaps the concrete descriptor for a concrete payload
+//     type, so it is deliberately guarded (object-typed candidate only, and
+//     exactly one) to keep the genuine single-schema case working while a
+//     non-object, ambiguous, or absent candidate abstains instead of guessing.
 //
 // LIMITATION (documented per the house rule that pragmatic is acceptable but
-// silent brittleness is not): a chain carrying two schema arguments — e.g.
-// both an input and an output schema — cannot be disambiguated structurally
-// without method-name knowledge, so it demotes to an honest `unknown` rather
-// than risk capturing the wrong side. This is coupling-safe: within this
-// trigger the locator already sat on the descriptor, so demoting can never be
-// worse than the (concrete, wrong) descriptor it replaces.
+// silent brittleness is not): a chain carrying two object-typed arguments —
+// e.g. both an input and an output schema — cannot be disambiguated as request
+// vs response without method-name knowledge, so it demotes rather than risk
+// the wrong side.
 // ===========================================================================
 
 type BuilderReaim =
@@ -705,13 +737,16 @@ type BuilderReaim =
   | { kind: 'reaim'; node: ts.Expression; note: string }
   | { kind: 'demote'; reason: string };
 
-function reaimBuilderChainPayload(located: ts.Node): BuilderReaim {
+function reaimBuilderChainPayload(
+  checker: ts.TypeChecker,
+  located: ts.Node
+): BuilderReaim {
   const descriptorCall = enclosingChainDescriptorCall(located);
   if (!descriptorCall) return { kind: 'none' };
   const chain = fluentChainCalls(descriptorCall);
   if (chain.length < 2) return { kind: 'none' };
 
-  const candidates = payloadCandidates(chain);
+  const candidates = payloadCandidates(checker, chain);
   if (candidates.length === 1) {
     return {
       kind: 'reaim',
@@ -797,27 +832,79 @@ function fluentChainCalls(anyCall: ts.CallExpression): ts.CallExpression[] {
 }
 
 /**
- * Chain arguments that carry type-space payload meaning: a named or
- * constructed schema (identifier / member access / call). Primitive literals,
- * inline object/array literals, and inline functions (handlers) are excluded —
- * the classification is SYNTACTIC so it holds on a bare checkout where every
- * schema resolves to `any`.
+ * Chain arguments that carry type-space PAYLOAD meaning: a named or constructed
+ * schema (identifier / member access / call) whose RESOLVED type is an object
+ * shape. Two filters, both load-bearing:
+ *  - syntactic: inline object/array literals and inline functions (handlers)
+ *    are never candidates;
+ *  - semantic: a candidate whose resolved type is a primitive or literal
+ *    (`.tag(routeName)` with `routeName: string`), a bare callable (a named
+ *    handler), or a top type is REJECTED — capturing a string-literal type as a
+ *    request payload manufactures a false incompatible. Only an object-typed
+ *    argument is a real schema.
+ * With this filter the single-candidate re-aim fires only on a genuine schema,
+ * and a non-object, ambiguous (>1), or absent candidate abstains via demote.
  */
-function payloadCandidates(chain: ts.CallExpression[]): ts.Expression[] {
+function payloadCandidates(
+  checker: ts.TypeChecker,
+  chain: ts.CallExpression[]
+): ts.Expression[] {
   const out: ts.Expression[] = [];
   for (const call of chain) {
     for (const arg of call.arguments) {
       if (
-        ts.isIdentifier(arg) ||
-        ts.isPropertyAccessExpression(arg) ||
-        ts.isElementAccessExpression(arg) ||
-        ts.isCallExpression(arg)
+        (ts.isIdentifier(arg) ||
+          ts.isPropertyAccessExpression(arg) ||
+          ts.isElementAccessExpression(arg) ||
+          ts.isCallExpression(arg)) &&
+        typeIsObjectPayload(checker.getTypeAtLocation(arg))
       ) {
         out.push(arg);
       }
     }
   }
   return out;
+}
+
+/**
+ * A type with object/payload meaning: a real object shape (or a union /
+ * intersection of them), never a primitive, string/number/boolean/bigint/enum
+ * literal, null/undefined/void, a top type (`any`/`unknown`/`never` — cannot be
+ * confirmed a payload), or a bare callable value (a handler function). This is
+ * the gate that keeps the builder-chain re-aim from capturing a non-schema.
+ */
+function typeIsObjectPayload(type: ts.Type): boolean {
+  const nonObject =
+    ts.TypeFlags.Any |
+    ts.TypeFlags.Unknown |
+    ts.TypeFlags.Never |
+    ts.TypeFlags.Null |
+    ts.TypeFlags.Undefined |
+    ts.TypeFlags.Void |
+    ts.TypeFlags.StringLike |
+    ts.TypeFlags.NumberLike |
+    ts.TypeFlags.BooleanLike |
+    ts.TypeFlags.BigIntLike |
+    ts.TypeFlags.ESSymbolLike |
+    ts.TypeFlags.EnumLike;
+  if (type.flags & nonObject) return false;
+  if (type.flags & (ts.TypeFlags.Union | ts.TypeFlags.Intersection)) {
+    // Every constituent must be an object shape: `string | { a }` is not a
+    // clean payload, while a union of objects stays eligible.
+    return (type as ts.UnionOrIntersectionType).types.every(typeIsObjectPayload);
+  }
+  if (type.flags & ts.TypeFlags.Object) {
+    // A bare callable (a named handler passed as a value) is not a payload; a
+    // schema object carries no top-level call/construct signature.
+    if (
+      type.getCallSignatures().length > 0 ||
+      type.getConstructSignatures().length > 0
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 /** A non-empty object literal whose every property is a literal-typed value. */

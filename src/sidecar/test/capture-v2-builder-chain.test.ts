@@ -31,10 +31,14 @@ interface Builder {
   meta(config: object): Builder;
   input(schema: unknown): Builder;
   output(schema: unknown): Builder;
+  tag(name: string): Builder;
   mutation(handler: () => unknown): Route;
 }
 interface Route { readonly __route: true; }
 declare const procedure: Builder;
+
+// A non-schema string constant passed to a chain method.
+declare const routeTag: string;
 
 // A plain-object schema whose inferred payload is an anonymous object type
 // (the shape a \`.input(schema)\` argument carries after inference).
@@ -70,6 +74,23 @@ declare function send(body: unknown): void;
 export function handler() {
   send({ status: "ok", code: 200 });
 }
+
+// Non-schema lone argument: the only non-descriptor argument is a string const,
+// not a schema. Capturing "documents" as a request payload is a false
+// incompatible, so this must abstain (demote).
+export const tagRoute = procedure
+  .meta({ openapi: { method: "POST", path: "/documents/tag" } })
+  .tag(routeTag)
+  .mutation(() => ({}));
+
+// A chain whose true payload is an all-literal object arg (never a candidate)
+// alongside a non-schema string identifier: must abstain, not mis-aim onto the
+// identifier.
+export const literalPayloadRoute = procedure
+  .meta({ openapi: { method: "POST", path: "/documents/create" } })
+  .input({ orderId: 1, label: "x" })
+  .tag(routeTag)
+  .mutation(() => ({}));
 `;
 
 function writeRepo(): void {
@@ -141,6 +162,26 @@ describe('capture v2: builder-chain payload selection over config descriptor', (
           expression_text: '{ status: "ok", code: 200 }',
           unwrap: 'none',
         },
+        // Lone non-schema argument (a string const) -> must abstain, never
+        // capture the string as a payload.
+        {
+          kind: 'infer',
+          alias: 'Tag_Request',
+          source_file: 'src/router.ts',
+          anchor_origin: 'deterministic-infer',
+          expression_text: '{ openapi: { method: "POST", path: "/documents/tag" } }',
+          unwrap: 'none',
+        },
+        // Chain with a literal-object payload + a non-schema identifier -> must
+        // abstain, never re-aim onto the identifier.
+        {
+          kind: 'infer',
+          alias: 'LiteralPayload_Request',
+          source_file: 'src/router.ts',
+          anchor_origin: 'deterministic-infer',
+          expression_text: '{ openapi: { method: "POST", path: "/documents/create" } }',
+          unwrap: 'none',
+        },
       ],
     });
     assert.strictEqual(result.success, true, JSON.stringify(result.errors));
@@ -199,5 +240,24 @@ describe('capture v2: builder-chain payload selection over config descriptor', (
     assert.match(surface, /Single_Request = [\s\S]*status/);
     assert.match(surface, /Single_Request = [\s\S]*code/);
     assert.ok(!/Single_Request = unknown;/.test(surface), surface);
+  });
+
+  it('abstains when the lone chain argument is a non-schema string const', () => {
+    // Pre-fix this captured `string` (the tag const) as the request payload.
+    const r = record('Tag_Request');
+    assert.strictEqual(r.serialization, 'structural_fallback');
+    assert.ok(r.capture_failure_reason, 'a non-schema lone arg must demote');
+    assert.match(surface, /Tag_Request = unknown;/);
+    // Never captures the string constant as a payload.
+    assert.ok(!/Tag_Request = string;/.test(surface), surface);
+  });
+
+  it('abstains when a literal-object payload sits beside a non-schema identifier', () => {
+    // Pre-fix this re-aimed onto the string identifier instead of abstaining.
+    const r = record('LiteralPayload_Request');
+    assert.strictEqual(r.serialization, 'structural_fallback');
+    assert.ok(r.capture_failure_reason, 'an ambiguous non-object candidate must demote');
+    assert.match(surface, /LiteralPayload_Request = unknown;/);
+    assert.ok(!/LiteralPayload_Request = string;/.test(surface), surface);
   });
 });
