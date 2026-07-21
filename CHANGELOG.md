@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.1](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.0...carrick-v0.3.1) (2026-07-21)
+
+
+### Features
+
+* **sidecar:** parse yarn-berry and bun text lockfiles for bare-checkout pins ([#434](https://github.com/carrick-tools/carrick/issues/434)) ([4045606](https://github.com/carrick-tools/carrick/commit/40456065067f815665aacae885217748464305ac)), closes [#430](https://github.com/carrick-tools/carrick/issues/430)
+
+
+### Bug Fixes
+
+* **evals:** fold carrick.json service names to corpus repo dirs in the edge join ([#431](https://github.com/carrick-tools/carrick/issues/431)) ([#435](https://github.com/carrick-tools/carrick/issues/435)) ([bc2ecbf](https://github.com/carrick-tools/carrick/commit/bc2ecbf223e04997fe253e22aed7b70e59bfe801))
+* **scanner:** resolve `./types.js` imports to the `.ts` sibling ([#148](https://github.com/carrick-tools/carrick/issues/148)) ([#443](https://github.com/carrick-tools/carrick/issues/443)) ([007241b](https://github.com/carrick-tools/carrick/commit/007241b6e6830ff93d2ac6fa8baacad03a16405d))
+* **sidecar:** abstain on wrapped response-envelope machinery ([#371](https://github.com/carrick-tools/carrick/issues/371)) ([#445](https://github.com/carrick-tools/carrick/issues/445)) ([53274af](https://github.com/carrick-tools/carrick/commit/53274af4720d4cd9f0b72d0d019c9ef09b6e6564))
+* **sidecar:** contain stub poison + fix value-only and builder-chain anchors ([#438](https://github.com/carrick-tools/carrick/issues/438), [#439](https://github.com/carrick-tools/carrick/issues/439)) ([#442](https://github.com/carrick-tools/carrick/issues/442)) ([7271698](https://github.com/carrick-tools/carrick/commit/7271698117b490f1a496f79df8b26aef17c47b7d))
+* **sidecar:** recover inline literal response types under an unresolvable generic ([#433](https://github.com/carrick-tools/carrick/issues/433)) ([#437](https://github.com/carrick-tools/carrick/issues/437)) ([5678a54](https://github.com/carrick-tools/carrick/commit/5678a540c66799d9e022b2c642e5523baa145661))
+
 ## [0.3.0](https://github.com/carrick-tools/carrick/compare/carrick-v0.2.9...carrick-v0.3.0) (2026-07-20)
 
 
