@@ -179,34 +179,62 @@ interface DeepTopType {
 
 /**
  * Depth-bounded structural walk for a disqualifying top type at ANY depth:
- * a member, array element, index signature, or type argument that resolved
- * to `any` (bidirectionally assignable — an arbitrary counterparty shape
- * reads compatible) or `unknown` (a failed-inference bake; carries no shape
- * information). The check phase's probe gates are WHOLE-type only, so this
- * walk owns the depths they cannot see.
+ * a member, array element, index signature, type argument, or callable RETURN
+ * that resolved to `any` (bidirectionally assignable — an arbitrary
+ * counterparty shape reads compatible) or `unknown` (a failed-inference bake;
+ * carries no shape information). The check phase's probe gates are WHOLE-type
+ * only, so this walk owns the depths they cannot see. It must be a genuine
+ * SUPERSET of v1's text-scan disqualifier (`contains_disqualifying_top_type`)
+ * so that removing the `type_state == Unknown` pre-verdict (carrick #448) never
+ * turns a shape v1 would have abstained on into a false-compatible.
  *
- * Bounded (depth + node budget) and cycle-safe. Types with call/construct
- * signatures are skipped: callable members are not wire payloads, and lib
- * callable surfaces legitimately carry `any` parameters. A type the walk
- * cannot cheaply finish is NOT flagged — over-demoting a legitimately
- * fully-resolved type is the failure mode this guard must not have.
+ * Bounded (depth to v1's expander reach + node budget) and cycle-safe. Two
+ * deliberate exceptions to "flag any/unknown anywhere":
+ *  - callable PARAMETER types are NOT descended (only return types): a
+ *    parameter `any` is contravariant and genuinely permissive (`(x: any) =>
+ *    void` safely accepts a stricter counterparty), so it is not a masked
+ *    mismatch and demoting it would over-demote a sound shape;
+ *  - TypeScript's unresolved-reference `error` placeholder (`intrinsicName ===
+ *    'error'`) is excluded (see `flagOf`): it heals when the check installs the
+ *    pinned external, so it is a healable decay, not an author-baked `any`.
+ * A type the walk cannot cheaply finish is NOT flagged — over-demoting a
+ * legitimately fully-resolved type is the failure mode this guard must not have.
  */
 function findDisqualifyingTopType(
   root: ts.Type,
   checker: ts.TypeChecker,
   location: ts.Node
 ): DeepTopType | undefined {
-  const MAX_DEPTH = 8;
-  const MAX_VISITED = 256;
+  // Cover v1's inline-expander reach with margin so this structural walk is a
+  // genuine superset of v1's text-scan disqualifier AT DEPTH: anything v1 could
+  // expand-and-flag as `any`/`unknown`, this walk reaches too. v1's expander
+  // (`MAX_EXPANSION_DEPTH` in ../type-structural-expander.ts) reaches 12; 16
+  // clears it with margin. That constant is NOT imported: the capture bundle
+  // seam (`capture-v2-seam.test.ts`) forbids capture/ from importing across the
+  // boundary, so the value is pinned here and kept ">= MAX_EXPANSION_DEPTH" by
+  // that contract. The node budget scales with the deeper bound so a real
+  // deep-but-narrow type cannot exhaust it before the walk reaches a buried
+  // `any` — running out early would fail OPEN (read compatible).
+  const MAX_DEPTH = 16;
+  const MAX_VISITED = 4096;
   const seen = new Set<ts.Type>();
   let visited = 0;
 
-  const flagOf = (t: ts.Type): 'any' | 'unknown' | undefined =>
-    t.flags & ts.TypeFlags.Any
-      ? 'any'
-      : t.flags & ts.TypeFlags.Unknown
-        ? 'unknown'
-        : undefined;
+  const flagOf = (t: ts.Type): 'any' | 'unknown' | undefined => {
+    if (t.flags & ts.TypeFlags.Any) {
+      // TypeScript's unresolved-reference placeholder (e.g. `import('ext').Foo`
+      // on a bare checkout) carries `TypeFlags.Any` but `intrinsicName ===
+      // 'error'` — NOT an author-baked `any`. It resolves to the real type once
+      // the check phase installs the pinned external, so it must not count as a
+      // disqualifier: treating it as `any` would demote a healable external
+      // reference. Genuine author `any` carries `intrinsicName === 'any'`.
+      // (`intrinsicName` is internal but stable since TS 1.x — same standing as
+      // its use in anchors.ts.)
+      const name = (t as unknown as { intrinsicName?: string }).intrinsicName;
+      return name === 'error' ? undefined : 'any';
+    }
+    return t.flags & ts.TypeFlags.Unknown ? 'unknown' : undefined;
+  };
 
   const walk = (t: ts.Type, path: string, depth: number): DeepTopType | undefined => {
     if (depth > MAX_DEPTH || visited > MAX_VISITED || seen.has(t)) return undefined;
@@ -230,8 +258,18 @@ function findDisqualifyingTopType(
 
     if (!(t.flags & ts.TypeFlags.Object)) return undefined;
 
-    if (t.getCallSignatures().length > 0 || t.getConstructSignatures().length > 0) {
-      return undefined;
+    // Callable members: descend the RETURN type of every call/construct
+    // signature — a return is a COVARIANT wire position, so `() => any`
+    // covariantly widens `() => string` and an `any` there masks a real
+    // mismatch exactly as a plain-member `any` does (v1's text scan flags it).
+    // PARAMETER types are deliberately NOT descended: a parameter `any` is
+    // contravariant and genuinely permissive (`(x: any) => void` safely
+    // accepts a stricter counterparty), so demoting it would over-demote a
+    // sound shape. Fall through afterwards so a hybrid callable
+    // (`{ (): T; data: any }`) still has its own members walked below.
+    for (const sig of [...t.getCallSignatures(), ...t.getConstructSignatures()]) {
+      const found = walk(sig.getReturnType(), `${path}()`, depth + 1);
+      if (found) return found;
     }
 
     // Type arguments: arrays, tuples, Promise<T>, Map<K, V>, ...
@@ -341,32 +379,42 @@ function checkedRecord(
       `(${pkg}@${ctx.args.pinned[pkg]}); kept at tier ${anchor.serialization} ` +
       'on bare checkout; probe gates are the backstop';
   };
-  // `unexplainedDeep`: a member-level any/unknown with NO failing-external
-  // explanation (literal text or the author's own source carried it). The
-  // check phase must pre-gate exactly these — an external-blamed decay can
-  // heal when the check workspace installs the pins, and the probe gates /
-  // poison rule backstop those paths.
+  // `unexplainedDeep`: a member-level author-baked any/unknown. The deep walk
+  // excludes TypeScript's unresolved-reference `error` placeholder (see
+  // `flagOf`), so `deep` is ALWAYS an author-baked disqualifier that survives
+  // into the emitted `.d.ts` text — never a healable external decay. The check
+  // phase must pre-gate exactly these: its probe gates are whole-type only and
+  // cannot see a member-level any.
   let unexplainedDeep: DeepTopType | undefined;
   if (internalFailure) {
     outcome = 'decayed_internal';
     detail = `dangling internal specifier '${internalFailure}'`;
   } else if (topType || deep) {
-    if (blamedExternal) {
+    // `deep` is only computed when `!topType`, so the two are mutually
+    // exclusive here.
+    if (deep) {
+      // Author-baked member any/unknown. It is baked into the emitted text and
+      // does NOT heal when the check installs pins, so record it even when the
+      // closure ALSO carries a failing pinned external (which would otherwise
+      // allowlist the alias) — fail closed.
+      unexplainedDeep = deep;
+      outcome = 'decayed_internal';
+      detail =
+        `type carries '${deep.kind}' at '${deep.path}'; an arbitrary ` +
+        'counterparty shape would read compatible';
+    } else if (blamedExternal) {
+      // Root top type from a pinned external decay: heals when the check
+      // installs the pin.
       if (ctx.args.bareCheckout) {
         allowlisted();
       } else {
         outcome = 'decayed_internal';
         detail = `unresolved pinned external '${blamedExternal}' on an installed checkout`;
       }
-    } else if (topType) {
+    } else {
+      // Root top type with no external explanation.
       outcome = 'decayed_internal';
       detail = 'alias resolved to a top type with no allowlisted external failure';
-    } else {
-      unexplainedDeep = deep;
-      outcome = 'decayed_internal';
-      detail =
-        `type carries '${deep!.kind}' at '${deep!.path}' with no allowlisted ` +
-        'external failure; an arbitrary counterparty shape would read compatible';
     }
   } else if (blamedExternal) {
     // The alias's own type is fully concrete, but its closure has failing

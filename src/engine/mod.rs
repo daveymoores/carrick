@@ -2985,8 +2985,18 @@ fn enrich_manifest_with_type_resolution(
             // disqualifying-top-type notion (adversarial-review finding 2)
             // rejects not just whole-string "any"/"unknown" but any/unknown
             // at ANY position — `any[]`, `Promise<any>`, `Record<string,
-            // any>`, `{ metadata: any }` — matching the capture self-check's
-            // deep walk, so the two layers agree on what counts as resolved.
+            // any>`, `{ metadata: any }`, `{ getData: () => any }`. Since
+            // carrick #448 removed the `type_state == Unknown` pre-verdict,
+            // `check_v2` is the sole authority on resolved-ness, so its capture
+            // self-check deep walk (`findDisqualifyingTopType`) is a genuine
+            // SUPERSET of this text scan — with two deliberate, safe
+            // exceptions the walk does NOT flag: a callable PARAMETER `any`
+            // (contravariant, genuinely permissive — this text scan may flag
+            // it, but abstaining there would only over-demote, never
+            // false-compatible), and TypeScript's unresolved-external `error`
+            // placeholder (heals when the check installs the pin). So the two
+            // layers agree on every author-baked disqualifier; they diverge
+            // only in the fail-closed direction.
             let is_unknown_type = type_string.trim().is_empty()
                 || type_compat_v2::contains_disqualifying_top_type(type_string)
                 || dts_trivially_unknown(&entry.type_alias);
