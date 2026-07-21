@@ -3605,11 +3605,20 @@ impl FileOrchestrator {
     }
 
     /// Returns true if `path` ends in a TypeScript-family source extension.
+    /// True when the path already carries a JS/TS module extension, so it must
+    /// be probed as-is and never get a `.ts` appended. Covers the NodeNext
+    /// families (`.mts`/`.cts`/`.mjs`/`.cjs`) too — `.d.mts`/`.d.cts` match via
+    /// their `.mts`/`.cts` suffix — so a literal `foo.mts` import resolves
+    /// exactly instead of probing a nonsensical `foo.mts.ts`.
     fn has_ts_extension(path: &str) -> bool {
         path.ends_with(".ts")
             || path.ends_with(".tsx")
+            || path.ends_with(".mts")
+            || path.ends_with(".cts")
             || path.ends_with(".js")
             || path.ends_with(".jsx")
+            || path.ends_with(".mjs")
+            || path.ends_with(".cjs")
     }
 
     /// TypeScript's NodeNext/ESM module resolution rewrites a relative
@@ -4697,6 +4706,32 @@ mod tests {
             std::path::Path::new(&resolved).canonicalize().unwrap(),
             expected,
             "`.ts` sibling must win over an emitted `.js` decoy",
+        );
+    }
+
+    /// A literal NodeNext TS-family extension (`.mts`/`.cts`) must be probed
+    /// exactly, not treated as extensionless and probed as `foo.mts.ts`
+    /// (Copilot review on #148).
+    #[test]
+    fn test_resolve_import_path_mts_specifier_resolves_exactly() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/types.mts"),
+            "export interface SearchByIntentResponse { hits: number }",
+        )
+        .unwrap();
+        let server = repo.path().join("src/index.ts");
+        std::fs::write(&server, "// stub").unwrap();
+
+        let resolved =
+            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "./types.mts");
+
+        let expected = repo.path().join("src/types.mts").canonicalize().unwrap();
+        assert_eq!(
+            std::path::Path::new(&resolved).canonicalize().unwrap(),
+            expected,
+            "`./types.mts` must resolve to `types.mts`, not a nonsensical `types.mts.ts`",
         );
     }
 
