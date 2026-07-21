@@ -59,6 +59,24 @@ function nested(levels: number, leaf: string): string {
   return t;
 }
 
+/** `k` Array-wrapped object levels: each `lN: Array<...>` costs 2 walk hops
+ * (property + type-arg), so the leaf sits at hop-depth 2k+1 — over the budget
+ * at only k=8 OBJECT levels, the walk-depth-counts-every-hop severity case. */
+function arrWrapped(k: number, leaf: string): string {
+  let t = `{ leaf: ${leaf} }`;
+  for (let i = k; i >= 1; i--) t = `{ l${i}: Array<${t}> }`;
+  return t;
+}
+
+/** `n` DISTINCT-typed properties (so `seen` cannot dedup them and the node
+ * budget actually climbs), the leaf at the last property. */
+function wideDistinct(n: number, leaf: string): string {
+  const props: string[] = [];
+  for (let i = 1; i < n; i++) props.push(`p${i}: { u${i}: string }`);
+  props.push(`p${n}: ${leaf}`);
+  return `{ ${props.join('; ')} }`;
+}
+
 describe('capture self-check: deep any/unknown decays, concrete types do not', () => {
   let root: string;
   let byAlias: Map<string, CaptureAliasRecord>;
@@ -544,5 +562,138 @@ describe('capture self-check: a non-healable error-type member still gates (narr
   it('a nested dangling-internal decay gates decayed_internal', () => {
     const rec = byAlias.get('DanglingInternal')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+  });
+});
+
+/**
+ * PR #448 adversarial-review follow-up (part C): the deep walk's budget guard
+ * FAILED OPEN — `depth > MAX_DEPTH || visited > MAX_VISITED` returned undefined
+ * ("clean"), so an `any` buried past the budget recorded `self_check=ok` and,
+ * since the check's probe gates are whole-type only, read COMPATIBLE. Raising
+ * the bound only relocated the cliff. Now budget exhaustion FAILS CLOSED: it
+ * returns a `budget_exhausted` sentinel → `decayed_internal` → the check gates
+ * it `unverifiable`. Because walk-depth counts every structural hop (property,
+ * type-arg, union member, callable return), the cliff is reachable at only ~8
+ * object levels when each wraps an `Array<…>` — an ordinary paginated generic.
+ *
+ * The tradeoff (owned, not hidden): a legitimately clean type deeper/wider than
+ * the budget now ABSTAINS (Unverifiable) instead of verifying — the correct
+ * fail-closed direction (over-abstain, never false-compatible). The budget is
+ * kept generous enough that ordinary types (incl. arrays of objects, whose
+ * built-in method suite is skipped, not recursed) clear it.
+ */
+describe('capture self-check: budget exhaustion fails CLOSED', () => {
+  let root: string;
+  let byAlias: Map<string, CaptureAliasRecord>;
+
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-448-budget-'));
+    const result = captureLiterals(root, 'budget-svc', {
+      D17_any: nested(17, 'any'), // past MAX_DEPTH=16
+      D20_any: nested(20, 'any'),
+      Arr8_any: arrWrapped(8, 'any'), // leaf at hop-depth 17 via only 8 object levels
+      W5000_any: wideDistinct(5000, 'any'), // past MAX_VISITED=4096
+      // Controls / positives — within budget, must NOT budget-exhaust:
+      OK_D16_any: nested(16, 'any'), // caught as a real 'any', not budget
+      OK_ArrayObjs: '{ items: { sku: string }[] }', // lib method suite skipped, not recursed
+      OK_NestedArrClean: arrWrapped(6, '{ ok: string }'), // clean array nesting within budget
+      OK_D16_clean: nested(16, 'string'),
+    });
+    byAlias = new Map(result.aliases.map((a) => [a.alias, a]));
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a depth-17 any (past MAX_DEPTH) gates budget_exhausted, never clean', () => {
+    const rec = byAlias.get('D17_any')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+    assert.strictEqual(rec.deep_top_type_kind, 'budget_exhausted');
+  });
+
+  it('a depth-20 any gates budget_exhausted', () => {
+    assert.strictEqual(byAlias.get('D20_any')!.deep_top_type_kind, 'budget_exhausted');
+  });
+
+  it('8 Array-wrapped object levels (hop-depth 17) gates budget_exhausted', () => {
+    const rec = byAlias.get('Arr8_any')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+    assert.strictEqual(rec.deep_top_type_kind, 'budget_exhausted');
+  });
+
+  it('a >4096-wide any gates budget_exhausted', () => {
+    assert.strictEqual(byAlias.get('W5000_any')!.deep_top_type_kind, 'budget_exhausted');
+  });
+
+  it('a depth-16 any WITHIN budget is caught as a real any (not budget_exhausted)', () => {
+    const rec = byAlias.get('OK_D16_any')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+    assert.strictEqual(rec.deep_top_type_kind, 'any');
+  });
+
+  it('ordinary arrays of objects and clean nested arrays are NOT over-demoted', () => {
+    for (const alias of ['OK_ArrayObjs', 'OK_NestedArrClean', 'OK_D16_clean']) {
+      const rec = byAlias.get(alias)!;
+      assert.strictEqual(rec.self_check, 'ok', `${alias}: ${rec.self_check_detail}`);
+      assert.strictEqual(rec.deep_top_type_kind, undefined, alias);
+    }
+  });
+});
+
+describe('check phase: a budget-exhausted deep any is unverifiable, within-budget clean verifies', () => {
+  let checkRoot: string;
+  let producerStub: string;
+  let consumerStub: string;
+
+  before(() => {
+    checkRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-448-budget-check-'));
+    const producer = captureLiterals(checkRoot, 'bd-producer', {
+      P_D17any: nested(17, 'any'),
+      P_D16clean: nested(16, 'string'),
+    });
+    const consumer = captureLiterals(checkRoot, 'bd-consumer', {
+      C_D17: nested(17, 'string'),
+      C_D16: nested(16, 'string'),
+    });
+    producerStub = producer.stub_dir;
+    consumerStub = consumer.stub_dir;
+  });
+
+  after(() => {
+    fs.rmSync(checkRoot, { recursive: true, force: true });
+  });
+
+  it('depth-17 any -> unverifiable (budget_exhausted); depth-16 clean -> compatible', async () => {
+    const result = await runCheck({
+      stubs: [
+        { service_name: 'bd-producer', stub_dir: producerStub },
+        { service_name: 'bd-consumer', stub_dir: consumerStub },
+      ],
+      pairs: [
+        {
+          pair_key: 'd17',
+          protocol: 'http',
+          type_kind: 'response',
+          producer: { service_name: 'bd-producer', alias: 'P_D17any' },
+          consumer: { service_name: 'bd-consumer', alias: 'C_D17' },
+        },
+        {
+          pair_key: 'd16-clean',
+          protocol: 'http',
+          type_kind: 'response',
+          producer: { service_name: 'bd-producer', alias: 'P_D16clean' },
+          consumer: { service_name: 'bd-consumer', alias: 'C_D16' },
+        },
+      ],
+    });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    const byKey = new Map(result.verdicts.map((v) => [v.pair_key, v]));
+    // Pre-fix this read 'compatible' — the any past the budget looked clean.
+    const d17 = byKey.get('d17')!;
+    assert.strictEqual(d17.bucket, 'unverifiable', JSON.stringify(d17));
+    assert.strictEqual(d17.gate, 'capture:producer:budget_exhausted');
+    // A clean type within budget still verifies — no over-demotion.
+    assert.strictEqual(byKey.get('d16-clean')!.bucket, 'compatible', JSON.stringify(byKey.get('d16-clean')));
   });
 });

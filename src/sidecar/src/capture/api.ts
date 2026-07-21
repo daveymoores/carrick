@@ -138,13 +138,17 @@ export interface CaptureAliasRecord {
    * checkout and is NOT a decay; the probe gates own the final verdict. */
   top_type_at_self_check: boolean;
   /**
-   * Set when the self-check found a disqualifying `any`/`unknown` at DEPTH
-   * (member / element / index signature / type argument) with no failing
-   * pinned-external explanation. The check phase pre-gates exactly these
-   * aliases: its whole-type probe gates cannot see member-level decay, and
-   * `any` at any depth lets an arbitrary counterparty shape read compatible.
+   * Set when the self-check found a disqualifier at DEPTH (member / element /
+   * index signature / type argument / callable return) with no failing
+   * pinned-external explanation: an author-baked `any`/`unknown`, or
+   * `budget_exhausted` — a subtree too deep/wide to finish within the walk's
+   * budget (failed closed, not silently clean). The check phase pre-gates
+   * exactly these aliases: its whole-type probe gates cannot see member-level
+   * decay, and `any` at any depth lets an arbitrary counterparty read
+   * compatible. `any` routes to `gate_caught_baked_any`; `unknown` and
+   * `budget_exhausted` route to `unverifiable`.
    */
-  deep_top_type_kind?: 'any' | 'unknown';
+  deep_top_type_kind?: 'any' | 'unknown' | 'budget_exhausted';
   /** Member path of the deep find, e.g. `metadata` or `items<0>.meta`. */
   deep_top_type_path?: string;
 }

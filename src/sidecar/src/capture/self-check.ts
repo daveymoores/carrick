@@ -142,6 +142,7 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
         ? demotedRecord(anchor)
         : checkedRecord(anchor, {
             args,
+            program,
             checker,
             surfaceAbs,
             surfaceSource,
@@ -170,9 +171,12 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
   };
 }
 
-/** A disqualifying `any`/`unknown` found below the root of a captured type. */
+/** A disqualifying finding below the root of a captured type: an author-baked
+ * `any`/`unknown`, or `budget_exhausted` — a subtree the walk could not finish
+ * within its depth/node budget, treated as unverifiable (fail closed) rather
+ * than silently clean. */
 interface DeepTopType {
-  kind: 'any' | 'unknown';
+  kind: 'any' | 'unknown' | 'budget_exhausted';
   /** Human-readable member path, e.g. `metadata`, `items<0>.meta`, `[index]`. */
   path: string;
 }
@@ -183,13 +187,19 @@ interface DeepTopType {
  * that resolved to `any` (bidirectionally assignable — an arbitrary
  * counterparty shape reads compatible) or `unknown` (a failed-inference bake;
  * carries no shape information). The check phase's probe gates are WHOLE-type
- * only, so this walk owns the depths they cannot see. It must be a genuine
- * SUPERSET of v1's text-scan disqualifier (`contains_disqualifying_top_type`)
- * so that removing the `type_state == Unknown` pre-verdict (carrick #448) never
- * turns a shape v1 would have abstained on into a false-compatible.
+ * only, so this walk owns the depths they cannot see. It is a genuine SUPERSET
+ * of v1's text-scan disqualifier (`contains_disqualifying_top_type`) at ALL
+ * depths/widths — so removing the `type_state == Unknown` pre-verdict (carrick
+ * #448) never turns a shape v1 would have abstained on into a false-compatible.
+ * The superset holds unconditionally because budget EXHAUSTION FAILS CLOSED
+ * (returns the `budget_exhausted` sentinel, not "clean"): a subtree too deep or
+ * wide to finish within budget is unverifiable, never silently compatible. A
+ * bigger bound would only relocate the fail-open cliff; failing closed removes
+ * it. v1's text scan is itself unbounded, so any disqualifier it would flag
+ * that lies past this walk's finite budget is still caught — as
+ * `budget_exhausted` rather than its exact kind.
  *
- * Bounded (depth to v1's expander reach + node budget) and cycle-safe. Two
- * deliberate exceptions to "flag any/unknown anywhere":
+ * Cycle-safe. Two deliberate exceptions to "flag any/unknown anywhere":
  *  - callable PARAMETER types are NOT descended (only return types): a
  *    parameter `any` is contravariant and genuinely permissive (`(x: any) =>
  *    void` safely accepts a stricter counterparty), so it is not a masked
@@ -202,6 +212,7 @@ interface DeepTopType {
  */
 function findDisqualifyingTopType(
   root: ts.Type,
+  program: ts.Program,
   checker: ts.TypeChecker,
   location: ts.Node
 ): DeepTopType | undefined {
@@ -237,7 +248,24 @@ function findDisqualifyingTopType(
   };
 
   const walk = (t: ts.Type, path: string, depth: number): DeepTopType | undefined => {
-    if (depth > MAX_DEPTH || visited > MAX_VISITED || seen.has(t)) return undefined;
+    // Genuine cycle handling — NOT fail-open. `t` is already on the walk stack
+    // (or was fully explored earlier), so the owning frame completes it;
+    // returning "clean" here is sound because a type reaches `seen` ONLY after a
+    // visit that fully completed clean. A visit that hit the budget below
+    // returns the `budget_exhausted` sentinel, which bubbles up (every frame
+    // propagates a truthy child return) and terminates the whole walk before
+    // any shallower re-entry — so `seen` never memoizes a truncated visit as
+    // clean. And a type fully explored clean at depth d1 is clean at any d2 < d1
+    // (the shallower reach is a superset of the deeper), so reusing it is safe.
+    if (seen.has(t)) return undefined;
+    // Budget exhaustion FAILS CLOSED. `return undefined` (clean) here would let
+    // an `any` buried past the depth/node budget read compatible — the
+    // fail-open cliff a bigger number only relocates. Instead abstain: the
+    // alias demotes to unverifiable, over-abstaining on a legitimately clean
+    // type deeper/wider than budget rather than ever false-compatible.
+    if (depth > MAX_DEPTH || visited > MAX_VISITED) {
+      return { kind: 'budget_exhausted', path: path === '' ? '<root>' : path };
+    }
     seen.add(t);
     visited++;
 
@@ -288,6 +316,17 @@ function findDisqualifyingTopType(
     }
 
     for (const prop of t.getProperties()) {
+      // Skip the built-in method suite (`Array#map`, `Promise#then`, ...): a
+      // lib-declared member is machinery, never a wire payload, and descending
+      // its return type recurses (map -> U[] -> map -> ...) until it exhausts
+      // the budget — which pre-fail-closed silently read "clean" and now would
+      // over-abstain on every ordinary `T[]`. The element/value type is still
+      // covered via the type-argument branch above; a USER function-typed
+      // member (`getData: () => any`) is not lib-declared, so it is still walked.
+      const decl = prop.valueDeclaration ?? prop.declarations?.[0];
+      if (decl && program.isSourceFileDefaultLibrary(decl.getSourceFile())) {
+        continue;
+      }
       const propType = checker.getTypeOfSymbolAtLocation(prop, location);
       const found = walk(
         propType,
@@ -306,6 +345,7 @@ function checkedRecord(
   anchor: ResolvedAnchor,
   ctx: {
     args: SelfCheckArgs;
+    program: ts.Program;
     checker: ts.TypeChecker;
     surfaceAbs: string;
     surfaceSource: ts.SourceFile | undefined;
@@ -325,7 +365,7 @@ function checkedRecord(
       topType =
         (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0;
       if (!topType) {
-        deep = findDisqualifyingTopType(type, ctx.checker, stmt.name);
+        deep = findDisqualifyingTopType(type, ctx.program, ctx.checker, stmt.name);
       }
       // Seed the closure with the alias's own import-type targets.
       const visit = (node: ts.Node) => {
@@ -393,15 +433,20 @@ function checkedRecord(
     // `deep` is only computed when `!topType`, so the two are mutually
     // exclusive here.
     if (deep) {
-      // Author-baked member any/unknown. It is baked into the emitted text and
-      // does NOT heal when the check installs pins, so record it even when the
-      // closure ALSO carries a failing pinned external (which would otherwise
-      // allowlist the alias) — fail closed.
+      // A member-level disqualifier. Either an author-baked any/unknown (baked
+      // into the emitted text; does NOT heal when the check installs pins) or a
+      // `budget_exhausted` sentinel (a subtree too deep/wide to finish). Record
+      // it even when the closure ALSO carries a failing pinned external (which
+      // would otherwise allowlist the alias) — fail closed.
       unexplainedDeep = deep;
       outcome = 'decayed_internal';
       detail =
-        `type carries '${deep.kind}' at '${deep.path}'; an arbitrary ` +
-        'counterparty shape would read compatible';
+        deep.kind === 'budget_exhausted'
+          ? `type too deep or wide to verify within the capture budget at ` +
+            `'${deep.path}'; abstaining (fail closed) rather than risk a buried ` +
+            'any reading compatible'
+          : `type carries '${deep.kind}' at '${deep.path}'; an arbitrary ` +
+            'counterparty shape would read compatible';
     } else if (blamedExternal) {
       // Root top type from a pinned external decay: heals when the check
       // installs the pin.
