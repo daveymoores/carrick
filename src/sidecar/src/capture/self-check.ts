@@ -390,7 +390,9 @@ function checkedRecord(
     anchor_origin: anchor.request.anchor_origin,
     serialization: anchor.serialization,
     self_check: outcome,
-    self_check_detail: detail,
+    // A #438/#439 re-aim note is provenance only; a real decay detail always
+    // wins, so it surfaces exactly when the re-aimed alias self-checks clean.
+    self_check_detail: detail ?? anchor.reaimNote,
     top_type_at_self_check: topType,
     ...(unexplainedDeep
       ? {

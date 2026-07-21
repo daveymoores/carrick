@@ -85,8 +85,12 @@ export interface ClassifyInput {
   plan: ProbePlan;
   /** Diagnostics attributed to this pair's probe file. */
   probeDiags: RawDiagnostic[];
-  /** Returns a reason string if the service's stub tree is poisoned. */
-  poisonReason: (serviceName: string) => string | undefined;
+  /**
+   * Returns a reason string when THIS alias of the service is poisoned (#438
+   * part 2: poison is contained to the aliases whose closure includes the
+   * poisoned file, not the whole service).
+   */
+  poisonReason: (serviceName: string, alias: string) => string | undefined;
   scrubCtx: ScrubContext;
 }
 
@@ -96,17 +100,18 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   const codes = [...new Set(probeDiags.map((d) => d.code))].sort((a, b) => a - b);
   const base = { pair_id: plan.pairId, pair_key: plan.spec.pair_key, codes };
 
-  // 1. Poison: any diagnostic in either side's stub tree makes the pair
-  //    unverifiable, never "no probe error -> compatible".
+  // 1. Poison: a diagnostic in this pair's own alias closure (either side)
+  //    makes the pair unverifiable, never "no probe error -> compatible". A
+  //    sibling alias's poison in the same service no longer reaches here.
   for (const side of ['producer', 'consumer'] as const) {
-    const service = plan.spec[side].service_name;
-    const reason = poisonReason(service);
+    const endpoint = plan.spec[side];
+    const reason = poisonReason(endpoint.service_name, endpoint.alias);
     if (reason) {
       return {
         ...base,
         bucket: 'unverifiable',
         gate: `poison:${side}`,
-        diagnostic: `types for service '${service}' contain declaration conflicts; compatibility cannot be verified.`,
+        diagnostic: `the type stub for service '${endpoint.service_name}' does not typecheck (its own declarations carry diagnostics); compatibility cannot be verified.`,
       };
     }
   }

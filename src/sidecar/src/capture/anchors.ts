@@ -7,7 +7,11 @@
 
 import ts from 'typescript';
 import * as path from 'node:path';
-import type { CaptureAnchorRequest, InferAnchorRequest } from './api.js';
+import type {
+  CaptureAnchorRequest,
+  InferAnchorRequest,
+  SymbolAnchorRequest,
+} from './api.js';
 import { printTypeForDestination } from './node-builder.js';
 
 export interface ResolvedAnchor {
@@ -17,6 +21,13 @@ export interface ResolvedAnchor {
   serialization: 'emitted' | 'node_builder' | 'structural_fallback';
   /** Present exactly for demotions (the alias line is `unknown`). */
   failureReason?: string;
+  /**
+   * Provenance for a non-demoting re-aim (#438/#439): recorded into the
+   * alias's `self_check_detail` when the alias self-checks clean, so a symbol
+   * anchor redirected from a value const to its `typeof` type sibling, or a
+   * builder-chain anchor moved off its config descriptor, stays traceable.
+   */
+  reaimNote?: string;
 }
 
 /** Repo-root-relative source file -> extensionless specifier from entryDir. */
@@ -111,6 +122,36 @@ export function resolveAnchor(
     // The anchor is the ELEMENT symbol; array_depth restores the use-site's
     // `[]` levels (#248/#306) so an array-vs-scalar mismatch stays visible.
     const arraySuffix = '[]'.repeat(Math.max(0, request.array_depth ?? 0));
+
+    // #438/#439: an LLM symbol anchor may name a schema VALUE const
+    // (`export const ZFooSchema = z.object({...})`) whose sibling
+    // `export type TFoo = z.infer<typeof ZFooSchema>` was the intended anchor.
+    // A value has no type-space meaning, so `import('./m').ZFooSchema` in TYPE
+    // position raises TS2694 in the stub tree and (before #438 part 2) poisons
+    // every producer pair. Guard structurally on symbol meaning, never on the
+    // name: resolve re-exports, then test for any type-space flag.
+    const resolvedExport = resolveSymbolAliases(checker, exported);
+    if (!symbolHasTypeMeaning(resolvedExport)) {
+      // #439 part 2: re-aim at a sibling type alias defined via a `typeof`
+      // type-query of this const (covers `z.infer<typeof C>` and equivalents;
+      // matched structurally, no library names). Guard A is the fallback.
+      const reaimed = reaimValueSymbolToTypeSibling(checker, sourceFile, {
+        request,
+        valueSymbol: resolvedExport,
+        spec,
+        arraySuffix,
+      });
+      if (reaimed) return reaimed;
+      // #438 part 1: value-only export with no type sibling. Demote so the
+      // existing demotion/backfill path engages (honest `unknown`) instead of
+      // emitting a surface line that references a value in type position.
+      return demote(
+        `'${request.symbol_name}' is a value export with no type-space meaning, ` +
+          `and no sibling type alias derives from it (e.g. \`typeof ${request.symbol_name}\`); ` +
+          'demoted so the surface line stays valid'
+      );
+    }
+
     return {
       request,
       aliasText: `import('${spec}').${request.symbol_name}${arraySuffix}`,
@@ -153,9 +194,24 @@ export function resolveAnchor(
   }
 
   // kind === 'infer'
-  const located = locateNode(sourceFile, request);
+  let located = locateNode(sourceFile, request);
   if (!located) {
     return demote(locatorFailureReason(request));
+  }
+  // #439 part 1: a producer anchor whose locator landed inside a fluent
+  // builder chain's config-descriptor argument (an all-literal metadata
+  // object) must never capture that descriptor as the request type. Re-aim at
+  // the chain's payload/schema argument, or demote when it cannot be picked
+  // unambiguously — never leave the descriptor captured (the artifact behind
+  // v1's false-incompatible verdicts; kept coupled with #438's containment).
+  let reaimNote: string | undefined;
+  const builderReaim = reaimBuilderChainPayload(checker, located);
+  if (builderReaim.kind === 'demote') {
+    return demote(builderReaim.reason);
+  }
+  if (builderReaim.kind === 'reaim') {
+    located = builderReaim.node;
+    reaimNote = builderReaim.note;
   }
   let type = checker.getTypeAtLocation(located);
   if ((request.unwrap ?? 'awaited') === 'awaited') {
@@ -188,6 +244,7 @@ export function resolveAnchor(
     request,
     aliasText: printed.text,
     serialization: 'node_builder',
+    ...(reaimNote ? { reaimNote } : {}),
   };
 }
 
@@ -507,4 +564,373 @@ function firstExpressionOnLine(
   };
   visit(sourceFile);
   return best;
+}
+
+// ===========================================================================
+// #438/#439 symbol-anchor guards: value-only demotion + const->type re-aim.
+// ===========================================================================
+
+/** Follow re-export aliases to the symbol they ultimately denote. */
+function resolveSymbolAliases(checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol {
+  let current = symbol;
+  // Bounded: alias chains are short; the guard is against a pathological cycle.
+  for (let i = 0; i < 16 && (current.flags & ts.SymbolFlags.Alias) !== 0; i++) {
+    let next: ts.Symbol | undefined;
+    try {
+      next = checker.getAliasedSymbol(current);
+    } catch {
+      break;
+    }
+    if (!next || next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * True when the symbol can stand in TYPE position (class, interface, enum,
+ * type alias, type parameter, ...). A pure value export (const / let / var /
+ * function) has no type-space meaning, so referencing it as a type is TS2694.
+ * Structural — never a name check. `ts.SymbolFlags.Type` is the compiler's own
+ * composite of the type-space meanings.
+ */
+function symbolHasTypeMeaning(symbol: ts.Symbol): boolean {
+  return (symbol.flags & ts.SymbolFlags.Type) !== 0;
+}
+
+/**
+ * #439 part 2: when a symbol anchor names a value-only export, look in the
+ * SAME module for a single exported type alias whose type node contains a
+ * `typeof <const>` type-query (covers `z.infer<typeof C>`, `Infer<typeof C>`,
+ * and any equivalent — matched structurally, no library names). Exactly one
+ * match re-aims; zero or several fall back to the value-only demotion (never
+ * guess which of an input/output pair is the request).
+ */
+function reaimValueSymbolToTypeSibling(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+  ctx: {
+    request: SymbolAnchorRequest;
+    valueSymbol: ts.Symbol;
+    spec: string;
+    arraySuffix: string;
+  }
+): ResolvedAnchor | undefined {
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (!moduleSymbol) return undefined;
+  const matches: string[] = [];
+  for (const exported of checker.getExportsOfModule(moduleSymbol)) {
+    const resolved = resolveSymbolAliases(checker, exported);
+    if ((resolved.flags & ts.SymbolFlags.TypeAlias) === 0) continue;
+    const decl = resolved.declarations?.find(ts.isTypeAliasDeclaration);
+    if (!decl) continue;
+    if (
+      typeAliasRhsInfersConst(checker, decl.type, ctx.request.symbol_name, ctx.valueSymbol)
+    ) {
+      matches.push(exported.getName());
+    }
+  }
+  if (matches.length !== 1) return undefined;
+  return {
+    request: ctx.request,
+    aliasText: `import('${ctx.spec}').${matches[0]}${ctx.arraySuffix}`,
+    serialization: 'emitted',
+    reaimNote:
+      `symbol anchor '${ctx.request.symbol_name}' is a value; re-aimed at sibling ` +
+      `type alias '${matches[0]}' (derived via \`typeof ${ctx.request.symbol_name}\`)`,
+  };
+}
+
+/**
+ * True iff the type alias RHS IS the inferred type derived from a
+ * `typeof <const>` query — the ordinary `export type T = z.infer<typeof C>`
+ * shape — and NOT a wrapper that merely embeds it. Structurally: the whole
+ * type node is a generic type reference (`Infer<typeof C>` /
+ * `SomeGeneric<typeof C>`) whose DIRECT type arguments include a `typeof C`
+ * query.
+ *
+ * An object / union / intersection / array that embeds the query as a member
+ * or element (`{ data: Infer<typeof C>; meta: string }`) is a WRAPPER: re-aiming
+ * at it would capture the wrapper shape, not the payload, and (since the
+ * wrapper self-checks concretely) manufacture a false incompatible. Those fall
+ * back to the value-only demotion — a guaranteed abstain, never a wrong
+ * concrete verdict. A bare `typeof C` alias is also rejected: it denotes the
+ * schema wrapper value's type, not the inferred payload. Still no library-name
+ * checks: matched purely on shape.
+ */
+function typeAliasRhsInfersConst(
+  checker: ts.TypeChecker,
+  node: ts.TypeNode,
+  symbolName: string,
+  valueSymbol: ts.Symbol
+): boolean {
+  if (!ts.isTypeReferenceNode(node)) return false;
+  for (const arg of node.typeArguments ?? []) {
+    let inner: ts.TypeNode = arg;
+    while (ts.isParenthesizedTypeNode(inner)) inner = inner.type;
+    if (
+      ts.isTypeQueryNode(inner) &&
+      typeQueryMatchesSymbol(checker, inner, symbolName, valueSymbol)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Does a `typeof X` query denote `valueSymbol`? Symbol identity is primary
+ * (resolves through re-exports and works on a bare checkout: the value symbol
+ * resolves without the schema library present); a textual identifier match on
+ * `symbolName` is the fallback.
+ */
+function typeQueryMatchesSymbol(
+  checker: ts.TypeChecker,
+  query: ts.TypeQueryNode,
+  symbolName: string,
+  valueSymbol: ts.Symbol
+): boolean {
+  const entity = query.exprName;
+  const idNode = ts.isQualifiedName(entity) ? entity.right : entity;
+  const queried =
+    checker.getSymbolAtLocation(entity) ?? checker.getSymbolAtLocation(idNode);
+  if (queried && resolveSymbolAliases(checker, queried) === valueSymbol) return true;
+  return ts.isIdentifier(idNode) && idNode.text === symbolName;
+}
+
+// ===========================================================================
+// #439 part 1: builder-chain payload selection.
+//
+// A producer request anchor whose line-based locator lands inside a fluent
+// builder chain's config-descriptor argument (`.meta({ openapi: {...} })`)
+// would otherwise capture that literal metadata object as the request type.
+// We re-aim at the chain argument that carries a schema, or demote when the
+// payload cannot be picked unambiguously.
+//
+// STRUCTURAL, NOT NAME-BASED: no method name (`meta` / `input` / `mutation`)
+// is consulted anywhere. The signal that the located node is a config
+// descriptor is purely that it is a non-empty, all-literal-typed object
+// literal argument of a chain of >=2 fluent calls; a payload candidate is a
+// chain argument whose RESOLVED type has object/payload meaning (a schema
+// resolves to an object; a string/number tag does not).
+//
+// SAFETY of the two outcomes:
+//   - the DEMOTE branches (no object candidate, or several) are no-worse-than
+//     the descriptor: within this trigger the locator already sat on the
+//     descriptor, so an honest `unknown` can never be worse than the concrete,
+//     wrong descriptor it replaces — a guaranteed abstain.
+//   - the single-candidate RE-AIM branch is a HEURISTIC, not a guaranteed-safe
+//     substitution: it swaps the concrete descriptor for a concrete payload
+//     type, so it is deliberately guarded (object-typed candidate only, and
+//     exactly one) to keep the genuine single-schema case working while a
+//     non-object, ambiguous, or absent candidate abstains instead of guessing.
+//
+// LIMITATION (documented per the house rule that pragmatic is acceptable but
+// silent brittleness is not): a chain carrying two object-typed arguments —
+// e.g. both an input and an output schema — cannot be disambiguated as request
+// vs response without method-name knowledge, so it demotes rather than risk
+// the wrong side.
+// ===========================================================================
+
+type BuilderReaim =
+  | { kind: 'none' }
+  | { kind: 'reaim'; node: ts.Expression; note: string }
+  | { kind: 'demote'; reason: string };
+
+function reaimBuilderChainPayload(
+  checker: ts.TypeChecker,
+  located: ts.Node
+): BuilderReaim {
+  const descriptorCall = enclosingChainDescriptorCall(located);
+  if (!descriptorCall) return { kind: 'none' };
+  const chain = fluentChainCalls(descriptorCall);
+  if (chain.length < 2) return { kind: 'none' };
+
+  const candidates = payloadCandidates(checker, chain);
+  if (candidates.length === 1) {
+    return {
+      kind: 'reaim',
+      node: candidates[0],
+      note:
+        'producer anchor landed on a builder-chain config descriptor; ' +
+        're-aimed at the chain schema argument',
+    };
+  }
+  // Zero (a descriptor with no schema argument) or several (ambiguous
+  // input/output schemas): never keep the descriptor captured.
+  return {
+    kind: 'demote',
+    reason:
+      candidates.length === 0
+        ? 'producer anchor landed on a builder-chain config descriptor with no ' +
+          'identifiable schema argument; demoted to keep the request type honest'
+        : `producer anchor landed on a builder-chain config descriptor; ` +
+          `${candidates.length} schema arguments are present and cannot be ` +
+          'disambiguated structurally; demoted to keep the request type honest',
+  };
+}
+
+/**
+ * Walk up from the located node to the enclosing object literal that is (a) a
+ * direct argument of a call and (b) all-literal metadata (the descriptor
+ * signature). Returns that call, or undefined when the located node is not
+ * inside such a descriptor.
+ */
+function enclosingChainDescriptorCall(
+  located: ts.Node
+): ts.CallExpression | undefined {
+  let node: ts.Node | undefined = located;
+  while (node) {
+    if (
+      ts.isObjectLiteralExpression(node) &&
+      node.parent &&
+      ts.isCallExpression(node.parent) &&
+      (node.parent.arguments as readonly ts.Node[]).includes(node) &&
+      isAllLiteralMetadata(node)
+    ) {
+      return node.parent;
+    }
+    node = node.parent;
+  }
+  return undefined;
+}
+
+/**
+ * The full set of calls in the fluent chain containing `anyCall`
+ * (`x.a(...).b(...).c(...)` -> the three calls). Climbs to the outermost call,
+ * then descends the callee chain.
+ */
+function fluentChainCalls(anyCall: ts.CallExpression): ts.CallExpression[] {
+  let outer = anyCall;
+  for (;;) {
+    const access = outer.parent;
+    if (
+      access &&
+      (ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access)) &&
+      access.expression === outer &&
+      access.parent &&
+      ts.isCallExpression(access.parent) &&
+      access.parent.expression === access
+    ) {
+      outer = access.parent;
+      continue;
+    }
+    break;
+  }
+  const calls: ts.CallExpression[] = [];
+  let current: ts.Expression = outer;
+  while (ts.isCallExpression(current)) {
+    calls.push(current);
+    const callee = current.expression;
+    if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+      current = callee.expression;
+    } else {
+      break;
+    }
+  }
+  return calls;
+}
+
+/**
+ * Chain arguments that carry type-space PAYLOAD meaning: a named or constructed
+ * schema (identifier / member access / call) whose RESOLVED type is an object
+ * shape. Two filters, both load-bearing:
+ *  - syntactic: inline object/array literals and inline functions (handlers)
+ *    are never candidates;
+ *  - semantic: a candidate whose resolved type is a primitive or literal
+ *    (`.tag(routeName)` with `routeName: string`), a bare callable (a named
+ *    handler), or a top type is REJECTED — capturing a string-literal type as a
+ *    request payload manufactures a false incompatible. Only an object-typed
+ *    argument is a real schema.
+ * With this filter the single-candidate re-aim fires only on a genuine schema,
+ * and a non-object, ambiguous (>1), or absent candidate abstains via demote.
+ */
+function payloadCandidates(
+  checker: ts.TypeChecker,
+  chain: ts.CallExpression[]
+): ts.Expression[] {
+  const out: ts.Expression[] = [];
+  for (const call of chain) {
+    for (const arg of call.arguments) {
+      if (
+        (ts.isIdentifier(arg) ||
+          ts.isPropertyAccessExpression(arg) ||
+          ts.isElementAccessExpression(arg) ||
+          ts.isCallExpression(arg)) &&
+        typeIsObjectPayload(checker.getTypeAtLocation(arg))
+      ) {
+        out.push(arg);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * A type with object/payload meaning: a real object shape (or a union /
+ * intersection of them), never a primitive, string/number/boolean/bigint/enum
+ * literal, null/undefined/void, a top type (`any`/`unknown`/`never` — cannot be
+ * confirmed a payload), or a bare callable value (a handler function). This is
+ * the gate that keeps the builder-chain re-aim from capturing a non-schema.
+ */
+function typeIsObjectPayload(type: ts.Type): boolean {
+  const nonObject =
+    ts.TypeFlags.Any |
+    ts.TypeFlags.Unknown |
+    ts.TypeFlags.Never |
+    ts.TypeFlags.Null |
+    ts.TypeFlags.Undefined |
+    ts.TypeFlags.Void |
+    ts.TypeFlags.StringLike |
+    ts.TypeFlags.NumberLike |
+    ts.TypeFlags.BooleanLike |
+    ts.TypeFlags.BigIntLike |
+    ts.TypeFlags.ESSymbolLike |
+    ts.TypeFlags.EnumLike;
+  if (type.flags & nonObject) return false;
+  if (type.flags & (ts.TypeFlags.Union | ts.TypeFlags.Intersection)) {
+    // Every constituent must be an object shape: `string | { a }` is not a
+    // clean payload, while a union of objects stays eligible.
+    return (type as ts.UnionOrIntersectionType).types.every(typeIsObjectPayload);
+  }
+  if (type.flags & ts.TypeFlags.Object) {
+    // A bare callable (a named handler passed as a value) is not a payload; a
+    // schema object carries no top-level call/construct signature.
+    if (
+      type.getCallSignatures().length > 0 ||
+      type.getConstructSignatures().length > 0
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/** A non-empty object literal whose every property is a literal-typed value. */
+function isAllLiteralMetadata(obj: ts.ObjectLiteralExpression): boolean {
+  if (obj.properties.length === 0) return false;
+  for (const prop of obj.properties) {
+    if (!ts.isPropertyAssignment(prop)) return false;
+    if (!isLiteralValueExpression(prop.initializer)) return false;
+  }
+  return true;
+}
+
+function isLiteralValueExpression(expr: ts.Expression): boolean {
+  switch (expr.kind) {
+    case ts.SyntaxKind.StringLiteral:
+    case ts.SyntaxKind.NoSubstitutionTemplateLiteral:
+    case ts.SyntaxKind.NumericLiteral:
+    case ts.SyntaxKind.TrueKeyword:
+    case ts.SyntaxKind.FalseKeyword:
+    case ts.SyntaxKind.NullKeyword:
+      return true;
+  }
+  if (ts.isPrefixUnaryExpression(expr)) return isLiteralValueExpression(expr.operand);
+  if (ts.isArrayLiteralExpression(expr)) {
+    return expr.elements.every(isLiteralValueExpression);
+  }
+  if (ts.isObjectLiteralExpression(expr)) return isAllLiteralMetadata(expr);
+  return false;
 }

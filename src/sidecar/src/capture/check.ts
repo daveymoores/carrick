@@ -41,6 +41,7 @@ import {
   writeProbes,
   type AssembledWorkspace,
 } from './check-workspace.js';
+import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
 
 export type CheckProgress = (phase: CheckProgressPhase, message: string) => void;
 
@@ -300,16 +301,23 @@ export async function runCheck(
     probing
   );
   for (const e of globalErrors) errors.push(scrubPaths(e, scrubCtx));
-  for (const [service, reason] of poison) {
-    degraded.push({ service_name: service, reason });
+  // Only SERVICE-WIDE poison (an unattributable stub diagnostic) degrades the
+  // whole service; contained alias-scoped poison rides its own verdicts.
+  for (const [service, scope] of poison) {
+    if (scope.all) degraded.push({ service_name: service, reason: scope.reason });
   }
+  const poisonReason = (service: string, alias: string): string | undefined => {
+    const scope = poison.get(service);
+    if (!scope) return undefined;
+    return scope.all || scope.aliases.has(alias) ? scope.reason : undefined;
+  };
 
   const verdicts = sortVerdicts([
     ...probing.map((plan) =>
       classifyPair({
         plan,
         probeDiags: probeDiagsByPair.get(plan.pairId) ?? [],
-        poisonReason: (svc) => poison.get(svc),
+        poisonReason,
         scrubCtx,
       })
     ),
@@ -383,14 +391,32 @@ function deepDecayOf(
   return undefined;
 }
 
-/** Group diagnostics: per-probe (for classification), plus stub-tree poison. */
+/**
+ * Alias-scoped poison for a service (#438 part 2). `all` is set only when a
+ * stub diagnostic could not be attributed to any alias's closure (soundness
+ * fallback); otherwise exactly the reachable aliases are poisoned.
+ */
+interface PoisonScope {
+  all: boolean;
+  aliases: Set<string>;
+  reason: string;
+}
+
+const POISON_REASON = 'stub type tree carries its own diagnostics';
+
+/**
+ * Group diagnostics: per-probe (for classification), plus stub-tree poison
+ * CONTAINED to the aliases reachable from the poisoned file (#438 part 2). An
+ * unattributable stub diagnostic (an augmentation-file collision in no alias's
+ * closure) falls back to service-wide poison; everything else is scoped.
+ */
 function attributeDiagnostics(
   diagnostics: RawDiagnostic[],
   ws: AssembledWorkspace,
   plans: ProbePlan[]
 ): {
   probeDiagsByPair: Map<string, RawDiagnostic[]>;
-  poison: Map<string, string>;
+  poison: Map<string, PoisonScope>;
   globalErrors: string[];
 } {
   const probeFileToPair = new Map<string, string>();
@@ -398,10 +424,24 @@ function attributeDiagnostics(
     probeFileToPair.set(`${ws.probesRel}/probes/${plan.fileName}`, plan.pairId);
   }
   const stubDirs = new Set(ws.stubs.map((s) => s.packageDir));
+  // Lazy: the clean path (no stub-tree diagnostic) must not walk and parse
+  // every stub `.d.ts` tree. Built on first stub-tree diagnostic, at most once.
+  let indexesMemo: Map<string, StubPoisonIndex> | undefined;
+  const getIndexes = (): Map<string, StubPoisonIndex> =>
+    (indexesMemo ??= buildPoisonIndexes(ws));
 
   const probeDiagsByPair = new Map<string, RawDiagnostic[]>();
-  const poison = new Map<string, string>();
+  const poison = new Map<string, PoisonScope>();
   const globalErrors: string[] = [];
+
+  const scopeFor = (service: string): PoisonScope => {
+    let scope = poison.get(service);
+    if (!scope) {
+      scope = { all: false, aliases: new Set(), reason: POISON_REASON };
+      poison.set(service, scope);
+    }
+    return scope;
+  };
 
   for (const d of diagnostics) {
     if (!d.file) {
@@ -418,8 +458,22 @@ function attributeDiagnostics(
     const pkgMatch = d.file.match(/^packages\/([^/]+)\//);
     if (pkgMatch && !d.file.includes('/node_modules/') && stubDirs.has(pkgMatch[1])) {
       const service = ws.serviceOfPackageDir(pkgMatch[1]);
-      if (service && !poison.has(service)) {
-        poison.set(service, 'stub type tree carries its own diagnostics');
+      if (!service) continue;
+      const scope = scopeFor(service);
+      const index = getIndexes().get(service);
+      if (index && d.file === index.surfaceFile) {
+        // Surface diagnostic: attribute by the alias statement span it sits in.
+        const alias = index.aliasAtSurfaceLine(d.line);
+        if (alias) scope.aliases.add(alias);
+        else scope.all = true;
+      } else if (index) {
+        // Nested-file diagnostic: attribute to every alias whose closure reads
+        // it; a file in no closure (augmentation collision) falls back wide.
+        const affected = index.aliasesForFile(d.file);
+        if (affected.length > 0) for (const a of affected) scope.aliases.add(a);
+        else scope.all = true;
+      } else {
+        scope.all = true;
       }
     }
     // Anything else (node_modules, TS lib) is environmental: ignored for
