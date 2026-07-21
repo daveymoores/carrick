@@ -241,6 +241,13 @@ function findDisqualifyingTopType(
       // reference. Genuine author `any` carries `intrinsicName === 'any'`.
       // (`intrinsicName` is internal but stable since TS 1.x — same standing as
       // its use in anchors.ts.)
+      //
+      // The `error` placeholder also stands in for NON-healable causes (TS2304
+      // undefined name, TS2315 wrong-arity generic, a dangling internal
+      // specifier). Excluding those here is not a hole: each emits a diagnostic
+      // in the alias's own closure, so the closure-failure classification
+      // (`internalFailure` -> decayed_internal) or the check-phase POISON rule
+      // — NOT this deep walk — is their backstop, and both fail closed.
       const name = (t as unknown as { intrinsicName?: string }).intrinsicName;
       return name === 'error' ? undefined : 'any';
     }
