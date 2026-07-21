@@ -13,6 +13,7 @@ import type {
   SymbolAnchorRequest,
 } from './api.js';
 import { printTypeForDestination } from './node-builder.js';
+import { typeIsOrContainsMachinery } from './machinery.js';
 
 export interface ResolvedAnchor {
   request: CaptureAnchorRequest;
@@ -232,6 +233,23 @@ export function resolveAnchor(
       const recovered = checker.getTypeAtLocation(literalNode);
       if (!isTopType(recovered)) type = recovered;
     }
+  }
+  // carrick#371 fail-closed guard: a producer anchor whose resolved type IS or
+  // CONTAINS framework machinery (a raw `Response`/`Request`, a wrapper envelope
+  // `{ response: Response; error }`, a wrapper function `(req) => Promise<Response>`)
+  // must never be emitted as a comparable contract — that manufactures a false
+  // compat mismatch against the consumer's real payload. This is the capture
+  // fallback for the case the v1-inferrer machinery guard leaves behind: when v1
+  // abstains on the envelope, `derive_capture_anchors` re-routes the alias to
+  // this locator-based infer anchor, which then resolves the WRAPPER FUNCTION
+  // type. No source locator points at a distinct clean payload here (the payload
+  // lives inside the wrapper's response builder), so degrade to `unknown` —
+  // abstain, never a concrete verdict off the machinery.
+  if (typeIsOrContainsMachinery(checker, type, located)) {
+    return demote(
+      'resolved type is or contains framework machinery (Response/Request-shaped); ' +
+        'degraded to unknown rather than emit a wrapper envelope as a response contract'
+    );
   }
   if (!args.placeholder) {
     return demote('internal: no placeholder destination for infer anchor');
