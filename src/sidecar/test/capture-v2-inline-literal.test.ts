@@ -59,6 +59,7 @@ function registrationSpanOf(head: string): { span_start: number; span_end: numbe
   const start = ROUTES_SOURCE.indexOf(head);
   assert.ok(start >= 0, `fixture drift: '${head}' not found`);
   const open = ROUTES_SOURCE.indexOf('(', start);
+  assert.ok(open >= 0, `fixture drift: no '(' after '${head}'`);
   let depth = 0;
   for (let i = open; i < ROUTES_SOURCE.length; i++) {
     if (ROUTES_SOURCE[i] === '(') depth++;
@@ -146,7 +147,7 @@ describe('capture v2: inline literal response types under an unresolvable generi
   });
 
   after(() => {
-    fs.rmSync(outRoot, { recursive: true, force: true });
+    if (outRoot) fs.rmSync(outRoot, { recursive: true, force: true });
   });
 
   it('recovers the send-call shape: literal with a local named type, self-check ok', () => {
