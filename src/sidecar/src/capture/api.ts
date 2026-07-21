@@ -277,7 +277,14 @@ export interface CheckVerdict {
   codes: number[];
 }
 
-/** A service whose pairs are degraded wholesale (install failure or poison). */
+/**
+ * A service degraded SERVICE-WIDE: install failure, or a stub-tree diagnostic
+ * that could not be attributed to any alias's import closure (#438). Poison
+ * contained to specific aliases does NOT appear here — those pairs carry their
+ * own `poison:*` verdicts while the service's clean pairs verify normally. So
+ * absence from this list is not a "fully verified" signal; read per-pair
+ * verdicts for that.
+ */
 export interface DegradedService {
   service_name: string;
   reason: string;

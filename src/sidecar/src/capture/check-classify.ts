@@ -111,7 +111,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
         ...base,
         bucket: 'unverifiable',
         gate: `poison:${side}`,
-        diagnostic: `types for service '${endpoint.service_name}' contain declaration conflicts; compatibility cannot be verified.`,
+        diagnostic: `the type stub for service '${endpoint.service_name}' does not typecheck (its own declarations carry diagnostics); compatibility cannot be verified.`,
       };
     }
   }

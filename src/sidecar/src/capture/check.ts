@@ -41,7 +41,7 @@ import {
   writeProbes,
   type AssembledWorkspace,
 } from './check-workspace.js';
-import { buildPoisonIndexes } from './check-poison.js';
+import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
 
 export type CheckProgress = (phase: CheckProgressPhase, message: string) => void;
 
@@ -424,7 +424,11 @@ function attributeDiagnostics(
     probeFileToPair.set(`${ws.probesRel}/probes/${plan.fileName}`, plan.pairId);
   }
   const stubDirs = new Set(ws.stubs.map((s) => s.packageDir));
-  const indexes = buildPoisonIndexes(ws);
+  // Lazy: the clean path (no stub-tree diagnostic) must not walk and parse
+  // every stub `.d.ts` tree. Built on first stub-tree diagnostic, at most once.
+  let indexesMemo: Map<string, StubPoisonIndex> | undefined;
+  const getIndexes = (): Map<string, StubPoisonIndex> =>
+    (indexesMemo ??= buildPoisonIndexes(ws));
 
   const probeDiagsByPair = new Map<string, RawDiagnostic[]>();
   const poison = new Map<string, PoisonScope>();
@@ -456,7 +460,7 @@ function attributeDiagnostics(
       const service = ws.serviceOfPackageDir(pkgMatch[1]);
       if (!service) continue;
       const scope = scopeFor(service);
-      const index = indexes.get(service);
+      const index = getIndexes().get(service);
       if (index && d.file === index.surfaceFile) {
         // Surface diagnostic: attribute by the alias statement span it sits in.
         const alias = index.aliasAtSurfaceLine(d.line);
