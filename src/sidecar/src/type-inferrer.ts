@@ -102,6 +102,48 @@ const BUILTIN_ANCHOR_SYMBOLS = new Set<string>([
 ]);
 
 /**
+ * Strongly-discriminating member names of HTTP transport machinery — the
+ * fetch/DOM `Response` & `Request`, a Node `http.ServerResponse`, a framework
+ * reply object. A type declared in a lib or `node_modules` origin that carries
+ * a subset of these is framework machinery, never a user contract: the
+ * PRODUCER-side structural mirror of the consumer `machineryIndicators`
+ * (ExtractionConfig), used to reject a wrapper envelope whose response field is
+ * a raw `Response` (carrick#371) instead of emitting it as a comparable type.
+ *
+ * Framework-agnostic by construction: no framework NAME appears here, only the
+ * shared HTTP-message surface. The names are deliberately the ones no
+ * JSON payload ever carries (`ok`, `redirected`, `bodyUsed`, `arrayBuffer`,
+ * `writeHead`, ...), so the origin gate + `MACHINERY_INDICATOR_THRESHOLD` never
+ * fire on real data. Kept in lockstep with the capture-seam mirror
+ * `capture/machinery.ts` (the seam forbids sharing a module across it, same as
+ * `BUILTIN_ANCHOR_SYMBOLS` mirrors `socket_io.rs`). Exported so a drift-guard
+ * test (`machinery-indicator-mirror.test.ts`) asserts the two sets stay equal.
+ */
+export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
+  // fetch / DOM Response & Request body-consumer surface
+  'ok',
+  'redirected',
+  'bodyUsed',
+  'arrayBuffer',
+  'blob',
+  'formData',
+  'clone',
+  'json',
+  'statusText',
+  // Node http ServerResponse / reply-object surface
+  'statusCode',
+  'statusMessage',
+  'setHeader',
+  'getHeader',
+  'removeHeader',
+  'writeHead',
+  'flushHeaders',
+]);
+
+/** Machinery needs at least this many indicator members to be recognized. */
+const MACHINERY_INDICATOR_THRESHOLD = 3;
+
+/**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
  *
  * `Type.getText()` truncates large/anonymous object types to ~160 chars and inserts
@@ -343,6 +385,21 @@ export class TypeInferrer {
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
     } else {
+      // No wrapper rule fired. Before treating the raw return as the contract,
+      // reject a wrapper envelope that IS or CONTAINS framework machinery
+      // (carrick#371): `withApiWrapper({ handler: () => ({ response: Response,
+      // error })})` resolves the handler's return to `{ response: Response; ... }`,
+      // which is transport machinery, not a payload. Emitting it manufactures a
+      // false compat mismatch against the consumer's real payload. No rule
+      // recovered a payload here, so abstain (honest `unknown`) — fail-closed.
+      if (this.typeIsOrContainsResponseMachinery(awaitedType)) {
+        this.log(
+          `Return type at ${request.file_path}:${request.line_number} is or contains ` +
+            'framework machinery (Response/Request-shaped); abstaining rather than ' +
+            'capturing the wrapper envelope as a response contract'
+        );
+        return null;
+      }
       // No wrapper rule fired: the (awaited) return resolved to its own type.
       // A named object return (`async (): Promise<Payment> => …`) renders as the
       // bare name `Payment`, which dangles in the source-less cross-repo bundle.
@@ -625,12 +682,24 @@ export class TypeInferrer {
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
     } else {
+      const resolved = this.unwrapPromiseType(payloadType);
+      // Same carrick#371 fail-closed guard as the function-return path: a
+      // payload that IS or CONTAINS framework machinery (a raw `Response`, a
+      // `{ response: Response; ... }` envelope) is not a contract. No rule
+      // recovered a payload, so abstain rather than emit the machinery.
+      if (this.typeIsOrContainsResponseMachinery(resolved)) {
+        this.log(
+          `Response payload at ${request.file_path}:${request.line_number} is or contains ` +
+            'framework machinery (Response/Request-shaped); abstaining rather than ' +
+            'capturing it as a response contract'
+        );
+        return null;
+      }
       // No wrapper rule fired: the payload resolved straight to its own type.
       // If that's a named object (`res.json(payment)` with `payment: Payment`),
       // `typeText` keeps the bare name `Payment`, which dangles in the
       // source-less cross-repo bundle → `any` → unverifiable. Expand the
       // resolved object structurally so the real members land in the bundle.
-      const resolved = this.unwrapPromiseType(payloadType);
       typeString = this.expandResolvedTypeStructural(resolved, typeString);
     }
 
@@ -1557,6 +1626,148 @@ export class TypeInferrer {
     }
 
     return null;
+  }
+
+  /**
+   * True when a producer RESPONSE type IS or CONTAINS framework transport
+   * machinery (a fetch/DOM `Response`, a Node `ServerResponse`, a reply object)
+   * — the artifact behind carrick#371, where a wrapped handler's literal return
+   * envelope `{ response: Response; error?: undefined } | { ...; error: Error }`
+   * was captured as the response contract. Machinery is never a comparable
+   * contract, so a response path that resolves here abstains (honest `unknown`)
+   * rather than emit a concrete-but-false type.
+   *
+   * DETECTS, exactly (see `typeIsOrContainsMachinery`):
+   *   1. the type itself is machinery (`typeIsFrameworkMachinery`);
+   *   2. a union/intersection member is machinery (the envelope union);
+   *   3. a DIRECT property's type is machinery, ONE level of descent only
+   *      (`{ response: Response; error }`).
+   *
+   * DELIBERATELY NOT DETECTED — listed so this comment never overstates the
+   * guarantee (an overstated safety comment is what bit sibling PR #442). Each is
+   * a non-regression: it leaves the pre-existing verdict unchanged and never
+   * manufactures a new wrong one, tracked as a follow-up:
+   *   - machinery nested deeper than one property level (a property whose type
+   *     is itself a nested object wrapping the machinery);
+   *   - a property typed `Promise<Response>` (the property type is NOT awaited /
+   *     Promise-unwrapped before the machinery check);
+   *   - an array element type: `Response[]` is not descended to its element;
+   *   - `interface X extends Response` declared in USER source — the origin gate
+   *     is lib/`node_modules` only, so a user-declared subtype reads as a real
+   *     contract, not machinery;
+   *   - a function / call-signature return type: the response paths that call
+   *     this resolve a handler's RETURN (an envelope/object), never a function
+   *     value, so no call-signature descent happens here. The capture-seam
+   *     mirror `capture/machinery.ts` DOES descend call signatures — that is
+   *     where the wrapper-FUNCTION type the Infer fallback resolves is caught.
+   *
+   * The origin gate in `typeIsFrameworkMachinery` keeps a user object whose
+   * fields merely share a member name from tripping.
+   */
+  private typeIsOrContainsResponseMachinery(type: Type): boolean {
+    return this.typeIsOrContainsMachinery(type, 0);
+  }
+
+  private typeIsOrContainsMachinery(type: Type, depth: number): boolean {
+    if (this.typeIsFrameworkMachinery(type)) {
+      return true;
+    }
+    // Union/intersection: any envelope member wrapping machinery taints it.
+    if (type.isUnion()) {
+      return type
+        .getUnionTypes()
+        .some((part) => this.typeIsOrContainsMachinery(part, depth));
+    }
+    if (type.isIntersection()) {
+      return type
+        .getIntersectionTypes()
+        .some((part) => this.typeIsOrContainsMachinery(part, depth));
+    }
+    // One level of property descent: `{ response: Response; error?: undefined }`.
+    if (depth < 1) {
+      for (const prop of type.getProperties()) {
+        const decl = prop.getDeclarations()[0];
+        if (!decl) continue;
+        const propType = prop.getTypeAtLocation(decl);
+        if (this.typeIsOrContainsMachinery(propType, depth + 1)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * True when `type` itself is an HTTP-machinery type: it structurally carries
+   * at least `MACHINERY_INDICATOR_THRESHOLD` of the strongly-discriminating
+   * `MACHINERY_MEMBER_INDICATORS`, AND its symbol is declared in a lib
+   * (`lib.dom.d.ts`, ...) or `node_modules` origin. Both gates are required —
+   * the indicator subset alone essentially never matches a JSON payload, and
+   * the origin gate makes certain a user's own local type sharing those member
+   * names is never mistaken for framework machinery (the advisor's guard).
+   */
+  private typeIsFrameworkMachinery(type: Type): boolean {
+    if (!this.hasMachineryIndicatorThreshold(type)) {
+      return false;
+    }
+    const symbol = type.getSymbol() ?? type.getAliasSymbol();
+    return this.symbolIsLibOrExternalOrigin(symbol);
+  }
+
+  /**
+   * True once the type carries at least `MACHINERY_INDICATOR_THRESHOLD` DISTINCT
+   * `MACHINERY_MEMBER_INDICATORS` (own + apparent). Deduplicates by name (own and
+   * apparent property lists overlap) and early-returns the moment the threshold
+   * is reached — the callers only need the boolean, never the full count.
+   */
+  private hasMachineryIndicatorThreshold(type: Type): boolean {
+    const matched = new Set<string>();
+    const consider = (name: string): boolean => {
+      if (MACHINERY_MEMBER_INDICATORS.has(name)) {
+        matched.add(name);
+      }
+      return matched.size >= MACHINERY_INDICATOR_THRESHOLD;
+    };
+    for (const prop of type.getProperties()) {
+      if (consider(prop.getName())) return true;
+    }
+    for (const prop of type.getApparentProperties()) {
+      if (consider(prop.getName())) return true;
+    }
+    return false;
+  }
+
+  /**
+   * True when the symbol is declared in a TypeScript lib file (`lib.*.d.ts`) or
+   * under `node_modules` — i.e. framework/runtime machinery, not user source.
+   * Works on a bare checkout: the DOM `Response`/`Request` resolve from the
+   * bundled `lib.dom.d.ts` even with no installed dependencies.
+   */
+  private symbolIsLibOrExternalOrigin(symbol: TsSymbol | undefined): boolean {
+    if (!symbol) {
+      return false;
+    }
+    const isExternalPath = (filePath: string): boolean => {
+      const normalized = filePath.replace(/\\/g, '/');
+      return (
+        normalized.includes('/node_modules/') ||
+        /\/lib\.[^/]*\.d\.ts$/.test(normalized)
+      );
+    };
+    for (const decl of symbol.getDeclarations()) {
+      if (isExternalPath(decl.getSourceFile().getFilePath())) {
+        return true;
+      }
+    }
+    try {
+      const aliased = symbol.getAliasedSymbol?.();
+      if (aliased && aliased !== symbol) {
+        return this.symbolIsLibOrExternalOrigin(aliased);
+      }
+    } catch {
+      // Ignore errors when resolving the aliased symbol.
+    }
+    return false;
   }
 
   /**
