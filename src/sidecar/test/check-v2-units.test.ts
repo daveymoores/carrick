@@ -186,15 +186,31 @@ describe('four-bucket classifier precedence', () => {
     assert.strictEqual(v.gate, 'import:producer');
   });
 
-  it('stub poison outranks everything -> unverifiable', () => {
+  it('stub poison for THIS alias outranks everything -> unverifiable', () => {
     const v = classifyPair({
       plan,
       probeDiags: [diag(plan.assignmentLine, 2741)],
-      poisonReason: (svc) => (svc === 'orders' ? 'conflict' : undefined),
+      // #438 part 2: poison is scoped to a (service, alias); the producer
+      // alias here is poisoned, so it wins over the assignment error.
+      poisonReason: (svc, alias) =>
+        svc === 'orders' && alias === 'Endpoint_a_Response' ? 'conflict' : undefined,
       scrubCtx,
     });
     assert.strictEqual(v.bucket, 'unverifiable');
     assert.strictEqual(v.gate, 'poison:producer');
+  });
+
+  it('poison of a SIBLING alias in the same service does not contain this pair', () => {
+    // Only a different alias of the producer service is poisoned; this pair's
+    // own aliases are clean, so it must still verdict (the #438 containment).
+    const v = classifyPair({
+      plan,
+      probeDiags: [],
+      poisonReason: (svc, alias) =>
+        svc === 'orders' && alias === 'Some_Other_Alias' ? 'conflict' : undefined,
+      scrubCtx,
+    });
+    assert.strictEqual(v.bucket, 'compatible');
   });
 });
 
