@@ -4,16 +4,20 @@
  *  1. `installedVersions` — the repo's own node_modules, when installed.
  *     This is the version the repo actually resolves against, so it wins
  *     over the lockfile, and it covers repos whose lockfiles we do not
- *     parse at all (yarn classic/berry, bun).
+ *     parse at all (yarn classic v1, binary bun.lockb).
  *  2. `lockfileVersions` — parsed lockfile fallback for bare checkouts
- *     (npm v1/v2/v3 and pnpm v6/v9 in scope).
+ *     (npm v1/v2/v3, pnpm v6/v9, yarn-berry v2+, and bun's text bun.lock
+ *     in scope).
  *
  * Pin selection prefers the DIRECT (top-level) dependency version: a package
  * present at multiple versions must pin to the version the emitted tree
  * resolves against — the hoisted/direct install — never to whichever nested
  * copy happens to appear first in the lockfile (npm sorts
  * `node_modules/a/node_modules/b` before `node_modules/b`, so first-match
- * picks a nested version the tree never sees).
+ * picks a nested version the tree never sees). When a lockfile offers
+ * multiple versions and no direct install can be identified, the package
+ * stays UNPINNED (fail-closed abstain): a wrong pin fails or corrupts the
+ * synthetic-workspace typecheck, no pin merely abstains.
  */
 
 import * as fs from 'node:fs';
@@ -155,11 +159,238 @@ function isPublishedSemver(version: string): boolean {
 }
 
 /**
+ * Direct-dependency ranges declared by the manifest sitting next to a
+ * lockfile: the workspace root's dependencies/devDependencies/
+ * optionalDependencies. Used to disambiguate multi-version packages in
+ * lockfiles that key entries by requested range (yarn-berry).
+ */
+function rootPackageJsonRanges(pkgJsonPath: string): Map<string, string> {
+  const ranges = new Map<string, string>();
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+    for (const section of ['dependencies', 'devDependencies', 'optionalDependencies']) {
+      const deps = pkg?.[section];
+      if (!deps || typeof deps !== 'object') continue;
+      for (const [name, range] of Object.entries(deps)) {
+        if (typeof range === 'string' && !ranges.has(name)) ranges.set(name, range);
+      }
+    }
+  } catch {
+    // No/unreadable root manifest: multi-version packages abstain.
+  }
+  return ranges;
+}
+
+/**
+ * yarn-berry (v2+) yarn.lock. Detected by its `__metadata:` block; a yarn
+ * CLASSIC (v1) lockfile has no such block and a different entry syntax, so
+ * it bails to an empty map here (classic is not parsed — `installedVersions`
+ * covers installed classic checkouts).
+ *
+ * Entries key a comma-separated descriptor set on the resolved package:
+ *
+ *   "ms@npm:2.0.0":            →   version: 2.0.0
+ *   "ms@npm:^2.1.3":           →   version: 2.1.3
+ *   "app@workspace:.":         →   version: 0.0.0-use.local
+ *
+ * Only `npm:` protocol descriptors are considered (`workspace:`, `patch:`,
+ * `portal:`, `link:`, git — none registry-installable as the bare name).
+ * npm-alias descriptors (`foo@npm:bar@^1.0.0`) resolve a DIFFERENT package
+ * than the install name, so they never pin either.
+ *
+ * Multi-version selection: the lockfile keys by requested range, not by
+ * install position, so the direct install is identified through the
+ * workspace-root package.json — the entry whose descriptor set contains
+ * `<name>@npm:<root-declared-range>` wins. Multiple versions and no direct
+ * match → unpinned (abstain).
+ */
+function yarnBerryLockfileVersions(lockPath: string): Map<string, string> {
+  const versions = new Map<string, string>();
+  try {
+    const text = fs.readFileSync(lockPath, 'utf8');
+    if (!/^__metadata:/m.test(text)) return versions;
+
+    // name → (requested range → resolved version), npm: descriptors only.
+    const byName = new Map<string, Map<string, string>>();
+    let current: Array<{ name: string; range: string }> = [];
+    for (const line of text.split('\n')) {
+      if (line.startsWith('#')) continue;
+      const keyMatch = /^(\S.*):\s*$/.exec(line);
+      if (keyMatch) {
+        // New top-level entry: a descriptor set (or `__metadata`).
+        current = [];
+        if (keyMatch[1] === '__metadata') continue;
+        for (const rawDesc of keyMatch[1].split(',')) {
+          const desc = rawDesc.trim().replace(/^['"]|['"]$/g, '');
+          const at = desc.indexOf('@', 1); // 1: skip a scope's leading @
+          if (at <= 0) continue;
+          const name = desc.slice(0, at);
+          const protocolAndRange = desc.slice(at + 1);
+          if (!protocolAndRange.startsWith('npm:')) continue;
+          const range = protocolAndRange.slice('npm:'.length);
+          if (range.includes('@')) continue; // npm alias: foo@npm:bar@^1.0.0
+          current.push({ name, range });
+        }
+        continue;
+      }
+      const versionMatch = /^ {2}version:\s*(.+?)\s*$/.exec(line);
+      if (versionMatch && current.length > 0) {
+        const version = versionMatch[1].replace(/^['"]|['"]$/g, '');
+        for (const { name, range } of current) {
+          let ranges = byName.get(name);
+          if (!ranges) byName.set(name, (ranges = new Map()));
+          ranges.set(range, version);
+        }
+        current = [];
+      }
+    }
+
+    const rootRanges = rootPackageJsonRanges(
+      path.join(path.dirname(lockPath), 'package.json')
+    );
+    for (const [name, ranges] of byName) {
+      const distinct = new Set(ranges.values());
+      let resolved: string | undefined;
+      if (distinct.size === 1) {
+        resolved = distinct.values().next().value;
+      } else {
+        const declared = rootRanges.get(name);
+        if (declared !== undefined) {
+          const expected = declared.startsWith('npm:')
+            ? declared.slice('npm:'.length)
+            : declared;
+          resolved = ranges.get(expected);
+        }
+        // No direct match among multiple versions: abstain.
+      }
+      if (resolved !== undefined && isPublishedSemver(resolved)) {
+        versions.set(name, resolved);
+      }
+    }
+  } catch {
+    // Unparseable lockfile: every external ends up in unpinned_externals.
+  }
+  return versions;
+}
+
+/**
+ * Strip JSONC affordances (line/block comments, trailing commas) so bun's
+ * text lockfile can be JSON.parsed. String-aware: `//` inside a string
+ * (registry URLs) is content, not a comment.
+ */
+function stripJsonc(text: string): string {
+  let noComments = '';
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      noComments += c;
+      if (c === '\\') {
+        noComments += text[i + 1] ?? '';
+        i++;
+      } else if (c === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      noComments += c;
+    } else if (c === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++;
+      i--;
+    } else if (c === '/' && text[i + 1] === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i++;
+    } else {
+      noComments += c;
+    }
+  }
+
+  let out = '';
+  inString = false;
+  for (let i = 0; i < noComments.length; i++) {
+    const c = noComments[i];
+    if (inString) {
+      out += c;
+      if (c === '\\') {
+        out += noComments[i + 1] ?? '';
+        i++;
+      } else if (c === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+    } else if (c === ',') {
+      let j = i + 1;
+      while (j < noComments.length && /\s/.test(noComments[j])) j++;
+      if (noComments[j] === '}' || noComments[j] === ']') continue; // trailing
+    }
+    out += c;
+  }
+  return out;
+}
+
+/**
+ * bun's TEXT bun.lock (JSONC). The binary bun.lockb is out of scope. The
+ * `packages` map is keyed by hoisted install path — `"ms"` is the top-level
+ * install, `"debug/ms"` a copy nested under debug — with the resolution as
+ * the first tuple element (`"ms@2.1.3"`, `"@probe/member@workspace:…"`).
+ *
+ * Mirrors the npm parser's direct-first rule: the top-level key (key ===
+ * package name) is what the emitted tree resolves against and wins. A
+ * top-level entry that fails the published-semver gate (workspace member,
+ * git, tarball) blocks nested fallback entirely — the tree resolves to the
+ * unpinnable thing, so pinning a nested registry copy would be wrong.
+ * Nested-only packages pin solely when every nested copy agrees on one
+ * version; several distinct nested versions → unpinned (abstain). Alias
+ * installs (key name ≠ resolved package name) never pin.
+ */
+function bunLockfileVersions(lockPath: string): Map<string, string> {
+  const versions = new Map<string, string>();
+  try {
+    const lock = JSON.parse(stripJsonc(fs.readFileSync(lockPath, 'utf8')));
+    const packages = lock?.packages;
+    if (!packages || typeof packages !== 'object') return versions;
+
+    const directNames = new Set<string>();
+    const nested = new Map<string, Set<string>>();
+    for (const [key, entry] of Object.entries(packages)) {
+      if (!Array.isArray(entry) || typeof entry[0] !== 'string') continue;
+      const spec = entry[0]; // "<name>@<resolution>"
+      const at = spec.indexOf('@', 1); // 1: skip a scope's leading @
+      if (at <= 0) continue;
+      const name = spec.slice(0, at);
+      const resolved = spec.slice(at + 1);
+      if (key === name) {
+        directNames.add(name);
+        if (isPublishedSemver(resolved)) versions.set(name, resolved);
+      } else if (key.endsWith(`/${name}`)) {
+        let copies = nested.get(name);
+        if (!copies) nested.set(name, (copies = new Set()));
+        copies.add(resolved);
+      }
+    }
+    for (const [name, copies] of nested) {
+      if (directNames.has(name) || copies.size !== 1) continue;
+      const version = copies.values().next().value;
+      if (version !== undefined && isPublishedSemver(version)) versions.set(name, version);
+    }
+  } catch {
+    // Unparseable lockfile: every external ends up in unpinned_externals.
+  }
+  return versions;
+}
+
+/**
  * Resolve exact versions from the repo's installed node_modules by reading
  * `node_modules/<pkg>/package.json` for each referenced external. On an
  * installed checkout this is ground truth — the versions the repo actually
- * runs against — and it needs no lockfile parser, which is what closes the
- * yarn/bun coverage gap.
+ * runs against — and it needs no lockfile parser, which is what covers the
+ * formats without one (yarn classic v1, binary bun.lockb).
  *
  * Workspace-member guard (fail-closed): package managers link workspace
  * siblings into node_modules as symlinks (`node_modules/@ws/member ->
@@ -213,7 +444,8 @@ export function installedVersions(
 /**
  * Resolve exact versions for the repo. Walks up from repoRoot so monorepo
  * members with a hoisted root lockfile still pin (nearest lockfile wins;
- * package-lock.json preferred over pnpm-lock.yaml at the same level).
+ * package-lock.json > pnpm-lock.yaml > yarn.lock > bun.lock at the same
+ * level).
  */
 export function lockfileVersions(repoRoot: string): Map<string, string> {
   let dir = path.resolve(repoRoot);
@@ -222,6 +454,10 @@ export function lockfileVersions(repoRoot: string): Map<string, string> {
     if (fs.existsSync(npmLock)) return npmLockfileVersions(npmLock);
     const pnpmLock = path.join(dir, 'pnpm-lock.yaml');
     if (fs.existsSync(pnpmLock)) return pnpmLockfileVersions(pnpmLock);
+    const yarnLock = path.join(dir, 'yarn.lock');
+    if (fs.existsSync(yarnLock)) return yarnBerryLockfileVersions(yarnLock);
+    const bunLock = path.join(dir, 'bun.lock');
+    if (fs.existsSync(bunLock)) return bunLockfileVersions(bunLock);
     const parent = path.dirname(dir);
     if (parent === dir) return new Map();
     dir = parent;

@@ -325,8 +325,9 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   }
   // Precedence: an installed checkout's node_modules is what the repo
   // actually resolves against, so it wins over the lockfile — and it pins
-  // repos whose lockfiles we do not parse (yarn classic/berry, bun). The
-  // parsed lockfile remains the bare-checkout fallback. Both paths pin only
+  // repos whose lockfiles we do not parse (yarn classic v1, binary
+  // bun.lockb). The parsed lockfile (npm, pnpm, yarn-berry, text bun.lock)
+  // remains the bare-checkout fallback. Both paths pin only
   // the directly-referenced externals; transitives resolve at check-install
   // (check-workspace NPMRC: "Direct deps are exact-pinned by the stubs;
   // only transitives resolve").
