@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/carrick-tools/carrick/compare/carrick-v0.2.9...carrick-v0.3.0) (2026-07-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* type-compat v2 — tsc as serializer and judge, ts_check deleted (the flip) ([#429](https://github.com/carrick-tools/carrick/issues/429))
+
+### Features
+
+* **evals:** install_corpus_deps dispatch input for bare-checkout eval arms ([#424](https://github.com/carrick-tools/carrick/issues/424)) ([3fd771d](https://github.com/carrick-tools/carrick/commit/3fd771d42e5f9c6ad3ec9b6ab05889b6f7654257))
+* type-compat v2 — tsc as serializer and judge, ts_check deleted (the flip) ([#429](https://github.com/carrick-tools/carrick/issues/429)) ([5c889d2](https://github.com/carrick-tools/carrick/commit/5c889d260735d868ac5cf427e185c26bd49c53f0))
+
 ## [0.2.9](https://github.com/carrick-tools/carrick/compare/carrick-v0.2.8...carrick-v0.2.9) (2026-07-20)
 
 
