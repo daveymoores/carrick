@@ -89,6 +89,18 @@ builds the scanner from the dispatched ref, so fix branches can be verified
 pre-merge. **Precision is meaningless on partial-label OSS slices** — read
 recall per edge from the `[diag]` lines, never the run mean.
 
+Label conventions the scorer normalizes for you:
+
+- **Edge repo identity is the corpus repo dir name.** The projection's
+  `producer_repo`/`consumer_repo` carry the `service_name ?? repo_name` id, so
+  the scorer folds every `carrick.json` service name to its owning corpus repo
+  dir on both sides of the match/compat/orphan join. Labels may use either
+  form. If labels and predictions share zero joined edges while both are
+  non-empty, the scorer prints a loud `[warn]` zero-join diagnosis instead of
+  a silent 0.00.
+- **Compat is UNSCORED when no labelled edge carries a `type_compatible`
+  verdict** (the usual state for OSS slices) — never a vacuous 1.00.
+
 ## Eval env vars
 
 | Var | Meaning |

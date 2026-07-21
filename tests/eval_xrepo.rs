@@ -25,7 +25,13 @@
 //!   7. **cross-repo match P/R/F1** (row 7) — `expected-output.json.matches` vs
 //!      `EvalProjection.cross_repo_matches`, keyed by
 //!      `(producer_repo, norm(producer_key), consumer_repo, norm(consumer_key))`,
-//!      spanning HTTP + GraphQL + socket edges.
+//!      spanning HTTP + GraphQL + socket edges. **Repo identity is the corpus
+//!      repo DIR name** (#431): the projection's `producer_repo`/`consumer_repo`
+//!      carry the #368 `service_name ?? repo_name` id, so any service name
+//!      declared in a corpus repo's `carrick.json` is folded to its owning repo
+//!      dir on BOTH sides of the join before scoring (see [`load_repo_aliases`]).
+//!      Labels may therefore key an edge by either the repo dir or the service
+//!      name; both normalize to the same identity.
 //!   8. **compat-verdict accuracy** (row 8) — `expected.type_compatible ==
 //!      actual.type_compatible` over edges in both sets. Guarded by §7: if any
 //!      labelled edge expects a non-null verdict, the actual matches MUST contain
@@ -889,6 +895,169 @@ fn match_edge_key(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Repo-identity normalization for the edge join (#431).
+//
+// The projection's `producer_repo`/`consumer_repo` carry the #368
+// `service_name ?? repo_name` id: in a monorepo with carrick.json `services[]`
+// that is the SERVICE name, while corpus labels (and the harness) know repos by
+// their fixture DIR name. The two vocabularies never overlapped on the recorded
+// OSS run, so every edge silently missed the join and match F1 collapsed to
+// 0.00 with byte-identical keys in the [diag] lines. The single documented join
+// identity is the corpus repo dir name; service names fold onto it here, on
+// BOTH sides, before any edge metric is scored.
+// ---------------------------------------------------------------------------
+
+/// Minimal mirror of `carrick.json`'s service-name shape (the same
+/// `name`/`serviceName` aliasing as `src/config.rs`), read purely to build the
+/// service→repo fold. Unknown fields are ignored.
+#[derive(Debug, Deserialize)]
+struct CarrickConfigFile {
+    #[serde(default)]
+    services: Vec<CarrickServiceDecl>,
+    #[serde(default, rename = "serviceName", alias = "name")]
+    service_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CarrickServiceDecl {
+    #[serde(default, rename = "name", alias = "serviceName")]
+    name: Option<String>,
+}
+
+/// Build the `service name → corpus repo dir` fold from each corpus repo's
+/// `carrick.json`. A repo without one (or without service names) contributes
+/// nothing — its identity is already the dir name. Ambiguity is a hard error:
+/// a service name declared by two repos, or colliding with another repo's dir
+/// name, would make the fold direction undecidable, so the scorer fails loud
+/// rather than join wrongly. An unparseable `carrick.json` (possible on
+/// third-party OSS checkouts) is warned and skipped — the scan itself defines
+/// how it degrades, not the scorer.
+fn load_repo_aliases(repos: &[PathBuf]) -> std::collections::HashMap<String, String> {
+    let dir_names: HashSet<String> = repos
+        .iter()
+        .filter_map(|r| r.file_name().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    let mut aliases = std::collections::HashMap::new();
+    for repo in repos {
+        let dir = repo
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("corpus repo has a name")
+            .to_string();
+        let path = repo.join("carrick.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let cfg: CarrickConfigFile = match serde_json::from_str(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "[eval] WARNING: {} did not parse as carrick.json ({e}) — no service \
+                     aliases folded for {dir}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        // Mirror Config::load_services: a non-empty `services` array supersedes
+        // the flat fields.
+        let names: Vec<String> = if cfg.services.is_empty() {
+            cfg.service_name.into_iter().collect()
+        } else {
+            cfg.services.into_iter().filter_map(|s| s.name).collect()
+        };
+        for name in names {
+            if name == dir {
+                continue; // identity — nothing to fold
+            }
+            assert!(
+                !dir_names.contains(&name),
+                "service name {name:?} in {dir}/carrick.json collides with the corpus repo \
+                 dir {name:?} — the repo-identity fold (#431) would be ambiguous"
+            );
+            if let Some(prev) = aliases.insert(name.clone(), dir.clone()) {
+                assert!(
+                    prev == dir,
+                    "service name {name:?} is declared by two corpus repos ({prev} and {dir}) \
+                     — the repo-identity fold (#431) would be ambiguous"
+                );
+            }
+        }
+    }
+    aliases
+}
+
+/// Fold one repo identity to the corpus repo dir name: a declared service name
+/// maps to its owning repo, anything else (already a repo dir, or unknown) is
+/// itself.
+fn canon_repo(aliases: &std::collections::HashMap<String, String>, id: &str) -> String {
+    aliases.get(id).cloned().unwrap_or_else(|| id.to_string())
+}
+
+/// The #431 loud-failure signal: labels AND predictions both non-empty, yet ZERO
+/// edges join. With correct extraction that pattern is (near-)impossible except
+/// through a join-identity defect, so it must never again hide inside an
+/// ordinary-looking 0.00. Computed on the already-folded edge sets; `None` when
+/// either side is empty (an empty `found` is a plain recall failure, already
+/// visible per-edge in the [diag] MISS lines) or when at least one edge joins.
+fn match_join_diagnosis(expected: &[ExpMatch], found: &[EvalCrossRepoMatch]) -> Option<String> {
+    if expected.is_empty() || found.is_empty() {
+        return None;
+    }
+    let expected_set: HashSet<_> = expected
+        .iter()
+        .map(|m| {
+            match_edge_key(
+                &m.producer_repo,
+                &m.producer_key,
+                &m.consumer_repo,
+                &m.consumer_key,
+            )
+        })
+        .collect();
+    let any_join = found.iter().any(|m| {
+        expected_set.contains(&match_edge_key(
+            &m.producer_repo,
+            &m.producer_key,
+            &m.consumer_repo,
+            &m.consumer_key,
+        ))
+    });
+    if any_join {
+        return None;
+    }
+    let repo_vocab = |producers: Vec<&str>| {
+        let mut v: Vec<&str> = producers
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        v.sort_unstable();
+        v.join(", ")
+    };
+    let label_repos = repo_vocab(
+        expected
+            .iter()
+            .flat_map(|m| [m.producer_repo.as_str(), m.consumer_repo.as_str()])
+            .collect(),
+    );
+    let found_repos = repo_vocab(
+        found
+            .iter()
+            .flat_map(|m| [m.producer_repo.as_str(), m.consumer_repo.as_str()])
+            .collect(),
+    );
+    Some(format!(
+        "match join produced ZERO joined edges although {} labelled and {} predicted edge(s) \
+         exist. Post-fold label repo ids [{label_repos}] vs predicted repo ids [{found_repos}]. \
+         A disjoint repo vocabulary means the repo-identity fold (#431) is missing an alias — \
+         the match/compat/orphan dimensions are floored by the join, not by extraction.",
+        expected.len(),
+        found.len(),
+    ))
+}
+
 /// Cross-repo match P/R/F1 for one tier (contract §6 row 7): exact set equality
 /// over the edge key, both sides normalized. Spans HTTP + GraphQL + socket edges.
 ///
@@ -950,9 +1119,13 @@ fn score_matches(
 
 /// Compat-verdict accuracy for one tier (contract §6 row 8): over edges present
 /// in BOTH expected and actual `matches` (keyed §6 row 7), the fraction where
-/// `actual.type_compatible == Some(expected.type_compatible)`. A labelled edge
-/// always carries a non-null verdict, so an actual `None` is a miss. The §7
-/// guard is enforced separately by [`compat_guard`] before this is trusted.
+/// `actual.type_compatible == Some(expected.type_compatible)`. An expected edge
+/// with a NULL verdict is compat-**unlabelled** (a partial-label OSS slice) and
+/// is skipped — it neither scores nor dings, so a joined-but-unlabelled edge
+/// can no longer read as a miss (#431). On the authored corpora every edge
+/// carries a verdict (contract §5.2), so this is a no-op there. An actual
+/// `None` on a verdict-labelled edge is a miss. The §7 guard is enforced
+/// separately by [`compat_guard`] before this is trusted.
 fn score_compat_verdict_accuracy(
     expected: &[ExpMatch],
     found: &[EvalCrossRepoMatch],
@@ -976,6 +1149,9 @@ fn score_compat_verdict_accuracy(
     let mut correct = 0usize;
     let mut total = 0usize;
     for m in expected.iter().filter(|m| m.tier == tier) {
+        let Some(expected_verdict) = m.type_compatible else {
+            continue; // compat-unlabelled edge: not scored on this row
+        };
         let key = match_edge_key(
             &m.producer_repo,
             &m.producer_key,
@@ -984,7 +1160,7 @@ fn score_compat_verdict_accuracy(
         );
         if let Some(actual_compat) = actual_by_key.get(&key) {
             total += 1;
-            if *actual_compat == m.type_compatible && m.type_compatible.is_some() {
+            if *actual_compat == Some(expected_verdict) {
                 correct += 1;
             }
         }
@@ -998,8 +1174,8 @@ fn score_compat_verdict_accuracy(
 /// absent (the type check never ran) and the scorer must FAIL LOUD rather than
 /// score the absence as "all compatible". Returns `Err(msg)` to fail; `Ok(())`
 /// to proceed.
-fn compat_guard(expected: &ExpectedOutput, found: &[EvalCrossRepoMatch]) -> Result<(), String> {
-    let expects_verdict = expected.matches.iter().any(|m| m.type_compatible.is_some());
+fn compat_guard(expected_matches: &[ExpMatch], found: &[EvalCrossRepoMatch]) -> Result<(), String> {
+    let expects_verdict = expected_matches.iter().any(|m| m.type_compatible.is_some());
     if !expects_verdict {
         return Ok(());
     }
@@ -1012,8 +1188,7 @@ fn compat_guard(expected: &ExpectedOutput, found: &[EvalCrossRepoMatch]) -> Resu
              NO actual cross_repo_match has type_compatible.is_some(). Cross-repo type checking \
              was silently skipped (the v2 capture/check never ran). Refusing to score absent \
              compat data as a verdict.",
-            expected
-                .matches
+            expected_matches
                 .iter()
                 .filter(|m| m.type_compatible.is_some())
                 .count()
@@ -1141,6 +1316,11 @@ struct RunScore {
     /// contract intent ("never score absent compat as a verdict") without
     /// blocking the rest of the vector from printing.
     compat: Result<(), String>,
+    /// The #431 zero-join diagnosis: `Some(msg)` when labels AND predictions
+    /// both exist but ZERO edges joined (post-fold) — the silent-collapse
+    /// signature this bug class hid behind. Printed loud by the caller;
+    /// report-only.
+    match_zero_join: Option<String>,
 }
 
 /// Score one joined projection against the corpus labels. Computes the FULL
@@ -1154,8 +1334,45 @@ fn score_corpus(
     proj: &EvalProjection,
     repo_expected: &[(String, ExpectedRepo)],
     expected_output: &ExpectedOutput,
+    repo_aliases: &std::collections::HashMap<String, String>,
 ) -> RunScore {
-    let compat = compat_guard(expected_output, &proj.cross_repo_matches);
+    // #431: fold every repo identity — label side AND projection side — to the
+    // corpus repo dir name before ANY edge metric (match / compat / orphans) is
+    // scored. One choke point so no per-run path can forget the fold.
+    let expected_matches: Vec<ExpMatch> = expected_output
+        .matches
+        .iter()
+        .map(|m| ExpMatch {
+            producer_repo: canon_repo(repo_aliases, &m.producer_repo),
+            producer_key: m.producer_key.clone(),
+            consumer_repo: canon_repo(repo_aliases, &m.consumer_repo),
+            consumer_key: m.consumer_key.clone(),
+            type_compatible: m.type_compatible,
+            tier: m.tier.clone(),
+        })
+        .collect();
+    let expected_orphans: Vec<ExpOrphan> = expected_output
+        .orphans
+        .iter()
+        .map(|o| ExpOrphan {
+            repo: canon_repo(repo_aliases, &o.repo),
+            side: o.side.clone(),
+            key: o.key.clone(),
+            tier: o.tier.clone(),
+        })
+        .collect();
+    let found_matches: Vec<EvalCrossRepoMatch> = proj
+        .cross_repo_matches
+        .iter()
+        .map(|m| EvalCrossRepoMatch {
+            producer_repo: canon_repo(repo_aliases, &m.producer_repo),
+            consumer_repo: canon_repo(repo_aliases, &m.consumer_repo),
+            ..m.clone()
+        })
+        .collect();
+
+    let compat = compat_guard(&expected_matches, &found_matches);
+    let match_zero_join = match_join_diagnosis(&expected_matches, &found_matches);
     let mut by_tier = std::collections::HashMap::new();
     for tier in TIERS {
         by_tier.insert(
@@ -1163,13 +1380,13 @@ fn score_corpus(
             TierScore {
                 ep_prf: score_endpoint_set(repo_expected, proj, tier),
                 call_prf: score_call_set(repo_expected, proj, tier),
-                match_prf: score_matches(&expected_output.matches, &proj.cross_repo_matches, tier),
+                match_prf: score_matches(&expected_matches, &found_matches, tier),
                 owner: score_owner_accuracy(repo_expected, proj, tier),
                 type_anchor: score_type_anchor_accuracy(repo_expected, proj, tier),
                 type_resolution: score_type_resolution_accuracy(repo_expected, proj, tier),
                 compat_verdict: score_compat_verdict_accuracy(
-                    &expected_output.matches,
-                    &proj.cross_repo_matches,
+                    &expected_matches,
+                    &found_matches,
                     tier,
                 ),
                 dep_prf: score_dep_conflicts(
@@ -1177,7 +1394,7 @@ fn score_corpus(
                     &proj.dependency_conflicts,
                     tier,
                 ),
-                orphan_prf: score_orphans(&expected_output.orphans, &proj.cross_repo_matches, tier),
+                orphan_prf: score_orphans(&expected_orphans, &found_matches, tier),
             },
         );
     }
@@ -1185,6 +1402,7 @@ fn score_corpus(
         by_tier,
         decoy_leak: score_decoy_leak(repo_expected, proj),
         compat,
+        match_zero_join,
     }
 }
 
@@ -1553,11 +1771,13 @@ fn agg(scores: &[RunScore], tier: &str, pick: impl Fn(&TierScore) -> f64) -> (f6
     mean_sd(&xs)
 }
 
-/// Print the full metric vector for one tier (report-only). `compat_absent`
-/// marks the compat-verdict row UNSCORED (§7, #226): when no run produced a
-/// non-null verdict the aggregated `compat_verdict` is a meaningless 0.0, so we
-/// never print it as a number — printing it would read absent compat data as a
-/// real "0% compatible" score.
+/// Print the full metric vector for one tier (report-only).
+/// `compat_unscored_reason` marks the compat-verdict row UNSCORED with its
+/// cause: either the §7 absence (#226 — no run produced a non-null verdict, so
+/// the aggregate would read absent data as "0% compatible") or an unlabelled
+/// slice (#431 — no labelled edge carries a verdict, so the vacuous 1.00 would
+/// read total abstention as a perfect score). Either way the number is never
+/// printed as if it were real.
 /// A single "generalised correctness" percentage for a run, so progress across
 /// runs is easy to track at a glance. It is the **unweighted mean of the
 /// fractional accuracy dimensions** — endpoint/call/xrepo-match F1, type-anchor,
@@ -1585,18 +1805,32 @@ fn overall_correctness(cap: &TierScore, compat_scored: bool) -> f64 {
 
 /// Whether a run dipped and therefore needs its per-edge diagnostics block: a
 /// scored dimension below full marks (surfaced as OVERALL < 100%, exact because
-/// a mean of exact 1.0s is exactly 1.0), a decoy leak, or an absent compat
-/// verdict (§7). The caller additionally always prints run 1 as the healthy
+/// a mean of exact 1.0s is exactly 1.0), a decoy leak, or a tripped §7
+/// compat-absence guard. A compat dimension that is merely **unlabelled**
+/// (`compat_scored == false` with the guard clean — a partial-label OSS slice)
+/// is a property of the slice, not a dip, so it does not fire the block by
+/// itself. The caller additionally always prints run 1 as the healthy
 /// reference to diff a dip against (`run_idx == 1 || run_needs_diag(..)`);
 /// run indexing is deliberately not this predicate's concern. Keeps CI output
 /// sane — a clean N-run eval prints one block, while a dip run captures its own
 /// failing signature in the log it happened in instead of forcing a manual
 /// re-root-cause next session.
-fn run_needs_diag(cap: &TierScore, compat_scored: bool, decoy_leak: usize) -> bool {
-    !compat_scored || decoy_leak > 0 || overall_correctness(cap, compat_scored) < 1.0
+fn run_needs_diag(
+    cap: &TierScore,
+    compat_guard_failed: bool,
+    compat_scored: bool,
+    decoy_leak: usize,
+) -> bool {
+    compat_guard_failed || decoy_leak > 0 || overall_correctness(cap, compat_scored) < 1.0
 }
 
-fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_absent: bool) {
+fn report_tier(
+    scores: &[RunScore],
+    tier: &str,
+    n: usize,
+    runs_n: usize,
+    compat_unscored_reason: Option<&str>,
+) {
     let (ep_p, ep_p_sd) = agg(scores, tier, |t| t.ep_prf.0);
     let (ep_r, ep_r_sd) = agg(scores, tier, |t| t.ep_prf.1);
     let (ep_f, ep_f_sd) = agg(scores, tier, |t| t.ep_prf.2);
@@ -1616,7 +1850,7 @@ fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_
     // Overall = mean of the fractional dimension means (compat only when scored),
     // mirroring `overall_correctness` for a per-tier headline.
     let mut dim_means = vec![ep_f, cl_f, m_f, anc, res, dp_f];
-    if !compat_absent {
+    if compat_unscored_reason.is_none() {
         dim_means.push(cmp);
     }
     let overall = dim_means.iter().sum::<f64>() / dim_means.len() as f64;
@@ -1639,10 +1873,9 @@ fn report_tier(scores: &[RunScore], tier: &str, n: usize, runs_n: usize, compat_
     println!("  owner accuracy        {own:.2}±{own_sd:.2}");
     println!("  type-anchor accuracy  {anc:.2}±{anc_sd:.2}");
     println!("  type-resolution acc   {res:.2}±{res_sd:.2}");
-    if compat_absent {
-        println!("  compat-verdict acc    UNSCORED (§7: no run produced a non-null verdict)");
-    } else {
-        println!("  compat-verdict acc    {cmp:.2}±{cmp_sd:.2}");
+    match compat_unscored_reason {
+        Some(reason) => println!("  compat-verdict acc    UNSCORED ({reason})"),
+        None => println!("  compat-verdict acc    {cmp:.2}±{cmp_sd:.2}"),
     }
     println!("  dependency F1         {dp_f:.2}±{dp_f_sd:.2}");
     println!("  orphans F1            {orph_f:.2}±{orph_f_sd:.2}");
@@ -1684,12 +1917,32 @@ fn xrepo_live_scorer() {
     let repos = discover_repos(&corpus);
     let repo_expected = load_repo_expected(&repos);
     let expected_output = load_expected_output(&corpus);
+    let repo_aliases = load_repo_aliases(&repos);
+    // Whether ANY labelled edge carries a compat verdict. When none does (a
+    // partial-label OSS slice), the compat dimension is UNSCORED — a vacuous
+    // 1.00 there would make total abstention indistinguishable from a pipeline
+    // that ran and passed (#431).
+    let compat_labeled = expected_output
+        .matches
+        .iter()
+        .any(|m| m.type_compatible.is_some());
 
     println!(
         "\n=== Cross-repo live scorer ({}, N={runs_n}) — full S4 vector ===",
         corpus_name()
     );
     println!("(report-only monitor; the only fail-loud is the §7 compat-absence guard)\n");
+    if !repo_aliases.is_empty() {
+        let mut folds: Vec<String> = repo_aliases
+            .iter()
+            .map(|(service, repo)| format!("{service} -> {repo}"))
+            .collect();
+        folds.sort();
+        eprintln!(
+            "[diag] repo-identity fold (#431, carrick.json service -> corpus repo dir): {}",
+            folds.join(", ")
+        );
+    }
 
     let mut scores: Vec<RunScore> = Vec::new();
     for run_idx in 1..=runs_n {
@@ -1701,9 +1954,16 @@ fn xrepo_live_scorer() {
         // compat-verdict number is meaningless — print `UNSCORED` (never a fake
         // "compat 1.00"), and red the whole run at the end. Scored BEFORE the
         // diag block so the diag trigger below can see this run's numbers.
-        let score = score_corpus(&proj, &repo_expected, &expected_output);
-        let compat_absent = score.compat.is_err();
+        let score = score_corpus(&proj, &repo_expected, &expected_output, &repo_aliases);
+        let compat_guard_failed = score.compat.is_err();
+        let compat_scored = compat_labeled && !compat_guard_failed;
         let cap = score.by_tier.get(TIER_CAPABILITY).expect("capability tier");
+        // #431 loud-failure signal: labels + predictions both present, zero
+        // joins. This exact signature previously printed as an unremarkable
+        // 0.00, so it gets its own unmissable line.
+        if let Some(msg) = &score.match_zero_join {
+            eprintln!("[warn] run {run_idx}: {msg}");
+        }
         // Extraction diagnostic (report-only; run 1 + any dipped run). A
         // cross-repo match metric of 0 (or endpoint recall < 1) is otherwise
         // opaque: surface the ENDPOINT SET, the calls, and the edges so a miss is
@@ -1712,7 +1972,8 @@ fn xrepo_live_scorer() {
         // the healthy reference; a dipped run (`run_needs_diag`) prints its own
         // block so recurring dip signatures land in the CI log instead of needing
         // a manual re-root-cause. Passing runs after run 1 stay silent.
-        if run_idx == 1 || run_needs_diag(cap, !compat_absent, score.decoy_leak) {
+        if run_idx == 1 || run_needs_diag(cap, compat_guard_failed, compat_scored, score.decoy_leak)
+        {
             let found_eps = projection_endpoint_set(&proj);
             let expected_eps = expected_endpoint_set(&repo_expected, TIER_CAPABILITY);
             eprintln!(
@@ -1848,16 +2109,16 @@ fn xrepo_live_scorer() {
                 },
             );
         }
-        let compat_cell = if compat_absent {
-            "UNSCORED".to_string()
-        } else {
+        let compat_cell = if compat_scored {
             format!("{:.2}", cap.compat_verdict)
+        } else {
+            "UNSCORED".to_string()
         };
         println!(
             "  run {run_idx}/{runs_n}: OVERALL {:.0}%  | endpoint F1 {:.2}  call F1 {:.2}  \
              match F1 {:.2}  anchor {:.2}  resolution {:.2}  compat {compat_cell}  dep F1 {:.2}  \
              decoy_leak {}",
-            overall_correctness(cap, !compat_absent) * 100.0,
+            overall_correctness(cap, compat_scored) * 100.0,
             cap.ep_prf.2,
             cap.call_prf.2,
             cap.match_prf.2,
@@ -1875,11 +2136,20 @@ fn xrepo_live_scorer() {
     // carried one is compat-absent. Treat the metric as unscored corpus-wide if
     // *any* run is absent — the aggregate would otherwise mix real verdicts with
     // meaningless 0.0s. The first absence message is kept for the loud report.
+    // #431: an UNLABELLED slice (no labelled edge carries a verdict) is also
+    // unscored — the vacuous 1.00 must never print as a real score.
     let compat_absent = scores.iter().any(|s| s.compat.is_err());
     let compat_err_msg = scores.iter().find_map(|s| s.compat.as_ref().err().cloned());
+    let compat_unscored_reason: Option<&str> = if !compat_labeled {
+        Some("no labelled edge carries a compat verdict — abstention, not a pass")
+    } else if compat_absent {
+        Some("§7: no run produced a non-null verdict")
+    } else {
+        None
+    };
 
-    report_tier(&scores, TIER_CAPABILITY, n, runs_n, compat_absent);
-    report_tier(&scores, TIER_ROADMAP, n, runs_n, compat_absent);
+    report_tier(&scores, TIER_CAPABILITY, n, runs_n, compat_unscored_reason);
+    report_tier(&scores, TIER_ROADMAP, n, runs_n, compat_unscored_reason);
 
     let (decoy_mean, decoy_sd) = mean_sd(
         &scores
@@ -1906,11 +2176,12 @@ fn xrepo_live_scorer() {
     let (own, own_sd) = agg(&scores, TIER_CAPABILITY, |t| t.owner);
     let (anc, anc_sd) = agg(&scores, TIER_CAPABILITY, |t| t.type_anchor);
     let (res, res_sd) = agg(&scores, TIER_CAPABILITY, |t| t.type_resolution);
-    // §7 (#226): the longitudinal record must never store an absent compat number
-    // as a real verdict. When compat was absent the mean is a meaningless 0.0, so
-    // null out the record's compat columns (the `Option` fields below).
+    // §7 (#226) / #431: the longitudinal record must never store an unscored
+    // compat number as a real verdict — absent compat aggregates a meaningless
+    // 0.0, an unlabelled slice a vacuous 1.0 — so null out the record's compat
+    // columns (the `Option` fields below) in either case.
     let (cmp, cmp_sd) = agg(&scores, TIER_CAPABILITY, |t| t.compat_verdict);
-    let (compat_mean_col, compat_sd_col) = if compat_absent {
+    let (compat_mean_col, compat_sd_col) = if compat_unscored_reason.is_some() {
         (None, None)
     } else {
         (Some(cmp), Some(cmp_sd))
@@ -2197,30 +2468,38 @@ mod scoring_tests {
 
     #[test]
     fn run_needs_diag_silent_on_full_marks() {
-        assert!(!run_needs_diag(&full_marks_tier(), true, 0));
+        assert!(!run_needs_diag(&full_marks_tier(), false, true, 0));
     }
 
     #[test]
     fn run_needs_diag_fires_on_any_dimension_dip() {
         let mut cap = full_marks_tier();
         cap.type_resolution = 0.93;
-        assert!(run_needs_diag(&cap, true, 0));
+        assert!(run_needs_diag(&cap, false, true, 0));
 
         let mut cap = full_marks_tier();
         cap.compat_verdict = 0.5;
-        assert!(run_needs_diag(&cap, true, 0));
+        assert!(run_needs_diag(&cap, false, true, 0));
 
         let mut cap = full_marks_tier();
         cap.match_prf.2 = 0.99;
-        assert!(run_needs_diag(&cap, true, 0));
+        assert!(run_needs_diag(&cap, false, true, 0));
     }
 
     #[test]
     fn run_needs_diag_fires_on_decoy_leak_and_absent_compat() {
-        assert!(run_needs_diag(&full_marks_tier(), true, 1));
-        // §7 compat-absent: the compat_verdict number is meaningless, so the
-        // absence itself is the dip signal regardless of the other dimensions.
-        assert!(run_needs_diag(&full_marks_tier(), false, 0));
+        assert!(run_needs_diag(&full_marks_tier(), false, true, 1));
+        // §7 compat-absent (guard failed): the compat_verdict number is
+        // meaningless, so the absence itself is the dip signal regardless of
+        // the other dimensions.
+        assert!(run_needs_diag(&full_marks_tier(), true, false, 0));
+    }
+
+    /// #431: an UNLABELLED compat slice (guard clean, nothing to score) is a
+    /// property of the labels, not a dip — full marks stay silent.
+    #[test]
+    fn run_needs_diag_silent_on_unlabelled_compat() {
+        assert!(!run_needs_diag(&full_marks_tier(), false, false, 0));
     }
 
     #[test]
@@ -2557,7 +2836,7 @@ mod scoring_tests {
         .unwrap();
         // No actual edge carries a verdict → guard trips.
         let absent = vec![cm("a", "http|GET|/x", "b", "http|GET|/x")];
-        assert!(compat_guard(&expected, &absent).is_err());
+        assert!(compat_guard(&expected.matches, &absent).is_err());
         // At least one verdict present → guard passes.
         let present = vec![cm_compat(
             "a",
@@ -2566,7 +2845,7 @@ mod scoring_tests {
             "http|GET|/x",
             Some(true),
         )];
-        assert!(compat_guard(&expected, &present).is_ok());
+        assert!(compat_guard(&expected.matches, &present).is_ok());
         // No edge expects a verdict → guard vacuously passes.
         let no_expect: ExpectedOutput = serde_json::from_value(serde_json::json!({
             "matches": [
@@ -2575,7 +2854,7 @@ mod scoring_tests {
             ]
         }))
         .unwrap();
-        assert!(compat_guard(&no_expect, &absent).is_ok());
+        assert!(compat_guard(&no_expect.matches, &absent).is_ok());
     }
 
     /// #226 regression: when compat is silently absent, `score_corpus` must NOT
@@ -2609,7 +2888,12 @@ mod scoring_tests {
             ));
         }
 
-        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        let score = score_corpus(
+            &proj,
+            &repo_expected,
+            &expected_output,
+            &load_repo_aliases(&repos),
+        );
         assert!(
             score.compat.is_err(),
             "the corpus expects verdicts + no actual edge carries one → §7 trips"
@@ -2796,10 +3080,19 @@ mod scoring_tests {
             dependency_conflicts,
         };
 
-        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        let score = score_corpus(
+            &proj,
+            &repo_expected,
+            &expected_output,
+            &load_repo_aliases(&repos),
+        );
         assert!(
             score.compat.is_ok(),
             "§7 guard passes — the perfect projection carries verdicts"
+        );
+        assert!(
+            score.match_zero_join.is_none(),
+            "a perfectly-joining projection must not trip the #431 zero-join diagnosis"
         );
         let cap = score.by_tier.get(TIER_CAPABILITY).unwrap();
         assert_eq!(cap.ep_prf, (1.0, 1.0, 1.0), "perfect endpoint set");
@@ -3077,9 +3370,10 @@ mod scoring_tests {
         // the FULL vector is still computed. Verify the guard verdict, then score
         // over a projection that DOES carry a verdict so the other metrics'
         // zero-recall behaviour is observable.
+        let aliases = load_repo_aliases(&repos);
         let empty = empty_proj();
         assert!(
-            score_corpus(&empty, &repo_expected, &expected_output)
+            score_corpus(&empty, &repo_expected, &expected_output, &aliases)
                 .compat
                 .is_err(),
             "empty projection → §7 guard trips (no compat verdict present)"
@@ -3095,7 +3389,7 @@ mod scoring_tests {
             "http|GET|/nope",
             Some(true),
         ));
-        let score = score_corpus(&proj, &repo_expected, &expected_output);
+        let score = score_corpus(&proj, &repo_expected, &expected_output, &aliases);
         assert!(
             score.compat.is_ok(),
             "one verdict-bearing edge clears the §7 guard"
@@ -3105,6 +3399,193 @@ mod scoring_tests {
         assert_eq!(cap.ep_prf.0, 0.0, "found==0 with expected>0 → precision 0");
         assert_eq!(cap.match_prf.1, 0.0, "no real matches found → recall 0");
         assert_eq!(cap.dep_prf.1, 0.0, "no deps found → recall 0");
+    }
+
+    /// #431 repro: an OSS slice labels its edges by corpus repo DIR name
+    /// (`platform`, `embed-kit`, `sdk`) while the projection carries the
+    /// carrick.json SERVICE names (`webapp`, `rpc`, `embed-core` — the #368
+    /// `service_name ?? repo_name` convention). The edges are byte-identical on
+    /// every key segment; only the repo-identity vocabulary differs. The scorer
+    /// must fold service names to their owning corpus repo dir before the row-7
+    /// join, so these score as the perfect matches they are — not the silent
+    /// 0.00 the recorded run printed.
+    #[test]
+    fn match_join_folds_service_names_to_corpus_repo_dirs() {
+        let repo_expected: Vec<(String, ExpectedRepo)> = vec![];
+        let expected_output: ExpectedOutput = serde_json::from_value(serde_json::json!({
+            "matches": [
+                { "producer_repo": "platform", "producer_key": "http|POST|/api/v2/embed/token",
+                  "consumer_repo": "embed-kit", "consumer_key": "http|POST|/api/v2/embed/token",
+                  "protocol": "http", "tier": "capability" },
+                { "producer_repo": "embed-kit", "producer_key": "pubsub|document-completed",
+                  "consumer_repo": "platform", "consumer_key": "pubsub|document-completed",
+                  "protocol": "pubsub", "tier": "capability" },
+                { "producer_repo": "platform", "producer_key": "http|GET|/envelope/:param",
+                  "consumer_repo": "sdk", "consumer_key": "http|GET|/envelope/:param",
+                  "protocol": "http", "tier": "capability" }
+            ]
+        }))
+        .unwrap();
+        // The projection's edges: same keys, service-name repo identities. `sdk`
+        // is a flat repo (no carrick.json service name) so it stays `sdk`.
+        let mut proj = empty_proj();
+        proj.cross_repo_matches = vec![
+            cm(
+                "webapp",
+                "http|POST|/api/v2/embed/token",
+                "embed-core",
+                "http|POST|/api/v2/embed/token",
+            ),
+            cm(
+                "embed-core",
+                "pubsub|document-completed",
+                "rpc",
+                "pubsub|document-completed",
+            ),
+            cm(
+                "webapp",
+                "http|GET|/envelope/:param",
+                "sdk",
+                "http|GET|/envelope/:param",
+            ),
+        ];
+
+        // The fold, as `load_repo_aliases` would build it from the two
+        // monorepos' carrick.json files.
+        let aliases: std::collections::HashMap<String, String> = [
+            ("webapp", "platform"),
+            ("rpc", "platform"),
+            ("embed-core", "embed-kit"),
+        ]
+        .into_iter()
+        .map(|(s, r)| (s.to_string(), r.to_string()))
+        .collect();
+
+        // WITHOUT the fold: the recorded bug — 0.00 across the board despite
+        // byte-identical keys, and the zero-join diagnosis fires loud.
+        let unfolded = score_corpus(
+            &proj,
+            &repo_expected,
+            &expected_output,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            unfolded.by_tier.get(TIER_CAPABILITY).unwrap().match_prf,
+            (0.0, 0.0, 0.0),
+            "the unfolded join reproduces the recorded 0.00"
+        );
+        assert!(
+            unfolded.match_zero_join.is_some(),
+            "labels + predictions present with zero joins must trip the #431 diagnosis"
+        );
+
+        // WITH the fold: the same edges join perfectly.
+        let score = score_corpus(&proj, &repo_expected, &expected_output, &aliases);
+        let cap = score.by_tier.get(TIER_CAPABILITY).unwrap();
+        assert_eq!(
+            cap.match_prf,
+            (1.0, 1.0, 1.0),
+            "identical edges must join across the repo-name/service-name vocabularies (#431)"
+        );
+        assert!(score.match_zero_join.is_none());
+        assert!(
+            score.compat.is_ok(),
+            "no labelled verdicts → §7 guard vacuously clean (compat is UNSCORED, not red)"
+        );
+    }
+
+    /// #431: the fold is built from the committed corpus carrick.json files —
+    /// corpus-1's orders-monorepo declares `orders-pkg` + `gateway`, the flat
+    /// repos declare no service names.
+    #[test]
+    fn load_repo_aliases_reads_corpus_carrick_json() {
+        if corpus_name() != "xrepo-corpus-1" {
+            return;
+        }
+        let repos = discover_repos(&corpus_dir());
+        let aliases = load_repo_aliases(&repos);
+        assert_eq!(
+            aliases.get("orders-pkg").map(String::as_str),
+            Some("orders-monorepo")
+        );
+        assert_eq!(
+            aliases.get("gateway").map(String::as_str),
+            Some("orders-monorepo")
+        );
+        assert_eq!(
+            aliases.len(),
+            2,
+            "flat repos contribute no aliases, got {aliases:?}"
+        );
+    }
+
+    /// The #431 zero-join diagnosis is precise: it stays silent when either
+    /// side is empty (plain recall failure / unlabelled slice) or when at least
+    /// one edge joins, and fires only on the both-present-zero-overlap
+    /// signature.
+    #[test]
+    fn match_join_diagnosis_fires_only_on_disjoint_nonempty_sides() {
+        let expected = vec![ExpMatch {
+            producer_repo: "platform".to_string(),
+            producer_key: "http|GET|/a".to_string(),
+            consumer_repo: "sdk".to_string(),
+            consumer_key: "http|GET|/a".to_string(),
+            type_compatible: None,
+            tier: TIER_CAPABILITY.to_string(),
+        }];
+        // Empty found: silent (an ordinary recall miss, not a join defect).
+        assert!(match_join_diagnosis(&expected, &[]).is_none());
+        // Empty labels: silent (nothing to join).
+        assert!(match_join_diagnosis(&[], &[cm("x", "http|GET|/a", "y", "http|GET|/a")]).is_none());
+        // One edge joins: silent even with extra unjoined edges present.
+        let partly = vec![
+            cm("platform", "http|GET|/a", "sdk", "http|GET|/a"),
+            cm("webapp", "http|GET|/b", "sdk", "http|GET|/b"),
+        ];
+        assert!(match_join_diagnosis(&expected, &partly).is_none());
+        // Both sides present, zero overlap: fires, naming both vocabularies.
+        let disjoint = vec![cm("webapp", "http|GET|/a", "sdk", "http|GET|/a")];
+        let msg = match_join_diagnosis(&expected, &disjoint)
+            .expect("disjoint non-empty sides must fire the diagnosis");
+        assert!(
+            msg.contains("platform") && msg.contains("webapp"),
+            "the diagnosis names both repo vocabularies, got: {msg}"
+        );
+    }
+
+    /// #431: a joined edge whose LABEL carries no verdict is compat-unlabelled —
+    /// it must neither score nor ding the compat row (partial-label OSS slices
+    /// label matches without compat). Verdict-labelled edges still score.
+    #[test]
+    fn compat_verdict_skips_unlabelled_edges() {
+        let expected = vec![
+            ExpMatch {
+                producer_repo: "a".to_string(),
+                producer_key: "http|GET|/x".to_string(),
+                consumer_repo: "b".to_string(),
+                consumer_key: "http|GET|/x".to_string(),
+                type_compatible: Some(true),
+                tier: TIER_CAPABILITY.to_string(),
+            },
+            ExpMatch {
+                producer_repo: "a".to_string(),
+                producer_key: "http|GET|/y".to_string(),
+                consumer_repo: "b".to_string(),
+                consumer_key: "http|GET|/y".to_string(),
+                type_compatible: None, // compat-unlabelled edge
+                tier: TIER_CAPABILITY.to_string(),
+            },
+        ];
+        let found = vec![
+            cm_compat("a", "http|GET|/x", "b", "http|GET|/x", Some(true)),
+            // Joined, but its label is compat-unlabelled → not scored, so the
+            // actual None cannot read as a miss.
+            cm("a", "http|GET|/y", "b", "http|GET|/y"),
+        ];
+        assert!(
+            (score_compat_verdict_accuracy(&expected, &found, TIER_CAPABILITY) - 1.0).abs() < 1e-9,
+            "the unlabelled edge must not ding the verdict-labelled edge's 1.0"
+        );
     }
 
     #[test]
