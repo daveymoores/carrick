@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use swc_common::{SourceMap, sync::Lrc};
 
 // Expected output structures matching our fixture JSON files
 #[derive(Debug, Deserialize, Serialize)]
@@ -137,8 +136,7 @@ async fn test_scenario_1_dependency_conflicts_output() {
     let fixture_path = PathBuf::from("tests/fixtures/scenario-1-dependency-conflicts");
 
     let config = Config::default();
-    let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(config, cm);
+    let mut analyzer = Analyzer::new(config);
 
     // Load packages from both repos
     let packages_a = load_packages_from_fixture(&fixture_path, "repo-a");
@@ -161,8 +159,7 @@ async fn test_scenario_3_no_conflicts_output() {
     let fixture_path = PathBuf::from("tests/fixtures/scenario-3-cross-repo-success");
 
     let config = Config::default();
-    let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(config, cm);
+    let mut analyzer = Analyzer::new(config);
 
     // Load packages from all three repos
     let packages_a = load_packages_from_fixture(&fixture_path, "repo-a");
@@ -191,8 +188,7 @@ async fn test_dependency_conflict_severity_classification() {
     let fixture_path = PathBuf::from("tests/fixtures/scenario-1-dependency-conflicts");
 
     let config = Config::default();
-    let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(config, cm);
+    let mut analyzer = Analyzer::new(config);
 
     let packages_a = load_packages_from_fixture(&fixture_path, "repo-a");
     let packages_b = load_packages_from_fixture(&fixture_path, "repo-b");
@@ -244,8 +240,7 @@ async fn test_output_stability_across_analysis_runs() {
     // When: run analysis 3 times
     for _ in 0..3 {
         let config = Config::default();
-        let cm: Lrc<SourceMap> = Default::default();
-        let mut analyzer = Analyzer::new(config, cm);
+        let mut analyzer = Analyzer::new(config);
 
         let packages_a = load_packages_from_fixture(&fixture_path, "repo-a");
         let packages_b = load_packages_from_fixture(&fixture_path, "repo-b");

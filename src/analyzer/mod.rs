@@ -14,7 +14,7 @@ use crate::{
     type_manifest::parse_file_location,
     url_normalizer::UrlNormalizer,
     utils::join_prefix_and_path,
-    visitor::{Call, FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
+    visitor::{FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::LazyLock;
@@ -716,14 +716,11 @@ pub struct Analyzer {
     pub function_definitions: HashMap<String, FunctionDefinition>,
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
-    fetch_calls: Vec<Call>, // Store processed fetch calls with unique IDs
     pub mounts: Vec<Mount>,
     pub apps: HashMap<String, AppContext>,
     config: Config,
     endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
-    source_map: Lrc<SourceMap>,
     all_repo_packages: HashMap<String, Packages>, // repo_name -> packages
-    detected_frameworks: Vec<String>,
     detected_data_fetchers: Vec<String>,
     mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
     /// Structured v2 check outcomes, one per matched manifest pair, set by
@@ -771,27 +768,20 @@ pub struct PairCheckOutcome {
     pub consumer_service: String,
 }
 
-impl CoreExtractor for Analyzer {
-    fn get_source_map(&self) -> &Lrc<SourceMap> {
-        &self.source_map
-    }
-}
+impl CoreExtractor for Analyzer {}
 
 impl Analyzer {
-    pub fn new(config: Config, source_map: Lrc<SourceMap>) -> Self {
+    pub fn new(config: Config) -> Self {
         Analyzer {
             imported_handlers: Vec::new(),
             function_definitions: HashMap::new(),
             endpoints: Vec::new(),
             calls: Vec::new(),
-            fetch_calls: Vec::new(),
             mounts: Vec::new(),
             apps: HashMap::new(),
             config,
             endpoint_router: None,
-            source_map,
             all_repo_packages: HashMap::new(),
-            detected_frameworks: Vec::new(),
             detected_data_fetchers: Vec::new(),
             mount_graph: None,
             pair_outcomes: None,
@@ -817,12 +807,6 @@ impl Analyzer {
 
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
         self.all_repo_packages.insert(repo_name, packages);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_framework_detection(&mut self, frameworks: Vec<String>, data_fetchers: Vec<String>) {
-        self.detected_frameworks = frameworks;
-        self.detected_data_fetchers = data_fetchers;
     }
 
     pub fn analyze_dependencies(&self) -> Vec<DependencyConflict> {
@@ -928,65 +912,6 @@ impl Analyzer {
         ConflictSeverity::Info
     }
 
-    pub async fn analyze_functions_for_fetch_calls(&mut self) {
-        use crate::agent_service::extract_calls_from_async_expressions;
-
-        let mut all_async_contexts = Vec::new();
-
-        // Extract async calls from each function definition using extractor methods
-        for def in self.function_definitions.values() {
-            let async_contexts = self.extract_async_calls_from_function(def);
-            all_async_contexts.extend(async_contexts);
-        }
-
-        // Skip Gemini call if no async expressions found (safety check)
-        if all_async_contexts.is_empty() {
-            debug!("No async expressions found, skipping Gemini analysis");
-            return;
-        }
-
-        // Send to Gemini Flash 2.5 for analysis with framework context
-        let gemini_calls = match extract_calls_from_async_expressions(
-            all_async_contexts,
-            &self.detected_frameworks,
-            &self.detected_data_fetchers,
-        )
-        .await
-        {
-            Ok(calls) => calls,
-            Err(e) => {
-                warn!("Failed to extract calls from async expressions: {}", e);
-                vec![]
-            }
-        };
-
-        debug!("Gemini extracted {} HTTP calls", gemini_calls.len());
-
-        // Process calls as before
-        let processed_calls = self.process_fetch_calls(gemini_calls);
-        self.fetch_calls.extend(processed_calls.clone());
-
-        // Create ApiEndpointDetails from processed calls
-        for call in processed_calls {
-            let params = self.extract_params_from_route(&call.route);
-            self.calls.push(ApiEndpointDetails {
-                owner: None,
-                key: OperationKey::http(&call.method, call.route.clone()),
-                params,
-                request_body: call.request.clone(),
-                response_body: Some(Json::Null),
-                handler_name: None,
-                request_type: call.request_type.clone(),
-                response_type: call.response_type.clone(),
-                file_path: call.call_file.clone(),
-                repo_name: None,
-                service_name: None,
-                // Provenance is producer-side metadata; calls keep the default.
-                provenance: Default::default(),
-            });
-        }
-    }
-
     fn byte_offset_to_utf16_offset(source: &str, byte_offset: usize) -> usize {
         source[..byte_offset].encode_utf16().count()
     }
@@ -1039,29 +964,6 @@ impl Analyzer {
         format!("{}{}{}{}", method_pascal, sanitized_route, suffix, role)
     }
 
-    /// Generate unique type alias name for tracking individual calls
-    /// This is used internally for analysis but not for type comparison
-    pub fn generate_unique_call_alias_name(
-        route: &str,
-        method: &str,
-        is_request_type: bool,
-        call_number: u32,
-        is_consumer: bool,
-    ) -> String {
-        let suffix = if is_request_type {
-            "Request"
-        } else {
-            "Response"
-        };
-        let role = if is_consumer { "Consumer" } else { "Producer" };
-        let method_pascal = Self::method_to_pascal_case(method);
-        let sanitized_route = Self::sanitize_route_for_dynamic_paths(route);
-        format!(
-            "{}{}{}{}Call{}",
-            method_pascal, sanitized_route, suffix, role, call_number
-        )
-    }
-
     /// Helper method to convert HTTP method to PascalCase
     fn method_to_pascal_case(method: &str) -> String {
         if method.is_empty() {
@@ -1074,69 +976,6 @@ impl Analyzer {
                 Some(f) => f.to_uppercase().collect::<String>() + m.as_str(),
             }
         }
-    }
-
-    /// Process fetch calls and assign unique identifiers and common type names
-    pub fn process_fetch_calls(&mut self, mut calls: Vec<Call>) -> Vec<Call> {
-        // Group calls by route+method to ensure consecutive numbering
-        let mut grouped_calls: std::collections::HashMap<(String, String), Vec<usize>> =
-            std::collections::HashMap::new();
-
-        // Group call indices by route+method, but only for calls that have response_type
-        for (index, call) in calls.iter().enumerate() {
-            if call.response_type.is_some() {
-                let key = (call.route.clone(), call.method.clone());
-                grouped_calls.entry(key).or_default().push(index);
-            }
-        }
-
-        // Process each group and assign consecutive numbers
-        for ((route, method), indices) in grouped_calls {
-            for (position, &call_index) in indices.iter().enumerate() {
-                let call_number = (position + 1) as u32; // Start from 1
-                let call = &mut calls[call_index];
-
-                // Set unique call ID for tracking
-                call.call_id = Some(Self::generate_unique_call_alias_name(
-                    &route,
-                    &method,
-                    false, // is_request_type = false (for response)
-                    call_number,
-                    true, // is_consumer = true (fetch calls are consumers)
-                ));
-
-                // Set call number
-                call.call_number = Some(call_number);
-
-                // Set common type name for comparison with producer
-                call.common_type_name = Some(Self::generate_common_type_alias_name(
-                    &route, &method, false, // is_request_type = false (for response)
-                    true,  // is_consumer = true (fetch calls are consumers)
-                ));
-
-                // Update TypeReference objects with unique aliases
-                if let Some(ref mut response_type) = call.response_type {
-                    response_type.alias = Self::generate_unique_call_alias_name(
-                        &route,
-                        &method,
-                        false, // is_request_type = false (for response)
-                        call_number,
-                        true, // is_consumer = true (fetch calls are consumers)
-                    );
-                }
-
-                if let Some(ref mut request_type) = call.request_type {
-                    request_type.alias = Self::generate_unique_call_alias_name(
-                        &route,
-                        &method,
-                        true, // is_request_type = true (for request)
-                        call_number,
-                        true, // is_consumer = true (fetch calls are consumers)
-                    );
-                }
-            }
-        }
-        calls
     }
 
     fn sanitize_route_for_dynamic_paths(route: &str) -> String {
@@ -2989,34 +2828,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_unique_call_alias_name_with_template_params() {
-        // Verify the full alias generation works with template literal paths
-        let alias = Analyzer::generate_unique_call_alias_name(
-            "/users/${userId}/comments",
-            "GET",
-            false, // is_request_type
-            1,     // call_number
-            true,  // is_consumer
-        );
-
-        assert!(
-            alias.contains("ByUserid"),
-            "Alias should contain 'ByUserid'. Got: {}",
-            alias
-        );
-        assert!(
-            alias.starts_with("Get"),
-            "Alias should start with 'Get'. Got: {}",
-            alias
-        );
-        assert!(
-            alias.contains("Consumer"),
-            "Alias should contain 'Consumer'. Got: {}",
-            alias
-        );
-    }
-
-    #[test]
     fn test_extract_env_var_name() {
         // ENV_VAR:NAME:/path format
         assert_eq!(
@@ -3118,8 +2929,7 @@ mod tests {
     #[test]
     fn test_graphql_matching_verified_missing_and_orphaned() {
         use crate::operation::GraphqlOperationKind;
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.endpoints.push(graphql_details(
             OperationKey::graphql(GraphqlOperationKind::Query, "user"),
@@ -3164,8 +2974,7 @@ mod tests {
     #[test]
     fn test_graphql_consumers_silent_without_indexed_producers() {
         use crate::operation::GraphqlOperationKind;
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         // A consumer document but no GraphQL schema indexed anywhere: the
         // producing service may simply not be scanned — stay silent.
@@ -3184,8 +2993,7 @@ mod tests {
     #[test]
     fn test_socket_matching_is_direction_aware() {
         use crate::operation::SocketDirection;
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         // Server side: listens for chat:message, emits chat:broadcast.
         analyzer.endpoints.push(graphql_details(
@@ -3243,8 +3051,7 @@ mod tests {
     #[test]
     fn test_exact_key_matches_emit_cross_repo_edges() {
         use crate::operation::{GraphqlOperationKind, SocketDirection};
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         // GraphQL: producer schema field in `gateway`, consumer document field
         // in `web-frontend`. Same operation key on both sides.
@@ -3301,8 +3108,7 @@ mod tests {
         // (the contract producer / endpoint) while analytics-worker PUBLISHES it
         // (the consumer / call). Identity is the topic alone, so the subscriber
         // and publisher keys are equal and match exactly across the two repos.
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.endpoints.push(op_details_in_repo(
             OperationKey::pubsub("metrics.page_view"),
@@ -3334,8 +3140,7 @@ mod tests {
         // endpoint) and publishes (consumer / call) the internal `__dlq.retry`
         // dead-letter topic. Same repo on both sides with no other participant is
         // an intra-repo self-loop, not a cross-repo contract — no edge.
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.endpoints.push(op_details_in_repo(
             OperationKey::pubsub("__dlq.retry"),
@@ -3362,8 +3167,7 @@ mod tests {
         // orders-engine→orders-engine self-edge is dropped; the genuine
         // orders-engine(publisher) → notifications-svc(subscriber) cross edge
         // survives.
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.endpoints.push(op_details_in_repo(
             OperationKey::pubsub("order.placed"),
@@ -3394,8 +3198,7 @@ mod tests {
     #[test]
     fn test_exact_key_matches_emit_edge_per_producer_repo() {
         use crate::operation::GraphqlOperationKind;
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         // Two services expose the same GraphQL field; exact-key matching cannot
         // disambiguate by URL, so a consumer of `order` gets an edge to each.
@@ -3429,8 +3232,7 @@ mod tests {
     #[test]
     fn test_graphql_calls_do_not_hit_http_matcher() {
         use crate::operation::GraphqlOperationKind;
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(graphql_details(
             OperationKey::graphql(GraphqlOperationKind::Query, "user"),
@@ -3453,8 +3255,7 @@ mod tests {
         };
 
         // Create analyzer with dummy source map (not used for this analysis)
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(config, cm);
+        let mut analyzer = Analyzer::new(config);
 
         // Add calls that use env vars
         // 1. Valid internal call (should match if endpoint exists, or report missing)
@@ -3568,8 +3369,7 @@ mod tests {
     fn test_wrong_verb_call_surfaces_as_method_mismatch() {
         use crate::mount_graph::ResolvedEndpoint;
 
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
             owner: None,
@@ -3624,8 +3424,7 @@ mod tests {
     fn test_unmatched_path_still_reports_missing_and_orphaned() {
         use crate::mount_graph::ResolvedEndpoint;
 
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
             owner: None,
@@ -3676,8 +3475,7 @@ mod tests {
         use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
         use crate::operation::EndpointProvenance;
 
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
             owner: None,
@@ -3768,8 +3566,7 @@ mod tests {
     fn test_exact_key_edge_carries_producer_provenance() {
         use crate::operation::EndpointProvenance;
 
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         let mut producer = op_details_in_repo(
             OperationKey::pubsub("orders.created"),
@@ -3808,8 +3605,7 @@ mod tests {
     fn test_call_site_evidence_pair_reports_shared_external_contract() {
         use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
 
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         // repo-alpha: a client call expression the extraction double-emitted;
         // reclassified to call-site evidence at scan time.
@@ -3884,8 +3680,7 @@ mod tests {
     fn test_route_definition_pair_stays_producer_consumer() {
         use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
 
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
@@ -3940,8 +3735,7 @@ mod tests {
     fn test_same_repo_call_site_pair_emits_no_edge_or_group() {
         use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
 
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
@@ -4012,8 +3806,7 @@ mod tests {
     /// would fail the cloud check run even for a no-baseline repo).
     #[test]
     fn test_wildcard_only_collision_stays_missing_endpoint() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer
             .calls
@@ -4041,8 +3834,7 @@ mod tests {
     /// producer's declared spelling.
     #[test]
     fn test_method_mismatch_matches_params_by_position_not_name() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer
             .calls
@@ -4071,8 +3863,7 @@ mod tests {
     /// verified/orphaned classification.
     #[test]
     fn test_method_mismatch_prefers_unverified_producer_and_keeps_siblings() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         // GET /a is genuinely consumed; PUT /a is the wrong verb; GET /b is
         // an unrelated real orphan that must survive.
@@ -4111,8 +3902,7 @@ mod tests {
     /// nothing is hidden.
     #[test]
     fn test_method_mismatch_falls_back_to_sorted_verified_producer() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(http_call("GET", "/a", "client.ts:1"));
         analyzer.calls.push(http_call("PUT", "/a", "client.ts:2"));
@@ -4158,7 +3948,7 @@ mod tests {
 
     /// Minimal analyzer carrying the given structured pair outcomes.
     fn analyzer_with_outcomes(outcomes: Vec<PairCheckOutcome>) -> Analyzer {
-        let mut analyzer = Analyzer::new(Config::default(), Default::default());
+        let mut analyzer = Analyzer::new(Config::default());
         analyzer.set_pair_outcomes(outcomes);
         analyzer
     }
@@ -4345,7 +4135,7 @@ mod tests {
     /// `None` (the load-bearing absent verdict, NOT a fake `Some(true)`).
     #[test]
     fn overlay_compat_verdicts_leaves_none_when_outcomes_absent() {
-        let analyzer = Analyzer::new(Config::default(), Default::default());
+        let analyzer = Analyzer::new(Config::default());
 
         let mut matches = vec![edge("http|GET|/orders/:id")];
         analyzer.overlay_compat_verdicts(&mut matches);
@@ -4921,8 +4711,7 @@ mod tests {
     /// cloud's `attach_compat_verdicts` consumer filter included.
     #[test]
     fn match_row_ids_are_service_qualified_on_both_sides() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(http_call(
             "POST",
@@ -4965,8 +4754,7 @@ mod tests {
     /// must not report the fallback as orphaned.
     #[test]
     fn catch_all_only_producer_absorbs_but_never_pairs() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(http_call(
             "GET",
@@ -5006,8 +4794,7 @@ mod tests {
     /// maximal-agreement producer only.
     #[test]
     fn catch_all_never_outranks_specific_producer() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(http_call(
             "GET",
@@ -5060,8 +4847,7 @@ mod tests {
     /// base in carrick.json) and the producer keeps its honest orphan state.
     #[test]
     fn unknown_template_base_is_advisory_not_match() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(http_call(
             "POST",
@@ -5111,8 +4897,7 @@ mod tests {
             internal_env_vars: ["AUTH_HOST".to_string()].into_iter().collect(),
             ..Config::default()
         };
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(config, cm);
+        let mut analyzer = Analyzer::new(config);
 
         analyzer.calls.push(http_call(
             "POST",
@@ -5165,8 +4950,7 @@ mod tests {
             internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
             ..Config::default()
         };
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(config, cm);
+        let mut analyzer = Analyzer::new(config);
 
         analyzer.calls.push(http_call(
             "GET",
@@ -5216,8 +5000,7 @@ mod tests {
     /// is applied to a pairing that literal segments corroborate.
     #[test]
     fn literal_and_param_paths_keep_pairing() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer
             .calls
@@ -5270,8 +5053,7 @@ mod tests {
     /// corroborating signal.
     #[test]
     fn sole_prefixed_catch_all_still_pairs() {
-        let cm = Lrc::new(SourceMap::default());
-        let mut analyzer = Analyzer::new(Config::default(), cm);
+        let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(http_call(
             "GET",

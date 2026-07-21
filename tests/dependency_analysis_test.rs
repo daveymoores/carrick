@@ -3,14 +3,12 @@ use carrick::config::Config;
 use carrick::packages::{PackageJson, Packages};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use swc_common::{SourceMap, sync::Lrc};
 
 #[tokio::test]
 async fn test_dependency_conflict_detection() {
     // Create analyzer
     let config = Config::default();
-    let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(config, cm);
+    let mut analyzer = Analyzer::new(config);
 
     // Create mock packages for repo-a with express 4.18.0
     let mut deps_a = HashMap::new();
@@ -86,8 +84,7 @@ async fn test_dependency_conflict_detection() {
 async fn test_no_dependency_conflicts_when_versions_match() {
     // Create analyzer
     let config = Config::default();
-    let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(config, cm);
+    let mut analyzer = Analyzer::new(config);
 
     // Create mock packages for repo-a with express 4.18.0
     let mut deps_a = HashMap::new();
@@ -144,8 +141,7 @@ async fn test_no_dependency_conflicts_when_versions_match() {
 async fn test_no_conflicts_for_unique_packages() {
     // Create analyzer
     let config = Config::default();
-    let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(config, cm);
+    let mut analyzer = Analyzer::new(config);
 
     // Create mock packages for repo-a with lodash only
     let mut deps_a = HashMap::new();
@@ -202,8 +198,7 @@ async fn test_no_conflicts_for_unique_packages() {
 async fn test_only_major_incompatible_conflicts_reported() {
     // Create analyzer
     let config = Config::default();
-    let cm: Lrc<SourceMap> = Default::default();
-    let mut analyzer = Analyzer::new(config, cm);
+    let mut analyzer = Analyzer::new(config);
 
     // Create packages spanning a major (critical), minor (warning), and patch
     // (info) difference. Only the semver-INCOMPATIBLE major spread is reported as
