@@ -1,26 +1,8 @@
 use crate::visitor::Json;
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use swc_common::{SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 
-/// Express-style `:param` route parameter pattern. Compiled once.
-static ROUTE_PARAM_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r":(\w+)").unwrap());
-
 pub trait CoreExtractor {
-    fn get_source_map(&self) -> &Lrc<SourceMap>;
-
-    fn extract_params_from_route(&self, route: &str) -> Vec<String> {
-        let mut params = Vec::new();
-
-        for cap in ROUTE_PARAM_RE.captures_iter(route) {
-            params.push(cap[1].to_string());
-        }
-
-        params
-    }
-
     fn extract_json_fields_from_call(&self, expr_stmt: &ExprStmt) -> Option<Json> {
         if let Expr::Call(call) = &*expr_stmt.expr {
             self.extract_res_json_fields(call)
@@ -346,60 +328,5 @@ pub trait CoreExtractor {
         }
 
         None
-    }
-
-    // Async call extraction methods for Agent integration
-    fn extract_async_calls_from_function(
-        &self,
-        func: &crate::visitor::FunctionDefinition,
-    ) -> Vec<crate::agent_service::AsyncCallContext> {
-        use swc_common::{SourceMapper, Spanned};
-
-        let mut contexts = Vec::new();
-
-        // Get the function source code for LLM analysis
-        let source_map = self.get_source_map();
-
-        let (function_source, function_name) = match &func.node_type {
-            crate::visitor::FunctionNodeType::ArrowFunction(arrow) => {
-                let source = source_map.span_to_snippet(arrow.span).unwrap_or_default();
-                (source, "arrow_function".to_string())
-            }
-            crate::visitor::FunctionNodeType::FunctionDeclaration(decl) => {
-                let source = source_map.span_to_snippet(decl.span()).unwrap_or_default();
-                let name = decl.ident.sym.to_string();
-                (source, name)
-            }
-            crate::visitor::FunctionNodeType::FunctionExpression(expr) => {
-                let source = source_map.span_to_snippet(expr.span()).unwrap_or_default();
-                let name = expr
-                    .ident
-                    .as_ref()
-                    .map(|i| i.sym.to_string())
-                    .unwrap_or("anonymous".to_string());
-                (source, name)
-            }
-            crate::visitor::FunctionNodeType::Placeholder => {
-                // In CI mode, AST is not available, skip extraction
-                return contexts;
-            }
-        };
-
-        // Only create context if we found async patterns in the source
-        if function_source.contains("await")
-            || function_source.contains(".then")
-            || function_source.contains("fetch")
-            || function_source.contains("axios")
-        {
-            contexts.push(crate::agent_service::AsyncCallContext {
-                kind: "function_analysis".to_string(),
-                function_source,
-                file: func.file_path.to_string_lossy().to_string(),
-                line: 1, // We'll let Agent figure out the specific line
-                function_name,
-            });
-        }
-
-        contexts
     }
 }

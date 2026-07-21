@@ -1,10 +1,8 @@
 use crate::oidc::OidcProvider;
-use crate::visitor::{Call, Json, TypeReference};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Semaphore;
@@ -283,32 +281,6 @@ impl AgentService {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct AsyncCallContext {
-    pub kind: String,
-    pub function_source: String,
-    pub file: String,
-    pub line: u32,
-    pub function_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AgentCallResponse {
-    route: String,
-    method: String,
-    request_body: Option<serde_json::Value>,
-    request_type_info: Option<TypeInfo>,
-    response_type_info: Option<TypeInfo>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct TypeInfo {
-    pub file_path: String,
-    pub start_position: u32,
-    pub composite_type_string: String,
-    pub alias: String,
-}
-
 /// Request body for per-task lambda endpoints (e.g. /analyze-file).
 /// The lambda owns the system prompt; Rust just sends the user payload.
 #[derive(Debug, Serialize)]
@@ -338,172 +310,6 @@ struct AgentError {
     retriable: bool,
 }
 
-pub async fn extract_calls_from_async_expressions(
-    async_calls: Vec<AsyncCallContext>,
-    frameworks: &[String],
-    data_fetchers: &[String],
-) -> Result<Vec<Call>, Box<dyn std::error::Error>> {
-    // If CARRICK_MOCK_ALL is set, bypass the actual API call for testing purposes
-    if env::var("CARRICK_MOCK_ALL").is_ok() {
-        return Ok(vec![]);
-    }
-
-    // Emergency disable option for Agent API
-    if env::var("DISABLE_AGENT").is_ok() {
-        debug!("Agent API disabled via DISABLE_AGENT environment variable");
-        return Ok(vec![]);
-    }
-
-    if async_calls.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Size protection: warn if function sources are very large (high token usage)
-    let total_size: usize = async_calls
-        .iter()
-        .map(|call| call.function_source.len())
-        .sum();
-
-    const MAX_REASONABLE_SIZE: usize = 200_000; // 200KB - warn above this
-    if total_size > MAX_REASONABLE_SIZE {
-        warn!(
-            "Warning: Large amount of source code to analyze ({:.1}KB total). This may result in high token usage.",
-            total_size as f64 / 1024.0
-        );
-    }
-
-    debug!(
-        "Found {} async expressions, sending to /extract-calls lambda with framework context",
-        async_calls.len()
-    );
-
-    let agent_service = AgentService::new();
-
-    let payload = serde_json::json!({
-        "async_calls": async_calls,
-        "frameworks": frameworks,
-        "data_fetchers": data_fetchers,
-    });
-
-    let response = agent_service
-        .post_to_lambda("/extract-calls", &payload, "extract-calls")
-        .await?;
-
-    Ok(parse_agent_response(&response, &async_calls))
-}
-
-// create_extraction_system_message + create_extraction_prompt moved to
-// carrick-cloud/lambdas/extract-calls/ (system_prompt.txt + buildUserMessage).
-// Rust now sends {async_calls, frameworks, data_fetchers} to /extract-calls;
-// the lambda assembles the prompt from those fields.
-
-fn convert_agent_responses_to_calls(
-    agent_calls: Vec<AgentCallResponse>,
-    contexts: &[AsyncCallContext],
-) -> Vec<Call> {
-    agent_calls
-        .into_iter()
-        .enumerate()
-        .map(|(i, gc)| {
-            let file_path = contexts
-                .get(i)
-                .map(|c| PathBuf::from(&c.file))
-                .unwrap_or_default();
-
-            // Convert TypeInfo to TypeReference if present
-            let request_type = gc.request_type_info.map(|type_info| {
-                TypeReference {
-                    file_path: PathBuf::from(type_info.file_path),
-                    type_ann: None, // We don't have SWC AST node from Agent
-                    start_position: type_info.start_position as usize,
-                    composite_type_string: type_info.composite_type_string,
-                    alias: type_info.alias,
-                }
-            });
-
-            let response_type = gc.response_type_info.map(|type_info| {
-                TypeReference {
-                    file_path: PathBuf::from(type_info.file_path),
-                    type_ann: None, // We don't have SWC AST node from Agent
-                    start_position: type_info.start_position as usize,
-                    composite_type_string: type_info.composite_type_string,
-                    alias: type_info.alias,
-                }
-            });
-
-            Call {
-                route: gc.route,
-                method: gc.method.to_uppercase(),
-                response: Json::Null,
-                request: gc.request_body.and_then(|v| serde_json::from_value(v).ok()),
-                response_type,
-                request_type,
-                call_file: file_path,
-                call_id: None,
-                call_number: None,
-                common_type_name: None,
-            }
-        })
-        .collect()
-}
-
-fn parse_agent_response(response: &str, contexts: &[AsyncCallContext]) -> Vec<Call> {
-    let json_str = response.trim();
-
-    // Try multiple parsing strategies
-    let cleaned = clean_response(json_str);
-    let extraction_attempts = vec![
-        // Direct parse (clean response)
-        json_str,
-        // Extract from code blocks
-        extract_from_code_block(json_str),
-        // Extract JSON array bounds
-        extract_json_array(json_str),
-        // Clean and retry
-        &cleaned,
-    ];
-
-    for attempt in extraction_attempts {
-        if let Ok(agent_calls) = serde_json::from_str::<Vec<AgentCallResponse>>(attempt) {
-            return convert_agent_responses_to_calls(agent_calls, contexts);
-        }
-    }
-
-    warn!("All JSON parsing attempts failed. Response: {}", json_str);
-    vec![]
-}
-
-fn extract_from_code_block(text: &str) -> &str {
-    if let Some(start) = text.find("```json") {
-        if let Some(end) = text[start + 7..].find("```") {
-            return text[start + 7..start + 7 + end].trim();
-        }
-    } else if let Some(start) = text.find("```")
-        && let Some(end) = text[start + 3..].find("```")
-    {
-        return text[start + 3..start + 3 + end].trim();
-    }
-    text
-}
-
-fn extract_json_array(text: &str) -> &str {
-    if let Some(start) = text.find('[')
-        && let Some(end) = text.rfind(']')
-        && end > start
-    {
-        return &text[start..=end];
-    }
-    "[]"
-}
-
-fn clean_response(text: &str) -> String {
-    text.lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && !line.starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 /// Mock-mode dispatch by task path. Some lambdas don't send a
 /// `response_schema` (e.g. /generate-intent ships only `{name, body,
 /// called_intents}`), so falling through to schema-based dispatch
@@ -519,7 +325,6 @@ fn generate_mock_for_task<B: Serialize + ?Sized>(
     }
     match task_path {
         "/generate-intent" => "Mock intent: function does something.".to_string(),
-        "/extract-calls" => "[]".to_string(),
         _ => {
             // Tasks that send a schema (file-analyzer, framework-guidance)
             // dispatch by inspecting the schema shape. Tasks that don't but

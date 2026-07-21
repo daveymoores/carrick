@@ -10,15 +10,6 @@ pub struct AnalyzerBuilder {
 }
 
 impl AnalyzerBuilder {
-    #[allow(dead_code)]
-    pub fn new(config: Config, cm: Lrc<SourceMap>) -> Self {
-        Self {
-            config,
-            cm,
-            skip_type_resolution: false,
-        }
-    }
-
     pub fn new_for_cross_repo(config: Config, cm: Lrc<SourceMap>) -> Self {
         Self {
             config,
@@ -32,7 +23,7 @@ impl AnalyzerBuilder {
         &self,
         all_repo_data: Vec<CloudRepoData>,
     ) -> Result<Analyzer, Box<dyn std::error::Error>> {
-        let mut analyzer = Analyzer::new(self.config.clone(), self.cm.clone());
+        let mut analyzer = Analyzer::new(self.config.clone());
 
         // Populate analyzer with data from all repos
         for repo_data in all_repo_data {
@@ -100,9 +91,6 @@ impl AnalyzerBuilder {
 
         if !self.skip_type_resolution {
             analyzer.resolve_types_for_endpoints(self.cm.clone());
-            // Only analyze functions for fetch calls when building from visitors (current repo)
-            // Skip in cross-repo mode since repos are already analyzed
-            analyzer.analyze_functions_for_fetch_calls().await;
         }
 
         Ok(analyzer)

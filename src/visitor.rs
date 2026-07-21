@@ -159,21 +159,6 @@ pub struct Mount {
     pub prefix: String,    // Path prefix for this mount
 }
 
-#[derive(Debug, Clone)]
-pub struct Call {
-    pub route: String,
-    pub method: String,
-    #[allow(dead_code)]
-    pub response: Json,
-    pub request: Option<Json>,
-    pub response_type: Option<TypeReference>,
-    pub request_type: Option<TypeReference>,
-    pub call_file: PathBuf,
-    pub call_id: Option<String>, // Unique identifier for this specific call instance
-    pub call_number: Option<u32>, // Sequential number for this route+method combination
-    pub common_type_name: Option<String>, // Common interface name for type comparison
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymbolKind {
     Named,
