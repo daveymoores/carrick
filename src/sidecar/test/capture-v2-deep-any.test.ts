@@ -485,3 +485,64 @@ describe('capture self-check: author-baked deep any is not masked by a co-presen
     assert.strictEqual(rec.deep_top_type_kind, undefined);
   });
 });
+
+/**
+ * `flagOf` excludes TypeScript's unresolved-reference `error` placeholder so it
+ * is not conflated with an author-baked `any` (hole 3). That exclusion is the
+ * only NARROWING in the fix, so it must not open a new false-compatible: a
+ * NON-healable error cause (an UNPINNED external, or a dangling INTERNAL
+ * specifier) at a nested position — which the walk used to flag structurally —
+ * must still gate, now via the closure `internalFailure`/`blamedExternal` path
+ * rather than the deep walk. Only a PINNED external heals at check; these do
+ * not, so they must read `decayed_internal`, never `ok`/`allowlisted_external`.
+ */
+describe('capture self-check: a non-healable error-type member still gates (narrowing is safe)', () => {
+  let root: string;
+  let byAlias: Map<string, CaptureAliasRecord>;
+
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-448-errsafe-'));
+    const repoRoot = path.join(root, 'repo');
+    fs.mkdirSync(repoRoot, { recursive: true });
+    // NO lockfile: `some-ext` is UNPINNED (its decay never heals at check).
+    fs.writeFileSync(
+      path.join(repoRoot, 'types.ts'),
+      "import type { Widget } from 'some-ext';\n" +
+        'export interface UnpinnedExt { id: string; deep: { w: Widget } }\n' +
+        "export interface DanglingInternal { id: string; deep: { x: import('./missing').X } }\n"
+    );
+    fs.writeFileSync(
+      path.join(repoRoot, 'package.json'),
+      JSON.stringify({ name: 'p', version: '1.0.0' })
+    );
+    const result = captureStub({
+      repoRoot,
+      serviceName: 'errsafe-svc',
+      outDir: path.join(root, 'stub'),
+      anchors: [
+        { kind: 'symbol', alias: 'UnpinnedExt', symbol_name: 'UnpinnedExt', source_file: 'types.ts', anchor_origin: 'llm-symbol' },
+        { kind: 'symbol', alias: 'DanglingInternal', symbol_name: 'DanglingInternal', source_file: 'types.ts', anchor_origin: 'llm-symbol' },
+      ],
+    });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    assert.strictEqual(result.bare_checkout, true);
+    // The external is genuinely unpinned (no lockfile), so it is never
+    // allowlistable — it must gate as an internal failure.
+    assert.deepStrictEqual(result.pinned_dependencies, {});
+    byAlias = new Map(result.aliases.map((a) => [a.alias, a]));
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a nested UNPINNED-external decay gates decayed_internal (not ok/allowlisted)', () => {
+    const rec = byAlias.get('UnpinnedExt')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+  });
+
+  it('a nested dangling-internal decay gates decayed_internal', () => {
+    const rec = byAlias.get('DanglingInternal')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+  });
+});
