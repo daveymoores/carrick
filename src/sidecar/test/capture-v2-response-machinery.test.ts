@@ -231,10 +231,16 @@ describe('carrick#371 capture degrades a wrapped response envelope to unknown', 
     return r!;
   }
 
-  /** RHS of `export type <alias> = <rhs>;` — scoped to that one statement. */
+  /**
+   * Full RHS of `export type <alias> = <rhs>;` — scoped to that one statement.
+   * The terminating `;` is the one followed (after any whitespace) by the next
+   * `export type` or end-of-file, NOT the first inner `;` — so a multi-member
+   * object RHS (`{ id: number; name: string }`) is captured whole, never
+   * truncated at `{ id: number`.
+   */
   function rhsOf(alias: string): string {
     const m = surface.match(
-      new RegExp(`export type ${alias} = ([\\s\\S]*?);(?:\\n|$)`)
+      new RegExp(`export type ${alias} = ([\\s\\S]*?);(?=\\s*(?:export type |$))`)
     );
     assert.ok(m, `no surface line for ${alias}:\n${surface}`);
     return m![1];
@@ -267,8 +273,11 @@ describe('carrick#371 capture degrades a wrapped response envelope to unknown', 
   it('control: a real payload literal is captured as-is (no over-abstain)', () => {
     const r = record('Payload_Response');
     assert.strictEqual(r.self_check, 'ok', r.self_check_detail);
-    assert.match(surface, /Payload_Response = [\s\S]*id/);
-    assert.match(surface, /Payload_Response = [\s\S]*name/);
+    // rhsOf captures the WHOLE multi-member object (both members past the first
+    // inner `;`): the truncating helper this replaced saw only `{ id: number`.
+    const rhs = rhsOf('Payload_Response');
+    assert.match(rhs, /id/);
+    assert.match(rhs, /name/);
     assert.ok(!/Payload_Response = unknown;/.test(surface), surface);
   });
 });

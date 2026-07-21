@@ -116,9 +116,10 @@ const BUILTIN_ANCHOR_SYMBOLS = new Set<string>([
  * `writeHead`, ...), so the origin gate + `MACHINERY_INDICATOR_THRESHOLD` never
  * fire on real data. Kept in lockstep with the capture-seam mirror
  * `capture/machinery.ts` (the seam forbids sharing a module across it, same as
- * `BUILTIN_ANCHOR_SYMBOLS` mirrors `socket_io.rs`).
+ * `BUILTIN_ANCHOR_SYMBOLS` mirrors `socket_io.rs`). Exported so a drift-guard
+ * test (`machinery-indicator-mirror.test.ts`) asserts the two sets stay equal.
  */
-const MACHINERY_MEMBER_INDICATORS = new Set<string>([
+export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
   // fetch / DOM Response & Request body-consumer surface
   'ok',
   'redirected',
@@ -1628,19 +1629,40 @@ export class TypeInferrer {
   }
 
   /**
-   * A producer response type that IS or CONTAINS framework transport machinery
-   * (a fetch/DOM `Response`, a Node `ServerResponse`, a reply object) — the
-   * artifact behind carrick#371, where a wrapped route handler's literal return
+   * True when a producer RESPONSE type IS or CONTAINS framework transport
+   * machinery (a fetch/DOM `Response`, a Node `ServerResponse`, a reply object)
+   * — the artifact behind carrick#371, where a wrapped handler's literal return
    * envelope `{ response: Response; error?: undefined } | { ...; error: Error }`
    * was captured as the response contract. Machinery is never a comparable
    * contract, so a response path that resolves here abstains (honest `unknown`)
    * rather than emit a concrete-but-false type.
    *
-   * "CONTAINS" is one structural level: a union/intersection member, or a direct
-   * property's type, that is itself machinery — enough for the envelope shape,
-   * shallow enough not to over-abstain on a payload that merely references a
-   * machinery type deep inside. The origin gate in `typeIsFrameworkMachinery`
-   * keeps a user object whose fields happen to share a name from tripping.
+   * DETECTS, exactly (see `typeIsOrContainsMachinery`):
+   *   1. the type itself is machinery (`typeIsFrameworkMachinery`);
+   *   2. a union/intersection member is machinery (the envelope union);
+   *   3. a DIRECT property's type is machinery, ONE level of descent only
+   *      (`{ response: Response; error }`).
+   *
+   * DELIBERATELY NOT DETECTED — listed so this comment never overstates the
+   * guarantee (an overstated safety comment is what bit sibling PR #442). Each is
+   * a non-regression: it leaves the pre-existing verdict unchanged and never
+   * manufactures a new wrong one, tracked as a follow-up:
+   *   - machinery nested deeper than one property level (a property whose type
+   *     is itself a nested object wrapping the machinery);
+   *   - a property typed `Promise<Response>` (the property type is NOT awaited /
+   *     Promise-unwrapped before the machinery check);
+   *   - an array element type: `Response[]` is not descended to its element;
+   *   - `interface X extends Response` declared in USER source — the origin gate
+   *     is lib/`node_modules` only, so a user-declared subtype reads as a real
+   *     contract, not machinery;
+   *   - a function / call-signature return type: the response paths that call
+   *     this resolve a handler's RETURN (an envelope/object), never a function
+   *     value, so no call-signature descent happens here. The capture-seam
+   *     mirror `capture/machinery.ts` DOES descend call signatures — that is
+   *     where the wrapper-FUNCTION type the Infer fallback resolves is caught.
+   *
+   * The origin gate in `typeIsFrameworkMachinery` keeps a user object whose
+   * fields merely share a member name from tripping.
    */
   private typeIsOrContainsResponseMachinery(type: Type): boolean {
     return this.typeIsOrContainsMachinery(type, 0);
@@ -1685,30 +1707,34 @@ export class TypeInferrer {
    * names is never mistaken for framework machinery (the advisor's guard).
    */
   private typeIsFrameworkMachinery(type: Type): boolean {
-    const indicatorHits = this.countMachineryIndicators(type);
-    if (indicatorHits < MACHINERY_INDICATOR_THRESHOLD) {
+    if (!this.hasMachineryIndicatorThreshold(type)) {
       return false;
     }
     const symbol = type.getSymbol() ?? type.getAliasSymbol();
     return this.symbolIsLibOrExternalOrigin(symbol);
   }
 
-  /** How many `MACHINERY_MEMBER_INDICATORS` the type carries (own + apparent). */
-  private countMachineryIndicators(type: Type): number {
-    const names = new Set<string>();
+  /**
+   * True once the type carries at least `MACHINERY_INDICATOR_THRESHOLD` DISTINCT
+   * `MACHINERY_MEMBER_INDICATORS` (own + apparent). Deduplicates by name (own and
+   * apparent property lists overlap) and early-returns the moment the threshold
+   * is reached — the callers only need the boolean, never the full count.
+   */
+  private hasMachineryIndicatorThreshold(type: Type): boolean {
+    const matched = new Set<string>();
+    const consider = (name: string): boolean => {
+      if (MACHINERY_MEMBER_INDICATORS.has(name)) {
+        matched.add(name);
+      }
+      return matched.size >= MACHINERY_INDICATOR_THRESHOLD;
+    };
     for (const prop of type.getProperties()) {
-      names.add(prop.getName());
+      if (consider(prop.getName())) return true;
     }
     for (const prop of type.getApparentProperties()) {
-      names.add(prop.getName());
+      if (consider(prop.getName())) return true;
     }
-    let hits = 0;
-    for (const name of names) {
-      if (MACHINERY_MEMBER_INDICATORS.has(name)) {
-        hits += 1;
-      }
-    }
-    return hits;
+    return false;
   }
 
   /**

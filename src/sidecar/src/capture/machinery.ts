@@ -25,8 +25,11 @@ import ts from 'typescript';
  * identical to `MACHINERY_MEMBER_INDICATORS` in `type-inferrer.ts`. These are
  * the names no JSON payload carries (`ok`, `redirected`, `bodyUsed`,
  * `writeHead`, ...), so the origin gate + threshold never fire on real data.
+ * Exported so a drift-guard test (`machinery-indicator-mirror.test.ts`) asserts
+ * it stays equal to the `type-inferrer.ts` copy — nothing else enforces the
+ * lockstep, and if the two drift one path silently stops abstaining.
  */
-const MACHINERY_MEMBER_INDICATORS = new Set<string>([
+export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
   // fetch / DOM Response & Request body-consumer surface
   'ok',
   'redirected',
@@ -52,13 +55,31 @@ const MACHINERY_INDICATOR_THRESHOLD = 3;
 
 /**
  * True when `type`, resolved against `node`, IS or CONTAINS framework
- * machinery. "CONTAINS" covers three structural shapes, all one level deep:
- *  - a union/intersection member that is machinery (the envelope union);
- *  - a direct property whose type is machinery (`{ response: Response }`);
- *  - a call signature whose (awaited) return type is machinery (the wrapper
- *    function `(req) => Promise<Response>` the Infer fallback resolves to).
- * The depth cap keeps a legitimate payload that merely references a machinery
- * type far inside from over-abstaining.
+ * machinery.
+ *
+ * DETECTS, exactly:
+ *   1. the type itself is machinery (`isFrameworkMachinery`);
+ *   2. a union/intersection member is machinery (the envelope union);
+ *   3. a DIRECT property whose type is machinery (`{ response: Response }`),
+ *      ONE level of descent only;
+ *   4. a CALL SIGNATURE whose AWAITED return type is machinery — the wrapper
+ *      function `(req) => Promise<Response>` the Infer fallback resolves to.
+ *      (Only the call return is awaited; property types below are not.)
+ *
+ * DELIBERATELY NOT DETECTED — stated so this comment never overstates the
+ * guarantee (mirrors the same list in `type-inferrer.ts`). Each is a
+ * non-regression (pre-existing verdict unchanged, never a new wrong one), a
+ * tracked follow-up:
+ *   - machinery nested deeper than one property level;
+ *   - a PROPERTY typed `Promise<Response>` (property types are not awaited /
+ *     Promise-unwrapped before the check — only call-signature returns are);
+ *   - an array element type: `Response[]` is not descended to its element;
+ *   - `interface X extends Response` declared in USER source — the origin gate
+ *     is lib/`node_modules` only, so a user-declared subtype reads as a real
+ *     contract.
+ *
+ * The depth cap + origin gate keep a legitimate payload that merely references a
+ * machinery type far inside from over-abstaining.
  */
 export function typeIsOrContainsMachinery(
   checker: ts.TypeChecker,
