@@ -161,6 +161,22 @@ export function resolveAnchor(
   if ((request.unwrap ?? 'awaited') === 'awaited') {
     type = checker.getAwaitedType(type) ?? type;
   }
+  // #433: the checker gave us nothing (whole top type) — try the syntactic
+  // recovery for an inline literal type argument of an unresolvable generic
+  // annotation. The literal is dependency-free source syntax; only the outer
+  // generic needed the missing package.
+  if (isTopType(type)) {
+    const literalNode = recoverInlineLiteralTypeArgument(
+      checker,
+      sourceFile,
+      request,
+      located
+    );
+    if (literalNode) {
+      const recovered = checker.getTypeAtLocation(literalNode);
+      if (!isTopType(recovered)) type = recovered;
+    }
+  }
   if (!args.placeholder) {
     return demote('internal: no placeholder destination for infer anchor');
   }
@@ -173,6 +189,222 @@ export function resolveAnchor(
     aliasText: printed.text,
     serialization: 'node_builder',
   };
+}
+
+function isTopType(type: ts.Type): boolean {
+  return (
+    (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0
+  );
+}
+
+/**
+ * The checker's intrinsic ERROR type: resolution of the reference FAILED
+ * (missing package on a bare checkout, unresolvable symbol). Distinct from a
+ * legitimate `any`, whose intrinsic name is `any` — an author-written or
+ * alias-resolved `any` must never trigger the syntactic recovery.
+ * `intrinsicName` is internal but stable since TS 1.x (same standing as the
+ * internals node-builder.ts already mirrors).
+ */
+function isErrorType(type: ts.Type): boolean {
+  if (!(type.flags & ts.TypeFlags.Any)) return false;
+  const name = (type as unknown as { intrinsicName?: string }).intrinsicName;
+  return name === 'error' || name === 'unresolved';
+}
+
+/**
+ * #433 syntactic recovery: an infer anchor whose checker type decayed to a
+ * whole top type may sit under a DECLARED annotation of the form
+ * `SomeGeneric<{ ...literal... }>` where only the outer generic failed to
+ * resolve (error-typed; its package is absent on a bare checkout) while the
+ * literal type argument is dependency-free source syntax referencing only
+ * locally-resolvable symbols. Trigger is purely structural — no framework
+ * names anywhere:
+ *
+ *  1. Data-flow path: the payload node (the located node, or the anchor's
+ *     expression_text relocated) is an argument of a call — or IS a send
+ *     call — whose callee chain roots at an identifier whose declaration
+ *     carries the annotation (`res.json(payload)` -> `res`).
+ *  2. Registration path: the located node is a call registering inline
+ *     callbacks; the callbacks' parameter annotations are scanned.
+ *
+ * Either path recovers ONLY when exactly one literal type argument is in
+ * scope — ambiguity refuses recovery and the alias keeps decaying honestly.
+ * The recovered literal node's own type is printed through the normal
+ * node-builder path, so the alias still faces the real self-check.
+ */
+function recoverInlineLiteralTypeArgument(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+  request: InferAnchorRequest,
+  located: ts.Node
+): ts.TypeLiteralNode | undefined {
+  const candidates: ts.Node[] = [located];
+  if (request.expression_text) {
+    const byText = nodeByExpressionText(
+      sourceFile,
+      request.expression_text,
+      request.line_number
+    );
+    if (byText && byText !== located) candidates.push(byText);
+  }
+
+  // Data-flow first: the payload's own call names the annotated receiver.
+  for (const node of candidates) {
+    const call = governingCall(node);
+    if (!call) continue;
+    const root = calleeRootIdentifier(call.expression);
+    if (!root) continue;
+    const annotation = declaredAnnotationOf(checker, root);
+    if (!annotation || !isErroredGenericReference(checker, annotation)) continue;
+    // The payload carrier is identified; its annotation's verdict is FINAL —
+    // never fall through to the registration scan, which could pick a
+    // different parameter's literal for this payload.
+    const literals = literalTypeArguments(annotation);
+    if (literals.length !== 1) return undefined;
+    return literalResolvesLocally(checker, literals[0]) ? literals[0] : undefined;
+  }
+
+  // Registration shape: the located call passes inline callbacks whose
+  // parameters carry the annotations. Ambiguity is counted BEFORE any
+  // resolvability filtering: two literal-carrying annotations refuse even
+  // when one of them would be rejected later — filtering first could crown
+  // the wrong parameter's literal.
+  for (const node of candidates) {
+    if (!ts.isCallExpression(node)) continue;
+    const literals: ts.TypeLiteralNode[] = [];
+    for (const arg of node.arguments) {
+      if (!isFunctionArgument(arg)) continue;
+      for (const param of arg.parameters) {
+        if (param.type && isErroredGenericReference(checker, param.type)) {
+          literals.push(...literalTypeArguments(param.type));
+        }
+      }
+    }
+    if (literals.length !== 1) continue;
+    return literalResolvesLocally(checker, literals[0]) ? literals[0] : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The call whose ARGUMENT list carries `node` (payload in argument position),
+ * or `node` itself when it is a call (the send call). Calls that register
+ * callbacks are excluded: their receiver is the framework app/router value,
+ * not a payload carrier — those go through the registration path instead.
+ */
+function governingCall(node: ts.Node): ts.CallExpression | undefined {
+  if (ts.isCallExpression(node)) {
+    return node.arguments.some(isFunctionArgument) ? undefined : node;
+  }
+  const parent = node.parent;
+  if (
+    parent !== undefined &&
+    ts.isCallExpression(parent) &&
+    node !== parent.expression &&
+    (parent.arguments as readonly ts.Node[]).includes(node)
+  ) {
+    return parent.arguments.some(isFunctionArgument) ? undefined : parent;
+  }
+  return undefined;
+}
+
+function isFunctionArgument(
+  arg: ts.Expression
+): arg is ts.ArrowFunction | ts.FunctionExpression {
+  return ts.isArrowFunction(arg) || ts.isFunctionExpression(arg);
+}
+
+/** Root identifier of a callee chain: `res.status(500).json` -> `res`. */
+function calleeRootIdentifier(expr: ts.Expression): ts.Identifier | undefined {
+  let current: ts.Expression = expr;
+  while (
+    ts.isPropertyAccessExpression(current) ||
+    ts.isElementAccessExpression(current) ||
+    ts.isCallExpression(current) ||
+    ts.isNonNullExpression(current) ||
+    ts.isParenthesizedExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return ts.isIdentifier(current) ? current : undefined;
+}
+
+/** The explicit type annotation on the identifier's declaration, if any. */
+function declaredAnnotationOf(
+  checker: ts.TypeChecker,
+  identifier: ts.Identifier
+): ts.TypeNode | undefined {
+  const symbol = checker.getSymbolAtLocation(identifier);
+  const decl = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
+  if (!decl) return undefined;
+  if (
+    ts.isParameter(decl) ||
+    ts.isVariableDeclaration(decl) ||
+    ts.isPropertySignature(decl) ||
+    ts.isPropertyDeclaration(decl)
+  ) {
+    return decl.type;
+  }
+  return undefined;
+}
+
+/**
+ * A generic type reference whose OUTER resolution failed: the annotation is
+ * `Name<...args>` and its own type is the checker's error type. A resolvable
+ * generic (however it resolves) never triggers recovery; its checker answer
+ * is the truth.
+ */
+function isErroredGenericReference(
+  checker: ts.TypeChecker,
+  annotation: ts.TypeNode
+): annotation is ts.TypeReferenceNode {
+  return (
+    ts.isTypeReferenceNode(annotation) &&
+    (annotation.typeArguments?.length ?? 0) > 0 &&
+    isErrorType(checker.getTypeFromTypeNode(annotation))
+  );
+}
+
+/** Type-literal type arguments of a generic reference (parens unwrapped). */
+function literalTypeArguments(annotation: ts.TypeReferenceNode): ts.TypeLiteralNode[] {
+  const literals: ts.TypeLiteralNode[] = [];
+  for (const arg of annotation.typeArguments ?? []) {
+    let node: ts.TypeNode = arg;
+    while (ts.isParenthesizedTypeNode(node)) node = node.type;
+    if (ts.isTypeLiteralNode(node)) literals.push(node);
+  }
+  return literals;
+}
+
+/**
+ * Every type reference inside the literal must itself RESOLVE. A literal
+ * leaning on a third-party type (`{ thing: LibThing }` with the lib absent)
+ * is not the tractable class — recovering it would bake `any` at a member;
+ * it keeps decaying honestly instead. Author-written `any`/`unknown`
+ * keywords are allowed through: they are the source's truth, and the
+ * self-check's deep walk still owns that verdict.
+ */
+function literalResolvesLocally(
+  checker: ts.TypeChecker,
+  literal: ts.TypeLiteralNode
+): boolean {
+  let resolves = true;
+  const visit = (node: ts.Node): void => {
+    if (!resolves) return;
+    if (
+      (ts.isTypeReferenceNode(node) ||
+        ts.isImportTypeNode(node) ||
+        ts.isTypeQueryNode(node) ||
+        ts.isExpressionWithTypeArguments(node)) &&
+      isErrorType(checker.getTypeFromTypeNode(node))
+    ) {
+      resolves = false;
+      return;
+    }
+    node.forEachChild(visit);
+  };
+  visit(literal);
+  return resolves;
 }
 
 function locatorFailureReason(request: InferAnchorRequest): string {
