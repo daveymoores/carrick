@@ -641,6 +641,90 @@ describe('capture self-check: budget exhaustion fails CLOSED', () => {
   });
 });
 
+/**
+ * The seen-set/budget interaction the coordinator asked to prove, not just
+ * reason: budget exhaustion fails closed, so a truncated visit returns the
+ * sentinel (which bubbles up and terminates the walk) rather than being
+ * memoized clean in `seen`. So a shared type buried past the budget on ONE
+ * reference can never be marked clean for a SHALLOWER reference, and a cyclic
+ * type terminates and still gates its buried any — while a genuinely clean
+ * cyclic type is not over-demoted. Symbol anchors give the shared/cyclic types
+ * a stable identity (a literal would be structurally re-created each time).
+ */
+describe('capture self-check: shared + cyclic types gate (seen-set is not fail-open)', () => {
+  let symRoot: string;
+  let byAlias: Map<string, CaptureAliasRecord>;
+
+  before(() => {
+    symRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-448-seen-'));
+    const repoRoot = path.join(symRoot, 'repo');
+    fs.mkdirSync(repoRoot, { recursive: true });
+    const wrap = (n: number, inner: string): string => {
+      let t = inner;
+      for (let i = n; i >= 1; i--) t = `{ w${i}: ${t} }`;
+      return t;
+    };
+    fs.writeFileSync(
+      path.join(repoRoot, 'types.ts'),
+      // `S` buries an any; referenced both DEEP (past budget) and SHALLOW.
+      'export interface S { mid: { buried: any } }\n' +
+        `export interface T_DeepFirst { deep: ${wrap(14, '{ s: S }')}; shallow: { s: S } }\n` +
+        `export interface T_ShallowFirst { shallow: { s: S }; deep: ${wrap(14, '{ s: S }')} }\n` +
+        // Cyclic type with a buried any: must terminate AND gate.
+        'export interface CyclicAny { next: CyclicAny; buried: any }\n' +
+        // Clean cyclic type: must terminate and NOT be over-demoted.
+        'export interface CyclicClean { self: CyclicClean; data: { ok: string } }\n'
+    );
+    const result = captureStub({
+      repoRoot,
+      serviceName: 'seen-svc',
+      outDir: path.join(symRoot, 'stub'),
+      anchors: ['T_DeepFirst', 'T_ShallowFirst', 'CyclicAny', 'CyclicClean'].map((n) => ({
+        kind: 'symbol' as const,
+        alias: n,
+        symbol_name: n,
+        source_file: 'types.ts',
+        anchor_origin: 'llm-symbol' as const,
+      })),
+    });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    byAlias = new Map(result.aliases.map((a) => [a.alias, a]));
+  });
+
+  after(() => {
+    fs.rmSync(symRoot, { recursive: true, force: true });
+  });
+
+  it('a shared type buried past budget gates regardless of reference order (deep first)', () => {
+    const rec = byAlias.get('T_DeepFirst')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+    // Never `ok`: the truncated deep visit is not memoized clean for the
+    // shallow reference. (Deep-first truncates -> budget_exhausted.)
+    assert.ok(
+      rec.deep_top_type_kind === 'budget_exhausted' || rec.deep_top_type_kind === 'any',
+      `expected a decay kind, got ${rec.deep_top_type_kind}`
+    );
+  });
+
+  it('the same shared type gates shallow-first too (any found before the deep reference)', () => {
+    const rec = byAlias.get('T_ShallowFirst')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+    assert.ok(rec.deep_top_type_kind === 'any' || rec.deep_top_type_kind === 'budget_exhausted');
+  });
+
+  it('a cyclic type with a buried any terminates and gates (never ok/hang)', () => {
+    const rec = byAlias.get('CyclicAny')!;
+    assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
+    assert.strictEqual(rec.deep_top_type_kind, 'any');
+  });
+
+  it('a genuinely clean cyclic type terminates and is NOT over-demoted', () => {
+    const rec = byAlias.get('CyclicClean')!;
+    assert.strictEqual(rec.self_check, 'ok', rec.self_check_detail);
+    assert.strictEqual(rec.deep_top_type_kind, undefined);
+  });
+});
+
 describe('check phase: a budget-exhausted deep any is unverifiable, within-budget clean verifies', () => {
   let checkRoot: string;
   let producerStub: string;
@@ -651,10 +735,12 @@ describe('check phase: a budget-exhausted deep any is unverifiable, within-budge
     const producer = captureLiterals(checkRoot, 'bd-producer', {
       P_D17any: nested(17, 'any'),
       P_D16clean: nested(16, 'string'),
+      P_ShallowClean: '{ ok: string }', // shallow clean producer for the consumer-side case
     });
     const consumer = captureLiterals(checkRoot, 'bd-consumer', {
       C_D17: nested(17, 'string'),
       C_D16: nested(16, 'string'),
+      C_D17any: nested(17, 'any'), // budget-exhausted on the CONSUMER side
     });
     producerStub = producer.stub_dir;
     consumerStub = consumer.stub_dir;
@@ -685,6 +771,14 @@ describe('check phase: a budget-exhausted deep any is unverifiable, within-budge
           producer: { service_name: 'bd-producer', alias: 'P_D16clean' },
           consumer: { service_name: 'bd-consumer', alias: 'C_D16' },
         },
+        {
+          // Symmetric: the budget-exhausted any on the CONSUMER side.
+          pair_key: 'd17-consumer',
+          protocol: 'http',
+          type_kind: 'response',
+          producer: { service_name: 'bd-producer', alias: 'P_ShallowClean' },
+          consumer: { service_name: 'bd-consumer', alias: 'C_D17any' },
+        },
       ],
     });
     assert.strictEqual(result.success, true, JSON.stringify(result.errors));
@@ -693,6 +787,10 @@ describe('check phase: a budget-exhausted deep any is unverifiable, within-budge
     const d17 = byKey.get('d17')!;
     assert.strictEqual(d17.bucket, 'unverifiable', JSON.stringify(d17));
     assert.strictEqual(d17.gate, 'capture:producer:budget_exhausted');
+    // Symmetric on the consumer side (deepDecayOf loops both sides).
+    const d17c = byKey.get('d17-consumer')!;
+    assert.strictEqual(d17c.bucket, 'unverifiable', JSON.stringify(d17c));
+    assert.strictEqual(d17c.gate, 'capture:consumer:budget_exhausted');
     // A clean type within budget still verifies — no over-demotion.
     assert.strictEqual(byKey.get('d16-clean')!.bucket, 'compatible', JSON.stringify(byKey.get('d16-clean')));
   });
