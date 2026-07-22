@@ -462,7 +462,7 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
     ));
     output.push_str(&format_verified_subsection(
         "Types not compared",
-        "Matched by method and path; no compiler verdict is stored for these pairs, so treat the types as unverified.",
+        "Matched by method and path. No stored verdict marks these types compatible, so treat them as unverified; any pairs found incompatible are reported as risks above.",
         &matched_only,
     ));
     output.push_str("</details>");
