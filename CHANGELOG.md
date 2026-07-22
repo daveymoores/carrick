@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.1...carrick-v0.3.2) (2026-07-22)
+
+
+### Bug Fixes
+
+* **type-compat:** verify Unknown-state sides with a resolved v2 surface ([#448](https://github.com/carrick-tools/carrick/issues/448)) ([f0fdffa](https://github.com/carrick-tools/carrick/commit/f0fdffa3ad8e0591e9e88e21d714e55ae56c776f))
+
 ## [0.3.1](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.0...carrick-v0.3.1) (2026-07-21)
 
 
