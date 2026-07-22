@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 use crate::analyzer::PairCheckOutcome;
 use crate::cloud_storage::{
     CAPTURE_ARTIFACT_VERSION, CaptureStubArtifact, CloudRepoData, ManifestRole, ManifestTypeKind,
-    ManifestTypeState, TypeManifestEntry,
+    TypeManifestEntry,
 };
 use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
@@ -626,8 +626,10 @@ pub(crate) struct BuiltPair {
     pub consumer_alias: String,
     pub producer_service: String,
     pub consumer_service: String,
-    /// Set when the pair is unverifiable before any probe runs (a side's
-    /// type_state is Unknown, or a side has no capture surface).
+    /// Set when the pair is unverifiable before any probe runs: a side has no
+    /// v2 capture surface at all (older scan or degraded capture). The stale
+    /// manifest `type_state` is NOT a pre-verdict trigger — check_v2 reads the
+    /// real surface and judges resolved-ness itself.
     pub pre_verdict: Option<(VerdictBucket, String)>,
 }
 
@@ -645,10 +647,15 @@ struct ServiceEntry<'a> {
 ///   most specific producer(s) per consumer.
 /// - socket/graphql/pubsub: exact operation-key match + type_kind.
 ///
-/// An unresolved side (`type_state == Unknown`) or a side without a capture
-/// surface produces a pair with a pre-set unverifiable verdict instead of a
-/// probe (design: unresolved anchors generate no probe; a missing surface is
-/// "peer scanned without a v2 surface — re-scan").
+/// A side without a v2 capture surface produces a pair with a pre-set
+/// unverifiable verdict instead of a probe ("peer scanned without a v2 surface
+/// — re-scan"). The manifest `type_state` is NOT consulted for the pre-verdict:
+/// it records the v1 (pre-capture) resolution, which leaves inline-literal
+/// producer/consumer responses `Unknown` even when the v2 capture surface fully
+/// resolved the alias. check_v2 reads the real surface and is the sole
+/// authority — an alias baked to any/unknown (or absent) is caught by its own
+/// gate. Gating the pre-verdict on the stale `type_state` dropped real,
+/// resolvable, compatible edges to "not compared".
 pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPair> {
     let mut producers: Vec<ServiceEntry> = Vec::new();
     let mut consumers: Vec<ServiceEntry> = Vec::new();
@@ -762,6 +769,18 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         consumer.entry.type_alias
     );
 
+    // The ONLY pre-probe unverifiable is a side that literally has no v2
+    // capture surface (older scan or capture degraded — re-scan it). The
+    // manifest `type_state` is deliberately NOT consulted: it records the v1
+    // (pre-capture) resolution, which leaves an inline-literal producer/
+    // consumer response `Unknown` even when the v2 capture surface fully
+    // resolved that alias (self-check ok). `check_v2` reads the actual surface
+    // and is the sole authority on resolved-ness — an alias that baked to
+    // `any`/`unknown` (or is absent from the surface) is caught by its own
+    // IsAny/IsUnknown gate (`gate_caught_baked_any` / import error →
+    // unverifiable) and can never read compatible. Gating on the stale
+    // `type_state` instead dropped real, resolvable, mutually-compatible edges
+    // to "not compared" (the order→notification verdict gap).
     let pre_verdict = if !producer.has_surface {
         Some((
             VerdictBucket::Unverifiable,
@@ -777,16 +796,6 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
                 "consumer service '{}' has no v2 type surface (older scan or capture degraded) — re-scan it",
                 consumer.service_id
             ),
-        ))
-    } else if producer.entry.type_state == ManifestTypeState::Unknown {
-        Some((
-            VerdictBucket::Unverifiable,
-            "producer type was not resolved at capture time".to_string(),
-        ))
-    } else if consumer.entry.type_state == ManifestTypeState::Unknown {
-        Some((
-            VerdictBucket::Unverifiable,
-            "consumer type was not resolved at capture time".to_string(),
         ))
     } else {
         None
@@ -995,9 +1004,10 @@ fn outcome_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cloud_storage::TypeEvidence;
+    use crate::cloud_storage::{ManifestTypeState, TypeEvidence};
     use crate::services::type_sidecar::InferKind;
     use crate::type_manifest::{build_manifest_type_alias, build_manifest_type_alias_with_call_id};
+    use serial_test::serial;
 
     fn entry(
         key: OperationKey,
@@ -1727,10 +1737,14 @@ mod tests {
         assert_eq!(pairs[0].consumer_service, "orders-engine");
     }
 
-    /// An unresolved side or a missing capture surface pre-verdicts the pair
-    /// unverifiable — it never reaches a probe, and the reason travels.
+    /// A missing capture surface — and ONLY a missing surface — pre-verdicts
+    /// the pair unverifiable before any probe. A manifest `type_state ==
+    /// Unknown` on a side that HAS a surface no longer pre-verdicts: the
+    /// manifest state is the stale v1 (pre-capture) signal, so a resolvable
+    /// alias would be dropped; check_v2 reads the actual surface and judges it
+    /// (baked any/unknown is caught by its own IsAny/IsUnknown gate).
     #[test]
-    fn build_pairs_pre_verdicts_unresolved_and_surfaceless() {
+    fn build_pairs_pre_verdicts_only_surfaceless() {
         let key = OperationKey::http("GET", "/orders");
         let no_surface_producer = repo(
             "api",
@@ -1766,8 +1780,9 @@ mod tests {
         assert_eq!(*bucket, VerdictBucket::Unverifiable);
         assert!(reason.contains("no v2 type surface"), "{reason}");
 
-        // Unknown type_state on a side with a surface: unresolved anchors
-        // generate no probe (design, Check step 9).
+        // Unknown type_state on a side WITH a surface: NO pre-verdict. The
+        // stale manifest state must not short-circuit a probe — check_v2 reads
+        // the real surface and is the sole authority on resolved-ness.
         let unresolved_producer = repo(
             "api",
             None,
@@ -1784,9 +1799,11 @@ mod tests {
         );
         let pairs = build_check_pairs(&[unresolved_producer, consumer_ok]);
         assert_eq!(pairs.len(), 1);
-        let (bucket, reason) = pairs[0].pre_verdict.as_ref().expect("pre-verdict");
-        assert_eq!(*bucket, VerdictBucket::Unverifiable);
-        assert!(reason.contains("not resolved at capture time"), "{reason}");
+        assert!(
+            pairs[0].pre_verdict.is_none(),
+            "an Unknown-state side WITH a surface must probe, not pre-verdict: {:?}",
+            pairs[0].pre_verdict
+        );
     }
 
     // ---- end-to-end: capture_v2 -> check_v2 -> pair outcomes -> edge join --
@@ -1805,6 +1822,7 @@ mod tests {
     /// The check path is deterministic given the anchors (no LLM anywhere);
     /// the pnpm install is local-only for these bare fixtures.
     #[test]
+    #[serial(v2_capture_sidecar)]
     fn corpus_capture_check_join_end_to_end() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
@@ -1977,6 +1995,7 @@ mod tests {
     /// the demoted surface ships as-is and the pair stays honestly
     /// unverifiable — never compatible.
     #[test]
+    #[serial(v2_capture_sidecar)]
     fn demoted_alias_literal_backfill_end_to_end() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
@@ -2168,6 +2187,160 @@ mod tests {
             "without a backfill the demotion must never read compatible; \
              diagnostic: {:?}",
             control_outcomes[0].diagnostic
+        );
+    }
+
+    /// Regression for the order→notification verdict gap: a producer whose
+    /// manifest `type_state` is `Unknown` (an inline-literal response v1 could
+    /// not resolve — `primary_type_symbol` null) but whose v2 capture surface
+    /// DID resolve the alias (self-check ok) must land a REAL verdict, not a
+    /// pre-probe `Unverifiable`.
+    ///
+    /// Pre-fix, `build_pair` short-circuited any `type_state == Unknown` side
+    /// to Unverifiable off the stale v1 signal, so `apply_pair_outcomes`
+    /// collapsed the edge to `type_compatible: None` and the cloud read "not
+    /// compared" — even though both sides had resolvable, mutually-compatible
+    /// types. This test captures notifications-svc's inline-literal `GET
+    /// /health` (`{ status: string }`) through an INFER anchor — v1 leaves it
+    /// Unknown, the v2 locator resolves it — and pairs it with a matching
+    /// consumer; the pair must verdict Compatible. The `type_state == Unknown`
+    /// on the producer entry is the exact production state the fix must no
+    /// longer gate on.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn unknown_state_producer_with_resolved_surface_verifies_end_to_end() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let notif_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/notifications-svc");
+        let dash_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/web-dashboard");
+        assert!(notif_repo.exists(), "fixture missing: {notif_repo:?}");
+        assert!(dash_repo.exists(), "fixture missing: {dash_repo:?}");
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&notif_repo, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(60))
+            .expect("sidecar init");
+
+        let key = OperationKey::http("GET", "/health");
+        let producer_alias =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let consumer_call_id = crate::type_manifest::build_call_site_id(
+            "lib/api.ts",
+            40,
+            &key,
+            dash_repo.to_str().unwrap(),
+        );
+        let consumer_alias = build_manifest_type_alias_with_call_id(
+            &key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&consumer_call_id),
+        );
+
+        // Producer: the inline-literal `/health` return, captured via an INFER
+        // anchor at the return statement (line 27). v1 cannot resolve an inline
+        // object literal (it stays Unknown in the manifest); the v2 capture
+        // locator resolves `{ status: string }`.
+        let (notif_stub, notif_artifact) = run_capture(
+            &sidecar,
+            notif_repo.to_str().unwrap(),
+            "notifications-svc",
+            &[CaptureAnchor::Infer {
+                alias: producer_alias.clone(),
+                source_file: "src/http/routes.ts".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                span_start: None,
+                span_end: None,
+                line_number: Some(27),
+                expression_text: None,
+            }],
+            &HashMap::new(),
+        )
+        .expect("notifications-svc capture");
+        let surface = notif_artifact
+            .files
+            .get("types/surface.d.ts")
+            .expect("surface in artifact");
+        assert!(
+            surface.contains(&format!("export type {} =", producer_alias))
+                && surface.contains("status"),
+            "the inline-literal producer must RESOLVE in the surface, got:\n{surface}"
+        );
+        assert!(
+            !surface.contains(&format!("export type {} = unknown", producer_alias))
+                && !surface.contains(&format!("export type {} = any", producer_alias)),
+            "the producer surface must not be a top-type placeholder:\n{surface}"
+        );
+
+        // Consumer: a matching `{ status: string }` expected type.
+        let (dash_stub, dash_artifact) = run_capture(
+            &sidecar,
+            dash_repo.to_str().unwrap(),
+            "web-dashboard",
+            &[CaptureAnchor::Literal {
+                alias: consumer_alias.clone(),
+                type_text: "{ status: string }".to_string(),
+                anchor_origin: AnchorOrigin::LlmSymbol,
+            }],
+            &HashMap::new(),
+        )
+        .expect("web-dashboard capture");
+        let _ = std::fs::remove_dir_all(&notif_stub);
+        let _ = std::fs::remove_dir_all(&dash_stub);
+
+        // The producer manifest entry carries `type_state = Unknown` — the exact
+        // production state for an inline-literal producer response (v1 could not
+        // resolve it; the v2 capture surface above DID). Pre-fix, this alone
+        // pre-verdicted the pair Unverifiable before check_v2 ever ran.
+        let producer_entry = entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            &producer_alias,
+            "src/http/routes.ts",
+            26,
+            ManifestTypeState::Unknown,
+        );
+        let consumer_entry = entry(
+            key.clone(),
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            &consumer_alias,
+            "lib/api.ts",
+            40,
+            ManifestTypeState::Explicit,
+        );
+
+        let outcomes = run_check(
+            &sidecar,
+            &[
+                repo(
+                    "notifications-svc",
+                    None,
+                    vec![producer_entry],
+                    Some(notif_artifact),
+                ),
+                repo(
+                    "web-dashboard",
+                    None,
+                    vec![consumer_entry],
+                    Some(dash_artifact),
+                ),
+            ],
+        );
+        assert_eq!(outcomes.len(), 1, "exactly one matched pair");
+        assert_eq!(
+            outcomes[0].bucket,
+            VerdictBucket::Compatible,
+            "an Unknown-state producer whose v2 surface resolved must verdict \
+             compatible — never pre-verdicted Unverifiable off the stale \
+             type_state; diagnostic: {:?}",
+            outcomes[0].diagnostic
         );
     }
 }

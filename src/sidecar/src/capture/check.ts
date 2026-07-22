@@ -191,12 +191,19 @@ export async function runCheck(
     preGated.push({
       pair_id: plan.pairId,
       pair_key: plan.spec.pair_key,
+      // `any` is a confirmed baked top type -> gate_caught_baked_any; `unknown`
+      // and `budget_exhausted` (a subtree the capture walk could not finish)
+      // are "cannot verify" -> unverifiable. All read as None downstream.
       bucket: hit.kind === 'any' ? 'gate_caught_baked_any' : 'unverifiable',
       gate: `capture:${hit.side}:${hit.kind}`,
       diagnostic:
-        `the ${hit.side} type carries '${hit.kind}' at '${hit.path}' from ` +
-        `capture; compatibility cannot be verified (a partially-unresolved ` +
-        `type would let an arbitrary shape read compatible).`,
+        hit.kind === 'budget_exhausted'
+          ? `the ${hit.side} type is too deep or wide to verify within the ` +
+            `capture budget (at '${hit.path}'); compatibility cannot be ` +
+            `verified — abstaining so a buried 'any' can never read compatible.`
+          : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}' from ` +
+            `capture; compatibility cannot be verified (a partially-unresolved ` +
+            `type would let an arbitrary shape read compatible).`,
       codes: [],
     });
   }
@@ -368,7 +375,7 @@ function readStubAliasRecords(
 
 interface DeepDecayHit {
   side: 'producer' | 'consumer';
-  kind: 'any' | 'unknown';
+  kind: 'any' | 'unknown' | 'budget_exhausted';
   path: string;
 }
 
