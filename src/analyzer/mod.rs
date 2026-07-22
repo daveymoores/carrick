@@ -35,9 +35,33 @@ static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
 // Type aliases to reduce complexity
 type RouteFieldMap = HashMap<OperationKey, Json>;
 /// A verified (matched) producer endpoint for the report: display label +
-/// name (`(method, path)` for HTTP) plus the producer's provenance so the
-/// verified table can mark mock/test handlers (#380).
-type VerifiedEndpointEntry = (String, String, crate::operation::EndpointProvenance);
+/// A verified producer endpoint: a display label + name (`(method, path)` for
+/// HTTP, `(KIND, field)` / `(direction, event)` / `("PUBSUB", topic)` for
+/// non-HTTP), the producer's provenance so the verified table can mark
+/// mock/test handlers (#380), and the aggregated per-endpoint type verdict.
+///
+/// `type_verdict` is `None` when the matchers build the entry (they run before
+/// the compat overlay) and is filled in `get_results` by joining
+/// `cross_repo_matches` — see [`ApiAnalyzer::attach_verified_type_verdicts`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifiedEndpointEntry {
+    pub method: String,
+    pub path: String,
+    pub provenance: crate::operation::EndpointProvenance,
+    pub type_verdict: Option<crate::operation::TypeVerdict>,
+}
+
+impl VerifiedEndpointEntry {
+    /// Build an entry with no verdict yet — the matcher-time constructor.
+    fn new(method: String, path: String, provenance: crate::operation::EndpointProvenance) -> Self {
+        Self {
+            method,
+            path,
+            provenance,
+            type_verdict: None,
+        }
+    }
+}
 /// Result of `analyze_matches_with_mount_graph` and
 /// `analyze_exact_key_matches`: `(findings, verified_endpoints,
 /// cross_repo_matches)`.
@@ -133,6 +157,14 @@ pub struct CrossRepoMatch {
     pub match_score: f64,
     /// `None` = compat NOT evaluated for this edge; `Some(b)` = evaluated.
     pub type_compatible: Option<bool>,
+    /// Three-way per-pair verdict, set by `apply_pair_outcomes` from the same
+    /// v2 pair outcomes as `type_compatible` but WITHOUT the lossy collapse:
+    /// `Unverifiable` stays distinct from "never evaluated" (`None`), which
+    /// `type_compatible` cannot express (both map to `None` there). Downstream
+    /// "Verified" bucketing reads this so a matched-but-unverifiable pair is
+    /// not silently labelled compiler-compared (#260). `None` = not evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_verdict: Option<crate::operation::TypeVerdict>,
     /// `Some(..)` iff `type_compatible == Some(false)`; human-readable reason.
     pub mismatch_reason: Option<String>,
     /// Whether the producer side of this edge is a real route or a mock/test
@@ -298,6 +330,45 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
     }
 }
 
+/// Reconstruct a verified endpoint's DISPLAY `(method_or_label, path_or_name)`
+/// from a canonical `OperationKey` string, matching [`OperationKey::display_labels`]
+/// byte-for-byte so a cross-repo edge joins to its verified row by plain string
+/// equality — no path normalization, because a verified entry and the edges
+/// pointing at it are both built from the SAME producer key/endpoint (the HTTP
+/// matcher stamps `OperationKey::http(method, full_path).canonical()` on the
+/// edge and the same `(method, full_path)` on the verified row; the exact-key
+/// matcher shares one key across both sides), so their canonical strings are
+/// already identical.
+///
+/// This differs from [`parse_producer_key`] (the verdict-JOIN key, which
+/// pseudo-normalizes: `("GRAPHQL", "query|field")`, `("SOCKET", "dir|event")`);
+/// here we produce the human display form (`("QUERY", "field")`,
+/// `("dir", "event")`) instead. Returns `None` for any unrecognized key.
+fn producer_display_from_canonical(key: &str) -> Option<(String, String)> {
+    let mut parts = key.splitn(3, '|');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("http"), Some(method), Some(path)) if !method.is_empty() && !path.is_empty() => {
+            Some((method.to_string(), path.to_string()))
+        }
+        // `display_labels` uppercases the GraphQL KIND; the canonical keeps it
+        // lowercase, so uppercase here to match the verified row.
+        (Some("graphql"), Some(kind), Some(field)) if !kind.is_empty() && !field.is_empty() => {
+            Some((kind.to_uppercase(), field.to_string()))
+        }
+        // The canonical's first socket segment IS `direction.label()`, the same
+        // value `display_labels` uses — pass it through verbatim.
+        (Some("socket"), Some(direction), Some(event))
+            if !direction.is_empty() && !event.is_empty() =>
+        {
+            Some((direction.to_string(), event.to_string()))
+        }
+        (Some("pubsub"), Some(topic), None) if !topic.is_empty() => {
+            Some(("PUBSUB".to_string(), topic.to_string()))
+        }
+        _ => None,
+    }
+}
+
 /// Canonicalize a consumer source location (`"<file>:<line>[:<col>]"`) to the
 /// `(path, line)` pair that joins a `CrossRepoMatch` edge to its per-pair
 /// verdict (#260). Both sides feed the same `call.file_location` here: the
@@ -406,6 +477,7 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
         // alongside `type_compatible == Some(false)`.
         if edge.relationship != carrick_match::MatchRelationship::ProducerConsumer {
             edge.type_compatible = None;
+            edge.type_verdict = None;
             edge.mismatch_reason = None;
             continue;
         }
@@ -415,6 +487,7 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
         // fabricate `Some(true)` (#260, part 2).
         let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
             edge.type_compatible = None;
+            edge.type_verdict = None;
             continue;
         };
         // Without a consumer identity the pair can't be matched to its own
@@ -422,21 +495,31 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
         // `None` (compat undetermined for this edge).
         let Some(consumer) = edge.consumer_location.as_deref().map(consumer_identity) else {
             edge.type_compatible = None;
+            edge.type_verdict = None;
             continue;
         };
         let key = (method, normalize_compat_path(&path), consumer);
+        // `type_verdict` carries the three-way result WITHOUT the `Option<bool>`
+        // collapse: `Unverifiable` stays distinct from "never evaluated"
+        // (`None`), which is exactly what the honest "Verified" buckets need.
         if let Some(reason) = incompatible.get(&key) {
             edge.type_compatible = Some(false);
+            edge.type_verdict = Some(crate::operation::TypeVerdict::Incompatible);
             edge.mismatch_reason = Some(reason.clone());
         } else if unverifiable.contains(&key) {
-            // Matched but unverifiable — compat undetermined, NOT compatible.
+            // Matched but unverifiable — compat undetermined (`type_compatible`
+            // NOT `Some(true)`), but the pair WAS reached, so the verdict is a
+            // real `Unverifiable`, not absent.
             edge.type_compatible = None;
+            edge.type_verdict = Some(crate::operation::TypeVerdict::Unverifiable);
         } else if compatible.contains(&key) {
             edge.type_compatible = Some(true);
+            edge.type_verdict = Some(crate::operation::TypeVerdict::Compatible);
         } else {
             // No pair outcome reached this edge: compat was not evaluated
             // for it. `None`, never a fabricated `Some(true)`.
             edge.type_compatible = None;
+            edge.type_verdict = None;
         }
     }
 }
@@ -486,6 +569,58 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
             && a.consumer_location == b.consumer_location
             && a.relationship == b.relationship
     });
+}
+
+/// Sort verified endpoints into a deterministic order and collapse same
+/// `(method, path)` rows. Sorting orders by `(method, path, provenance)`, so a
+/// `Route` entry sorts before a `Mock` one (`Route < Mock`) and `dedup_by`
+/// keeps the first of each run — a key backed by BOTH a real route and a mock
+/// reads as a route (#380). `type_verdict` is not yet set at any call site
+/// (the matchers build entries verdict-free; the join runs later), so it plays
+/// no part in the ordering or the dedup key.
+fn sort_dedup_verified(verified: &mut Vec<VerifiedEndpointEntry>) {
+    verified.sort_by(|a, b| {
+        (&a.method, &a.path, a.provenance).cmp(&(&b.method, &b.path, b.provenance))
+    });
+    verified.dedup_by(|a, b| a.method == b.method && a.path == b.path);
+}
+
+/// Aggregate the per-consumer type verdicts on the cross-repo edges onto each
+/// verified producer endpoint. A verified row is per producer `(method, path)`;
+/// a producer can have several consumer edges, each with its own verdict, so
+/// they collapse by [`TypeVerdict::combine`] (honesty-first: `Compatible` only
+/// when EVERY evaluated pair is compatible). Edges with no evaluated verdict
+/// (`type_verdict == None` — compat never ran for that pair) contribute
+/// nothing, so a row with zero evaluated pairs stays `None` ("types not
+/// compared"), never a fabricated compatible.
+///
+/// The join is exact string equality between the edge's reconstructed producer
+/// display ([`producer_display_from_canonical`]) and the verified row's
+/// `(method, path)`: both derive from the same producer key, HTTP and non-HTTP
+/// alike, so parameterized routes (`/orders/:id`) join without normalization.
+fn attach_verified_type_verdicts(
+    verified: &mut [VerifiedEndpointEntry],
+    cross_repo_matches: &[CrossRepoMatch],
+) {
+    use std::collections::HashMap;
+    let mut by_endpoint: HashMap<(String, String), crate::operation::TypeVerdict> = HashMap::new();
+    for edge in cross_repo_matches {
+        let Some(verdict) = edge.type_verdict else {
+            continue;
+        };
+        let Some(display) = producer_display_from_canonical(&edge.producer_key) else {
+            continue;
+        };
+        by_endpoint
+            .entry(display)
+            .and_modify(|agg| *agg = agg.combine(verdict))
+            .or_insert(verdict);
+    }
+    for entry in verified.iter_mut() {
+        entry.type_verdict = by_endpoint
+            .get(&(entry.method.clone(), entry.path.clone()))
+            .copied();
+    }
 }
 
 /// Order-preserving dedup of byte-identical findings rows, run once at the
@@ -1717,7 +1852,7 @@ impl Analyzer {
             }
             let key = format!("{}:{}", endpoint.method, endpoint.full_path);
             if matched_endpoints.contains(&key) {
-                verified.push((
+                verified.push(VerifiedEndpointEntry::new(
                     endpoint.method.clone(),
                     endpoint.full_path.clone(),
                     endpoint.provenance,
@@ -1772,11 +1907,7 @@ impl Analyzer {
                 sites.into_iter().collect(),
             ));
         }
-        verified.sort();
-        // Collapse same (method, path) rows; sorting put `Route` first
-        // (`Route < Mock`), and `dedup_by` keeps the first of a run, so a key
-        // backed by both a real route and a mock reads as a route.
-        verified.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        sort_dedup_verified(&mut verified);
 
         // Deterministic order for the projection (mirrors verified.sort()): the
         // matcher iterates calls/endpoints in a non-deterministic order, so sort
@@ -1839,6 +1970,7 @@ impl Analyzer {
             consumer_location: Some(call.file_path.display().to_string()),
             match_score: 1.0,
             type_compatible: None,
+            type_verdict: None,
             mismatch_reason: None,
             producer_provenance: endpoint.provenance,
         })
@@ -1957,6 +2089,7 @@ impl Analyzer {
                             consumer_location: Some(call.file_path.display().to_string()),
                             match_score: 1.0,
                             type_compatible: None,
+                            type_verdict: None,
                             mismatch_reason: None,
                             producer_provenance: *producer_provenance,
                         });
@@ -1988,7 +2121,7 @@ impl Analyzer {
             }
             let (label, name) = endpoint.key.display_labels();
             if matched.contains(&endpoint.key) {
-                verified.push((label, name, endpoint.provenance));
+                verified.push(VerifiedEndpointEntry::new(label, name, endpoint.provenance));
             } else {
                 // GraphQL/socket producers are not repo-tagged at this layer, so
                 // the owning service is unknown.
@@ -1998,9 +2131,7 @@ impl Analyzer {
                 );
             }
         }
-        verified.sort();
-        // Route-wins per (label, name), mirroring the HTTP matcher's dedup.
-        verified.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        sort_dedup_verified(&mut verified);
 
         (findings, verified, cross_repo_matches)
     }
@@ -2137,10 +2268,8 @@ impl Analyzer {
             verified_endpoints.extend(protocol_verified);
             cross_repo_matches.extend(protocol_cross_repo_matches);
         }
-        verified_endpoints.sort();
-        // Route-wins per (method, path): sorted order puts `Route` first and
-        // `dedup_by` keeps the first of each run.
-        verified_endpoints.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        // Route-wins per (method, path) over the combined HTTP + non-HTTP set.
+        sort_dedup_verified(&mut verified_endpoints);
         // Re-sort/dedup over the combined HTTP + non-HTTP edge set so the final
         // ordering is stable regardless of which matcher produced an edge.
         sort_dedup_cross_repo_matches(&mut cross_repo_matches);
@@ -2165,6 +2294,12 @@ impl Analyzer {
         // load-bearing: the scorer must never read absent compat data as
         // "compatible".
         self.overlay_compat_verdicts(&mut cross_repo_matches);
+
+        // Join the per-pair verdicts back onto each verified producer endpoint,
+        // so the "Verified" surfaces (PR comment #455, terminal report #456) can
+        // bucket rows honestly instead of blanket-claiming compiler comparison.
+        // Runs AFTER the overlay so the edges carry their verdicts.
+        attach_verified_type_verdicts(&mut verified_endpoints, &cross_repo_matches);
 
         let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
         let graphql_operations_indexed = self
@@ -2953,7 +3088,7 @@ mod tests {
 
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "QUERY".to_string(),
                 "user".to_string(),
                 crate::operation::EndpointProvenance::Route
@@ -3025,12 +3160,12 @@ mod tests {
         assert_eq!(
             verified,
             vec![
-                (
+                VerifiedEndpointEntry::new(
                     "CLIENT->SERVER".to_string(),
                     "chat:message".to_string(),
                     crate::operation::EndpointProvenance::Route
                 ),
-                (
+                VerifiedEndpointEntry::new(
                     "SERVER->CLIENT".to_string(),
                     "chat:broadcast".to_string(),
                     crate::operation::EndpointProvenance::Route
@@ -3543,7 +3678,7 @@ mod tests {
         );
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "GET".to_string(),
                 "/api/widgets".to_string(),
                 EndpointProvenance::Mock
@@ -3587,7 +3722,7 @@ mod tests {
         assert_eq!(edges[0].producer_provenance, EndpointProvenance::Mock);
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "PUBSUB".to_string(),
                 "orders.created".to_string(),
                 EndpointProvenance::Mock
@@ -3720,7 +3855,7 @@ mod tests {
         assert!(findings.is_empty(), "findings: {findings:?}");
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "POST".to_string(),
                 "/v2/widgets".to_string(),
                 crate::operation::EndpointProvenance::Route
@@ -3889,7 +4024,7 @@ mod tests {
         );
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "GET".to_string(),
                 "/a".to_string(),
                 crate::operation::EndpointProvenance::Route
@@ -3924,7 +4059,7 @@ mod tests {
         );
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "GET".to_string(),
                 "/a".to_string(),
                 crate::operation::EndpointProvenance::Route
@@ -4001,6 +4136,7 @@ mod tests {
             consumer_location: Some(consumer_location.to_string()),
             match_score: 1.0,
             type_compatible: None,
+            type_verdict: None,
             mismatch_reason: None,
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,
@@ -4049,6 +4185,136 @@ mod tests {
         assert!(matches[1].mismatch_reason.is_none());
     }
 
+    /// #455/#456: `apply_pair_outcomes` sets the three-way `type_verdict`
+    /// WITHOUT the `Option<bool>` collapse. The load-bearing case is
+    /// `Unverifiable`: the edge keeps `type_compatible == None` (it is NOT
+    /// compatible) yet carries `Some(Unverifiable)`, so a matched-but-
+    /// unverifiable pair is separable from a never-evaluated one (`None`).
+    #[test]
+    fn apply_pair_outcomes_sets_three_way_type_verdict() {
+        use crate::operation::TypeVerdict;
+        let outcomes = vec![
+            outcome(
+                "GET",
+                "/orders/:id",
+                PAYMENTS_CONSUMER_LOC,
+                VerdictBucket::Compatible,
+                None,
+            ),
+            outcome(
+                "POST",
+                "/refunds",
+                PAYMENTS_CONSUMER_LOC,
+                VerdictBucket::Unverifiable,
+                None,
+            ),
+            outcome(
+                "PUT",
+                "/widgets",
+                PAYMENTS_CONSUMER_LOC,
+                VerdictBucket::Incompatible,
+                Some("boom"),
+            ),
+        ];
+        let mut matches = vec![
+            edge("http|GET|/orders/:id"),
+            edge("http|POST|/refunds"),
+            edge("http|PUT|/widgets"),
+            edge("http|DELETE|/never-checked"),
+        ];
+        apply_pair_outcomes(&outcomes, &mut matches);
+
+        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::Compatible));
+        assert_eq!(matches[1].type_verdict, Some(TypeVerdict::Unverifiable));
+        assert_eq!(
+            matches[1].type_compatible, None,
+            "an unverifiable pair is NOT compatible, but its verdict is present"
+        );
+        assert_eq!(matches[2].type_verdict, Some(TypeVerdict::Incompatible));
+        assert_eq!(
+            matches[3].type_verdict, None,
+            "an edge no outcome reached stays verdict-absent"
+        );
+    }
+
+    /// The reconstruction used by the verified-endpoint verdict join must equal
+    /// [`OperationKey::display_labels`] byte-for-byte for every protocol —
+    /// otherwise the join silently misses and every row falls to "not
+    /// compared" (the exact bug #456 targets). Guards trap #1 (join drift),
+    /// including the param-name-carrying HTTP route.
+    #[test]
+    fn producer_display_from_canonical_matches_display_labels() {
+        use crate::operation::{GraphqlOperationKind, OperationKey, SocketDirection};
+        let keys = vec![
+            OperationKey::http("get", "/orders/:id"),
+            OperationKey::http("POST", "/payments"),
+            OperationKey::graphql(GraphqlOperationKind::Query, "getUser"),
+            OperationKey::graphql(GraphqlOperationKind::Mutation, "createOrder"),
+            OperationKey::socket("chat:message", SocketDirection::ClientToServer),
+            OperationKey::socket("chat:message", SocketDirection::ServerToClient),
+            OperationKey::pubsub("orders.created"),
+        ];
+        for key in keys {
+            let canonical = key.canonical();
+            assert_eq!(
+                producer_display_from_canonical(&canonical),
+                Some(key.display_labels()),
+                "canonical {canonical} must reconstruct display_labels exactly"
+            );
+        }
+    }
+
+    /// The verdict join + per-endpoint aggregation (#455/#456): edges carry
+    /// per-consumer verdicts; a verified row aggregates all its consumers'
+    /// verdicts honesty-first. Covers a param HTTP route with two consumers
+    /// (compatible + unverifiable → the row degrades to unverifiable), a
+    /// non-HTTP (GraphQL) producer joined by reconstructed display, and a
+    /// verified row with no evaluated edge (stays `None`).
+    #[test]
+    fn attach_verified_type_verdicts_joins_and_aggregates() {
+        use crate::operation::{EndpointProvenance, TypeVerdict};
+
+        let mut compat = edge_at("http|GET|/orders/:id", "a", "a/x.ts:1");
+        compat.type_verdict = Some(TypeVerdict::Compatible);
+        let mut unver = edge_at("http|GET|/orders/:id", "b", "b/y.ts:2");
+        unver.type_verdict = Some(TypeVerdict::Unverifiable);
+        let mut gql = edge_at("graphql|query|getUser", "c", "c/z.ts:3");
+        gql.type_verdict = Some(TypeVerdict::Compatible);
+        // An edge whose producer was never type-checked contributes nothing.
+        let unevaluated = edge_at("http|POST|/unmatched", "d", "d/w.ts:4");
+        let edges = vec![compat, unver, gql, unevaluated];
+
+        let mut verified = vec![
+            VerifiedEndpointEntry::new(
+                "GET".into(),
+                "/orders/:id".into(),
+                EndpointProvenance::Route,
+            ),
+            VerifiedEndpointEntry::new("QUERY".into(), "getUser".into(), EndpointProvenance::Route),
+            VerifiedEndpointEntry::new(
+                "POST".into(),
+                "/unmatched".into(),
+                EndpointProvenance::Route,
+            ),
+        ];
+        attach_verified_type_verdicts(&mut verified, &edges);
+
+        assert_eq!(
+            verified[0].type_verdict,
+            Some(TypeVerdict::Unverifiable),
+            "compatible + unverifiable consumers aggregate to unverifiable"
+        );
+        assert_eq!(
+            verified[1].type_verdict,
+            Some(TypeVerdict::Compatible),
+            "a GraphQL producer joins by reconstructed display and is compatible"
+        );
+        assert_eq!(
+            verified[2].type_verdict, None,
+            "a verified row with no evaluated edge stays verdict-absent"
+        );
+    }
+
     /// #379: a shared-external-contract edge is verdict-exempt. Both sides
     /// are call sites, so any comparison on the same key would be
     /// request-vs-request — the guard keeps the verdict `None` even when a
@@ -4077,6 +4343,10 @@ mod tests {
             "shared-external-contract edges are verdict-exempt"
         );
         assert_eq!(
+            matches[0].type_verdict, None,
+            "a verdict-exempt edge carries no three-way verdict either"
+        );
+        assert_eq!(
             matches[0].mismatch_reason, None,
             "a verdict-exempt edge carries no mismatch reason"
         );
@@ -4084,6 +4354,11 @@ mod tests {
             matches[1].type_compatible,
             Some(true),
             "the producer/consumer edge on the same key still gets its verdict"
+        );
+        assert_eq!(
+            matches[1].type_verdict,
+            Some(crate::operation::TypeVerdict::Compatible),
+            "the producer/consumer edge on the same key gets its three-way verdict"
         );
     }
 
@@ -4827,7 +5102,7 @@ mod tests {
         assert_eq!(edges[0].consumer_repo, "web-client");
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "GET".to_string(),
                 "/api/v1/chat/new".to_string(),
                 crate::operation::EndpointProvenance::Route
@@ -4928,7 +5203,7 @@ mod tests {
         assert_eq!(edges[0].consumer_key, "http|POST|/oauth/token");
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "POST".to_string(),
                 "/oauth/token".to_string(),
                 crate::operation::EndpointProvenance::Route
@@ -4981,7 +5256,7 @@ mod tests {
         );
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "GET".to_string(),
                 "/api/self-status".to_string(),
                 crate::operation::EndpointProvenance::Route
@@ -5078,7 +5353,7 @@ mod tests {
         assert_eq!(edges[0].producer_repo, "files-svc");
         assert_eq!(
             verified,
-            vec![(
+            vec![VerifiedEndpointEntry::new(
                 "GET".to_string(),
                 "/files/**".to_string(),
                 crate::operation::EndpointProvenance::Route

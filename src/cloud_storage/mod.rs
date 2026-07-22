@@ -706,6 +706,7 @@ mod tests {
             consumer_location: Some("src/client.ts".to_string()),
             match_score: 1.0,
             type_compatible,
+            type_verdict: None,
             mismatch_reason: mismatch_reason.map(String::from),
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,
