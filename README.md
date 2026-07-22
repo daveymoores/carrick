@@ -64,6 +64,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        # Full git history lets Carrick diff against the last scan and run incrementally.
+        with:
+          fetch-depth: 0
 
       - uses: carrick-tools/carrick@v1
 ```
