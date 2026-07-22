@@ -1947,6 +1947,7 @@ mod tests {
             consumer_location: Some("src/billing-call.ts:5:9".to_string()),
             match_score: 1.0,
             type_compatible: None,
+            type_verdict: None,
             mismatch_reason: None,
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,

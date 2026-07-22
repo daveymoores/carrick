@@ -366,33 +366,106 @@ fn format_no_issues(
     output
 }
 
-/// Render a "Verified Endpoints" details block listing every endpoint that
-/// at least one consumer call successfully matched. Surfaced so PR comments
-/// communicate what's *working*, not just what's broken — without it, a
-/// clean cross-repo run produces no positive signal at all.
-fn format_verified_section(
-    verified: &[(String, String, crate::operation::EndpointProvenance)],
+/// Render one verified-endpoint table row, marking mock/test-handler
+/// producers so the match is trusted accordingly (#380).
+fn format_verified_row(entry: &crate::analyzer::VerifiedEndpointEntry) -> String {
+    let marker = if entry.provenance.is_mock() {
+        " (mock handler)"
+    } else {
+        ""
+    };
+    format!("| `{}` | `{}`{} |\n", entry.method, entry.path, marker)
+}
+
+/// Render a verdict subsection (heading + honest caption + table) when it has
+/// rows; empty buckets render nothing.
+fn format_verified_subsection(
+    heading: &str,
+    caption: &str,
+    rows: &[&crate::analyzer::VerifiedEndpointEntry],
 ) -> String {
-    let mut output = String::new();
-    output.push_str(&format!(
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("**{} ({})**\n\n> {}\n\n", heading, rows.len(), caption);
+    out.push_str("| Method | Path |\n| :--- | :--- |\n");
+    for entry in rows {
+        out.push_str(&format_verified_row(entry));
+    }
+    out.push('\n');
+    out
+}
+
+/// Render a "Verified" details block listing every endpoint that at least one
+/// consumer call matched. Surfaced so the report communicates what's *working*,
+/// not just what's broken — without it, a clean cross-repo run produces no
+/// positive signal at all.
+///
+/// "Verified" is the STRUCTURAL claim (method + path matched). The type-level
+/// claim is made per bucket from each entry's `type_verdict` (#260, #456), NOT
+/// blanket-asserted: only pairs the TypeScript compiler pass actually compared
+/// get the compiler caption; pairs it reached but could not verify get their
+/// own honest bucket; and rows without a verdict (not type-checked, non-HTTP)
+/// get no type claim at all. The old single caption labelled every row as
+/// compiler-compared, which overstated coverage exactly where the check was
+/// being deliberately honest. Mirrors the cloud `render_pr_comment.js`
+/// `verifiedSection` buckets so the terminal/Action log and the PR comment
+/// agree.
+fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) -> String {
+    use crate::operation::TypeVerdict;
+
+    let type_checked: Vec<&_> = verified
+        .iter()
+        .filter(|e| e.type_verdict == Some(TypeVerdict::Compatible))
+        .collect();
+    let unverifiable: Vec<&_> = verified
+        .iter()
+        .filter(|e| e.type_verdict == Some(TypeVerdict::Unverifiable))
+        .collect();
+    // Everything else: no verdict (not type-checked / non-HTTP) OR incompatible
+    // (already reported as a loud finding above; none of the three verified
+    // captions fit it, and "not compared" carries the least-wrong advice).
+    let matched_only: Vec<&_> = verified
+        .iter()
+        .filter(|e| {
+            e.type_verdict != Some(TypeVerdict::Compatible)
+                && e.type_verdict != Some(TypeVerdict::Unverifiable)
+        })
+        .collect();
+
+    let mut output = format!(
         "<details>\n<summary><strong>Verified ({})</strong></summary>\n\n",
         verified.len()
-    ));
-    output.push_str(
-        "> Endpoints with at least one matching consumer call. Types were resolved and compared by the TypeScript compiler pass.\n\n",
     );
-    output.push_str("| Method | Path |\n| :--- | :--- |\n");
-    for (method, path, provenance) in verified {
-        // A producer whose evidence is a mock/test handler is marked so the
-        // match is trusted accordingly (#380).
-        let marker = if provenance.is_mock() {
-            " (mock handler)"
-        } else {
-            ""
-        };
-        output.push_str(&format!("| `{}` | `{}`{} |\n", method, path, marker));
+    output.push_str("> Endpoints with at least one matching consumer call.\n\n");
+
+    // No per-endpoint type verdicts anywhere: one table, structural claim only
+    // — no compiler sentence for pairs nobody proved.
+    if type_checked.is_empty() && unverifiable.is_empty() {
+        output.push_str("| Method | Path |\n| :--- | :--- |\n");
+        for entry in verified {
+            output.push_str(&format_verified_row(entry));
+        }
+        output.push_str("\n</details>");
+        return output;
     }
-    output.push_str("\n</details>");
+
+    output.push_str(&format_verified_subsection(
+        "Type-checked",
+        "Request/response types were resolved and compared by the TypeScript compiler pass.",
+        &type_checked,
+    ));
+    output.push_str(&format_verified_subsection(
+        "Types not verifiable",
+        "The compiler pass reached these pairs but could not compare their types (for example the producer's published types decay to `any` outside its own workspace). Treat the types as unreviewed, not as agreeing.",
+        &unverifiable,
+    ));
+    output.push_str(&format_verified_subsection(
+        "Types not compared",
+        "Matched by method and path; no compiler verdict is stored for these pairs, so treat the types as unverified.",
+        &matched_only,
+    ));
+    output.push_str("</details>");
     output
 }
 
@@ -1092,16 +1165,18 @@ mod tests {
     fn test_verified_section_renders_when_matches_present() {
         let mut result = result_with(vec![]);
         result.verified_endpoints = vec![
-            (
-                "GET".to_string(),
-                "/api/users".to_string(),
-                EndpointProvenance::Route,
-            ),
-            (
-                "POST".to_string(),
-                "/api/orders".to_string(),
-                EndpointProvenance::Route,
-            ),
+            crate::analyzer::VerifiedEndpointEntry {
+                method: "GET".to_string(),
+                path: "/api/users".to_string(),
+                provenance: EndpointProvenance::Route,
+                type_verdict: None,
+            },
+            crate::analyzer::VerifiedEndpointEntry {
+                method: "POST".to_string(),
+                path: "/api/orders".to_string(),
+                provenance: EndpointProvenance::Route,
+                type_verdict: None,
+            },
         ];
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1115,16 +1190,18 @@ mod tests {
     fn test_verified_section_marks_mock_producers() {
         let mut result = result_with(vec![]);
         result.verified_endpoints = vec![
-            (
-                "GET".to_string(),
-                "/api/users".to_string(),
-                EndpointProvenance::Route,
-            ),
-            (
-                "GET".to_string(),
-                "/api/widgets".to_string(),
-                EndpointProvenance::Mock,
-            ),
+            crate::analyzer::VerifiedEndpointEntry {
+                method: "GET".to_string(),
+                path: "/api/users".to_string(),
+                provenance: EndpointProvenance::Route,
+                type_verdict: None,
+            },
+            crate::analyzer::VerifiedEndpointEntry {
+                method: "GET".to_string(),
+                path: "/api/widgets".to_string(),
+                provenance: EndpointProvenance::Mock,
+                type_verdict: None,
+            },
         ];
 
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -1170,11 +1247,12 @@ mod tests {
     #[test]
     fn test_verified_section_singular_label() {
         let mut result = result_with(vec![]);
-        result.verified_endpoints = vec![(
-            "GET".to_string(),
-            "/api/users".to_string(),
-            EndpointProvenance::Route,
-        )];
+        result.verified_endpoints = vec![crate::analyzer::VerifiedEndpointEntry {
+            method: "GET".to_string(),
+            path: "/api/users".to_string(),
+            provenance: EndpointProvenance::Route,
+            type_verdict: None,
+        }];
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("Verified (1)"));
     }
@@ -1185,15 +1263,88 @@ mod tests {
         // matches must surface them — that's the whole point of the
         // section. Pre-fix, `format_no_issues` ignored verified entirely.
         let mut result = result_with(vec![]);
-        result.verified_endpoints = vec![(
-            "GET".to_string(),
-            "/api/users".to_string(),
-            EndpointProvenance::Route,
-        )];
+        result.verified_endpoints = vec![crate::analyzer::VerifiedEndpointEntry {
+            method: "GET".to_string(),
+            path: "/api/users".to_string(),
+            provenance: EndpointProvenance::Route,
+            type_verdict: None,
+        }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
         assert!(output.contains("All cross-service calls match the indexed contracts"));
         assert!(output.contains("Verified (1)"));
+    }
+
+    /// #456: with NO per-endpoint verdicts, the verified section makes only
+    /// the structural claim — it must NOT blanket-assert the TypeScript
+    /// compiler compared anything (the overstatement this issue kills).
+    #[test]
+    fn test_verified_section_no_verdicts_makes_no_compiler_claim() {
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![crate::analyzer::VerifiedEndpointEntry {
+            method: "GET".to_string(),
+            path: "/api/users".to_string(),
+            provenance: EndpointProvenance::Route,
+            type_verdict: None,
+        }];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+
+        assert!(output.contains("Verified (1)"));
+        assert!(
+            output.contains("Endpoints with at least one matching consumer call."),
+            "structural claim is always present: {output}"
+        );
+        assert!(
+            !output.contains("compared by the TypeScript compiler pass"),
+            "a row with no verdict must not claim compiler comparison: {output}"
+        );
+        assert!(
+            !output.contains("Type-checked"),
+            "no Type-checked bucket without a compatible verdict: {output}"
+        );
+    }
+
+    /// #456: mixed verdicts split into the three honest buckets, each with its
+    /// own caption — the compiler claim applies ONLY to the compatible row.
+    #[test]
+    fn test_verified_section_buckets_by_type_verdict() {
+        use crate::operation::TypeVerdict;
+        let ve = |method: &str, path: &str, verdict: Option<TypeVerdict>| {
+            crate::analyzer::VerifiedEndpointEntry {
+                method: method.to_string(),
+                path: path.to_string(),
+                provenance: EndpointProvenance::Route,
+                type_verdict: verdict,
+            }
+        };
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![
+            ve("GET", "/api/users", Some(TypeVerdict::Compatible)),
+            ve("POST", "/api/refunds", Some(TypeVerdict::Unverifiable)),
+            ve("PUT", "/api/widgets", None),
+        ];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+
+        assert!(output.contains("Verified (3)"));
+        assert!(output.contains("**Type-checked (1)**"), "output: {output}");
+        assert!(
+            output.contains("**Types not verifiable (1)**"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("**Types not compared (1)**"),
+            "output: {output}"
+        );
+        assert!(output.contains("compared by the TypeScript compiler pass"));
+        // The compatible endpoint sits under Type-checked; the unverifiable and
+        // no-verdict endpoints must NOT be under a compiler-compared claim.
+        let type_checked_idx = output.find("**Type-checked").unwrap();
+        let users_idx = output.find("/api/users").unwrap();
+        let refunds_idx = output.find("/api/refunds").unwrap();
+        assert!(
+            users_idx > type_checked_idx && refunds_idx > users_idx,
+            "compatible row precedes the unverifiable row across buckets: {output}"
+        );
     }
 
     #[test]

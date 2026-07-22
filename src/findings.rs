@@ -449,6 +449,14 @@ pub struct VerifiedEndpoint {
     /// Real route vs mock/test handler (#380); route-wins when several
     /// producers share the (method, path) key.
     pub provenance: EndpointProvenance,
+    /// Aggregated per-endpoint type verdict (#455). Drives the cloud
+    /// PR-comment renderer's honest "Verified" buckets: `Some(Compatible)` →
+    /// "Type-checked", `Some(Unverifiable)` → "Types not verifiable", anything
+    /// else (absent, or `Incompatible` — already a loud finding above) →
+    /// "Types not compared". Omitted from the wire when absent, so an older
+    /// payload and a not-type-checked pair both read as "not compared".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_verdict: Option<crate::operation::TypeVerdict>,
 }
 
 /// GraphQL coverage signal: libraries detected vs operations actually
@@ -657,6 +665,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/api/users".to_string(),
                 provenance: Default::default(),
+                type_verdict: None,
             }],
             graphql: GraphqlStatus {
                 libraries: vec![],
@@ -777,6 +786,45 @@ mod tests {
                 "repos": ["repo-alpha", "repo-beta"],
                 "call_sites": ["src/widgets-client.ts:33"],
             })
+        );
+    }
+
+    /// #455: a verified entry's `type_verdict` serializes to the exact
+    /// lowercase strings the cloud PR-comment renderer keys its honest buckets
+    /// on (`"compatible"` / `"unverifiable"` / `"incompatible"`), and is
+    /// OMITTED entirely when absent so an older payload and a not-type-checked
+    /// pair both read as "Types not compared".
+    #[test]
+    fn verified_endpoint_type_verdict_wire_strings() {
+        use crate::operation::TypeVerdict;
+
+        let with = |v: Option<TypeVerdict>| {
+            serde_json::to_value(VerifiedEndpoint {
+                method: "GET".to_string(),
+                path: "/api/users".to_string(),
+                provenance: Default::default(),
+                type_verdict: v,
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            with(Some(TypeVerdict::Compatible))["type_verdict"],
+            "compatible"
+        );
+        assert_eq!(
+            with(Some(TypeVerdict::Unverifiable))["type_verdict"],
+            "unverifiable"
+        );
+        assert_eq!(
+            with(Some(TypeVerdict::Incompatible))["type_verdict"],
+            "incompatible"
+        );
+        // Absent verdict: the key must not appear at all.
+        let none = with(None);
+        assert!(
+            none.get("type_verdict").is_none(),
+            "an absent verdict must be omitted from the wire, got: {none}"
         );
     }
 

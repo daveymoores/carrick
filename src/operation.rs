@@ -31,6 +31,43 @@ pub enum Protocol {
     Pubsub,
 }
 
+/// Per-pair type-compatibility verdict, the three-way result of the type
+/// sidecar's check. Distinct from `Option<bool>` (`type_compatible`): that
+/// collapses `Unverifiable` and "never evaluated" both to `None`, which is
+/// exactly the distinction the PR-comment / terminal "Verified" buckets and
+/// the MCP `check_compatibility` tool need to keep honest (#260, cloud#268).
+/// Absence of a verdict (edge never evaluated) is represented by `Option::None`
+/// around this enum, never by a variant here.
+///
+/// Wire strings are lowercase (`"compatible"` / `"incompatible"` /
+/// `"unverifiable"`); the cloud PR-comment renderer keys the "Type-checked"
+/// and "Types not verifiable" buckets on the first and third, and treats any
+/// other value (including absent) as "Types not compared".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeVerdict {
+    Compatible,
+    Incompatible,
+    Unverifiable,
+}
+
+impl TypeVerdict {
+    /// Collapse two per-consumer verdicts for the same producer endpoint into
+    /// one per-endpoint verdict, honesty-first: a row is only `Compatible`
+    /// when EVERY evaluated consumer pair is compatible; any `Unverifiable`
+    /// pair degrades the row to `Unverifiable`; any `Incompatible` pair marks
+    /// it `Incompatible` (already surfaced as a loud finding elsewhere).
+    /// Precedence: `Incompatible` > `Unverifiable` > `Compatible`.
+    pub fn combine(self, other: Self) -> Self {
+        use TypeVerdict::*;
+        match (self, other) {
+            (Incompatible, _) | (_, Incompatible) => Incompatible,
+            (Unverifiable, _) | (_, Unverifiable) => Unverifiable,
+            (Compatible, Compatible) => Compatible,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphqlOperationKind {

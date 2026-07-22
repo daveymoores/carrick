@@ -497,13 +497,12 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         verified: results
             .verified_endpoints
             .iter()
-            .map(
-                |(method, path, provenance)| crate::findings::VerifiedEndpoint {
-                    method: method.clone(),
-                    path: path.clone(),
-                    provenance: *provenance,
-                },
-            )
+            .map(|entry| crate::findings::VerifiedEndpoint {
+                method: entry.method.clone(),
+                path: entry.path.clone(),
+                provenance: entry.provenance,
+                type_verdict: entry.type_verdict,
+            })
             .collect(),
         graphql: crate::findings::GraphqlStatus {
             libraries: results.detected_graphql_libraries.clone(),
@@ -4393,6 +4392,7 @@ mod tests {
             consumer_location: Some("src/client.ts".to_string()),
             match_score: 1.0,
             type_compatible: Some(false),
+            type_verdict: None,
             mismatch_reason: Some("y".repeat(400)),
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,
