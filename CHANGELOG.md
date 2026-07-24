@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.3](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.2...carrick-v0.3.3) (2026-07-24)
+
+
+### Bug Fixes
+
+* fetch-depth: 0 for incremental Carrick scans (FAR-76) ([#453](https://github.com/carrick-tools/carrick/issues/453)) ([f5a11b7](https://github.com/carrick-tools/carrick/commit/f5a11b79e12b03a2b1b001537cd69691f0ad935b))
+* **verified:** emit honest per-endpoint type verdicts ([#455](https://github.com/carrick-tools/carrick/issues/455), [#456](https://github.com/carrick-tools/carrick/issues/456)) ([#457](https://github.com/carrick-tools/carrick/issues/457)) ([bccf74e](https://github.com/carrick-tools/carrick/commit/bccf74efafadaf087559644353f00158c7f4deed))
+
+
+### Documentation
+
+* fix stale "exported functions" index-scope claims ([#458](https://github.com/carrick-tools/carrick/issues/458)) ([092787d](https://github.com/carrick-tools/carrick/commit/092787da2a817a77246c686d10f29110dd0d7900))
+
 ## [0.3.2](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.1...carrick-v0.3.2) (2026-07-22)
 
 
