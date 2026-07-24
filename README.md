@@ -84,7 +84,7 @@ The MCP endpoint exposes the index as structured tools your agent can call direc
 | `search_by_intent` | Find functions by what they do — a plain-English query matched against the intent descriptions |
 | `list_projects` | The Carrick projects in your workspace and each project's connected repos |
 | `list_services` | Every service Carrick has indexed in your org |
-| `list_function_intents` | One or two sentence descriptions of exported functions, searchable by service |
+| `list_function_intents` | One or two sentence descriptions of indexed functions, searchable by service |
 | `get_api_endpoints` | Endpoints declared by a given service |
 | `get_endpoint_types` | Resolved request and response types for a specific endpoint |
 | `get_type_definition` | Fully resolved TypeScript type by name, across the org |
