@@ -77,9 +77,9 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 ## Carrick
 
 This repo is part of the **carrick-tools / carrick-ci** Carrick
-project. Carrick indexes every service in the project: exported functions
-with intent descriptions, dependencies, and API endpoints with their real
-request/response types.
+project. Carrick indexes every service in the project: functions with
+intent descriptions (exported or not), dependencies, and API endpoints
+with their real request/response types.
 
 ### Connect the agent
 

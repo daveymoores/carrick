@@ -112,9 +112,12 @@ fn body_references_identifier(body: &str, name: &str) -> bool {
     false
 }
 
-/// Generate intents for all exported functions that have body source,
-/// except trivial single-expression bodies (see [`TRIVIAL_BODY_MAX_CHARS`]),
-/// which keep `intent = None` and never cost a lambda call.
+/// Generate intents for every function with a non-trivial body source,
+/// regardless of export status. The only exclusion is a trivial body
+/// (single line, at most [`TRIVIAL_BODY_MAX_CHARS`] chars), which keeps
+/// `intent = None` and never costs a lambda call. Eligible functions
+/// therefore include non-exported named declarations, const-bound
+/// arrows/function expressions, and synthetic route/event callback handlers.
 ///
 /// After generation:
 /// - Each function's `intent` is populated with a 1-2 sentence description
@@ -132,9 +135,11 @@ pub async fn generate_function_intents(
     _imported_symbols: &HashMap<String, ImportedSymbol>,
     prev_intents_by_hash: &HashMap<String, String>,
 ) {
-    // Process all named functions with body source, skipping trivial
-    // single-expression bodies (see TRIVIAL_BODY_MAX_CHARS) — no lambda
-    // call, no intent, permanently cheap.
+    // Process every function with a body source, skipping trivial
+    // single-line bodies (see TRIVIAL_BODY_MAX_CHARS): no lambda call,
+    // no intent, permanently cheap. There is no export gate. Non-exported
+    // functions, const-bound arrows, and synthetic callback handlers all
+    // qualify.
     let eligible: Vec<String> = function_definitions
         .iter()
         .filter(|(_, def)| {
