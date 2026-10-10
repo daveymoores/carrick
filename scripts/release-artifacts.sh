@@ -14,6 +14,8 @@
 #   release-artifacts.sh upload-lister <tag>   reads LISTER_OK; uploads nothing unless it passed
 #   release-artifacts.sh dispatch <tag>        reads LISTER_OK, LISTER_ATTACHED (the attach step's
 #                                              outcome), SOURCE_SHA; runs `gh api`
+#   release-artifacts.sh announce-cli <tag>    reads SOURCE_SHA; tells carrick-cloud npm now serves
+#                                              this version (carrick-cli-published); runs `gh api`
 #
 # Paths are relative to the working directory: wasm-artifact/ (matcher) and
 # lister-artifact/ (lister). GH names the gh binary (a stub in the test).
@@ -82,8 +84,19 @@ case "${1:-}" in
       -f "client_payload[wasm_sha256]=$wasm_sha" \
       ${lister[@]+"${lister[@]}"}
     ;;
+  announce-cli)
+    tag="${2:?usage: release-artifacts.sh announce-cli <tag>}"
+    if ! "$GH" api "repos/carrick-tools/carrick-cloud/dispatches" \
+      -f event_type=carrick-cli-published \
+      -f "client_payload[tag]=$tag" \
+      -f "client_payload[version]=${tag#carrick-v}" \
+      -f "client_payload[source_sha]=${SOURCE_SHA:?SOURCE_SHA is required}"; then
+      echo "::error::carrick-cloud was not told $tag is on npm, so the runner's scanner pin has not moved. Backfill: gh workflow run scanner-pin-bump.yml -R carrick-tools/carrick-cloud -f tag=$tag"
+      exit 1
+    fi
+    ;;
   *)
-    echo "usage: release-artifacts.sh upload-matcher <tag> | lister-status | upload-lister <tag> | dispatch <tag>" >&2
+    echo "usage: release-artifacts.sh upload-matcher <tag> | lister-status | upload-lister <tag> | dispatch <tag> | announce-cli <tag>" >&2
     exit 2
     ;;
 esac

@@ -1034,6 +1034,31 @@ mod tests {
     use super::*;
     use crate::visitor::FunctionCallRef;
 
+    /// The npm manifest states the cache pair so carrick-cloud's runner pin can
+    /// read it from the registry (carrick#2203). It must equal the constants.
+    #[test]
+    fn npm_manifest_cache_pair_equals_the_constants() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/npm/carrick/package.json");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read npm manifest"))
+                .expect("parse npm manifest");
+        let field = |name: &str| manifest["carrickCache"][name].as_u64();
+        assert_eq!(
+            field("cache_version"),
+            Some(u64::from(crate::engine::CACHE_VERSION)),
+            "npm/carrick/package.json carrickCache.cache_version is {:?} but CACHE_VERSION is {}: change both together",
+            field("cache_version"),
+            crate::engine::CACHE_VERSION
+        );
+        assert_eq!(
+            field("intent_cache_version"),
+            Some(u64::from(INTENT_CACHE_VERSION)),
+            "npm/carrick/package.json carrickCache.intent_cache_version is {:?} but INTENT_CACHE_VERSION is {}: change both together",
+            field("intent_cache_version"),
+            INTENT_CACHE_VERSION
+        );
+    }
+
     /// Dependency order comes from the resolved call edges, not from body
     /// text. `processId` contains "id" as a substring and `id`'s body names
     /// `processId` in a comment; under the old text matcher that pair formed

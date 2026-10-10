@@ -1,6 +1,10 @@
 {
   "name": "carrick",
   "version": "0.3.112",
+  "carrickCache": {
+    "cache_version": 22,
+    "intent_cache_version": 2
+  },
   "description": "Maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.",
   "keywords": [
     "typescript",
