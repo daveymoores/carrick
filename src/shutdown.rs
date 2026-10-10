@@ -52,7 +52,8 @@ impl Shutdown {
 
     /// 128 plus the signal number, the code a shell reports for a process a
     /// signal ended, so a caller reading the status sees the same thing it
-    /// would have without the handler.
+    /// would have without the handler. Every exit code a scan can end with is
+    /// listed in `docs/reference/runner.md`.
     pub fn exit_code(self) -> i32 {
         match self {
             Shutdown::Interrupt => 130,

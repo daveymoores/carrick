@@ -205,6 +205,10 @@ impl CloudStorage for TeeStorage {
             .await;
     }
 
+    async fn report_scan_closed(&self, reason: &str) {
+        self.cloud.report_scan_closed(reason).await;
+    }
+
     async fn post_pr_result(
         &self,
         payload: &crate::findings::PrResultPayload,

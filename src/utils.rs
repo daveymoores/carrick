@@ -13,31 +13,77 @@ pub fn join_prefix_and_path(prefix: &str, path: &str) -> String {
     }
 }
 
-/// Get repository name, checking GITHUB_REPOSITORY environment variable first
-pub fn get_repository_name(repo_path: &str) -> String {
-    // Check for GitHub Actions environment variable (format: "owner/repo")
-    if let Ok(github_repo) = env::var("GITHUB_REPOSITORY")
-        && let Some(repo_name) = github_repo.split('/').next_back()
-    {
-        return repo_name.to_string();
-    }
+/// The repository this run was told it is with `--repo <owner/name>`
+/// (carrick#2207), set once in `main` before anything reads a repository
+/// name. `None` on every run that did not pass the flag, which then names
+/// itself exactly as it always did.
+///
+/// A process-global, like the scan id, because its readers are spread across
+/// the engine (the previous generation, the PR baseline, the own-copy and
+/// sibling split in the join, the name `start-scan` is told), and threading
+/// one value through each would change every caller for a flag only a runner
+/// passes. See `docs/reference/runner.md`.
+fn declared_slot() -> &'static std::sync::OnceLock<String> {
+    static DECLARED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    &DECLARED
+}
 
-    // Fall back to extracting from path
-    let path_name = repo_path
-        .split("/")
-        .filter(|s| !s.is_empty())
-        .last()
-        .unwrap_or(".");
+/// Record the `owner/name` this run was declared to be. One run is one
+/// repository, so a second call is ignored rather than replacing it.
+pub fn declare_repository(full_name: &str) {
+    let _ = declared_slot().set(full_name.to_string());
+}
+
+/// The `owner/name` passed with `--repo`, or `None` when it was not.
+pub fn declared_repository() -> Option<&'static str> {
+    declared_slot().get().map(String::as_str)
+}
+
+/// The name a scan compares its own stored blobs against: which stored
+/// generation it reuses, and which downloaded copies are this repo's rather
+/// than siblings in the join.
+///
+/// `--repo` first, then `GITHUB_REPOSITORY`, each by its basename, then the
+/// scanned directory's name.
+pub fn get_repository_name(repo_path: &str) -> String {
+    let github_repository = env::var("GITHUB_REPOSITORY").ok();
+    let name = repository_name_from(
+        repo_path,
+        declared_repository(),
+        github_repository.as_deref(),
+    );
 
     // If we got "." (current directory), use the actual directory name
-    if path_name == "."
+    if name == "."
         && let Ok(current_dir) = env::current_dir()
         && let Some(dir_name) = current_dir.file_name()
     {
         return dir_name.to_string_lossy().to_string();
     }
 
-    path_name.to_string()
+    name
+}
+
+/// [`get_repository_name`] with everything it reads passed in, so the
+/// precedence is tested without the process environment: CI sets
+/// `GITHUB_REPOSITORY` to the repo being built. A bare `.` is returned as it
+/// is, for the caller to resolve against the working directory.
+pub fn repository_name_from(
+    repo_path: &str,
+    declared: Option<&str>,
+    github_repository: Option<&str>,
+) -> String {
+    if let Some(full_name) = declared.or(github_repository)
+        && let Some(repo_name) = full_name.split('/').next_back()
+    {
+        return repo_name.to_string();
+    }
+
+    repo_path
+        .split('/')
+        .rfind(|s| !s.is_empty())
+        .unwrap_or(".")
+        .to_string()
 }
 
 /// Reduce a source path to its repo-relative form: strip the repo-root prefix
@@ -94,6 +140,30 @@ pub(crate) fn utf16_offset(content: &str, byte_offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A declared repository is the repository, whatever the environment and
+    /// the folder say (carrick#2207); with nothing declared, the name is the
+    /// one every run already used.
+    #[test]
+    fn a_declared_repository_wins_over_the_environment_and_the_folder() {
+        assert_eq!(
+            repository_name_from("/work/checkout", Some("acme/api"), Some("acme/other")),
+            "api"
+        );
+        assert_eq!(
+            repository_name_from("/work/checkout", Some("acme/api"), None),
+            "api"
+        );
+        assert_eq!(
+            repository_name_from("/work/checkout", None, Some("acme/other")),
+            "other"
+        );
+        assert_eq!(
+            repository_name_from("/work/checkout/", None, None),
+            "checkout"
+        );
+        assert_eq!(repository_name_from(".", None, None), ".");
+    }
 
     /// A path outside the repo root must pass through unchanged, never be
     /// mangled by a partial prefix match (`/repo` vs `/repo-other`).

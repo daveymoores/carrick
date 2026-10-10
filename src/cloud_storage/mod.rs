@@ -1577,6 +1577,15 @@ pub trait CloudStorage {
     /// reason: only the laptop credential has anyone to tell.
     async fn report_preflight_failed(&self, _repo: Option<&str>, _stage: &str, _reason: &str) {}
 
+    /// Say that this run ended without replacing the index, which hands the
+    /// scan slot back (carrick#1262, carrick#2207). `reason` is a
+    /// `[a-z_]{1,64}` token.
+    ///
+    /// Best-effort and a default no-op, for the reasons
+    /// [`CloudStorage::report_scan_failed`] gives: only the laptop credential
+    /// holds a slot.
+    async fn report_scan_closed(&self, _reason: &str) {}
+
     /// Relay a PR run's structured findings to the cloud, which renders and
     /// posts (and updates in place on later pushes) a single GitHub App
     /// comment + check run on the PR. Only called on `pull_request` runs —

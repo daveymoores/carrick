@@ -126,20 +126,90 @@ struct FileDiscovery {
 
 type FileDiscoveryResult = Result<FileDiscovery, Box<dyn std::error::Error>>;
 
-/// Determine if we should upload data based on GitHub context
-/// Only upload on main/master branch, not on PRs
+/// `--upload` (`true`) or `--no-upload` (`false`), held for the whole process
+/// and set once in `main` (carrick#2207). `None` on every run that passed
+/// neither, which then decides as it always did.
+fn upload_switch_slot() -> &'static std::sync::OnceLock<bool> {
+    static SWITCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    &SWITCH
+}
+
+/// Record `--upload` / `--no-upload`. A second call is ignored.
+pub fn set_upload_switch(upload: bool) {
+    let _ = upload_switch_slot().set(upload);
+}
+
+fn upload_switch() -> Option<bool> {
+    upload_switch_slot().get().copied()
+}
+
+/// What `--upload` together with `CARRICK_OUTPUT_JSON` is told: a usage error
+/// rather than a flag that silently does nothing (the carrick#966 rule).
+pub const UPLOAD_WITH_OUTPUT_JSON: &str =
+    "--upload cannot be combined with CARRICK_OUTPUT_JSON, which never uploads. Unset one of them.";
+
+/// Everything the upload decision reads from the process environment.
+#[derive(Debug, Clone, Copy, Default)]
+struct UploadContext<'a> {
+    /// `CARRICK_OUTPUT_JSON` is set.
+    output_json: bool,
+    /// `CARRICK_LOCAL_STORAGE_DIR` is set.
+    local_dir: bool,
+    /// `GITHUB_EVENT_NAME`.
+    event_name: Option<&'a str>,
+    /// `GITHUB_REF`.
+    git_ref: Option<&'a str>,
+}
+
+/// Whether this run uploads, or the usage error `--upload` meets.
+///
+/// Read once, in `main` to refuse the conflict and in the engine to decide,
+/// so the two cannot disagree. See `docs/reference/runner.md`.
+pub fn upload_decision_from_env() -> Result<bool, &'static str> {
+    let event_name = env::var("GITHUB_EVENT_NAME").ok();
+    let git_ref = env::var("GITHUB_REF").ok();
+    upload_decision(
+        upload_switch(),
+        UploadContext {
+            output_json: env::var("CARRICK_OUTPUT_JSON").is_ok(),
+            local_dir: env::var(CACHE_DIR_ENV).is_ok(),
+            event_name: event_name.as_deref(),
+            git_ref: git_ref.as_deref(),
+        },
+    )
+}
+
+/// Determine if we should upload data. With no switch, from the GitHub
+/// context: only upload on main/master branch, not on PRs. A scan outside
+/// GitHub Actions sets none of it, so a runner or another CI says what it
+/// wants with `--upload` / `--no-upload` (carrick#2207,
+/// `docs/reference/runner.md`).
 fn should_upload_data() -> bool {
+    // `main` has already refused the one combination that errs.
+    upload_decision_from_env().unwrap_or(false)
+}
+
+/// The decision itself, pure, so the table test reads no process environment.
+fn upload_decision(switch: Option<bool>, context: UploadContext<'_>) -> Result<bool, &'static str> {
     // Eval runs (`CARRICK_OUTPUT_JSON`) are read-only benchmarks against throwaway
     // fixtures. Never upload, or a dispatch on main would pollute the real cloud
     // index with fixture "services". This is the upstream half of eval mode's
     // no-side-effects guarantee; the JSON output branch skips the markdown
-    // report + PR comment downstream.
+    // report + PR comment downstream. It stays first, above the switch: asking
+    // for an upload here is a usage error, not an upload.
     //
     // This branch returning first is what leaves a named cache directory empty
     // without saying so; `suppressed_upload_warning` is where the run says it
     // (carrick#966).
-    if env::var("CARRICK_OUTPUT_JSON").is_ok() {
-        return false;
+    if context.output_json {
+        return match switch {
+            Some(true) => Err(UPLOAD_WITH_OUTPUT_JSON),
+            _ => Ok(false),
+        };
+    }
+
+    if let Some(upload) = switch {
+        return Ok(upload);
     }
 
     // LocalDirStorage (the offline cross-repo eval harness, Phase A) writes
@@ -147,33 +217,48 @@ fn should_upload_data() -> bool {
     // PR/branch anti-pollution guards below do not apply. Without this, a CI
     // run (GITHUB_EVENT_NAME=pull_request) skips the upload and Phase A
     // persists nothing. Phase B sets CARRICK_OUTPUT_JSON and returns above.
-    if env::var("CARRICK_LOCAL_STORAGE_DIR").is_ok() {
-        return true;
+    if context.local_dir {
+        return Ok(true);
     }
 
     // Check if we're in a pull request
-    if let Ok(event_name) = env::var("GITHUB_EVENT_NAME")
-        && event_name == "pull_request"
-    {
-        return false;
+    if context.event_name == Some("pull_request") {
+        return Ok(false);
     }
 
     // Check if we're on a feature branch (not main/master)
-    if let Ok(ref_name) = env::var("GITHUB_REF") {
+    if let Some(ref_name) = context.git_ref {
         // GITHUB_REF format: refs/heads/branch-name or refs/pull/123/merge
         if ref_name.starts_with("refs/pull/") {
-            return false;
+            return Ok(false);
         }
 
         if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
             // Only upload for main/master branches
-            return branch == "main" || branch == "master";
+            return Ok(branch == "main" || branch == "master");
         }
     }
 
     // If we can't determine the context, default to upload (for local testing)
-    // You might want to change this to false for stricter behavior
-    true
+    Ok(true)
+}
+
+/// The reason `close-scan` carries for a run that opened a scan and was told
+/// not to upload (carrick#2207).
+const NO_UPLOAD_REASON: &str = "no_upload";
+
+/// The `owner/name` the cloud is told this run is: `--repo` when it was
+/// passed, else the checkout's origin remote (carrick#2207).
+fn repo_full_name(repo_path: &str) -> Option<String> {
+    repo_full_name_from(crate::utils::declared_repository(), repo_path)
+}
+
+/// [`repo_full_name`] with the declared name passed in, so the test sets no
+/// process-global. The remote is read only when nothing was declared.
+fn repo_full_name_from(declared: Option<&str>, repo_path: &str) -> Option<String> {
+    declared
+        .map(str::to_string)
+        .or_else(|| crate::git_state::remote_name(std::path::Path::new(repo_path)))
 }
 
 /// What a run is told when it names a local cache directory and then
@@ -538,11 +623,31 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     // The marker first, then the log: the marker is four short fields and the
     // log is up to five megabytes, and a run that is already failing may not
     // get to finish both.
-    if let Err(error) = &result {
-        report_scan_failure(&storage, repo_path, error.as_ref()).await;
-    }
+    report_run_end(&storage, repo_path, &result, upload_switch()).await;
     upload_run_logs(&storage, repo_path).await;
     result
+}
+
+/// The marker a finished run owes the scan it opened, if any.
+///
+/// A failure says so with `scan-failed`. A run told `--no-upload` sends no
+/// write and so no `scan_final`, and without `close-scan` the slot
+/// `start-scan` opened stays held for the quiet window (carrick#2207). Every
+/// other success closed its scan with its last write. Each marker is a no-op
+/// on a storage that opened no scan.
+async fn report_run_end<T: CloudStorage + Sync>(
+    storage: &T,
+    repo_path: &str,
+    result: &Result<(), Box<dyn std::error::Error>>,
+    upload_switch: Option<bool>,
+) {
+    match result {
+        Err(error) => report_scan_failure(storage, repo_path, error.as_ref()).await,
+        Ok(()) if upload_switch == Some(false) => {
+            storage.report_scan_closed(NO_UPLOAD_REASON).await
+        }
+        Ok(()) => {}
+    }
 }
 
 /// Tell the cloud this run died before it could upload, and where
@@ -583,7 +688,7 @@ pub async fn report_preflight_failure<T: CloudStorage + Sync>(
     stage: crate::scan_stage::Stage,
     error: &dyn std::error::Error,
 ) {
-    let repo = crate::git_state::remote_name(std::path::Path::new(repo_path));
+    let repo = repo_full_name(repo_path);
     storage
         .report_preflight_failed(
             repo.as_deref(),
@@ -697,7 +802,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // cache (see `stamp_tree_state`).
     let unchanged_at_start = crate::git_state::unchanged_since(repo_path, &git_state.commit).ok();
     let run_context = crate::cloud_storage::RunContext {
-        repo_full_name: crate::git_state::remote_name(std::path::Path::new(repo_path)),
+        repo_full_name: repo_full_name(repo_path),
         commit: git_state.commit.clone(),
         dirty: git_state.dirty,
     };
@@ -9477,6 +9582,221 @@ mod tests {
     #[test]
     fn json_output_without_a_local_cache_directory_is_not_warned() {
         assert_eq!(suppressed_upload_warning(true, None), None);
+    }
+
+    /// Every context the upload decision reads, with the answer it gave
+    /// before the switch existed (carrick#2207).
+    fn upload_contexts() -> Vec<(&'static str, UploadContext<'static>, bool)> {
+        let base = UploadContext::default();
+        vec![
+            (
+                "CARRICK_OUTPUT_JSON",
+                UploadContext {
+                    output_json: true,
+                    ..base
+                },
+                false,
+            ),
+            (
+                "local cache dir",
+                UploadContext {
+                    local_dir: true,
+                    event_name: Some("pull_request"),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "pull_request",
+                UploadContext {
+                    event_name: Some("pull_request"),
+                    ..base
+                },
+                false,
+            ),
+            (
+                "refs/pull/*",
+                UploadContext {
+                    git_ref: Some("refs/pull/12/merge"),
+                    ..base
+                },
+                false,
+            ),
+            (
+                "refs/heads/main",
+                UploadContext {
+                    git_ref: Some("refs/heads/main"),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "refs/heads/master",
+                UploadContext {
+                    git_ref: Some("refs/heads/master"),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "refs/heads/feature",
+                UploadContext {
+                    git_ref: Some("refs/heads/feature"),
+                    ..base
+                },
+                false,
+            ),
+            ("nothing set", base, true),
+        ]
+    }
+
+    /// With no switch, every context decides exactly as it did before the
+    /// switch existed.
+    #[test]
+    fn without_the_switch_every_context_decides_as_before() {
+        for (name, context, before) in upload_contexts() {
+            assert_eq!(upload_decision(None, context), Ok(before), "{name}");
+        }
+    }
+
+    /// With the switch, the switch decides, after the one guard that stays
+    /// first: `CARRICK_OUTPUT_JSON` never uploads, and asking it to is a usage
+    /// error rather than a flag that does nothing.
+    #[test]
+    fn the_switch_decides_except_against_json_output() {
+        for (name, context, _) in upload_contexts() {
+            assert_eq!(
+                upload_decision(Some(false), context),
+                Ok(false),
+                "--no-upload, {name}"
+            );
+            let expected = if context.output_json {
+                Err(UPLOAD_WITH_OUTPUT_JSON)
+            } else {
+                Ok(true)
+            };
+            assert_eq!(
+                upload_decision(Some(true), context),
+                expected,
+                "--upload, {name}"
+            );
+        }
+    }
+
+    /// `start-scan` and the preflight marker name the declared repository,
+    /// not the origin remote; with nothing declared, the remote as before
+    /// (carrick#2207).
+    #[test]
+    fn the_cloud_is_told_the_declared_repository_over_the_remote() {
+        let checkout = tempfile::tempdir().expect("a checkout");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(checkout.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/api-fork.git",
+        ]);
+        let path = checkout.path().to_str().expect("a UTF-8 path");
+
+        assert_eq!(
+            repo_full_name_from(Some("acme/api"), path).as_deref(),
+            Some("acme/api")
+        );
+        assert_eq!(
+            repo_full_name_from(None, path).as_deref(),
+            Some("acme/api-fork")
+        );
+    }
+
+    /// A Bearer run told `--no-upload` sends no write, so nothing carries
+    /// `scan_final`: it ends its scan with one `close-scan` naming
+    /// `no_upload`, which hands the slot back (carrick#2207).
+    #[tokio::test]
+    async fn a_run_told_not_to_upload_closes_the_scan_it_opened() {
+        let (base, server) = crate::agent_service::tests::stub_server(vec![(
+            200,
+            serde_json::json!({ "ok": true }).to_string(),
+        )]);
+        let storage = crate::cloud_storage::AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            crate::credentials::CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+            false,
+        );
+        storage.adopt_scan_id("scan_01J");
+
+        report_run_end(&storage, "/repos/api", &Ok(()), Some(false)).await;
+
+        // The stub has one answer. A run that sent no marker leaves it to
+        // this probe, which the stub then records in the marker's place; a
+        // run that did finds nobody listening, and the probe's failure is
+        // ignored.
+        let _ = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("a client")
+            .post(format!("{base}/types/check-or-upload"))
+            .json(&serde_json::json!({ "action": "carrick-2207-probe" }))
+            .send()
+            .await;
+        let seen = server.join().expect("the stub server thread");
+        assert_eq!(seen.len(), 1, "{seen:#?}");
+        let body: serde_json::Value = serde_json::from_str(
+            seen[0]
+                .split("\r\n\r\n")
+                .nth(1)
+                .expect("the request has a body"),
+        )
+        .expect("the body is JSON");
+        assert_eq!(body["action"], "close-scan");
+        assert_eq!(body["scan_id"], "scan_01J");
+        assert_eq!(body["reason"], "no_upload");
+    }
+
+    /// A run that uploaded, or decided as it always did, closed its scan with
+    /// its last write and sends no marker of its own.
+    #[tokio::test]
+    async fn a_run_that_was_not_told_not_to_upload_sends_no_close() {
+        for switch in [None, Some(true)] {
+            // The stub has one answer. A marker would take it, and the probe
+            // after it would find nobody listening.
+            let (base, server) = crate::agent_service::tests::stub_server(vec![(
+                200,
+                serde_json::json!({ "ok": true }).to_string(),
+            )]);
+            let url = format!("{base}/types/check-or-upload");
+            let storage = crate::cloud_storage::AwsStorage::for_test(
+                &url,
+                crate::credentials::CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+                false,
+            );
+            storage.adopt_scan_id("scan_01J");
+            report_run_end(&storage, "/repos/api", &Ok(()), switch).await;
+
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("a client")
+                .post(&url)
+                .json(&serde_json::json!({ "action": "carrick-2207-probe" }))
+                .send()
+                .await
+                .expect("the stub still had its answer for this test's own probe");
+            let seen = server.join().expect("the stub server thread");
+            assert_eq!(seen.len(), 1, "{switch:?}: {seen:#?}");
+            assert!(seen[0].contains("carrick-2207-probe"), "{switch:?}");
+        }
     }
 
     /// The incremental upload path stamps the running release, same as the
