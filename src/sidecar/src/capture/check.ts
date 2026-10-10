@@ -23,6 +23,7 @@ import ts from 'typescript';
 import type {
   CaptureAliasRecord,
   CheckOptions,
+  CompilerEnd,
   CheckProgressPhase,
   CheckResult,
   CheckStubInput,
@@ -50,6 +51,8 @@ export type CheckProgress = (phase: CheckProgressPhase, message: string) => void
 
 interface SpawnResult {
   code: number | null;
+  /** The signal that ended the process, when one did. */
+  signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
 }
@@ -57,17 +60,92 @@ interface SpawnResult {
 function runProcess(
   command: string,
   args: string[],
-  cwd: string
+  cwd: string,
+  env?: NodeJS.ProcessEnv
 ): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
+    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
+}
+
+/** The tail V8 prints on every fatal heap-exhaustion line. */
+const HEAP_OUT_OF_MEMORY = 'JavaScript heap out of memory';
+
+/**
+ * V8's hard size limits print the same tail, and a larger heap does not lift
+ * them, so they are not memory deaths.
+ */
+const HARD_SIZE_LIMITS = ['invalid table size', 'invalid array length', 'Invalid array buffer length'];
+
+/**
+ * Whether a process's stderr carries V8's fatal heap-exhaustion line
+ * (`Reached heap limit`, `Ineffective mark-compacts near heap limit`, and the
+ * other forms all end in `JavaScript heap out of memory`), and not one of the
+ * hard size limits that end the same way (carrick#2209).
+ *
+ * The scanner applies the same rule to the sidecar's own stderr
+ * (carrick#2208); the two must stay in step.
+ */
+export function carriesHeapLimitLine(stderr: string): boolean {
+  return stderr
+    .split('\n')
+    .some(
+      (line) =>
+        line.includes(HEAP_OUT_OF_MEMORY) &&
+        !HARD_SIZE_LIMITS.some((limit) => line.includes(limit))
+    );
+}
+
+/** V8's default old-space ceiling on a 64-bit host, in MB. */
+const V8_DEFAULT_HEAP_CEILING_MB = 4096;
+
+/** What a Node child of the sidecar is started with. */
+export interface ChildHeap {
+  /** `NODE_OPTIONS` for the child. */
+  nodeOptions: string | undefined;
+  /** The heap cap passed to the child, in MB, or null when it runs at V8's
+   * default. */
+  heapCapMb: number | null;
+}
+
+/**
+ * The heap a Node child of the sidecar (the check's compiler) is given
+ * (carrick#2209).
+ *
+ * The scanner sizes the sidecar's cap to the machine and passes it as a
+ * command-line flag, which a child does not inherit, so the child ran at V8's
+ * default. Handing it the same cap would overcommit the box: the sidecar's
+ * cap is already 3/4 of memory, and two such caps turn a heap error into an
+ * OS kill, which the sizing exists to avoid. So the child gets what is left of
+ * the sidecar's cap after what the sidecar holds now (`rssMb`), and only when
+ * that is more than V8's default; otherwise `NODE_OPTIONS` is left as it is
+ * and the child runs at the default, as before.
+ */
+export function childHeap(
+  execArgv: readonly string[],
+  existing: string | undefined,
+  rssMb: number
+): ChildHeap {
+  let cap: number | undefined;
+  for (let i = 0; i < execArgv.length; i++) {
+    const match = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/.exec(execArgv[i]);
+    if (!match) continue;
+    const value = match[1] ?? execArgv[i + 1];
+    if (value !== undefined && /^\d+$/.test(value)) cap = Number(value);
+  }
+  const budget = cap === undefined ? 0 : Math.floor(cap - rssMb);
+  if (budget <= V8_DEFAULT_HEAP_CEILING_MB) return { nodeOptions: existing, heapCapMb: null };
+  const flag = `--max-old-space-size=${budget}`;
+  return {
+    nodeOptions: existing && existing.trim() ? `${existing} ${flag}` : flag,
+    heapCapMb: budget,
+  };
 }
 
 /** Resolve the sidecar root (where the vendored pnpm/tsc live) from this bundle. */
@@ -262,10 +340,16 @@ export async function runCheck(
 
   // ---- Judge (async, off the event loop) ----------------------------------
   progress('checking', 'type-checking probes');
+  const heap = childHeap(
+    process.execArgv,
+    process.env.NODE_OPTIONS,
+    process.memoryUsage().rss / (1024 * 1024)
+  );
   const tsc = await runProcess(
     tscPath,
     ['--noEmit', '--pretty', 'false', '-p', path.join(ws.probesRel, 'tsconfig.json')],
-    ws.workspaceDir
+    ws.workspaceDir,
+    { ...process.env, NODE_OPTIONS: heap.nodeOptions }
   );
   const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
 
@@ -276,7 +360,9 @@ export async function runCheck(
   // WITH parsed diagnostics is the legitimate incompatible path (tsc exits 1
   // on ordinary type errors) and stays untouched. Mirrors the install step's
   // `code === 0` guard.
-  if (tsc.code !== 0 && diagnostics.length === 0) {
+  // A compiler a signal ended never finished, so a pair with no diagnostic
+  // was never cleared, whatever it printed first (carrick#2209).
+  if (tsc.signal !== null || (tsc.code !== 0 && diagnostics.length === 0)) {
     const excerpt = scrubPaths(
       (tsc.stderr || tsc.stdout).trim().slice(0, 2000),
       scrubCtx
@@ -302,6 +388,15 @@ export async function runCheck(
       ...preGated,
       ...unresolved,
     ]);
+    // How the compiler ended, as fields, so the scanner can tell a memory
+    // death from any other abnormal end without reading the text
+    // (carrick#2209).
+    const compilerEnd: CompilerEnd = {
+      exit_code: tsc.code,
+      signal: tsc.signal,
+      heap_limit: carriesHeapLimitLine(tsc.stderr),
+      heap_cap_mb: heap.heapCapMb,
+    };
     if (cleanup) safeRm(ws);
     return {
       success: false,
@@ -312,6 +407,7 @@ export async function runCheck(
       verdicts,
       degraded_services: dedupeDegraded(degraded),
       errors,
+      compiler_end: compilerEnd,
     };
   }
 

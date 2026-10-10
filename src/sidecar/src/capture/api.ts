@@ -579,6 +579,24 @@ export interface CheckResult {
   verdicts: CheckVerdict[];
   degraded_services: DegradedService[];
   errors: string[];
+  /** How the compiler ended, present only when it ended abnormally (a
+   * signal, or a non-zero exit with no parseable diagnostics): every pair is then
+   * unverifiable, and this says whether it died of memory (carrick#2209). */
+  compiler_end?: CompilerEnd;
+}
+
+/** How the check's compiler process ended. */
+export interface CompilerEnd {
+  /** Its exit code, or null when a signal ended it. */
+  exit_code: number | null;
+  /** The signal that ended it (`SIGABRT` when V8 aborts on a full heap,
+   * `SIGKILL` from the OS), or null. */
+  signal: string | null;
+  /** Whether its stderr carried V8's heap-exhaustion line. */
+  heap_limit: boolean;
+  /** The heap cap it was started with, in MB, or null when it ran at V8's
+   * default. */
+  heap_cap_mb: number | null;
 }
 
 export interface CheckOptions {

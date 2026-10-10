@@ -22,7 +22,10 @@ import * as assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runCheck } from '../src/capture/index.js';
+import { carriesHeapLimitLine, childHeap } from '../src/capture/check.js';
 import { buildProbe, decisiveAssignmentLine } from '../src/capture/check-probe.js';
 import type { CheckPairSpec, CheckStubInput } from '../src/capture/api.js';
 
@@ -131,6 +134,93 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     assert.match(result.errors.join('\n'), /exit code null/);
   });
 
+  it('a compiler that aborts on a full heap says so on the answer (carrick#2209)', async () => {
+    const tscPath = fakeTsc(
+      'tsc-heap',
+      "echo 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory' >&2; kill -ABRT $$"
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, false);
+    assert.deepStrictEqual(result.compiler_end, {
+      exit_code: null,
+      signal: 'SIGABRT',
+      heap_limit: true,
+      heap_cap_mb: null,
+    });
+    for (const v of result.verdicts) {
+      assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+      assert.strictEqual(v.gate, 'tsc:abnormal-termination');
+      assert.match(v.diagnostic ?? '', /exit code null/);
+    }
+  });
+
+  it('a killed compiler is not a heap death, and a crash names its exit code', async () => {
+    const killed = await runCheck({ stubs, pairs: PAIRS, tscPath: fakeTsc('tsc-kill', 'kill -KILL $$') });
+    assert.deepStrictEqual(killed.compiler_end, {
+      exit_code: null,
+      signal: 'SIGKILL',
+      heap_limit: false,
+      heap_cap_mb: null,
+    });
+    const crashed = await runCheck({
+      stubs,
+      pairs: PAIRS,
+      tscPath: fakeTsc('tsc-crash-2', "echo 'error TS18003: No inputs.' >&2; exit 2"),
+    });
+    assert.deepStrictEqual(crashed.compiler_end, {
+      exit_code: 2,
+      signal: null,
+      heap_limit: false,
+      heap_cap_mb: null,
+    });
+  });
+
+  it('a compiler a signal ended after printing a diagnostic clears no pair (carrick#2209)', async () => {
+    const plan = buildProbe(PAIRS[0], (s) => `@carrick/${s}`);
+    const probeFile = `packages/carrick-probes/probes/${plan.fileName}`;
+    const tscPath = fakeTsc(
+      'tsc-partial-abort',
+      `echo "${probeFile}(${decisiveAssignmentLine(plan)},7): error TS2322: Type 'A' is not assignable to type 'B'."; kill -ABRT $$`
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.compiler_end?.signal, 'SIGABRT');
+    for (const v of result.verdicts) {
+      assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+      assert.strictEqual(v.gate, 'tsc:abnormal-termination');
+    }
+  });
+
+  it('the compiler gets what is left of the sidecar cap, and says so (carrick#2209)', () => {
+    // The sidecar gets its cap as a node flag, which a child does not inherit;
+    // the compiler must see its share through NODE_OPTIONS. A fresh node with
+    // a cap far above what it holds runs the check against a compiler that
+    // prints its NODE_OPTIONS; a small cap leaves the compiler at the default.
+    const tscPath = fakeTsc('tsc-env', 'echo "options: [$NODE_OPTIONS]" >&2; exit 1');
+    const checkModule = pathToFileURL(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'capture', 'index.js')
+    ).href;
+    const script =
+      `const { runCheck } = await import(${JSON.stringify(checkModule)});` +
+      `const r = await runCheck(${JSON.stringify({ stubs, pairs: PAIRS, tscPath })});` +
+      'process.stdout.write(JSON.stringify({ errors: r.errors.join("\\n"), cap: r.compiler_end.heap_cap_mb }));';
+    const run = (capMb: number) => {
+      const out = spawnSync(
+        process.execPath,
+        [`--max-old-space-size=${capMb}`, '--input-type=module', '-e', script],
+        { encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' } }
+      );
+      assert.strictEqual(out.status, 0, out.stderr);
+      return JSON.parse(out.stdout) as { errors: string; cap: number | null };
+    };
+    const large = run(20000);
+    assert.ok(large.cap !== null && large.cap > 4096 && large.cap < 20000, String(large.cap));
+    assert.match(large.errors, new RegExp(`options: \\[--max-old-space-size=${large.cap}\\]`));
+    const small = run(2048);
+    assert.strictEqual(small.cap, null);
+    assert.match(small.errors, /options: \[\]/);
+  });
+
   it('non-zero exit WITH parseable probe diagnostics stays the incompatible path', async () => {
     // Fake tsc emits a real assignment-class diagnostic for pair-a's probe
     // and exits 1 exactly like the real tsc does on ordinary type errors.
@@ -147,5 +237,57 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     assert.strictEqual(verdictA.bucket, 'incompatible', JSON.stringify(verdictA));
     const verdictB = result.verdicts.find((v) => v.pair_key === 'pair-b')!;
     assert.strictEqual(verdictB.bucket, 'compatible', JSON.stringify(verdictB));
+  });
+});
+
+describe('check_v2: heap-death evidence and the compiler heap cap', () => {
+  it('every heap-exhaustion line V8 prints is a heap death', () => {
+    for (const line of [
+      'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+      'FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory',
+      'FATAL ERROR: MarkCompactCollector: young object promotion failed Allocation failed - JavaScript heap out of memory',
+      'FATAL ERROR: Scavenger: semi-space copy Allocation failed - JavaScript heap out of memory',
+    ]) {
+      assert.strictEqual(carriesHeapLimitLine(`<--- Last few GCs --->\n${line}\n 1: 0x1 node`), true, line);
+    }
+  });
+
+  it('a hard size limit, or no line at all, is not', () => {
+    for (const line of [
+      'FATAL ERROR: invalid table size Allocation failed - JavaScript heap out of memory',
+      'FATAL ERROR: invalid array length Allocation failed - JavaScript heap out of memory',
+      'FATAL ERROR: Invalid array buffer length Allocation failed - JavaScript heap out of memory',
+      'error TS18003: No inputs were found in config file.',
+      '',
+    ]) {
+      assert.strictEqual(carriesHeapLimitLine(line), false, line);
+    }
+  });
+
+  it("the child gets the sidecar's cap less what the sidecar holds, only above V8's default", () => {
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=6144'], undefined, 3000), {
+      nodeOptions: undefined,
+      heapCapMb: null,
+    });
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=8192'], undefined, 2000), {
+      nodeOptions: '--max-old-space-size=6192',
+      heapCapMb: 6192,
+    });
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=8192'], '--enable-source-maps', 2000), {
+      nodeOptions: '--enable-source-maps --max-old-space-size=6192',
+      heapCapMb: 6192,
+    });
+    assert.deepStrictEqual(childHeap(['--max_old_space_size', '8192'], '', 1000.6), {
+      nodeOptions: '--max-old-space-size=7191',
+      heapCapMb: 7191,
+    });
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=8192'], '--x', 4096), {
+      nodeOptions: '--x',
+      heapCapMb: null,
+    });
+    assert.deepStrictEqual(childHeap([], '--enable-source-maps', 100), {
+      nodeOptions: '--enable-source-maps',
+      heapCapMb: null,
+    });
   });
 });

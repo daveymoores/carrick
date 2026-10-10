@@ -6675,7 +6675,7 @@ fn record_capture_failure(
             return;
         }
         CaptureFailure::TimedOut => format!("type capture timed out: {failure}; {CONSEQUENCE}"),
-        CaptureFailure::SidecarDied(_) => {
+        CaptureFailure::SidecarDied { .. } => {
             format!("type capture failed: {failure}; {CONSEQUENCE}")
         }
     };
