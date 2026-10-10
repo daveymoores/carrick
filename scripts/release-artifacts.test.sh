@@ -150,6 +150,50 @@ then pass "workflow: matcher first, lister steps (attach too) continue on error,
 else fail "workflow step order or guards"
 fi
 
+# The cli announcement: event, tag, version and source sha.
+: > "$calls"
+"$script" announce-cli carrick-v0.0.0 > /dev/null
+expect_call "event_type=carrick-cli-published" "announce-cli: sends the event"
+expect_call "client_payload[tag]=carrick-v0.0.0" "announce-cli: names the tag"
+expect_call "client_payload[version]=0.0.0" "announce-cli: names the version"
+expect_call "client_payload[source_sha]=abc123" "announce-cli: names the source sha"
+
+# A failed dispatch fails the step and names the backfill command.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$work/gh-fail"
+chmod +x "$work/gh-fail"
+if out="$(GH="$work/gh-fail" "$script" announce-cli carrick-v0.0.0 2>&1)"; then
+  fail "announce-cli: a failed dispatch exits 0"
+elif [[ "$out" == *"::error::"*"gh workflow run scanner-pin-bump.yml -R carrick-tools/carrick-cloud -f tag=carrick-v0.0.0"* ]]; then
+  pass "announce-cli: a failed dispatch is an error naming the backfill"
+else
+  fail "announce-cli: failed dispatch message: $out"
+fi
+
+# The release workflow runs it only after publish, and only for the latest.
+if python3 - "$here/../.github/workflows/release.yml" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"\n  announce-cli:\n(.*?)(?=\n  [a-z][a-z-]*:\n|\Z)", text, re.S)
+problems = []
+if not m:
+    problems.append("no announce-cli job")
+else:
+    body = m.group(1)
+    needs = re.search(r"needs: \[(.*?)\]", body)
+    if not needs or "publish" not in [n.strip() for n in needs.group(1).split(",")]:
+        problems.append("announce-cli does not need publish")
+    if "needs.target.outputs.is_latest == 'true'" not in body:
+        problems.append("announce-cli is not gated on is_latest")
+    if "announce-cli" not in body.split("steps:")[1]:
+        problems.append("announce-cli job does not run the announce-cli arm")
+for p in problems:
+    print(p)
+sys.exit(1 if problems else 0)
+PY
+then pass "workflow: announce-cli needs publish and is gated on is_latest"
+else fail "release.yml announce-cli job"
+fi
+
 echo
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed"

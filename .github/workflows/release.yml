@@ -612,6 +612,27 @@ jobs:
       tag: ${{ needs.target.outputs.tag_name }}
     secrets: inherit
 
+  # Tells carrick-cloud this version is installable, for the runner's scanner
+  # pin (carrick-cloud#1936). After `publish`, which waits until npm serves the
+  # version; only for the latest release, so a backfill of an older tag never
+  # moves the runner backwards.
+  announce-cli:
+    needs: [target, publish]
+    if: ${{ needs.target.outputs.publish == 'true' && needs.target.outputs.is_latest == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.target.outputs.sha }}
+
+      - name: Announce the published CLI to carrick-cloud
+        env:
+          GH_TOKEN: ${{ secrets.CARRICK_CLOUD_DISPATCH_TOKEN }}
+          SOURCE_SHA: ${{ needs.target.outputs.sha }}
+        run: bash scripts/release-artifacts.sh announce-cli "${{ needs.target.outputs.tag_name }}"
+
   # The VS Code extension, packaged at the release version and published to the
   # galleries. Its own job on purpose: the extension is a manifest that starts
   # `carrick lsp --stdio`, so a gallery that is down, a token that expired or a
