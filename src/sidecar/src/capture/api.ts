@@ -594,6 +594,9 @@ export interface CompilerEnd {
   signal: string | null;
   /** Whether its stderr carried V8's heap-exhaustion line. */
   heap_limit: boolean;
+  /** The heap cap it was started with, in MB, or null when it ran at V8's
+   * default. */
+  heap_cap_mb: number | null;
 }
 
 export interface CheckOptions {

@@ -1003,6 +1003,11 @@ pub struct CompilerEnd {
     pub signal: Option<String>,
     /// Whether its stderr carried V8's heap-exhaustion line.
     pub heap_limit: bool,
+    /// The heap cap it was started with, in MB, or `None` when it ran at
+    /// V8's default: the sidecar gives it what is left of its own cap, and
+    /// only when that is above the default (carrick#2209).
+    #[serde(default)]
+    pub heap_cap_mb: Option<u64>,
 }
 
 impl CompilerEnd {
@@ -3707,7 +3712,7 @@ mod tests {
             .unwrap()
         };
         let heap = answer(serde_json::json!({
-            "exit_code": null, "signal": "SIGABRT", "heap_limit": true
+            "exit_code": null, "signal": "SIGABRT", "heap_limit": true, "heap_cap_mb": 6192
         }));
         assert_eq!(
             heap.compiler_end,
@@ -3715,6 +3720,7 @@ mod tests {
                 exit_code: None,
                 signal: Some("SIGABRT".to_string()),
                 heap_limit: true,
+                heap_cap_mb: Some(6192),
             })
         );
         assert!(heap.compiler_end.unwrap().is_memory_death());

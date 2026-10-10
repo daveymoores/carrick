@@ -102,28 +102,50 @@ export function carriesHeapLimitLine(stderr: string): boolean {
     );
 }
 
+/** V8's default old-space ceiling on a 64-bit host, in MB. */
+const V8_DEFAULT_HEAP_CEILING_MB = 4096;
+
+/** What a Node child of the sidecar is started with. */
+export interface ChildHeap {
+  /** `NODE_OPTIONS` for the child. */
+  nodeOptions: string | undefined;
+  /** The heap cap passed to the child, in MB, or null when it runs at V8's
+   * default. */
+  heapCapMb: number | null;
+}
+
 /**
- * `NODE_OPTIONS` for a Node child of the sidecar: the existing value with the
- * sidecar's own `--max-old-space-size` appended, so the child's heap cap is
- * the one the scanner sized for this machine and not V8's lower default
- * (carrick#2209). The scanner passes the cap as a command-line flag, which a
- * child does not inherit. Unchanged when the sidecar runs with no cap.
+ * The heap a Node child of the sidecar (the check's compiler) is given
+ * (carrick#2209).
+ *
+ * The scanner sizes the sidecar's cap to the machine and passes it as a
+ * command-line flag, which a child does not inherit, so the child ran at V8's
+ * default. Handing it the same cap would overcommit the box: the sidecar's
+ * cap is already 3/4 of memory, and two such caps turn a heap error into an
+ * OS kill, which the sizing exists to avoid. So the child gets what is left of
+ * the sidecar's cap after what the sidecar holds now (`rssMb`), and only when
+ * that is more than V8's default; otherwise `NODE_OPTIONS` is left as it is
+ * and the child runs at the default, as before.
  */
-export function childNodeOptions(
+export function childHeap(
   execArgv: readonly string[],
-  existing: string | undefined
-): string | undefined {
-  let cap: string | undefined;
+  existing: string | undefined,
+  rssMb: number
+): ChildHeap {
+  let cap: number | undefined;
   for (let i = 0; i < execArgv.length; i++) {
-    const arg = execArgv[i];
-    const match = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/.exec(arg);
+    const match = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/.exec(execArgv[i]);
     if (!match) continue;
     const value = match[1] ?? execArgv[i + 1];
-    if (value !== undefined && /^\d+$/.test(value)) cap = value;
+    if (value !== undefined && /^\d+$/.test(value)) cap = Number(value);
   }
-  if (cap === undefined) return existing;
-  const flag = `--max-old-space-size=${cap}`;
-  return existing && existing.trim() ? `${existing} ${flag}` : flag;
+  const budget = cap === undefined ? 0 : Math.floor(cap - rssMb);
+  if (budget <= V8_DEFAULT_HEAP_CEILING_MB) return { nodeOptions: existing, heapCapMb: null };
+  const flag = `--max-old-space-size=${budget}`;
+  return {
+    nodeOptions: existing && existing.trim() ? `${existing} ${flag}` : flag,
+    heapCapMb: budget,
+  };
 }
 
 /** Resolve the sidecar root (where the vendored pnpm/tsc live) from this bundle. */
@@ -318,11 +340,16 @@ export async function runCheck(
 
   // ---- Judge (async, off the event loop) ----------------------------------
   progress('checking', 'type-checking probes');
+  const heap = childHeap(
+    process.execArgv,
+    process.env.NODE_OPTIONS,
+    process.memoryUsage().rss / (1024 * 1024)
+  );
   const tsc = await runProcess(
     tscPath,
     ['--noEmit', '--pretty', 'false', '-p', path.join(ws.probesRel, 'tsconfig.json')],
     ws.workspaceDir,
-    { ...process.env, NODE_OPTIONS: childNodeOptions(process.execArgv, process.env.NODE_OPTIONS) }
+    { ...process.env, NODE_OPTIONS: heap.nodeOptions }
   );
   const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
 
@@ -368,6 +395,7 @@ export async function runCheck(
       exit_code: tsc.code,
       signal: tsc.signal,
       heap_limit: carriesHeapLimitLine(tsc.stderr),
+      heap_cap_mb: heap.heapCapMb,
     };
     if (cleanup) safeRm(ws);
     return {

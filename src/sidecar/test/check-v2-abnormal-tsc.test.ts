@@ -25,7 +25,7 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runCheck } from '../src/capture/index.js';
-import { carriesHeapLimitLine, childNodeOptions } from '../src/capture/check.js';
+import { carriesHeapLimitLine, childHeap } from '../src/capture/check.js';
 import { buildProbe, decisiveAssignmentLine } from '../src/capture/check-probe.js';
 import type { CheckPairSpec, CheckStubInput } from '../src/capture/api.js';
 
@@ -145,6 +145,7 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
       exit_code: null,
       signal: 'SIGABRT',
       heap_limit: true,
+      heap_cap_mb: null,
     });
     for (const v of result.verdicts) {
       assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
@@ -159,6 +160,7 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
       exit_code: null,
       signal: 'SIGKILL',
       heap_limit: false,
+      heap_cap_mb: null,
     });
     const crashed = await runCheck({
       stubs,
@@ -169,6 +171,7 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
       exit_code: 2,
       signal: null,
       heap_limit: false,
+      heap_cap_mb: null,
     });
   });
 
@@ -188,25 +191,34 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     }
   });
 
-  it('the compiler runs under the heap cap the sidecar was given (carrick#2209)', () => {
+  it('the compiler gets what is left of the sidecar cap, and says so (carrick#2209)', () => {
     // The sidecar gets its cap as a node flag, which a child does not inherit;
-    // the compiler must see it through NODE_OPTIONS. A fresh node with a cap
-    // runs the check against a compiler that prints its NODE_OPTIONS.
-    const tscPath = fakeTsc('tsc-env', 'echo "options: $NODE_OPTIONS" >&2; exit 1');
+    // the compiler must see its share through NODE_OPTIONS. A fresh node with
+    // a cap far above what it holds runs the check against a compiler that
+    // prints its NODE_OPTIONS; a small cap leaves the compiler at the default.
+    const tscPath = fakeTsc('tsc-env', 'echo "options: [$NODE_OPTIONS]" >&2; exit 1');
     const checkModule = pathToFileURL(
       path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'capture', 'index.js')
     ).href;
     const script =
       `const { runCheck } = await import(${JSON.stringify(checkModule)});` +
       `const r = await runCheck(${JSON.stringify({ stubs, pairs: PAIRS, tscPath })});` +
-      'process.stdout.write(r.errors.join("\\n"));';
-    const run = spawnSync(
-      process.execPath,
-      ['--max-old-space-size=1234', '--input-type=module', '-e', script],
-      { encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' } }
-    );
-    assert.strictEqual(run.status, 0, run.stderr);
-    assert.match(run.stdout, /options: --max-old-space-size=1234/);
+      'process.stdout.write(JSON.stringify({ errors: r.errors.join("\\n"), cap: r.compiler_end.heap_cap_mb }));';
+    const run = (capMb: number) => {
+      const out = spawnSync(
+        process.execPath,
+        [`--max-old-space-size=${capMb}`, '--input-type=module', '-e', script],
+        { encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' } }
+      );
+      assert.strictEqual(out.status, 0, out.stderr);
+      return JSON.parse(out.stdout) as { errors: string; cap: number | null };
+    };
+    const large = run(20000);
+    assert.ok(large.cap !== null && large.cap > 4096 && large.cap < 20000, String(large.cap));
+    assert.match(large.errors, new RegExp(`options: \\[--max-old-space-size=${large.cap}\\]`));
+    const small = run(2048);
+    assert.strictEqual(small.cap, null);
+    assert.match(small.errors, /options: \[\]/);
   });
 
   it('non-zero exit WITH parseable probe diagnostics stays the incompatible path', async () => {
@@ -252,14 +264,30 @@ describe('check_v2: heap-death evidence and the compiler heap cap', () => {
     }
   });
 
-  it("the child's NODE_OPTIONS carries the sidecar's own heap cap", () => {
-    assert.strictEqual(childNodeOptions(['--max-old-space-size=8192'], undefined), '--max-old-space-size=8192');
-    assert.strictEqual(
-      childNodeOptions(['--max-old-space-size=8192'], '--enable-source-maps'),
-      '--enable-source-maps --max-old-space-size=8192'
-    );
-    assert.strictEqual(childNodeOptions(['--max_old_space_size', '4096'], ''), '--max-old-space-size=4096');
-    assert.strictEqual(childNodeOptions([], '--enable-source-maps'), '--enable-source-maps');
-    assert.strictEqual(childNodeOptions(['--inspect'], undefined), undefined);
+  it("the child gets the sidecar's cap less what the sidecar holds, only above V8's default", () => {
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=6144'], undefined, 3000), {
+      nodeOptions: undefined,
+      heapCapMb: null,
+    });
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=8192'], undefined, 2000), {
+      nodeOptions: '--max-old-space-size=6192',
+      heapCapMb: 6192,
+    });
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=8192'], '--enable-source-maps', 2000), {
+      nodeOptions: '--enable-source-maps --max-old-space-size=6192',
+      heapCapMb: 6192,
+    });
+    assert.deepStrictEqual(childHeap(['--max_old_space_size', '8192'], '', 1000.6), {
+      nodeOptions: '--max-old-space-size=7191',
+      heapCapMb: 7191,
+    });
+    assert.deepStrictEqual(childHeap(['--max-old-space-size=8192'], '--x', 4096), {
+      nodeOptions: '--x',
+      heapCapMb: null,
+    });
+    assert.deepStrictEqual(childHeap([], '--enable-source-maps', 100), {
+      nodeOptions: '--enable-source-maps',
+      heapCapMb: null,
+    });
   });
 });
