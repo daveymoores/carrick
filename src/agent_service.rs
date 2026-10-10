@@ -654,6 +654,82 @@ const COLLECT_HEADER: &str = "X-Carrick-Collect";
 /// The one route a collecting request is sent to. Its lambda is the one that
 /// holds a lease on a request in flight and keeps its answer, so it is the
 /// one with something a later request could collect.
+/// The per-request timeout of every route, and of the prompt routes unless
+/// the runner sets one.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The four routes a runner's loopback proxy serves. `/library-claims` is the
+/// fifth AgentService route and stays on the build-time endpoint, as does
+/// `/types/check-or-upload`. Documented in `docs/reference/runner.md`.
+const PROMPT_ROUTES: [&str; 4] = [
+    "/analyze-file",
+    "/generate-intent",
+    "/framework-detect",
+    "/framework-guidance",
+];
+
+/// Set once by `main` from the environment, before any service is built.
+static PROMPT_RUNNER: std::sync::OnceLock<PromptRunner> = std::sync::OnceLock::new();
+
+/// What the runner changed about the four prompt routes
+/// (`CARRICK_PROMPT_ENDPOINT`, `CARRICK_PROMPT_TIMEOUT_SECS`;
+/// `docs/reference/runner.md`). The default changes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptRunner {
+    endpoint: Option<String>,
+    timeout: Option<Duration>,
+}
+
+/// `http://127.0.0.1:<port>` or `http://[::1]:<port>`: a loopback address
+/// with a port, and no path, query or userinfo. A name is refused because it
+/// can resolve anywhere.
+fn parse_prompt_endpoint(value: &str) -> Result<String, String> {
+    let addr = value
+        .strip_prefix("http://")
+        .and_then(|rest| rest.parse::<std::net::SocketAddr>().ok())
+        .filter(|addr| addr.port() != 0)
+        .filter(|addr| {
+            addr.ip() == std::net::Ipv4Addr::LOCALHOST || addr.ip() == std::net::Ipv6Addr::LOCALHOST
+        });
+    match addr {
+        Some(_) => Ok(value.to_string()),
+        None => Err(format!(
+            "CARRICK_PROMPT_ENDPOINT must be http://127.0.0.1:<port> or http://[::1]:<port>, not '{value}'."
+        )),
+    }
+}
+
+/// Whole seconds, 1 to 900.
+fn parse_prompt_timeout(value: &str) -> Result<Duration, String> {
+    match value.parse::<u64>() {
+        Ok(secs) if (1..=900).contains(&secs) => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "CARRICK_PROMPT_TIMEOUT_SECS must be a whole number of seconds from 1 to 900, not '{value}'."
+        )),
+    }
+}
+
+impl PromptRunner {
+    fn from_values(endpoint: Option<&str>, timeout: Option<&str>) -> Result<Self, String> {
+        Ok(Self {
+            endpoint: endpoint.map(parse_prompt_endpoint).transpose()?,
+            timeout: timeout.map(parse_prompt_timeout).transpose()?,
+        })
+    }
+}
+
+/// Read both settings and keep them for every service built after this.
+/// An error is a usage error for `main` to print and exit 2 on.
+pub fn init_prompt_runner_from_env() -> Result<(), String> {
+    let read = |name: &str| env::var(name).ok();
+    let runner = PromptRunner::from_values(
+        read("CARRICK_PROMPT_ENDPOINT").as_deref(),
+        read("CARRICK_PROMPT_TIMEOUT_SECS").as_deref(),
+    )?;
+    let _ = PROMPT_RUNNER.set(runner);
+    Ok(())
+}
+
 const COLLECT_ROUTE: &str = "/analyze-file";
 
 /// A `Retry-After` value in delta-seconds, the only form the cloud sends. The
@@ -904,6 +980,9 @@ pub struct AgentService {
     refusals: Arc<RouteRefusals>,
     capabilities: Arc<CloudCapabilities>,
     retry: RetryPolicy,
+    /// Where the four prompt routes go and how long each waits, when the
+    /// runner set them ([`PromptRunner`]).
+    prompt_runner: PromptRunner,
     /// Whether a call this service sends is one of the run's requests
     /// ([`record_request`]). Every service a scan builds counts its calls. A
     /// test that drives the retry loop against a stub does not, so it neither
@@ -934,9 +1013,27 @@ impl AgentService {
             refusals: global_refusals(),
             capabilities: global_capabilities(),
             retry: RetryPolicy::STANDARD,
+            prompt_runner: PROMPT_RUNNER.get().cloned().unwrap_or_default(),
             counts_requests: true,
             #[cfg(test)]
             script: None,
+        }
+    }
+
+    /// The base URL a call to `path` is sent to: the runner's endpoint for
+    /// the four prompt routes when it set one, else `build_base`.
+    fn base_for<'a>(&'a self, path: &str, build_base: &'a str) -> &'a str {
+        match &self.prompt_runner.endpoint {
+            Some(endpoint) if PROMPT_ROUTES.contains(&path) => endpoint,
+            _ => build_base,
+        }
+    }
+
+    /// How long one request to `path` may take.
+    fn timeout_for(&self, path: &str) -> Duration {
+        match self.prompt_runner.timeout {
+            Some(timeout) if PROMPT_ROUTES.contains(&path) => timeout,
+            _ => REQUEST_TIMEOUT,
         }
     }
 
@@ -1033,8 +1130,8 @@ impl AgentService {
             ),
             crate::credentials::CloudAuth::Bearer(token) => RequestAuth::Bearer(token),
         };
-        self.post_with_retry(&auth, env!("CARRICK_API_ENDPOINT"), task_path, body)
-            .await
+        let base = self.base_for(task_path, env!("CARRICK_API_ENDPOINT"));
+        self.post_with_retry(&auth, base, task_path, body).await
     }
 
     /// Put one request on the wire.
@@ -1212,7 +1309,7 @@ impl AgentService {
             }
             asked = true;
 
-            let request_builder = self.request(&endpoint, body, auth, &token, lambda_attempt);
+            let request_builder = self.request(&endpoint, path, body, auth, &token, lambda_attempt);
             let asked_at = tokio::time::Instant::now();
             let sent = self.send(request_builder, path, lambda_attempt).await;
             // The request a refusal was waited out for has come back, so the
@@ -1729,6 +1826,7 @@ impl AgentService {
     fn request<B>(
         &self,
         endpoint: &str,
+        path: &str,
         body: &B,
         auth: &RequestAuth<'_>,
         token: &str,
@@ -1741,7 +1839,7 @@ impl AgentService {
             .client
             .post(endpoint)
             .json(body)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(self.timeout_for(path))
             .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
             .header("X-Carrick-Run-Id", crate::logging::run_id())
             .header(ATTEMPT_HEADER, lambda_attempt.to_string());
@@ -1852,7 +1950,7 @@ impl AgentService {
                 return Err(ended);
             };
             let request = self
-                .request(endpoint, body, auth, &token, lambda_attempt)
+                .request(endpoint, path, body, auth, &token, lambda_attempt)
                 .header(COLLECT_HEADER, "1");
             let response = match self.send(request, path, lambda_attempt).await {
                 Ok(response) => response,
@@ -3676,6 +3774,7 @@ pub(crate) mod tests {
             refusals: Arc::new(RouteRefusals::new()),
             capabilities: Arc::new(CloudCapabilities::new()),
             retry: RetryPolicy::STANDARD,
+            prompt_runner: PromptRunner::default(),
             counts_requests: false,
             script: None,
         }
@@ -4478,6 +4577,140 @@ pub(crate) mod tests {
             header_of(&requests[1], "x-carrick-attempt").as_deref(),
             Some("2")
         );
+    }
+
+    fn runner_service(endpoint: Option<&str>, timeout: Option<&str>) -> AgentService {
+        let mut service = AgentService::new();
+        service.prompt_runner = PromptRunner::from_values(endpoint, timeout).unwrap();
+        service
+    }
+
+    #[test]
+    fn the_prompt_endpoint_must_be_a_loopback_address_with_a_port() {
+        for ok in ["http://127.0.0.1:8080", "http://[::1]:8080"] {
+            assert_eq!(parse_prompt_endpoint(ok).as_deref(), Ok(ok), "{ok}");
+        }
+        for bad in [
+            "https://api.carrick.tools",
+            "http://localhost:8080",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8080/x",
+            "http://127.0.0.1:8080/",
+            "http://user@127.0.0.1:8080",
+            "http://10.0.0.1:8080",
+            "http://127.0.0.1:0",
+            "",
+        ] {
+            assert!(parse_prompt_endpoint(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_timeout_is_whole_seconds_from_one_to_nine_hundred() {
+        assert_eq!(parse_prompt_timeout("130"), Ok(Duration::from_secs(130)));
+        assert_eq!(parse_prompt_timeout("1"), Ok(Duration::from_secs(1)));
+        assert_eq!(parse_prompt_timeout("900"), Ok(Duration::from_secs(900)));
+        for bad in ["0", "901", "abc", "", "1.5", "-1"] {
+            assert!(parse_prompt_timeout(bad).is_err(), "{bad}");
+        }
+        assert!(PromptRunner::from_values(None, Some("0")).is_err());
+        assert!(PromptRunner::from_values(Some("http://x:1"), None).is_err());
+    }
+
+    /// With the endpoint set, the four prompt routes reach it with the usual
+    /// headers and `/library-claims` does not; without it, none do.
+    #[tokio::test]
+    async fn only_the_four_prompt_routes_go_to_the_runner_endpoint() {
+        const BUILD: &str = "http://build.invalid";
+        let routes = [
+            "/analyze-file",
+            "/generate-intent",
+            "/framework-detect",
+            "/framework-guidance",
+        ];
+        let (stub, server) = stub_server(
+            routes
+                .iter()
+                .map(|_| (200, r#"{"success":true,"text":"ok"}"#.to_string()))
+                .collect(),
+        );
+        let service = runner_service(Some(&stub), None);
+        for route in routes {
+            let base = service.base_for(route, BUILD);
+            assert_eq!(base, stub, "{route}");
+            service
+                .post_with_retry(
+                    &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                    base,
+                    route,
+                    &serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(service.base_for("/library-claims", BUILD), BUILD);
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), routes.len());
+        for (request, route) in seen.iter().zip(routes) {
+            assert!(request.starts_with(&format!("POST {route} ")), "{request}");
+            assert_eq!(
+                header_of(request, "authorization").as_deref(),
+                Some("Bearer carrick_sk_live_test")
+            );
+            assert!(header_of(request, "x-carrick-scanner-version").is_some());
+            assert!(header_of(request, "x-carrick-attempt").is_some());
+        }
+
+        let plain = runner_service(None, None);
+        for route in routes.iter().chain(&["/library-claims"]) {
+            assert_eq!(plain.base_for(route, BUILD), BUILD, "{route}");
+            assert_eq!(plain.timeout_for(route), Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn the_prompt_timeout_applies_to_the_prompt_routes_only() {
+        let service = runner_service(None, Some("135"));
+        assert_eq!(
+            service.timeout_for("/analyze-file"),
+            Duration::from_secs(135)
+        );
+        assert_eq!(
+            service.timeout_for("/library-claims"),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A stub that answers after the setting has run out ends the request in
+    /// transport, which the loop retries like any other transport failure.
+    #[tokio::test]
+    async fn a_prompt_request_times_out_at_the_runner_setting() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let slow = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let service = runner_service(None, Some("1")).with_retry_policy(RetryPolicy::ONCE);
+        let started = std::time::Instant::now();
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(1900),
+            "waited {:?}",
+            started.elapsed()
+        );
+        slow.join().unwrap();
     }
 
     /// A call waiting out a retry holds no concurrency slot (carrick#1077).

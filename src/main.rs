@@ -299,6 +299,7 @@ fn apply_runner_flags(args: &CliArgs) -> Result<(), String> {
     if let Some(upload) = args.upload {
         engine::set_upload_switch(upload);
     }
+    carrick::agent_service::init_prompt_runner_from_env()?;
     engine::upload_decision_from_env()
         .map(|_| ())
         .map_err(str::to_string)
