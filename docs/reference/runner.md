@@ -49,8 +49,20 @@ Neither flag is listed in `carrick --help`.
 
 The folder the checkout lives in can have any name once `--repo` is passed.
 For unchanged files to replay their stored answers, the commit each service's
-stored blob was written at must be present in the clone; carrick#2212 covers
-partial and shallow clones.
+stored blob was written at must be present in the clone.
+
+- A partial clone (`--filter=blob:none --depth=1`) works with that commit
+  fetched the same way. The scan's git commands fetch no file contents; a
+  tracked file edited after checkout reads as changed and is analysed again
+  (`unchanged_since`, `src/git_state.rs`).
+- Each service carries the commit of its own stored blob, and the commits
+  differ when services landed at different times. Fetch every distinct one
+  (`resolve-repos` lists them per service as `hash`), not one.
+- A stored commit that no longer exists on the remote, for example after a
+  force push, cannot be fetched; that service runs in full.
+- Keep the tree clean before the scan: install with frozen lockfiles where
+  the manager allows it. A rewritten tracked file also marks the upload
+  `dirty`.
 
 ## Exit codes
 
