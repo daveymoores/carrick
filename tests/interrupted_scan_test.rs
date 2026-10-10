@@ -242,6 +242,102 @@ process.stdin.resume();
     assert_eq!(code, TERMINATED);
 }
 
+/// The exit code a run stopped by SIGINT reports: 128 plus the signal.
+const INTERRUPTED: i32 = 130;
+
+/// A signal while several services are analysed side by side, each on a
+/// thread of its own and each waiting on a sidecar of its own, ends the run
+/// (carrick#2216).
+///
+/// The first sidecar process, the one `main` starts, becomes ready. Every
+/// process started for a service answers nothing, so four service threads sit
+/// in their readiness waits when the signal lands. A run that can only notice
+/// the signal on the thread it arrived on, or once a service ends, fails this
+/// by outliving the deadline.
+#[test]
+fn a_signal_while_services_run_side_by_side_ends_the_run() {
+    let home = tempfile::tempdir().expect("a home for the run");
+    let sidecar = home.path().join("sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
+    let marks = home.path().join("marks");
+    std::fs::create_dir_all(&marks).expect("a directory for the marks");
+    std::fs::write(
+        sidecar.join("index.js"),
+        format!(
+            r#"const fs = require("fs");
+const path = require("path");
+let first = true;
+try {{ fs.writeFileSync(path.join({marks:?}, "main"), "", {{ flag: "wx" }}); }} catch (e) {{ first = false; }}
+if (!first) fs.writeFileSync(path.join({marks:?}, `service-${{process.pid}}`), "");
+let buffered = "";
+process.stdin.on("data", (chunk) => {{
+  buffered += chunk;
+  let end;
+  while ((end = buffered.indexOf("\n")) >= 0) {{
+    const line = buffered.slice(0, end);
+    buffered = buffered.slice(end + 1);
+    if (!line.trim() || !first) continue;
+    let request;
+    try {{ request = JSON.parse(line); }} catch (e) {{ continue; }}
+    process.stdout.write(JSON.stringify({{ request_id: request.request_id, status: "ready", init_time_ms: 1 }}) + "\n");
+  }}
+}});
+process.stdin.on("end", () => process.exit(0));
+process.stdin.resume();
+"#,
+            marks = marks.to_string_lossy()
+        ),
+    )
+    .expect("write the sidecar that serves only the first process");
+
+    let mut child = scan(
+        &repo_root().join("tests/fixtures/parallel-services"),
+        home.path(),
+    )
+    .env("CARRICK_SIDECAR_DIR", home.path().join("sidecar"))
+    .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600")
+    .env("CARRICK_SERVICE_CONCURRENCY", "4")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("start a scan");
+
+    let start = Instant::now();
+    let waiting = || {
+        std::fs::read_dir(&marks)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("service-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    while waiting() < 4 {
+        if start.elapsed() > DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "only {} service sidecar(s) were started side by side",
+                waiting()
+            );
+        }
+        assert!(
+            child.try_wait().expect("poll the scan").is_none(),
+            "the scan was over before it could be signalled"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    send(&child, libc::SIGINT);
+
+    let code = code_within(
+        &mut child,
+        DEADLINE,
+        "the scan was still waiting on its services' sidecars",
+    );
+    assert_eq!(code, INTERRUPTED);
+}
+
 /// A run whose terminal goes away finishes instead of panicking on its next
 /// print (carrick#1386).
 ///

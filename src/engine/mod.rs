@@ -48,6 +48,7 @@ use swc_ecma_visit::VisitWith;
 
 pub mod durability;
 pub(crate) mod served_paths;
+pub mod service_workers;
 pub mod setup_ahead;
 pub(crate) mod type_compat_v2;
 pub(crate) mod upload_boundary;
@@ -1039,76 +1040,105 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         previous_generation(previous_generations, &repo_name, service)
             .map(setup_ahead::StoredSetup::of)
     });
-    let scan = ServiceScan {
+    let scan = std::sync::Arc::new(ServiceScan {
         repo_path: repo_path.to_string(),
         services: analysed.into(),
-        sidecar,
+        sidecar: sidecar.map(TypeSidecar::recipe),
         run_intents,
         graphql_schemas,
         setups: std::sync::Arc::new(setups),
         workspace: workspace_scan,
-    };
+    });
     let upload_blocked = multi_service && !storage.supports_multi_service();
+    // Several services at once, each on a thread of its own and each started
+    // in declared order (carrick#1066). A failure in one stops none of the
+    // others, and each result is kept at its service's index. A carried
+    // service is no job: it is never handed to a worker.
+    let width = service_workers::width(scan.services.len(), crate::analysis_channel::dispatching());
+    debug!(
+        "Analysing services {} at a time: {}",
+        width.count, width.why
+    );
+    let jobs: Vec<ServiceJob> = services
+        .iter()
+        .zip(&scan_index)
+        .filter_map(|(service, at)| at.map(|at| (at, service)))
+        .map(|(at, service)| ServiceJob {
+            index: at,
+            // Incremental cache is per service: match on repo + service name
+            // so editing one service does not invalidate the others.
+            previous: if no_cache {
+                None
+            } else {
+                previous_generation(previous_generations, &repo_name, service).cloned()
+            },
+            generation: PreviousGeneration::Stored,
+        })
+        .collect();
+    let pass_started = Instant::now();
+    let outcomes = scan.analyze_all(jobs, width.count).await;
+    crate::scan_timing::pass_ended(pass_started.elapsed().as_secs_f64());
     let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
+    // Back in declared order: a carried service's stored generation in its
+    // place, every analysed one's outcome in its.
+    let mut outcomes: Vec<Option<ServiceOutcome>> = outcomes.into_iter().map(Some).collect();
+    let mut first_failure = None;
     for (index, service) in services.iter().enumerate() {
-        // Incremental cache is per service: match on repo + service name so
-        // editing one service does not invalidate the others.
-        let previous_data = if no_cache {
-            None
-        } else {
-            previous_generation(previous_generations, &repo_name, service).cloned()
-        };
         let Some(at) = scan_index[index] else {
             // Carried, which only a service with a stored generation is, and
             // `--no-cache` is refused beside `--changed-only`.
-            let stored = previous_data.expect("a carried service has a stored generation");
+            let stored = previous_generation(previous_generations, &repo_name, service)
+                .cloned()
+                .expect("a carried service has a stored generation");
             runs.push(ServiceRun::carried(service, stored));
             continue;
         };
-        match scan
-            .analyze(at, previous_data.as_ref(), PreviousGeneration::Stored)
-            .await
+        match outcomes[at]
+            .take()
+            .expect("every analysed service has an outcome")
         {
             Ok(run) => runs.push(run),
             Err(error) => {
-                // Not a model failure — those defer, they do not reach here —
-                // so something this run cannot work around. The services that
-                // finished owe nothing, and they land before the run ends, so
-                // the next scan replays them instead of paying for them again.
-                // Verdict-less, as on the cross-repo failure path below, and
-                // without closing the scan: the fail marker the caller sends
-                // releases the slot and does not call this a finished index.
-                logging::finish_spinner_warn(&sp, "Analysis stopped");
-                if should_upload && !upload_blocked {
-                    let finished: Vec<&CloudRepoData> = runs
-                        .iter()
-                        // A carried service's data is its stored blob, which
-                        // has nothing new to land.
-                        .filter(|run| run.owed.is_empty() && !run.carried)
-                        .map(|run| &run.data)
-                        .collect();
-                    if !finished.is_empty() {
-                        warn!(
-                            "Analysis stopped at service {}/{}; landing the {} service(s) that \
-                             finished before it",
-                            index + 1,
-                            services.len(),
-                            finished.len()
-                        );
-                        let payloads = upload_payloads_for(
-                            storage,
-                            repo_path,
-                            &finished,
-                            git_state.dirty,
-                            unchanged_at_start.as_ref(),
-                        );
-                        upload_service_payloads(storage, &payloads, no_cache, false, &boundary)
-                            .await;
-                    }
-                }
-                return Err(error);
+                first_failure.get_or_insert((index, error));
             }
         }
+    }
+    if let Some((index, error)) = first_failure {
+        // Not a model failure — those defer, they do not reach here — so
+        // something this run cannot work around. Every other service ran to
+        // its end; the ones that finished owe nothing, and they land before
+        // the run ends, so the next scan replays them instead of paying for
+        // them again. Verdict-less, as on the cross-repo failure path below,
+        // and without closing the scan: the fail marker the caller sends
+        // releases the slot and does not call this a finished index. The
+        // error is the first-declared service's that failed.
+        logging::finish_spinner_warn(&sp, "Analysis stopped");
+        if should_upload && !upload_blocked {
+            let finished: Vec<&CloudRepoData> = runs
+                .iter()
+                // A carried service's data is its stored blob, which has
+                // nothing new to land.
+                .filter(|run| run.owed.is_empty() && !run.carried)
+                .map(|run| &run.data)
+                .collect();
+            if !finished.is_empty() {
+                warn!(
+                    "Analysis stopped at service {}/{}; landing the {} service(s) that finished",
+                    index + 1,
+                    services.len(),
+                    finished.len()
+                );
+                let payloads = upload_payloads_for(
+                    storage,
+                    repo_path,
+                    &finished,
+                    git_state.dirty,
+                    unchanged_at_start.as_ref(),
+                );
+                upload_service_payloads(storage, &payloads, no_cache, false, &boundary).await;
+            }
+        }
+        return Err(error);
     }
 
     // 4a. A dispatched run ends here, and this is its whole product: every
@@ -1218,21 +1248,35 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             })
             .await;
         }
-        for index in retrying {
-            let service = &services[index];
-            // Whatever this service lost is recorded again if it is lost again.
-            crate::scan_health::forget_service_losses(service.service_name.as_deref());
-            // Its own blob from a minute ago is the previous generation: every
-            // answer it holds replays, and only what it lacks is asked for.
-            let this_run = runs[index].data.clone();
-            // Only an analysed service owes work.
-            let Some(at) = scan_index[index] else {
-                continue;
-            };
-            match scan
-                .analyze(at, Some(&this_run), PreviousGeneration::ThisRun)
-                .await
-            {
+        // Through the same workers, as wide as the loop and no wider than
+        // what is retried. Only an analysed service owes work.
+        let retrying: Vec<(usize, usize)> = retrying
+            .into_iter()
+            .filter_map(|index| scan_index[index].map(|at| (index, at)))
+            .collect();
+        let jobs: Vec<ServiceJob> = retrying
+            .iter()
+            .map(|&(index, at)| {
+                // Whatever this service lost is recorded again if it is lost
+                // again.
+                crate::scan_health::forget_service_losses(services[index].service_name.as_deref());
+                ServiceJob {
+                    index: at,
+                    // Its own blob from a minute ago is the previous
+                    // generation: every answer it holds replays, and only
+                    // what it lacks is asked for.
+                    previous: Some(runs[index].data.clone()),
+                    generation: PreviousGeneration::ThisRun,
+                }
+            })
+            .collect();
+        let pass_started = Instant::now();
+        let outcomes = scan
+            .analyze_all(jobs, width.count.min(retrying.len()))
+            .await;
+        crate::scan_timing::pass_ended(pass_started.elapsed().as_secs_f64());
+        for ((index, _), outcome) in retrying.into_iter().zip(outcomes) {
+            match outcome {
                 Ok(run) => runs[index] = run,
                 Err(error) => {
                     warn!("Retrying service {} failed: {error}", runs[index].label);
@@ -1970,12 +2014,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 ///
 /// Owned or shared rather than borrowed from the loop's frame, so that a
 /// service's analysis can be handed to a thread of its own (carrick#1066).
-struct ServiceScan<'a> {
+struct ServiceScan {
     repo_path: String,
-    /// Every service of the scan, in declared order: [`Self::analyze`] takes
-    /// an index into it.
+    /// Every service the scan analyses, in declared order, and none that
+    /// `--changed-only` carries: [`Self::analyze`] takes an index into it.
     services: std::sync::Arc<[Config]>,
-    sidecar: Option<&'a TypeSidecar>,
+    /// How to start a sidecar process of a service's own, when this run has
+    /// a sidecar at all. The process `main` started serves the preflight and
+    /// the cross-repo phase, and no service.
+    sidecar: Option<crate::services::type_sidecar::SidecarRecipe>,
     run_intents: RunIntentMemo,
     graphql_schemas: std::sync::Arc<crate::graphql::SchemaCatalogue>,
     /// Each service's detection and guidance, asked for ahead of it.
@@ -2016,14 +2063,67 @@ impl ServiceRun {
     }
 }
 
-// A service's result crosses to the thread that gathers it once services are
-// analysed on threads of their own (carrick#1066).
+// Each service is analysed on a thread of its own, which shares the scan and
+// sends its result back to the thread that gathers them (carrick#1066).
 const _: fn() = || {
     fn sendable<T: Send>() {}
+    fn shared<T: Send + Sync + 'static>() {}
     sendable::<ServiceRun>();
+    shared::<ServiceScan>();
 };
 
-impl ServiceScan<'_> {
+/// One service's analysis to run: which, over what, and with what before it.
+struct ServiceJob {
+    /// Into [`ServiceScan::services`], the analysed services.
+    index: usize,
+    previous: Option<CloudRepoData>,
+    generation: PreviousGeneration,
+}
+
+type ServiceOutcome = Result<ServiceRun, Box<dyn std::error::Error + Send + Sync>>;
+
+impl ServiceScan {
+    /// Analyse `jobs`, `width` at a time, each on a thread of its own and
+    /// each started in the order given. Every outcome comes back at its job's
+    /// position, whichever finished first; none stops another.
+    ///
+    /// Except a type checker's memory death in a run told to stop on one
+    /// (carrick#2208): the run is already lost, so a job not yet started is
+    /// not started, and fails with the same stop. The ones running finish,
+    /// and land unless their own checker died.
+    async fn analyze_all(
+        self: &std::sync::Arc<Self>,
+        jobs: Vec<ServiceJob>,
+        width: usize,
+    ) -> Vec<ServiceOutcome> {
+        let mut jobs: Vec<Option<ServiceJob>> = jobs.into_iter().map(Some).collect();
+        service_workers::in_declared_order(jobs.len(), width, |position| {
+            let job = jobs[position].take().expect("each job is started once");
+            if let Err(stop) = crate::scan_health::type_memory_stop() {
+                let stopped: ServiceOutcome = Err(stop.to_string().into());
+                return futures::future::Either::Left(std::future::ready(stopped));
+            }
+            let scan = std::sync::Arc::clone(self);
+            futures::future::Either::Right(service_workers::on_a_thread(
+                format!("carrick-service-{}", job.index + 1),
+                move |runtime| {
+                    let label = scan.services[job.index]
+                        .service_name
+                        .clone()
+                        .unwrap_or_else(|| "(root)".to_string());
+                    // Every line the run log gets from inside the analysis names
+                    // the service; the terminal's lines do not change for it.
+                    let span = tracing::info_span!("service", name = %label);
+                    runtime.block_on(tracing::Instrument::instrument(
+                        scan.analyze(job.index, job.previous.as_ref(), job.generation),
+                        span,
+                    ))
+                },
+            ))
+        })
+        .await
+    }
+
     /// Analyse one service and read back what it owes the model.
     ///
     /// `Err` is a failure that is not the model's: a manifest that cannot be
@@ -2087,9 +2187,14 @@ impl ServiceScan<'_> {
         let packages = load_packages_for_service(&self.repo_path, service)?;
         let packages_took = service_started.elapsed();
 
-        // Scope the sidecar's type extraction to this service's directory/tsconfig.
+        // A sidecar process of the service's own, scoped to its directory and
+        // tsconfig, at the full heap cap. It is dropped, and its process
+        // stopped, when this analysis ends.
         let sidecar_started = Instant::now();
-        scope_sidecar_to_service(self.sidecar, &self.repo_path, service);
+        let sidecar = self
+            .sidecar
+            .as_ref()
+            .and_then(|recipe| start_service_sidecar(recipe, &self.repo_path, service));
         let sidecar_took = sidecar_started.elapsed();
 
         let analysis_started = Instant::now();
@@ -2098,7 +2203,7 @@ impl ServiceScan<'_> {
                 &self.repo_path,
                 service,
                 &packages,
-                self.sidecar,
+                sidecar.as_ref(),
                 previous_data,
                 generation,
                 self.setups.source(index, generation),
@@ -2110,8 +2215,10 @@ impl ServiceScan<'_> {
         let analysis = analysis?;
         // A type checker that died of memory while this service was analysed
         // ends the run here when the run was told to stop on one: this
-        // service does not land, the ones before it do (carrick#2208).
-        crate::scan_health::type_memory_stop()?;
+        // service does not land, the ones that finished do (carrick#2208).
+        // Its own checker's death only: a service analysed beside it whose
+        // checker lived lands (carrick#1066).
+        crate::scan_health::type_memory_stop_of(service.service_name.as_deref())?;
 
         // `analysis` used to be the whole phase and nothing said what was in
         // it (carrick#767). The breakdown after the colon adds up to it, and
@@ -2140,6 +2247,20 @@ impl ServiceScan<'_> {
             phases,
             requests,
         );
+
+        // What runner box shapes are sized from: how much the service's
+        // sidecar held at its peak, and how many files its analysis read.
+        debug!(
+            "Service {} ended: sidecar peak {}, {} file(s) read",
+            label,
+            sidecar
+                .as_ref()
+                .and_then(TypeSidecar::peak_resident_bytes)
+                .map(|bytes| format!("{} MB", bytes / (1024 * 1024)))
+                .unwrap_or_else(|| "unknown".to_string()),
+            crate::scan_timing::files_of_current_service().unwrap_or(0),
+        );
+        drop(sidecar);
 
         let data = analysis.data;
         if data.bundled_types.is_some() {
@@ -6408,14 +6529,6 @@ fn build_cloud_data_from_mount_graph(
     }
 }
 
-/// Re-scope the already-spawned sidecar to a single service's project so type
-/// extraction uses that service's directory and tsconfig instead of the whole
-/// repo. No-op for a whole-repo service (no `directory` and no `tsconfig`),
-/// which keeps the single-service path on the warm init done in `main`.
-///
-/// Re-init rebuilds the sidecar's ts-morph project; for a large monorepo this
-/// runs once per scoped service. A future optimization could load all service
-/// projects in a single init via the sidecar's monorepo builder.
 /// The root that file-based route derivation strips before matching a
 /// convention's root globs. Conventions declare app-root globs like `app` /
 /// `src/app`, which are SERVICE-relative: in a monorepo the app lives at e.g.
@@ -6428,31 +6541,48 @@ fn service_scan_root(repo_path: &str, service: &Config) -> std::path::PathBuf {
     }
 }
 
-fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, service: &Config) {
-    let Some(sidecar) = sidecar else { return };
-
-    // Match main()'s absolute-path init so the sidecar resolves files the same way.
+/// The directory a service's sidecar is initialised at: the service's
+/// directory under the repo's absolute path, as `main` initialises its own.
+fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf {
     let canonical =
         std::fs::canonicalize(repo_path).unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
-    let service_root = match &service.directory {
+    match &service.directory {
         Some(dir) => canonical.join(dir),
         None => canonical,
-    };
-    let label = service.service_name.as_deref().unwrap_or("(root)");
+    }
+}
 
+/// A sidecar process of the service's own, scoped to its directory and
+/// tsconfig and ready, or `None` with the loss recorded when it could not be
+/// started (carrick#1066).
+///
+/// Every service gets one, whatever the width: a service's program is built
+/// by a process nothing else has asked, so its types do not depend on which
+/// services ran before it or beside it, and each process keeps the full heap
+/// cap.
+fn start_service_sidecar(
+    recipe: &crate::services::type_sidecar::SidecarRecipe,
+    repo_path: &str,
+    service: &Config,
+) -> Option<TypeSidecar> {
+    let service_root = service_sidecar_root(repo_path, service);
+    let label = service.service_name.as_deref().unwrap_or("(root)");
     debug!(
-        "Re-initializing sidecar for service '{}' at {}",
+        "Starting a sidecar for service '{}' at {}",
         label,
         service_root.display()
     );
-    sidecar.start_init(&service_root, service.tsconfig.as_deref());
-    if let Err(e) = sidecar.wait_ready(crate::services::type_sidecar::ready_budget()) {
-        warn!(
-            "Sidecar re-init for service '{}' failed: {} — type extraction may be skipped \
-             for this service",
-            label, e
-        );
-        crate::scan_health::record_types_unavailable(label, &e.to_string());
+    match recipe.spawn_scoped(&service_root, service.tsconfig.as_deref()) {
+        Ok(sidecar) => Some(sidecar),
+        Err(e) => {
+            warn!(
+                "Sidecar re-init for service '{}' failed: {} — type extraction may be skipped \
+                 for this service",
+                label, e
+            );
+            crate::scan_health::record_types_unavailable(label, &e.to_string());
+            None
+        }
     }
 }
 
@@ -6734,7 +6864,7 @@ fn run_capture_for_service(
         }
     }
     // The consumer calls the check may retype with a producer's response
-    // (carrick#1491), under the root `scope_sidecar_to_service` initialises
+    // (carrick#1491), under the root `start_service_sidecar` initialises
     // this service at, so the check re-uses the program when it is still
     // scoped here.
     let service_id = cloud_data
@@ -10159,6 +10289,17 @@ mod tests {
     /// The incremental upload path stamps the running release, same as the
     /// full-analysis path. Miss it here and every incremental scan — the common
     /// case — uploads an unattributed blob the cloud can never re-index.
+    /// Initialise a test's sidecar at `service`'s root, as a service's own
+    /// sidecar is started there.
+    fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, service: &Config) {
+        let sidecar = sidecar.expect("a test sidecar");
+        sidecar.start_init(
+            &service_sidecar_root(repo_path, service),
+            service.tsconfig.as_deref(),
+        );
+        let _ = sidecar.wait_ready(crate::services::type_sidecar::ready_budget());
+    }
+
     #[test]
     fn sidecar_service_scope_covers_capture_shared_includes_and_return_to_root() {
         use crate::services::type_sidecar::SymbolRequest;

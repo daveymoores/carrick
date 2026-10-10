@@ -97,11 +97,13 @@ pub fn in_scope() -> bool {
 }
 
 /// The scope the running task is in, taken to be re-established where a task
-/// or thread it starts runs.
-#[derive(Debug, Clone, Default)]
+/// or thread it starts runs. The log span it runs in goes with it, so a line
+/// the started work logs names the service as its starter's do.
+#[derive(Debug, Clone)]
 pub struct Carried {
     service: Option<Option<String>>,
     asked_for: Option<Option<String>>,
+    span: tracing::Span,
 }
 
 impl Carried {
@@ -109,11 +111,14 @@ impl Carried {
         Self {
             service: SERVICE.try_with(Clone::clone).ok(),
             asked_for: asked_ahead(),
+            span: tracing::Span::current(),
         }
     }
 
     /// Run `work` in the captured scope.
     pub async fn future<Work: Future>(self, work: Work) -> Work::Output {
+        use tracing::Instrument;
+        let work = work.instrument(self.span);
         match (self.service, self.asked_for) {
             (Some(service), Some(asked)) => {
                 SERVICE.scope(service, ASKED_FOR.scope(asked, work)).await
@@ -126,6 +131,7 @@ impl Carried {
 
     /// Run `work` in the captured scope, on whatever thread calls this.
     pub fn run<R>(&self, work: impl FnOnce() -> R) -> R {
+        let _entered = self.span.enter();
         let inner = || match &self.asked_for {
             Some(asked) => ASKED_FOR.sync_scope(asked.clone(), work),
             None => work(),

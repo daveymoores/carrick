@@ -29,6 +29,7 @@ use std::sync::{Mutex, OnceLock};
 
 use tracing::{debug, warn};
 
+use crate::services::machine;
 use crate::services::type_sidecar::{SidecarError, TypeSidecar, ready_budget};
 
 /// Env override for the number of processes a pool runs, the caller's own
@@ -40,10 +41,6 @@ pub const POOL_ENV: &str = "CARRICK_SIDECAR_POOL";
 /// the processes compete for the same memory bandwidth and disk.
 const MAX_PROCESSES: usize = 4;
 
-/// Memory left free for everything else on the machine (the scanner, the
-/// editor and browser of whoever runs the scan), never handed to a pool.
-const HEADROOM_MB: u64 = 2048;
-
 /// How many processes a pool runs, and why, for the scan's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSize {
@@ -52,108 +49,38 @@ pub struct PoolSize {
     pub why: String,
 }
 
+/// A pool's limits: the caller's own process is already running, at most
+/// [`MAX_PROCESSES`] in all, and [`POOL_ENV`] is still capped by memory.
+const POOL: machine::Sizing = machine::Sizing {
+    noun: "process(es)",
+    knob: POOL_ENV,
+    cap: MAX_PROCESSES,
+    cores_floor: 1,
+    running: 1,
+    knob_capped_by_memory: true,
+};
+
 /// How many processes a pool may run for work whose processes each take
 /// about `per_process_mb`: the caller's own, and as many more as the free
-/// memory holds after [`HEADROOM_MB`], no more than one per spare core and
-/// [`MAX_PROCESSES`] in all. [`POOL_ENV`] sets the number instead, still
-/// capped by memory.
+/// memory holds after [`machine::HEADROOM_MB`], no more than one per spare
+/// core and [`MAX_PROCESSES`] in all. [`POOL_ENV`] sets the number instead,
+/// still capped by memory.
 pub fn pool_size(per_process_mb: u64) -> PoolSize {
     let forced = std::env::var(POOL_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|n| *n > 0);
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    size_for(available_memory_mb(), per_process_mb, cores, forced)
-}
-
-/// [`pool_size`] with its inputs given.
-fn size_for(
-    available_mb: Option<u64>,
-    per_process_mb: u64,
-    cores: usize,
-    forced: Option<usize>,
-) -> PoolSize {
-    let per = per_process_mb.max(1);
-    let Some(available) = available_mb else {
-        return PoolSize {
-            processes: 1,
-            why: "one process: the free memory could not be read".to_string(),
-        };
-    };
-    let by_memory = 1 + (available.saturating_sub(HEADROOM_MB) / per) as usize;
-    let by_cores = cores.saturating_sub(1).max(1);
-    let wanted = forced.unwrap_or_else(|| by_cores.min(MAX_PROCESSES));
-    let processes = wanted.min(by_memory).max(1);
-    let why = format!(
-        "{processes} process(es): {wanted} {} and {available} MB free holds {by_memory} at {per} MB each after {HEADROOM_MB} MB kept back",
-        if forced.is_some() {
-            format!("asked for by {POOL_ENV}")
-        } else {
-            format!("allowed by {cores} core(s)")
-        },
+    let size = machine::size_for(
+        &POOL,
+        machine::available_memory_mb(),
+        per_process_mb,
+        machine::cores(),
+        forced,
     );
-    PoolSize { processes, why }
-}
-
-/// Memory the machine can hand out now, in MB: what is free plus what the
-/// system would reclaim first. `None` when it cannot be read.
-fn available_memory_mb() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb: u64 = meminfo
-            .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()?;
-        let available = kb / 1024;
-        // Inside a container the host's figure is not ours to spend.
-        let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()
-            .and_then(|max| max.trim().parse::<u64>().ok())
-            .zip(
-                std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-                    .ok()
-                    .and_then(|used| used.trim().parse::<u64>().ok()),
-            )
-            .map(|(max, used)| max.saturating_sub(used) / (1024 * 1024));
-        return Some(cgroup.map_or(available, |left| left.min(available)));
+    PoolSize {
+        processes: size.count,
+        why: size.why,
     }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("vm_stat").output().ok()?;
-        return vm_stat_available_mb(&String::from_utf8_lossy(&out.stdout));
-    }
-    #[allow(unreachable_code)]
-    None
-}
-
-/// Free, inactive and speculative pages from `vm_stat`'s output, in MB.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn vm_stat_available_mb(text: &str) -> Option<u64> {
-    let page: u64 = text
-        .lines()
-        .next()?
-        .split("page size of ")
-        .nth(1)?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    let pages = |label: &str| -> Option<u64> {
-        text.lines()
-            .find_map(|line| line.strip_prefix(label))?
-            .trim()
-            .trim_end_matches('.')
-            .parse()
-            .ok()
-    };
-    let total = pages("Pages free:")? + pages("Pages inactive:")? + pages("Pages speculative:")?;
-    Some(total * page / (1024 * 1024))
 }
 
 /// Resident memory of `sidecar`'s process in MB: an estimate of what another
@@ -161,50 +88,9 @@ fn vm_stat_available_mb(text: &str) -> Option<u64> {
 /// for [`pool_size`]. `None` when it cannot be read. Read after the process
 /// has built its program, or it says nothing about the program.
 ///
-/// Asked of the kernel, not of `ps`: `ps` is setuid on macOS, so a sandbox
-/// that refuses setuid binaries refuses it, and a slim container may not
-/// have it. Without the size no pool starts.
+/// Without the size no pool starts.
 pub fn resident_mb(sidecar: &TypeSidecar) -> Option<u64> {
-    resident_bytes(sidecar.pid()).map(|bytes| bytes / (1024 * 1024))
-}
-
-/// The resident size of process `pid` in bytes, from `proc_pidinfo`.
-#[cfg(target_os = "macos")]
-fn resident_bytes(pid: u32) -> Option<u64> {
-    let pid = libc::c_int::try_from(pid).ok()?;
-    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
-    // SAFETY: a zeroed `proc_taskinfo` is a valid value of that plain C struct.
-    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `proc_pidinfo` writes at most `size` bytes, the size of `info`.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&mut info as *mut libc::proc_taskinfo).cast(),
-            size,
-        )
-    };
-    (written == size).then_some(info.pti_resident_size)
-}
-
-/// The resident size of process `pid` in bytes, from `/proc/<pid>/status`.
-#[cfg(target_os = "linux")]
-fn resident_bytes(pid: u32) -> Option<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let kb: u64 = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    Some(kb * 1024)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn resident_bytes(_pid: u32) -> Option<u64> {
-    None
+    machine::resident_bytes(sidecar.pid()).map(|bytes| bytes / (1024 * 1024))
 }
 
 /// The caller's sidecar and the processes started beside it, each scoped to
@@ -596,71 +482,37 @@ mod tests {
         retype_item("/repo/src/a.ts", id)
     }
 
+    /// A pool counts the caller's process, which needs no more memory, and
+    /// its knob is still capped by memory.
     #[test]
-    fn the_pool_is_sized_by_free_memory_cores_and_the_cap() {
+    fn a_pool_is_sized_by_free_memory_cores_and_the_cap() {
         let size =
-            |available, per, cores, forced| size_for(available, per, cores, forced).processes;
+            |available, per, cores, forced| machine::size_for(&POOL, available, per, cores, forced);
         // Memory unknown: one process.
-        assert_eq!(size(None, 3000, 8, None), 1);
+        assert_eq!(size(None, 3000, 8, None).count, 1);
+        assert_eq!(
+            size(None, 3000, 8, Some(3)).count,
+            1,
+            "the knob is capped by a memory that cannot be read"
+        );
         // 10 GB free, 3 GB a process after 2 GB kept back: the base and two more.
-        assert_eq!(size(Some(10_240), 3000, 8, None), 3);
+        assert_eq!(size(Some(10_240), 3000, 8, None).count, 3);
         // Plenty of memory: one per spare core, at most four.
-        assert_eq!(size(Some(64_000), 1000, 3, None), 2);
-        assert_eq!(size(Some(64_000), 1000, 16, None), MAX_PROCESSES);
+        assert_eq!(size(Some(64_000), 1000, 3, None).count, 2);
+        assert_eq!(size(Some(64_000), 1000, 16, None).count, MAX_PROCESSES);
         // One core, or too little memory: one process, never zero.
-        assert_eq!(size(Some(64_000), 1000, 1, None), 1);
-        assert_eq!(size(Some(1_000), 3000, 8, None), 1);
-        // The override sets the count, still capped by memory.
-        assert_eq!(size(Some(64_000), 1000, 2, Some(6)), 6);
-        assert_eq!(size(Some(10_240), 3000, 8, Some(6)), 3);
-        assert_eq!(size(Some(64_000), 1000, 8, Some(1)), 1);
-        let why = size_for(Some(10_240), 3000, 8, None).why;
+        assert_eq!(size(Some(64_000), 1000, 1, None).count, 1);
+        assert_eq!(size(Some(1_000), 3000, 8, None).count, 1);
+        // The knob sets the count, still capped by memory.
+        assert_eq!(size(Some(64_000), 1000, 2, Some(6)).count, 6);
+        assert_eq!(size(Some(10_240), 3000, 8, Some(6)).count, 3);
+        assert_eq!(size(Some(64_000), 1000, 8, Some(1)).count, 1);
+        let why = size(Some(10_240), 3000, 8, None).why;
         assert!(why.starts_with("3 process(es)"), "{why}");
-    }
-
-    /// A live child's resident size is read from the kernel, as the pool
-    /// reads its sidecars': a node process that holds 64 MB it has written
-    /// to reads as at least that much. No other process is started for the
-    /// read, so it works where `ps` cannot run (a sandbox that refuses setuid
-    /// binaries, a container without procps).
-    #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn a_live_child_s_resident_size_is_read_from_the_kernel() {
-        use std::io::BufRead;
-
-        let mut child = std::process::Command::new("node")
-            .args([
-                "-e",
-                "globalThis.held = Buffer.alloc(64 * 1024 * 1024, 1); \
-                 console.log('ready'); setTimeout(() => {}, 60000);",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("node starts");
-        let mut ready = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
-        assert_eq!(ready.trim(), "ready");
-
-        let bytes = resident_bytes(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
-        let bytes = bytes.expect("the child's size reads");
-        assert!(bytes >= 64 * 1024 * 1024, "{bytes} bytes");
-        assert_eq!(resident_bytes(u32::MAX), None, "no such process");
-    }
-
-    #[test]
-    fn vm_stat_reads_free_inactive_and_speculative_pages() {
-        let text = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
-                    Pages free:                               65536.\n\
-                    Pages active:                            900000.\n\
-                    Pages inactive:                          131072.\n\
-                    Pages speculative:                         1024.\n";
-        // (65536 + 131072 + 1024) * 16 KB = 3088 MB.
-        assert_eq!(vm_stat_available_mb(text), Some(3088));
-        assert_eq!(vm_stat_available_mb("no header"), None);
+        assert_eq!(
+            size(None, 3000, 8, None).why,
+            "one process: the free memory could not be read"
+        );
     }
 
     #[test]

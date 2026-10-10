@@ -1,0 +1,20 @@
+{
+  "services": [
+    {
+      "serviceName": "orders-api",
+      "directory": "services/orders"
+    },
+    {
+      "serviceName": "catalog-api",
+      "directory": "services/catalog"
+    },
+    {
+      "serviceName": "storefront-web",
+      "directory": "apps/storefront"
+    },
+    {
+      "serviceName": "notifier",
+      "directory": "services/notifier"
+    }
+  ]
+}

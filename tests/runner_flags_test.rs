@@ -342,21 +342,28 @@ fn the_pr_flags_refuse_what_they_cannot_do() {
 /// A committed two-service repo, `alpha` then `beta`, each an HTTP server
 /// with one route, so each asks the type sidecar about its handler.
 fn two_service_repo(root: &Path) -> PathBuf {
+    service_repo(root, &["alpha", "beta"])
+}
+
+/// A committed repo of `services`, in that order, each an HTTP server with
+/// one route.
+fn service_repo(root: &Path, services: &[&str]) -> PathBuf {
     let repo = root.join("monorepo");
     let write = |relative: &str, contents: &str| {
         let path = repo.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
     };
+    let declared: Vec<String> = services
+        .iter()
+        .map(|service| format!(r#"  {{ "name": "{service}", "directory": "services/{service}" }}"#))
+        .collect();
     write(
         "carrick.json",
-        r#"{ "services": [
-  { "name": "alpha", "directory": "services/alpha" },
-  { "name": "beta", "directory": "services/beta" }
-] }"#,
+        &format!("{{ \"services\": [\n{}\n] }}", declared.join(",\n")),
     );
     write("package.json", r#"{ "name": "monorepo", "private": true }"#);
-    for service in ["alpha", "beta"] {
+    for service in services {
         write(
             &format!("services/{service}/package.json"),
             &format!(r#"{{ "name": "{service}", "dependencies": {{ "express": "4.18.2" }} }}"#),
@@ -384,12 +391,21 @@ fn two_service_repo(root: &Path) -> PathBuf {
 /// meets a full heap: V8's fatal line on stderr, then an abort. It writes
 /// `died` first, so the test knows the death happened rather than guessing.
 fn sidecar_that_runs_out_of_heap_in_beta(home: &Path, died: &Path) {
+    sidecar_stand_in(home, died, false);
+}
+
+/// The stand-in, and with `alpha_waits` its `alpha` process holds its first
+/// type request until `beta`'s has died (30 seconds at most), and two
+/// seconds more: `alpha` is still being analysed when the death is recorded.
+fn sidecar_stand_in(home: &Path, died: &Path, alpha_waits: bool) {
     let dir = home.join("sidecar/dist/src");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("index.js"),
         format!(
             r#"const fs = require("fs");
+const pause = new Int32Array(new SharedArrayBuffer(4));
+let waited = false;
 let root = "";
 let buffered = "";
 process.stdin.on("data", (chunk) => {{
@@ -408,6 +424,12 @@ process.stdin.on("data", (chunk) => {{
       root = request.repo_root || "";
       answer({{ status: "ready", init_time_ms: 1 }});
       continue;
+    }}
+    if ({alpha_waits} && root.endsWith("alpha") && !waited) {{
+      const since = Date.now();
+      while (!fs.existsSync({died:?}) && Date.now() - since < 30000) Atomics.wait(pause, 0, 0, 20);
+      Atomics.wait(pause, 0, 0, 2000);
+      waited = true;
     }}
     if (root.endsWith("beta")) {{
       fs.writeFileSync({died:?}, request.action);
@@ -432,7 +454,8 @@ process.stdin.on("data", (chunk) => {{
 process.stdin.on("end", () => process.exit(0));
 process.stdin.resume();
 "#,
-            died = died.to_string_lossy()
+            died = died.to_string_lossy(),
+            alpha_waits = alpha_waits,
         ),
     )
     .unwrap();
@@ -464,11 +487,21 @@ fn typed_scan(fail_on_type_memory: bool) -> TypedScan {
     let home = tmp.path().join("home");
     let died = tmp.path().join("died");
     sidecar_that_runs_out_of_heap_in_beta(&home, &died);
+    typed_scan_of(&repo, &home, &died, fail_on_type_memory, &[])
+}
 
+fn typed_scan_of(
+    repo: &Path,
+    home: &Path,
+    died: &Path,
+    fail_on_type_memory: bool,
+    env: &[(&str, &str)],
+) -> TypedScan {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
-    cmd.arg(&repo)
+    cmd.envs(env.iter().copied());
+    cmd.arg(repo)
         .args(["--allow-unprepared", "--upload"])
-        .env("HOME", &home)
+        .env("HOME", home)
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_SKIP_INTENTS", "1")
         .env("CARRICK_SIDECAR_DIR", home.join("sidecar"))
@@ -562,6 +595,50 @@ fn without_the_variable_a_memory_death_costs_only_the_types() {
         run.log
             .contains("The type sidecar died of memory (heap_limit"),
         "the classification is logged:\n{}",
+        run.log
+    );
+}
+
+/// carrick#1066 with carrick#2208: services analysed side by side, and the
+/// type checker of the second dies of memory while the first is still being
+/// analysed. The run still stops with exit 3 and names the service whose
+/// checker died; the first, whose own checker lived, lands although it ends
+/// after the death; and the third, not yet started when the death was
+/// recorded, is never started.
+#[test]
+fn a_memory_death_in_one_of_several_workers_stops_the_run_with_exit_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = service_repo(tmp.path(), &["alpha", "beta", "gamma"]);
+    let home = tmp.path().join("home");
+    let died = tmp.path().join("died");
+    sidecar_stand_in(&home, &died, true);
+    let run = typed_scan_of(
+        &repo,
+        &home,
+        &died,
+        true,
+        &[("CARRICK_SERVICE_CONCURRENCY", "2")],
+    );
+    assert_eq!(run.code, Some(3), "{}\n{}", run.stderr, run.log);
+    assert!(
+        run.stderr
+            .contains("types_out_of_memory: the type checker reached its heap limit")
+            && run
+                .stderr
+                .contains("for service beta, under a heap cap of 512 MB"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(run.uploaded(), ["alpha"], "{}", run.log);
+    assert!(
+        run.log.contains("Analyzing service alpha (1/3)")
+            && run.log.contains("Analyzing service beta (2/3)"),
+        "alpha and beta were analysed:\n{}",
+        run.log
+    );
+    assert!(
+        !run.log.contains("Analyzing service gamma"),
+        "gamma was started after the death:\n{}",
         run.log
     );
 }
