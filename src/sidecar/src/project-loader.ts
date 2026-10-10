@@ -10,7 +10,8 @@
  * - Pinned dependency snapshots for deterministic builds
  */
 
-import { Project, getCompilerOptionsFromTsConfig, type CompilerOptions } from 'ts-morph';
+import { boundedFileSystem, untrustedReadBound } from './checkout.js';
+import { Project, getCompilerOptionsFromTsConfig, type CompilerOptions, type FileSystemHost } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
@@ -228,6 +229,7 @@ export class ProjectLoader {
         this.log('Project will load with tsconfig snapshot');
         this.buildProject = () => {
           const project = new Project({
+              ...this.fileSystemOption(),
             compilerOptions: sidecarCompilerOptions(this.snapshotToCompilerOptions(snapshot)),
             skipAddingFilesFromTsConfig: true,
           });
@@ -249,6 +251,7 @@ export class ProjectLoader {
             // rebuilds that drop them (carrick#1731).
             const imports = new ExternalImports();
             const project = new Project({
+              ...this.fileSystemOption(),
               compilerOptions: sidecarCompilerOptions(deno.parsed.options as CompilerOptions),
               skipAddingFilesFromTsConfig: true,
               resolutionHost: imports.recording((host, getOptions) => ({
@@ -272,6 +275,7 @@ export class ProjectLoader {
           this.log('No tsconfig.json found, using default compiler options');
           this.buildProject = () => {
             const project = new Project({
+              ...this.fileSystemOption(),
               compilerOptions: sidecarCompilerOptions(DEFAULT_COMPILER_OPTIONS),
               skipAddingFilesFromTsConfig: true,
             });
@@ -370,10 +374,21 @@ export class ProjectLoader {
     return result;
   }
 
+  /**
+   * Under CARRICK_UNTRUSTED_TREE, the file system every project reads
+   * through: nothing whose real path is outside the checkout (carrick#2230).
+   * Nothing at all otherwise, so a project is built as it always was.
+   */
+  private fileSystemOption(): { fileSystem?: FileSystemHost } {
+    const bound = untrustedReadBound(this.repoRoot);
+    return bound ? { fileSystem: boundedFileSystem(bound) } : {};
+  }
+
   /** A ts-morph project built from one tsconfig and the files it lists. */
   private projectFromConfig(configPath: string): Project {
     const imports = new ExternalImports();
     const project = new Project({
+      ...this.fileSystemOption(),
       tsConfigFilePath: configPath,
       // Over the tsconfig's own options: ts-morph lays these on top.
       compilerOptions: sidecarCompilerOptions(getCompilerOptionsFromTsConfig(configPath).options),
