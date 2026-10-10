@@ -36,12 +36,18 @@ const RESPONDER_TS = `export interface PackagedEnvelope {
   statusCode: number;
   body: string;
 }
+/** A platform result type whose members are all optional. */
+export interface PlatformResult {
+  statusCode?: number;
+  headers?: Record<string, string>;
+  body?: string;
+}
 export function respond(code: number, payload: unknown): PackagedEnvelope {
   return { statusCode: code, body: JSON.stringify(payload) };
 }
 `;
 
-const NOTES_TS = `import { respond } from "responder-runtime";
+const NOTES_TS = `import { respond, type PlatformResult } from "responder-runtime";
 
 export interface Note {
   id: string;
@@ -61,13 +67,6 @@ export interface AddNoteResult {
 
 export interface CreditResult {
   balance: number;
-}
-
-/** A platform result type whose members are all optional. */
-export interface PlatformResult {
-  statusCode?: number;
-  headers?: Record<string, string>;
-  body?: string;
 }
 
 declare const store: { list(): Note[]; add(title: string): Note };
@@ -207,6 +206,24 @@ export async function greeting() { // GREETING
 }
 
 declare const prebuilt: PlatformResult;
+
+declare const articleStore: { update(id: string): Promise<Partial<Article>> };
+
+export async function patchArticle(id: string): Promise<Partial<Article>> { // PARTIAL
+  return articleStore.update(id);
+}
+
+declare const saver: { create(a: Omit<Article, "id">): Promise<Article> };
+
+export async function storeJson(doc: { tags: string[] }): Promise<Article> { // STORE_JSON
+  return saver.create({ title: "t", body: JSON.stringify(doc), status: 1 });
+}
+
+declare function withFallback(run: () => Envelope, fallback: Envelope): Envelope;
+
+export async function withFallbackReply() { // FALLBACK
+  return withFallback(() => reply(200, { a: 1 }), reply(200, { b: "x" }));
+}
 
 export async function platformAsIs(): Promise<PlatformResult> { // PLATFORM_AS_IS
   return prebuilt;
@@ -563,6 +580,24 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
     assert.strictEqual(collapse(inferred.type_string), '{ late: boolean; }');
   });
 
+  it('reads both the callback and the envelope a call is handed', async () => {
+    const inferred = await inferReturn('FALLBACK');
+    assertNoEnvelope(inferred);
+    assert.strictEqual(collapse(inferred.type_string), '{ a: number; } | { b: string; }');
+  });
+
+  it('keeps today\'s answer when a serialised body is a call\'s input', async () => {
+    const inferred = await inferReturn('STORE_JSON');
+    assert.strictEqual(inferred.type_string, PINNED_STORE_JSON);
+    assert.strictEqual(inferred.any_provenance, undefined);
+  });
+
+  it('keeps today\'s answer for the repo\'s own all-optional type', async () => {
+    const inferred = await inferReturn('PARTIAL');
+    assert.strictEqual(inferred.type_string, PINNED_PARTIAL);
+    assert.strictEqual(inferred.any_provenance, undefined);
+  });
+
   it('keeps today\'s answer for a domain type with status and body members', async () => {
     const inferred = await inferReturn('ARTICLE');
     assert.strictEqual(inferred.type_string, PINNED_ARTICLE);
@@ -606,3 +641,6 @@ const PINNED_ARTICLE = '{ id: string; title: string; body: string; status: numbe
 const PINNED_GREETING = '{ status: number; body: string; }';
 const PINNED_CSV_ONLY =
   '{ statusCode: number; headers?: { [x: string]: string; }; body: string; }';
+const PINNED_STORE_JSON = '{ id: string; title: string; body: string; status: number; }';
+const PINNED_PARTIAL =
+  '{ id?: string | undefined; title?: string | undefined; body?: string | undefined; status?: number | undefined; }';

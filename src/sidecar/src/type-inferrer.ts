@@ -5422,9 +5422,10 @@ export class TypeInferrer {
    *  - a returned branch builds an envelope whose `body` is `JSON.stringify`
    *    of a value, inline, through a `const`, or in a builder the reading can
    *    follow (`branchShowsSerialisation`); or
-   *  - the envelope type declares every member optional, which is how a
-   *    platform's result type is written. Nothing else returns such a type,
-   *    so a value of it returned as-is is still transport.
+   *  - the envelope type is declared outside the repository (a platform's
+   *    result type) with every member optional. Nothing else returns such a
+   *    type, so a value of it returned as-is is still transport. The repo's
+   *    own all-optional types (`Partial<Article>`) engage only on evidence.
    *
    * A domain object that merely has `status` and `body` members (an article,
    * a message) shows neither and keeps the ordinary reading.
@@ -5432,13 +5433,15 @@ export class TypeInferrer {
   private serialisedBodyEnvelopeEngages(type: Type, func: FunctionLike): boolean {
     if (!this.typeIsSerialisedBodyEnvelope(type, func)) return false;
     const members = type.isUnion() ? type.getUnionTypes() : [type];
-    const platformShaped = members.some(
-      (member) =>
-        this.typeIsSerialisedBodyEnvelope(member, func) &&
-        member
-          .getProperties()
-          .every((property) => property.hasFlags(ts.SymbolFlags.Optional))
-    );
+    const platformShaped = members.some((member) => {
+      if (!this.typeIsSerialisedBodyEnvelope(member, func)) return false;
+      const properties = member.getProperties();
+      return properties.every(
+        (property) =>
+          property.hasFlags(ts.SymbolFlags.Optional) &&
+          this.symbolIsLibOrExternalOrigin(property)
+      );
+    });
     if (platformShaped) return true;
     return this.envelopeBranches(func).some((branch) =>
       this.branchShowsSerialisation(branch, func, 0)
@@ -5458,16 +5461,35 @@ export class TypeInferrer {
     }
     if (!Node.isCallExpression(node)) return false;
     if (this.envelopeBuilderOf(node) !== undefined) return true;
-    return node
+    return this.handedOnArguments(node).some((arg) =>
+      this.branchShowsSerialisation(arg, scope, depth + 1)
+    );
+  }
+
+  /**
+   * The arguments a call could hand back as its result: every argument but
+   * an object literal, which is the call's input (`create({ body:
+   * JSON.stringify(doc) })` stores a document, it does not respond with it),
+   * and but a function, whose returns are read as the call's callbacks.
+   */
+  private handedOnArguments(call: CallExpression): Node[] {
+    return call
       .getArguments()
-      .some((arg) => this.branchShowsSerialisation(arg, scope, depth + 1));
+      .map((arg) => this.peelTransparentExpression(arg))
+      .filter(
+        (arg) =>
+          !Node.isObjectLiteralExpression(arg) &&
+          !Node.isArrowFunction(arg) &&
+          !Node.isFunctionExpression(arg)
+      );
   }
 
   /**
    * The returned branches of an envelope handler: each returned expression,
    * conditional sides split. A returned call whose callbacks return values
-   * (`settle().then(ok, fail)`) is carried by those returns instead; a call
-   * whose callbacks return nothing stays a branch of its own.
+   * (`settle().then(ok, fail)`) is carried by those returns, plus every
+   * envelope it is handed directly (`withFallback(() => a, b)` can answer
+   * `b`); a call whose callbacks return nothing stays a branch of its own.
    */
   private envelopeBranches(func: FunctionLike): Node[] {
     const carriedByCallbacks = new Set(
@@ -5483,9 +5505,25 @@ export class TypeInferrer {
         });
       })
     );
-    return this.responseReturnedExpressions(func)
-      .filter((expression) => !carriedByCallbacks.has(expression))
-      .flatMap((expression) => this.expandResponseBranches(expression, 0));
+    const handedEnvelopes = [...carriedByCallbacks].flatMap((expression) => {
+      const call = this.peelTransparentExpression(expression);
+      if (!Node.isCallExpression(call)) return [];
+      return call
+        .getArguments()
+        .map((arg) => this.peelTransparentExpression(arg))
+        .filter(
+          (arg) =>
+            !Node.isArrowFunction(arg) &&
+            !Node.isFunctionExpression(arg) &&
+            this.typeIsSerialisedBodyEnvelope(arg.getType(), arg)
+        );
+    });
+    return [
+      ...this.responseReturnedExpressions(func).filter(
+        (expression) => !carriedByCallbacks.has(expression)
+      ),
+      ...handedEnvelopes,
+    ].flatMap((expression) => this.expandResponseBranches(expression, 0));
   }
 
   /**
@@ -5559,7 +5597,8 @@ export class TypeInferrer {
    *  - a call to a response builder this repository declares
    *    (`envelopeBuilderOf`): the argument the builder serialises; the
    *    argument or literal its status member takes decides the branch;
-   *  - any other call handing on exactly one envelope argument: that
+   *  - any other call handing on exactly one envelope argument (never an
+   *    object literal, which is the call's input): that
    *    envelope is read in its place. Its own stated status decides the
    *    branch; only when it states none does a status the outer call's
    *    arguments state decide (`log(ctx, 503, "code", prebuilt)`).
@@ -5594,10 +5633,9 @@ export class TypeInferrer {
       return this.builderPayloadCandidate(node, builder, argument, wire);
     }
 
-    const envelopes = node
-      .getArguments()
-      .map((arg) => this.peelTransparentExpression(arg))
-      .filter((arg) => this.typeIsSerialisedBodyEnvelope(arg.getType(), arg));
+    const envelopes = this.handedOnArguments(node).filter((arg) =>
+      this.typeIsSerialisedBodyEnvelope(arg.getType(), arg)
+    );
     if (envelopes.length > 1) return { unread: 'builder' };
     const inner = envelopes[0];
     const innerStatus = inner ? this.envelopeOwnStatus(inner) : 'undecided';
