@@ -685,3 +685,76 @@ fn a_workspace_member_inside_another_member_is_left_out_of_the_outer_walk() {
         ["packages/api/plugins/audit/index.ts"]
     );
 }
+
+/// A repository at `<tmp>/repo` beside a directory `<tmp>/outside` that
+/// exists, so a refusal is the containment check and never the existence one.
+fn repository_beside_an_outside_directory() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    write(&root, "api/index.ts", "");
+    write(&root, "shared/index.ts", "");
+    write(&root, "tsconfig.base.json", "{}");
+    write(dir.path(), "outside/index.ts", "");
+    write(dir.path(), "outside/tsconfig.json", "{}");
+    (dir, root)
+}
+
+/// Every path a service declares must stay inside the repository
+/// (carrick#2245): the scan reads what it names and carries it into the
+/// index. An absolute path, a `..` and a symlink that lands outside are all
+/// refused, for `directory`, `include` and `tsconfig` alike.
+#[cfg(unix)]
+#[test]
+fn a_declared_path_outside_the_repository_is_refused() {
+    let (dir, root) = repository_beside_an_outside_directory();
+    std::os::unix::fs::symlink(dir.path().join("outside"), root.join("linked")).unwrap();
+    let mut accepted = Vec::new();
+    for service in [
+        r#"{"name":"up","directory":"../outside"}"#,
+        r#"{"name":"up-missing","directory":"../gone"}"#,
+        r#"{"name":"up-inner","directory":"api/../../outside"}"#,
+        r#"{"name":"absolute","directory":"/etc"}"#,
+        r#"{"name":"symlinked","directory":"linked"}"#,
+        r#"{"name":"include-up","directory":"api","include":["../outside"]}"#,
+        r#"{"name":"include-absolute","directory":"api","include":["/etc"]}"#,
+        r#"{"name":"include-symlinked","directory":"api","include":["linked"]}"#,
+        r#"{"name":"tsconfig-up","directory":"api","tsconfig":"../../outside/tsconfig.json"}"#,
+        r#"{"name":"tsconfig-symlinked","directory":"api","tsconfig":"../linked/tsconfig.json"}"#,
+    ] {
+        write(
+            &root,
+            "carrick.json",
+            &format!(r#"{{"services":[{service}]}}"#),
+        );
+        match resolve(&root) {
+            Err(error) if error.contains("which is outside the repository") => {}
+            other => accepted.push(format!("{service}: {:?}", other.map(|_| ()))),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "each is refused for leaving the repository:\n{}",
+        accepted.join("\n")
+    );
+}
+
+/// The same check leaves an in-tree layout alone: a directory, an include,
+/// a tsconfig reached through `..` from the service directory, and a symlink
+/// that lands inside the repository.
+#[cfg(unix)]
+#[test]
+fn a_declared_path_inside_the_repository_still_resolves() {
+    let (_dir, root) = repository_beside_an_outside_directory();
+    std::os::unix::fs::symlink(root.join("api"), root.join("alias")).unwrap();
+    write(
+        &root,
+        "carrick.json",
+        r#"{"services":[
+            {"name":"api","directory":"./api/","include":["shared"],"tsconfig":"../tsconfig.base.json"},
+            {"name":"alias","directory":"alias"}
+        ]}"#,
+    );
+    let services = resolve(&root).unwrap().services;
+    assert_eq!(services.len(), 2);
+    assert_eq!(services[0].include, ["shared"]);
+}

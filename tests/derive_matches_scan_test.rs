@@ -137,3 +137,32 @@ fn a_declared_workspace_an_explicit_config_and_a_single_package_agree() {
     package(&single, ".", "single");
     assert_eq!(asked_of_the_command(&single), asked_of_the_scan(&single));
 }
+
+/// `carrick derive` refuses a `carrick.json` whose service directory leaves
+/// the repository (carrick#2245), so the installer is never told to prepare
+/// it; the scan refuses it through the same `resolve`
+/// (`service_derivation_test`).
+#[test]
+fn derive_refuses_a_service_directory_outside_the_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    package(&root, "api", "api");
+    package(dir.path(), "outside", "outside");
+    write(
+        &root,
+        "carrick.json",
+        r#"{"services":[{"name":"api","directory":"../outside"}]}"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["derive", "--workspace"])
+        .arg(&root)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "derive refused: {stderr}");
+    assert!(
+        stderr.contains("which is outside the repository"),
+        "derive says why: {stderr}"
+    );
+}
