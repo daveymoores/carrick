@@ -54,6 +54,11 @@ pub const ALLOW_PARTIAL_ENV: &str = "CARRICK_ALLOW_PARTIAL_ANALYSIS";
 /// types and the whole LLM spend would buy a typeless index (carrick#748).
 pub const ALLOW_MISSING_TYPES_ENV: &str = "CARRICK_ALLOW_MISSING_TYPES";
 
+/// Set this (the cloud runner does) to stop the run at the first type-checker
+/// memory death, so it can be run again on a larger machine (carrick#2202).
+/// Unset, a memory death costs the service its types and the run goes on.
+pub const FAIL_ON_TYPE_MEMORY_ENV: &str = "CARRICK_FAIL_ON_TYPE_MEMORY";
+
 /// How many lost files are named individually before the list is truncated.
 const MAX_NAMED_FILES: usize = 10;
 
@@ -654,6 +659,11 @@ pub fn allow_partial_from_env() -> bool {
 /// Whether [`ALLOW_MISSING_TYPES_ENV`] is set for this run.
 pub fn allow_missing_types_from_env() -> bool {
     env_flag(ALLOW_MISSING_TYPES_ENV)
+}
+
+/// Whether [`FAIL_ON_TYPE_MEMORY_ENV`] is set for this run.
+pub fn fail_on_type_memory_from_env() -> bool {
+    env_flag(FAIL_ON_TYPE_MEMORY_ENV)
 }
 
 fn env_flag(name: &str) -> bool {

@@ -23,6 +23,7 @@ import ts from 'typescript';
 import type {
   CaptureAliasRecord,
   CheckOptions,
+  CompilerEnd,
   CheckProgressPhase,
   CheckResult,
   CheckStubInput,
@@ -50,6 +51,8 @@ export type CheckProgress = (phase: CheckProgressPhase, message: string) => void
 
 interface SpawnResult {
   code: number | null;
+  /** The signal that ended the process, when one did. */
+  signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
 }
@@ -57,17 +60,70 @@ interface SpawnResult {
 function runProcess(
   command: string,
   args: string[],
-  cwd: string
+  cwd: string,
+  env?: NodeJS.ProcessEnv
 ): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
+    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
+}
+
+/** The tail V8 prints on every fatal heap-exhaustion line. */
+const HEAP_OUT_OF_MEMORY = 'JavaScript heap out of memory';
+
+/**
+ * V8's hard size limits print the same tail, and a larger heap does not lift
+ * them, so they are not memory deaths.
+ */
+const HARD_SIZE_LIMITS = ['invalid table size', 'invalid array length', 'Invalid array buffer length'];
+
+/**
+ * Whether a process's stderr carries V8's fatal heap-exhaustion line
+ * (`Reached heap limit`, `Ineffective mark-compacts near heap limit`, and the
+ * other forms all end in `JavaScript heap out of memory`), and not one of the
+ * hard size limits that end the same way (carrick#2209).
+ *
+ * The scanner applies the same rule to the sidecar's own stderr
+ * (carrick#2208); the two must stay in step.
+ */
+export function carriesHeapLimitLine(stderr: string): boolean {
+  return stderr
+    .split('\n')
+    .some(
+      (line) =>
+        line.includes(HEAP_OUT_OF_MEMORY) &&
+        !HARD_SIZE_LIMITS.some((limit) => line.includes(limit))
+    );
+}
+
+/**
+ * `NODE_OPTIONS` for a Node child of the sidecar: the existing value with the
+ * sidecar's own `--max-old-space-size` appended, so the child's heap cap is
+ * the one the scanner sized for this machine and not V8's lower default
+ * (carrick#2209). The scanner passes the cap as a command-line flag, which a
+ * child does not inherit. Unchanged when the sidecar runs with no cap.
+ */
+export function childNodeOptions(
+  execArgv: readonly string[],
+  existing: string | undefined
+): string | undefined {
+  let cap: string | undefined;
+  for (let i = 0; i < execArgv.length; i++) {
+    const arg = execArgv[i];
+    const match = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/.exec(arg);
+    if (!match) continue;
+    const value = match[1] ?? execArgv[i + 1];
+    if (value !== undefined && /^\d+$/.test(value)) cap = value;
+  }
+  if (cap === undefined) return existing;
+  const flag = `--max-old-space-size=${cap}`;
+  return existing && existing.trim() ? `${existing} ${flag}` : flag;
 }
 
 /** Resolve the sidecar root (where the vendored pnpm/tsc live) from this bundle. */
@@ -265,7 +321,8 @@ export async function runCheck(
   const tsc = await runProcess(
     tscPath,
     ['--noEmit', '--pretty', 'false', '-p', path.join(ws.probesRel, 'tsconfig.json')],
-    ws.workspaceDir
+    ws.workspaceDir,
+    { ...process.env, NODE_OPTIONS: childNodeOptions(process.execArgv, process.env.NODE_OPTIONS) }
   );
   const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
 
@@ -302,6 +359,14 @@ export async function runCheck(
       ...preGated,
       ...unresolved,
     ]);
+    // How the compiler ended, as fields, so the scanner can tell a memory
+    // death from any other abnormal end without reading the text
+    // (carrick#2209).
+    const compilerEnd: CompilerEnd = {
+      exit_code: tsc.code,
+      signal: tsc.signal,
+      heap_limit: carriesHeapLimitLine(tsc.stderr),
+    };
     if (cleanup) safeRm(ws);
     return {
       success: false,
@@ -312,6 +377,7 @@ export async function runCheck(
       verdicts,
       degraded_services: dedupeDegraded(degraded),
       errors,
+      compiler_end: compilerEnd,
     };
   }
 

@@ -988,6 +988,32 @@ pub struct CheckV2Result {
     pub degraded_services: Vec<DegradedService>,
     #[serde(default)]
     pub errors: Vec<String>,
+    /// How the check's compiler ended, present only when it ended
+    /// abnormally (every pair is then unverifiable) (carrick#2209).
+    #[serde(default)]
+    pub compiler_end: Option<CompilerEnd>,
+}
+
+/// How the check's compiler process ended (mirrors `CompilerEnd`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CompilerEnd {
+    /// Its exit code, or `None` when a signal ended it.
+    pub exit_code: Option<i32>,
+    /// The signal that ended it, by name (`SIGABRT`, `SIGKILL`), or `None`.
+    pub signal: Option<String>,
+    /// Whether its stderr carried V8's heap-exhaustion line.
+    pub heap_limit: bool,
+}
+
+impl CompilerEnd {
+    /// Whether the compiler died of memory: it aborted, as V8 does when its
+    /// heap is full (SIGABRT, or exit code 134 when a shell sat between),
+    /// and said so on stderr. A SIGKILL the cgroup counted as an OOM kill is
+    /// carrick#2208's to add, beside its reader.
+    pub fn is_memory_death(&self) -> bool {
+        self.heap_limit
+            && (self.signal.as_deref() == Some("SIGABRT") || self.exit_code == Some(134))
+    }
 }
 
 // ============================================================================
@@ -3665,6 +3691,52 @@ fn answered_in_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The check's answer carries how its compiler ended, and only an abort
+    /// with V8's heap line is a memory death (carrick#2209).
+    #[test]
+    fn a_check_answer_says_whether_its_compiler_died_of_memory() {
+        let answer = |end: serde_json::Value| -> CheckV2Result {
+            serde_json::from_value(serde_json::json!({
+                "success": false,
+                "isolation": "pnpm",
+                "install_ok": true,
+                "ts_version": "6.0.2",
+                "compiler_end": end,
+            }))
+            .unwrap()
+        };
+        let heap = answer(serde_json::json!({
+            "exit_code": null, "signal": "SIGABRT", "heap_limit": true
+        }));
+        assert_eq!(
+            heap.compiler_end,
+            Some(CompilerEnd {
+                exit_code: None,
+                signal: Some("SIGABRT".to_string()),
+                heap_limit: true,
+            })
+        );
+        assert!(heap.compiler_end.unwrap().is_memory_death());
+        let through_a_shell =
+            answer(serde_json::json!({ "exit_code": 134, "signal": null, "heap_limit": true }));
+        assert!(through_a_shell.compiler_end.unwrap().is_memory_death());
+        for end in [
+            serde_json::json!({ "exit_code": null, "signal": "SIGABRT", "heap_limit": false }),
+            serde_json::json!({ "exit_code": null, "signal": "SIGKILL", "heap_limit": false }),
+            serde_json::json!({ "exit_code": 2, "signal": null, "heap_limit": true }),
+        ] {
+            assert!(
+                !answer(end.clone()).compiler_end.unwrap().is_memory_death(),
+                "{end}"
+            );
+        }
+        let normal: CheckV2Result = serde_json::from_value(serde_json::json!({
+            "success": true, "isolation": "pnpm", "install_ok": true, "ts_version": "6.0.2"
+        }))
+        .unwrap();
+        assert_eq!(normal.compiler_end, None);
+    }
 
     /// carrick#2054: the sidecar reports `response_modes` on a response
     /// joined from several bodies, and nothing on this side reads it yet. An
