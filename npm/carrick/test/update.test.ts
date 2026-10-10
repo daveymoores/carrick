@@ -362,6 +362,7 @@ test("which invocations count as a scan", () => {
     "status",
     "check",
     "touch",
+    "__untrusted-yarn-refusal",
     "login",
     "logout",
     "lsp",

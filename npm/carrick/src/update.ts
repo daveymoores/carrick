@@ -393,6 +393,9 @@ const COMMANDS = new Set([
   "status",
   "check",
   "touch",
+  // The binary's internal one, run by scripts/install-scanned-deps.sh
+  // (src/untrusted_yarn.rs, `COMMAND`).
+  "__untrusted-yarn-refusal",
   // This package's.
   "login",
   "logout",

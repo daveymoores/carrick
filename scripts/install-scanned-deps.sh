@@ -46,13 +46,22 @@
 # not own (the hosted runner). Lifecycle scripts being off is not enough there:
 # a pnpm `.pnpmfile.cjs`, a Yarn `yarnPath` / `yarn-path` release and Yarn
 # Berry `plugins` are all files from the scanned tree that run during an
-# install. In this mode none of them can:
-#   - pnpm installs with `--ignore-pnpmfile`;
+# install, and so is any program a project `.npmrc` names (carrick#2246). In
+# this mode none of them can:
+#   - npm runs with every setting that names a program (`git`, `node-options`,
+#     `script-shell`, `shell`, `node-gyp`) set in the environment, which
+#     outranks the tree's `.npmrc` (see `npm_trusted_tools`);
+#   - pnpm installs with `--ignore-pnpmfile`; no pnpm setting in `.npmrc` or
+#     `pnpm-workspace.yaml` starts a program from the tree during a frozen
+#     install without scripts (surveyed on pnpm 9 and 10, carrick#2246);
 #   - Yarn runs with YARN_IGNORE_PATH=1, so the launcher never hands the
 #     install to a committed release, and Berry with YARN_ENABLE_SCRIPTS=0;
-#   - a Berry root listing `plugins`, or naming a `yarnPath` with no
-#     `packageManager` pin (the version cannot be known without running the
-#     repo's file), is not installed: it warns and the pre-flight refuses it;
+#   - a Yarn root where any `.yarnrc.yml` from it up to the clone root lists
+#     `plugins`, or names a `yarnPath` with no `packageManager` pin (the
+#     version cannot be known without running the repo's file), is not
+#     installed: it warns and the pre-flight refuses it. The scanner reads
+#     those files as YAML (`$CARRICK_CLI __untrusted-yarn-refusal`), so this
+#     mode needs CARRICK_CLI for Yarn roots and refuses them without it;
 #   - corepack never writes `packageManager` into the repo's package.json
 #     (COREPACK_ENABLE_AUTO_PIN=0), and classic Yarn and bun install frozen, so
 #     no tracked file differs from the commit afterwards.
@@ -321,21 +330,56 @@ run_install() {
   fi
 }
 
+# npm settings that name a program npm starts, each pinned to the machine's
+# own answer for an untrusted install (carrick#2246). npm reads them from the
+# tree's `.npmrc`, and the environment outranks that file, in this npm and in
+# every npm it starts: a git dependency is cloned with `git`, and one whose
+# manifest declares a build script is prepared by a child `npm install` that
+# runs whatever `node-options` says, `--ignore-scripts` or not (pacote's
+# `git.js`). `script-shell`, `shell` and `node-gyp` are the other settings that
+# name a program; nothing `npm ci --ignore-scripts` does reaches them today.
+# Sets NPM_TRUSTED_TOOLS to `env` assignments.
+npm_trusted_tools() {
+  local gyp
+  NPM_TRUSTED_TOOLS=(
+    "npm_config_git=$(command -v git || echo git)"
+    # Never empty: npm skips an empty `npm_config_*` variable and falls back
+    # to the tree's file (@npmcli/config `loadEnv`). A space is no option.
+    "npm_config_node_options=${NODE_OPTIONS:- }"
+    "npm_config_script_shell=/bin/sh"
+    "npm_config_shell=/bin/sh"
+  )
+  # npm's own node-gyp, read where no project config applies.
+  gyp=$(cd / && npm config get node-gyp 2>/dev/null)
+  case "$gyp" in /*) NPM_TRUSTED_TOOLS+=("npm_config_node_gyp=$gyp") ;; esac
+}
+
 # Whether a Yarn root cannot be installed without running a file from the tree.
-# Prints the reason when it cannot. Read as text: nothing here executes the
-# repository's files. Only Yarn Berry's `.yarnrc.yml` carries either key.
+# Prints the reason when it cannot. The scanner reads every `.yarnrc.yml` Yarn
+# would read for the root, as YAML, executing nothing (src/untrusted_yarn.rs).
+# A root it cannot answer for is refused, never installed unread.
 yarn_untrusted_refusal() {
-  local rc="$1/.yarnrc.yml"
-  [ -f "$rc" ] || return 1
-  if grep -Eq '^plugins[[:space:]]*:' "$rc"; then
-    echo "its .yarnrc.yml lists plugins, which Yarn loads at startup"
+  local answer problem status
+  if [ -z "${CARRICK_CLI:-}" ]; then
+    echo "no Carrick was named to read its .yarnrc.yml files (CARRICK_CLI is unset)"
     return 0
   fi
-  if grep -Eq '^yarnPath[[:space:]]*:' "$rc" && ! grep -Eq '"packageManager"[[:space:]]*:' "$1/package.json" 2>/dev/null; then
-    echo "its .yarnrc.yml names a yarnPath and package.json pins no packageManager, so the Yarn version cannot be known without running the repository's own file"
+  # stdout is the answer; stderr is only read when there is none, since a
+  # wrapper may print notices there.
+  problem=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/carrick-yarnrc.XXXXXX") || {
+    echo "its .yarnrc.yml files could not be read"
+    return 0
+  }
+  answer=$("$CARRICK_CLI" __untrusted-yarn-refusal "$1" 2>"$problem")
+  status=$?
+  if [ $status -ne 0 ]; then
+    echo "its .yarnrc.yml files could not be read (exit $status): $(tail -n 1 "$problem")"
+    rm -f "$problem"
     return 0
   fi
-  return 1
+  rm -f "$problem"
+  [ -n "$answer" ] || return 1
+  echo "$answer"
 }
 
 # Yarn Berry's lockfile opens with a `__metadata` block; classic's does not.
@@ -366,7 +410,12 @@ cmd_install_one() {
       status=$?
       ;;
     npm)
-      run_install "$root" "$log" npm ci --ignore-scripts
+      if [ -n "$UNTRUSTED" ]; then
+        npm_trusted_tools
+        run_install "$root" "$log" env "${NPM_TRUSTED_TOOLS[@]}" npm ci --ignore-scripts
+      else
+        run_install "$root" "$log" npm ci --ignore-scripts
+      fi
       status=$?
       ;;
     pnpm)
