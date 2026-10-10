@@ -1463,7 +1463,6 @@ mod tests {
     /// counted against the service being verified. The stand-in answers
     /// every check the way the verifier does once its time limit has passed.
     #[test]
-    #[serial_test::serial(current_service)]
     fn checks_the_time_limit_did_not_reach_are_counted_against_the_service() {
         const SERVICE: &str = "semantics-2021";
         let dir = tempfile::tempdir().unwrap();
@@ -1500,10 +1499,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(asked > 0, "the sample asks something");
         crate::scan_health::forget_service_losses(Some(SERVICE));
 
-        let semantics = {
-            let _scope = crate::current_service::enter(Some(SERVICE));
+        let semantics = crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
             verify(&sidecar, &root, &entries)
-        };
+        });
         assert!(semantics.is_empty(), "nothing was verified");
         assert_eq!(
             crate::scan_health::time_limits_for(Some(SERVICE)).library_checks,

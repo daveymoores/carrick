@@ -82,18 +82,17 @@ fn retry_announcement_due(last: Option<Instant>, now: Instant) -> bool {
 /// stopped answering ([`NOT_ASKED_CODE`], carrick#1909), is no row at all.
 static REQUEST_COUNTS: OnceLock<Mutex<RequestCounts>> = OnceLock::new();
 
-/// Every request the scan has issued, by route, and which of them were asked
-/// for a service ahead of its analysis (carrick#1895).
+/// Every request the scan has issued, by route, and by the service each was
+/// made for.
 #[derive(Default)]
 struct RequestCounts {
     /// Every request, by route.
     issued: BTreeMap<String, usize>,
-    /// Those of `issued` that a service's detection and guidance were asked
-    /// with ahead of it ([`crate::current_service::asked_for`]), by route.
-    ahead: BTreeMap<String, usize>,
-    /// Those of `ahead` no service's line has counted yet, by the service
-    /// they were asked for.
-    ahead_unclaimed: BTreeMap<Option<String>, BTreeMap<String, usize>>,
+    /// Those of `issued` made for a service, by that service and route, until
+    /// [`requests_of_service`] reads the service's line. `None` is the
+    /// unnamed service of a single-service scan. A request made for no
+    /// service (the cross-repo phase, the upload) is in `issued` only.
+    by_service: BTreeMap<Option<String>, BTreeMap<String, usize>>,
 }
 
 fn request_counts_map() -> &'static Mutex<RequestCounts> {
@@ -102,13 +101,12 @@ fn request_counts_map() -> &'static Mutex<RequestCounts> {
 
 fn record_request(path: &str) {
     // Read before the lock: it is the running task's own.
-    let asked_ahead = crate::current_service::asked_ahead();
+    let service = crate::current_service::working_for();
     let mut counts = request_counts_map().lock().unwrap();
     *counts.issued.entry(path.to_string()).or_insert(0) += 1;
-    if let Some(service) = asked_ahead {
-        *counts.ahead.entry(path.to_string()).or_insert(0) += 1;
+    if let Some(service) = service {
         *counts
-            .ahead_unclaimed
+            .by_service
             .entry(service)
             .or_default()
             .entry(path.to_string())
@@ -121,50 +119,25 @@ pub fn request_counts() -> BTreeMap<String, usize> {
     request_counts_map().lock().unwrap().issued.clone()
 }
 
-/// The requests one service made, for its line in the run log.
+/// The requests one service made since its line was last read, for its line
+/// in the run log, as [`requests_between`] words them.
 ///
-/// A service's requests used to be the ones issued while its analysis ran,
-/// because nothing else was asking. Its detection and guidance are now asked
-/// ahead of it, while the scan analyses another service (carrick#1895), so
-/// the window alone would give the first service every other service's
-/// setup and the later ones none of their own. A service's requests are the
-/// ones issued in its window that were not asked ahead for anyone, and the
-/// ones asked ahead for it, whenever they were sent.
-pub struct ServiceRequests {
-    issued: BTreeMap<String, usize>,
-    ahead: BTreeMap<String, usize>,
-}
-
-impl ServiceRequests {
-    /// Open the window as the service's analysis starts.
-    pub fn open() -> Self {
-        let counts = request_counts_map().lock().unwrap();
-        Self {
-            issued: counts.issued.clone(),
-            ahead: counts.ahead.clone(),
-        }
-    }
-
-    /// Close the window and say what `service` requested, as
-    /// [`requests_between`] words it. What was asked ahead for it is counted
-    /// here once: a second pass over the service does not count it again.
-    pub fn close(self, service: Option<&str>) -> String {
-        let mut counts = request_counts_map().lock().unwrap();
-        let asked_ahead = counts
-            .ahead_unclaimed
-            .remove(&service.map(str::to_string))
-            .unwrap_or_default();
-        let mut own = self.issued.clone();
-        for (route, issued) in &counts.issued {
-            let before =
-                |snapshot: &BTreeMap<String, usize>| snapshot.get(route).copied().unwrap_or(0);
-            let in_window = issued - before(&self.issued);
-            let ahead_in_window = before(&counts.ahead) - before(&self.ahead);
-            *own.entry(route.clone()).or_insert(0) += in_window.saturating_sub(ahead_in_window)
-                + asked_ahead.get(route).copied().unwrap_or(0);
-        }
-        requests_between(&self.issued, &own)
-    }
+/// Each request is counted against the service it was made for when it is
+/// made ([`crate::current_service::working_for`]): the service the task
+/// belongs to, or the one a task asking ahead of its analysis was started for
+/// (carrick#1895). So the line holds what was asked ahead for the service as
+/// well as its own, whenever they were sent, and nothing another service
+/// asked while it ran (carrick#1066). Reading the line takes the count: a
+/// second pass over the service (the retry of owed work) states its own
+/// requests, and none again.
+pub fn requests_of_service(service: Option<&str>) -> String {
+    let own = request_counts_map()
+        .lock()
+        .unwrap()
+        .by_service
+        .remove(&service.map(str::to_string))
+        .unwrap_or_default();
+    requests_between(&BTreeMap::new(), &own)
 }
 
 /// The requests issued between two snapshots, as the per-service line prints
@@ -7319,7 +7292,6 @@ pub(crate) mod tests {
     /// made outside the scan loop must not be billed to whichever service
     /// happened to run last.
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_call_outside_the_service_loop_sends_no_service_header() {
         let request = prompt_call_request().await;
         assert!(
@@ -7332,10 +7304,9 @@ pub(crate) mod tests {
     /// being analysed, which is what makes a monorepo's model spend
     /// attributable to one tree (carrick#1221).
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_call_inside_a_service_scope_names_that_service() {
-        let _scope = crate::current_service::enter(Some("api"));
-        let request = prompt_call_request().await;
+        let request =
+            crate::current_service::scope(Some("api".to_string()), prompt_call_request()).await;
         assert_eq!(
             header_of(&request, "x-carrick-service").as_deref(),
             Some("api")
@@ -7347,22 +7318,23 @@ pub(crate) mod tests {
     /// the service the loop is in; one made for an unnamed service names
     /// nobody.
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_call_asked_ahead_for_a_service_names_it_and_not_the_one_being_analysed() {
-        let _scope = crate::current_service::enter(Some("api"));
+        crate::current_service::scope(Some("api".to_string()), async {
+            let ahead =
+                crate::current_service::asked_for(Some("web".to_string()), prompt_call_request())
+                    .await;
+            assert_eq!(
+                header_of(&ahead, "x-carrick-service").as_deref(),
+                Some("web")
+            );
 
-        let ahead =
-            crate::current_service::asked_for(Some("web".to_string()), prompt_call_request()).await;
-        assert_eq!(
-            header_of(&ahead, "x-carrick-service").as_deref(),
-            Some("web")
-        );
-
-        let unnamed = crate::current_service::asked_for(None, prompt_call_request()).await;
-        assert!(
-            header_of(&unnamed, "x-carrick-service").is_none(),
-            "an unnamed service asked ahead names nobody, not the loop's service: {unnamed}"
-        );
+            let unnamed = crate::current_service::asked_for(None, prompt_call_request()).await;
+            assert!(
+                header_of(&unnamed, "x-carrick-service").is_none(),
+                "an unnamed service asked ahead names nobody, not the loop's service: {unnamed}"
+            );
+        })
+        .await;
     }
 
     /// The per-service line of the run log says what a service requested. Its
@@ -7384,42 +7356,75 @@ pub(crate) mod tests {
             })
         };
 
+        let in_service = |service: &'static str| {
+            crate::current_service::scope(Some(service.to_string()), async { record_request(FILE) })
+        };
+
         // Before any service is analysed, the second one's setup is asked.
         ask_ahead(SECOND).await;
 
         // The first is analysed. Its own setup is asked meanwhile, and one
         // more request of the second's; two files are its own.
-        let first = ServiceRequests::open();
         ask_ahead(FIRST).await;
         ask_ahead(SECOND).await;
-        record_request(FILE);
-        record_request(FILE);
-        let first = first.close(Some(FIRST));
+        in_service(FIRST).await;
+        in_service(FIRST).await;
+        let first = requests_of_service(Some(FIRST));
         assert!(first.contains("a-setup-asked-ahead 1"), "{first}");
         assert!(first.contains("a-file-of-its-own 2"), "{first}");
 
         // The second is analysed and asks for one file: what was asked ahead
         // for it, before and during the first's analysis, is counted here.
-        let second = ServiceRequests::open();
-        record_request(FILE);
-        let second = second.close(Some(SECOND));
+        in_service(SECOND).await;
+        let second = requests_of_service(Some(SECOND));
         assert!(second.contains("a-setup-asked-ahead 2"), "{second}");
         assert!(second.contains("a-file-of-its-own 1"), "{second}");
 
         // A second pass over it (the retry of owed work) counts none again.
-        let again = ServiceRequests::open().close(Some(SECOND));
+        let again = requests_of_service(Some(SECOND));
         assert!(!again.contains("a-setup-asked-ahead"), "{again}");
         assert!(!again.contains("a-file-of-its-own"), "{again}");
+    }
+
+    /// Two services analysed side by side, their awaits interleaving, are
+    /// each counted for their own requests and not each other's
+    /// (carrick#1066): a time window over the process would hand both the
+    /// sum.
+    #[tokio::test]
+    async fn requests_made_side_by_side_are_counted_against_their_own_service() {
+        const ROUTE: &str = "/a-route-counted-side-by-side";
+        const LEFT: &str = "the service on the left";
+        const RIGHT: &str = "the service on the right";
+        let analyse = |service: &'static str, requests: usize| {
+            crate::current_service::scope(Some(service.to_string()), async move {
+                for _ in 0..requests {
+                    tokio::task::yield_now().await;
+                    record_request(ROUTE);
+                }
+                // A task it starts through the helper counts for it too.
+                crate::current_service::spawn(async { record_request(ROUTE) })
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::join!(analyse(LEFT, 3), analyse(RIGHT, 1));
+
+        assert_eq!(
+            requests_of_service(Some(LEFT)),
+            "a-route-counted-side-by-side 4"
+        );
+        assert_eq!(
+            requests_of_service(Some(RIGHT)),
+            "a-route-counted-side-by-side 2"
+        );
     }
 
     /// A single unnamed service sends nothing rather than the `(root)` the
     /// log lines use: an absent header already says the same thing, and there
     /// is only one service in that case anyway.
     #[tokio::test]
-    #[serial(current_service)]
     async fn an_unnamed_service_sends_no_service_header() {
-        let _scope = crate::current_service::enter(None);
-        let request = prompt_call_request().await;
+        let request = crate::current_service::scope(None, prompt_call_request()).await;
         assert!(
             header_of(&request, "x-carrick-service").is_none(),
             "an unnamed service sends no name: {request}"
@@ -7431,10 +7436,10 @@ pub(crate) mod tests {
     /// nothing else — handing it to `.header()` would store a builder error
     /// and fail the send, stopping every prompt call of the scan over a name.
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_service_name_that_is_not_a_legal_header_value_is_dropped() {
-        let _scope = crate::current_service::enter(Some("café\nservice"));
-        let request = prompt_call_request().await;
+        let request =
+            crate::current_service::scope(Some("café\nservice".to_string()), prompt_call_request())
+                .await;
         assert!(
             header_of(&request, "x-carrick-service").is_none(),
             "an illegal name is dropped, not sent: {request}"

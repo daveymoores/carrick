@@ -7,12 +7,12 @@
 //! This records the elapsed time of each stage inside that phase so the line
 //! attributes itself.
 //!
-//! It is a process-global recorder rather than a value threaded through the
-//! analysis, for the same reason [`crate::scan_health`] is: the stages sit in
-//! two branches (incremental and full) several call layers below the loop that
+//! The recorder belongs to the service's analysis future, a task-local, for
+//! the same reason [`crate::current_service`] does: the stages sit in two
+//! branches (incremental and full) several call layers below the loop that
 //! prints the line, and a return value would have to be carried through every
-//! one of them. Services are analysed one at a time, so a run's marks belong
-//! to exactly one service.
+//! one of them. Two services analysed side by side each have a recorder of
+//! their own, so a run's marks belong to exactly one service (carrick#1066).
 //!
 //! The rendered line is a contract with the rescan gate, which parses
 //! `analysis <seconds>s` per service and refuses a run whose total has grown
@@ -20,7 +20,8 @@
 //! `name 0.0s` shape stable.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::future::Future;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 /// The stages of one service's analysis, in the order the line prints them.
@@ -118,48 +119,43 @@ struct Recorder {
     totals: BTreeMap<Phase, f64>,
 }
 
-fn recorder() -> &'static Mutex<Option<Recorder>> {
-    static RECORDER: OnceLock<Mutex<Option<Recorder>>> = OnceLock::new();
-    RECORDER.get_or_init(|| Mutex::new(None))
+tokio::task_local! {
+    /// The recorder of the service the running task is analysing.
+    static RECORDER: Arc<Mutex<Recorder>>;
 }
 
-/// Begin recording a service's analysis. Discards anything the previous
-/// service left behind, so a stage that never marked cannot leak forward.
-pub fn start_service() {
-    let mut guard = recorder().lock().unwrap();
-    *guard = Some(Recorder {
+/// Run `work` as one service's analysis and record its stages: every
+/// [`mark`] made inside it, on its task, lands here and in no other service's
+/// recording. Returns what `work` returned and the stages it spent, even when
+/// `work` ended in an error.
+pub async fn record<Work: Future>(work: Work) -> (Work::Output, Totals) {
+    let recorder = Arc::new(Mutex::new(Recorder {
         last: Instant::now(),
         totals: BTreeMap::new(),
-    });
+    }));
+    let output = RECORDER.scope(recorder.clone(), work).await;
+    let recorder = recorder.lock().unwrap_or_else(PoisonError::into_inner);
+    (
+        output,
+        Totals {
+            per_phase: recorder.totals.clone(),
+        },
+    )
 }
 
 /// Attribute everything since the previous mark to `phase`.
 ///
 /// A phase may be marked more than once (the incremental branch resolves
 /// types, then definitions, then more types on some services); the durations
-/// add.
+/// add. A mark made outside [`record`] is dropped.
 pub fn mark(phase: Phase) {
-    let mut guard = recorder().lock().unwrap();
-    let Some(recorder) = guard.as_mut() else {
-        return;
-    };
-    let now = Instant::now();
-    let elapsed = now.duration_since(recorder.last).as_secs_f64();
-    *recorder.totals.entry(phase).or_insert(0.0) += elapsed;
-    recorder.last = now;
-}
-
-/// What this service spent per stage, and the end of recording.
-///
-/// Returns `None` when nothing was recorded (a path that never called
-/// [`start_service`]), so a caller states its line unchanged rather than an
-/// all-zero breakdown that would read as a measurement.
-pub fn take() -> Option<Totals> {
-    let mut guard = recorder().lock().unwrap();
-    let recorder = guard.take()?;
-    Some(Totals {
-        per_phase: recorder.totals,
-    })
+    let _ = RECORDER.try_with(|recorder| {
+        let mut recorder = recorder.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        let elapsed = now.duration_since(recorder.last).as_secs_f64();
+        *recorder.totals.entry(phase).or_insert(0.0) += elapsed;
+        recorder.last = now;
+    });
 }
 
 /// One service's recorded stages, read two ways: the line the log states, and
@@ -209,17 +205,15 @@ mod tests {
     use super::*;
 
     /// The line names every phase in a fixed order whether or not it was
-    /// marked, because the gate that parses it counts on the shape; and
-    /// nothing recorded is stated as nothing, not as a service that spent
-    /// zero seconds everywhere.
-    ///
-    /// One test, not two: the recorder is process-global, so two tests
-    /// asserting on it in parallel would each see the other's service.
-    #[test]
-    fn line_states_every_phase_in_order_and_only_after_a_start() {
-        start_service();
-        mark(Phase::Discover);
-        let totals = take().expect("a started service renders a line");
+    /// marked, because the gate that parses it counts on the shape; and a
+    /// mark outside a recording is dropped, not kept for the next service.
+    #[tokio::test]
+    async fn line_states_every_phase_in_order_and_only_inside_a_recording() {
+        mark(Phase::Cache);
+        let ((), totals) = record(async {
+            mark(Phase::Discover);
+        })
+        .await;
         let line = totals.line();
         for phase in Phase::ORDER {
             assert!(line.contains(phase.label()), "{line} is missing {phase:?}");
@@ -227,13 +221,38 @@ mod tests {
         let discover = line.find("discover").expect("discover present");
         let other = line.find("other").expect("other present");
         assert!(discover < other, "phases print in ORDER: {line}");
+        assert!(
+            line.contains("cache 0.0s"),
+            "an outside mark is dropped: {line}"
+        );
 
         // And the same marks, read as the split the build states: a discover
         // mark is this machine's work, and nothing was spent on the model.
         assert!(totals.local_secs() > 0.0, "discover is local work");
         assert_eq!(totals.model_secs(), 0.0);
+    }
 
-        assert!(take().is_none(), "a taken recording is finished");
+    /// Two services analysed side by side, their awaits interleaving, each
+    /// take the stages they marked and none of the other's (carrick#1066).
+    #[tokio::test]
+    async fn services_side_by_side_each_take_only_their_own_stages() {
+        let model = record(async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            mark(Phase::Model);
+        });
+        let types = record(async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            mark(Phase::Types);
+        });
+        let (((), model), ((), types)) = tokio::join!(model, types);
+        assert!(model.model_secs() > 0.0, "the first marked model time");
+        assert_eq!(model.local_secs(), 0.0, "and no local stage of its own");
+        assert!(types.local_secs() > 0.0, "the second marked a local stage");
+        assert_eq!(
+            types.model_secs(),
+            0.0,
+            "and none of the first's model time"
+        );
     }
 
     /// Exactly the two stages that ask the model are model time. A stage

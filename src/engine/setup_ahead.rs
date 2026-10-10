@@ -252,6 +252,17 @@ impl AskTurns {
             .clone();
         turn.lock_owned().await
     }
+
+    /// Run `ask` in its turn: after every earlier ask of `what` has been
+    /// answered, and before any later one is sent.
+    pub(super) async fn in_turn<Answer>(
+        &self,
+        what: String,
+        ask: impl std::future::Future<Output = Answer>,
+    ) -> Answer {
+        let _turn = self.take(what).await;
+        ask.await
+    }
 }
 
 /// The names in `list`, as the set the cloud keys an answer on: it sorts and
@@ -286,6 +297,14 @@ pub(super) fn extraction_ask(detection: &DetectionResult, packages: &Packages) -
         name_set(&detection.data_fetchers),
         name_set(&dependencies)
     )
+}
+
+/// What a library-claims ask is, for [`AskTurns`]: its request body. The
+/// store answers a package it is still building as pending, so a second ask
+/// of the same body costs a round trip and never a second build.
+pub(super) fn library_ask(request: &crate::library_store::LibraryClaimsRequest) -> String {
+    let body = serde_json::to_string(request).unwrap_or_default();
+    format!("library claims {:x}", Sha256::digest(body.as_bytes()))
 }
 
 /// What one model setup asks, as one id: two setups share it only when they
@@ -736,6 +755,12 @@ pub(super) struct SetupSource {
 }
 
 impl SetupSource {
+    /// The run's turns, for the asks a service makes itself outside
+    /// [`Self::settle`].
+    pub(super) fn turns(&self) -> AskTurns {
+        self.turns.clone()
+    }
+
     /// The service's model setup: detection, guidance and extraction config,
     /// or a deferral.
     ///
@@ -1175,6 +1200,49 @@ mod tests {
         assert_eq!(second, (seconds(10), seconds(11)));
         assert_eq!(third, (seconds(11), seconds(12)));
         assert_eq!(other, (seconds(0), seconds(3)));
+    }
+
+    /// carrick#1066. The asks a service sends outside the model setup (the
+    /// semantics re-ask, the extraction config, the schedule's re-ask) go
+    /// through [`AskTurns::in_turn`]: two of one thing go one after the other,
+    /// in the order they were made, and an ask of another thing beside them.
+    #[tokio::test(start_paused = true)]
+    async fn asks_run_in_turn_one_after_another_per_thing() {
+        let turns = AskTurns::default();
+        let began = Instant::now();
+        let ask = |what: &'static str, takes: u64| {
+            turns.in_turn(what.to_string(), async move {
+                let started = began.elapsed();
+                sleep(seconds(takes)).await;
+                (started, began.elapsed())
+            })
+        };
+
+        let (first, second, other) = tokio::join!(
+            ask("a re-ask", 10),
+            ask("a re-ask", 1),
+            ask("an extraction config", 3),
+        );
+
+        assert_eq!(first, (seconds(0), seconds(10)));
+        assert_eq!(second, (seconds(10), seconds(11)));
+        assert_eq!(other, (seconds(0), seconds(3)));
+    }
+
+    /// Two library-claims asks share a turn when their request bodies are the
+    /// same, whatever service sends them.
+    #[test]
+    fn library_asks_are_one_thing_when_their_bodies_are() {
+        let request = |package: &str| crate::library_store::LibraryClaimsRequest {
+            roles: vec!["broker"],
+            packages: vec![crate::library_store::RegistryPackage {
+                package: package.to_string(),
+                version: "1.0.0".to_string(),
+                specifiers: Vec::new(),
+            }],
+        };
+        assert_eq!(library_ask(&request("lib")), library_ask(&request("lib")));
+        assert_ne!(library_ask(&request("lib")), library_ask(&request("other")));
     }
 
     fn detection(frameworks: &[&str], data_fetchers: &[&str]) -> DetectionResult {

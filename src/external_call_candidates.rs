@@ -280,7 +280,10 @@ pub struct ExternalCallCandidate {
 /// genuinely a different one and sharing would silently drop its rows.
 #[derive(Debug, Default)]
 pub struct WorkspaceScan {
-    built: Option<Built>,
+    /// Built by whichever service asks first, and read by every one after it
+    /// through `&self`, so services analysed side by side share it
+    /// (carrick#1066).
+    built: std::sync::OnceLock<Built>,
 }
 
 /// Everything the shared pass holds for one repo root.
@@ -316,18 +319,20 @@ impl WorkspaceScan {
     /// and vendored/build directories are excluded by the scanner's existing
     /// rules rather than by anything invented here.
     pub fn rows_for_service(
-        &mut self,
+        &self,
         service_files: &[PathBuf],
         repo_root: &Path,
     ) -> Vec<ExternalCallCandidate> {
-        if self
-            .built
-            .as_ref()
-            .is_none_or(|built| built.repo_root != repo_root)
-        {
-            self.built = Some(Built::for_repo(repo_root));
-        }
-        let built = self.built.as_ref().expect("built directly above");
+        let shared = self.built.get_or_init(|| Built::for_repo(repo_root));
+        // A scan has one repo root. A caller that asks about another gets that
+        // root's pass built for the one question, never mixed with this one's.
+        let other;
+        let built = if shared.repo_root == repo_root {
+            shared
+        } else {
+            other = Built::for_repo(repo_root);
+            &other
+        };
         let Some(index) = built.index.as_ref() else {
             return Vec::new();
         };
@@ -3422,7 +3427,7 @@ mod tests {
         fn one_shared_pass_answers_every_service_as_its_own_would() {
             let root = fixture_root();
             let services = ["apps/api", "apps/worker", "apps/build", "apps/relay"];
-            let mut shared = WorkspaceScan::new();
+            let shared = WorkspaceScan::new();
             for directory in services {
                 let service = Config {
                     directory: Some(directory.to_string()),
@@ -3436,6 +3441,43 @@ mod tests {
                     "{directory} answered differently from a pass of its own"
                 );
             }
+        }
+
+        /// Services asking at once (carrick#1066) share the one pass: each
+        /// gets what a pass of its own would give it, and the pass is built
+        /// once, by whichever asked first.
+        #[test]
+        fn services_asking_at_once_share_one_pass() {
+            let root = fixture_root();
+            let services = ["apps/api", "apps/worker", "apps/build", "apps/relay"];
+            let shared = WorkspaceScan::new();
+            let answers: Vec<(Vec<PathBuf>, Vec<ExternalCallCandidate>)> =
+                std::thread::scope(|threads| {
+                    let asking: Vec<_> = services
+                        .iter()
+                        .map(|directory| {
+                            let (shared, root) = (&shared, &root);
+                            threads.spawn(move || {
+                                let service = Config {
+                                    directory: Some(directory.to_string()),
+                                    ..Default::default()
+                                };
+                                let (files, _) = find_service_files(
+                                    &root.to_string_lossy(),
+                                    &service,
+                                    IGNORE_PATTERNS,
+                                );
+                                let rows = shared.rows_for_service(&files, root);
+                                (files, rows)
+                            })
+                        })
+                        .collect();
+                    asking.into_iter().map(|t| t.join().unwrap()).collect()
+                });
+            for (files, rows) in answers {
+                assert_eq!(rows, WorkspaceScan::new().rows_for_service(&files, &root));
+            }
+            assert!(shared.built.get().is_some(), "the shared pass was built");
         }
     }
 

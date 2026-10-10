@@ -80,11 +80,6 @@ struct Registry {
     attempted: usize,
     /// One entry per file the analyzer never answered for.
     lost: Vec<LostFile>,
-    /// The service the engine is analysing now. Every loss is recorded
-    /// against it, because the run lands, holds back and retries services one
-    /// at a time and each of those decisions is about ONE service's losses.
-    /// The engine analyses services sequentially, so one slot is exact.
-    current: Scope,
     /// Function intents that failed after their retries, per service: how
     /// many, and how many of those the model refused for capacity. Not a
     /// reason to hold a service back (a missing intent never was), only a
@@ -189,27 +184,28 @@ impl Registry {
     }
 
     /// Records that `path` has no analysis, and why.
-    fn record_unanalysed_file(&mut self, path: &str, reason: &LossReason) {
+    fn record_unanalysed_file(&mut self, scope: &Scope, path: &str, reason: &LossReason) {
         self.lost.push(LostFile {
-            scope: self.current.clone(),
+            scope: scope.clone(),
             path: path.to_string(),
             reason: reason.clone(),
         });
     }
 
-    /// Records that `count` intents of the current service failed,
-    /// `for_capacity` of them because the model refused for capacity.
-    fn record_intents_failed(&mut self, count: usize, for_capacity: usize) {
+    /// Records that `count` intents of `scope` failed, `for_capacity` of them
+    /// because the model refused for capacity.
+    fn record_intents_failed(&mut self, scope: &Scope, count: usize, for_capacity: usize) {
         if count == 0 {
             return;
         }
-        let scope = self.current.clone();
-        match self.intents_failed.iter_mut().find(|(s, _, _)| *s == scope) {
+        match self.intents_failed.iter_mut().find(|(s, _, _)| s == scope) {
             Some((_, total, total_for_capacity)) => {
                 *total += count;
                 *total_for_capacity += for_capacity;
             }
-            None => self.intents_failed.push((scope, count, for_capacity)),
+            None => self
+                .intents_failed
+                .push((scope.clone(), count, for_capacity)),
         }
     }
 
@@ -359,11 +355,11 @@ impl Registry {
         ))
     }
 
-    /// Records how many pub/sub rows the current service left out as
-    /// in-process. Replaces the service's earlier count, so a service that
-    /// is analysed again is not counted twice.
-    fn record_in_process_pubsub(&mut self, count: usize) {
-        self.in_process_pubsub.insert(self.current.clone(), count);
+    /// Records how many pub/sub rows `scope` left out as in-process.
+    /// Replaces the service's earlier count, so a service that is analysed
+    /// again is not counted twice.
+    fn record_in_process_pubsub(&mut self, scope: &Scope, count: usize) {
+        self.in_process_pubsub.insert(scope.clone(), count);
     }
 
     /// One line saying how many pub/sub calls were left out, or `None`.
@@ -444,12 +440,15 @@ pub fn record_files_attempted(count: usize) {
 }
 
 /// Records that `path` has no analysis in this run's index, and why
-/// ([`analysis_failure_reason`]).
+/// ([`analysis_failure_reason`]), against the service whose analysis is
+/// running ([`crate::current_service`]): the run lands, holds back and retries
+/// services one at a time, and each of those decisions is about ONE service's
+/// losses.
 pub fn record_unanalysed_file(path: &str, reason: &LossReason) {
     registry()
         .lock()
         .expect("scan health lock")
-        .record_unanalysed_file(path, reason);
+        .record_unanalysed_file(&crate::current_service::name(), path, reason);
 }
 
 /// Records that the model was deliberately not asked about `path`, with the
@@ -580,7 +579,7 @@ pub fn record_in_process_pubsub(count: usize) {
     registry()
         .lock()
         .expect("scan health lock")
-        .record_in_process_pubsub(count);
+        .record_in_process_pubsub(&crate::current_service::name(), count);
 }
 
 /// One line saying how many pub/sub calls the run left out as in-process, or
@@ -592,11 +591,6 @@ pub fn in_process_pubsub_line() -> Option<String> {
         .in_process_pubsub_line()
 }
 
-/// Name the service every loss recorded from now on belongs to.
-pub fn enter_service(service: Option<&str>) {
-    registry().lock().expect("scan health lock").current = service.map(str::to_string);
-}
-
 /// Records that `count` of the current service's function intents failed
 /// after their retries, `for_capacity` of them because the model refused for
 /// capacity.
@@ -604,7 +598,7 @@ pub fn record_intents_failed(count: usize, for_capacity: usize) {
     registry()
         .lock()
         .expect("scan health lock")
-        .record_intents_failed(count, for_capacity);
+        .record_intents_failed(&crate::current_service::name(), count, for_capacity);
 }
 
 /// What `service` still owes the model.
@@ -850,7 +844,7 @@ mod tests {
 
         let mut registry = run();
         registry.record_files_attempted(2);
-        registry.record_unanalysed_file("src/a.ts", &analysis_failure_reason(&failed));
+        registry.record_unanalysed_file(&None, "src/a.ts", &analysis_failure_reason(&failed));
         assert_eq!(registry.lost_file_count(), 1);
         assert_eq!(registry.service_losses(&None).files, 1);
         assert!(registry.not_refreshed_line().is_none());
@@ -896,11 +890,9 @@ mod tests {
     #[test]
     fn left_out_pubsub_rows_are_counted_once_per_service() {
         let mut run = run();
-        run.current = Some("api".to_string());
-        run.record_in_process_pubsub(16);
-        run.record_in_process_pubsub(16);
-        run.current = Some("worker".to_string());
-        run.record_in_process_pubsub(2);
+        run.record_in_process_pubsub(&Some("api".to_string()), 16);
+        run.record_in_process_pubsub(&Some("api".to_string()), 16);
+        run.record_in_process_pubsub(&Some("worker".to_string()), 2);
         assert_eq!(
             run.in_process_pubsub_line().as_deref(),
             Some("18 pub/sub call(s) left out of the index: their events stay inside the service.")
@@ -915,7 +907,11 @@ mod tests {
     fn a_lost_file_is_named_and_owed_by_its_service() {
         let mut run = run();
         run.record_files_attempted(3);
-        run.record_unanalysed_file("src/routes/orders.ts", &LossReason::owed("gateway_error"));
+        run.record_unanalysed_file(
+            &None,
+            "src/routes/orders.ts",
+            &LossReason::owed("gateway_error"),
+        );
 
         let summary = run
             .summary_line()
@@ -939,13 +935,15 @@ mod tests {
         let api = Some("api".to_string());
         let billing = Some("billing".to_string());
         let mut run = run();
-        run.current = api.clone();
         run.record_files_attempted(4);
-        run.record_unanalysed_file("api/src/a.ts", &LossReason::owed("model_error"));
-        run.current = billing.clone();
+        run.record_unanalysed_file(&api, "api/src/a.ts", &LossReason::owed("model_error"));
         run.record_files_attempted(2);
-        run.record_unanalysed_file("billing/src/b.ts", &LossReason::owed("gateway_error"));
-        run.record_intents_failed(3, 0);
+        run.record_unanalysed_file(
+            &billing,
+            "billing/src/b.ts",
+            &LossReason::owed("gateway_error"),
+        );
+        run.record_intents_failed(&billing, 3, 0);
 
         assert_eq!(run.service_losses(&api).files, 1);
         assert_eq!(run.service_losses(&api).intents, 0);
@@ -963,6 +961,37 @@ mod tests {
         assert_eq!(run.attempted, 5);
     }
 
+    /// carrick#1066. Two services analysed side by side, their awaits
+    /// interleaving, each file their losses under their own name, including
+    /// the ones recorded on a task the service started through the helper.
+    /// Names no other test uses: the registry is the process's.
+    #[tokio::test]
+    async fn losses_recorded_side_by_side_are_each_services_own() {
+        const LEFT: &str = "side-by-side-left-1066";
+        const RIGHT: &str = "side-by-side-right-1066";
+        forget_service_losses(Some(LEFT));
+        forget_service_losses(Some(RIGHT));
+        let analyse = |service: &'static str, files: usize, intents: usize| {
+            crate::current_service::scope(Some(service.to_string()), async move {
+                for n in 0..files {
+                    tokio::task::yield_now().await;
+                    record_unanalysed_file(&format!("{service}/{n}.ts"), &LossReason::owed("x"));
+                }
+                crate::current_service::spawn(async move { record_intents_failed(intents, 0) })
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::join!(analyse(LEFT, 3, 5), analyse(RIGHT, 1, 2));
+
+        let (left, right) = (service_losses(Some(LEFT)), service_losses(Some(RIGHT)));
+        assert_eq!((left.files, left.intents), (3, 5));
+        assert_eq!((right.files, right.intents), (1, 2));
+        assert_eq!(unanalysed_files_for(Some(RIGHT)).len(), 1);
+        forget_service_losses(Some(LEFT));
+        forget_service_losses(Some(RIGHT));
+    }
+
     /// carrick#1896: what a service owes is split by whether waiting can mend
     /// it. A file or an intent the model refused for capacity is counted as
     /// one; a file the gateway cut, a lost connection and an intent the model
@@ -972,19 +1001,26 @@ mod tests {
         let api = Some("api".to_string());
         let billing = Some("billing".to_string());
         let mut run = run();
-        run.current = api.clone();
-        run.record_unanalysed_file("api/src/a.ts", &LossReason::owed("gateway_error"));
-        run.record_unanalysed_file("api/src/b.ts", &LossReason::owed("network_error"));
-        run.record_unanalysed_file("api/src/c.ts", &LossReason::owed("analysis_in_flight"));
-        run.record_intents_failed(4, 0);
-        run.current = billing.clone();
+        run.record_unanalysed_file(&api, "api/src/a.ts", &LossReason::owed("gateway_error"));
+        run.record_unanalysed_file(&api, "api/src/b.ts", &LossReason::owed("network_error"));
         run.record_unanalysed_file(
+            &api,
+            "api/src/c.ts",
+            &LossReason::owed("analysis_in_flight"),
+        );
+        run.record_intents_failed(&api, 4, 0);
+        run.record_unanalysed_file(
+            &billing,
             "billing/src/a.ts",
             &LossReason::owed(crate::agent_service::CAPACITY_REFUSAL_CODE),
         );
-        run.record_unanalysed_file("billing/src/b.ts", &LossReason::owed("gateway_error"));
-        run.record_intents_failed(5, 2);
-        run.record_intents_failed(1, 1);
+        run.record_unanalysed_file(
+            &billing,
+            "billing/src/b.ts",
+            &LossReason::owed("gateway_error"),
+        );
+        run.record_intents_failed(&billing, 5, 2);
+        run.record_intents_failed(&billing, 1, 1);
 
         assert_eq!(
             run.service_losses(&api),
@@ -1039,11 +1075,10 @@ mod tests {
 
         let api = Some("api".to_string());
         let mut run = run();
-        run.current = api.clone();
         run.record_files_attempted(3);
-        run.record_unanalysed_file("api/src/a.ts", &analysis_failure_reason(&refused));
-        run.record_unanalysed_file("api/src/b.ts", &analysis_failure_reason(&unasked));
-        run.record_unanalysed_file("api/src/c.ts", &analysis_failure_reason(&unasked));
+        run.record_unanalysed_file(&api, "api/src/a.ts", &analysis_failure_reason(&refused));
+        run.record_unanalysed_file(&api, "api/src/b.ts", &analysis_failure_reason(&unasked));
+        run.record_unanalysed_file(&api, "api/src/c.ts", &analysis_failure_reason(&unasked));
 
         assert_eq!(
             run.service_losses(&api),
@@ -1095,12 +1130,20 @@ mod tests {
         let mut run = run();
         run.record_files_attempted(2987);
         for i in 0..8 {
-            run.record_unanalysed_file(&format!("a/{i}.ts"), &LossReason::owed("gateway_error"));
+            run.record_unanalysed_file(
+                &None,
+                &format!("a/{i}.ts"),
+                &LossReason::owed("gateway_error"),
+            );
         }
         for i in 0..3 {
-            run.record_unanalysed_file(&format!("b/{i}.ts"), &LossReason::owed("model_error"));
+            run.record_unanalysed_file(
+                &None,
+                &format!("b/{i}.ts"),
+                &LossReason::owed("model_error"),
+            );
         }
-        run.record_unanalysed_file("c/0.ts", &LossReason::owed("oidc_rejected"));
+        run.record_unanalysed_file(&None, "c/0.ts", &LossReason::owed("oidc_rejected"));
 
         let summary = run.summary_line().unwrap();
         assert!(
@@ -1246,8 +1289,8 @@ mod tests {
         let truncated = AgentCallError::from_cloud("output_truncated", "every try was cut", false);
         let mut run = run();
         run.record_files_attempted(3);
-        run.record_unanalysed_file("src/routes.ts", &analysis_failure_reason(&truncated));
-        run.record_unanalysed_file("src/orders.ts", &LossReason::owed("gateway_error"));
+        run.record_unanalysed_file(&None, "src/routes.ts", &analysis_failure_reason(&truncated));
+        run.record_unanalysed_file(&None, "src/orders.ts", &LossReason::owed("gateway_error"));
 
         assert_eq!(
             run.service_losses(&None),

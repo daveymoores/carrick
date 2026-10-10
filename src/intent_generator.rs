@@ -117,29 +117,144 @@ impl PreviousIntents {
 /// it once, and its callers then see the same callee intent in every member,
 /// so they dedupe too. The key material itself is unchanged.
 ///
-/// Services are analysed one after another, so a later service reads what an
-/// earlier one settled; only described intents are recorded, never failures,
-/// so a later service still asks for a function an earlier one failed on.
+/// A later service reads what an earlier one settled; only described intents
+/// are recorded, never failures, so a later service still asks for a function
+/// an earlier one failed on.
+///
+/// Services analysed side by side can hold one `(name, hash)` at once, and a
+/// read made when a level starts is minutes older than the answer it would
+/// have waited for. So a request is claimed when it is sent ([`Self::claim`]):
+/// the first service to send a key holds it, and another that wants the same
+/// key waits for the answer instead of paying for it twice (carrick#1066).
 #[derive(Debug, Clone, Default)]
 pub struct RunIntentMemo {
-    described: std::sync::Arc<std::sync::Mutex<HashMap<(String, String), String>>>,
+    state: std::sync::Arc<std::sync::Mutex<MemoState>>,
 }
 
+type MemoKey = (String, String);
+
+#[derive(Debug, Default)]
+struct MemoState {
+    described: HashMap<MemoKey, String>,
+    /// Keys whose request is in flight, each by the claim that sent it.
+    claimed: HashMap<MemoKey, InFlightClaim>,
+    next_claim: u64,
+}
+
+#[derive(Debug)]
+struct InFlightClaim {
+    id: u64,
+    /// Closed when the claim ends, answered or not.
+    ended: tokio::sync::watch::Receiver<()>,
+}
+
+/// What [`RunIntentMemo::claim`] found for a key.
+enum Claimed {
+    /// Another service already described it.
+    Described(String),
+    /// Nobody holds it: the caller sends the request, and holds the key until
+    /// it has the answer.
+    Yours(Lease),
+    /// Another service has its request in flight.
+    Waiting(Waiter),
+}
+
+/// The right to send one key's request. Dropped without
+/// [`Self::record`] (the request failed, or the task holding it was aborted)
+/// it frees the key for whoever waits.
+struct Lease {
+    memo: RunIntentMemo,
+    key: MemoKey,
+    id: u64,
+    /// Dropped after the claim is removed, which is what wakes the waiters.
+    _ended: tokio::sync::watch::Sender<()>,
+}
+
+/// A wait for another service's request on the same key to end.
+struct Waiter(tokio::sync::watch::Receiver<()>);
+
 impl RunIntentMemo {
-    fn get(&self, name: &str, hash: &str) -> Option<String> {
-        self.described
+    fn state(&self) -> std::sync::MutexGuard<'_, MemoState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get(&self, name: &str, hash: &str) -> Option<String> {
+        self.state()
+            .described
             .get(&(name.to_string(), hash.to_string()))
             .cloned()
     }
 
     fn record(&self, name: &str, hash: &str, intent: &str) {
-        self.described
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.state()
+            .described
             .entry((name.to_string(), hash.to_string()))
             .or_insert_with(|| intent.to_string());
+    }
+
+    /// Take the right to send `name`'s request for content `hash`, unless it
+    /// is described or another claim holds it.
+    ///
+    /// Taken when the request is about to be sent, never when a level starts,
+    /// and never held while waiting for another key: a service that waits
+    /// holds nothing a service it waits on could be waiting for.
+    fn claim(&self, name: &str, hash: &str) -> Claimed {
+        let key = (name.to_string(), hash.to_string());
+        let mut state = self.state();
+        if let Some(intent) = state.described.get(&key) {
+            return Claimed::Described(intent.clone());
+        }
+        match state.claimed.get(&key) {
+            // A claim whose lease is gone without having cleared it can never
+            // be answered: take the key rather than wait on it.
+            Some(held) if held.ended.has_changed().is_err() => {
+                state.claimed.remove(&key);
+            }
+            Some(held) => return Claimed::Waiting(Waiter(held.ended.clone())),
+            None => {}
+        }
+        let (ended_tx, ended) = tokio::sync::watch::channel(());
+        let id = state.next_claim;
+        state.next_claim += 1;
+        state
+            .claimed
+            .insert(key.clone(), InFlightClaim { id, ended });
+        Claimed::Yours(Lease {
+            memo: self.clone(),
+            key,
+            id,
+            _ended: ended_tx,
+        })
+    }
+}
+
+impl Lease {
+    /// The request was answered: keep the intent for every service after.
+    fn record(self, intent: &str) {
+        self.memo.record(&self.key.0, &self.key.1, intent);
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut state = self.memo.state();
+        if state
+            .claimed
+            .get(&self.key)
+            .is_some_and(|c| c.id == self.id)
+        {
+            state.claimed.remove(&self.key);
+        }
+    }
+}
+
+impl Waiter {
+    /// Wait until the claim being waited on has ended, answered or not.
+    async fn ended(mut self) {
+        // Nothing is ever sent on the channel: it closes when the claim ends.
+        let _ = self.0.changed().await;
     }
 }
 
@@ -437,6 +552,70 @@ where
     done.sort_by_key(|(idx, _, _)| *idx);
     done.into_iter()
         .map(|(_, pending, result)| (pending, result))
+        .collect()
+}
+
+/// Whether a model answer is an intent worth keeping once trimmed: not empty
+/// and under 500 bytes. Anything else is dropped and its function asked again
+/// next scan.
+fn is_keepable_intent(trimmed: &str) -> bool {
+    !trimmed.is_empty() && trimmed.len() < 500
+}
+
+/// [`describe_unit`] for requests the run's other services may be making too:
+/// each function's key is claimed as the request is sent, one described since
+/// the level started is not sent at all, and one another service has in
+/// flight waits for that answer. A claim that ends without one (its request
+/// failed, or its service stopped) leaves the function to be sent here.
+///
+/// Claims are held only across the request, and the waits come after it, so
+/// no service waits while holding a key another is waiting for.
+async fn describe_unit_leased<S, SFut>(
+    unit: Vec<Pending>,
+    memo: &RunIntentMemo,
+    state: &BatchState,
+    send: S,
+) -> Vec<(Pending, Result<String, AgentCallError>)>
+where
+    S: Fn(serde_json::Value) -> SFut,
+    SFut: std::future::Future<Output = Result<String, AgentCallError>>,
+{
+    let mut settled: Vec<Option<(Pending, Result<String, AgentCallError>)>> =
+        (0..unit.len()).map(|_| None).collect();
+    let mut todo: Vec<(usize, Pending)> = unit.into_iter().enumerate().collect();
+    while !todo.is_empty() {
+        let mut mine: Vec<(usize, Pending)> = Vec::new();
+        let mut leases: Vec<Lease> = Vec::new();
+        let mut waiting: Vec<(usize, Pending, Waiter)> = Vec::new();
+        for (idx, pending) in std::mem::take(&mut todo) {
+            match memo.claim(&pending.name, &pending.hash) {
+                Claimed::Described(intent) => settled[idx] = Some((pending, Ok(intent))),
+                Claimed::Yours(lease) => {
+                    leases.push(lease);
+                    mine.push((idx, pending));
+                }
+                Claimed::Waiting(waiter) => waiting.push((idx, pending, waiter)),
+            }
+        }
+        if !mine.is_empty() {
+            let (indices, pendings): (Vec<usize>, Vec<Pending>) = mine.into_iter().unzip();
+            let answers = describe_unit(pendings, state, &send).await;
+            for ((idx, lease), (pending, result)) in indices.into_iter().zip(leases).zip(answers) {
+                match result.as_deref().map(str::trim) {
+                    Ok(intent) if is_keepable_intent(intent) => lease.record(intent),
+                    _ => drop(lease),
+                }
+                settled[idx] = Some((pending, result));
+            }
+        }
+        for (idx, pending, waiter) in waiting {
+            waiter.ended().await;
+            todo.push((idx, pending));
+        }
+    }
+    settled
+        .into_iter()
+        .map(|slot| slot.expect("every function of the unit is settled"))
         .collect()
 }
 
@@ -755,7 +934,7 @@ async fn describe_functions<S, SFut>(
         let send = &send;
         let outcomes: Vec<(Pending, Result<String, AgentCallError>)> =
             generate_level(units, intent_concurrency(), |unit| async move {
-                describe_unit(unit, state, send).await
+                describe_unit_leased(unit, memo, state, send).await
             })
             .await
             .into_iter()
@@ -774,7 +953,7 @@ async fn describe_functions<S, SFut>(
             match result {
                 Ok(intent) => {
                     let intent = intent.trim().to_string();
-                    if !intent.is_empty() && intent.len() < 500 {
+                    if is_keepable_intent(&intent) {
                         memo.record(&name, &hash, &intent);
                         hashes.insert(name.clone(), hash);
                         intents.insert(name, intent);
@@ -904,7 +1083,9 @@ impl IntentsInFlight {
         previous: PreviousIntents,
         memo: RunIntentMemo,
     ) -> Self {
-        let task = tokio::spawn(async move {
+        // A task of the service that starts it: its losses, its requests and
+        // its calls' header name that service (carrick#1066).
+        let task = crate::current_service::spawn(async move {
             generate_function_intents(&agent_service, &mut function_definitions, &previous, &memo)
                 .await;
             function_definitions
@@ -2151,6 +2332,47 @@ mod tests {
         assert!(defs["helper"].body_source.is_none());
     }
 
+    /// carrick#1066. The task intents run on is started inside the service's
+    /// scope: its requests are counted against that service, as the ones the
+    /// service's own future makes are, and not against nobody.
+    #[tokio::test]
+    async fn the_intents_task_works_for_the_service_that_started_it() {
+        const SERVICE: &str = "intents-task-1066";
+        let _env = ENV_LOCK.lock().await;
+        let prev_mock = std::env::var("CARRICK_MOCK_ALL").ok();
+        // SAFETY: serialized on ENV_LOCK and restored below.
+        unsafe { std::env::set_var("CARRICK_MOCK_ALL", "1") };
+        let mut defs = HashMap::new();
+        defs.insert(
+            "helper".to_string(),
+            def_with_body("helper", "const rate = table[region];\nreturn base * rate;"),
+        );
+        let _ = crate::agent_service::requests_of_service(Some(SERVICE));
+
+        crate::current_service::scope(Some(SERVICE.to_string()), async {
+            IntentsInFlight::start(
+                AgentService::new(),
+                defs,
+                PreviousIntents::default(),
+                RunIntentMemo::default(),
+            )
+            .finish()
+            .await
+        })
+        .await;
+        unsafe {
+            match prev_mock {
+                Some(v) => std::env::set_var("CARRICK_MOCK_ALL", v),
+                None => std::env::remove_var("CARRICK_MOCK_ALL"),
+            }
+        }
+
+        assert_eq!(
+            crate::agent_service::requests_of_service(Some(SERVICE)),
+            "generate-intent 1"
+        );
+    }
+
     // ------------------------------------- key material pinned (#1080)
 
     /// A recording `/generate-intent` transport for [`describe_functions`]:
@@ -2500,6 +2722,229 @@ mod tests {
                 def.intent_input_hash, member_a[key].intent_input_hash,
                 "{key}"
             );
+        }
+    }
+
+    /// `send` that answers `after` the time a model round trip takes, so two
+    /// services' requests overlap on one runtime.
+    fn slow_send<'a>(
+        recorder: &'a Recorder,
+        after: std::time::Duration,
+    ) -> impl Fn(
+        serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, AgentCallError>> + 'a>,
+    > + 'a {
+        move |payload| {
+            let answered = recorder.send(payload);
+            Box::pin(async move {
+                tokio::time::sleep(after).await;
+                answered.await
+            })
+        }
+    }
+
+    fn requests_naming(recorder: &Recorder, name: &str) -> usize {
+        recorder
+            .asked()
+            .iter()
+            .filter(|n| n.as_str() == name)
+            .count()
+    }
+
+    const ROUND_TRIP: std::time::Duration = std::time::Duration::from_millis(30);
+
+    /// carrick#1066. Two services hold the same functions and describe them
+    /// side by side. The memo is read when a level starts, so both miss; the
+    /// first to send a function holds it, and the other waits for the answer
+    /// instead of paying for it twice. Counted at the transport, because a
+    /// mock answer is one constant sentence and bytes cannot show a race.
+    #[tokio::test]
+    async fn a_function_two_services_describe_side_by_side_is_sent_once() {
+        let _env = ENV_LOCK.lock().await;
+        let memo = RunIntentMemo::default();
+        let nothing_before = PreviousIntents::default();
+        let recorder = Recorder::default();
+        let (mut left, mut right) = (layered_fixture(), layered_fixture());
+
+        tokio::join!(
+            describe_functions(
+                &mut left,
+                &nothing_before,
+                &memo,
+                slow_send(&recorder, ROUND_TRIP)
+            ),
+            describe_functions(
+                &mut right,
+                &nothing_before,
+                &memo,
+                slow_send(&recorder, ROUND_TRIP)
+            ),
+        );
+
+        assert_eq!(recorder.asked().len(), 5, "{:?}", recorder.asked());
+        for name in ["a1", "a2", "b1", "mid", "top"] {
+            assert_eq!(requests_naming(&recorder, name), 1, "{name} was sent twice");
+            assert!(left[name].intent.is_some(), "left {name}");
+            assert_eq!(left[name].intent, right[name].intent, "{name}");
+            assert_eq!(
+                left[name].intent_input_hash, right[name].intent_input_hash,
+                "{name}"
+            );
+        }
+    }
+
+    /// carrick#1066. A waiter gets a function's intent when its request is
+    /// answered, not when the claimant's whole level is: one request of the
+    /// level is slow, and the waiter must not send the quick one again while
+    /// the claimant is still waiting on the slow one.
+    #[tokio::test]
+    async fn a_waiter_is_given_an_answer_as_soon_as_it_arrives() {
+        let _env = ENV_LOCK.lock().await;
+        let prev_size = std::env::var("CARRICK_INTENT_BATCH_SIZE").ok();
+        // SAFETY: serialized on ENV_LOCK and restored below. One function per
+        // request, so the level's requests answer at different times.
+        unsafe { std::env::set_var("CARRICK_INTENT_BATCH_SIZE", "1") };
+        let memo = RunIntentMemo::default();
+        let nothing_before = PreviousIntents::default();
+        let recorder = Recorder::default();
+        let (mut left, mut right) = (layered_fixture(), layered_fixture());
+        let by_name = |payload: serde_json::Value| {
+            let after = if payload["name"] == "a1" {
+                std::time::Duration::from_millis(10)
+            } else {
+                std::time::Duration::from_millis(120)
+            };
+            let answered = recorder.send(payload);
+            async move {
+                tokio::time::sleep(after).await;
+                answered.await
+            }
+        };
+
+        tokio::join!(
+            describe_functions(&mut left, &nothing_before, &memo, by_name),
+            describe_functions(&mut right, &nothing_before, &memo, by_name),
+        );
+        unsafe {
+            match prev_size {
+                Some(v) => std::env::set_var("CARRICK_INTENT_BATCH_SIZE", v),
+                None => std::env::remove_var("CARRICK_INTENT_BATCH_SIZE"),
+            }
+        }
+
+        for name in ["a1", "a2", "b1", "mid", "top"] {
+            assert_eq!(requests_naming(&recorder, name), 1, "{name} was sent twice");
+        }
+        assert_eq!(left["a1"].intent, right["a1"].intent);
+    }
+
+    /// carrick#1066. A claim whose lease is gone without having cleared it
+    /// (it can never be answered) is taken over, not waited on.
+    #[tokio::test]
+    async fn a_claim_whose_lease_is_gone_is_taken_over() {
+        let memo = RunIntentMemo::default();
+        let (ended_tx, ended) = tokio::sync::watch::channel(());
+        let key = ("fn".to_string(), "hash".to_string());
+        memo.state()
+            .claimed
+            .insert(key, InFlightClaim { id: 0, ended });
+        drop(ended_tx);
+
+        let lease = memo.claim("fn", "hash");
+        assert!(matches!(lease, Claimed::Yours(_)));
+        assert!(
+            matches!(memo.claim("fn", "hash"), Claimed::Waiting(_)),
+            "the new holder is waited on like any other"
+        );
+    }
+
+    /// carrick#1066. The service that sent a function fails. The one waiting
+    /// on it asks for itself and gets the intent; the failed service keeps
+    /// none, as a failed call always left it.
+    #[tokio::test]
+    async fn a_waiter_asks_for_itself_when_the_claimant_fails() {
+        let _env = ENV_LOCK.lock().await;
+        let memo = RunIntentMemo::default();
+        let nothing_before = PreviousIntents::default();
+        let recorder = Recorder::default();
+        let first_request = std::sync::atomic::AtomicBool::new(true);
+        let (mut left, mut right) = (layered_fixture(), layered_fixture());
+
+        let failing_once = |payload: serde_json::Value| {
+            let answered = recorder.send(payload);
+            let fail = first_request.swap(false, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                tokio::time::sleep(ROUND_TRIP).await;
+                let text = answered.await?;
+                if fail {
+                    Err(AgentCallError::from_cloud(
+                        "model_error",
+                        "retries exhausted",
+                        true,
+                    ))
+                } else {
+                    Ok(text)
+                }
+            }
+        };
+        tokio::join!(
+            describe_functions(&mut left, &nothing_before, &memo, failing_once),
+            describe_functions(
+                &mut right,
+                &nothing_before,
+                &memo,
+                slow_send(&recorder, ROUND_TRIP)
+            ),
+        );
+
+        assert!(
+            left["a1"].intent.is_none(),
+            "the failed call gave no intent"
+        );
+        assert!(right["a1"].intent.is_some(), "the waiter asked for itself");
+        assert_eq!(
+            requests_naming(&recorder, "a1"),
+            2,
+            "failed once, asked once more"
+        );
+    }
+
+    /// carrick#1066. The service that sent a function is stopped mid-ask (its
+    /// analysis failed, or the scan was interrupted). Its claim ends with it
+    /// and the waiter asks for itself.
+    #[tokio::test]
+    async fn a_waiter_asks_for_itself_when_the_claimant_is_dropped_mid_ask() {
+        let _env = ENV_LOCK.lock().await;
+        let memo = RunIntentMemo::default();
+        let nothing_before = PreviousIntents::default();
+        let recorder = Recorder::default();
+        let (mut left, mut right) = (layered_fixture(), layered_fixture());
+
+        let (stopped, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                describe_functions(
+                    &mut left,
+                    &nothing_before,
+                    &memo,
+                    slow_send(&recorder, ROUND_TRIP * 3)
+                ),
+            ),
+            describe_functions(
+                &mut right,
+                &nothing_before,
+                &memo,
+                slow_send(&recorder, ROUND_TRIP)
+            ),
+        );
+
+        assert!(
+            stopped.is_err(),
+            "the claimant was stopped before it answered"
+        );
+        for name in ["a1", "a2", "b1", "mid", "top"] {
+            assert!(right[name].intent.is_some(), "the waiter described {name}");
         }
     }
 
