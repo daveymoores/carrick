@@ -44,6 +44,8 @@ Neither flag is listed in `carrick --help`.
 | `CARRICK_RUN_REPO_COUNT` | How many repositories the run covers, so the cloud waits for all of them before it mails. |
 | `CARRICK_SIDECAR_MAX_OLD_SPACE_MB` | The type checker's V8 heap cap, in MB. `0` passes no cap. |
 | `CARRICK_ALLOW_UNPREPARED` | Scan a checkout whose dependencies are not installed instead of refusing it. |
+| `CARRICK_PROMPT_ENDPOINT` | Where the four prompt routes (`/analyze-file`, `/generate-intent`, `/framework-detect`, `/framework-guidance`) are sent, instead of the build-time endpoint. `http://127.0.0.1:<port>` or `http://[::1]:<port>` only; anything else is a usage error (exit 2). `/library-claims` and `/types/check-or-upload` keep the build-time endpoint. Headers and bodies are unchanged. |
+| `CARRICK_PROMPT_TIMEOUT_SECS` | The per-request timeout of the four prompt routes, in whole seconds, 1 to 900; anything else is a usage error (exit 2). Unset: 60. Other routes keep 60. |
 
 ## Clone shape
 
