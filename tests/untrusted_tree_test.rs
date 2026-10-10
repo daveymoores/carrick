@@ -186,11 +186,15 @@ fn with_the_switch_a_link_out_of_the_checkout_is_never_read() {
         "the outside file reached the output:\n{}",
         scan.output
     );
-    assert!(
-        scan.output.contains(
-            "Left out 1 symbolic link(s) whose real path is outside the repository: src/link.ts."
-        ),
-        "the scan says what it left out:\n{}",
+    assert_eq!(
+        scan.output
+            .matches(
+                "Left out 1 symbolic link(s) whose real path is outside the repository: \
+                 src/link.ts."
+            )
+            .count(),
+        1,
+        "the scan says once what it left out:\n{}",
         scan.output
     );
     assert!(

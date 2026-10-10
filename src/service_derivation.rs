@@ -684,10 +684,7 @@ fn leaves_repository(root: &Path, path: &str) -> bool {
     Path::new(path)
         .components()
         .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-        || root
-            .join(path)
-            .canonicalize()
-            .is_ok_and(|resolved| !resolved.starts_with(root))
+        || crate::file_finder::resolves_outside(root, &root.join(path))
 }
 
 /// Every path a service declares must name something inside the repository,

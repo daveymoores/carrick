@@ -252,11 +252,17 @@ fn checkout_bound(scan_root: &Path) -> PathBuf {
 /// inside the bound is inside it, unless it is a link itself. A link that
 /// does not resolve reads nothing and is not counted here.
 fn links_outside(entry: &walkdir::DirEntry, bound: &Path) -> bool {
-    entry.path_is_symlink()
-        && entry
-            .path()
-            .canonicalize()
-            .is_ok_and(|real| !real.starts_with(bound))
+    entry.path_is_symlink() && resolves_outside(bound, entry.path())
+}
+
+/// Whether `path` exists and its real path, every link on the way resolved,
+/// is outside `bound`, a canonical directory. A path that does not resolve
+/// is not judged here: whoever reads it reports it missing. The one test of
+/// "does this leave the repository" for the walk (carrick#2230), the config
+/// (carrick#2245) and declared schemas (carrick#2249).
+pub fn resolves_outside(bound: &Path, path: &Path) -> bool {
+    path.canonicalize()
+        .is_ok_and(|real| !real.starts_with(bound))
 }
 
 /// The paths the checkout at `top` declares as its submodules, relative to
@@ -958,7 +964,7 @@ pub fn find_service_files(
     service: &crate::config::Config,
     ignore_patterns: &[&str],
 ) -> (Vec<PathBuf>, Option<PathBuf>) {
-    let walk = walk_service(repo_path, service, ignore_patterns);
+    let walk = walk_service_quietly(repo_path, service, ignore_patterns);
     (walk.files, walk.manifest)
 }
 
@@ -989,18 +995,14 @@ pub struct ServiceWalk {
     pub links_outside: Vec<PathBuf>,
 }
 
-/// Say, once per link per process, which links an untrusted walk left out
-/// (carrick#2230). A scan walks a service more than once (its import sample
-/// is read ahead of discovery), and the reader is told once. Names the link
+/// Say which links an untrusted walk left out (carrick#2230), naming each
 /// where it sits in the repository, never where it points.
 fn log_links_outside(repo_root: &Path, links: &[PathBuf]) {
-    static TOLD: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    let Ok(mut told) = TOLD.get_or_init(Default::default).lock() else {
+    if links.is_empty() {
         return;
-    };
-    let new: Vec<String> = links
+    }
+    let listing: Vec<String> = links
         .iter()
-        .filter(|link| told.insert((*link).clone()))
         .map(|link| {
             link.strip_prefix(repo_root)
                 .unwrap_or(link)
@@ -1008,13 +1010,11 @@ fn log_links_outside(repo_root: &Path, links: &[PathBuf]) {
                 .to_string()
         })
         .collect();
-    if !new.is_empty() {
-        tracing::info!(
-            "Left out {} symbolic link(s) whose real path is outside the repository: {}. This scan reads only the repository.",
-            new.len(),
-            new.join(", ")
-        );
-    }
+    tracing::info!(
+        "Left out {} symbolic link(s) whose real path is outside the repository: {}. This scan reads only the repository.",
+        listing.len(),
+        listing.join(", ")
+    );
 }
 
 /// The ignored paths a reader is told were left out, from the paths the walk
@@ -1062,8 +1062,22 @@ pub struct ExcludedFiles {
     pub files: usize,
 }
 
-/// [`find_service_files`], with the directories the walk stopped at.
+/// [`find_service_files`], with the directories the walk stopped at. The
+/// scan's own walk of a service: it says which links an untrusted walk left
+/// out ([`log_links_outside`]), where the other readers of a service's files
+/// ([`find_service_files`]) say nothing, so a scan says it once.
 pub fn walk_service(
+    repo_path: &str,
+    service: &crate::config::Config,
+    ignore_patterns: &[&str],
+) -> ServiceWalk {
+    let walk = walk_service_quietly(repo_path, service, ignore_patterns);
+    log_links_outside(Path::new(repo_path), &walk.links_outside);
+    walk
+}
+
+/// [`walk_service`], saying nothing.
+fn walk_service_quietly(
     repo_path: &str,
     service: &crate::config::Config,
     ignore_patterns: &[&str],
@@ -1179,7 +1193,6 @@ pub fn walk_service(
     let mut links_outside = stopped.outside;
     links_outside.sort();
     links_outside.dedup();
-    log_links_outside(root, &links_outside);
 
     ServiceWalk {
         files,
