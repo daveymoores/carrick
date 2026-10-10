@@ -55,11 +55,12 @@ import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
-import { boundedCompilerHost, boundedSys, untrustedReadBound, type ReadBound } from '../checkout.js';
+import { boundedCompilerHost, boundedSys, untrustedReadBound, type ReadBound } from './checkout.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
+export { isInsideCheckout, untrustedReadBound, UNTRUSTED_TREE_ENV, type ReadBound } from './checkout.js';
 export { serviceConfigPath } from './project-references.js';
 export { findServiceTsconfig } from './service-config.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar

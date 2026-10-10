@@ -22,7 +22,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { captureStub } from '../src/capture/index.js';
 import { ProjectLoader } from '../src/project-loader.js';
-import { UNTRUSTED_TREE_ENV } from '../src/checkout.js';
+import { UNTRUSTED_TREE_ENV } from '../src/capture/checkout.js';
 
 const SENTINEL = 'SENTINEL_9f3c_outside';
 const PKG_MARK = 'PKG_MARK_inside_link';

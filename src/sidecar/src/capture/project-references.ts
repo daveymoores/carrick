@@ -20,7 +20,7 @@
 
 import * as path from 'node:path';
 import ts from 'typescript';
-import { boundedSys, untrustedReadBound } from '../checkout.js';
+import { boundedSys, untrustedReadBound } from './checkout.js';
 
 /** One parsed tsconfig. */
 export interface ServiceProject {

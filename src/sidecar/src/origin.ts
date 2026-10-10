@@ -16,7 +16,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { isInsideCheckout } from './checkout.js';
+import { isInsideCheckout } from './capture/index.js';
 import type { Project, ResolutionHostFactory, ts } from 'ts-morph';
 
 /**

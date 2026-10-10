@@ -93,6 +93,7 @@ describe('capture bundle seam (pinned decision 11a)', () => {
         if (!spec.includes('capture/')) continue;
         if (
           base === 'index.ts' ||
+          base === 'origin.ts' ||
           base === 'project-loader.ts' ||
           base === 'definition-resolver.ts' ||
           base === 'type-inferrer.ts' ||

@@ -10,7 +10,6 @@
  * - Pinned dependency snapshots for deterministic builds
  */
 
-import { boundedFileSystem, untrustedReadBound } from './checkout.js';
 import { Project, getCompilerOptionsFromTsConfig, type CompilerOptions, type FileSystemHost } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
@@ -21,6 +20,8 @@ import {
   findServiceTsconfig,
   serviceConfigPath,
   sidecarCompilerOptions,
+  untrustedReadBound,
+  type ReadBound,
 } from './capture/index.js';
 import { moduleFormatResolutionHost } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
@@ -583,4 +584,53 @@ export class ProjectLoader {
   private logError(message: string): void {
     console.error(`[sidecar:project-loader:error] ${message}`);
   }
+}
+
+/**
+ * A ts-morph file system that reads only inside the bound. ts-morph reads the
+ * tsconfig, lists the files it names and reads each through this host, and its
+ * module resolution asks it whether a file exists. Writes are not bounded:
+ * the write guard owns them (carrick#1748).
+ */
+function boundedFileSystem(bound: ReadBound): FileSystemHost {
+  const base = new Project({
+    compilerOptions: sidecarCompilerOptions({}),
+    skipAddingFilesFromTsConfig: true,
+    skipFileDependencyResolution: true,
+  }).getFileSystem();
+  const missing = (filePath: string): Error =>
+    Object.assign(new Error(`ENOENT: no such file or directory, open '${filePath}'`), { code: 'ENOENT' });
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      if (typeof value !== 'function') return value;
+      const fn = value.bind(target) as (...args: any[]) => any;
+      switch (prop) {
+        case 'readFileSync':
+          return (p: string, e?: string) => {
+            if (!bound.allows(p)) throw missing(p);
+            return fn(p, e);
+          };
+        case 'readFile':
+          return async (p: string, e?: string) => {
+            if (!bound.allows(p)) throw missing(p);
+            return fn(p, e);
+          };
+        case 'fileExistsSync':
+        case 'directoryExistsSync':
+          return (p: string) => bound.allows(p) && fn(p);
+        case 'fileExists':
+        case 'directoryExists':
+          return async (p: string) => bound.allows(p) && (await fn(p));
+        case 'readDirSync':
+          return (p: string) => (bound.allows(p) ? fn(p) : []);
+        case 'globSync':
+          return (patterns: string[]) => (fn(patterns) as string[]).filter((f) => bound.allows(f));
+        case 'glob':
+          return async (patterns: string[]) => ((await fn(patterns)) as string[]).filter((f) => bound.allows(f));
+        default:
+          return fn;
+      }
+    },
+  });
 }
