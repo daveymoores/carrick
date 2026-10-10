@@ -196,24 +196,45 @@ pub fn unchanged_since(repo_path: &str, commit: &str) -> Result<HashSet<String>,
     if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("{commit:?} is not a commit id"));
     }
-    let changed: HashSet<String> = nul_paths(run_git(
-        repo_path,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "--relative",
-            "-z",
-            commit,
-            "--",
-        ],
-    )?)
-    .into_iter()
-    .collect();
+    // On a partial clone, `git diff` compares an edited tracked file's bytes
+    // with the commit's copy, and that copy may be absent: git then fetches it
+    // from the promisor remote, and an unreachable remote fails the whole
+    // diff. With the stat-refresh off the diff compares object ids only, so an
+    // edited file reads as changed and nothing is fetched (carrick#2212). A
+    // full clone keeps git's default, which never fetches.
+    let mut diff_args = vec![];
+    if is_partial_clone(repo_path) {
+        diff_args.extend(["-c", "diff.autoRefreshIndex=false"]);
+    }
+    diff_args.extend([
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--relative",
+        "-z",
+        commit,
+        "--",
+    ]);
+    let changed: HashSet<String> = nul_paths(run_git(repo_path, &diff_args)?)
+        .into_iter()
+        .collect();
     Ok(nul_paths(run_git(repo_path, &["ls-files", "-z"])?)
         .into_iter()
         .filter(|path| !changed.contains(path))
         .collect())
+}
+
+/// Whether the checkout at `repo_path` is a partial clone: git's own marker,
+/// `extensions.partialClone` or a remote with `promisor = true`.
+fn is_partial_clone(repo_path: &str) -> bool {
+    let extension = run_git(repo_path, &["config", "--get", "extensions.partialClone"])
+        .is_ok_and(|out| !out.trim().is_empty());
+    extension
+        || run_git(
+            repo_path,
+            &["config", "--get-regexp", r"^remote\..*\.promisor$"],
+        )
+        .is_ok_and(|out| out.lines().any(|line| line.ends_with(" true")))
 }
 
 /// The parents of the commit checked out at `repo_path`, first parent first.
@@ -903,5 +924,89 @@ pub(crate) mod tests {
         assert_eq!(state, GitState::default());
         assert!(warnings(&state).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A runner's partial clone (`--filter=blob:none --depth=1`, then the
+    /// stored commit fetched the same way) with the server moved away, so any
+    /// lazy fetch fails loudly (carrick#2212). `a.txt` changed between the
+    /// stored commit and HEAD, so the stored copy of it is not held; `b.txt`
+    /// did not change. Returns the clone and the stored commit.
+    fn partial_clone_without_remote(
+        filter: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let root = tempfile::TempDir::new().unwrap();
+        let server = root.path().join("server");
+        std::fs::create_dir_all(&server).unwrap();
+        git_in(&server, &["init", "-q", "-b", "main"]);
+        git_in(&server, &["config", "uploadpack.allowFilter", "true"]);
+        git_in(
+            &server,
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        std::fs::write(server.join("a.txt"), "one\n").unwrap();
+        std::fs::write(server.join("b.txt"), "same\n").unwrap();
+        git_in(&server, &["add", "-A"]);
+        git_in(&server, &["commit", "-qm", "base"]);
+        let base = git_in(&server, &["rev-parse", "HEAD"]);
+        std::fs::write(server.join("a.txt"), "two\n").unwrap();
+        git_in(&server, &["commit", "-qam", "head"]);
+
+        let url = format!("file://{}", server.display());
+        let clone = root.path().join("clone");
+        let mut args = vec!["clone", "-q", "--depth=1"];
+        if filter {
+            args.push("--filter=blob:none");
+        }
+        args.extend([url.as_str(), clone.to_str().unwrap()]);
+        git_in(root.path(), &args);
+        let mut fetch = vec!["fetch", "-q", "--depth=1"];
+        if filter {
+            fetch.push("--filter=blob:none");
+        }
+        fetch.extend(["origin", base.as_str()]);
+        git_in(&clone, &fetch);
+        std::fs::rename(&server, root.path().join("server-gone")).unwrap();
+        (root, clone, base)
+    }
+
+    fn missing_objects(clone: &std::path::Path) -> usize {
+        git_in(
+            clone,
+            &["rev-list", "--objects", "--missing=print", "--all"],
+        )
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .count()
+    }
+
+    #[test]
+    fn a_clean_partial_clone_answers_without_fetching() {
+        let (_root, clone, base) = partial_clone_without_remote(true);
+        let before = missing_objects(&clone);
+        let set = unchanged_since(clone.to_str().unwrap(), &base).unwrap();
+        assert_eq!(set, HashSet::from(["b.txt".to_string()]));
+        assert_eq!(missing_objects(&clone), before);
+    }
+
+    /// The rewritten-lockfile case: a tracked file edited after checkout,
+    /// whose stored copy is absent, must read as changed, not fail the diff.
+    #[test]
+    fn an_edited_file_on_a_partial_clone_is_changed_not_a_failure() {
+        let (_root, clone, base) = partial_clone_without_remote(true);
+        let before = missing_objects(&clone);
+        std::fs::write(clone.join("a.txt"), "edited after checkout\n").unwrap();
+        let set = unchanged_since(clone.to_str().unwrap(), &base).unwrap();
+        assert_eq!(set, HashSet::from(["b.txt".to_string()]));
+        assert_eq!(missing_objects(&clone), before);
+    }
+
+    /// A full clone keeps git's default command and answers as before.
+    #[test]
+    fn an_edited_file_on_a_full_clone_is_changed() {
+        let (_root, clone, base) = partial_clone_without_remote(false);
+        std::fs::write(clone.join("a.txt"), "edited after checkout\n").unwrap();
+        assert!(!is_partial_clone(clone.to_str().unwrap()));
+        let set = unchanged_since(clone.to_str().unwrap(), &base).unwrap();
+        assert_eq!(set, HashSet::from(["b.txt".to_string()]));
     }
 }
