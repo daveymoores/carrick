@@ -1604,54 +1604,6 @@ impl AwsStorage {
         self.post_run_marker(token, request.action, &request).await;
     }
 
-    /// `close-scan`: the run ended, and it replaced no index (carrick#1262).
-    ///
-    /// The counterpart to `scan_final` for a run that writes nothing to the
-    /// cloud. A resume the cloud answered `superseded: true` finishes its
-    /// index locally and sends no write action at all, so the write that
-    /// carries `scan_final` never happens and the scan `start-scan` opened
-    /// stays open: the repo's in-flight slot keeps refusing the user's next
-    /// run for the quiet window, and the cloud's silent-scan sweep alerts
-    /// about a run that did exactly what it was asked to.
-    ///
-    /// Wire contract: the check-or-upload envelope,
-    /// `{ action: "close-scan", scan_id, reason }`, Bearer auth, 200
-    /// `{ ok: true }`. `reason` is a `[a-z_]{1,64}` token that the cloud
-    /// records as `unspecified` rather than refusing, because a 400 here
-    /// would confirm the very scan row the call names.
-    ///
-    /// Exactly the fail marker's delivery, and for the same reason: one
-    /// attempt, the same short timeout, every refusal at debug and none of
-    /// them able to change the run's exit code. The cloud deployed today
-    /// answers 403 from its action gate, which reads here as the nothing that
-    /// was sent before this existed — the slot falls to its TTL.
-    ///
-    /// Laptop credential and an open scan only: a CI run opens no scan, so
-    /// there is no slot to hand back and no `scan_id` to name it with.
-    pub async fn report_scan_closed(&self, reason: &str) {
-        let CloudAuth::Bearer(token) = &self.auth else {
-            return;
-        };
-        let Some(scan_id) = self.scan_id() else {
-            return;
-        };
-
-        #[derive(Serialize)]
-        struct CloseScanRequest<'a> {
-            action: &'a str,
-            scan_id: &'a str,
-            reason: &'a str,
-        }
-
-        let request = CloseScanRequest {
-            action: "close-scan",
-            scan_id: &scan_id,
-            reason,
-        };
-
-        self.post_run_marker(token, request.action, &request).await;
-    }
-
     /// Send one end-of-run marker, with one retry, and say at warn when both
     /// attempts failed (carrick#1472).
     ///
@@ -2381,6 +2333,55 @@ impl CloudStorage for AwsStorage {
             reason,
             scanner_version: env!("CARGO_PKG_VERSION"),
         };
+        self.post_run_marker(token, request.action, &request).await;
+    }
+
+    /// `close-scan`: the run ended, and it replaced no index (carrick#1262).
+    ///
+    /// The counterpart to `scan_final` for a run that writes nothing to the
+    /// cloud: a resume the cloud answered `superseded: true`, or a run told
+    /// `--no-upload` (carrick#2207). Neither sends a write action, so the
+    /// write that carries `scan_final` never happens and the scan
+    /// `start-scan` opened stays open: the repo's in-flight slot keeps
+    /// refusing the next run for the quiet window, and the cloud's
+    /// silent-scan sweep alerts about a run that did exactly what it was
+    /// asked to.
+    ///
+    /// Wire contract: the check-or-upload envelope,
+    /// `{ action: "close-scan", scan_id, reason }`, Bearer auth, 200
+    /// `{ ok: true }`. `reason` is a `[a-z_]{1,64}` token that the cloud
+    /// records as `unspecified` rather than refusing, because a 400 here
+    /// would confirm the very scan row the call names.
+    ///
+    /// Exactly the fail marker's delivery, and for the same reason: one
+    /// attempt, the same short timeout, every refusal at debug and none of
+    /// them able to change the run's exit code. The cloud deployed today
+    /// answers 403 from its action gate, which reads here as the nothing that
+    /// was sent before this existed — the slot falls to its TTL.
+    ///
+    /// Laptop credential and an open scan only: a CI run opens no scan, so
+    /// there is no slot to hand back and no `scan_id` to name it with.
+    async fn report_scan_closed(&self, reason: &str) {
+        let CloudAuth::Bearer(token) = &self.auth else {
+            return;
+        };
+        let Some(scan_id) = self.scan_id() else {
+            return;
+        };
+
+        #[derive(Serialize)]
+        struct CloseScanRequest<'a> {
+            action: &'a str,
+            scan_id: &'a str,
+            reason: &'a str,
+        }
+
+        let request = CloseScanRequest {
+            action: "close-scan",
+            scan_id: &scan_id,
+            reason,
+        };
+
         self.post_run_marker(token, request.action, &request).await;
     }
 
