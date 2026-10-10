@@ -1345,3 +1345,315 @@ fn a_service_root_outside_the_scan_root_is_never_prepared() {
         detected.text()
     );
 }
+
+// ---------------------------------------------------------------------------
+// carrick#2251: what a dependency the tree names brings with it. A git
+// dependency is cloned and prepared by a package manager started inside the
+// clone, which reads the clone's own config; a pnpm config dependency is a
+// package whose pnpmfile pnpm loads. Both are served from this machine, so
+// nothing leaves it.
+// ---------------------------------------------------------------------------
+
+/// A port nothing listens on yet.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind a free port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+/// Wait until something accepts on `port`, or fail the case: a server that
+/// never came up would make the default half fail for the wrong reason.
+fn await_listener(port: u16, what: &str) {
+    for _ in 0..200 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("{what} never listened on 127.0.0.1:{port}");
+}
+
+/// `git daemon` serving every repository under `base` as `git://127.0.0.1:<port>/<dir>`,
+/// killed on drop. Yarn Berry's URL parser rejects `git+file://`, and the
+/// `git://` protocol is a form every manager accepts with no network.
+struct GitDaemon {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl GitDaemon {
+    fn serve(base: &Path) -> Self {
+        let port = free_port();
+        let base_text = base.to_str().expect("utf-8 path");
+        let child = Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--export-all",
+                "--listen=127.0.0.1",
+                &format!("--port={port}"),
+                &format!("--base-path={base_text}"),
+                base_text,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start git daemon");
+        await_listener(port, "git daemon");
+        Self { child, port }
+    }
+
+    fn url(&self, repo: &str) -> String {
+        format!("git://127.0.0.1:{}/{repo}", self.port)
+    }
+}
+
+impl Drop for GitDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Commit everything in `dir` as a repository of its own.
+fn commit_repository(dir: &Path) {
+    sh(
+        dir,
+        "git init -q . && git add -A \
+         && git -c user.email=t@t -c user.name=t commit -q -m dep",
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn untrusted_mode_never_lets_a_yarn_git_dependency_load_its_own_config() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    // Yarn Berry prepares a git dependency by starting a package manager in
+    // the clone (`prepareExternalProject`): Yarn, Yarn Classic or npm, chosen
+    // by the clone's own files. Each reads the clone's config, so the clone's
+    // `.yarnrc.yml` `plugins` load, and no setting of the parent install
+    // reaches them. This dependency pins no manager, so the child is the
+    // parent's own Yarn. Its commit carries the marker path, which is unique
+    // to the case, so no cache can answer for the clone.
+    let build = |t: &Untrusted, daemon_base: &Path| -> GitDaemon {
+        let dep = daemon_base.join("dep");
+        write(&dep, "package.json", r#"{"name":"dep","version":"1.0.0"}"#);
+        write(
+            &dep,
+            ".yarnrc.yml",
+            "plugins:\n  - path: .yarn/plugins/p.cjs\n",
+        );
+        write(&dep, ".yarn/plugins/p.cjs", &plugin(t));
+        commit_repository(&dep);
+        let daemon = GitDaemon::serve(daemon_base);
+        write(
+            &t.repo,
+            "svc/package.json",
+            &format!(
+                r#"{{"name":"s","private":true,"packageManager":"yarn@4.9.2","dependencies":{{"dep":"{}"}}}}"#,
+                daemon.url("dep")
+            ),
+        );
+        // The lockfile, written by Yarn itself. Writing it prepares the
+        // dependency too, so the marker it leaves is cleared, and the cache it
+        // fills is the case's own, so the installs below clone again.
+        let global = t.markers.parent().expect("scratch").join("yarn-global");
+        sh(
+            &t.repo.join("svc"),
+            &format!(
+                "YARN_GLOBAL_FOLDER={} corepack yarn install --mode=skip-build \
+                 && rm -rf node_modules .yarn .pnp.cjs .pnp.loader.mjs",
+                global.to_str().expect("utf-8 path")
+            ),
+        );
+        let _ = fs::remove_file(t.marker("plugin"));
+        t.commit();
+        daemon
+    };
+
+    let default = Untrusted::new();
+    let base = default.markers.parent().expect("scratch").join("served");
+    let _daemon = build(&default, &base);
+    let run = default.install_one("svc", "yarn", false);
+    assert!(
+        default.marker("plugin").exists(),
+        "default mode loads the git dependency's plugin, so this case can see it: {}",
+        run.text()
+    );
+
+    let untrusted = Untrusted::new();
+    let base = untrusted.markers.parent().expect("scratch").join("served");
+    let _daemon = build(&untrusted, &base);
+    let run = untrusted.install_one("svc", "yarn", true);
+    assert!(
+        !untrusted.marker("plugin").exists(),
+        "the git dependency's plugin ran in untrusted mode: {}",
+        run.text()
+    );
+    assert!(
+        run.text().contains("::warning::") && run.text().contains("from a git repository"),
+        "the root is refused and named: {}",
+        run.text()
+    );
+    untrusted.assert_safe("svc", &run);
+}
+
+/// A registry on this machine serving one package: every `.tgz` path is the
+/// tarball, every other path its packument. pnpm asks for the tarball at the
+/// registry's conventional path, which a static directory cannot serve beside
+/// a packument of the same name.
+struct LocalRegistry {
+    port: u16,
+}
+
+impl LocalRegistry {
+    fn serve(packument: impl FnOnce(u16) -> String, tarball: Vec<u8>) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind registry");
+        let port = listener.local_addr().expect("registry addr").port();
+        let packument = packument(port).into_bytes();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request_line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                // Drain the headers.
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let (body, kind) = if path.ends_with(".tgz") {
+                    (&tarball, "application/octet-stream")
+                } else {
+                    (&packument, "application/json")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        Self { port }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/", self.port)
+    }
+}
+
+#[test]
+fn untrusted_mode_never_loads_a_pnpmfile_a_config_dependency_ships() {
+    if !have("corepack") {
+        eprintln!("skipped: corepack is not on PATH");
+        return;
+    }
+    // pnpm 10 installs `configDependencies` from the registry before anything
+    // else, and loads the pnpmfile of one named `pnpm-plugin-*`. The package
+    // is packed and served here.
+    let build = |t: &Untrusted| -> LocalRegistry {
+        let scratch = t.markers.parent().expect("scratch");
+        let package = scratch.join("plugin");
+        write(
+            &package,
+            "package.json",
+            r#"{"name":"pnpm-plugin-x","version":"1.0.0"}"#,
+        );
+        write(
+            &package,
+            "pnpmfile.cjs",
+            &format!(
+                "{}module.exports = {{ hooks: {{}} }};\n",
+                t.witness("pnpmfile")
+            ),
+        );
+        let packed = Command::new("npm")
+            .args(["pack", "--json", "--ignore-scripts"])
+            .current_dir(&package)
+            .output()
+            .expect("npm pack");
+        assert!(packed.status.success(), "npm pack failed");
+        let packed: serde_json::Value =
+            serde_json::from_slice(&packed.stdout).expect("npm pack --json");
+        let integrity = packed[0]["integrity"]
+            .as_str()
+            .expect("integrity")
+            .to_string();
+        let filename = packed[0]["filename"].as_str().expect("filename");
+        let tarball = fs::read(package.join(filename)).expect("read tarball");
+        let registry = LocalRegistry::serve(
+            |port| {
+                serde_json::json!({
+                    "name": "pnpm-plugin-x",
+                    "dist-tags": {"latest": "1.0.0"},
+                    "versions": {"1.0.0": {
+                        "name": "pnpm-plugin-x",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("http://127.0.0.1:{port}/pnpm-plugin-x/-/pnpm-plugin-x-1.0.0.tgz"),
+                            "integrity": integrity,
+                        },
+                    }},
+                })
+                .to_string()
+            },
+            tarball,
+        );
+        write(
+            &t.repo,
+            "pnpm/package.json",
+            r#"{"name":"p","private":true,"packageManager":"pnpm@10.18.2"}"#,
+        );
+        write(
+            &t.repo,
+            "pnpm/.npmrc",
+            &format!("registry={}\n", registry.url()),
+        );
+        write(
+            &t.repo,
+            "pnpm/pnpm-workspace.yaml",
+            &format!("configDependencies:\n  pnpm-plugin-x: \"1.0.0+{integrity}\"\n"),
+        );
+        // The lockfile, written by pnpm itself; that loads the pnpmfile too,
+        // so its marker is cleared. The store is the case's own.
+        sh(
+            &t.repo.join("pnpm"),
+            &format!(
+                "corepack pnpm install --store-dir {} && rm -rf node_modules",
+                scratch.join("store").to_str().expect("utf-8 path")
+            ),
+        );
+        let _ = fs::remove_file(t.marker("pnpmfile"));
+        t.commit();
+        registry
+    };
+
+    let default = Untrusted::new();
+    let _registry = build(&default);
+    let run = default.install_one("pnpm", "pnpm", false);
+    assert!(
+        default.marker("pnpmfile").exists(),
+        "default mode loads the config dependency's pnpmfile, so this case can see it: {}",
+        run.text()
+    );
+
+    let untrusted = Untrusted::new();
+    let _registry = build(&untrusted);
+    let run = untrusted.install_one("pnpm", "pnpm", true);
+    assert!(
+        !untrusted.marker("pnpmfile").exists(),
+        "the config dependency's pnpmfile ran in untrusted mode: {}",
+        run.text()
+    );
+    untrusted.assert_safe("pnpm", &run);
+}

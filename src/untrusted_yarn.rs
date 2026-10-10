@@ -16,6 +16,14 @@
 //! YAML: a quoted key, a flow mapping or a merge key is the same setting to
 //! Yarn as `plugins:` at the start of a line. A file this cannot read is an
 //! error, never "nothing found": the caller refuses the root.
+//!
+//! A git dependency hands the install to code no file in the tree shows
+//! (carrick#2251): Yarn prepares it by starting a package manager inside the
+//! clone (`prepareExternalProject`), Yarn, Yarn Classic or npm as the clone's
+//! own files choose, and that manager reads the clone's config, `plugins`
+//! included. Nothing the parent install sets reaches it, so a Berry root whose
+//! `yarn.lock` resolves any package from a git repository is refused too.
+//! Classic lockfiles are not read here (carrick#2258).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -29,6 +37,7 @@ use serde_yaml_ng::Value;
 pub const COMMAND: &str = "__untrusted-yarn-refusal";
 
 const RC_FILE: &str = ".yarnrc.yml";
+const LOCKFILE: &str = "yarn.lock";
 
 /// Run [`COMMAND`]. Prints the reason the root is refused on stdout, or
 /// nothing when it can be installed; exits 0 either way. Exit 1, with the
@@ -91,7 +100,74 @@ pub fn refusal(install_root: &Path) -> Result<Option<String>, String> {
             shown(&rc, &clone_root)
         )));
     }
+    if let Some(package) = git_resolved_package(&install_root.join(LOCKFILE))? {
+        return Ok(Some(format!(
+            "{} resolves {package} from a git repository, which Yarn prepares by running a \
+             package manager with that repository's own settings",
+            shown(&install_root.join(LOCKFILE), &clone_root)
+        )));
+    }
     Ok(None)
+}
+
+/// The first package a Berry `yarn.lock` resolves from a git repository, or
+/// `None`. Yarn's git resolver writes every git resolution, whatever URL form
+/// the manifest used, as `<repo>#<query>` with a `commit` key in the query
+/// (`GitUtils.resolveUrl`), and the GitHub fetcher reads the same form. The
+/// reference is percent-decoded first, so a git source wrapped in a `patch:`
+/// resolution is seen too. A missing lockfile resolves nothing; a classic one
+/// is not read (carrick#2258); one that is not a YAML mapping is an error.
+fn git_resolved_package(lockfile: &Path) -> Result<Option<String>, String> {
+    let text = match fs::read_to_string(lockfile) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", lockfile.display())),
+    };
+    if text.lines().any(|line| line.trim() == "# yarn lockfile v1") {
+        return Ok(None);
+    }
+    let entries = match untagged(
+        serde_yaml_ng::from_str::<Value>(&text)
+            .map_err(|error| format!("{}: {error}", lockfile.display()))?,
+    ) {
+        Value::Null => return Ok(None),
+        Value::Mapping(entries) => entries,
+        _ => {
+            return Err(format!(
+                "{}: the top level is not a mapping",
+                lockfile.display()
+            ));
+        }
+    };
+    for (_, entry) in entries {
+        let Some(resolution) = entry.get("resolution").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some((package, reference)) = split_locator(resolution)
+            && fetched_from_git(reference)
+        {
+            return Ok(Some(package.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// A locator `name@reference` split at the `@` that ends the name, which for
+/// a scoped package is the second one.
+fn split_locator(locator: &str) -> Option<(&str, &str)> {
+    let at = locator.get(1..)?.find('@')? + 1;
+    Some((&locator[..at], &locator[at + 1..]))
+}
+
+/// Whether a resolution reference names a git commit: any `#` fragment of the
+/// decoded reference is a query with a `commit` key.
+fn fetched_from_git(reference: &str) -> bool {
+    let decoded = percent_encoding::percent_decode_str(reference).decode_utf8_lossy();
+    decoded.split('#').skip(1).any(|fragment| {
+        fragment
+            .split('&')
+            .any(|pair| pair.split('=').next() == Some("commit"))
+    })
 }
 
 /// The directories whose `.yarnrc.yml` Yarn reads for this root that the
@@ -262,10 +338,74 @@ mod tests {
     }
 
     #[test]
+    fn a_git_resolution_refuses_whatever_url_form_or_wrapper_it_has() {
+        for resolution in [
+            "dep@git://127.0.0.1:9418/dep.git#commit=c70ff5cf5b7a1431a45e8510783ceafe50537f45",
+            "dep@https://github.com/o/dep.git#commit=c70ff5cf5b7a1431a45e8510783ceafe50537f45",
+            "dep@git+ssh://git@host/o/dep.git#workspace=a&commit=c70ff5cf5b7a1431a45e8510783ceafe50537f45",
+            "@scope/dep@ssh://host/dep.git#commit=c70ff5cf5b7a1431a45e8510783ceafe50537f45",
+            "dep@patch:dep@git%3A//host/dep.git%23commit%3Dc70ff5cf#~/.yarn/patches/dep.patch::version=1.0.0&hash=abc&locator=r%40workspace%3A.",
+        ] {
+            let lock = format!(
+                "__metadata:\n  version: 8\n\n\"dep@x\":\n  version: 1.0.0\n  resolution: \"{resolution}\"\n"
+            );
+            let clone = clone_with(&[("svc/yarn.lock", &lock), ("svc/package.json", "{}")]);
+            let reason = answer(&clone, "svc").unwrap();
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("svc/yarn.lock resolves ")
+                        && r.contains("from a git repository")),
+                "{resolution} -> {reason:?}"
+            );
+        }
+        let scoped = clone_with(&[(
+            "svc/yarn.lock",
+            "\"@scope/dep@x\":\n  resolution: \"@scope/dep@git://h/d.git#commit=abc\"\n",
+        )]);
+        assert!(
+            answer(&scoped, "svc")
+                .unwrap()
+                .is_some_and(|r| r.contains("resolves @scope/dep from"))
+        );
+    }
+
+    #[test]
+    fn registry_workspace_and_local_resolutions_are_not_git() {
+        let lock = "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+            \"a@npm:^1.0.0\":\n  resolution: \"a@npm:1.0.0\"\n  checksum: 10c0/abc\n\n\
+            \"b@patch:b@npm%3A1.0.0#~/.yarn/patches/b.patch\":\n  resolution: \"b@patch:b@npm%3A1.0.0#~/.yarn/patches/b.patch::version=1.0.0&hash=d0&locator=r%40workspace%3A.\"\n\n\
+            \"c@https://example.test/c-1.0.0.tgz\":\n  resolution: \"c@https://example.test/c-1.0.0.tgz\"\n\n\
+            \"r@workspace:.\":\n  resolution: \"r@workspace:.\"\n  languageName: unknown\n";
+        let clone = clone_with(&[("svc/yarn.lock", lock), ("svc/package.json", "{}")]);
+        assert_eq!(answer(&clone, "svc").unwrap(), None);
+        // No lockfile, an empty one, and a classic one are not read for this.
+        for lock in [
+            None,
+            Some(""),
+            Some("# yarn lockfile v1\n\n\ndep@git://h/d.git:\n  resolved \"git://h/d.git#abc\"\n"),
+        ] {
+            let mut files = vec![("svc/package.json", "{}")];
+            if let Some(lock) = lock {
+                files.push(("svc/yarn.lock", lock));
+            }
+            assert_eq!(
+                answer(&clone_with(&files), "svc").unwrap(),
+                None,
+                "{lock:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_file_yarn_could_not_read_either_is_an_error() {
         for rc in ["plugins: [\n", "- plugins\n", "a: 1\n---\nplugins: []\n"] {
             let clone = clone_with(&[("svc/.yarnrc.yml", rc)]);
             assert!(answer(&clone, "svc").is_err(), "{rc:?}");
+        }
+        for lock in ["\"a@npm:1\": [\n", "- a\n"] {
+            let clone = clone_with(&[("svc/yarn.lock", lock)]);
+            assert!(answer(&clone, "svc").is_err(), "{lock:?}");
         }
         let clone = clone_with(&[]);
         fs::create_dir_all(clone.path().join("svc/.yarnrc.yml")).unwrap();
