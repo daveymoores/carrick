@@ -333,7 +333,9 @@ export async function runCheck(
   // WITH parsed diagnostics is the legitimate incompatible path (tsc exits 1
   // on ordinary type errors) and stays untouched. Mirrors the install step's
   // `code === 0` guard.
-  if (tsc.code !== 0 && diagnostics.length === 0) {
+  // A compiler a signal ended never finished, so a pair with no diagnostic
+  // was never cleared, whatever it printed first (carrick#2209).
+  if (tsc.signal !== null || (tsc.code !== 0 && diagnostics.length === 0)) {
     const excerpt = scrubPaths(
       (tsc.stderr || tsc.stdout).trim().slice(0, 2000),
       scrubCtx

@@ -1085,7 +1085,11 @@ fn one_memory_death(death: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
         death.ended(false),
         death.stage()
     );
-    match death.held() {
+    // Only an abort is V8's heap running out; a kill is the machine's memory.
+    match death
+        .held()
+        .filter(|_| death.end.is_some_and(|end| end.is_abort()))
+    {
         Some(held) => format!("{lead}: {held} did not fit {heap}"),
         None => format!("{lead}, {under}"),
     }
@@ -5863,6 +5867,16 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
              memory death; it was aborted (SIGABRT), as Node aborts when its heap is full, \
              while building the service's program, before any anchor was resolved: the \
              service's program did not fit the 8192 MB heap it was given"
+        );
+        let killed = death(
+            Some(("program", "building the program")),
+            Some(ProcessEnd::Signal(9)),
+        );
+        assert!(
+            one_memory_death(&killed, Some(8192))
+                .ends_with("before any anchor was resolved, under a heap cap of 8192 MB"),
+            "a kill is not V8's heap: {}",
+            one_memory_death(&killed, Some(8192))
         );
         let silent = death(None, ABORTED);
         assert!(

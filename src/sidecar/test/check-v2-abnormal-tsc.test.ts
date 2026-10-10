@@ -172,6 +172,22 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     });
   });
 
+  it('a compiler a signal ended after printing a diagnostic clears no pair (carrick#2209)', async () => {
+    const plan = buildProbe(PAIRS[0], (s) => `@carrick/${s}`);
+    const probeFile = `packages/carrick-probes/probes/${plan.fileName}`;
+    const tscPath = fakeTsc(
+      'tsc-partial-abort',
+      `echo "${probeFile}(${decisiveAssignmentLine(plan)},7): error TS2322: Type 'A' is not assignable to type 'B'."; kill -ABRT $$`
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.compiler_end?.signal, 'SIGABRT');
+    for (const v of result.verdicts) {
+      assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+      assert.strictEqual(v.gate, 'tsc:abnormal-termination');
+    }
+  });
+
   it('the compiler runs under the heap cap the sidecar was given (carrick#2209)', () => {
     // The sidecar gets its cap as a node flag, which a child does not inherit;
     // the compiler must see it through NODE_OPTIONS. A fresh node with a cap

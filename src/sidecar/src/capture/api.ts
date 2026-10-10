@@ -579,8 +579,8 @@ export interface CheckResult {
   verdicts: CheckVerdict[];
   degraded_services: DegradedService[];
   errors: string[];
-  /** How the compiler ended, present only when it ended abnormally (no
-   * parseable diagnostics, non-zero exit or a signal): every pair is then
+  /** How the compiler ended, present only when it ended abnormally (a
+   * signal, or a non-zero exit with no parseable diagnostics): every pair is then
    * unverifiable, and this says whether it died of memory (carrick#2209). */
   compiler_end?: CompilerEnd;
 }
