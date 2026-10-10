@@ -127,6 +127,10 @@ async fn main() {
     // process, whichever command it is, so the flag is read here and both
     // parsers only accept it (carrick#1889).
     keep_awake::turn_off(argv.iter().any(|arg| arg == keep_awake::OFF_FLAG));
+    // Internal: the install script's question in untrusted mode (carrick#2246).
+    if argv.first().map(String::as_str) == Some(carrick::untrusted_yarn::COMMAND) {
+        std::process::exit(carrick::untrusted_yarn::run(&argv[1..]));
+    }
     if let Some(parsed) = local_mode::cli::parse(&argv) {
         match parsed {
             Ok(command) => {

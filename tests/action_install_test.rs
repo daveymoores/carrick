@@ -684,8 +684,12 @@ impl Untrusted {
             .args(["install-one", dir.to_str().expect("utf-8 path"), manager])
             .env_remove("CARRICK_CLI")
             .env_remove("CARRICK_INSTALL_UNTRUSTED");
+        // Untrusted mode asks the scanner to read Yarn's rc files, as the
+        // hosted runner does through its own CARRICK_CLI (carrick#2246).
         if untrusted {
-            command.env("CARRICK_INSTALL_UNTRUSTED", "1");
+            command
+                .env("CARRICK_INSTALL_UNTRUSTED", "1")
+                .env("CARRICK_CLI", carrick_cli());
         }
         let output = command.output().expect("run install-scanned-deps.sh");
         Run {
@@ -888,13 +892,13 @@ fn untrusted_mode_refuses_a_berry_root_it_cannot_install_without_the_trees_code(
     t.commit();
     let unpinned = t.install_one("unpinned", "yarn", true);
     assert!(
-        unpinned.text().contains("pins no packageManager"),
+        unpinned.text().contains("pins a packageManager"),
         "an unpinned yarnPath is named in a warning: {}",
         unpinned.text()
     );
     let pinned = t.install_one("pinned", "yarn", true);
     assert!(
-        !pinned.text().contains("pins no packageManager") && !t.marker("pinned").exists(),
+        !pinned.text().contains("pins a packageManager") && !t.marker("pinned").exists(),
         "a pinned root is not refused for its yarnPath, and the file is not run: {}",
         pinned.text()
     );
@@ -1011,4 +1015,205 @@ fn untrusted_mode_leaves_bun_with_nothing_from_the_tree_to_run() {
         run.text()
     );
     t.assert_safe("bun", &run);
+}
+
+// ---------------------------------------------------------------------------
+// carrick#2246: the settings `--ignore-scripts` and the flags above leave open.
+// ---------------------------------------------------------------------------
+
+/// A shell program that records that it ran, then hands on to `then`.
+fn witness_program(t: &Untrusted, name: &str, then: &str) -> String {
+    format!(
+        "#!/bin/sh\n: > {:?}\nexec {then} \"$@\"\n",
+        t.marker(name).to_str().expect("utf-8 path")
+    )
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+#[test]
+#[cfg(unix)]
+fn untrusted_mode_never_runs_a_program_an_npmrc_names() {
+    // A git dependency is what makes npm start programs during `npm ci
+    // --ignore-scripts`: it clones with the `git` setting, and a dependency
+    // whose manifest declares `prepare` is prepared by a child npm that
+    // starts with `node-options`. The tree's `.npmrc` names both.
+    let build = |t: &Untrusted| {
+        let dep = t.markers.parent().expect("scratch").join("dep");
+        write(
+            &dep,
+            "package.json",
+            r#"{"name":"dep","version":"1.0.0","scripts":{"prepare":"node -e 0"}}"#,
+        );
+        sh(
+            &dep,
+            "git init -q . && git add -A \
+             && git -c user.email=t@t -c user.name=t commit -q -m dep",
+        );
+        write(
+            &t.repo,
+            "npm/package.json",
+            &format!(
+                r#"{{"name":"n","private":true,"dependencies":{{"dep":"git+file://{}"}}}}"#,
+                dep.to_str().expect("utf-8 path")
+            ),
+        );
+        sh(
+            &t.repo.join("npm"),
+            "npm install --package-lock-only --ignore-scripts",
+        );
+        write(&t.repo, "npm/git.sh", &witness_program(t, "git", "git"));
+        make_executable(&t.repo.join("npm/git.sh"));
+        write(&t.repo, "npm/hook.cjs", &t.witness("node-options"));
+        write(
+            &t.repo,
+            "npm/.npmrc",
+            &format!(
+                "git=./git.sh\nnode-options=--require {}\n",
+                t.repo.join("npm/hook.cjs").to_str().expect("utf-8 path")
+            ),
+        );
+        t.commit();
+    };
+
+    let default = Untrusted::new();
+    build(&default);
+    let run = default.install_one("npm", "npm", false);
+    for marker in ["git", "node-options"] {
+        assert!(
+            default.marker(marker).exists(),
+            "default mode runs the .npmrc `{marker}` program, so this case can see it: {}",
+            run.text()
+        );
+    }
+
+    let untrusted = Untrusted::new();
+    build(&untrusted);
+    let run = untrusted.install_one("npm", "npm", true);
+    for marker in ["git", "node-options"] {
+        assert!(
+            !untrusted.marker(marker).exists(),
+            "the .npmrc `{marker}` program ran in untrusted mode: {}",
+            run.text()
+        );
+    }
+    assert!(
+        untrusted.repo.join("npm/node_modules/dep").exists(),
+        "the git dependency is still installed: {}",
+        run.text()
+    );
+    untrusted.assert_safe("npm", &run);
+}
+
+#[test]
+fn untrusted_mode_reads_every_yarnrc_up_to_the_clone_root_as_yaml() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    // Yarn reads `.yarnrc.yml` in every parent of the directory it runs in,
+    // and YAML spells one key many ways. Each tree pins its Yarn, so default
+    // mode loads the plugin and the case can see it.
+    let pinned_service = |t: &Untrusted| {
+        write(
+            &t.repo,
+            "svc/package.json",
+            r#"{"name":"s","private":true,"packageManager":"yarn@4.9.2"}"#,
+        );
+        write(&t.repo, "svc/yarn.lock", "__metadata:\n  version: 8\n");
+    };
+    let parent = |t: &Untrusted| {
+        pinned_service(t);
+        write(
+            &t.repo,
+            ".yarnrc.yml",
+            "plugins:\n  - path: .yarn/plugins/p.cjs\n",
+        );
+        write(&t.repo, ".yarn/plugins/p.cjs", &plugin(t));
+        t.commit();
+    };
+    let quoted = |t: &Untrusted| {
+        pinned_service(t);
+        write(
+            &t.repo,
+            "svc/.yarnrc.yml",
+            "\"plugins\": [{ path: .yarn/plugins/p.cjs }]\n",
+        );
+        write(&t.repo, "svc/.yarn/plugins/p.cjs", &plugin(t));
+        t.commit();
+    };
+
+    for (case, build) in [
+        ("parent", &parent as &dyn Fn(&Untrusted)),
+        ("quoted", &quoted as &dyn Fn(&Untrusted)),
+    ] {
+        let default = Untrusted::new();
+        build(&default);
+        let run = default.install_one("svc", "yarn", false);
+        assert!(
+            default.marker("plugin").exists(),
+            "{case}: default mode loads the plugin, so this case can see it: {}",
+            run.text()
+        );
+
+        let untrusted = Untrusted::new();
+        build(&untrusted);
+        let run = untrusted.install_one("svc", "yarn", true);
+        assert!(
+            !untrusted.marker("plugin").exists(),
+            "{case}: the plugin ran in untrusted mode: {}",
+            run.text()
+        );
+        assert!(
+            run.text().contains("::warning::") && run.text().contains("lists plugins"),
+            "{case}: the root is refused and named: {}",
+            run.text()
+        );
+        untrusted.assert_safe("svc", &run);
+    }
+}
+
+/// A Yarn plugin that records that it was loaded.
+fn plugin(t: &Untrusted) -> String {
+    format!(
+        "{}module.exports = {{ name: 'p', factory: () => ({{}}) }};\n",
+        t.witness("plugin")
+    )
+}
+
+#[test]
+fn untrusted_mode_refuses_a_yarn_root_it_has_no_reader_for() {
+    let t = Untrusted::new();
+    write(
+        &t.repo,
+        "svc/package.json",
+        r#"{"name":"s","private":true}"#,
+    );
+    write(&t.repo, "svc/yarn.lock", "__metadata:\n  version: 8\n");
+    t.commit();
+    let output = Command::new("bash")
+        .arg(script())
+        .args([
+            "install-one",
+            t.repo.join("svc").to_str().expect("utf-8 path"),
+            "yarn",
+        ])
+        .env_remove("CARRICK_CLI")
+        .env("CARRICK_INSTALL_UNTRUSTED", "1")
+        .output()
+        .expect("run install-scanned-deps.sh");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("::warning::") && text.contains("CARRICK_CLI is unset"),
+        "a Yarn root is refused when nothing can read its rc files: {text}"
+    );
+    assert!(!t.repo.join("svc/node_modules").exists(), "{text}");
 }
