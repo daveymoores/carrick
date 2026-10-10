@@ -387,28 +387,35 @@ impl<'a> SidecarPool<'a> {
         let workers: Vec<(Option<usize>, &TypeSidecar)> = std::iter::once((None, self.base))
             .chain(self.extra.iter().enumerate().map(|(i, s)| (Some(i), s)))
             .collect();
+        // A worker thread is outside the task-local scope of the service it
+        // works for, and a request that times out records its loss there
+        // (carrick#2021).
+        let service = crate::current_service::Carried::capture();
         std::thread::scope(|scope| {
             for (started, sidecar) in workers {
-                let (next, answers, work, leaves_no_process) =
-                    (&next, &answers, &work, &leaves_no_process);
+                let (next, answers, work, leaves_no_process, service) =
+                    (&next, &answers, &work, &leaves_no_process, &service);
                 scope.spawn(move || {
                     if started.is_some_and(|index| !self.holds_program(index)) {
                         return;
                     }
-                    loop {
-                        let index = next.fetch_add(1, Ordering::SeqCst);
-                        let Some(job) = jobs.get(index) else {
-                            self.stop_the_unready();
-                            break;
-                        };
-                        let answer = work(sidecar, job);
-                        let gone = leaves_no_process(&answer);
-                        *answers[index].lock().unwrap_or_else(|p| p.into_inner()) = Some(answer);
-                        if gone {
-                            retired(sidecar);
-                            break;
+                    service.run(|| {
+                        loop {
+                            let index = next.fetch_add(1, Ordering::SeqCst);
+                            let Some(job) = jobs.get(index) else {
+                                self.stop_the_unready();
+                                break;
+                            };
+                            let answer = work(sidecar, job);
+                            let gone = leaves_no_process(&answer);
+                            *answers[index].lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(answer);
+                            if gone {
+                                retired(sidecar);
+                                break;
+                            }
                         }
-                    }
+                    });
                 });
             }
         });
@@ -763,6 +770,35 @@ mod tests {
                 .iter()
                 .all(|answer| matches!(answer, Some(Ok(pid)) if *pid == own)),
             "{answers:?}"
+        );
+    }
+
+    /// A worker thread runs a job for the service whose analysis asked for the
+    /// pool: a request that times out there is recorded against that service,
+    /// and a thread that lost the task-local scope would drop the loss
+    /// (carrick#1066).
+    #[test]
+    fn a_pool_worker_works_for_the_service_that_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = base_at(&root);
+        let pool = SidecarPool::scoped(&base, &root, None, 2).unwrap();
+        let jobs: Vec<String> = (0..6).map(|n| format!("job-{n}")).collect();
+        let named = |_: &TypeSidecar, _: &String| crate::current_service::name();
+
+        let inside = crate::current_service::sync_scope(Some("api".to_string()), || {
+            pool.run(&jobs, |_: &Option<String>| false, named)
+        });
+        assert!(
+            inside
+                .iter()
+                .all(|name| name.as_ref() == Some(&Some("api".to_string()))),
+            "{inside:?}"
+        );
+        let outside = pool.run(&jobs, |_: &Option<String>| false, named);
+        assert!(
+            outside.iter().all(|name| name.as_ref() == Some(&None)),
+            "{outside:?}"
         );
     }
 

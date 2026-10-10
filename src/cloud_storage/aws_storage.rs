@@ -3856,7 +3856,6 @@ mod tests {
             },
         )]);
 
-        crate::scan_health::enter_service(Some(SERVICE));
         crate::scan_health::forget_service_losses(Some(SERVICE));
         crate::agent_service::inject_mock_not_asked(FILE_ROUTE, MARKER, OWED);
         let requested = || {
@@ -3866,23 +3865,26 @@ mod tests {
                 .unwrap_or(0)
         };
         let before = requested();
-        FileOrchestrator::new(crate::agent_service::AgentService::new())
-            .analyze_files(
-                &files,
-                &std::collections::HashMap::new(),
-                &guidance,
-                &crate::framework_detector::DetectionResult::default(),
-                &root,
-                &root,
-                &[],
-                &Default::default(),
-                &Default::default(),
-                &crate::url_normalizer::UrlNormalizer::default_permissive(),
-                &crate::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
-                None,
-            )
-            .await
-            .expect("the analysis runs");
+        crate::current_service::scope(Some(SERVICE.to_string()), async {
+            FileOrchestrator::new(crate::agent_service::AgentService::new())
+                .analyze_files(
+                    &files,
+                    &std::collections::HashMap::new(),
+                    &guidance,
+                    &crate::framework_detector::DetectionResult::default(),
+                    &root,
+                    &root,
+                    &[],
+                    &Default::default(),
+                    &Default::default(),
+                    &crate::url_normalizer::UrlNormalizer::default_permissive(),
+                    &crate::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
+                    None,
+                )
+                .await
+                .expect("the analysis runs")
+        })
+        .await;
         let requests_made = requested() - before;
         let losses = crate::scan_health::service_losses(Some(SERVICE));
 
@@ -3905,7 +3907,6 @@ mod tests {
         let held = crate::scan_health::unanalysed_files_for(Some(SERVICE));
         // The run's losses are the process's: leave none for a later test.
         crate::scan_health::forget_service_losses(Some(SERVICE));
-        crate::scan_health::enter_service(None);
         // SAFETY: as above.
         unsafe {
             std::env::remove_var("CARRICK_MOCK_ALL");

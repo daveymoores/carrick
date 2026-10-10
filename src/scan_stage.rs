@@ -6,11 +6,12 @@
 //! fail marker sends it as `stage`, and the scanner's own last stderr line
 //! prints it, so a user who pastes their terminal has already reported it.
 //!
-//! A process-global for the same reason [`crate::phase_timing`] and
-//! [`crate::scan_health`] are: the stages sit several call layers below the
-//! function that has to name one, and threading a value through every one of
-//! them would be a worse record than an atomic store. One process is one
-//! scan, so there is exactly one answer to keep.
+//! A process-global, where [`crate::phase_timing`] and [`crate::scan_health`]
+//! belong to a service's analysis: the stages sit several call layers below
+//! the function that has to name one, and threading a value through every one
+//! of them would be a worse record than an atomic store. One process is one
+//! scan, so there is exactly one answer to keep, and with services analysed
+//! side by side it is the last writer's.
 //!
 //! The set is deliberately coarse and closed. It is a bucket a human reads in
 //! a dashboard, not a trace: `file_analysis` is where a first index spends

@@ -340,11 +340,9 @@ fn offline() {
         std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR");
         std::env::remove_var("CARRICK_EVAL_DUMP_DIR");
     }
-    // The registry files a loss under the service being scanned, and keeps
-    // it for the life of the process: a test that ran the engine may have
-    // left a service entered, and a loss an earlier test recorded would read
-    // to the engine as work this scan still owes.
-    carrick::scan_health::enter_service(None);
+    // The registry keeps a service's losses for the life of the process: a
+    // loss an earlier test recorded would read to the engine as work this
+    // scan still owes.
     carrick::scan_health::forget_service_losses(None);
 }
 

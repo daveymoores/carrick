@@ -73,8 +73,66 @@ impl Update {
     }
 }
 
-/// The service a scan is inside, set once per service by the engine.
-static SERVICE: Mutex<Option<(String, usize, usize)>> = Mutex::new(None);
+/// The services whose analysis is running, each entered once by the engine.
+static IN_FLIGHT: Mutex<InFlight> = Mutex::new(InFlight {
+    services: Vec::new(),
+});
+
+/// Where one service in flight sits in the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Position {
+    /// The service's name, which is what a [`Ticker`] finds it by
+    /// ([`crate::current_service::name`]); `None` for a single unnamed one.
+    key: Option<String>,
+    label: String,
+    index: usize,
+    total: usize,
+}
+
+/// The services analysed right now. A parent renders one line, and side by
+/// side the updates of several services would interleave on it, so only the
+/// earliest-declared service still in flight is heard: the line moves forward
+/// through the services as it did when they ran one after another.
+#[derive(Debug, Default)]
+struct InFlight {
+    services: Vec<Position>,
+}
+
+impl InFlight {
+    fn start(&mut self, position: Position) {
+        self.finish(&position.key);
+        self.services.push(position);
+    }
+
+    fn finish(&mut self, key: &Option<String>) {
+        self.services.retain(|position| position.key != *key);
+    }
+
+    /// What the update of the service `key` is sent as, or `None` when it is
+    /// not the one to be heard. Nothing in flight at all is the scan before
+    /// its first service, heard as it always was.
+    fn speaker(&self, key: &Option<String>) -> Option<(String, usize, usize)> {
+        let Some(earliest) = self.services.iter().min_by_key(|position| position.index) else {
+            return Some(("(scanning)".to_string(), 1, 1));
+        };
+        (earliest.key == *key).then(|| (earliest.label.clone(), earliest.index, earliest.total))
+    }
+}
+
+/// Holds one service in flight until it drops. See [`service_started`].
+#[must_use = "the service is in flight until this drops, so binding it to `_` \
+              ends it at once"]
+pub struct ServiceInFlight(Option<Option<String>>);
+
+impl Drop for ServiceInFlight {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take()
+            && let Ok(mut in_flight) = IN_FLIGHT.lock()
+        {
+            in_flight.finish(&key);
+        }
+    }
+}
 /// Milliseconds since the epoch at the last emitted update.
 static LAST_EMIT: AtomicU64 = AtomicU64::new(0);
 
@@ -122,23 +180,47 @@ fn workspace_position(index: usize, total: usize) -> (usize, usize) {
     }
 }
 
-/// Name the service the following updates are about, and reset the throttle.
-pub fn service_started(label: &str, index: usize, total: usize) {
+/// Name the service the following updates of its tickers are about, and reset
+/// the throttle. `service` is its name ([`crate::current_service::name`]); the
+/// service is in flight until the returned guard drops.
+pub fn service_started(
+    service: Option<&str>,
+    label: &str,
+    index: usize,
+    total: usize,
+) -> ServiceInFlight {
     if !enabled() {
-        return;
+        return ServiceInFlight(None);
     }
     let (index, total) = workspace_position(index, total);
-    if let Ok(mut service) = SERVICE.lock() {
-        *service = Some((label.to_string(), index, total));
+    let key = service.map(str::to_string);
+    if let Ok(mut in_flight) = IN_FLIGHT.lock() {
+        in_flight.start(Position {
+            key: key.clone(),
+            label: label.to_string(),
+            index,
+            total,
+        });
     }
     LAST_EMIT.store(0, Ordering::Relaxed);
+    ServiceInFlight(Some(key))
 }
 
-/// A tick within the current service. `done == total` always gets through.
-pub fn tick(phase: Phase, done: usize, total: usize) {
+/// A tick within the service named `service`. `done == total` always gets
+/// through, unless another service declared before this one is still in
+/// flight and is the one being heard.
+fn tick(service: &Option<String>, phase: Phase, done: usize, total: usize) {
     if !enabled() || total == 0 {
         return;
     }
+    let Ok(in_flight) = IN_FLIGHT.lock() else {
+        return;
+    };
+    let speaker = in_flight.speaker(service);
+    drop(in_flight);
+    let Some((label, index, count)) = speaker else {
+        return;
+    };
     let final_tick = done >= total;
     let now = now_ms();
     if !final_tick {
@@ -148,13 +230,6 @@ pub fn tick(phase: Phase, done: usize, total: usize) {
         }
     }
     LAST_EMIT.store(now, Ordering::Relaxed);
-    let Ok(service) = SERVICE.lock() else {
-        return;
-    };
-    let (label, index, count) = service
-        .clone()
-        .unwrap_or_else(|| ("(scanning)".to_string(), 1, 1));
-    drop(service);
     let update = Update {
         service: label,
         service_index: index,
@@ -586,6 +661,8 @@ pub fn parse_failure(line: &str) -> Option<Failure> {
 /// A throttle for a caller that counts its own work, so a loop can tick on
 /// every item and pay for it only when an update is actually due.
 pub struct Ticker {
+    /// The service whose work this counts, taken when the ticker is made.
+    service: Option<String>,
     phase: Phase,
     total: usize,
     done: usize,
@@ -595,6 +672,7 @@ pub struct Ticker {
 impl Ticker {
     pub fn new(phase: Phase, total: usize) -> Self {
         Self {
+            service: crate::current_service::name(),
             phase,
             total,
             done: 0,
@@ -607,7 +685,7 @@ impl Ticker {
         self.done += 1;
         if self.done >= self.total || self.last.elapsed() >= MIN_GAP {
             self.last = Instant::now();
-            tick(self.phase, self.done, self.total);
+            tick(&self.service, self.phase, self.done, self.total);
         }
     }
 }
@@ -806,6 +884,61 @@ mod tests {
         assert!(parse_notice(&line).is_none());
         assert_eq!(summary.services.len(), 2);
         assert!(parse_summary("@carrick-summary not json").is_none());
+    }
+
+    fn at(key: &str, index: usize) -> Position {
+        Position {
+            key: Some(key.to_string()),
+            label: key.to_string(),
+            index,
+            total: 3,
+        }
+    }
+
+    /// Side by side, only the earliest-declared service in flight is heard,
+    /// and the line moves on to the next when it ends (carrick#1066).
+    #[test]
+    fn only_the_earliest_declared_service_in_flight_is_heard() {
+        let (api, web, jobs) = (
+            Some("api".to_string()),
+            Some("web".to_string()),
+            Some("jobs".to_string()),
+        );
+        let mut in_flight = InFlight::default();
+        assert_eq!(
+            in_flight.speaker(&api),
+            Some(("(scanning)".to_string(), 1, 1)),
+            "before the first service starts, the scan speaks as it always did"
+        );
+        // Started out of declared order: the later one first.
+        in_flight.start(at("web", 2));
+        in_flight.start(at("api", 1));
+        in_flight.start(at("jobs", 3));
+        assert_eq!(in_flight.speaker(&api), Some(("api".to_string(), 1, 3)));
+        assert_eq!(in_flight.speaker(&web), None);
+        assert_eq!(in_flight.speaker(&jobs), None);
+
+        in_flight.finish(&api);
+        assert_eq!(in_flight.speaker(&api), None);
+        assert_eq!(in_flight.speaker(&web), Some(("web".to_string(), 2, 3)));
+        in_flight.finish(&web);
+        assert_eq!(in_flight.speaker(&jobs), Some(("jobs".to_string(), 3, 3)));
+    }
+
+    /// A ticker speaks for the service it was made in, however the services
+    /// interleave afterwards (carrick#1066).
+    #[tokio::test]
+    async fn a_ticker_is_made_for_the_service_it_is_made_in() {
+        let made_in = |service: &'static str| {
+            crate::current_service::scope(Some(service.to_string()), async {
+                tokio::task::yield_now().await;
+                Ticker::new(Phase::Files, 3).service
+            })
+        };
+        let (api, web) = tokio::join!(made_in("api"), made_in("web"));
+        assert_eq!(api.as_deref(), Some("api"));
+        assert_eq!(web.as_deref(), Some("web"));
+        assert_eq!(Ticker::new(Phase::Files, 3).service, None);
     }
 
     #[test]

@@ -880,11 +880,23 @@ fn parse_export(
 
 /// Ask the store once, through `send`. Every failure and a timeout are no
 /// claims: logged, and the scan carries on.
-pub async fn ask<S, Fut>(request: LibraryClaimsRequest, send: S) -> LibraryAnswer
+///
+/// `gate` is awaited before the ask starts and its output held until the ask
+/// is over, so services that would send one request side by side can take
+/// turns (carrick#1066). The wait is outside [`ASK_TIMEOUT`]: a service
+/// queued behind another's ask is not out of time for it.
+pub async fn ask<G, GateFut, S, Fut>(
+    request: LibraryClaimsRequest,
+    gate: G,
+    send: S,
+) -> LibraryAnswer
 where
+    G: FnOnce(&LibraryClaimsRequest) -> GateFut,
+    GateFut: Future,
     S: FnOnce(LibraryClaimsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
+    let _turn = gate(&request).await;
     match tokio::time::timeout(ASK_TIMEOUT, send(request)).await {
         Ok(Ok(text)) => parse_answer(&text),
         Ok(Err(error)) => {
@@ -901,15 +913,22 @@ where
 /// The claims the service reads its library rows through: `first`'s, and,
 /// when the store had packages pending, theirs from one more ask through
 /// `send`. A package still pending is asked again next scan.
-pub async fn settle<S, Fut>(asked: &Asked, first: LibraryAnswer, send: S) -> Vec<ExportClaims>
+pub async fn settle<G, GateFut, S, Fut>(
+    asked: &Asked,
+    first: LibraryAnswer,
+    gate: G,
+    send: S,
+) -> Vec<ExportClaims>
 where
+    G: FnOnce(&LibraryClaimsRequest) -> GateFut,
+    GateFut: Future,
     S: FnOnce(LibraryClaimsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
     let mut exports = first.exports;
     let mut pending = first.pending;
     if let Some(again) = asked.only(&pending) {
-        let second = ask(again, send).await;
+        let second = ask(again, gate, send).await;
         exports.extend(second.exports);
         pending = second.pending;
     }
@@ -1846,10 +1865,15 @@ mod tests {
         let asked = asked_lib_and_other(dir.path());
         let first = parse_answer(STORE_PENDING);
         let mut sent = None;
-        let claims = settle(&asked, first, |request| {
-            sent = Some(request);
-            async { Ok(STORE_ANSWERED.to_string()) }
-        })
+        let claims = settle(
+            &asked,
+            first,
+            |_| async {},
+            |request| {
+                sent = Some(request);
+                async { Ok(STORE_ANSWERED.to_string()) }
+            },
+        )
         .await;
         let sent = sent.expect("the pending package is asked again");
         assert_eq!(
@@ -1862,16 +1886,59 @@ mod tests {
         assert_eq!(claims.len(), 1);
     }
 
+    /// carrick#1066. The turn is taken before the ask and held until it has
+    /// its answer, so a second service asking the same thing sends after it.
+    #[tokio::test]
+    async fn an_ask_holds_its_turn_from_before_it_is_sent_until_it_is_answered() {
+        let turn_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Turn(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Turn {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let held = turn_held.clone();
+        let during = turn_held.clone();
+        let answer = ask(
+            LibraryClaimsRequest {
+                roles: ROLES.to_vec(),
+                packages: Vec::new(),
+            },
+            move |_| async move {
+                held.store(true, std::sync::atomic::Ordering::SeqCst);
+                Turn(held)
+            },
+            move |_| async move {
+                assert!(
+                    during.load(std::sync::atomic::Ordering::SeqCst),
+                    "the turn is held while the ask is in flight"
+                );
+                Ok(String::new())
+            },
+        )
+        .await;
+        assert_eq!(answer, LibraryAnswer::default());
+        assert!(
+            !turn_held.load(std::sync::atomic::Ordering::SeqCst),
+            "the turn is released once the ask is answered"
+        );
+    }
+
     #[tokio::test]
     async fn nothing_pending_asks_nothing_more() {
         let dir = tempfile::tempdir().unwrap();
         let asked = asked_lib_and_other(dir.path());
         let first = parse_answer(STORE_ANSWERED);
-        let claims = settle(&asked, first, |_| async {
-            panic!("nothing was pending");
-            #[allow(unreachable_code)]
-            Ok(String::new())
-        })
+        let claims = settle(
+            &asked,
+            first,
+            |_| async {},
+            |_| async {
+                panic!("nothing was pending");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+        )
         .await;
         assert_eq!(claims.len(), 1);
     }
@@ -1883,6 +1950,7 @@ mod tests {
                 roles: ROLES.to_vec(),
                 packages: Vec::new(),
             },
+            |_| async {},
             |_| async {
                 Err(AgentCallError::permanent(
                     "scan_not_started",
@@ -1894,9 +1962,12 @@ mod tests {
         assert_eq!(refused, LibraryAnswer::default());
         let dir = tempfile::tempdir().unwrap();
         let asked = asked_lib_and_other(dir.path());
-        let kept = settle(&asked, parse_answer(STORE_ANSWERED), |_| async {
-            Ok(String::new())
-        })
+        let kept = settle(
+            &asked,
+            parse_answer(STORE_ANSWERED),
+            |_| async {},
+            |_| async { Ok(String::new()) },
+        )
         .await;
         assert_eq!(kept.len(), 1, "a failed re-ask keeps the first answer");
     }

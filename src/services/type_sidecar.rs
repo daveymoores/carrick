@@ -5816,10 +5816,8 @@ mod tests {
     /// counted here, because the check counts its own from its outcomes.
     ///
     /// The stand-in answers `init` and nothing else. The count is a range,
-    /// not one number: another test's sidecar timing out while this scope is
-    /// open is counted against it too, one capture anchor at a time.
+    /// not one number.
     #[test]
-    #[serial_test::serial(current_service)]
     fn a_request_the_sidecar_never_answers_is_counted_with_its_items() {
         const SERVICE: &str = "deadline-2021";
         const ITEMS: usize = 1000;
@@ -5860,13 +5858,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
 
-        {
-            let _scope = crate::current_service::enter(Some(SERVICE));
+        crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
             assert!(matches!(
                 sidecar.infer_types(&items, None),
                 Err(SidecarError::Timeout)
             ));
-        }
+        });
         let counted = crate::scan_health::time_limits_for(Some(SERVICE)).sidecar_deadline;
         assert!(
             (ITEMS..ITEMS + 10).contains(&counted),
