@@ -29,9 +29,9 @@ use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureV2Result, CheckPairEndpoint,
-    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, OperationProgress,
-    ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem, RetypeOutcome, RetypeVerdict,
-    SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
+    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, MemoryDeath,
+    OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem, RetypeOutcome,
+    RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -1011,10 +1011,13 @@ fn capture_in_a_fresh_process(
         }
         // Read before anything else is asked of the sidecar: the next wait
         // starts the progress empty, and the restart replaces the process.
+        let died = sidecar.how_the_process_died();
         let death = CaptureDeath {
             error: error.to_string(),
             progress: sidecar.last_progress(),
-            end: sidecar.how_the_process_ended(),
+            end: died.end,
+            heap_line: died.heap_line,
+            oom_kills_rose: died.oom_kills_rose,
         };
         if died_before.is_none() && !retries_after(&death, fail_on_memory) {
             warn!(
@@ -1104,19 +1107,21 @@ pub(crate) struct CaptureDeath {
     progress: Option<OperationProgress>,
     /// How the process ended, when the OS said.
     end: Option<ProcessEnd>,
+    /// Its stderr carried V8's heap-exhaustion line.
+    heap_line: bool,
+    /// The cgroup's OOM-kill counter rose while it ran.
+    oom_kills_rose: bool,
 }
 
 impl CaptureDeath {
-    /// Whether the process died of memory: it aborted (SIGABRT), which is how
-    /// Node ends when V8 cannot allocate inside its heap cap.
+    /// Whether the process died of memory: it aborted with V8's
+    /// heap-exhaustion line on stderr, or it was killed and the cgroup
+    /// counted an OOM kill ([`MemoryDeath::classify`], carrick#2208).
     ///
-    /// The one rule the capture retry reads. carrick#2208 narrows it to an
-    /// abort whose stderr carried V8's heap-out-of-memory line, and widens it
-    /// to a SIGKILL the cgroup counted as an OOM kill, once the stderr reader
-    /// and the cgroup reader keep that evidence; this method is where both
-    /// land, so the retry and the run's record agree.
+    /// The one rule the capture retry reads, and the one the run's record
+    /// of the death was made by, so the two agree.
     pub(crate) fn is_memory_death(&self) -> bool {
-        self.end.is_some_and(|end| end.is_abort())
+        MemoryDeath::classify(self.end, self.heap_line, self.oom_kills_rose).is_some()
     }
 
     /// How the process ended, as the verb of a sentence about one process or
@@ -2120,6 +2125,9 @@ pub(crate) fn run_check(
         let stubs = materialize_stubs(all_repo_data, &workspace_parent);
         let specs: Vec<CheckPairSpec> = probing.iter().map(|p| p.spec.clone()).collect();
 
+        // Read around the check: its compiler is a child of the sidecar, in
+        // this process's cgroup (carrick#2208).
+        let oom_kills_before = crate::services::type_sidecar::cgroup_oom_kills();
         let check_result = if stubs.is_empty() {
             Err(crate::services::type_sidecar::SidecarError::CheckFailed(
                 "no capture stubs available".to_string(),
@@ -2127,6 +2135,10 @@ pub(crate) fn run_check(
         } else {
             sidecar.check_v2(&stubs, &specs)
         };
+        let oom_kills_rose = crate::services::type_sidecar::oom_kills_rose(
+            oom_kills_before,
+            crate::services::type_sidecar::cgroup_oom_kills(),
+        );
 
         match check_result {
             Ok(result) => {
@@ -2136,13 +2148,20 @@ pub(crate) fn run_check(
                         result.errors.join("; ")
                     );
                 }
-                // The check's compiler died of memory: carrick#2208 records
-                // it for the run here, beside the capture's deaths.
-                if let Some(end) = result.compiler_end.as_ref().filter(|e| e.is_memory_death()) {
+                // The check's compiler died of memory: recorded for the run,
+                // as a sidecar process's death is (carrick#2208).
+                if let Some(end) = result.compiler_end.as_ref()
+                    && let Some(kind) = end.memory_death(oom_kills_rose)
+                {
                     warn!(
-                        "the check's type checker died of memory ({:?}, heap-limit line on stderr)",
-                        end.signal
+                        "The check's type checker died of memory ({}; signal {:?}, exit code \
+                         {:?}, heap cap {:?} MB)",
+                        kind.as_str(),
+                        end.signal,
+                        end.exit_code,
+                        end.heap_cap_mb
                     );
+                    crate::scan_health::record_type_memory_death(kind, end.heap_cap_mb);
                 }
                 let by_key: BTreeMap<&str, &crate::services::type_sidecar::CheckVerdict> = result
                     .verdicts
@@ -5655,6 +5674,10 @@ mod tests {
                 message: message.to_string(),
             }),
             end,
+            // An abort below is V8's heap running out unless a test says
+            // otherwise: its line was on stderr.
+            heap_line: true,
+            oom_kills_rose: false,
         }
     }
 
@@ -5838,19 +5861,32 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     #[test]
     fn a_memory_death_is_retried_unless_the_run_stops_on_one() {
         let program = Some(("program", "building the program"));
+        let killed = Some(ProcessEnd::Signal(9));
+        // (end, heap line on stderr, OOM kills rose, fail_on_memory, retried)
         let cases = [
-            (ABORTED, false, true),
-            (ABORTED, true, false),
-            (Some(ProcessEnd::Signal(9)), true, true),
-            (Some(ProcessEnd::Code(1)), true, true),
-            (None, true, true),
-            (Some(ProcessEnd::Signal(9)), false, true),
+            (ABORTED, true, false, false, true),
+            (ABORTED, true, false, true, false),
+            // An abort without V8's line is not a memory death (carrick#2208).
+            (ABORTED, false, false, true, true),
+            (killed, false, false, true, true),
+            // A kill the cgroup counted as an OOM kill is one.
+            (killed, false, true, true, false),
+            (killed, false, true, false, true),
+            (Some(ProcessEnd::Code(1)), true, true, true, true),
+            (None, true, true, true, true),
+            (killed, false, false, false, true),
         ];
-        for (end, fail_on_memory, retried) in cases {
+        for (end, heap_line, oom_kills_rose, fail_on_memory, retried) in cases {
+            let death = CaptureDeath {
+                heap_line,
+                oom_kills_rose,
+                ..death(program, end)
+            };
             assert_eq!(
-                retries_after(&death(program, end), fail_on_memory),
+                retries_after(&death, fail_on_memory),
                 retried,
-                "end {end:?}, fail_on_memory {fail_on_memory}"
+                "end {end:?}, heap line {heap_line}, OOM kills rose {oom_kills_rose}, \
+                 fail_on_memory {fail_on_memory}"
             );
         }
     }
@@ -5912,7 +5948,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
   if (request.action === 'init') return write({{ request_id, status: 'ready' }});
   fs.appendFileSync({attempts:?}, 'capture\n');
   write({{ request_id, status: 'progress', phase: 'program', message: 'building the program the anchors are read in' }});
-  process.stderr.write('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
+  fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
   process.kill(process.pid, 'SIGABRT');
 }});
 "#

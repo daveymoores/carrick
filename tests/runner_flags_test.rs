@@ -338,3 +338,230 @@ fn the_pr_flags_refuse_what_they_cannot_do() {
     let written: Vec<_> = std::fs::read_dir(&storage).unwrap().flatten().collect();
     assert!(written.is_empty(), "{written:?}");
 }
+
+/// A committed two-service repo, `alpha` then `beta`, each an HTTP server
+/// with one route, so each asks the type sidecar about its handler.
+fn two_service_repo(root: &Path) -> PathBuf {
+    let repo = root.join("monorepo");
+    let write = |relative: &str, contents: &str| {
+        let path = repo.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        "carrick.json",
+        r#"{ "services": [
+  { "name": "alpha", "directory": "services/alpha" },
+  { "name": "beta", "directory": "services/beta" }
+] }"#,
+    );
+    write("package.json", r#"{ "name": "monorepo", "private": true }"#);
+    for service in ["alpha", "beta"] {
+        write(
+            &format!("services/{service}/package.json"),
+            &format!(r#"{{ "name": "{service}", "dependencies": {{ "express": "4.18.2" }} }}"#),
+        );
+        write(
+            &format!("services/{service}/src/server.ts"),
+            &format!(
+                "import express from \"express\";\n\n\
+                 const app = express();\n\n\
+                 app.get(\"/{service}/status\", async (_req, res) => {{\n  \
+                 const upstream = await fetch(\"http://localhost:9000/api/health\");\n  \
+                 res.json({{ ok: upstream.ok }});\n}});\n\n\
+                 app.listen(3000);\n"
+            ),
+        );
+    }
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    repo
+}
+
+/// A stand-in type sidecar under `home`: it answers every request, until the
+/// first one after an `init` scoped to `beta`. That one it meets as Node
+/// meets a full heap: V8's fatal line on stderr, then an abort. It writes
+/// `died` first, so the test knows the death happened rather than guessing.
+fn sidecar_that_runs_out_of_heap_in_beta(home: &Path, died: &Path) {
+    let dir = home.join("sidecar/dist/src");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("index.js"),
+        format!(
+            r#"const fs = require("fs");
+let root = "";
+let buffered = "";
+process.stdin.on("data", (chunk) => {{
+  buffered += chunk;
+  let end;
+  while ((end = buffered.indexOf("\n")) >= 0) {{
+    const line = buffered.slice(0, end);
+    buffered = buffered.slice(end + 1);
+    if (!line.trim()) continue;
+    let request;
+    try {{ request = JSON.parse(line); }} catch (e) {{ continue; }}
+    const answer = (fields) =>
+      fs.writeSync(1, JSON.stringify(Object.assign({{ request_id: request.request_id }}, fields)) + "\n");
+    if (request.action === "shutdown") process.exit(0);
+    if (request.action === "init") {{
+      root = request.repo_root || "";
+      answer({{ status: "ready", init_time_ms: 1 }});
+      continue;
+    }}
+    if (root.endsWith("beta")) {{
+      fs.writeFileSync({died:?}, request.action);
+      fs.writeSync(2, "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n");
+      process.abort();
+    }}
+    switch (request.action) {{
+      case "bundle":
+        answer({{ status: "success", dts_content: "", manifest: [], symbol_failures: [] }});
+        break;
+      case "infer":
+        answer({{ status: "success", inferred_types: [] }});
+        break;
+      case "resolve_definitions":
+        answer({{ status: "success", definitions: [] }});
+        break;
+      default:
+        answer({{ status: "error", errors: ["the stand-in answers nothing else"] }});
+    }}
+  }}
+}});
+process.stdin.on("end", () => process.exit(0));
+process.stdin.resume();
+"#,
+            died = died.to_string_lossy()
+        ),
+    )
+    .unwrap();
+}
+
+/// What a scan of the two-service repo with the stand-in sidecar did.
+struct TypedScan {
+    code: Option<i32>,
+    stderr: String,
+    /// Every line of the run's own log (`~/.carrick/logs`).
+    log: String,
+}
+
+impl TypedScan {
+    /// The services the run uploaded.
+    fn uploaded(&self) -> Vec<String> {
+        let line =
+            Regex::new(r#"MOCK: Uploading repo data for repo: .* \(service: Some\("(\w+)"\)\)"#)
+                .unwrap();
+        line.captures_iter(&self.log)
+            .map(|c| c[1].to_string())
+            .collect()
+    }
+}
+
+fn typed_scan(fail_on_type_memory: bool) -> TypedScan {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = two_service_repo(tmp.path());
+    let home = tmp.path().join("home");
+    let died = tmp.path().join("died");
+    sidecar_that_runs_out_of_heap_in_beta(&home, &died);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(&repo)
+        .args(["--allow-unprepared", "--upload"])
+        .env("HOME", &home)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_SIDECAR_DIR", home.join("sidecar"))
+        .env("CARRICK_SIDECAR_MAX_OLD_SPACE_MB", "512");
+    if fail_on_type_memory {
+        cmd.env("CARRICK_FAIL_ON_TYPE_MEMORY", "1");
+    } else {
+        cmd.env_remove("CARRICK_FAIL_ON_TYPE_MEMORY");
+    }
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_REF",
+        "GITHUB_ACTIONS",
+        "CI",
+        "CARRICK_OUTPUT_JSON",
+        "CARRICK_LOCAL_STORAGE_DIR",
+        "CARRICK_ALLOW_MISSING_TYPES",
+        "CARRICK_RUN_ID",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("failed to spawn carrick");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        died.exists(),
+        "the stand-in was never asked a type request for beta:\n{stderr}"
+    );
+    let mut log = String::new();
+    let mut dirs = vec![home.join(".carrick/logs")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                log.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    TypedScan {
+        code: output.status.code(),
+        stderr,
+        log,
+    }
+}
+
+/// carrick#2208: told to stop on a type-checker memory death, the run stops
+/// at the service the checker died in. The service before it lands, that
+/// one does not, the scan is marked failed with its stage, and the exit code
+/// is 3, which a runner reads as "run again on a larger machine".
+#[test]
+fn a_memory_death_stops_a_run_told_to_stop_on_one_with_exit_3() {
+    let run = typed_scan(true);
+    assert_eq!(run.code, Some(3), "{}\n{}", run.stderr, run.log);
+    assert_eq!(run.uploaded(), ["alpha"], "{}", run.log);
+    assert!(
+        run.log.contains("MOCK: Recording scan failure in "),
+        "no scan-failed:\n{}",
+        run.log
+    );
+    assert!(
+        run.stderr
+            .contains("types_out_of_memory: the type checker reached its heap limit")
+            && run
+                .stderr
+                .contains("for service beta, under a heap cap of 512 MB"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// Without the variable the same death costs beta its types and nothing
+/// else, as it always has: both services land and the run exits 0.
+#[test]
+fn without_the_variable_a_memory_death_costs_only_the_types() {
+    let run = typed_scan(false);
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
+    assert_eq!(run.uploaded(), ["alpha", "beta"], "{}", run.log);
+    assert!(
+        !run.log.contains("MOCK: Recording scan failure"),
+        "{}",
+        run.log
+    );
+    // The service's types are degraded with today's words.
+    assert!(run.log.contains("Type resolution failed: "), "{}", run.log);
+    // The one addition: a line naming the classification.
+    assert!(
+        run.log
+            .contains("The type sidecar died of memory (heap_limit"),
+        "the classification is logged:\n{}",
+        run.log
+    );
+}

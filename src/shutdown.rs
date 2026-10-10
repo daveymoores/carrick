@@ -82,6 +82,12 @@ impl Shutdown {
     }
 }
 
+/// The exit code of a run that stopped because its type checker died of
+/// memory, with `CARRICK_FAIL_ON_TYPE_MEMORY` set (carrick#2208): a runner
+/// reads it as "run this again on a larger machine". Listed with every other
+/// exit code in `docs/reference/runner.md`.
+pub const TYPES_OUT_OF_MEMORY_EXIT: i32 = 3;
+
 /// The reason an interrupted run reports, on either failure event.
 pub const INTERRUPTED_REASON: &str = "interrupted";
 

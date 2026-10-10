@@ -2108,6 +2108,10 @@ impl ServiceScan<'_> {
             )))
             .await;
         let analysis = analysis?;
+        // A type checker that died of memory while this service was analysed
+        // ends the run here when the run was told to stop on one: this
+        // service does not land, the ones before it do (carrick#2208).
+        crate::scan_health::type_memory_stop()?;
 
         // `analysis` used to be the whole phase and nothing said what was in
         // it (carrick#767). The breakdown after the colon adds up to it, and
@@ -9492,6 +9496,9 @@ async fn build_cross_repo_analyzer(
         if let Some(outcomes) = outcomes {
             analyzer.set_pair_outcomes(outcomes);
         }
+        // A memory death in the check ends a run told to stop on one; the
+        // caller lands the services without verdicts (carrick#2208).
+        crate::scan_health::type_memory_stop()?;
         state
     } else {
         warn!(

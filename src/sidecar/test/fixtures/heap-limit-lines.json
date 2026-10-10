@@ -1,0 +1,16 @@
+{
+  "heap": [
+    "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+    "FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory",
+    "FATAL ERROR: MarkCompactCollector: young object promotion failed Allocation failed - JavaScript heap out of memory",
+    "FATAL ERROR: Scavenger: semi-space copy Allocation failed - JavaScript heap out of memory",
+    "FATAL ERROR: NewSpace::Rebalance Allocation failed - JavaScript heap out of memory"
+  ],
+  "not_heap": [
+    "FATAL ERROR: invalid table size Allocation failed - JavaScript heap out of memory",
+    "FATAL ERROR: invalid array length Allocation failed - JavaScript heap out of memory",
+    "FATAL ERROR: Invalid array buffer length Allocation failed - JavaScript heap out of memory",
+    "error TS18003: No inputs were found in config file.",
+    ""
+  ]
+}
