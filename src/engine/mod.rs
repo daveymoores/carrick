@@ -3151,6 +3151,10 @@ async fn analyze_current_repo_incremental(
                         debug!("Reusing cached framework detection and guidance");
                         // Both asks below are ones another service with the
                         // same lists asks identically: each takes its turn.
+                        // The re-ask's wait for its turn is deliberately
+                        // inside its PENDING_REASK_TIMEOUT: it is best effort,
+                        // and a re-ask that times out queued keeps the cached
+                        // detection and is asked again next scan.
                         let det = reask_client_semantics(
                             &detection,
                             generation,
@@ -3697,7 +3701,9 @@ async fn analyze_current_repo_incremental(
 /// through `notice` first, and made at most once a run, never when the
 /// cached detection is this run's own (a retry of owed work). A failure, or
 /// no answer in time, keeps the cached detection as it is and never defers
-/// the service.
+/// the service. When `ask` takes a turn on the run's `AskTurns`, the wait for
+/// it is inside that time limit on purpose: a re-ask that times out queued
+/// is asked again next scan.
 ///
 /// What `notice` returns is held until the ask has returned, failed or run
 /// out of time, and then dropped: [`say_schedule`]'s guard ends the notice
@@ -7283,7 +7289,8 @@ impl SettlingSemantics {
 /// installed package is still `pending`: every such package is asked about
 /// again on [`crate::client_semantics::settle_pending`]'s schedule, one HTTP
 /// attempt per ask, each bounded by
-/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An answer gives its
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`], the wait for its turn on
+/// the run's `AskTurns` included ([`reask_semantics_in_turn`]). An answer gives its
 /// semantics whatever lists it names, and nothing else ([`semantics_from_reask`]);
 /// an ask that fails changes nothing, and the next scan asks again.
 fn start_semantics_schedule(
@@ -7321,22 +7328,29 @@ fn start_semantics_schedule(
             async move {
                 // The same ask another service with these lists makes: one at
                 // a time, in turn.
-                turns
-                    .in_turn(
-                        setup_ahead::detection_ask(&packages, &import_facts),
-                        async {
-                            let detector = FrameworkDetector::new(reask_agent());
-                            semantics_from_reask(
-                                detector.detect_frameworks_and_libraries(&packages, &import_facts),
-                            )
-                            .await
-                        },
-                    )
-                    .await
+                let detector = FrameworkDetector::new(reask_agent());
+                reask_semantics_in_turn(
+                    &turns,
+                    setup_ahead::detection_ask(&packages, &import_facts),
+                    detector.detect_frameworks_and_libraries(&packages, &import_facts),
+                )
+                .await
             }
         },
         say_schedule,
     )
+}
+
+/// One ask of the in-scan schedule: `detect` in its turn on `turns`, with the
+/// wait for the turn inside [`crate::client_semantics::PENDING_REASK_TIMEOUT`]
+/// ([`semantics_from_reask`] bounds the whole), so a schedule queued behind
+/// another service's ask gives up on time like one whose ask hangs.
+async fn reask_semantics_in_turn<E: std::fmt::Display>(
+    turns: &setup_ahead::AskTurns,
+    what: String,
+    detect: impl std::future::Future<Output = Result<DetectionResult, E>>,
+) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+    semantics_from_reask(turns.in_turn(what, detect)).await
 }
 
 /// Spawn [`crate::client_semantics::settle_pending`] over `asked`, so it runs
@@ -16839,6 +16853,31 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
 
     fn broken_ask() -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
         panic!("the schedule broke")
+    }
+
+    /// carrick#1066. The schedule's ask waits for its turn inside its time
+    /// limit: queued behind another service's ask of the same thing, it gives
+    /// up when the limit passes, not when the turn comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_scheduled_reask_queued_for_its_turn_gives_up_on_time() {
+        let turns = setup_ahead::AskTurns::default();
+        let held = turns.take("a detection".to_string()).await;
+        let began = tokio::time::Instant::now();
+
+        let answered = tokio::time::timeout(
+            crate::client_semantics::PENDING_REASK_TIMEOUT * 3,
+            reask_semantics_in_turn(&turns, "a detection".to_string(), async {
+                Ok::<_, String>(DetectionResult::default())
+            }),
+        )
+        .await;
+
+        assert_eq!(answered, Ok(None), "it gave up while still queued");
+        assert_eq!(
+            began.elapsed(),
+            crate::client_semantics::PENDING_REASK_TIMEOUT
+        );
+        drop(held);
     }
 
     /// carrick#1066. Two services asking the library store for the same

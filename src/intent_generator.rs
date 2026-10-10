@@ -206,8 +206,14 @@ impl RunIntentMemo {
         if let Some(intent) = state.described.get(&key) {
             return Claimed::Described(intent.clone());
         }
-        if let Some(held) = state.claimed.get(&key) {
-            return Claimed::Waiting(Waiter(held.ended.clone()));
+        match state.claimed.get(&key) {
+            // A claim whose lease is gone without having cleared it can never
+            // be answered: take the key rather than wait on it.
+            Some(held) if held.ended.has_changed().is_err() => {
+                state.claimed.remove(&key);
+            }
+            Some(held) => return Claimed::Waiting(Waiter(held.ended.clone())),
+            None => {}
         }
         let (ended_tx, ended) = tokio::sync::watch::channel(());
         let id = state.next_claim;
@@ -2806,6 +2812,26 @@ mod tests {
             assert_eq!(requests_naming(&recorder, name), 1, "{name} was sent twice");
         }
         assert_eq!(left["a1"].intent, right["a1"].intent);
+    }
+
+    /// carrick#1066. A claim whose lease is gone without having cleared it
+    /// (it can never be answered) is taken over, not waited on.
+    #[tokio::test]
+    async fn a_claim_whose_lease_is_gone_is_taken_over() {
+        let memo = RunIntentMemo::default();
+        let (ended_tx, ended) = tokio::sync::watch::channel(());
+        let key = ("fn".to_string(), "hash".to_string());
+        memo.state()
+            .claimed
+            .insert(key, InFlightClaim { id: 0, ended });
+        drop(ended_tx);
+
+        let lease = memo.claim("fn", "hash");
+        assert!(matches!(lease, Claimed::Yours(_)));
+        assert!(
+            matches!(memo.claim("fn", "hash"), Claimed::Waiting(_)),
+            "the new holder is waited on like any other"
+        );
     }
 
     /// carrick#1066. The service that sent a function fails. The one waiting
