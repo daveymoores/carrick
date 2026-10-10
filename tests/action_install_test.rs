@@ -1461,12 +1461,14 @@ fn untrusted_mode_never_lets_a_yarn_git_dependency_load_its_own_config() {
         );
         // The lockfile, written by Yarn itself. Writing it prepares the
         // dependency too, so the marker it leaves is cleared, and the cache it
-        // fills is the case's own, so the installs below clone again.
+        // fills is the case's own, so the installs below clone again. On CI
+        // Yarn forbids creating a lockfile unless told it may.
         let global = t.markers.parent().expect("scratch").join("yarn-global");
         sh(
             &t.repo.join("svc"),
             &format!(
-                "YARN_GLOBAL_FOLDER={} corepack yarn install --mode=skip-build \
+                "YARN_GLOBAL_FOLDER={} YARN_ENABLE_IMMUTABLE_INSTALLS=0 \
+                 corepack yarn install --mode=skip-build \
                  && rm -rf node_modules .yarn .pnp.cjs .pnp.loader.mjs",
                 global.to_str().expect("utf-8 path")
             ),
