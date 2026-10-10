@@ -15,7 +15,13 @@ use super::workspace::Workspace;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalCommand {
     /// Read the shared workspace/service proposal without scanning or writing.
-    Derive { workspace: Option<PathBuf> },
+    ///
+    /// `--candidates` adds, per service, the env vars and URL origins its
+    /// source reads ([`crate::derive_candidates`], carrick#2232).
+    Derive {
+        workspace: Option<PathBuf>,
+        candidates: bool,
+    },
     /// Scan every repo the workspace lists, and build the index.
     ///
     /// This is the inferred scan: Carrick Cloud classifies what the
@@ -126,6 +132,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut recheck = false;
     let mut allow_unprepared = false;
     let mut no_keep_awake = false;
+    let mut candidates = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -146,6 +153,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 service = Some(value.clone());
             }
             "--json" => json = true,
+            "--candidates" => candidates = true,
             "--recheck" => recheck = true,
             // Removed in carrick#1008, and refused by name for one release
             // (carrick#1011): `carrick index` IS the inferred scan now.
@@ -199,6 +207,10 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     if recheck && name != "check" {
         return Err(format!("unknown option for `carrick {name}`: --recheck"));
     }
+    // Only the proposal has services to list candidates for.
+    if candidates && name != "derive" {
+        return Err(format!("unknown option for `carrick {name}`: --candidates"));
+    }
     // `index` is the only command that asks the model about this tree, so it
     // is the only one an unprepared tree is refused for, and the only one with
     // anything to override.
@@ -222,7 +234,10 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             if workspace.is_none() {
                 workspace = positional.first().map(PathBuf::from);
             }
-            Ok(LocalCommand::Derive { workspace })
+            Ok(LocalCommand::Derive {
+                workspace,
+                candidates,
+            })
         }
         "index" => {
             // `carrick index <dir>` reads the same as `--workspace <dir>`;
@@ -287,7 +302,10 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
 /// item 2, [`read`]).
 pub fn run(command: LocalCommand) -> i32 {
     match command {
-        LocalCommand::Derive { workspace } => match derive(workspace.as_deref()) {
+        LocalCommand::Derive {
+            workspace,
+            candidates,
+        } => match derive(workspace.as_deref(), candidates) {
             Ok(proposal) => {
                 crate::outln!("{proposal}");
                 0
@@ -388,7 +406,7 @@ pub fn run(command: LocalCommand) -> i32 {
     }
 }
 
-fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
+fn derive(root: Option<&Path>, candidates: bool) -> Result<serde_json::Value, String> {
     let root = root
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
@@ -407,7 +425,17 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
         // the handoff rather than by a refused scan: `carrick init` puts the
         // install in the agent's instruction (carrick#1489, carrick#1254).
         let not_installed = not_installed(repo, &derived.services);
-        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.service_documents(), "config": derived.config, "warnings": derived.warnings, "notes": derived.notes, "not_installed": not_installed }));
+        let mut services = derived.service_documents();
+        // Additive and only on request, so a derive without the flag prints
+        // the same bytes it did before it (carrick#2232).
+        if candidates {
+            for (document, service) in services.iter_mut().zip(&derived.services) {
+                let found = crate::derive_candidates::service_candidates(repo, service);
+                document["candidates"] =
+                    serde_json::to_value(found).expect("candidates serialize as a JSON object");
+            }
+        }
+        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": services,"config": derived.config, "warnings": derived.warnings, "notes": derived.notes, "not_installed": not_installed }));
     }
     Ok(
         serde_json::json!({ "schema": "carrick.derive/0", "workspace": workspace.root, "repos_detected_by": workspace.repos_detected_by, "repos_added": workspace.repos_added, "repos_excluded": workspace.repos_excluded, "missing": workspace.missing, "parent_proposal": workspace.parent_proposal, "repos": repos }),
@@ -1786,6 +1814,10 @@ carrick.status/0 from `status`)."#
 }
 
 #[cfg(test)]
+#[path = "derive_candidates_tests.rs"]
+mod derive_candidates_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2240,7 +2272,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("package-lock.json"), "{}").unwrap();
 
-        let bare = derive(Some(root)).unwrap();
+        let bare = derive(Some(root), false).unwrap();
         let rows = bare["repos"][0]["not_installed"]
             .as_array()
             .unwrap()
@@ -2255,7 +2287,7 @@ mod tests {
         );
 
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
-        let installed = derive(Some(root)).unwrap();
+        let installed = derive(Some(root), false).unwrap();
         assert_eq!(
             installed["repos"][0]["not_installed"],
             serde_json::json!([]),

@@ -717,7 +717,7 @@ fn fallback_url_literal(expr: &Expr) -> Option<String> {
 /// one: it is reported verbatim as what the source states the request falls
 /// back to. A non-literal default (a template, a function call, another
 /// binding) still yields `None` — there is no written literal to report.
-fn fallback_literal(expr: &Expr) -> Option<String> {
+pub(crate) fn fallback_literal(expr: &Expr) -> Option<String> {
     let Expr::Bin(bin) = unwrap_transparent(expr) else {
         return None;
     };
@@ -941,14 +941,23 @@ impl EnvSchemaIndex {
 /// there is nothing about optionality to report, and inventing "required" from
 /// a chain that never said so would be a guess.
 pub fn module_env_schema(module: &Module) -> EnvSchemaMap {
+    module_env_schema_sites(module).0
+}
+
+/// [`module_env_schema`], with the position of the property key each recorded
+/// declaration was read from, in source order (carrick#2232).
+pub fn module_env_schema_sites(
+    module: &Module,
+) -> (EnvSchemaMap, Vec<(String, swc_common::BytePos)>) {
     let mut extractor = EnvSchemaExtractor::default();
     module.visit_with(&mut extractor);
-    extractor.declarations
+    (extractor.declarations, extractor.sites)
 }
 
 #[derive(Default)]
 struct EnvSchemaExtractor {
     declarations: EnvSchemaMap,
+    sites: Vec<(String, swc_common::BytePos)>,
 }
 
 impl Visit for EnvSchemaExtractor {
@@ -969,6 +978,8 @@ impl Visit for EnvSchemaExtractor {
                 continue;
             }
             if let Some(declaration) = schema_chain_declaration(&kv.value) {
+                use swc_common::Spanned;
+                self.sites.push((name.clone(), kv.key.span().lo));
                 // First declaration in the module wins; the repo-wide fold
                 // above is what resolves a name declared twice.
                 self.declarations.entry(name).or_insert(declaration);
