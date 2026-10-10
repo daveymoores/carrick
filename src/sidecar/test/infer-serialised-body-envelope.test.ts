@@ -176,11 +176,100 @@ export async function archive() { // ARCHIVE
 }
 
 export async function exportCsv(): Promise<Envelope> { // CSV
+  if (flag) return reply(200, { rows: store.list().length });
+  return { statusCode: 200, body: toCsv(store.list()) };
+}
+
+export async function exportCsvOnly(): Promise<Envelope> { // CSV_ONLY
   return { statusCode: 200, body: toCsv(store.list()) };
 }
 
 export async function packaged() { // PACKAGED
+  if (flag) return reply(200, { local: true });
   return respond(200, { packaged: true });
+}
+
+export interface Article {
+  id: string;
+  title: string;
+  body: string;
+  status: number;
+}
+
+declare const article: Article;
+
+export async function getArticle() { // ARTICLE
+  return article;
+}
+
+export async function greeting() { // GREETING
+  return { status: 1, body: "hello" };
+}
+
+declare const prebuilt: PlatformResult;
+
+export async function platformAsIs(): Promise<PlatformResult> { // PLATFORM_AS_IS
+  return prebuilt;
+}
+
+declare function forward(ev: unknown, edit: (r: Envelope) => void): Envelope;
+
+export async function forwarded(ev: unknown) { // FORWARD
+  if (flag) return forward(ev, (r) => { r.headers = { "x": "1" }; });
+  return reply(200, { id: "1" });
+}
+
+declare function firstOf(a: Envelope, b: Envelope): Envelope;
+
+export async function either() { // TWO_ENVELOPES
+  return firstOf(reply(200, { a: 1 }), reply(200, { b: "x" }));
+}
+
+declare const loose: { [x: string]: any };
+declare const wrapped: { data: any };
+
+export async function indexAny() { // INDEX_ANY
+  return reply(200, loose);
+}
+
+export async function memberAny() { // MEMBER_ANY
+  return reply(200, { wrapped });
+}
+
+export async function sendAny() { // SEND_ANY
+  return send<any>(200, { x: 1 });
+}
+
+export async function sendUnknown() { // SEND_UNKNOWN
+  return send<unknown>(200, { x: 1 });
+}
+
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+
+function objectReply(code: number, payload: object): Envelope {
+  return { statusCode: code, body: JSON.stringify(payload) };
+}
+
+function jsonReply(code: number, payload: Json): Envelope {
+  return { statusCode: code, body: JSON.stringify(payload) };
+}
+
+export async function objectParam() { // OBJECT_PARAM
+  return objectReply(200, { k: 1 });
+}
+
+export async function jsonParam() { // JSON_PARAM
+  return jsonReply(200, { j: "x" });
+}
+
+function withTimeout(ctx: unknown, code: number, out: Envelope): Envelope {
+  void ctx;
+  void code;
+  return out;
+}
+
+export async function timed(ctx: unknown) { // TIMEOUT
+  return withTimeout(ctx, 500, reply(200, { late: false }));
 }
 
 export async function unknownPayload(raw: unknown): Promise<Envelope> { // UNKNOWN_PAYLOAD
@@ -305,7 +394,7 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
     return inferred;
   }
 
-  function assertUnread(inferred: Inferred): void {
+  function assertUnread(inferred: Inferred, detail: RegExp): void {
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
     assert.strictEqual(inferred.is_explicit, false);
     const provenance = inferred.any_provenance ?? [];
@@ -317,6 +406,7 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
       !/\//.test(provenance[0].detail ?? ''),
       `the reason must carry no path, got: ${provenance[0].detail}`
     );
+    assert.match(provenance[0].detail ?? '', detail);
   }
 
   function assertNoEnvelope(inferred: Inferred): void {
@@ -410,19 +500,19 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
   });
 
   it('answers unknown when one branch returns an identifier', async () => {
-    assertUnread(await inferReturn('ARCHIVE'));
+    assertUnread(await inferReturn('ARCHIVE'), /built somewhere else/);
   });
 
   it('answers unknown when the body is not produced by JSON.stringify', async () => {
-    assertUnread(await inferReturn('CSV'));
+    assertUnread(await inferReturn('CSV'), /not made by JSON\.stringify/);
   });
 
   it('answers unknown when the builder is an installed package', async () => {
-    assertUnread(await inferReturn('PACKAGED'));
+    assertUnread(await inferReturn('PACKAGED'), /response helper that could not be followed/);
   });
 
   it('answers unknown when the serialised value is typed unknown', async () => {
-    assertUnread(await inferReturn('UNKNOWN_PAYLOAD'));
+    assertUnread(await inferReturn('UNKNOWN_PAYLOAD'), /typed any or unknown/);
   });
 
   it('never publishes string for a rule that reads the envelope body', async () => {
@@ -432,6 +522,63 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
       collapse(inferred.type_string),
       '{ notes: { id: string; title: string; }[]; }'
     );
+  });
+
+  it('answers unknown for a platform-typed value returned as-is', async () => {
+    assertUnread(await inferReturn('PLATFORM_AS_IS'), /built somewhere else/);
+  });
+
+  it('keeps a returned call whose callback returns nothing as a branch', async () => {
+    assertUnread(
+      await inferReturn('FORWARD'),
+      /response helper that could not be followed/
+    );
+  });
+
+  it('answers unknown for a call handed two envelopes', async () => {
+    assertUnread(
+      await inferReturn('TWO_ENVELOPES'),
+      /response helper that could not be followed/
+    );
+  });
+
+  it('answers unknown when the serialised value holds any or unknown', async () => {
+    for (const marker of ['INDEX_ANY', 'MEMBER_ANY', 'SEND_ANY', 'SEND_UNKNOWN']) {
+      assertUnread(await inferReturn(marker), /typed any or unknown/);
+    }
+  });
+
+  it('reads the argument when the builder takes object or a JSON value', async () => {
+    const object = await inferReturn('OBJECT_PARAM');
+    assert.strictEqual(collapse(object.type_string), '{ k: number; }');
+    assert.strictEqual(object.is_explicit, false);
+    const json = await inferReturn('JSON_PARAM');
+    assert.strictEqual(collapse(json.type_string), '{ j: string; }');
+    assert.strictEqual(json.is_explicit, false);
+  });
+
+  it('lets the inner envelope\'s own status outrank an outer numeric argument', async () => {
+    const inferred = await inferReturn('TIMEOUT');
+    assertNoEnvelope(inferred);
+    assert.strictEqual(collapse(inferred.type_string), '{ late: boolean; }');
+  });
+
+  it('keeps today\'s answer for a domain type with status and body members', async () => {
+    const inferred = await inferReturn('ARTICLE');
+    assert.strictEqual(inferred.type_string, PINNED_ARTICLE);
+    assert.strictEqual(inferred.any_provenance, undefined);
+  });
+
+  it('keeps today\'s answer for an inferred literal whose body is not serialised', async () => {
+    const inferred = await inferReturn('GREETING');
+    assert.strictEqual(inferred.type_string, PINNED_GREETING);
+    assert.strictEqual(inferred.any_provenance, undefined);
+  });
+
+  it('keeps today\'s answer when no return shows a serialised body', async () => {
+    const inferred = await inferReturn('CSV_ONLY');
+    assert.strictEqual(inferred.type_string, PINNED_CSV_ONLY);
+    assert.strictEqual(inferred.any_provenance, undefined);
   });
 
   it('keeps today\'s answer for an object-typed body', async () => {
@@ -455,3 +602,7 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
 /** Pinned from origin/main before carrick#2200, byte for byte. */
 const PINNED_OBJECT_BODY = '{ status: number; body: { id: string; }; }';
 const PINNED_NOT_ENVELOPE = '{ balance: number; }';
+const PINNED_ARTICLE = '{ id: string; title: string; body: string; status: number; }';
+const PINNED_GREETING = '{ status: number; body: string; }';
+const PINNED_CSV_ONLY =
+  '{ statusCode: number; headers?: { [x: string]: string; }; body: string; }';
