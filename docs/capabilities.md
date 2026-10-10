@@ -74,8 +74,9 @@ Every row, and every pairing of rows, carries a source (`EdgeSource`,
   The runtime's own events (`message`, `open`, `close`) are never keyed
   (`src/event_emitter.rs:168`). An event listener is indexed as a pub/sub
   endpoint only when the object it listens on belongs to the repository:
-  created or imported in its own code, or a messaging or socket client that
-  detection lists. A listener on an object that a package or the runtime
+  created in its own code (a package's class only when built with no
+  arguments), imported from its own modules, or a messaging or socket client
+  that detection lists. A listener on an object that a package or the runtime
   returns, such as a line reader, is not (`src/event_emitter.rs:43`,
   carrick#941).
 - A consumer that reaches a producer through a published SDK package has no
