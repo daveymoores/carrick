@@ -241,25 +241,25 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
 });
 
 describe('check_v2: heap-death evidence and the compiler heap cap', () => {
+  // One table for this rule and the scanner's own (`is_heap_limit_line`,
+  // type_sidecar.rs), which reads the same file (carrick#2208).
+  const table = JSON.parse(
+    fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'test', 'fixtures', 'heap-limit-lines.json'),
+      'utf8'
+    )
+  ) as { heap: string[]; not_heap: string[] };
+
   it('every heap-exhaustion line V8 prints is a heap death', () => {
-    for (const line of [
-      'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
-      'FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory',
-      'FATAL ERROR: MarkCompactCollector: young object promotion failed Allocation failed - JavaScript heap out of memory',
-      'FATAL ERROR: Scavenger: semi-space copy Allocation failed - JavaScript heap out of memory',
-    ]) {
+    assert.ok(table.heap.length >= 4);
+    for (const line of table.heap) {
       assert.strictEqual(carriesHeapLimitLine(`<--- Last few GCs --->\n${line}\n 1: 0x1 node`), true, line);
     }
   });
 
   it('a hard size limit, or no line at all, is not', () => {
-    for (const line of [
-      'FATAL ERROR: invalid table size Allocation failed - JavaScript heap out of memory',
-      'FATAL ERROR: invalid array length Allocation failed - JavaScript heap out of memory',
-      'FATAL ERROR: Invalid array buffer length Allocation failed - JavaScript heap out of memory',
-      'error TS18003: No inputs were found in config file.',
-      '',
-    ]) {
+    assert.ok(table.not_heap.length >= 3);
+    for (const line of table.not_heap) {
       assert.strictEqual(carriesHeapLimitLine(line), false, line);
     }
   });

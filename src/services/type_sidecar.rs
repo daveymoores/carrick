@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1011,13 +1011,19 @@ pub struct CompilerEnd {
 }
 
 impl CompilerEnd {
-    /// Whether the compiler died of memory: it aborted, as V8 does when its
-    /// heap is full (SIGABRT, or exit code 134 when a shell sat between),
-    /// and said so on stderr. A SIGKILL the cgroup counted as an OOM kill is
-    /// carrick#2208's to add, beside its reader.
-    pub fn is_memory_death(&self) -> bool {
-        self.heap_limit
-            && (self.signal.as_deref() == Some("SIGABRT") || self.exit_code == Some(134))
+    /// Whether the compiler died of memory, and how: the rule every sidecar
+    /// process is held to ([`MemoryDeath::classify`]), over the end the
+    /// sidecar reported. `oom_kills_rose` is the cgroup's OOM-kill counter
+    /// read around the check, which the compiler shares with the scanner.
+    pub fn memory_death(&self, oom_kills_rose: bool) -> Option<MemoryDeath> {
+        let end = match (self.signal.as_deref(), self.exit_code) {
+            (Some("SIGABRT"), _) => Some(ProcessEnd::Signal(ProcessEnd::SIGABRT)),
+            (Some("SIGKILL"), _) => Some(ProcessEnd::Signal(ProcessEnd::SIGKILL)),
+            // Another signal: neither rule reads it.
+            (Some(_), _) => None,
+            (None, code) => code.map(ProcessEnd::Code),
+        };
+        MemoryDeath::classify(end, self.heap_limit, oom_kills_rose)
     }
 }
 
@@ -1673,6 +1679,110 @@ fn cgroup_memory_limit_mb() -> Option<u64> {
     None
 }
 
+/// How many processes the kernel has killed for memory in this process's
+/// cgroup, when it runs under one that says (carrick#2208).
+///
+/// cgroup v2 `memory.events`, then v1 `memory.oom_control`; both carry an
+/// `oom_kill <n>` line. Linux only: anywhere else there is no counter, and a
+/// SIGKILL stays unclassified.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_oom_kills() -> Option<u64> {
+    const V2: &str = "/sys/fs/cgroup/memory.events";
+    const V1: &str = "/sys/fs/cgroup/memory/memory.oom_control";
+    [V2, V1]
+        .into_iter()
+        .find_map(|path| oom_kill_count(&std::fs::read_to_string(path).ok()?))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn cgroup_oom_kills() -> Option<u64> {
+    None
+}
+
+/// The `oom_kill` count in a cgroup memory file's text. The key is matched
+/// whole: v1's file also carries `oom_kill_disable`.
+fn oom_kill_count(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "oom_kill").then(|| fields.next()?.parse().ok())?
+    })
+}
+
+/// Whether the cgroup's OOM-kill counter rose between two reads. Unknown
+/// either side reads as no.
+pub(crate) fn oom_kills_rose(before: Option<u64>, after: Option<u64>) -> bool {
+    matches!((before, after), (Some(before), Some(after)) if after > before)
+}
+
+/// The tail V8 prints on every fatal heap-exhaustion line.
+const HEAP_OUT_OF_MEMORY: &str = "JavaScript heap out of memory";
+
+/// V8's hard size limits print the same tail, and a larger heap does not lift
+/// them, so they are not memory deaths.
+const HARD_SIZE_LIMITS: [&str; 3] = [
+    "invalid table size",
+    "invalid array length",
+    "Invalid array buffer length",
+];
+
+/// Whether one stderr line is V8's fatal heap-exhaustion line (`Reached heap
+/// limit`, `Ineffective mark-compacts near heap limit`, and the other forms
+/// all end in `JavaScript heap out of memory`), and not one of the hard size
+/// limits that end the same way.
+///
+/// The same rule as the sidecar's `carriesHeapLimitLine` (check.ts) applies
+/// to its compiler's stderr; both are tested against one table,
+/// `src/sidecar/test/fixtures/heap-limit-lines.json`.
+pub(crate) fn is_heap_limit_line(line: &str) -> bool {
+    line.contains(HEAP_OUT_OF_MEMORY) && !HARD_SIZE_LIMITS.iter().any(|limit| line.contains(limit))
+}
+
+/// A type-checker process that died of memory, and how (carrick#2208).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryDeath {
+    /// It aborted with V8's heap-exhaustion line on stderr: the heap cap it
+    /// was given was not enough.
+    HeapLimit,
+    /// It was killed (SIGKILL) and the cgroup's OOM-kill counter rose while
+    /// it ran: the machine's memory was not enough.
+    OomKilled,
+}
+
+impl MemoryDeath {
+    /// How a process that ended `end` died, when it was memory.
+    ///
+    /// The rule leans wide on purpose: a false positive costs one retry on a
+    /// larger machine, and a false negative ships a typeless index.
+    /// - An abort (SIGABRT, or exit code 134 when a shell sat between) is a
+    ///   heap death only with V8's line on stderr (`heap_line`); without it
+    ///   the process merely aborted.
+    /// - A SIGKILL is an OOM kill only when the cgroup counted one
+    ///   (`oom_kills_rose`); otherwise something else killed it.
+    pub fn classify(
+        end: Option<ProcessEnd>,
+        heap_line: bool,
+        oom_kills_rose: bool,
+    ) -> Option<Self> {
+        match end? {
+            ProcessEnd::Signal(ProcessEnd::SIGABRT) | ProcessEnd::Code(134) if heap_line => {
+                Some(MemoryDeath::HeapLimit)
+            }
+            ProcessEnd::Signal(ProcessEnd::SIGKILL) if oom_kills_rose => {
+                Some(MemoryDeath::OomKilled)
+            }
+            _ => None,
+        }
+    }
+
+    /// The kind, as a stable token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryDeath::HeapLimit => "heap_limit",
+            MemoryDeath::OomKilled => "oom_killed",
+        }
+    }
+}
+
 /// Physical memory in MB, or `None` when this platform's probe fails.
 ///
 /// Deliberately dependency-free: one `/proc/meminfo` read on Linux (where CI
@@ -1739,6 +1849,25 @@ struct SidecarProcess {
     /// Lines the process writes to stdout, in order: see
     /// [`TypeSidecar::responses`].
     responses: Receiver<String>,
+    /// What is known about how it might die: see [`DeathEvidence`].
+    evidence: DeathEvidence,
+}
+
+/// What one sidecar process leaves behind to say whether it died of memory
+/// (carrick#2208): whether its stderr carried V8's heap-exhaustion line, and
+/// the cgroup's OOM-kill count when it was started.
+#[derive(Clone)]
+struct DeathEvidence {
+    stderr: Arc<StderrEvidence>,
+    oom_kills_at_spawn: Option<u64>,
+}
+
+/// Set by the stderr reader thread.
+#[derive(Default)]
+struct StderrEvidence {
+    heap_line: AtomicBool,
+    /// The reader reached EOF: every line the process wrote has been read.
+    closed: AtomicBool,
 }
 
 impl SidecarProcess {
@@ -1819,22 +1948,36 @@ impl SidecarProcess {
             }
         });
 
-        // Pipe sidecar stderr through tracing on a background thread
+        // Pipe sidecar stderr through tracing on a background thread, keeping
+        // whether V8 said its heap ran out: the abort that follows does not
+        // say why (carrick#2208).
+        let stderr_evidence = Arc::new(StderrEvidence::default());
         if let Some(stderr) = child.stderr.take() {
+            let evidence = Arc::clone(&stderr_evidence);
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
+                    if is_heap_limit_line(&line) {
+                        evidence.heap_line.store(true, Ordering::SeqCst);
+                    }
                     if !line.trim().is_empty() {
                         debug!("{}", line);
                     }
                 }
+                evidence.closed.store(true, Ordering::SeqCst);
             });
+        } else {
+            stderr_evidence.closed.store(true, Ordering::SeqCst);
         }
 
         Ok(Self {
             child,
             stdin,
             responses,
+            evidence: DeathEvidence {
+                stderr: stderr_evidence,
+                oom_kills_at_spawn: cgroup_oom_kills(),
+            },
         })
     }
 }
@@ -1873,6 +2016,8 @@ pub enum ProcessEnd {
 impl ProcessEnd {
     /// The signal a runtime raises on itself to abort.
     pub const SIGABRT: i32 = 6;
+    /// The signal the OS ends a process with, the OOM killer included.
+    pub const SIGKILL: i32 = 9;
 
     /// Whether the process aborted itself, which is how Node ends when its
     /// heap is full.
@@ -1958,6 +2103,32 @@ pub struct TypeSidecar {
     /// How many items the request last sent carries: what a timeout costs
     /// ([`Self::restarting_on_timeout`]).
     in_flight_items: AtomicUsize,
+    /// What the current process leaves to say whether it died of memory
+    /// ([`Self::how_the_process_died`]). Replaced with the process.
+    evidence: Mutex<DeathEvidence>,
+    /// The current process's death has been classified and, when it was
+    /// memory, recorded for the run ([`Self::note_death`]). Every request
+    /// after a death fails the same way, and it is one death.
+    death_noted: AtomicBool,
+}
+
+/// How a sidecar process that is gone came to an end, with what it left to
+/// say whether that was memory (carrick#2208).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessDeath {
+    /// The signal or exit code, when the OS said.
+    pub end: Option<ProcessEnd>,
+    /// Its stderr carried V8's heap-exhaustion line.
+    pub heap_line: bool,
+    /// The cgroup's OOM-kill counter rose while it ran.
+    pub oom_kills_rose: bool,
+}
+
+impl ProcessDeath {
+    /// Whether it died of memory, and how ([`MemoryDeath::classify`]).
+    pub fn memory_death(&self) -> Option<MemoryDeath> {
+        MemoryDeath::classify(self.end, self.heap_line, self.oom_kills_rose)
+    }
 }
 
 impl TypeSidecar {
@@ -1978,6 +2149,7 @@ impl TypeSidecar {
             child,
             stdin,
             responses,
+            evidence,
         } = SidecarProcess::spawn(sidecar_path)?;
 
         debug!(
@@ -1998,6 +2170,8 @@ impl TypeSidecar {
             operation_timeout: OPERATION_TIMEOUT,
             last_progress: Mutex::new(None),
             in_flight_items: AtomicUsize::new(0),
+            evidence: Mutex::new(evidence),
+            death_noted: AtomicBool::new(false),
         })
     }
 
@@ -2030,6 +2204,65 @@ impl TypeSidecar {
                 }
                 _ => return None,
             }
+        }
+    }
+
+    /// How the current process died, with what it left to say whether that
+    /// was memory (carrick#2208). For a process whose stdout has closed, as
+    /// [`Self::how_the_process_ended`] is.
+    ///
+    /// The stderr reader is waited for, briefly, after the process is
+    /// reaped: V8 writes its heap line just before it aborts, and a read of
+    /// the flag that beat the reader to that line would call a heap death a
+    /// plain abort.
+    pub fn how_the_process_died(&self) -> ProcessDeath {
+        let end = self.how_the_process_ended();
+        let evidence = self.evidence.lock().unwrap().clone();
+        let waited = Instant::now();
+        while !evidence.stderr.closed.load(Ordering::SeqCst)
+            && waited.elapsed() < Duration::from_secs(2)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        ProcessDeath {
+            end,
+            heap_line: evidence.stderr.heap_line.load(Ordering::SeqCst),
+            oom_kills_rose: oom_kills_rose(evidence.oom_kills_at_spawn, cgroup_oom_kills()),
+        }
+    }
+
+    /// Classify the death of the current process once, the first time a
+    /// request finds it gone, and record it for the run when it was memory
+    /// ([`crate::scan_health::record_type_memory_death`]).
+    ///
+    /// Every request reaches the process through [`Self::send_request`] and
+    /// [`Self::read_frame`], so this one place sees a death in any stage:
+    /// readiness, inference, bundling, the capture, the check.
+    fn note_death(&self) {
+        if self.death_noted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let death = self.how_the_process_died();
+        match death.memory_death() {
+            Some(kind) => {
+                let cap = heap_cap_mb();
+                // The log's, not the terminal's: a run told to stop on it says
+                // so in its failure, and one that is not loses the service's
+                // types with today's words (carrick#2208).
+                debug!(
+                    "The type sidecar died of memory ({}, {:?}, heap cap {}) during {}",
+                    kind.as_str(),
+                    death.end,
+                    cap.map_or_else(|| "V8 default".to_string(), |mb| format!("{mb} MB")),
+                    crate::scan_stage::current().as_str()
+                );
+                crate::scan_health::record_type_memory_death(kind, cap);
+            }
+            None => debug!(
+                "[type_sidecar] The sidecar process ended ({:?}); not a memory death \
+                 (heap line: {}, OOM kills rose: {})",
+                death.end, death.heap_line, death.oom_kills_rose
+            ),
         }
     }
 
@@ -2322,6 +2555,8 @@ impl TypeSidecar {
         *self.child.lock().unwrap() = process.child;
         *self.stdin.lock().unwrap() = process.stdin;
         *self.responses.lock().unwrap() = process.responses;
+        *self.evidence.lock().unwrap() = process.evidence;
+        self.death_noted.store(false, Ordering::SeqCst);
 
         // A sidecar that was never initialised has no scope to restore: the
         // fresh one waits for its first `init` as the old one did.
@@ -2989,12 +3224,13 @@ impl TypeSidecar {
             .store(request.item_count(), Ordering::Relaxed);
 
         let mut stdin = self.stdin.lock().unwrap();
-        writeln!(stdin, "{}", json).map_err(|e| SidecarError::IoError(e.to_string()))?;
-        stdin
-            .flush()
-            .map_err(|e| SidecarError::IoError(e.to_string()))?;
-
-        Ok(())
+        let written = writeln!(stdin, "{}", json).and_then(|()| stdin.flush());
+        drop(stdin);
+        written.map_err(|e| {
+            // A write fails when the process at the other end is gone.
+            self.note_death();
+            SidecarError::IoError(e.to_string())
+        })
     }
 
     /// Read the terminal JSON frame for `request_id`. Frames for other request
@@ -3075,7 +3311,10 @@ impl TypeSidecar {
                 // checks, where the deadline itself is read.
                 Err(RecvTimeoutError::Timeout) => continue,
                 // stdout hit EOF: the process is gone.
-                Err(RecvTimeoutError::Disconnected) => return Err(SidecarError::ProcessDied),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.note_death();
+                    return Err(SidecarError::ProcessDied);
+                }
             };
 
             let trimmed = line.trim();
@@ -3723,17 +3962,36 @@ mod tests {
                 heap_cap_mb: Some(6192),
             })
         );
-        assert!(heap.compiler_end.unwrap().is_memory_death());
+        assert_eq!(
+            heap.compiler_end.unwrap().memory_death(false),
+            Some(MemoryDeath::HeapLimit)
+        );
         let through_a_shell =
             answer(serde_json::json!({ "exit_code": 134, "signal": null, "heap_limit": true }));
-        assert!(through_a_shell.compiler_end.unwrap().is_memory_death());
+        assert_eq!(
+            through_a_shell.compiler_end.unwrap().memory_death(false),
+            Some(MemoryDeath::HeapLimit)
+        );
+        // A kill the cgroup counted is the machine's memory (carrick#2208).
+        let killed = answer(
+            serde_json::json!({ "exit_code": null, "signal": "SIGKILL", "heap_limit": false }),
+        );
+        assert_eq!(
+            killed.compiler_end.unwrap().memory_death(true),
+            Some(MemoryDeath::OomKilled)
+        );
         for end in [
             serde_json::json!({ "exit_code": null, "signal": "SIGABRT", "heap_limit": false }),
             serde_json::json!({ "exit_code": null, "signal": "SIGKILL", "heap_limit": false }),
             serde_json::json!({ "exit_code": 2, "signal": null, "heap_limit": true }),
+            serde_json::json!({ "exit_code": null, "signal": "SIGSEGV", "heap_limit": true }),
         ] {
-            assert!(
-                !answer(end.clone()).compiler_end.unwrap().is_memory_death(),
+            assert_eq!(
+                answer(end.clone())
+                    .compiler_end
+                    .unwrap()
+                    .memory_death(false),
+                None,
                 "{end}"
             );
         }
@@ -3742,6 +4000,82 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(normal.compiler_end, None);
+    }
+
+    /// carrick#2208: a process end is a memory death by one rule. An abort
+    /// is V8's heap only with its line on stderr; a SIGKILL is the OOM killer
+    /// only when the cgroup counted a kill; nothing else is either.
+    #[test]
+    fn a_process_end_is_a_memory_death_by_one_rule() {
+        use MemoryDeath::{HeapLimit, OomKilled};
+        let abort = Some(ProcessEnd::Signal(ProcessEnd::SIGABRT));
+        let kill = Some(ProcessEnd::Signal(ProcessEnd::SIGKILL));
+        let cases = [
+            // (end, heap line, OOM kills rose, expected)
+            (abort, true, false, Some(HeapLimit)),
+            (abort, true, true, Some(HeapLimit)),
+            (Some(ProcessEnd::Code(134)), true, false, Some(HeapLimit)),
+            (abort, false, false, None),
+            (abort, false, true, None),
+            (Some(ProcessEnd::Code(134)), false, false, None),
+            (kill, false, true, Some(OomKilled)),
+            (kill, true, true, Some(OomKilled)),
+            (kill, false, false, None),
+            (kill, true, false, None),
+            (Some(ProcessEnd::Signal(15)), true, true, None),
+            (Some(ProcessEnd::Code(1)), true, true, None),
+            (Some(ProcessEnd::Code(0)), false, false, None),
+            (None, true, true, None),
+        ];
+        for (end, heap_line, oom_kills_rose, expected) in cases {
+            assert_eq!(
+                MemoryDeath::classify(end, heap_line, oom_kills_rose),
+                expected,
+                "{end:?}, heap line {heap_line}, OOM kills rose {oom_kills_rose}"
+            );
+        }
+    }
+
+    /// The heap-line rule here and the sidecar's `carriesHeapLimitLine`
+    /// (check.ts) read one table, so the two cannot drift apart unnoticed.
+    #[test]
+    fn the_heap_line_rule_agrees_with_the_sidecars_table() {
+        let table: serde_json::Value = serde_json::from_str(include_str!(
+            "../sidecar/test/fixtures/heap-limit-lines.json"
+        ))
+        .unwrap();
+        let lines = |key: &str| -> Vec<String> {
+            table[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("no {key} array"))
+                .iter()
+                .map(|line| line.as_str().unwrap().to_string())
+                .collect()
+        };
+        let (heap, not_heap) = (lines("heap"), lines("not_heap"));
+        assert!(heap.len() >= 4 && not_heap.len() >= 3);
+        for line in &heap {
+            assert!(is_heap_limit_line(line), "{line}");
+        }
+        for line in &not_heap {
+            assert!(!is_heap_limit_line(line), "{line}");
+        }
+    }
+
+    /// Both cgroup versions' memory files carry `oom_kill <n>`; v1's also
+    /// carries `oom_kill_disable`, which is not it.
+    #[test]
+    fn the_oom_kill_count_is_read_from_either_cgroup_version() {
+        let v2 = "low 0\nhigh 0\nmax 12\noom 3\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(oom_kill_count(v2), Some(2));
+        let v1 = "oom_kill_disable 0\nunder_oom 0\noom_kill 5\n";
+        assert_eq!(oom_kill_count(v1), Some(5));
+        assert_eq!(oom_kill_count("oom_kill_disable 1\nunder_oom 0\n"), None);
+        assert_eq!(oom_kill_count(""), None);
+        assert!(oom_kills_rose(Some(2), Some(3)));
+        assert!(!oom_kills_rose(Some(3), Some(3)));
+        assert!(!oom_kills_rose(None, Some(3)));
+        assert!(!oom_kills_rose(Some(3), None));
     }
 
     /// carrick#2054: the sidecar reports `response_modes` on a response

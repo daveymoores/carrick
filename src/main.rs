@@ -314,7 +314,18 @@ async fn main() {
         // After the line, not before it: the user reads why the run stopped
         // without waiting on a request about it.
         report_failure_before_scan(&repo_path, e.as_ref()).await;
-        std::process::exit(1);
+        std::process::exit(failure_exit_code());
+    }
+}
+
+/// The code a failed run exits with: [`shutdown::TYPES_OUT_OF_MEMORY_EXIT`]
+/// when it stopped at a type-checker memory death it was told to stop on
+/// (carrick#2208), otherwise 1. Read from the run's record rather than the
+/// error, which reaches here as text.
+fn failure_exit_code() -> i32 {
+    match scan_health::type_memory_stop() {
+        Err(_) => shutdown::TYPES_OUT_OF_MEMORY_EXIT,
+        Ok(()) => 1,
     }
 }
 

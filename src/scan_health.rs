@@ -114,6 +114,72 @@ struct Registry {
     /// off its outcomes instead ([`crate::time_limits::from_check_outcomes`]),
     /// because no service is being analysed while it runs.
     time_limits: BTreeMap<Scope, crate::time_limits::TimeLimitsRunOut>,
+    /// Every type-checker process that died of memory in this run, in order
+    /// (carrick#2208). With [`FAIL_ON_TYPE_MEMORY_ENV`] the first one ends
+    /// the run.
+    type_memory_deaths: Vec<TypeMemoryDeath>,
+}
+
+/// A type-checker process that died of memory (carrick#2208).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeMemoryDeath {
+    /// The service whose analysis was running, when one was and it is named;
+    /// `None` in the cross-service check, or for an unnamed service.
+    pub service: Option<String>,
+    /// The stage the run was in ([`crate::scan_stage::current`]).
+    pub stage: crate::scan_stage::Stage,
+    pub kind: crate::services::type_sidecar::MemoryDeath,
+    /// The heap cap the process was started with, in MB; `None` for V8's
+    /// default.
+    pub heap_cap_mb: Option<u64>,
+}
+
+/// The run stopped at a type-checker memory death, because it was asked to
+/// with [`FAIL_ON_TYPE_MEMORY_ENV`]: the machine is too small for this repo's
+/// types, and the run is to be asked again on a larger one. `main` exits
+/// with [`crate::shutdown::TYPES_OUT_OF_MEMORY_EXIT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypesOutOfMemory(pub TypeMemoryDeath);
+
+impl std::fmt::Display for TypesOutOfMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::services::type_sidecar::MemoryDeath;
+        let death = &self.0;
+        let how = match death.kind {
+            MemoryDeath::HeapLimit => "reached its heap limit",
+            MemoryDeath::OomKilled => "was killed by the kernel for memory",
+        };
+        let cap = match death.heap_cap_mb {
+            Some(mb) => format!("{mb} MB"),
+            None => "V8's default".to_string(),
+        };
+        let service = match &death.service {
+            Some(service) => format!(" for service {service}"),
+            None => String::new(),
+        };
+        write!(
+            f,
+            "types_out_of_memory: the type checker {how} ({}) during {}{service}, under a heap \
+             cap of {cap}; the run stopped so it can run again on a larger machine",
+            death.kind.as_str(),
+            death.stage.as_str(),
+        )
+    }
+}
+
+impl std::error::Error for TypesOutOfMemory {}
+
+/// Whether the run stops at a memory death: when `fail_on_memory` is set and
+/// one was recorded, the first. Pure, so the policy is testable without the
+/// process environment.
+pub fn stop_for_type_memory(
+    fail_on_memory: bool,
+    deaths: &[TypeMemoryDeath],
+) -> Result<(), TypesOutOfMemory> {
+    match deaths.first() {
+        Some(first) if fail_on_memory => Err(TypesOutOfMemory(first.clone())),
+        _ => Ok(()),
+    }
 }
 
 /// Which service a loss belongs to: its `service_name`, or `None` for a repo
@@ -664,6 +730,35 @@ pub fn allow_missing_types_from_env() -> bool {
 /// Whether [`FAIL_ON_TYPE_MEMORY_ENV`] is set for this run.
 pub fn fail_on_type_memory_from_env() -> bool {
     env_flag(FAIL_ON_TYPE_MEMORY_ENV)
+}
+
+/// Records that a type-checker process died of memory, against the service
+/// whose analysis is running and the stage the run is in (carrick#2208).
+pub fn record_type_memory_death(
+    kind: crate::services::type_sidecar::MemoryDeath,
+    heap_cap_mb: Option<u64>,
+) {
+    let death = TypeMemoryDeath {
+        service: crate::current_service::name(),
+        stage: crate::scan_stage::current(),
+        kind,
+        heap_cap_mb,
+    };
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .type_memory_deaths
+        .push(death);
+}
+
+/// `Err` when this run stops at a memory death ([`stop_for_type_memory`]
+/// over [`FAIL_ON_TYPE_MEMORY_ENV`] and what was recorded). Read where a
+/// service's analysis ends, after the cross-service check, and by `main` for
+/// the exit code.
+pub fn type_memory_stop() -> Result<(), TypesOutOfMemory> {
+    let fail_on_memory = fail_on_type_memory_from_env();
+    let registry = registry().lock().expect("scan health lock");
+    stop_for_type_memory(fail_on_memory, &registry.type_memory_deaths)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -1372,6 +1467,48 @@ mod tests {
                 library_checks: 1,
                 ..TimeLimitsRunOut::default()
             }
+        );
+    }
+
+    /// carrick#2208: a recorded memory death stops the run only when it was
+    /// asked to stop on one, and then at the first; unset, nothing changes.
+    #[test]
+    fn the_first_memory_death_stops_only_a_run_told_to_stop() {
+        use crate::scan_stage::Stage;
+        use crate::services::type_sidecar::MemoryDeath;
+        let capture = TypeMemoryDeath {
+            service: Some("beta".to_string()),
+            stage: Stage::TypeCapture,
+            kind: MemoryDeath::HeapLimit,
+            heap_cap_mb: Some(6144),
+        };
+        let check = TypeMemoryDeath {
+            service: None,
+            stage: Stage::CrossRepoCheck,
+            kind: MemoryDeath::OomKilled,
+            heap_cap_mb: None,
+        };
+        assert_eq!(stop_for_type_memory(true, &[]), Ok(()));
+        assert_eq!(
+            stop_for_type_memory(false, std::slice::from_ref(&capture)),
+            Ok(())
+        );
+        let deaths = [capture.clone(), check.clone()];
+        assert_eq!(
+            stop_for_type_memory(true, &deaths),
+            Err(TypesOutOfMemory(capture.clone()))
+        );
+        assert_eq!(
+            TypesOutOfMemory(capture).to_string(),
+            "types_out_of_memory: the type checker reached its heap limit (heap_limit) during \
+             type_capture for service beta, under a heap cap of 6144 MB; the run stopped so it \
+             can run again on a larger machine"
+        );
+        assert_eq!(
+            TypesOutOfMemory(check).to_string(),
+            "types_out_of_memory: the type checker was killed by the kernel for memory \
+             (oom_killed) during cross_repo_check, under a heap cap of V8's default; the run \
+             stopped so it can run again on a larger machine"
         );
     }
 }
