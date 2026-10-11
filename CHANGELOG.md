@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.3.113](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.112...carrick-v0.3.113) (2026-10-11)
+
+
+### Features
+
+* **change-scope:** publish the input rule as carrickInputs in the npm manifest ([#2269](https://github.com/carrick-tools/carrick/issues/2269)) ([abdb44c](https://github.com/carrick-tools/carrick/commit/abdb44cf13f95949cef0be33f6ddc4ec5132c50a))
+* **engine:** analyse a scan's services side by side, each on a thread with a sidecar of its own ([#2252](https://github.com/carrick-tools/carrick/issues/2252)) ([7362d8c](https://github.com/carrick-tools/carrick/commit/7362d8cf40375816c18925d8c10b09bdb0f49174))
+* **install:** CARRICK_INSTALL_UNTRUSTED mode and ship the install script in the npm package ([#2225](https://github.com/carrick-tools/carrick/issues/2225)) ([56e2a4a](https://github.com/carrick-tools/carrick/commit/56e2a4aea4a131235cba67bb5fb9af6da8d23bc7)), closes [#2211](https://github.com/carrick-tools/carrick/issues/2211)
+* **release:** state the cache pair in the npm manifest and announce a published CLI ([#2244](https://github.com/carrick-tools/carrick/issues/2244)) ([6fe42af](https://github.com/carrick-tools/carrick/commit/6fe42af7bb562205d5eec3a3813b12075cbed5a3))
+* **runner:** a type-checker memory death stops a runner scan with exit 3 ([#2256](https://github.com/carrick-tools/carrick/issues/2256)) ([90c5809](https://github.com/carrick-tools/carrick/commit/90c58091f08c07d139fcb9d2a47f91631eeeb351))
+* **scan:** a pull request scan outside Actions takes its context from flags and never uploads ([#2229](https://github.com/carrick-tools/carrick/issues/2229)) ([#2268](https://github.com/carrick-tools/carrick/issues/2268)) ([e1ab2b7](https://github.com/carrick-tools/carrick/commit/e1ab2b7165d032354359c841dfcb972b284a3d5a))
+* **scanner:** --changed-only analyses the services whose inputs changed and carries the rest ([#2227](https://github.com/carrick-tools/carrick/issues/2227)) ([#2265](https://github.com/carrick-tools/carrick/issues/2265)) ([055f059](https://github.com/carrick-tools/carrick/commit/055f0597ac73f1af98a02f8774f9abd8b39a73b1))
+* **scanner:** --repo and --upload/--no-upload for scans run outside Actions ([#2237](https://github.com/carrick-tools/carrick/issues/2237)) ([48d71bb](https://github.com/carrick-tools/carrick/commit/48d71bbb865d5447b7c78edf8dccb506fae5a47a))
+* **scanner:** carrick derive --candidates lists each service's env vars and URL origins ([#2248](https://github.com/carrick-tools/carrick/issues/2248)) ([d228b69](https://github.com/carrick-tools/carrick/commit/d228b6993a199d6e1816d6f81a51a8932731ad08)), closes [#2232](https://github.com/carrick-tools/carrick/issues/2232)
+* **sidecar:** bound the compiler's file reads to the checkout under CARRICK_UNTRUSTED_TREE (part 2 of [#2230](https://github.com/carrick-tools/carrick/issues/2230)) ([#2262](https://github.com/carrick-tools/carrick/issues/2262)) ([7b89632](https://github.com/carrick-tools/carrick/commit/7b896320edf408cacebcd9259577f16c0881fca2))
+* the four prompt routes take a loopback endpoint and a timeout from the environment ([#2253](https://github.com/carrick-tools/carrick/issues/2253)) ([57fe3ad](https://github.com/carrick-tools/carrick/commit/57fe3add5f15c03a6bea08fa725894d23b097f1c))
+* **walk:** an untrusted scan reads no file through a link out of the checkout ([#2259](https://github.com/carrick-tools/carrick/issues/2259)) ([1637586](https://github.com/carrick-tools/carrick/commit/1637586afd38439281798e14d631d8a4bee1b815))
+
+
+### Bug Fixes
+
+* **action:** close npm tool paths and every .yarnrc.yml in untrusted install mode ([#2250](https://github.com/carrick-tools/carrick/issues/2250)) ([fccf706](https://github.com/carrick-tools/carrick/commit/fccf7067ff3981d44b5249d9f4f5143f669defc4)), closes [#2246](https://github.com/carrick-tools/carrick/issues/2246)
+* **action:** install classic Yarn with --ignore-scripts in default mode ([#2264](https://github.com/carrick-tools/carrick/issues/2264)) ([34e8a6d](https://github.com/carrick-tools/carrick/commit/34e8a6d284957653059ae8935dcf75d507fa9a3d))
+* **action:** refuse Yarn roots whose lockfile runs code at fetch time in untrusted install mode ([#2261](https://github.com/carrick-tools/carrick/issues/2261)) ([dd909b3](https://github.com/carrick-tools/carrick/commit/dd909b3b8ddc8a2706799209120c17e5960c486c))
+* **config:** refuse carrick.json service paths outside the repository ([#2247](https://github.com/carrick-tools/carrick/issues/2247)) ([fb0c0f8](https://github.com/carrick-tools/carrick/commit/fb0c0f8045c7280373e0f24bde3485336f9f8c7f)), closes [#2245](https://github.com/carrick-tools/carrick/issues/2245)
+* **dispatch:** a model's dispatch value stands only where its file writes it ([#2224](https://github.com/carrick-tools/carrick/issues/2224)) ([c7bb2c0](https://github.com/carrick-tools/carrick/commit/c7bb2c0c5a38401531964c3f2a1898034efa3bd6)), closes [#2201](https://github.com/carrick-tools/carrick/issues/2201)
+* **event-bus:** keep a listener only when the repo owns its receiver ([#2206](https://github.com/carrick-tools/carrick/issues/2206)) ([da98b36](https://github.com/carrick-tools/carrick/commit/da98b36df52f4c0c39cc69afe30275893da1d61e))
+* **local:** a no-model re-read of a repo without carrick.json takes the hosted index's config ([#2271](https://github.com/carrick-tools/carrick/issues/2271)) ([9305534](https://github.com/carrick-tools/carrick/commit/93055349eabb9cbb5d796b139c7f72b7ea38dd53))
+* **pr-baseline:** main's copy of a service is judged by that service's inputs ([#2228](https://github.com/carrick-tools/carrick/issues/2228)) ([#2266](https://github.com/carrick-tools/carrick/issues/2266)) ([beecb94](https://github.com/carrick-tools/carrick/commit/beecb9414a99a29fa0f0675f4a3e9de71dd47fa6))
+* **scanner:** a Bearer scan names its start-scan project on get-cross-repo-data ([#2280](https://github.com/carrick-tools/carrick/issues/2280)) ([9e33050](https://github.com/carrick-tools/carrick/commit/9e330506d03366199ebd093ad045eecd68374e1a)), closes [#2279](https://github.com/carrick-tools/carrick/issues/2279) [#2195](https://github.com/carrick-tools/carrick/issues/2195)
+* **scanner:** partial-clone cache diff compares object ids, so an edited file cannot lose the cache ([#2243](https://github.com/carrick-tools/carrick/issues/2243)) ([ac64aa0](https://github.com/carrick-tools/carrick/commit/ac64aa056bf3845eb3fbb0bba48f4750afad8f75)), closes [#2212](https://github.com/carrick-tools/carrick/issues/2212)
+* **sidecar:** a memory death in the capture or the check's compiler reaches the scanner, and runner mode skips the same-size capture retry ([#2209](https://github.com/carrick-tools/carrick/issues/2209)) ([#2255](https://github.com/carrick-tools/carrick/issues/2255)) ([8714773](https://github.com/carrick-tools/carrick/commit/8714773d19e3c5caa9081c0614b804133b2c8bf9))
+* **sidecar:** read the value a handler serialises into a status-and-body envelope ([#2204](https://github.com/carrick-tools/carrick/issues/2204)) ([973ba15](https://github.com/carrick-tools/carrick/commit/973ba156f8251822eaa1e2c3a7dfdb86d6ea4db8))
+* **walk:** untrusted scan's manifest and GraphQL walks stay inside the checkout ([#2270](https://github.com/carrick-tools/carrick/issues/2270)) ([53ded78](https://github.com/carrick-tools/carrick/commit/53ded78c893d15c0b0c93d919ed80ac2ae126858))
+
+
+### Refactoring
+
+* **engine:** scan state that assumed one service at a time becomes per service ([#2242](https://github.com/carrick-tools/carrick/issues/2242)) ([687b1f4](https://github.com/carrick-tools/carrick/commit/687b1f4b53222f641ec0ec7df10e6237651b28dd))
+
+
+### CI/CD
+
+* cancel superseded pull_request runs ([#2194](https://github.com/carrick-tools/carrick/issues/2194)) ([e720aec](https://github.com/carrick-tools/carrick/commit/e720aec5da61461a4aa00e9e644514b7a3d44362))
+* gate every job in CI result; smoke the release binary in Build ([#2198](https://github.com/carrick-tools/carrick/issues/2198)) ([449a4be](https://github.com/carrick-tools/carrick/commit/449a4be9e5356cc4845e196e6f4f60f191f99ba8))
+
 ## [0.3.112](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.111...carrick-v0.3.112) (2026-10-10)
 
 
