@@ -947,10 +947,42 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Where each service's previous generation is read from: the laptop's
     // hosted snapshot when the indexer handed one in, otherwise the download.
     let previous_generations = local_previous.as_ref().unwrap_or(&all_repo_data);
+    // Under `--changed-only`, which services are analysed and which carry
+    // their stored generation (carrick#2227). A carried service is in no
+    // part of the analysis: not asked ahead, not scanned, not retried.
+    let scopes: Vec<crate::change_scope::Scope> = if crate::change_scope::requested() {
+        crate::change_scope::plan(
+            repo_path,
+            &services,
+            |service| previous_generation(previous_generations, &repo_name, service),
+            crate::change_scope::ThisRun {
+                scanner_version: env!("CARGO_PKG_VERSION"),
+                cache_version: CACHE_VERSION,
+            },
+        )
+    } else {
+        Vec::new()
+    };
+    // Each service's place among the analysed ones, `None` when carried.
+    let mut analysed_count = 0;
+    let scan_index: Vec<Option<usize>> = (0..services.len())
+        .map(|index| {
+            (!scopes.get(index).is_some_and(|scope| scope.is_carried())).then(|| {
+                analysed_count += 1;
+                analysed_count - 1
+            })
+        })
+        .collect();
+    let analysed: Vec<Config> = services
+        .iter()
+        .zip(&scan_index)
+        .filter(|(_, at)| at.is_some())
+        .map(|(service, _)| service.clone())
+        .collect();
     // Every service's detection and guidance, asked for from here on beside
     // the loop below instead of one service at a time inside it
     // (carrick#1895). Dropped with this function, which ends every ask.
-    let setups = setup_ahead::SetupsAhead::start(repo_path, &services, |service| {
+    let setups = setup_ahead::SetupsAhead::start(repo_path, &analysed, |service| {
         if no_cache {
             return None;
         }
@@ -959,7 +991,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     });
     let scan = ServiceScan {
         repo_path: repo_path.to_string(),
-        services: services.clone().into(),
+        services: analysed.into(),
         sidecar,
         run_intents,
         graphql_schemas,
@@ -976,8 +1008,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         } else {
             previous_generation(previous_generations, &repo_name, service).cloned()
         };
+        let Some(at) = scan_index[index] else {
+            // Carried, which only a service with a stored generation is, and
+            // `--no-cache` is refused beside `--changed-only`.
+            let stored = previous_data.expect("a carried service has a stored generation");
+            runs.push(ServiceRun::carried(service, stored));
+            continue;
+        };
         match scan
-            .analyze(index, previous_data.as_ref(), PreviousGeneration::Stored)
+            .analyze(at, previous_data.as_ref(), PreviousGeneration::Stored)
             .await
         {
             Ok(run) => runs.push(run),
@@ -993,7 +1032,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 if should_upload && !upload_blocked {
                     let finished: Vec<&CloudRepoData> = runs
                         .iter()
-                        .filter(|run| run.owed.is_empty())
+                        // A carried service's data is its stored blob, which
+                        // has nothing new to land.
+                        .filter(|run| run.owed.is_empty() && !run.carried)
                         .map(|run| &run.data)
                         .collect();
                     if !finished.is_empty() {
@@ -1134,8 +1175,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             // Its own blob from a minute ago is the previous generation: every
             // answer it holds replays, and only what it lacks is asked for.
             let this_run = runs[index].data.clone();
+            // Only an analysed service owes work.
+            let Some(at) = scan_index[index] else {
+                continue;
+            };
             match scan
-                .analyze(index, Some(&this_run), PreviousGeneration::ThisRun)
+                .analyze(at, Some(&this_run), PreviousGeneration::ThisRun)
                 .await
             {
                 Ok(run) => runs[index] = run,
@@ -1264,6 +1309,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     let current_services_data: Vec<CloudRepoData> = runs
         .iter()
         .map(|run| {
+            if run.carried && should_upload {
+                // Kept beside a laptop run's local index like a held-back
+                // service's; a refreshed copy written below replaces it.
+                storage.keep_served_generation(&run.data);
+            }
             if !run.held_back {
                 return run.data.clone();
             }
@@ -1310,7 +1360,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         } else {
             let landing: Vec<&CloudRepoData> = runs
                 .iter()
-                .filter(|run| !run.held_back)
+                .filter(|run| !run.held_back && !run.carried)
                 .map(|run| &run.data)
                 .collect();
             Some(upload_payloads_for(
@@ -1613,6 +1663,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .collect();
     let mut closed_by_final_write = false;
     if let Some(mut payloads) = upload_payloads {
+        // A carried service's verdicts, edges and boundary are attached like
+        // an analysed one's, so a consumer whose producer changed is not left
+        // stale (carrick#2227). Which of them are written is decided below.
+        let carried_from = payloads.len();
+        payloads.extend(
+            runs.iter()
+                .filter(|run| run.carried)
+                .map(|run| run.data.clone()),
+        );
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
             &results.cross_repo_matches,
@@ -1631,6 +1690,33 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .unwrap_or_else(|| payload.repo_name.clone());
             if let Some((_, boundary)) = boundaries.iter().find(|(known, _)| *known == id) {
                 payload.boundary = Some(boundary.clone());
+            }
+        }
+        // A carried service is written only when what this run's join says
+        // of it differs from its stored blob, stamped as this run's.
+        let carried = payloads.split_off(carried_from);
+        for (payload, run) in carried
+            .into_iter()
+            .zip(runs.iter().filter(|run| run.carried))
+        {
+            let id = run
+                .data
+                .service_name
+                .clone()
+                .unwrap_or_else(|| run.data.repo_name.clone());
+            if let Some(refreshed) = crate::change_scope::refreshed_carried(
+                payload,
+                &run.data,
+                &sdk_join.unresolved_for(&id),
+                &git_state.commit,
+                git_state.dirty,
+            ) {
+                info!(
+                    "scope: {} carried and written at this commit: its verdicts, SDK edges or \
+                     boundary changed",
+                    run.label
+                );
+                payloads.push(refreshed);
             }
         }
         // The size guard already ran once inside strip_ast_nodes, but the
@@ -1657,8 +1743,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // the run stopped, which is as true of an interruption as of any
         // other failure.
         enter_stage(crate::scan_stage::Stage::Upload)?;
-        unconfirmed_uploads =
-            upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
+        if payloads.is_empty() && crate::change_scope::requested() {
+            // Nothing this run read changed what the index holds, so nothing
+            // is written, and the scan it opened is closed rather than left
+            // to its slot's expiry (carrick#2227).
+            info!("scope: nothing to write; closing the scan");
+            storage
+                .report_scan_closed(crate::change_scope::NO_CHANGE_REASON)
+                .await;
+        } else {
+            unconfirmed_uploads =
+                upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
+        }
     }
 
     // Which of this PR's findings main already had (carrick-cloud#1369). Run
@@ -1847,6 +1943,27 @@ struct ServiceRun {
     owed: durability::OwedWork,
     /// Decided once every service has been analysed (step 4c).
     held_back: bool,
+    /// Not analysed: `data` is its stored generation (`--changed-only`,
+    /// carrick#2227).
+    carried: bool,
+}
+
+impl ServiceRun {
+    /// A service `--changed-only` carries: its stored generation stands in
+    /// for it, and it owes nothing.
+    fn carried(service: &Config, stored: CloudRepoData) -> Self {
+        Self {
+            label: service
+                .service_name
+                .as_deref()
+                .unwrap_or("(root)")
+                .to_string(),
+            data: stored,
+            owed: durability::OwedWork::default(),
+            held_back: false,
+            carried: true,
+        }
+    }
 }
 
 // A service's result crosses to the thread that gathers it once services are
@@ -1993,6 +2110,7 @@ impl ServiceScan<'_> {
             data,
             owed,
             held_back: false,
+            carried: false,
         })
     }
 }

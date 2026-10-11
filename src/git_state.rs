@@ -283,6 +283,95 @@ pub fn differs_under(repo_path: &str, a: &str, b: &str) -> Result<bool, String> 
     }
 }
 
+/// One path `git diff --name-status` lists, relative to the repository's top
+/// level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedPath {
+    /// git's status letter: `A`dded, `D`eleted, `M`odified, `T`ype changed.
+    pub status: char,
+    pub path: String,
+}
+
+impl ChangedPath {
+    /// Added or deleted: a change that can alter what an unchanged import
+    /// resolves to.
+    pub fn adds_or_deletes(&self) -> bool {
+        matches!(self.status, 'A' | 'D')
+    }
+}
+
+/// Every path that differs between commit `from` and `to` (another commit,
+/// or the working tree when `None`), relative to the repository's top level
+/// whatever directory `repo_path` is (carrick#2227).
+///
+/// No `--relative` and no pathspec: a scan rooted in a subdirectory still
+/// sees a change outside it, which is where a service's imports can reach.
+/// Against the working tree, a file git does not track yet is listed as
+/// added. `Err` means git could not compare: a commit this clone does not
+/// hold, or no answer.
+pub fn changed_paths(
+    repo_path: &str,
+    from: &str,
+    to: Option<&str>,
+) -> Result<Vec<ChangedPath>, String> {
+    for commit in std::iter::once(from).chain(to) {
+        // A value that is not a hex object name never reaches git's argument
+        // list, where a leading `-` would read as an option.
+        if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{commit:?} is not a commit id"));
+        }
+        run_git(
+            repo_path,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )?;
+    }
+    // The partial-clone guard `unchanged_since` explains (carrick#2212).
+    let mut args = vec![];
+    if to.is_none() && is_partial_clone(repo_path) {
+        args.extend(["-c", "diff.autoRefreshIndex=false"]);
+    }
+    args.extend(["diff", "--name-status", "--no-renames", "-z", from]);
+    args.extend(to);
+    args.push("--");
+    let fields = nul_paths(run_git(repo_path, &args)?);
+    let mut changed: Vec<ChangedPath> = fields
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter_map(|pair| {
+            Some(ChangedPath {
+                status: pair[0].chars().next()?,
+                path: pair[1].clone(),
+            })
+        })
+        .collect();
+    if to.is_none() {
+        changed.extend(
+            nul_paths(run_git(
+                repo_path,
+                &[
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "--full-name",
+                    "-z",
+                ],
+            )?)
+            .into_iter()
+            .map(|path| ChangedPath { status: 'A', path }),
+        );
+    }
+    Ok(changed)
+}
+
+/// The repository's top level, as git names it, for the checkout at
+/// `repo_path`.
+pub fn toplevel(repo_path: &str) -> Result<std::path::PathBuf, String> {
+    Ok(std::path::PathBuf::from(
+        run_git(repo_path, &["rev-parse", "--show-toplevel"])?.trim(),
+    ))
+}
+
 /// The tracked paths under `repo_path` that match any of `pathspecs` (git
 /// pathspec globs such as `*.graphql`), relative to `repo_path`.
 ///
@@ -637,6 +726,54 @@ pub(crate) mod tests {
         assert!(!inspect(&dir.to_string_lossy()).dirty);
         std::fs::write(dir.join("b.txt"), "new").unwrap();
         assert!(inspect(&dir.to_string_lossy()).dirty);
+    }
+
+    /// What changed since a commit is listed from the top level whatever
+    /// directory asks, against the working tree or another commit, and a
+    /// commit the clone lacks is not an answer (carrick#2227).
+    #[test]
+    fn changed_paths_lists_the_whole_repository_from_its_top_level() {
+        let (repo, first) = committed_repo(&[
+            ("apps/api/a.ts", "a"),
+            ("libs/util.ts", "u"),
+            ("gone.ts", "g"),
+        ]);
+        let api = repo.path().join("apps/api");
+        std::fs::write(repo.path().join("libs/util.ts"), "u2").unwrap();
+        std::fs::remove_file(repo.path().join("gone.ts")).unwrap();
+        std::fs::write(api.join("new.ts"), "n").unwrap();
+        let mut changed = changed_paths(&api.to_string_lossy(), &first, None).unwrap();
+        changed.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            changed,
+            vec![
+                ChangedPath {
+                    status: 'A',
+                    path: "apps/api/new.ts".to_string()
+                },
+                ChangedPath {
+                    status: 'D',
+                    path: "gone.ts".to_string()
+                },
+                ChangedPath {
+                    status: 'M',
+                    path: "libs/util.ts".to_string()
+                },
+            ]
+        );
+
+        git_in(repo.path(), &["add", "-A"]);
+        git_in(repo.path(), &["commit", "-qm", "two"]);
+        let second = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        let between = changed_paths(&api.to_string_lossy(), &first, Some(&second)).unwrap();
+        assert_eq!(between.len(), 3, "{between:?}");
+        assert!(
+            changed_paths(&api.to_string_lossy(), &second, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(changed_paths(&api.to_string_lossy(), &"f".repeat(40), None).is_err());
+        assert!(changed_paths(&api.to_string_lossy(), "--output=x", None).is_err());
     }
 
     /// A throwaway repository on `main` with one commit holding `files`, and

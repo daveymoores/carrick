@@ -29,7 +29,7 @@ use crate::cloud_storage::{
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Env var holding the cache directory. Its presence at startup also selects
 /// this backend over `MockStorage`/`AwsStorage`.
@@ -256,6 +256,12 @@ impl CloudStorage for LocalDirStorage {
 
         debug!("LOCAL: Downloaded {} cached repos", repos.len());
         Ok((repos, urls))
+    }
+
+    /// Nothing holds a slot here; said in the log so an offline run shows
+    /// how the scan would have been closed.
+    async fn report_scan_closed(&self, reason: &str) {
+        info!("LOCAL: close-scan (reason: {reason})");
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
