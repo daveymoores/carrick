@@ -159,6 +159,11 @@ async fn main() {
     if argv.first().map(String::as_str) == Some(carrick::untrusted_yarn::COMMAND) {
         std::process::exit(carrick::untrusted_yarn::run(&argv[1..]));
     }
+    // Internal: the Action's project-config step (carrick#2233). Both words,
+    // so `carrick config` still scans a directory named `config`.
+    if carrick::config_pull::is_invocation(&argv) {
+        std::process::exit(carrick::config_pull::run(&argv[1..]).await);
+    }
     if let Some(parsed) = local_mode::cli::parse(&argv) {
         match parsed {
             Ok(command) => {

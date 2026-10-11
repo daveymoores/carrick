@@ -14,6 +14,7 @@ pub mod client_semantics;
 pub mod cloud_storage;
 pub mod commonjs;
 pub mod config;
+pub mod config_pull;
 pub mod console;
 pub mod consumer_row_fold;
 pub mod credentials;
