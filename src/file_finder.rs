@@ -227,7 +227,7 @@ pub const UNTRUSTED_TREE_ENV: &str = "CARRICK_UNTRUSTED_TREE";
 
 /// Where an untrusted scan rooted at `scan_root` stops reading
 /// ([`UNTRUSTED_TREE_ENV`]), or `None` when the switch is off.
-fn untrusted_bound(scan_root: &Path) -> Option<PathBuf> {
+pub fn untrusted_bound(scan_root: &Path) -> Option<PathBuf> {
     std::env::var_os(UNTRUSTED_TREE_ENV)
         .is_some_and(|value| !value.is_empty())
         .then(|| checkout_bound(scan_root))
@@ -251,7 +251,7 @@ fn checkout_bound(scan_root: &Path) -> PathBuf {
 /// (carrick#2230). Only a link can leave: what sits under a directory read
 /// inside the bound is inside it, unless it is a link itself. A link that
 /// does not resolve reads nothing and is not counted here.
-fn links_outside(entry: &walkdir::DirEntry, bound: &Path) -> bool {
+pub fn links_outside(entry: &walkdir::DirEntry, bound: &Path) -> bool {
     entry.path_is_symlink() && resolves_outside(bound, entry.path())
 }
 

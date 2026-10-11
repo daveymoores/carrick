@@ -418,8 +418,19 @@ fn is_graphql_file(path: &Path) -> bool {
 /// through the same test-folder filter: a schema this walk leaves out must not
 /// come back as another API's.
 fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
+    graphql_files_under_within(roots, |root| crate::file_finder::untrusted_bound(root))
+}
+
+/// [`graphql_files_under`] with `bound_of` naming where a root's walk stops.
+/// Untrusted, a schema file linked from outside the checkout is not listed
+/// (carrick#2260).
+fn graphql_files_under_within(
+    roots: &[PathBuf],
+    bound_of: impl Fn(&Path) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for root in roots {
+        let bound = bound_of(root);
         for entry in WalkDir::new(root)
             .sort_by_file_name()
             .into_iter()
@@ -432,6 +443,9 @@ fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
                     })
                     .unwrap_or(false)
                     && crate::file_finder::git_boundary(e).is_none()
+                    && !bound
+                        .as_deref()
+                        .is_some_and(|bound| crate::file_finder::links_outside(e, bound))
             })
             .filter_map(Result::ok)
         {
@@ -1949,6 +1963,71 @@ fn is_builtin_type(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repo with a `.graphql` file inside and a link to one outside it.
+    /// Returns the temp dir and the repo root (canonical).
+    #[cfg(unix)]
+    fn repo_with_linked_schemas() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(root.join("schema")).unwrap();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: x").unwrap();
+        std::fs::write(root.join("schema/own.graphql"), "type Query { a: Int }").unwrap();
+        std::fs::write(
+            dir.path().join("outside/theirs.graphql"),
+            "type Query { b: Int }",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("outside/theirs.graphql"),
+            root.join("schema/linked.graphql"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("schema/own.graphql"),
+            root.join("schema/inner.graphql"),
+        )
+        .unwrap();
+        (dir, root)
+    }
+
+    fn names(root: &Path, files: Vec<PathBuf>) -> Vec<String> {
+        files
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string())
+            .collect()
+    }
+
+    /// carrick#2260: untrusted, a linked `.graphql` file whose real path is
+    /// outside the checkout is not listed; one that lands inside still is.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_service_schema_walk_skips_a_link_out_of_the_checkout() {
+        let (_dir, root) = repo_with_linked_schemas();
+        let roots = vec![root.clone()];
+        let open = names(&root, graphql_files_under_within(&roots, |_| None));
+        assert!(
+            open.contains(&"schema/linked.graphql".to_string()),
+            "{open:?}"
+        );
+        let bounded = names(
+            &root,
+            graphql_files_under_within(&roots, |r| Some(r.to_path_buf())),
+        );
+        assert!(
+            !bounded.contains(&"schema/linked.graphql".to_string()),
+            "{bounded:?}"
+        );
+        assert!(
+            bounded.contains(&"schema/own.graphql".to_string()),
+            "{bounded:?}"
+        );
+        assert!(
+            bounded.contains(&"schema/inner.graphql".to_string()),
+            "{bounded:?}"
+        );
+    }
 
     fn keys(ops: &[GraphqlOp]) -> Vec<String> {
         let mut keys: Vec<String> = ops.iter().map(|op| op.key.canonical()).collect();
