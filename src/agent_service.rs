@@ -7134,7 +7134,6 @@ pub(crate) mod tests {
     pub(crate) fn stub_server_with_headers(
         responses: Vec<StubResponse>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7143,49 +7142,69 @@ pub(crate) mod tests {
             let mut seen = Vec::new();
             for (status, body, headers) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = stream.read(&mut buf).unwrap();
-                    raw.extend_from_slice(&buf[..n]);
-                    if n == 0 {
-                        break;
-                    }
-                    let text = String::from_utf8_lossy(&raw).to_string();
-                    let Some(header_end) = text.find("\r\n\r\n") else {
-                        continue;
-                    };
-                    let content_length = text[..header_end]
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    if raw.len() >= header_end + 4 + content_length {
-                        break;
-                    }
-                }
-                seen.push(String::from_utf8_lossy(&raw).to_string());
-                let extra: String = headers
-                    .iter()
-                    .map(|(name, value)| format!("{name}: {value}\r\n"))
-                    .collect();
-                let response = format!(
-                    "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n\
-                     {}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    status,
-                    extra,
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-                stream.flush().unwrap();
+                seen.push(read_stub_request(&mut stream));
+                write_stub_response(&mut stream, status, &body, &headers);
             }
             seen
         });
         (format!("http://{}", addr), handle)
+    }
+
+    /// One whole request off a stub's connection, headers and body, as text.
+    pub(crate) fn read_stub_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            if n == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let Some(header_end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let content_length = text[..header_end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if raw.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&raw).to_string()
+    }
+
+    /// A stub's answer: a JSON body under `status`, with any extra headers,
+    /// and the connection closed after it.
+    pub(crate) fn write_stub_response(
+        stream: &mut std::net::TcpStream,
+        status: u16,
+        body: &str,
+        headers: &[(&'static str, String)],
+    ) {
+        use std::io::Write;
+
+        let extra: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
+        let response = format!(
+            "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n\
+             {}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            extra,
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
     }
 
     /// A stub GitHub token endpoint that hands out each token in turn.

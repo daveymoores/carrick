@@ -486,6 +486,13 @@ pub struct AwsStorage {
     /// on the laptop path; every prompt-lambda call and every write action of
     /// the run carries it, and it is what the money gates key on (C4).
     scan_id: std::sync::OnceLock<String>,
+    /// The project `start-scan` resolved this run into. Present only on a run
+    /// `start-scan` opened (a laptop's or a cloud runner's), and named on
+    /// `get-cross-repo-data`: a laptop's `cli` credential is workspace-scoped,
+    /// so a read that names no project is refused `400 project_required`
+    /// (carrick#2279). The CI path's OIDC identity carries its project itself
+    /// and never sets this.
+    project_id: std::sync::OnceLock<String>,
     /// The tree this run scanned did not match its commit. Sent to
     /// `start-scan`, stamped on every payload, and folded into
     /// `force_reindex` so a second scan at the same HEAD is not told the
@@ -658,7 +665,8 @@ struct StartScanRequest<'a> {
 struct StartScanResponse {
     schema: String,
     scan_id: String,
-    #[allow(dead_code)]
+    /// Named on `get-cross-repo-data`, which a workspace-scoped credential
+    /// cannot otherwise resolve to a project (carrick#2279).
     project_id: String,
     project_slug: String,
     #[serde(default)]
@@ -932,6 +940,14 @@ struct CrossRepoResponse {
 #[derive(Serialize)]
 struct GetCrossRepoRequest {
     action: String,
+    /// The project `start-scan` opened this run in. A `cli` credential has no
+    /// project of its own, so without it the cloud answers
+    /// `400 project_required` (carrick#2279); a scan-bound runner credential
+    /// is refused any project but its scan's, which is the one named here.
+    /// Omitted on the CI path, which opens no scan and whose OIDC identity
+    /// names the project, so that body is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
 }
 
 /// The shared configuration of every cloud-call client.
@@ -993,6 +1009,7 @@ impl AwsStorage {
             http_client,
             auth,
             scan_id: std::sync::OnceLock::new(),
+            project_id: std::sync::OnceLock::new(),
             dirty: std::sync::atomic::AtomicBool::new(false),
             analyzed: std::sync::atomic::AtomicBool::new(false),
             multi_service: std::sync::atomic::AtomicBool::new(false),
@@ -1558,6 +1575,7 @@ impl AwsStorage {
         // are built far from here and each of their calls must carry it.
         crate::credentials::set_scan_id(&response.scan_id);
         let _ = self.scan_id.set(response.scan_id);
+        let _ = self.project_id.set(response.project_id);
         // The name every later action of this run must report for the repo,
         // taken from the string the scan was authorised with rather than from
         // anything the checkout happens to be called (carrick#1022).
@@ -2112,6 +2130,7 @@ impl CloudStorage for AwsStorage {
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
         let request = GetCrossRepoRequest {
             action: "get-cross-repo-data".to_string(),
+            project_id: self.project_id.get().cloned(),
         };
 
         let mut response: CrossRepoResponse =
@@ -3083,6 +3102,7 @@ mod tests {
             .post(format!("http://{}/types/check-or-upload", addr))
             .json(&GetCrossRepoRequest {
                 action: "get-cross-repo-data".to_string(),
+                project_id: None,
             })
             .send()
             .await
@@ -4633,6 +4653,211 @@ mod tests {
         assert_eq!(write["action"], "store-metadata");
         assert_eq!(write["scan_id"], "scan_01J");
         assert_eq!(write["scan_final"], true);
+    }
+
+    /// Which `cli` credential [`cli_cloud`] authorises a run under.
+    #[derive(Clone, Copy, Debug)]
+    enum CliHolder {
+        /// The key `carrick login` writes: workspace-scoped, so it carries no
+        /// project of its own.
+        Laptop,
+        /// A cloud runner's scan-bound key (carrick-cloud#1957): it carries
+        /// its scan's project and may read no other.
+        Runner,
+    }
+
+    /// The scan `cli_cloud`'s `start-scan` opens, and the project it opens it
+    /// in, which is the only project the workspace holds.
+    const CLI_CLOUD_SCAN: &str = "scan_01J";
+    const CLI_CLOUD_PROJECT: &str = "proj_1";
+
+    /// A cloud that answers each action of a `cli` scan by the rule the
+    /// deployed `check-or-upload` lambda applies, so a request that leaves out
+    /// what the cloud reads is refused here as it is there (carrick#2279).
+    /// From carrick-cloud `lambdas/check-or-upload/`:
+    ///
+    /// - `get-cross-repo-data` (`effective_project.ts`): a named project must
+    ///   be the workspace's, and a bound credential's own. Naming none is
+    ///   `400 project_required` unless the credential carries a project,
+    ///   which only the runner's does.
+    /// - the write actions (`resolveWriteContext`): this run's `scan_id`, or
+    ///   `403 scan_not_started`.
+    /// - the run reports (`resolveScanForCli`): this run's `scan_id`, or 404.
+    /// - `resolve-repos`: a workspace read, which names no project.
+    ///
+    /// A PUT is the presigned object a run log goes to. Serves until it is
+    /// sent `GET /done`, and returns each action with the status it answered.
+    fn cli_cloud(holder: CliHolder) -> (String, std::thread::JoinHandle<Vec<(String, u16)>>) {
+        use crate::agent_service::tests::{read_stub_request, write_stub_response};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log_url = format!("{base}/log-object");
+        let handle = std::thread::spawn(move || {
+            let mut answered = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_stub_request(&mut stream);
+                let line = request.lines().next().unwrap_or_default().to_string();
+                if line.starts_with("GET /done") {
+                    write_stub_response(&mut stream, 200, "{}", &[]);
+                    return answered;
+                }
+                let (label, status, body) = if line.starts_with("PUT ") {
+                    ("log-object PUT".to_string(), 200, serde_json::json!({}))
+                } else {
+                    cli_cloud_answer(holder, &request, &log_url)
+                };
+                write_stub_response(&mut stream, status, &body.to_string(), &[]);
+                answered.push((label, status));
+            }
+        });
+        (base, handle)
+    }
+
+    fn cli_cloud_answer(
+        holder: CliHolder,
+        request: &str,
+        log_url: &str,
+    ) -> (String, u16, serde_json::Value) {
+        let refuse =
+            |status: u16, code: &str| (status, serde_json::json!({ "error": code, "code": code }));
+        if !has_header(request, "authorization", "Bearer ") {
+            return ("no credential".to_string(), 401, serde_json::json!({}));
+        }
+        let body = body_of(request);
+        let action = body["action"].as_str().unwrap_or_default().to_string();
+        let this_scan = body["scan_id"] == CLI_CLOUD_SCAN;
+        let (status, answer) = match action.as_str() {
+            "start-scan" => (
+                200,
+                serde_json::json!({
+                    "schema": "carrick.start-scan/0",
+                    "scan_id": CLI_CLOUD_SCAN,
+                    "project_id": CLI_CLOUD_PROJECT,
+                    "project_slug": "payments",
+                    "indexed_services": ["api"],
+                    "multi_service": true
+                }),
+            ),
+            "get-cross-repo-data" => match (holder, body["project_id"].as_str()) {
+                (_, Some(CLI_CLOUD_PROJECT)) | (CliHolder::Runner, None) => {
+                    (200, serde_json::json!({ "repos": [] }))
+                }
+                (_, Some(_)) => refuse(403, "project_not_found"),
+                (CliHolder::Laptop, None) => refuse(400, "project_required"),
+            },
+            "check-or-upload" | "store-metadata" | "complete-upload" if !this_scan => {
+                refuse(403, "scan_not_started")
+            }
+            "check-or-upload" => {
+                let (status, body) = check_ok();
+                (status, serde_json::from_str(&body).unwrap())
+            }
+            "store-metadata" | "complete-upload" => (200, serde_json::json!({ "success": true })),
+            "resolve-repos" => (
+                200,
+                serde_json::json!({
+                    "schema": "carrick.resolve-repos/0",
+                    "repos": [{
+                        "full_name": "example/api",
+                        "services": [{ "service": "api", "hash": "4f2a1c9" }]
+                    }]
+                }),
+            ),
+            "upload-logs" | "close-scan" | "scan-failed" if !this_scan => {
+                refuse(404, "scan_not_found")
+            }
+            "upload-logs" => (200, serde_json::json!({ "uploadUrl": log_url })),
+            "close-scan" | "scan-failed" => (200, serde_json::json!({ "success": true })),
+            _ => refuse(404, "unknown_action"),
+        };
+        (action, status, answer)
+    }
+
+    /// carrick#2279: every action a Bearer scan sends after `start-scan` is
+    /// one the cloud answers, under both `cli` credentials.
+    ///
+    /// A laptop key is workspace-scoped, so the cloud reads the project of a
+    /// read action off the request. The run used to drop the project
+    /// `start-scan` resolved and ask `get-cross-repo-data` for nothing, and
+    /// the cloud refused it `400 project_required` before a file was read.
+    /// The runner's key carries its scan's project and is refused any other,
+    /// so naming the one `start-scan` answered is safe for it too. The order
+    /// is the engine's: open, read the siblings, write the index, check it
+    /// landed, ship the log, close.
+    #[tokio::test]
+    async fn every_action_of_a_cli_scan_after_start_scan_is_answered() {
+        for holder in [CliHolder::Laptop, CliHolder::Runner] {
+            let (base, server) = cli_cloud(holder);
+            let storage = AwsStorage::for_test(
+                &format!("{base}/types/check-or-upload"),
+                CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+                false,
+            );
+
+            storage.begin_run(&run_context(false)).await.unwrap();
+            let read = storage.download_all_repo_data().await;
+            assert!(
+                read.is_ok(),
+                "{holder:?}: the cross-repo read was refused: {}",
+                read.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+            storage.upload_repo_data(&blob(), true).await.unwrap();
+            storage
+                .index_landed(&blob(), chrono::Utc::now())
+                .await
+                .unwrap();
+            storage.upload_logs("api", "a run log").await.unwrap();
+            storage.report_scan_failed("upload", "a test failure").await;
+            storage.report_scan_closed("no_upload").await;
+
+            http_client_builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("{base}/done"))
+                .send()
+                .await
+                .unwrap();
+            let answered = server.join().unwrap();
+
+            let actions: Vec<&str> = answered.iter().map(|(a, _)| a.as_str()).collect();
+            assert_eq!(
+                actions,
+                [
+                    "start-scan",
+                    "get-cross-repo-data",
+                    "check-or-upload",
+                    "store-metadata",
+                    "resolve-repos",
+                    "upload-logs",
+                    "log-object PUT",
+                    "scan-failed",
+                    "close-scan",
+                ],
+                "{holder:?}"
+            );
+            let refused: Vec<_> = answered
+                .iter()
+                .filter(|(_, status)| !(200..300).contains(status))
+                .collect();
+            assert!(refused.is_empty(), "{holder:?}: refused {refused:?}");
+        }
+    }
+
+    /// The project rides only on a run `start-scan` opened. A run that opened
+    /// none — the CI path, whose OIDC identity names its project — sends the
+    /// cross-repo read as it always has, with no `project_id` key at all.
+    #[tokio::test]
+    async fn a_run_that_opened_no_scan_names_no_project_on_the_cross_repo_read() {
+        let (storage, server) =
+            bearer_storage(vec![(200, serde_json::json!({ "repos": [] }).to_string())]);
+
+        storage.download_all_repo_data().await.unwrap();
+
+        let body = body_of(&server.join().unwrap()[0]);
+        assert_eq!(body, serde_json::json!({ "action": "get-cross-repo-data" }));
     }
 
     /// carrick#1022: the name a laptop upload reports is the repository the
