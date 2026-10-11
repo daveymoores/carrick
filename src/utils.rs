@@ -39,6 +39,24 @@ pub fn declared_repository() -> Option<&'static str> {
     declared_slot().get().map(String::as_str)
 }
 
+/// The `owner/name` this run is: `--repo` when it was passed, else the
+/// checkout's origin remote (carrick#2207). The name the cloud is told, and
+/// the one a scan finds its project config entry under (carrick#2272).
+pub fn repo_full_name(root: &std::path::Path) -> Option<String> {
+    repo_full_name_from(declared_repository(), root)
+}
+
+/// [`repo_full_name`] with the declared name passed in, so the test sets no
+/// process-global. The remote is read only when nothing was declared.
+pub(crate) fn repo_full_name_from(
+    declared: Option<&str>,
+    root: &std::path::Path,
+) -> Option<String> {
+    declared
+        .map(str::to_string)
+        .or_else(|| crate::git_state::remote_name(root))
+}
+
 /// The name a scan compares its own stored blobs against: which stored
 /// generation it reuses, and which downloaded copies are this repo's rather
 /// than siblings in the join.

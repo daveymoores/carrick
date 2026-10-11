@@ -9,7 +9,7 @@
       "type": "object",
       "required": ["schema", "workspace", "indexed_at", "services"],
       "properties": {
-        "repos_detected_by": { "enum": ["carrick_json", "workspace_manifest", "siblings", "single_repo", "workspace_overrides"] },
+        "repos_detected_by": { "enum": ["workspace_manifest", "siblings", "single_repo", "workspace_overrides"] },
         "repos_added": { "type": "array", "items": { "type": "string" } },
         "repos_excluded": { "type": "array", "items": { "type": "string" } },
         "hosted_checked_at": { "type": ["string", "null"] },

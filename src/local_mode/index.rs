@@ -1561,7 +1561,6 @@ pub(super) fn build(
         hosted_workspace: None,
         repos_detected_by: Some(
             match workspace.repos_detected_by.as_str() {
-                "carrick.json" => "carrick_json",
                 "sibling repositories" => "siblings",
                 "single repository" => "single_repo",
                 "workspace manifest" => "workspace_manifest",

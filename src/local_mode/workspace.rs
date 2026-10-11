@@ -346,10 +346,9 @@ struct Detection {
 
 /// The files that make a directory a repository worth indexing. Named in the
 /// census, so what a user is told is what was actually checked.
-const REPO_MARKERS: [&str; 6] = [
+const REPO_MARKERS: [&str; 5] = [
     ".git",
     "package.json",
-    "carrick.json",
     "deno.json",
     "deno.jsonc",
     "pnpm-workspace.yaml",
@@ -357,7 +356,7 @@ const REPO_MARKERS: [&str; 6] = [
 
 /// The manifests that make the root itself the thing to index.
 const ROOT_MANIFESTS: &str =
-    "carrick.json, a package.json with workspaces, pnpm-workspace.yaml, deno.json or deno.jsonc";
+    "a package.json with workspaces, pnpm-workspace.yaml, deno.json or deno.jsonc";
 
 /// How many directories to name before counting the rest. A folder of scratch
 /// checkouts holds dozens, and a wall of names answers nothing.
@@ -373,9 +372,6 @@ fn detect(root: &Path) -> Result<Detection, String> {
         repos,
         census: String::new(),
     };
-    if std::fs::symlink_metadata(root.join("carrick.json")).is_ok() {
-        return Ok(found("carrick.json", vec![".".into()]));
-    }
     if !crate::service_derivation::workspace_patterns(root)?.is_empty()
         || root.join("deno.json").is_file()
         || root.join("deno.jsonc").is_file()
@@ -602,7 +598,7 @@ mod tests {
             std::fs::create_dir(dir.path().join(name)).unwrap();
         }
         std::fs::write(dir.path().join("api/package.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("web/carrick.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("web/package.json"), "{}").unwrap();
         let workspace = Workspace::load(dir.path()).unwrap();
         assert_eq!(workspace.repos_detected_by, "sibling repositories");
         assert_eq!(workspace.repos.len(), 2);
@@ -639,16 +635,21 @@ mod tests {
         assert!(!excluded_repo(dir.path(), &dir.path().join("api")));
     }
 
+    /// A scan never reads `carrick.json` (carrick#2272), so one at the root
+    /// does not make the root the repository: the directories inside it that
+    /// hold a manifest are found as they would be without it.
     #[test]
-    fn explicit_repo_config_wins_over_nested_package_directories() {
+    fn a_root_carrick_json_does_not_mark_a_repository() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("carrick.json"), "{}").unwrap();
         std::fs::create_dir(dir.path().join("nested")).unwrap();
         std::fs::write(dir.path().join("nested/package.json"), "{}").unwrap();
         let workspace = Workspace::load(dir.path()).unwrap();
-        assert_eq!(workspace.repos_detected_by, "carrick.json");
-        assert_eq!(workspace.repos, [dir.path().canonicalize().unwrap()]);
-        assert!(!dir.path().join(WORKSPACE_FILE).exists());
+        assert_eq!(workspace.repos_detected_by, "sibling repositories");
+        assert_eq!(
+            workspace.repos,
+            [dir.path().canonicalize().unwrap().join("nested")]
+        );
     }
 
     #[test]

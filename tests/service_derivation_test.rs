@@ -1,5 +1,14 @@
-use carrick::service_derivation::resolve;
+use carrick::project_config::Section;
+use carrick::service_derivation::{ServiceDerivation, resolve, resolve_with_section};
 use std::path::Path;
+
+/// `body` as this repository's project config entry: what a scan reads when
+/// `CARRICK_CONFIG` names one (carrick#2272). A `carrick.json` in the tree is
+/// never read.
+fn with_config(root: &Path, body: &str) -> Result<ServiceDerivation, String> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    resolve_with_section(root, Some(Section::from_body("acme/repo", &value)?))
+}
 
 fn write(root: &Path, file: &str, body: &str) {
     let target = root.join(file);
@@ -49,13 +58,8 @@ fn npm_services_use_member_names_and_nearest_tsconfig_and_roundtrip_identically(
         Some("../../tsconfig.json")
     );
     assert!(derived.services[0].include.is_empty());
-    write(
-        root,
-        "carrick.json",
-        &serde_json::to_string(&derived.config).unwrap(),
-    );
-    let explicit = resolve(root).unwrap();
-    assert_eq!(explicit.reason, "carrick.json");
+    let explicit = with_config(root, &serde_json::to_string(&derived.config).unwrap()).unwrap();
+    assert_eq!(explicit.reason, "project config");
     assert_eq!(
         serde_json::to_value(derived.services).unwrap(),
         serde_json::to_value(explicit.services).unwrap()
@@ -100,36 +104,24 @@ fn explicit_config_preserves_shared_sources_and_refuses_invalid_paths() {
     );
     write(root, "api/index.ts", "");
     write(root, "shared/index.ts", "");
-    let text = r#"{"services":[{"name":"chosen","directory":"api","include":["shared"],"externalDomains":["example.com"]}]}"#;
-    write(root, "carrick.json", text);
-    let service = resolve(root).unwrap().services.remove(0);
-    assert_eq!(service.include, ["shared"]);
-    assert!(service.external_domains.contains("example.com"));
-    assert_eq!(
-        std::fs::read_to_string(root.join("carrick.json")).unwrap(),
-        text
-    );
-    write(root, "carrick.json", "{broken");
-    assert!(resolve(root).is_err());
-    write(
-        root,
-        "carrick.json",
-        r#"{"services":[{"directory":"gone"}]}"#,
-    );
-    assert!(resolve(root).is_err());
+    let text = r#"{"services":[{"name":"chosen","directory":"api","include":["shared"],"externalDomains":["example.com"]},{"name":"gone","directory":"gone"}]}"#;
+    let services = with_config(root, text).unwrap().services;
+    // A member whose directory this tree lacks is left out, not refused: the
+    // config is Carrick's and the user cannot fix it (carrick#2272).
+    assert_eq!(services.len(), 1);
+    assert_eq!(services[0].include, ["shared"]);
+    assert!(services[0].external_domains.contains("example.com"));
+    assert!(with_config(root, r#"{"services":[{"directory":7}]}"#).is_err());
 }
 
 #[test]
-fn plain_repo_and_own_repo_layout() {
+fn plain_repo_layout() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "package.json", r#"{"name":"one"}"#);
     let plain = resolve(dir.path()).unwrap();
     assert_eq!(plain.services.len(), 1);
     assert!(plain.services[0].directory.is_none());
     assert!(plain.services[0].service_name.is_none());
-    let own = resolve(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
-    assert_eq!(own.reason, "carrick.json");
-    assert_eq!(own.services[0].directory.as_deref(), Some("src/sidecar"));
 }
 
 #[test]
@@ -163,16 +155,27 @@ fn native_init_preview_and_ci_select_identical_services() {
     assert!(!dir.path().join(".carrick").exists());
 }
 
+/// A `carrick.json` in the tree is never read (carrick#2272), so a broken
+/// one changes nothing, and the preview still writes nothing.
 #[test]
-fn native_preview_refuses_a_broken_explicit_config_without_writing() {
+fn native_preview_ignores_a_broken_tree_config_without_writing() {
     let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "package.json", r#"{"name":"one"}"#);
     write(dir.path(), "carrick.json", "{broken");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
         .args(["derive", "--workspace"])
         .arg(dir.path())
+        .arg("--json")
+        .env_remove("CARRICK_CONFIG")
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let derived: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(derived["repos"][0]["reason"], "carrick.json");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("carrick.json")).unwrap(),
         "{broken"
@@ -262,12 +265,7 @@ fn explicit_typescript_config_keeps_node_path_in_deno_workspace() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "deno.json", "{}");
     write(dir.path(), "tsconfig.json", "{}");
-    write(
-        dir.path(),
-        "carrick.json",
-        r#"{"tsconfig":"tsconfig.json"}"#,
-    );
-    let derived = resolve(dir.path()).unwrap();
+    let derived = with_config(dir.path(), r#"{"tsconfig":"tsconfig.json"}"#).unwrap();
     assert!(carrick::deno_support::service_manifest(dir.path(), &derived.services[0]).is_none());
 }
 
@@ -328,18 +326,11 @@ fn alternate_deno_config_is_rejected_by_the_shared_service_plan() {
         "deno.jsonc",
         r#"{"compilerOptions":{"strict":false}}"#,
     );
-    write(dir.path(), "carrick.json", r#"{"tsconfig":"deno.jsonc"}"#);
-    let error = resolve(dir.path()).unwrap_err();
+    let error = with_config(dir.path(), r#"{"tsconfig":"deno.jsonc"}"#).unwrap_err();
     assert!(error.contains("nearest Deno manifest"), "{error}");
-    write(dir.path(), "carrick.json", r#"{"tsconfig":"deno.json"}"#);
-    assert!(resolve(dir.path()).is_ok());
+    assert!(with_config(dir.path(), r#"{"tsconfig":"deno.json"}"#).is_ok());
     write(dir.path(), "tsconfig.json", "{}");
-    write(
-        dir.path(),
-        "carrick.json",
-        r#"{"tsconfig":"tsconfig.json"}"#,
-    );
-    assert!(resolve(dir.path()).is_ok());
+    assert!(with_config(dir.path(), r#"{"tsconfig":"tsconfig.json"}"#).is_ok());
 }
 
 #[test]
@@ -352,7 +343,6 @@ fn generated_deno_cache_does_not_change_discovered_sources() {
             dir.path().to_str().unwrap(),
             &carrick::packages::MANIFEST_SKIP_DIRS,
         )
-        .0
     };
     let before = discover();
     assert_eq!(before.len(), 1);
@@ -450,9 +440,8 @@ fn member_facts_carry_what_decides_application_from_library() {
 
     // And an explicit config is described the same way: the facts are read
     // from the repository, not from how the services were chosen.
-    write(root, "carrick.json", &written);
-    let explicit = resolve(root).unwrap();
-    assert_eq!(explicit.reason, "carrick.json");
+    let explicit = with_config(root, &written).unwrap();
+    assert_eq!(explicit.reason, "project config");
     assert_eq!(explicit.members, derived.members);
 }
 
@@ -669,13 +658,8 @@ fn a_workspace_member_inside_another_member_is_left_out_of_the_outer_walk() {
         ["packages/api/plugins/audit/index.ts"]
     );
 
-    write(
-        root,
-        "carrick.json",
-        &serde_json::to_string(&derived.config).unwrap(),
-    );
-    let explicit = resolve(root).unwrap();
-    assert_eq!(explicit.reason, "carrick.json");
+    let explicit = with_config(root, &serde_json::to_string(&derived.config).unwrap()).unwrap();
+    assert_eq!(explicit.reason, "project config");
     assert_eq!(
         read_by(&explicit.services, "@sample/api"),
         ["packages/api/index.ts"]
@@ -684,77 +668,4 @@ fn a_workspace_member_inside_another_member_is_left_out_of_the_outer_walk() {
         read_by(&explicit.services, "@sample/audit"),
         ["packages/api/plugins/audit/index.ts"]
     );
-}
-
-/// A repository at `<tmp>/repo` beside a directory `<tmp>/outside` that
-/// exists, so a refusal is the containment check and never the existence one.
-fn repository_beside_an_outside_directory() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("repo");
-    write(&root, "api/index.ts", "");
-    write(&root, "shared/index.ts", "");
-    write(&root, "tsconfig.base.json", "{}");
-    write(dir.path(), "outside/index.ts", "");
-    write(dir.path(), "outside/tsconfig.json", "{}");
-    (dir, root)
-}
-
-/// Every path a service declares must stay inside the repository
-/// (carrick#2245): the scan reads what it names and carries it into the
-/// index. An absolute path, a `..` and a symlink that lands outside are all
-/// refused, for `directory`, `include` and `tsconfig` alike.
-#[cfg(unix)]
-#[test]
-fn a_declared_path_outside_the_repository_is_refused() {
-    let (dir, root) = repository_beside_an_outside_directory();
-    std::os::unix::fs::symlink(dir.path().join("outside"), root.join("linked")).unwrap();
-    let mut accepted = Vec::new();
-    for service in [
-        r#"{"name":"up","directory":"../outside"}"#,
-        r#"{"name":"up-missing","directory":"../gone"}"#,
-        r#"{"name":"up-inner","directory":"api/../../outside"}"#,
-        r#"{"name":"absolute","directory":"/etc"}"#,
-        r#"{"name":"symlinked","directory":"linked"}"#,
-        r#"{"name":"include-up","directory":"api","include":["../outside"]}"#,
-        r#"{"name":"include-absolute","directory":"api","include":["/etc"]}"#,
-        r#"{"name":"include-symlinked","directory":"api","include":["linked"]}"#,
-        r#"{"name":"tsconfig-up","directory":"api","tsconfig":"../../outside/tsconfig.json"}"#,
-        r#"{"name":"tsconfig-symlinked","directory":"api","tsconfig":"../linked/tsconfig.json"}"#,
-    ] {
-        write(
-            &root,
-            "carrick.json",
-            &format!(r#"{{"services":[{service}]}}"#),
-        );
-        match resolve(&root) {
-            Err(error) if error.contains("which is outside the repository") => {}
-            other => accepted.push(format!("{service}: {:?}", other.map(|_| ()))),
-        }
-    }
-    assert!(
-        accepted.is_empty(),
-        "each is refused for leaving the repository:\n{}",
-        accepted.join("\n")
-    );
-}
-
-/// The same check leaves an in-tree layout alone: a directory, an include,
-/// a tsconfig reached through `..` from the service directory, and a symlink
-/// that lands inside the repository.
-#[cfg(unix)]
-#[test]
-fn a_declared_path_inside_the_repository_still_resolves() {
-    let (_dir, root) = repository_beside_an_outside_directory();
-    std::os::unix::fs::symlink(root.join("api"), root.join("alias")).unwrap();
-    write(
-        &root,
-        "carrick.json",
-        r#"{"services":[
-            {"name":"api","directory":"./api/","include":["shared"],"tsconfig":"../tsconfig.base.json"},
-            {"name":"alias","directory":"alias"}
-        ]}"#,
-    );
-    let services = resolve(&root).unwrap().services;
-    assert_eq!(services.len(), 2);
-    assert_eq!(services[0].include, ["shared"]);
 }

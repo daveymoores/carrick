@@ -417,7 +417,6 @@ fn workspace(bench: &Bench, repos: &[&str]) -> PathBuf {
     let source = repo_root().join("tests/fixtures/local-mode-workspace");
     for repo in repos {
         copy_tree(&source.join(repo), &root.join(repo));
-        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
         git(&root.join(repo), &["init", "-q", "."]);
         git(&root.join(repo), &["add", "-A"]);
         git(

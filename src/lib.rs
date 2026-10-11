@@ -65,6 +65,7 @@ pub mod pr_baseline;
 pub mod pr_context;
 pub mod preflight;
 pub mod progress;
+pub mod project_config;
 pub mod receiver_origin;
 pub mod receiver_type;
 pub mod registration_scope;

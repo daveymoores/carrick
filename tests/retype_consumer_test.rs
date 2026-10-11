@@ -11,6 +11,8 @@
 //! neither when it returns `{ x }`. It must also say, in its log, why each
 //! pair it could not verify is unverified.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -43,6 +45,7 @@ fn scan_with(root: &Path, env: &[(&str, &str)]) -> (serde_json::Value, String) {
     let cassettes = root.join("__llm__");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.envs(env.iter().copied());
+    support::with_tree_config(&mut cmd, root);
     cmd.arg(root)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")

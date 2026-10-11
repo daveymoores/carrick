@@ -216,7 +216,6 @@ pub const REPO_INPUT_NAMES: &[&str] = &[
     "deno.json",
     "deno.jsonc",
     ".gitignore",
-    "carrick.json",
     // Read by the npm and pnpm installs and the library store
     // (`library_store.rs`, `scripts/install-scanned-deps.sh`).
     ".npmrc",
@@ -314,7 +313,7 @@ pub fn decide(
     if stored.config_json.as_deref() != config_json {
         return Scope::analysed(
             Reason::ConfigChanged,
-            "its carrick.json entry differs from the stored one",
+            "its configuration entry differs from the stored one",
         );
     }
     let changed = match changed {
@@ -916,7 +915,8 @@ mod tests {
             ),
             (('M', "schema/a.graphqls"), Some(Reason::RepoInputChanged)),
             (('M', "apps/web/.gitignore"), Some(Reason::RepoInputChanged)),
-            (('M', "carrick.json"), Some(Reason::RepoInputChanged)),
+            // A scan never reads it (carrick#2272).
+            (('M', "carrick.json"), None),
             (('M', ".npmrc"), Some(Reason::RepoInputChanged)),
             (
                 ('M', "apps/web/.yarnrc.yml"),

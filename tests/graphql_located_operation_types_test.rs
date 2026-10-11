@@ -33,6 +33,8 @@
 //! Served whole, the operation's result would read incompatible against each
 //! resolver's field-level return, which is what the verdicts rule out.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -45,6 +47,7 @@ fn scan(repo: &Path) -> Vec<serde_json::Value> {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&repo));
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")

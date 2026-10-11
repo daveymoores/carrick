@@ -23,6 +23,8 @@
 //! scan-health registry, the request counters and the injected failures are
 //! process-globals.
 
+mod support;
+
 use async_trait::async_trait;
 use carrick::cloud_storage::{
     CloudRepoData, CloudStorage, RunContext, RunStart, StorageError, UploadOutcome,
@@ -260,6 +262,11 @@ fn three_service_repo(tmp: &Path) -> PathBuf {
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
+    // The three services are this repository's project config entry; the
+    // committed `carrick.json` is never read (carrick#2272). Every test here
+    // is `#[serial]` and builds this same repository, so the variable is left
+    // set for the next one rather than unset.
+    std::mem::forget(support::in_process_tree_config(&repo).expect("the repo's config"));
     repo
 }
 

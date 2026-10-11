@@ -3,7 +3,6 @@
 //! This module contains services that manage external processes and communication
 //! with sidecar applications.
 
-pub mod machine;
 pub mod sidecar_pool;
 pub mod type_sidecar;
 

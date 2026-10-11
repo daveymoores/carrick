@@ -24,6 +24,8 @@
 //! post-fix state (`Implicit` + a structurally-correct expanded definition),
 //! so it FAILS on the pre-fix scanner by construction.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -68,6 +70,7 @@ fn scan_fixture() -> serde_json::Value {
     assert!(cassettes.exists(), "fixture cassette dir missing");
 
     let mut cmd = Command::new(carrick_bin());
+    support::with_tree_config(&mut cmd, &fixture_dir());
     cmd.arg(fixture_dir())
         .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")

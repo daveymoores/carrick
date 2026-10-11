@@ -22,6 +22,8 @@
 //!   CARRICK_API_ENDPOINT="https://api.carrick.tools" cargo build --release
 //!   cargo test --release --test eval_tier_a -- --test-threads=1 --nocapture
 
+mod support;
+
 use carrick::eval_output::EvalProjection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -137,6 +139,7 @@ fn run_scanner(bin: &Path, fixture_dir: &Path, dump_dir: Option<&Path>) -> Optio
     for attempt in 1..=2 {
         let hermetic_store = tempfile::tempdir().expect("create hermetic storage dir");
         let mut cmd = Command::new(bin);
+        support::with_tree_config(&mut cmd, fixture_dir);
         cmd.arg(fixture_dir)
             .env("CARRICK_OUTPUT_JSON", "1")
             .env("CARRICK_LOCAL_STORAGE_DIR", hermetic_store.path())

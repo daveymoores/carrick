@@ -36,6 +36,8 @@
 //! are compared verbatim: `build_site_id` hashes the REPO-RELATIVE site path
 //! (#355), so the ids are identical on every machine and need no masking.
 
+mod support;
+
 use std::process::Command;
 
 #[test]
@@ -44,7 +46,9 @@ fn cassette_hard_gate_llm_mocked_api() {
     let fixture = format!("{repo}/tests/fixtures/llm-mocked-api");
     let mock_dir = format!("{fixture}/__llm__/");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&fixture));
+    let output = cmd
         .arg(&fixture)
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_MOCK_FIXTURE_DIR", &mock_dir)

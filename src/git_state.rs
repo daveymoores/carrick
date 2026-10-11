@@ -106,7 +106,12 @@ pub fn inspect(repo_path: &str) -> GitState {
 /// which mirror the scaffold tool in carrick-cloud
 /// (`lambdas/mcp-server/src/tools/scaffold.ts`). A file added there is added
 /// here too, or a first run is dirty again.
+///
+/// `carrick.json` is one of them in any state: a scan never reads it, since
+/// the services come from the project config Carrick holds (carrick#2272), so
+/// no change to it changes what the index describes.
 const SCAFFOLD_FILES: &[&str] = &[
+    "carrick.json",
     ".github/workflows/carrick.yml",
     ".claude/skills/carrick/SKILL.md",
     ".claude/skills/carrick-impact/SKILL.md",
@@ -128,12 +133,6 @@ const SCAFFOLD_FILES: &[&str] = &[
     ".gitignore",
 ];
 
-/// The scaffold's config, which a scan DOES read. It is part of the scaffold
-/// only while the commit does not hold it at all: a `carrick.json` the tree
-/// adds is the first run's, and an edit to a committed one is a change to what
-/// the index describes, so it still counts.
-const SCAFFOLD_CONFIG: &str = "carrick.json";
-
 /// Whether a `git status --porcelain=v1 -z` answer names any change that is
 /// not the Carrick scaffold's.
 ///
@@ -147,22 +146,17 @@ fn carries_changes_beyond_the_scaffold(porcelain: &str, prefix: &str) -> bool {
         .split('\0')
         .filter(|entry| entry.len() > 3)
         .any(|entry| {
-            let (status, path) = entry.split_at(3);
-            !is_scaffold_change(status.trim_end(), path, prefix)
+            let (_status, path) = entry.split_at(3);
+            !is_scaffold_change(path, prefix)
         })
 }
 
-fn is_scaffold_change(status: &str, path: &str, prefix: &str) -> bool {
+fn is_scaffold_change(path: &str, prefix: &str) -> bool {
     if path.starts_with(".carrick/") || path.contains("/.carrick/") {
         return true;
     }
     let at_root = |name: &str| path == name || path.strip_prefix(prefix) == Some(name);
-    if SCAFFOLD_FILES.iter().any(|name| at_root(name)) {
-        return true;
-    }
-    // `??` untracked, or `A` staged as a new file (with or without a later
-    // edit): either way the commit has no copy of it.
-    at_root(SCAFFOLD_CONFIG) && (status == "??" || status.starts_with('A'))
+    SCAFFOLD_FILES.iter().any(|name| at_root(name))
 }
 
 /// The paths under `repo_path` whose content on disk is the content `commit`
@@ -881,11 +875,11 @@ pub(crate) mod tests {
         assert!(inspect(&root).dirty, "scaffold plus an edited source file");
     }
 
-    /// An edit to a committed `carrick.json` changes what the scan reads, so
-    /// it is a change; an untracked file that merely shares a scaffold name
-    /// somewhere else is too.
+    /// A scan never reads `carrick.json` (carrick#2272), so an edit to a
+    /// committed one leaves the tree clean; an untracked file that merely
+    /// shares a scaffold name somewhere else is still a change.
     #[test]
-    fn an_edited_committed_config_and_a_lookalike_path_still_count() {
+    fn an_edited_committed_config_is_clean_and_a_lookalike_path_still_counts() {
         let (repo, _head) = committed_repo(&[
             ("AGENTS.md", "# Agents\n"),
             ("sub/index.ts", "export {};\n"),
@@ -898,7 +892,7 @@ pub(crate) mod tests {
         assert!(!inspect(&root).dirty);
 
         std::fs::write(dir.join("carrick.json"), "{\"services\": []}").unwrap();
-        assert!(inspect(&root).dirty, "an edited committed carrick.json");
+        assert!(!inspect(&root).dirty, "an edited committed carrick.json");
         git_in(dir, &["checkout", "-q", "--", "carrick.json"]);
 
         std::fs::create_dir_all(dir.join("docs")).unwrap();
@@ -935,7 +929,15 @@ pub(crate) mod tests {
             "?? carrick.json\0 M src/a.ts\0",
             ""
         ));
-        assert!(carries_changes_beyond_the_scaffold(" M carrick.json\0", ""));
+        // A scan never reads it (carrick#2272): an edit or a deletion is no change.
+        assert!(!carries_changes_beyond_the_scaffold(
+            " M carrick.json\0",
+            ""
+        ));
+        assert!(!carries_changes_beyond_the_scaffold(
+            " D carrick.json\0",
+            ""
+        ));
         assert!(!carries_changes_beyond_the_scaffold(
             "AM carrick.json\0",
             ""

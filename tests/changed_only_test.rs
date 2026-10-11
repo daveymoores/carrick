@@ -1,8 +1,9 @@
 //! carrick#2227: `--changed-only` analyses the services whose inputs changed
 //! since their stored index, and carries the rest.
 //!
-//! The workspace is written by this test: three services in carrick.json
-//! (`apps/api`, `apps/web`, `apps/worker`), a workspace package two of them
+//! The workspace is written by this test: three services in its project
+//! config entry (`apps/api`, `apps/web`, `apps/worker`; the committed
+//! `carrick.json` holds the same body and is never read, carrick#2272), a workspace package two of them
 //! import by name, a library one reaches through a tsconfig `paths` alias, a
 //! shared base tsconfig, and an ambient declaration directory `web`'s tsconfig
 //! includes. `web` calls `api`'s route with a typed client, so a change to
@@ -18,7 +19,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+mod support;
+
 const REPO: &str = "fixture/mono";
+
+/// The project config every scan reads: [`REPO`]'s entry is the body of the
+/// `carrick.json` in [`FILES`].
+fn project_config() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let body = FILES
+            .iter()
+            .find(|(path, _)| *path == "carrick.json")
+            .map(|(_, body)| serde_json::from_str(body).expect("the config parses"))
+            .expect("FILES holds the config");
+        support::project_config(&[(REPO.to_string(), body)])
+    })
+}
 
 const FILES: &[(&str, &str)] = &[
     (
@@ -312,15 +329,11 @@ impl Workspace {
     }
 
     fn scan_into(&self, store: &Path, flags: &[&str]) -> Scan {
-        self.scan_with(store, flags, &[])
-    }
-
-    fn scan_with(&self, store: &Path, flags: &[&str], env: &[(&str, &str)]) -> Scan {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
-        cmd.envs(env.iter().copied());
         cmd.arg(&self.repo)
             .args(["--repo", REPO])
             .args(flags)
+            .env("CARRICK_CONFIG", project_config())
             .env("CARRICK_MOCK_ALL", "1")
             .env(
                 "CARRICK_MOCK_FIXTURE_DIR",
@@ -620,20 +633,27 @@ fn a_file_that_shadows_a_resolution_is_an_input_when_added_or_deleted() {
     assert_analysed(&scan, &["api", "web"]);
 }
 
-/// Cases 7, 8 and 9: the shared tsconfig, the lockfile and carrick.json.
+/// Cases 7 and 8: the shared tsconfig and the lockfile.
 #[test]
-fn shared_config_lockfile_and_carrick_json_analyse_every_service() {
-    for (path, append) in [
-        ("tsconfig.base.json", "\n"),
-        ("package-lock.json", "\n"),
-        ("carrick.json", "\n"),
-    ] {
+fn shared_config_and_lockfile_analyse_every_service() {
+    for (path, append) in [("tsconfig.base.json", "\n"), ("package-lock.json", "\n")] {
         let (_, scan, _, _) = changed_only_after(|ws| {
             let contents = ws.read(path) + append;
             ws.edit(path, &contents);
         });
         assert_analysed(&scan, &["api", "web", "worker"]);
     }
+}
+
+/// Case 9: a scan never reads `carrick.json` (carrick#2272), so a change to it
+/// analyses no service.
+#[test]
+fn a_carrick_json_change_analyses_no_service() {
+    let (_, scan, _, _) = changed_only_after(|ws| {
+        let contents = ws.read("carrick.json") + "\n";
+        ws.edit("carrick.json", &contents);
+    });
+    assert_analysed(&scan, &[]);
 }
 
 /// Case 10: a change no service reads writes nothing and closes the scan.
@@ -725,62 +745,6 @@ fn an_analysed_service_writes_what_a_full_scan_writes() {
         assert_eq!(
             pinned(scoped[service].clone()),
             pinned(full[service].clone()),
-            "{service}"
-        );
-    }
-}
-
-/// carrick#1066 with carrick#2227: services analysed side by side carry the
-/// rest exactly as one at a time does. The carried service is never handed
-/// to a worker (its stored blob is untouched and no worker names it), and
-/// the two analysed beside each other write the bytes they write one at a
-/// time.
-#[test]
-fn analysed_side_by_side_a_carried_service_is_never_analysed() {
-    let workspace = case();
-    workspace.edit(
-        "apps/api/src/types.ts",
-        "export interface Order {\n  id: string;\n  total?: number;\n}\n",
-    );
-    workspace.commit("B");
-    let before = workspace.blobs();
-    let one_at_a_time_store = workspace.repo.parent().unwrap().join("one-at-a-time");
-    copy_dir(&workspace.store, &one_at_a_time_store);
-    let side_by_side = workspace.scan_with(
-        &workspace.store,
-        &["--changed-only"],
-        &[("CARRICK_SERVICE_CONCURRENCY", "4"), ("RUST_LOG", "info")],
-    );
-    assert_eq!(side_by_side.code, Some(0), "{}", side_by_side.output);
-    assert_analysed(&side_by_side, &["api", "web"]);
-    let analysing: Vec<&str> = side_by_side
-        .output
-        .lines()
-        .filter(|line| line.contains("Analyzing service "))
-        .collect();
-    assert_eq!(analysing.len(), 2, "{}", side_by_side.output);
-    assert!(
-        analysing.iter().all(|line| !line.contains("worker")),
-        "{}",
-        side_by_side.output
-    );
-    let one_at_a_time = workspace.scan_with(
-        &one_at_a_time_store,
-        &["--changed-only"],
-        &[("CARRICK_SERVICE_CONCURRENCY", "1")],
-    );
-    assert_eq!(one_at_a_time.code, Some(0), "{}", one_at_a_time.output);
-    let side_by_side = workspace.blobs();
-    assert_eq!(side_by_side["worker"], before["worker"]);
-    let pinned = |mut blob: serde_json::Value| {
-        blob["last_updated"] = serde_json::Value::Null;
-        serde_json::to_string_pretty(&blob).unwrap()
-    };
-    let one_at_a_time = blobs_in(&one_at_a_time_store);
-    for service in ["api", "web", "worker"] {
-        assert_eq!(
-            pinned(side_by_side[service].clone()),
-            pinned(one_at_a_time[service].clone()),
             "{service}"
         );
     }

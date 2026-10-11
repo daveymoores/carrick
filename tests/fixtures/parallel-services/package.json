@@ -1,8 +1,0 @@
-{
-  "name": "parallel-services",
-  "private": true,
-  "workspaces": [
-    "services/*",
-    "apps/*"
-  ]
-}

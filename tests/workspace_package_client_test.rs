@@ -14,6 +14,8 @@
 //! roughly thirty real calls recorded one. This test asserts the post-fix
 //! state, so it FAILS on the pre-fix scanner by construction.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -49,6 +51,7 @@ fn scan_fixture() -> serde_json::Value {
 
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_carrick"));
     let mut cmd = Command::new(&bin);
+    support::with_tree_config(&mut cmd, std::path::Path::new(&fixture_dir()));
     cmd.arg(fixture_dir())
         .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")

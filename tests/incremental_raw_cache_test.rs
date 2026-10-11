@@ -16,6 +16,8 @@
 //! which is a process-global: two of these running at once would see each
 //! other's dispatch counts.
 
+mod support;
+
 use async_trait::async_trait;
 use carrick::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
 use carrick::engine::run_analysis_engine_with_sidecar;
@@ -535,6 +537,9 @@ async fn a_service_with_no_answered_file_replays_its_detection_and_guidance() {
             ("slugs/slugify.ts", NO_CANDIDATES),
         ],
     );
+    // The two services are this repository's project config entry; the
+    // committed `carrick.json` is never read (carrick#2272).
+    let _config = support::in_process_tree_config(&repo_path).expect("a config");
     mock_env(&cassette);
 
     let storage = StubStorage::default();

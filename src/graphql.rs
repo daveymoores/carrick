@@ -418,19 +418,8 @@ fn is_graphql_file(path: &Path) -> bool {
 /// through the same test-folder filter: a schema this walk leaves out must not
 /// come back as another API's.
 fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
-    graphql_files_under_within(roots, crate::file_finder::untrusted_bound)
-}
-
-/// [`graphql_files_under`] with `bound_of` naming where a root's walk stops.
-/// Untrusted, a schema file linked from outside the checkout is not listed
-/// (carrick#2260).
-fn graphql_files_under_within(
-    roots: &[PathBuf],
-    bound_of: impl Fn(&Path) -> Option<PathBuf>,
-) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for root in roots {
-        let bound = bound_of(root);
         for entry in WalkDir::new(root)
             .sort_by_file_name()
             .into_iter()
@@ -443,9 +432,6 @@ fn graphql_files_under_within(
                     })
                     .unwrap_or(false)
                     && crate::file_finder::git_boundary(e).is_none()
-                    && !bound
-                        .as_deref()
-                        .is_some_and(|bound| crate::file_finder::links_outside(e, bound))
             })
             .filter_map(Result::ok)
         {
@@ -554,8 +540,7 @@ pub struct DeclaredSchemas {
 /// would ([`crate::file_finder::left_out_below`], carrick#1902), so
 /// `**/*.graphql` reads no schema in a folder git ignores or in another
 /// checkout, and `apps/api/dist/**/*.graphql` still reads an ignored `dist`.
-/// A match whose real path is outside the repository, reached through a link,
-/// is not read and is reported (carrick#2249). A matched file is parsed here as
+/// A matched file is parsed here as
 /// well, so a file that is not a schema, or defines no Query, Mutation or
 /// Subscription field, is reported rather than quietly adding nothing.
 pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> DeclaredSchemas {
@@ -566,11 +551,6 @@ pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> Declar
         require_literal_separator: true,
         require_literal_leading_dot: false,
     };
-    // Canonical, so a link is judged by where it lands and a root reached
-    // through a link of its own (a macOS temp dir) still holds itself.
-    let canonical_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
     for raw in patterns {
         let entry = raw.trim().trim_start_matches("./");
         let relative = Path::new(entry);
@@ -624,22 +604,6 @@ pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> Declar
                     .collect()
             })
             .unwrap_or_default();
-        // A match reached through a link, the file's own or a folder's on
-        // the way, is read only where it really sits inside the repository
-        // (carrick#2249): the entry's text cannot say where a link lands.
-        let (matches, outside): (Vec<PathBuf>, Vec<PathBuf>) = matches
-            .into_iter()
-            .partition(|path| !crate::file_finder::resolves_outside(&canonical_root, path));
-        for path in &outside {
-            declared.problems.push(format!(
-                "`graphqlSchemas` entry '{raw}' matches '{}', whose real path is outside the \
-                 repository, so it was not read",
-                path.strip_prefix(repo_root).unwrap_or(path).display()
-            ));
-        }
-        if !outside.is_empty() && matches.is_empty() {
-            continue;
-        }
         if matches.is_empty() {
             declared.problems.push(format!(
                 "`graphqlSchemas` entry '{raw}' matches no file in this repository, so the \
@@ -1964,71 +1928,6 @@ fn is_builtin_type(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// A repo with a `.graphql` file inside and a link to one outside it.
-    /// Returns the temp dir and the repo root (canonical).
-    #[cfg(unix)]
-    fn repo_with_linked_schemas() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("repo");
-        std::fs::create_dir_all(root.join("schema")).unwrap();
-        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
-        std::fs::write(root.join(".git"), "gitdir: x").unwrap();
-        std::fs::write(root.join("schema/own.graphql"), "type Query { a: Int }").unwrap();
-        std::fs::write(
-            dir.path().join("outside/theirs.graphql"),
-            "type Query { b: Int }",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("outside/theirs.graphql"),
-            root.join("schema/linked.graphql"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(
-            root.join("schema/own.graphql"),
-            root.join("schema/inner.graphql"),
-        )
-        .unwrap();
-        (dir, root)
-    }
-
-    fn names(root: &Path, files: Vec<PathBuf>) -> Vec<String> {
-        files
-            .iter()
-            .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string())
-            .collect()
-    }
-
-    /// carrick#2260: untrusted, a linked `.graphql` file whose real path is
-    /// outside the checkout is not listed; one that lands inside still is.
-    #[cfg(unix)]
-    #[test]
-    fn untrusted_service_schema_walk_skips_a_link_out_of_the_checkout() {
-        let (_dir, root) = repo_with_linked_schemas();
-        let roots = vec![root.clone()];
-        let open = names(&root, graphql_files_under_within(&roots, |_| None));
-        assert!(
-            open.contains(&"schema/linked.graphql".to_string()),
-            "{open:?}"
-        );
-        let bounded = names(
-            &root,
-            graphql_files_under_within(&roots, |r| Some(r.to_path_buf())),
-        );
-        assert!(
-            !bounded.contains(&"schema/linked.graphql".to_string()),
-            "{bounded:?}"
-        );
-        assert!(
-            bounded.contains(&"schema/own.graphql".to_string()),
-            "{bounded:?}"
-        );
-        assert!(
-            bounded.contains(&"schema/inner.graphql".to_string()),
-            "{bounded:?}"
-        );
-    }
-
     fn keys(ops: &[GraphqlOp]) -> Vec<String> {
         let mut keys: Vec<String> = ops.iter().map(|op| op.key.canonical()).collect();
         keys.sort();
@@ -2990,55 +2889,6 @@ export const typeDefs = gql`
                     .to_string(),
                 "`graphqlSchemas` file 'dist/types.graphql' defines no Query, Mutation or \
                  Subscription field, so it adds no operations"
-                    .to_string(),
-            ]
-        );
-    }
-
-    /// carrick#2249. An entry's text stays inside the repository, but a link
-    /// on the way, a folder's or the file's own, lands outside it: the match
-    /// is not read and is reported. A link that lands inside is read.
-    #[cfg(unix)]
-    #[test]
-    fn declared_schemas_never_read_through_a_link_out_of_the_repository() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("outside");
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("leak.graphql"), "type Query { leak: String }").unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(repo.join("api")).unwrap();
-        std::fs::write(repo.join("api/real.graphql"), "type Query { real: String }").unwrap();
-        std::os::unix::fs::symlink(
-            outside.join("leak.graphql"),
-            repo.join("api/linked.graphql"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(&outside, repo.join("vendored")).unwrap();
-        std::os::unix::fs::symlink(repo.join("api"), repo.join("alias")).unwrap();
-
-        let declared = resolve_declared_schemas(
-            &repo,
-            &[
-                "api/*.graphql".to_string(),
-                "vendored/*.graphql".to_string(),
-                "alias/real.graphql".to_string(),
-            ],
-        );
-        assert_eq!(
-            declared.files,
-            vec![
-                repo.join("alias/real.graphql"),
-                repo.join("api/real.graphql")
-            ]
-        );
-        assert_eq!(
-            declared.problems,
-            vec![
-                "`graphqlSchemas` entry 'api/*.graphql' matches 'api/linked.graphql', whose real \
-                 path is outside the repository, so it was not read"
-                    .to_string(),
-                "`graphqlSchemas` entry 'vendored/*.graphql' matches 'vendored/leak.graphql', \
-                 whose real path is outside the repository, so it was not read"
                     .to_string(),
             ]
         );

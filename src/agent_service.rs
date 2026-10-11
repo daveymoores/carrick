@@ -1100,9 +1100,6 @@ impl AgentService {
         // path (carrick#1909). The concurrency permit is taken per HTTP
         // attempt inside `post_with_retry`, so an offline run takes none.
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            if let Some(latency) = mock_latency(task_path) {
-                tokio::time::sleep(latency).await;
-            }
             let injected = take_mock_override(task_path, body);
             if !matches!(&injected, Some(Err(error)) if error.code == NOT_ASKED_CODE) {
                 record_request(task_path);
@@ -2123,28 +2120,6 @@ fn push_mock_override(
         remaining: times,
         outcome,
     });
-}
-
-fn mock_latencies() -> &'static Mutex<HashMap<String, Duration>> {
-    static LATENCIES: OnceLock<Mutex<HashMap<String, Duration>>> = OnceLock::new();
-    LATENCIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn mock_latency(task_path: &str) -> Option<Duration> {
-    mock_latencies().lock().unwrap().get(task_path).copied()
-}
-
-/// Make every offline call to `task_path` take `latency` before it answers,
-/// as a real one takes time, so a test can hold two calls in flight at once.
-/// `None` makes them answer at once again. Honoured only under
-/// `CARRICK_MOCK_ALL`.
-#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
-pub fn set_mock_latency(task_path: &str, latency: Option<Duration>) {
-    let mut latencies = mock_latencies().lock().unwrap();
-    match latency {
-        Some(latency) => latencies.insert(task_path.to_string(), latency),
-        None => latencies.remove(task_path),
-    };
 }
 
 /// Make the next `times` offline calls to `task_path` whose serialized body

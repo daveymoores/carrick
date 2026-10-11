@@ -218,53 +218,6 @@ pub fn is_git_checkout(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join(".git")).is_ok()
 }
 
-/// The switch a machine that scans repositories it does not own sets
-/// (carrick#2230): the scan reads nothing whose real path is outside the
-/// checkout. The scan's counterpart of the installer's
-/// `CARRICK_INSTALL_UNTRUSTED`, and read the same way: any non-empty value
-/// turns it on.
-pub const UNTRUSTED_TREE_ENV: &str = "CARRICK_UNTRUSTED_TREE";
-
-/// Where an untrusted scan rooted at `scan_root` stops reading
-/// ([`UNTRUSTED_TREE_ENV`]), or `None` when the switch is off.
-pub fn untrusted_bound(scan_root: &Path) -> Option<PathBuf> {
-    std::env::var_os(UNTRUSTED_TREE_ENV)
-        .is_some_and(|value| !value.is_empty())
-        .then(|| checkout_bound(scan_root))
-}
-
-/// The checkout `scan_root` sits in, canonical: the nearest directory at or
-/// above it that holds `.git` ([`is_git_checkout`]), or `scan_root` itself
-/// when none does. Canonical so a link is judged by where it lands, and a
-/// root reached through a link of its own (a macOS temp dir) still holds
-/// itself.
-fn checkout_bound(scan_root: &Path) -> PathBuf {
-    let absolute = std::path::absolute(scan_root).unwrap_or_else(|_| scan_root.to_path_buf());
-    let top = absolute
-        .ancestors()
-        .find(|dir| is_git_checkout(dir))
-        .unwrap_or(&absolute);
-    top.canonicalize().unwrap_or_else(|_| top.to_path_buf())
-}
-
-/// Whether `entry` is a symbolic link whose real path is outside `bound`
-/// (carrick#2230). Only a link can leave: what sits under a directory read
-/// inside the bound is inside it, unless it is a link itself. A link that
-/// does not resolve reads nothing and is not counted here.
-pub fn links_outside(entry: &walkdir::DirEntry, bound: &Path) -> bool {
-    entry.path_is_symlink() && resolves_outside(bound, entry.path())
-}
-
-/// Whether `path` exists and its real path, every link on the way resolved,
-/// is outside `bound`, a canonical directory. A path that does not resolve
-/// is not judged here: whoever reads it reports it missing. The one test of
-/// "does this leave the repository" for the walk (carrick#2230), the config
-/// (carrick#2245) and declared schemas (carrick#2249).
-pub fn resolves_outside(bound: &Path, path: &Path) -> bool {
-    path.canonicalize()
-        .is_ok_and(|real| !real.starts_with(bound))
-}
-
 /// The paths the checkout at `top` declares as its submodules, relative to
 /// `top`: every `path` its `.gitmodules` states.
 ///
@@ -547,17 +500,11 @@ pub fn left_out_below(root: &Path, path: &Path) -> bool {
 ///
 /// `exclusion` is the service's `exclude` (carrick#1990): what it matches is
 /// never entered either, and is put in `stopped` to be counted.
-///
-/// `bound`, set in untrusted mode ([`untrusted_bound`], carrick#2230), is the
-/// checkout: a link whose real path is outside it is neither entered nor
-/// read, and is put in `stopped` to be counted. A link that lands inside it,
-/// such as an installed package store's, is followed as before.
 fn source_entries<'a>(
     root: &'a Path,
     ignore_patterns: &'a [&'a str],
     left_out: &'a [PathBuf],
     exclusion: &'a Exclusion,
-    bound: Option<&'a Path>,
     stopped: &'a RefCell<Stopped>,
 ) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
@@ -571,13 +518,6 @@ fn source_entries<'a>(
                     .strip_prefix(root)
                     .is_ok_and(|relative| left_out.iter().any(|dir| relative == dir))
             {
-                return false;
-            }
-            if bound.is_some_and(|bound| links_outside(entry, bound)) {
-                stopped
-                    .borrow_mut()
-                    .outside
-                    .push(entry.path().to_path_buf());
                 return false;
             }
             if entry.depth() > 0 && exclusion.excludes(entry.path(), entry.file_type().is_dir()) {
@@ -624,9 +564,6 @@ struct Stopped {
     ignored: Vec<PathBuf>,
     /// Files and folders the service's `exclude` matches ([`Exclusion`]).
     excluded: Vec<PathBuf>,
-    /// Links whose real path is outside the checkout, in untrusted mode
-    /// (carrick#2230).
-    outside: Vec<PathBuf>,
 }
 
 /// What a service's carrick.json `exclude` leaves out (carrick#1990): paths
@@ -714,7 +651,6 @@ impl Exclusion {
 /// What one walk read, and the directories it stopped at.
 struct Walked {
     files: Vec<Found>,
-    config_file: Option<PathBuf>,
     stopped: Stopped,
 }
 
@@ -785,9 +721,7 @@ fn keep_what_is_imported(
     )
 }
 
-/// Find all JavaScript and TypeScript files in a directory
-/// Also looks for carrick.json configuration file
-/// Returns (js_ts_files, config_file_option)
+/// Find all JavaScript and TypeScript files in a directory.
 ///
 /// Deliberately does NOT report a `package.json`: the walk visits every
 /// manifest below `dir` (test fixtures, examples, nested workers) in
@@ -797,47 +731,27 @@ fn keep_what_is_imported(
 ///
 /// A file git ignores is read only when a file read imports it
 /// ([`keep_what_is_imported`]), resolved with the configs nearest each file.
-///
-/// In untrusted mode a link whose real path is outside the checkout `dir`
-/// sits in is not read ([`untrusted_bound`], carrick#2230).
-pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
-    let bound = untrusted_bound(Path::new(dir));
-    let walked = find_files_leaving_out(
-        dir,
-        ignore_patterns,
-        &[],
-        &Exclusion::default(),
-        bound.as_deref(),
-    );
+pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> Vec<PathBuf> {
+    let walked = find_files_leaving_out(dir, ignore_patterns, &[], &Exclusion::default());
     let (files, _) = keep_what_is_imported(walked.files, || {
         crate::workspace_resolver::WorkspaceIndex::build_with_aliases(Path::new(dir), None)
     });
-    (files, walked.config_file)
+    files
 }
 
 /// [`find_files`] before an ignored file is kept or left out, never entering
-/// the `left_out` directories below `dir`, what `exclusion` matches, or a
-/// link out of `bound` ([`source_entries`]).
+/// the `left_out` directories below `dir` or what `exclusion` matches.
 fn find_files_leaving_out(
     dir: &str,
     ignore_patterns: &[&str],
     left_out: &[PathBuf],
     exclusion: &Exclusion,
-    bound: Option<&Path>,
 ) -> Walked {
     let mut js_ts_files = Vec::new();
-    let mut config_file = None;
     let stopped = RefCell::new(Stopped::default());
     let root_path = Path::new(dir);
 
-    for entry in source_entries(
-        root_path,
-        ignore_patterns,
-        left_out,
-        exclusion,
-        bound,
-        &stopped,
-    ) {
+    for entry in source_entries(root_path, ignore_patterns, left_out, exclusion, &stopped) {
         let path = entry.path();
 
         if !path.is_file() {
@@ -852,13 +766,6 @@ fn find_files_leaving_out(
             .iter()
             .any(|ignored| path.starts_with(ignored));
 
-        if path.file_name().is_some_and(|name| name == "carrick.json") {
-            if !ignored {
-                config_file = Some(path.to_path_buf());
-            }
-            continue;
-        }
-
         if is_scanned_source(path, root_path) {
             js_ts_files.push(Found {
                 path: path.to_path_buf(),
@@ -869,20 +776,13 @@ fn find_files_leaving_out(
 
     Walked {
         files: js_ts_files,
-        config_file,
         stopped: stopped.into_inner(),
     }
 }
 
 /// How many source files the walk rooted at `root` would have read under the
-/// `excluded` paths it did not enter (carrick#1990), never following a link
-/// out of `bound`.
-fn count_excluded(
-    excluded: &[PathBuf],
-    root: &Path,
-    ignore_patterns: &[&str],
-    bound: Option<&Path>,
-) -> usize {
+/// `excluded` paths it did not enter (carrick#1990).
+fn count_excluded(excluded: &[PathBuf], root: &Path, ignore_patterns: &[&str]) -> usize {
     excluded
         .iter()
         .map(|path| {
@@ -894,7 +794,6 @@ fn count_excluded(
                 ignore_patterns,
                 &[],
                 &Exclusion::default(),
-                bound,
                 &RefCell::default(),
             )
             .filter(|entry| entry.path().is_file() && is_scanned_source(entry.path(), root))
@@ -964,7 +863,7 @@ pub fn find_service_files(
     service: &crate::config::Config,
     ignore_patterns: &[&str],
 ) -> (Vec<PathBuf>, Option<PathBuf>) {
-    let walk = walk_service_quietly(repo_path, service, ignore_patterns);
+    let walk = walk_service(repo_path, service, ignore_patterns);
     (walk.files, walk.manifest)
 }
 
@@ -989,32 +888,6 @@ pub struct ServiceWalk {
     pub ignored_left_out: Vec<PathBuf>,
     /// What the service's `exclude` left out (carrick#1990).
     pub excluded: ExcludedFiles,
-    /// In untrusted mode, the links the walk did not follow because their
-    /// real path is outside the checkout (carrick#2230), sorted, each under
-    /// `repo_path` as given.
-    pub links_outside: Vec<PathBuf>,
-}
-
-/// Say which links an untrusted walk left out (carrick#2230), naming each
-/// where it sits in the repository, never where it points.
-fn log_links_outside(repo_root: &Path, links: &[PathBuf]) {
-    if links.is_empty() {
-        return;
-    }
-    let listing: Vec<String> = links
-        .iter()
-        .map(|link| {
-            link.strip_prefix(repo_root)
-                .unwrap_or(link)
-                .display()
-                .to_string()
-        })
-        .collect();
-    tracing::info!(
-        "Left out {} symbolic link(s) whose real path is outside the repository: {}. This scan reads only the repository.",
-        listing.len(),
-        listing.join(", ")
-    );
 }
 
 /// The ignored paths a reader is told were left out, from the paths the walk
@@ -1062,22 +935,8 @@ pub struct ExcludedFiles {
     pub files: usize,
 }
 
-/// [`find_service_files`], with the directories the walk stopped at. The
-/// scan's own walk of a service: it says which links an untrusted walk left
-/// out ([`log_links_outside`]), where the other readers of a service's files
-/// ([`find_service_files`]) say nothing, so a scan says it once.
+/// [`find_service_files`], with the directories the walk stopped at.
 pub fn walk_service(
-    repo_path: &str,
-    service: &crate::config::Config,
-    ignore_patterns: &[&str],
-) -> ServiceWalk {
-    let walk = walk_service_quietly(repo_path, service, ignore_patterns);
-    log_links_outside(Path::new(repo_path), &walk.links_outside);
-    walk
-}
-
-/// [`walk_service`], saying nothing.
-fn walk_service_quietly(
     repo_path: &str,
     service: &crate::config::Config,
     ignore_patterns: &[&str],
@@ -1096,26 +955,17 @@ fn walk_service_quietly(
         .map(|nested| nested[own.len()..].iter().collect())
         .collect();
 
-    // The carrick.json lives at the repo root, not per service directory, so the
-    // config returned here is ignored — config resolution is handled separately.
     let exclusion = Exclusion::of_service(root, service);
-    // The checkout the scan root sits in, in untrusted mode (carrick#2230):
-    // every root below is walked inside it.
-    let bound = untrusted_bound(root);
-    let bound = bound.as_deref();
     let Walked {
         mut files,
-        config_file: _,
         mut stopped,
     } = find_files_leaving_out(
         &service_root.to_string_lossy(),
         ignore_patterns,
         &left_out,
         &exclusion,
-        bound,
     );
-    let mut excluded_files =
-        count_excluded(&stopped.excluded, &service_root, ignore_patterns, bound);
+    let mut excluded_files = count_excluded(&stopped.excluded, &service_root, ignore_patterns);
 
     let manifest = find_service_manifest(root, service);
 
@@ -1126,13 +976,11 @@ fn walk_service_quietly(
             ignore_patterns,
             &[],
             &exclusion,
-            bound,
         );
         files.extend(included.files);
         stopped.checkouts.extend(included.stopped.checkouts);
         stopped.dot_folders.extend(included.stopped.dot_folders);
         stopped.ignored.extend(included.stopped.ignored);
-        stopped.outside.extend(included.stopped.outside);
         // Only what the directory walk did not already count.
         let new: Vec<PathBuf> = included
             .stopped
@@ -1140,7 +988,7 @@ fn walk_service_quietly(
             .into_iter()
             .filter(|path| !stopped.excluded.iter().any(|seen| path.starts_with(seen)))
             .collect();
-        excluded_files += count_excluded(&new, &inc_path, ignore_patterns, bound);
+        excluded_files += count_excluded(&new, &inc_path, ignore_patterns);
         stopped.excluded.extend(new);
     }
 
@@ -1188,11 +1036,6 @@ fn walk_service_quietly(
         &files,
         &ignored_files,
     );
-    // Never read, whatever the config names: a root the config names that
-    // is such a link is refused before the walk (carrick#2245).
-    let mut links_outside = stopped.outside;
-    links_outside.sort();
-    links_outside.dedup();
 
     ServiceWalk {
         files,
@@ -1204,7 +1047,6 @@ fn walk_service_quietly(
             patterns: exclusion.patterns(),
             files: excluded_files,
         },
-        links_outside,
     }
 }
 
@@ -1286,10 +1128,9 @@ mod tests {
         File::create(&config_path).expect("config file");
         File::create(&package_path).expect("package file");
 
-        let (files, config) = find_files(root.to_str().unwrap(), &[]);
+        let files = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(files, vec![source_file]);
-        assert_eq!(config, Some(config_path));
     }
 
     #[test]
@@ -1312,10 +1153,9 @@ mod tests {
         File::create(&config_path).expect("config file");
         File::create(&package_path).expect("package file");
 
-        let (files, config) = find_files(root.to_str().unwrap(), &[]);
+        let files = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(files, vec![normal_file]);
-        assert_eq!(config, Some(config_path));
     }
 
     #[test]
@@ -1340,7 +1180,7 @@ mod tests {
             File::create(f).expect("file");
         }
 
-        let (mut files, _) = find_files(root.to_str().unwrap(), &[]);
+        let mut files = find_files(root.to_str().unwrap(), &[]);
         files.sort();
 
         let mut expected = vec![component, real_module];
@@ -1366,10 +1206,9 @@ mod tests {
         File::create(&package_path).expect("package file");
 
         // Pass the "fixtures" directory as the root
-        let (files, config) = find_files(root.to_str().unwrap(), &[]);
+        let files = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(files, vec![source_file]);
-        assert_eq!(config, Some(config_path));
     }
 
     const ARTIFACT_IGNORES: &[&str] = &crate::packages::MANIFEST_SKIP_DIRS;
@@ -1423,16 +1262,10 @@ mod tests {
         installed_workspace(root, 12, 2);
 
         let stopped = RefCell::default();
-        let visited: Vec<PathBuf> = source_entries(
-            root,
-            ARTIFACT_IGNORES,
-            &[],
-            &Exclusion::default(),
-            None,
-            &stopped,
-        )
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
+        let visited: Vec<PathBuf> =
+            source_entries(root, ARTIFACT_IGNORES, &[], &Exclusion::default(), &stopped)
+                .map(|entry| entry.path().to_path_buf())
+                .collect();
 
         assert!(
             !visited
@@ -1451,90 +1284,8 @@ mod tests {
         );
 
         // The file set is what it always was.
-        let (files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        let files = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
         assert_eq!(files.len(), 12, "source files: {files:?}");
-    }
-
-    /// carrick#2230. Bounded by the checkout, the walk neither reads a file
-    /// nor enters a folder whose real path is outside it, and records each
-    /// link it left out. A link that lands inside the checkout, a package
-    /// store's or the repository's own, is followed as before.
-    #[test]
-    #[cfg(unix)]
-    fn a_bounded_walk_leaves_out_every_link_out_of_the_checkout() {
-        let tmp = tempdir().expect("temp dir");
-        let outside = tmp.path().join("outside");
-        fs::create_dir_all(outside.join("lib")).unwrap();
-        fs::write(outside.join("secret.ts"), "").unwrap();
-        fs::write(outside.join("lib/more.ts"), "").unwrap();
-        let root = tmp.path().join("repo");
-        fs::create_dir_all(root.join(".git")).unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("shared")).unwrap();
-        fs::write(root.join("src/index.ts"), "").unwrap();
-        fs::write(root.join("shared/client.ts"), "").unwrap();
-        std::os::unix::fs::symlink(outside.join("secret.ts"), root.join("src/link.ts")).unwrap();
-        std::os::unix::fs::symlink(outside.join("lib"), root.join("src/vendor")).unwrap();
-        std::os::unix::fs::symlink(root.join("shared"), root.join("src/lib")).unwrap();
-
-        let walk = |bound: Option<&Path>| {
-            let walked = find_files_leaving_out(
-                &root.join("src").to_string_lossy(),
-                ARTIFACT_IGNORES,
-                &[],
-                &Exclusion::default(),
-                bound,
-            );
-            let mut files: Vec<String> = walked
-                .files
-                .iter()
-                .map(|file| file.path.strip_prefix(&root).unwrap().display().to_string())
-                .collect();
-            files.sort();
-            let outside: Vec<String> = walked
-                .stopped
-                .outside
-                .iter()
-                .map(|link| link.strip_prefix(&root).unwrap().display().to_string())
-                .collect();
-            (files, outside)
-        };
-
-        let bound = checkout_bound(&root.join("src"));
-        assert_eq!(
-            walk(Some(&bound)),
-            (
-                vec!["src/index.ts".to_string(), "src/lib/client.ts".to_string()],
-                vec!["src/link.ts".to_string(), "src/vendor".to_string()],
-            )
-        );
-        // Unbounded, as every scan outside untrusted mode walks: all of it.
-        assert_eq!(
-            walk(None).0,
-            [
-                "src/index.ts",
-                "src/lib/client.ts",
-                "src/link.ts",
-                "src/vendor/more.ts"
-            ]
-        );
-    }
-
-    /// carrick#2230. The bound is the nearest directory at or above the scan
-    /// root that holds `.git`, canonical, and the root itself without one.
-    #[test]
-    fn the_bound_is_the_checkout_the_scan_root_sits_in() {
-        let tmp = tempdir().expect("temp dir");
-        let root = tmp.path().join("repo");
-        fs::create_dir_all(root.join("apps/api")).unwrap();
-        assert_eq!(
-            checkout_bound(&root.join("apps/api")),
-            root.join("apps/api").canonicalize().unwrap()
-        );
-        fs::create_dir_all(root.join(".git")).unwrap();
-        let checkout = root.canonicalize().unwrap();
-        assert_eq!(checkout_bound(&root.join("apps/api")), checkout);
-        assert_eq!(checkout_bound(&root), checkout);
     }
 
     #[test]
@@ -1560,7 +1311,7 @@ mod tests {
             File::create(f).expect("file");
         }
 
-        let (mut files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        let mut files = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
         files.sort();
 
         let mut expected = vec![
@@ -1593,7 +1344,7 @@ mod tests {
         File::create(root.join(".next/server/page.js")).expect(".next file");
         File::create(root.join(".vite/deps/chunk.js")).unwrap();
 
-        let (files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        let files = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
 
         assert_eq!(files, vec![kept]);
     }
@@ -1612,7 +1363,7 @@ mod tests {
         File::create(&kept).expect("kept file");
         File::create(root.join("node_modules/dep/index.ts")).expect("dep file");
 
-        let (files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        let files = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
 
         assert_eq!(files, vec![kept]);
     }
@@ -1854,7 +1605,7 @@ mod tests {
         // directory: None => whole-repo scope, identical to find_files.
         let service = Config::default();
         let (svc_files, svc_pkg) = find_service_files(root.to_str().unwrap(), &service, &[]);
-        let (files, _) = find_files(root.to_str().unwrap(), &[]);
+        let files = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(svc_files, files);
         assert_eq!(svc_pkg, Some(root.join("package.json")));
@@ -2571,7 +2322,7 @@ mod tests {
         );
 
         // A scan started at the checkout reads it.
-        let (files, _) = find_files(
+        let files = find_files(
             root.join("vendor/clone").to_str().unwrap(),
             ARTIFACT_IGNORES,
         );

@@ -4,6 +4,8 @@
 //! the model off and reads the blob it writes. The fixture's README is the
 //! answer key.
 
+mod support;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -21,6 +23,7 @@ fn scan() -> &'static Scan {
         let storage = tempfile::tempdir().expect("storage dir");
         let cache = tempfile::tempdir().expect("cache dir");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+        support::with_tree_config(&mut cmd, std::path::Path::new(&&fixture));
         cmd.arg(&fixture)
             .env("CARRICK_MOCK_ALL", "1")
             .env("CARRICK_NO_MODEL", "1")

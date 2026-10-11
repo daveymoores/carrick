@@ -8,6 +8,8 @@
 //! in memory, handing each copy back from its bytes. The type cases run the
 //! real sidecar.
 
+mod support;
+
 use async_trait::async_trait;
 use carrick::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
 use carrick::engine::run_analysis_engine_with_sidecar;
@@ -539,7 +541,7 @@ async fn a_pr_that_leaves_main_as_it_is_posts_what_the_full_comparison_posts() {
 async fn a_two_service_pr_that_leaves_main_as_it_is_posts_what_the_full_comparison_posts() {
     let _serial = SERIAL.lock().await;
     let (tmp, _, _) = setup();
-    let (repo, cassettes) = retype_repo(tmp.path());
+    let (repo, cassettes, _config) = retype_repo(tmp.path());
     let _cassettes = Cassettes::from(&cassettes);
 
     let store = Store::default();
@@ -602,14 +604,15 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
 /// judge them: `web/src/checkout.ts` reads `response.data.x` after the calls
 /// on lines 6 and 11, and `api` answers with `{ y }`. Returned with its mocked
 /// model answers.
-fn retype_repo(root: &Path) -> (PathBuf, PathBuf) {
+fn retype_repo(root: &Path) -> (PathBuf, PathBuf, Option<support::ConfigEnv>) {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retype-http-client");
     let repo = unlinked(root).join("retype-http-client");
     copy_dir(&fixture, &repo);
     git(&repo, &["init", "-q"]);
     commit(&repo, "init");
-    (repo, fixture.join("__llm__"))
+    let config = support::in_process_tree_config(&repo);
+    (repo, fixture.join("__llm__"), config)
 }
 
 /// Answer the model from `cassettes` until the returned guard drops.
@@ -660,7 +663,7 @@ fn call_at(findings: &[serde_json::Value], line: u32) -> serde_json::Value {
 async fn a_break_main_stored_from_its_own_retype_is_on_main() {
     let _serial = SERIAL.lock().await;
     let (tmp, _, _) = setup();
-    let (repo, cassettes) = retype_repo(tmp.path());
+    let (repo, cassettes, _config) = retype_repo(tmp.path());
     let _cassettes = Cassettes::from(&cassettes);
 
     let store = Store::default();

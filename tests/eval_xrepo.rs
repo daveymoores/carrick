@@ -64,6 +64,8 @@
 //!
 //! Runner: `.github/workflows/eval-xrepo.yml` (`workflow_dispatch`).
 
+mod support;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -1805,6 +1807,7 @@ fn strip_ci_identity_keep_oidc(cmd: &mut Command) -> &mut Command {
 /// is deliberately unset (it would skip the upload).
 fn phase_a_live(bin: &Path, repo: &Path, cache_dir: &Path) {
     let mut cmd = Command::new(bin);
+    support::with_tree_config(&mut cmd, repo);
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
@@ -1832,6 +1835,7 @@ fn phase_a_live(bin: &Path, repo: &Path, cache_dir: &Path) {
 /// `#[ignore]`d mock-smoke test.
 fn phase_a_mock(bin: &Path, repo: &Path, cache_dir: &Path) {
     let mut cmd = Command::new(bin);
+    support::with_tree_config(&mut cmd, repo);
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
@@ -1892,6 +1896,7 @@ fn assert_phase_a_persisted(repo: &Path, cache_dir: &Path) {
 /// Fails loud if type checking was silently skipped (no sidecar), per §7.
 fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path, mock: bool) -> (EvalProjection, String) {
     let mut cmd = Command::new(bin);
+    support::with_tree_config(&mut cmd, repo);
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
         .env("CARRICK_OUTPUT_JSON", "1")

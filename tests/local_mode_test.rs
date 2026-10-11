@@ -24,6 +24,8 @@
 //! Every workspace is copied to a temp dir and `git init`-ed there: the tests
 //! edit producers and delete files, and a fixture is never mutated in place.
 
+mod support;
+
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,12 +42,31 @@ fn repo_root() -> PathBuf {
 /// Copy a fixture's repos into a fresh workspace, commit each one, and write
 /// the workspace file. Returns the workspace root, which owns the temp dir for
 /// as long as the test holds it.
+/// Where [`workspace`] writes the project config its repos' committed
+/// `carrick.json` bodies make, which the runners below hand every command as
+/// `CARRICK_CONFIG` (carrick#2272).
+const PROJECT_CONFIG: &str = ".test-project-config.json";
+
 fn workspace(fixture: &str, repos: &[&str]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let source = repo_root().join("tests/fixtures").join(fixture);
+    let mut configs = Vec::new();
     for repo in repos {
         copy_tree(&source.join(repo), &dir.path().join(repo));
         git(&dir.path().join(repo), &["init", "-q", "."]);
+        if let Some(config) = support::tree_config(&dir.path().join(repo)) {
+            let name = support::fixture_repo(&dir.path().join(repo));
+            git(
+                &dir.path().join(repo),
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("https://github.com/{name}.git"),
+                ],
+            );
+            configs.push((name, config));
+        }
         git(&dir.path().join(repo), &["add", "-A"]);
         git(
             &dir.path().join(repo),
@@ -59,6 +80,13 @@ fn workspace(fixture: &str, repos: &[&str]) -> tempfile::TempDir {
                 "fixture",
             ],
         );
+    }
+    if !configs.is_empty() {
+        std::fs::copy(
+            support::project_config(&configs),
+            dir.path().join(PROJECT_CONFIG),
+        )
+        .expect("write the project config");
     }
     let listed: Vec<String> = repos.iter().map(|repo| format!("\"./{repo}\"")).collect();
     std::fs::write(
@@ -98,6 +126,12 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+/// `CARRICK_CONFIG` for a command in `workspace`, when [`workspace`] wrote one.
+fn project_config(workspace: &Path) -> Option<(&'static str, PathBuf)> {
+    let path = workspace.join(PROJECT_CONFIG);
+    path.exists().then_some(("CARRICK_CONFIG", path))
+}
+
 /// Run a carrick command in the workspace and return its stdout. Read-only
 /// commands must always exit 0, which is asserted here rather than in every
 /// test: a hook that fails an edit because an index is stale is the failure
@@ -106,6 +140,7 @@ fn run(workspace: &Path, args: &[&str]) -> String {
     let output = Command::new(carrick())
         .args(args)
         .current_dir(workspace)
+        .envs(project_config(workspace))
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .output()
@@ -127,6 +162,7 @@ fn run_mocked(workspace: &Path, args: &[&str]) -> String {
     let output = Command::new(carrick())
         .args(args)
         .current_dir(workspace)
+        .envs(project_config(workspace))
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_MOCK_ALL", "1")
@@ -148,6 +184,7 @@ fn run_mocked_output(workspace: &Path, args: &[&str]) -> (String, String) {
     let output = Command::new(carrick())
         .args(args)
         .current_dir(workspace)
+        .envs(project_config(workspace))
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_MOCK_ALL", "1")
@@ -183,6 +220,7 @@ fn run_with_env(workspace: &Path, args: &[&str], env: &[(&str, &str)]) -> String
     command
         .args(args)
         .current_dir(workspace)
+        .envs(project_config(workspace))
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"));
     for (key, value) in env {
@@ -1613,17 +1651,14 @@ fn an_unknown_subcommand_is_not_read_as_a_repository_path() {
 /// the shape: the parent returns, the child finishes the build on its own, its
 /// output is in the log, and the state file is gone once it is done.
 ///
-/// `carrick index` is the inferred scan since carrick#1008, so the two things
-/// it demands are here: a `carrick.json` in every repo, which is what its
-/// refusal checks, and `CARRICK_MOCK_ALL`, which keeps the run off the wire.
+/// `carrick index` is the inferred scan since carrick#1008, and
+/// `CARRICK_MOCK_ALL` keeps it off the wire. No repo holds a config: the
+/// services are derived, and nothing refuses the scan for it (carrick#2272).
 #[test]
 #[serial]
 fn a_detached_scan_outlives_the_command_that_started_it() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
-    for repo in ["catalog-web", "inventory-svc"] {
-        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
-    }
 
     let started = Instant::now();
     let stdout = run_mocked(root, &["index", "--workspace", ".", "--detach"]);
@@ -1732,9 +1767,6 @@ fn a_foreground_scan_is_named_by_status_and_says_it_was_interrupted() {
 
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
-    for repo in ["catalog-web", "inventory-svc"] {
-        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
-    }
     let output = std::fs::File::create(root.join("foreground.out")).expect("output file");
     let mut build = Command::new(carrick())
         .args(["index", "--workspace", "."])
@@ -2120,7 +2152,6 @@ fn a_check_refusal_exits_non_zero_and_a_touch_refusal_does_not() {
 fn a_successful_index_supersedes_the_record_of_the_scan_before_it() {
     let workspace = workspace("local-mode-workspace", &["catalog-web"]);
     let root = workspace.path();
-    std::fs::write(root.join("catalog-web").join("carrick.json"), "{}\n").expect("a config");
     let index_dir = root.join(".carrick");
     std::fs::create_dir_all(&index_dir).expect("the index directory");
     let failed = index_dir.join("scan-12d9106f.json");
@@ -2175,9 +2206,6 @@ fn a_successful_index_supersedes_the_record_of_the_scan_before_it() {
 fn a_dispatched_index_records_its_jobs_and_says_the_analysis_is_elsewhere() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
-    for repo in ["catalog-web", "inventory-svc"] {
-        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
-    }
 
     let stdout = run_mocked(root, &["index", "--dispatch", "--workspace", "."]);
     assert!(
@@ -2281,7 +2309,6 @@ fn a_dispatch_with_nothing_to_hand_over_says_so() {
     let workspace = workspace("local-mode-workspace", &["inventory-svc"]);
     let root = workspace.path();
     let repo = root.join("inventory-svc");
-    std::fs::write(repo.join("carrick.json"), "{}\n").expect("write a config");
     // Nothing a model would be asked about: no route, no call, no schema.
     for file in std::fs::read_dir(repo.join("src")).expect("the fixture's sources") {
         std::fs::remove_file(file.expect("dir entry").path()).expect("remove it");
@@ -2346,9 +2373,6 @@ fn laptop_index(consumer: &str) -> (tempfile::TempDir, String) {
             format!("{{ \"repos\": [\"./catalog-web\", \"./{consumer}\"] }}\n"),
         )
         .expect("rewrite the workspace file");
-    }
-    for repo in ["catalog-web", consumer] {
-        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
     }
     let (stdout, stderr) = run_mocked_output(root, &["index", "--workspace", "."]);
     (workspace, format!("{stdout}\n{stderr}"))

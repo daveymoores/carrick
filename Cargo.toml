@@ -35,7 +35,6 @@ indicatif = "0.17"
 libc = "0.2"
 
 matchit = "0.8.6"
-percent-encoding = "2"
 regex = "1.11.1"
 # `gzip` is load-bearing, not an optimisation. The cloud's `get-cross-repo-data`
 # response inlines every repo's index blob, and past ~5.8 MB it breaches AWS

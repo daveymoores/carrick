@@ -6,6 +6,8 @@
 //! with the model stage off, so every row is one a pass states as a fact.
 //! The fixture's README is the answer key.
 
+mod support;
+
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -16,6 +18,7 @@ fn calls() -> &'static [serde_json::Value] {
         let fixture = format!("{repo}/tests/fixtures/response-init-bag");
         let cache = tempfile::tempdir().expect("cache dir");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+        support::with_tree_config(&mut cmd, std::path::Path::new(&&fixture));
         cmd.arg(&fixture)
             .env("CARRICK_MOCK_ALL", "1")
             .env("CARRICK_NO_MODEL", "1")

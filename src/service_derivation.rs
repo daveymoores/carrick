@@ -146,13 +146,13 @@ pub fn workspace_patterns(root: &Path) -> Result<Vec<(String, Vec<String>)>, Str
     Ok(sources)
 }
 
-/// The services a scan of `root` reads (carrick#2221): the ones in the tree's
-/// `carrick.json`, or, for a no-model re-read of a repo without one, the
-/// configs its hosted index was written with.
+/// The services a scan of `root` reads: for a no-model re-read, the configs
+/// its hosted index was written with (carrick#2221); otherwise, and when
+/// those do not fit this tree, [`resolve`]'s list (carrick#2272).
 ///
 /// The preflight (`main.rs`) and the engine both call this, so they see one
 /// list. Only a no-model pass takes the hosted configs: CI, the runner and
-/// every scan that asks the model resolve from the tree as before.
+/// every scan that asks the model read the project config or derive.
 pub fn resolve_for_scan(root: &Path) -> Result<Vec<Config>, String> {
     resolve_gated(root, crate::local_mode::no_model(), || {
         crate::local_mode::hosted::previous_data()
@@ -168,12 +168,7 @@ fn resolve_gated(
     no_model: bool,
     previous: impl FnOnce() -> Option<Vec<crate::cloud_storage::CloudRepoData>>,
 ) -> Result<Vec<Config>, String> {
-    // A tree that holds its own config never reads the previous generation.
-    let hosted = if no_model && !has_root_config(root)? {
-        previous()
-    } else {
-        None
-    };
+    let hosted = if no_model { previous() } else { None };
     resolve_with_hosted(root, hosted.as_deref())
 }
 
@@ -182,15 +177,13 @@ fn resolve_gated(
 ///
 /// The hosted configs are taken all or nothing: every blob must carry a
 /// `config_json` that parses and names directories this tree holds, or the
-/// list is derived exactly as without them. Half a hosted split and half a
-/// derived one is a split neither side wrote.
+/// list is [`resolve`]'s. Half a hosted split and half another one is a split
+/// neither side wrote.
 pub fn resolve_with_hosted(
     root: &Path,
     hosted: Option<&[crate::cloud_storage::CloudRepoData]>,
 ) -> Result<Vec<Config>, String> {
-    if !has_root_config(root)?
-        && let Some(services) = hosted.and_then(|blobs| hosted_services(root, blobs))
-    {
+    if let Some(services) = hosted.and_then(|blobs| hosted_services(root, blobs)) {
         tracing::debug!(
             "Services for {}: the hosted index's configs ({})",
             root.display(),
@@ -201,16 +194,6 @@ pub fn resolve_with_hosted(
     let derived = resolve(root)?;
     tracing::debug!("Services for {}: {}", root.display(), derived.reason);
     Ok(derived.services)
-}
-
-fn has_root_config(root: &Path) -> Result<bool, String> {
-    // The same test `resolve` makes: a file in the tree always wins.
-    let config_path = root.join("carrick.json");
-    match std::fs::symlink_metadata(&config_path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("Could not read {}: {e}", config_path.display())),
-    }
 }
 
 fn hosted_services(
@@ -231,32 +214,33 @@ fn hosted_services(
 }
 
 /// Resolve once, including the validation CI applies before scanning any files.
+///
+/// The services of this repository's entry in the project config when
+/// `CARRICK_CONFIG` holds one ([`crate::project_config`]), else derived from
+/// the manifests. A `carrick.json` in the tree is never read (carrick#2272).
 pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
-    let config_path = root.join("carrick.json");
-    // symlink_metadata also sees broken symlinks: an existing path is never
-    // mistaken for permission to infer and replace an explicit declaration.
-    match std::fs::symlink_metadata(&config_path) {
-        Ok(_) => {
-            let services = Config::load_services(vec![config_path.clone()]).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidInput {
-                    e.to_string()
-                } else {
-                    format!("Failed to parse {}: {e}", config_path.display())
-                }
-            })?;
-            validate(root, &services)?;
-            let members = member_facts(root, &services);
-            return Ok(ServiceDerivation {
-                reason: "carrick.json".into(),
-                config: serde_json::Value::Null,
-                members,
-                services,
-                warnings: Vec::new(),
-                notes: Vec::new(),
-            });
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("Could not read {}: {e}", config_path.display())),
+    resolve_with_section(root, crate::project_config::section_for(root)?)
+}
+
+/// [`resolve`] with this repository's project config entry handed in, for a
+/// caller that holds it and for tests, which cannot share one process-wide
+/// `CARRICK_CONFIG`.
+pub fn resolve_with_section(
+    root: &Path,
+    section: Option<crate::project_config::Section>,
+) -> Result<ServiceDerivation, String> {
+    if let Some(section) = section
+        && let Some(services) = section_services(root, section)?
+    {
+        let members = member_facts(root, &services);
+        return Ok(ServiceDerivation {
+            reason: "project config".into(),
+            config: serde_json::Value::Null,
+            members,
+            services,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+        });
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let sources = workspace_patterns(&root)?;
@@ -611,7 +595,7 @@ fn imported_members(
     if by_package.is_empty() {
         return found;
     }
-    let (files, _) =
+    let files =
         crate::file_finder::find_files(&directories[index].to_string_lossy(), &MANIFEST_SKIP_DIRS);
     let mut resolver = crate::parser::ModuleReader::default();
     for file in files {
@@ -675,27 +659,69 @@ fn nearest_tsconfig(root: &Path, directory: &Path) -> Option<String> {
     None
 }
 
-/// Whether a path `carrick.json` names, relative to the repository root,
-/// leaves the repository (carrick#2245): absolute, stepping up through `..`
-/// (refused outright, as a workspace pattern is), or resolving through a
-/// symlink to somewhere outside it. `root` is canonical. A path that does not
-/// exist is judged by its text alone; the existence check reports it.
-fn leaves_repository(root: &Path, path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-        || crate::file_finder::resolves_outside(root, &root.join(path))
+/// The services of a project config entry that this tree can hold.
+///
+/// The config is Carrick's, and the user cannot edit it, so a path it names
+/// that this tree lacks is left out rather than refused: a member whose
+/// `directory` does not exist, and a `tsconfig` or an `include` that does
+/// not. Each says so in the debug log only. `None` when no member is left,
+/// and the services are derived instead.
+fn section_services(
+    root: &Path,
+    section: crate::project_config::Section,
+) -> Result<Option<Vec<Config>>, String> {
+    let repo = section.repo;
+    let mut services: Vec<Config> = section
+        .services
+        .into_iter()
+        .filter(|service| {
+            let present = service
+                .directory
+                .as_deref()
+                .is_none_or(|directory| root.join(directory).is_dir());
+            if !present {
+                tracing::debug!(
+                    "{repo}: project config service {} names directory {:?}, which this tree lacks; left out",
+                    label(service),
+                    service.directory
+                );
+            }
+            present
+        })
+        .collect();
+    for service in &mut services {
+        let name = label(service);
+        service.include.retain(|include| {
+            let present = root.join(include).exists();
+            if !present {
+                tracing::debug!(
+                    "{repo}: project config service {name} includes '{include}', which this tree lacks; dropped"
+                );
+            }
+            present
+        });
+        if let Some(tsconfig) = &service.tsconfig
+            && !root
+                .join(service.directory.as_deref().unwrap_or("."))
+                .join(tsconfig)
+                .is_file()
+        {
+            tracing::debug!(
+                "{repo}: project config service {name} names tsconfig '{tsconfig}', which this tree lacks; dropped"
+            );
+            service.tsconfig = None;
+        }
+    }
+    if services.is_empty() {
+        tracing::debug!("{repo}: no project config service fits this tree; deriving");
+        return Ok(None);
+    }
+    validate(root, &services)?;
+    Config::resolve_nested(&mut services);
+    Ok(Some(services))
 }
 
-/// Every path a service declares must name something inside the repository,
-/// because the scan reads what it names and carries it into the index
-/// (carrick#2245).
 fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
-    // Canonical, so a symlink is judged by where it lands and a root reached
-    // through a symlink of its own (a macOS temp dir) still contains itself.
-    let canonical = root
-        .canonicalize()
-        .map_err(|e| format!("Could not read {}: {e}", root.display()))?;
     for service in services {
         let label = service
             .service_name
@@ -703,30 +729,10 @@ fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
             .or(service.directory.as_deref())
             .unwrap_or("<unnamed>");
         if let Some(directory) = &service.directory
-            && leaves_repository(&canonical, directory)
-        {
-            return Err(format!(
-                "Service '{label}' in {} declares directory '{directory}', which is outside the repository '{}'. Name a directory inside the repository, relative to carrick.json.",
-                root.join("carrick.json").display(),
-                root.display()
-            ));
-        }
-        if let Some(include) = service
-            .include
-            .iter()
-            .find(|include| leaves_repository(&canonical, include))
-        {
-            return Err(format!(
-                "Service '{label}' declares include path '{include}', which is outside the repository '{}'. Name a path inside the repository, relative to carrick.json.",
-                root.display()
-            ));
-        }
-        if let Some(directory) = &service.directory
             && !root.join(directory).is_dir()
         {
             return Err(format!(
-                "Service '{label}' in {} declares directory '{directory}', which does not exist under '{}'",
-                root.join("carrick.json").display(),
+                "Service '{label}' declares directory '{directory}', which does not exist under '{}'",
                 root.display()
             ));
         }
@@ -746,17 +752,6 @@ fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
                 return Err(format!(
                     "Service '{label}' declares tsconfig '{}', which does not exist",
                     path.display()
-                ));
-            }
-            // Relative to the service directory, so `../tsconfig.base.json`
-            // is an ordinary shared config: judged by where it lands.
-            if !path
-                .canonicalize()
-                .is_ok_and(|resolved| resolved.starts_with(&canonical))
-            {
-                return Err(format!(
-                    "Service '{label}' declares tsconfig '{tsconfig}', which is outside the repository '{}'. Name a tsconfig inside the repository, relative to the service directory.",
-                    root.display()
                 ));
             }
             if path
@@ -853,18 +848,82 @@ mod tests {
         assert_eq!(services[0].exclude, ["generated/**"]);
     }
 
+    /// A scan never reads a `carrick.json` in the tree (carrick#2272), so a
+    /// no-model re-read of a tree that holds one still takes the hosted
+    /// configs, and without them derives.
     #[test]
-    fn a_root_carrick_json_wins_over_the_hosted_configs() {
+    fn a_tree_carrick_json_is_never_read() {
         let tmp = workspace();
         std::fs::write(
             tmp.path().join("carrick.json"),
-            r#"{"services":[{"name":"declared","directory":"packages/a"}]}"#,
+            r#"{"services":[{"serviceName":"declared","directory":"packages/a"}]}"#,
         )
         .unwrap();
         let services = resolve_gated(tmp.path(), true, || Some(hosted())).unwrap();
-        assert_eq!(names(&services), ["declared"]);
+        assert_eq!(names(&services), ["a", "b"]);
         let services = resolve_with_hosted(tmp.path(), Some(&hosted())).unwrap();
-        assert_eq!(names(&services), ["declared"]);
+        assert_eq!(names(&services), ["a", "b"]);
+        let services = resolve_gated(tmp.path(), false, || Some(hosted())).unwrap();
+        assert_eq!(names(&services), ["@scope/a", "@scope/b"]);
+    }
+
+    fn section(services: serde_json::Value) -> crate::project_config::Section {
+        crate::project_config::Section {
+            repo: "acme/mono".into(),
+            services: Config::load_services_from_str(&services.to_string(), "test").unwrap(),
+        }
+    }
+
+    /// A project config path this tree lacks is left out, never refused: the
+    /// config is Carrick's and the user cannot fix it (carrick#2272).
+    #[test]
+    fn a_section_path_this_tree_lacks_is_left_out() {
+        let tmp = workspace();
+        std::fs::write(tmp.path().join("packages/a/tsconfig.json"), "{}").unwrap();
+        let services = section_services(
+            tmp.path(),
+            section(json!({"services":[
+                {"serviceName":"a","directory":"packages/a","tsconfig":"tsconfig.json",
+                 "include":["packages/b","shared/missing"]},
+                {"serviceName":"b","directory":"packages/b","tsconfig":"missing.json"},
+                {"serviceName":"gone","directory":"packages/gone"},
+            ]})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(names(&services), ["a", "b"]);
+        assert_eq!(services[0].tsconfig.as_deref(), Some("tsconfig.json"));
+        assert_eq!(services[0].include, ["packages/b"]);
+        assert_eq!(services[1].tsconfig, None);
+    }
+
+    #[test]
+    fn a_section_with_no_member_this_tree_holds_derives() {
+        let tmp = workspace();
+        let services = section_services(
+            tmp.path(),
+            section(json!({"services":[{"serviceName":"gone","directory":"gone"}]})),
+        )
+        .unwrap();
+        assert!(services.is_none());
+    }
+
+    /// Nesting is resolved over the members kept, not the members sent.
+    #[test]
+    fn a_section_resolves_nesting_after_leaving_members_out() {
+        let tmp = workspace();
+        let services = section_services(
+            tmp.path(),
+            section(json!({"services":[
+                {"serviceName":"root"},
+                {"serviceName":"gone","directory":"packages/gone"},
+                {"serviceName":"a","directory":"packages/a"},
+            ]})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(names(&services), ["root", "a"]);
+        assert_eq!(services[0].nested_directories, ["packages/a"]);
     }
 
     #[test]
