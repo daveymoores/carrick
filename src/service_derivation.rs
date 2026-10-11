@@ -101,7 +101,7 @@ impl ServiceDerivation {
 /// Deployment descriptors, read only in the member's own directory: one of
 /// these beside a package is the strongest statement in a repository that it
 /// is deployed rather than imported.
-const DEPLOY_CONFIG: [&str; 5] = [
+pub const DEPLOY_CONFIG: [&str; 5] = [
     "netlify.toml",
     "vercel.json",
     "serverless.yml",

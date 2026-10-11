@@ -189,11 +189,20 @@ fn parent_of(path: &str) -> &str {
 /// whole repository), the workspace files, what the walk ignores, and the
 /// scan's own config.
 ///
-/// With [`REPO_INPUT_EXTENSIONS`], [`crate::file_finder::SOURCE_EXTENSIONS`]
-/// and a service's [`ServiceInputs`] (its tsconfig chain, its declared
-/// GraphQL schemas), this is the one definition of the files a scan reads
-/// (carrick#2227). A filter that decides whether a push needs a scan reads
-/// it from here rather than restating it.
+/// The package-manager and git config files are named too, because they
+/// decide what the scan reads: `.npmrc`, `.yarnrc`, `.yarnrc.yml` and
+/// `bunfig.toml` shape the installs and so `node_modules`, `.gitmodules`
+/// decides which directories are separate checkouts, and `.gitattributes` is
+/// applied by git when it writes the checkout.
+///
+/// With [`REPO_INPUT_EXTENSIONS`], [`CONFIG_EXTENSIONS`],
+/// [`crate::file_finder::SOURCE_EXTENSIONS`] and a service's
+/// [`ServiceInputs`] (its tsconfig chain, its declared GraphQL schemas), this
+/// is the one definition of the files a scan reads (carrick#2227). It is
+/// published as `carrickInputs` in `npm/carrick/package.json` (carrick#2234,
+/// held equal by `npm_manifest_inputs_equal_the_constants`) so a filter that
+/// decides whether a push needs a scan reads it from there rather than
+/// restating it.
 pub const REPO_INPUT_NAMES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -208,11 +217,45 @@ pub const REPO_INPUT_NAMES: &[&str] = &[
     "deno.jsonc",
     ".gitignore",
     "carrick.json",
+    // Read by the npm and pnpm installs and the library store
+    // (`library_store.rs`, `scripts/install-scanned-deps.sh`).
+    ".npmrc",
+    // Read by the classic Yarn install.
+    ".yarnrc",
+    // Read by the Yarn installs (`library_store.rs`, `untrusted_yarn.rs`).
+    ".yarnrc.yml",
+    // Read by the bun install.
+    "bunfig.toml",
+    // `file_finder::declared_submodules` decides `is_separate_checkout`.
+    ".gitmodules",
+    // Git applies it (eol, filters) when it writes the checkout.
+    ".gitattributes",
 ];
 
 /// The extensions whose files are an input of every service: the GraphQL
 /// schema catalogue covers the whole repository.
 pub const REPO_INPUT_EXTENSIONS: &[&str] = &["graphql", "gql", "graphqls"];
+
+/// The extensions of files a service reads by name: its tsconfig chain, a
+/// Deno import map, a JSON module it imports. These are per service
+/// (`service_inputs`), so the published rule reads every one. It is not a
+/// repo input: [`is_repo_input`] does not read it, and a JSON change
+/// re-analyses only the services whose inputs hold that file.
+pub const CONFIG_EXTENSIONS: &[&str] = &["json", "jsonc"];
+
+/// The version of the published input rule (`carrickInputs.rule`).
+///
+/// Rule 1, over repository-relative `/` paths: the basename is the text
+/// after the last `/`, compared lowercased on both sides. A path is read when
+/// its basename equals an entry of `repo_input_names` or `derive_names`, when
+/// its extension equals an entry of `source_extensions`,
+/// `repo_input_extensions` or `config_extensions`, or when its basename has no
+/// extension. The extension is the text after the basename's last `.` when
+/// that `.` is neither its first nor its last character. A push needs a scan
+/// when any path it adds, modifies, removes or renames from is read.
+///
+/// Bump it when the rule changes, not when a list does.
+pub const INPUT_RULE: u32 = 1;
 
 /// Whether a change to `path` re-analyses every service
 /// ([`REPO_INPUT_NAMES`], [`REPO_INPUT_EXTENSIONS`]).
@@ -874,12 +917,135 @@ mod tests {
             (('M', "schema/a.graphqls"), Some(Reason::RepoInputChanged)),
             (('M', "apps/web/.gitignore"), Some(Reason::RepoInputChanged)),
             (('M', "carrick.json"), Some(Reason::RepoInputChanged)),
+            (('M', ".npmrc"), Some(Reason::RepoInputChanged)),
+            (
+                ('M', "apps/web/.yarnrc.yml"),
+                Some(Reason::RepoInputChanged),
+            ),
+            (('M', ".yarnrc"), Some(Reason::RepoInputChanged)),
+            (('M', "bunfig.toml"), Some(Reason::RepoInputChanged)),
+            (('M', ".gitmodules"), Some(Reason::RepoInputChanged)),
+            (('M', ".gitattributes"), Some(Reason::RepoInputChanged)),
+            // CONFIG_EXTENSIONS is not a repo input.
+            (('M', "packages/x/tsconfig.base.json"), None),
         ] {
             let changes = changed(&[change]);
             assert_eq!(
                 reason(&decide_with(Some(&blob), Ok(&changes), api_inputs())),
                 expected,
                 "{change:?}"
+            );
+        }
+    }
+
+    /// The npm manifest publishes the input rule so carrick-cloud's push
+    /// filter reads it rather than restating it (carrick#2234). It must equal
+    /// the constants. On failure the message prints the whole expected field.
+    #[test]
+    fn npm_manifest_inputs_equal_the_constants() {
+        let expected = serde_json::json!({
+            "rule": INPUT_RULE,
+            "source_extensions": crate::file_finder::SOURCE_EXTENSIONS,
+            "repo_input_names": REPO_INPUT_NAMES,
+            "repo_input_extensions": REPO_INPUT_EXTENSIONS,
+            "config_extensions": CONFIG_EXTENSIONS,
+            "derive_names": crate::service_derivation::DEPLOY_CONFIG,
+        });
+        assert_eq!(
+            published_inputs(),
+            expected,
+            "npm/carrick/package.json carrickInputs differs from the constants; set it to:\n{}",
+            serde_json::to_string_pretty(&expected).unwrap()
+        );
+    }
+
+    fn published_inputs() -> serde_json::Value {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/npm/carrick/package.json");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read npm manifest"))
+                .expect("parse npm manifest");
+        manifest["carrickInputs"].clone()
+    }
+
+    /// Rule 1 (see [`INPUT_RULE`]) over the parsed manifest field, which is
+    /// what the cloud reads.
+    fn rule_reads(field: &serde_json::Value, path: &str) -> bool {
+        let list = |key: &str| -> Vec<String> {
+            field[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is not a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_lowercase())
+                .collect()
+        };
+        let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+        let extension = name
+            .rsplit_once('.')
+            .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+            .map(|(_, ext)| ext);
+        let named = list("repo_input_names")
+            .into_iter()
+            .chain(list("derive_names"))
+            .any(|n| n == name);
+        let by_extension = extension.is_some_and(|ext| {
+            [
+                "source_extensions",
+                "repo_input_extensions",
+                "config_extensions",
+            ]
+            .iter()
+            .any(|key| list(key).iter().any(|e| e == ext))
+        });
+        named || by_extension || extension.is_none()
+    }
+
+    #[test]
+    fn the_published_rule_reads_what_the_scanner_reads() {
+        let field = published_inputs();
+        let read = [
+            "apps/api/src/server.ts",
+            "SRC/A.TS",
+            "src/__tests__/a.test.ts",
+            "tests/fixtures/seed.ts",
+            "e2e/y.ts",
+            "src/a.stories.tsx",
+            "packages/x/tsconfig.build.json",
+            "deno/import_map.json",
+            "src/data/fixture.json",
+            "config.jsonc",
+            "schema/a.graphqls",
+            "deep/.gitignore",
+            ".npmrc",
+            "apps/web/.yarnrc.yml",
+            ".yarnrc",
+            "bunfig.toml",
+            ".gitmodules",
+            ".gitattributes",
+            "services/api/Dockerfile",
+            "vendor/submodule",
+            "bin/cli",
+        ];
+        let not_read = [
+            "docs/a.md",
+            "img.png",
+            "src/style.css",
+            "src/lib.rs",
+            "README.md",
+            ".github/workflows/ci.yml",
+        ];
+        for p in read {
+            assert!(rule_reads(&field, p), "{p} should be read");
+            // The scanner never reads less than the rule says.
+            let scanner = is_repo_input(p)
+                || crate::file_finder::is_scanned_source(Path::new(p), Path::new(""));
+            assert!(!scanner || rule_reads(&field, p), "{p}");
+        }
+        for p in not_read {
+            assert!(!rule_reads(&field, p), "{p} should not be read");
+            assert!(
+                !is_repo_input(p)
+                    && !crate::file_finder::is_scanned_source(Path::new(p), Path::new("")),
+                "{p}"
             );
         }
     }
