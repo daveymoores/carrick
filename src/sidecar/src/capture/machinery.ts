@@ -21,6 +21,7 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { isInsideCheckout } from './checkout.js';
 
 /**
  * Strongly-discriminating member names of HTTP transport machinery. Kept
@@ -207,34 +208,6 @@ export function isExternalOrigin(
   return program.isSourceFileFromExternalLibrary(sourceFile) && !isInsideCheckout(file, repoRoot);
 }
 
-const checkoutRoots = new Map<string, string>();
-
-/** The checkout the service root sits in: the nearest ancestor holding a
- * `.git` entry (a directory, or the file a worktree carries), else the service
- * root itself. */
-function checkoutRootOf(repoRoot: string): string {
-  const key = path.resolve(repoRoot);
-  const cached = checkoutRoots.get(key);
-  if (cached) return cached;
-  let dir = key;
-  let root = key;
-  for (;;) {
-    if (fs.existsSync(path.join(dir, '.git'))) {
-      root = dir;
-      break;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  checkoutRoots.set(key, root);
-  return root;
-}
-
-function isInsideCheckout(file: string, repoRoot: string): boolean {
-  const root = checkoutRootOf(repoRoot).replace(/\\/g, '/');
-  return file === root || file.startsWith(root.endsWith('/') ? root : root + '/');
-}
 
 /**
  * True when the symbol is declared in a runtime/library origin. Works on a bare

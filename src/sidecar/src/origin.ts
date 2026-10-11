@@ -16,6 +16,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { isInsideCheckout } from './capture/index.js';
 import type { Project, ResolutionHostFactory, ts } from 'ts-morph';
 
 /**
@@ -154,31 +155,3 @@ export function externalImportsOf(project: Project): ExternalImports | undefined
   return externalImportsByProject.get(project);
 }
 
-const checkoutRoots = new Map<string, string>();
-
-/** The checkout the service root sits in: the nearest ancestor holding a
- * `.git` entry (a directory, or the file a worktree carries), else the service
- * root itself. */
-function checkoutRootOf(repoRoot: string): string {
-  const key = path.resolve(repoRoot);
-  const cached = checkoutRoots.get(key);
-  if (cached) return cached;
-  let dir = key;
-  let root = key;
-  for (;;) {
-    if (fs.existsSync(path.join(dir, '.git'))) {
-      root = dir;
-      break;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  checkoutRoots.set(key, root);
-  return root;
-}
-
-function isInsideCheckout(file: string, repoRoot: string): boolean {
-  const root = checkoutRootOf(repoRoot).replace(/\\/g, '/');
-  return file === root || file.startsWith(root.endsWith('/') ? root : root + '/');
-}

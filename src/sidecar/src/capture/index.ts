@@ -55,10 +55,12 @@ import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
+import { boundedCompilerHost, boundedSys, untrustedReadBound, type ReadBound } from './checkout.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
+export { isInsideCheckout, untrustedReadBound, UNTRUSTED_TREE_ENV, type ReadBound } from './checkout.js';
 export { serviceConfigPath } from './project-references.js';
 export { findServiceTsconfig } from './service-config.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
@@ -155,6 +157,10 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const packageName = `@carrick/${sanitizeServiceName(opts.serviceName)}`;
   const stubDir = path.resolve(opts.outDir);
   const errors: string[] = [];
+  // Under CARRICK_UNTRUSTED_TREE every compiler read below is held to the
+  // checkout, the sidecar's own install and this stub; otherwise undefined
+  // and nothing here changes (carrick#2230).
+  const bound = untrustedReadBound(repoRoot, [stubDir]);
 
   // The named config, else the one the init'd project reads too
   // (carrick#1776). A service with neither is typed under defaults below.
@@ -215,7 +221,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
           resolveJsonModule: true,
         },
       },
-      ts.sys,
+      boundedSys(bound),
       repoRoot
     );
   } else {
@@ -282,7 +288,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
   let resolved: ResolvedAnchor[];
   const progress = opts.onProgress ?? (() => {});
-  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard, progress };
+  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard, progress, bound };
   try {
     resolved = ownerGroups && emitProject
       ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx, errors)
@@ -330,7 +336,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     written = emitDeclarations({
       rootNames: [entryPath, ...augmentationSources],
       options: emitOptions,
-      host: deno?.host(emitOptions),
+      host: programHost(emitOptions, deno, bound),
       staging,
       entryDir,
     });
@@ -544,9 +550,12 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     bareCheckout,
     repoRoot: dependencyRoot,
     compilerHost:
-      deno || Object.keys(rewritten.installs).length > 0
+      deno || bound || Object.keys(rewritten.installs).length > 0
         ? (options) =>
-            withInstalledPackages(options, rewritten.installs, deno ? deno.host(options) : undefined)
+            boundedCompilerHost(
+              withInstalledPackages(options, rewritten.installs, deno ? deno.host(options) : undefined),
+              bound
+            )
         : undefined,
   });
   const fidelity = computeFidelity(aliases);
@@ -817,6 +826,19 @@ function resolveAnchorsByOwner(
   return resolved;
 }
 
+/**
+ * The compiler host a capture program is built on: the Deno graph's, else the
+ * default one (`undefined`), each held to the read bound when there is one.
+ */
+function programHost(
+  options: ts.CompilerOptions,
+  deno: DenoProject | undefined,
+  bound: ReadBound | undefined
+): ts.CompilerHost | undefined {
+  if (!bound) return deno?.host(options);
+  return boundedCompilerHost(deno ? deno.host(options) : ts.createCompilerHost(options), bound);
+}
+
 /** What Phase A reads beside the anchors and the options they are typed under. */
 interface AnalysisContext {
   repoRoot: string;
@@ -824,6 +846,8 @@ interface AnalysisContext {
   entryPath: string;
   guard: WriteGuard;
   progress: (phase: CapturePhase, message: string) => void;
+  /** The untrusted-tree read bound, or undefined. */
+  bound: ReadBound | undefined;
 }
 
 /** Phase A: build the placeholder entry, then resolve every anchor. */
@@ -851,7 +875,7 @@ function resolveAnchors(
       ...parsed.options,
       noEmit: true,
     });
-    const program = ts.createProgram([ctx.entryPath, ...anchorSources, ...(deno?.globals ?? [])], options, deno?.host(options));
+    const program = ts.createProgram([ctx.entryPath, ...anchorSources, ...(deno?.globals ?? [])], options, programHost(options, deno, ctx.bound));
     // The checker binds every file of the program when it is first asked for,
     // which the first anchor would otherwise do: asked for here, so that the
     // report below says the program is whole before any anchor is read.
@@ -875,7 +899,7 @@ function resolveAnchors(
           specifier,
           (deno
             ? deno.resolve(specifier, ctx.entryPath, options)
-            : ts.resolveModuleName(specifier, ctx.entryPath, options, ts.sys, undefined, undefined, entryMode)
+            : ts.resolveModuleName(specifier, ctx.entryPath, options, boundedSys(ctx.bound), undefined, undefined, entryMode)
                 .resolvedModule
           )?.resolvedFileName
         );

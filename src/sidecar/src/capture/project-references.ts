@@ -20,6 +20,7 @@
 
 import * as path from 'node:path';
 import ts from 'typescript';
+import { boundedSys, untrustedReadBound } from './checkout.js';
 
 /** One parsed tsconfig. */
 export interface ServiceProject {
@@ -34,7 +35,7 @@ function parseConfig(
   extendedConfigCache: Map<string, ts.ExtendedConfigCacheEntry>
 ): ServiceProject {
   const host: ts.ParseConfigFileHost = {
-    ...ts.sys,
+    ...boundedSys(untrustedReadBound(path.dirname(configPath))),
     onUnRecoverableConfigFileDiagnostic: (d) => {
       throw new Error(ts.flattenDiagnosticMessageText(d.messageText, '\n'));
     },
