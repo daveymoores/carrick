@@ -2154,12 +2154,8 @@ pub(crate) fn run_check(
                     && let Some(kind) = end.memory_death(oom_kills_rose)
                 {
                     warn!(
-                        "The check's type checker died of memory ({}; signal {:?}, exit code \
-                         {:?}, heap cap {:?} MB)",
-                        kind.as_str(),
-                        end.signal,
-                        end.exit_code,
-                        end.heap_cap_mb
+                        "the check's type checker died of memory ({:?}, heap-limit line on stderr)",
+                        end.signal
                     );
                     crate::scan_health::record_type_memory_death(kind, end.heap_cap_mb);
                 }
