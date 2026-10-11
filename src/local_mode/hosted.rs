@@ -2054,6 +2054,45 @@ mod tests {
         assert_eq!(again.projects["pa"][0].last_updated, rewritten.last_updated);
     }
 
+    /// The indexer's progress count reads the list each scan will resolve
+    /// (carrick#2221): a refresh counts the hosted configs it hands over, and
+    /// a scan that asks the model counts the split derived from the tree.
+    #[test]
+    fn the_progress_count_reads_the_services_the_scan_resolves() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("package.json"),
+            r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        for name in ["a", "b"] {
+            let dir = repo.path().join("packages").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(r#"{{"name":"@scope/{name}"}}"#),
+            )
+            .unwrap();
+        }
+        let mut hosted = blob();
+        hosted.config_json = Some(r#"{"serviceName":"api"}"#.into());
+        let mut resolution = resolution();
+        resolution["repos"][0]["services"] =
+            json!([{"service":"api","hash":"abcdef","updated_at":null,"scanner_version":null}]);
+        let input = HostedInput {
+            snapshot: Some(snapshot(
+                resolution,
+                BTreeMap::from([("p".to_string(), vec![hosted])]),
+            )),
+            remotes: BTreeMap::from([(repo.path().to_path_buf(), "example/api".into())]),
+            ..Default::default()
+        };
+        let repos = [repo.path().to_path_buf()];
+        let counts = |pass| super::super::index::workspace_service_counts(&repos, &input, &pass);
+        assert_eq!(counts(super::super::index::Pass::Facts), Some(vec![1]));
+        assert_eq!(counts(super::super::index::Pass::Infer), Some(vec![2]));
+    }
+
     /// The snapshot a laptop holds when this ships: written before blobs
     /// recorded the row they were downloaded as, with a `resolution` that a
     /// later read already rewrote to the newest rows while its blobs stayed

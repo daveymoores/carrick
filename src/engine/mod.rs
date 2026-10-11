@@ -7626,9 +7626,7 @@ fn semantics_schedule_applies(generation: PreviousGeneration) -> bool {
 /// don't exist, is a hard error: silently falling back to defaults would
 /// ignore the user's declared service layout and upload a wrong index.
 fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
-    crate::service_derivation::resolve(std::path::Path::new(repo_path))
-        .map(|derived| derived.services)
-        .map_err(Into::into)
+    crate::service_derivation::resolve_for_scan(std::path::Path::new(repo_path)).map_err(Into::into)
 }
 
 /// Build-artifact directories to skip everywhere.

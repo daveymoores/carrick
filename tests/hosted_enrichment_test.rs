@@ -676,3 +676,154 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
             .all(|b| b["service_name"] == "inventory-svc")
     );
 }
+
+/// A repo whose hosted index was written with a `carrick.json` its tree does
+/// not hold is re-read with that config, not a derived one (carrick#2221).
+///
+/// The tree is an npm workspace whose manifests derive `@scope/a` and
+/// `@scope/b`; the hosted index names the services `a` and `b`, declares the
+/// env var the call is built on, and leaves a generated folder out. Read with
+/// the derived split, no local service has a hosted match and both read
+/// `read_failed`; read with the hosted configs, both are enriched, the call
+/// pairs with the route, and the excluded file states nothing.
+#[test]
+fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let repo = root.join("shop");
+    std::fs::create_dir_all(repo.join("packages/a/generated")).unwrap();
+    std::fs::create_dir_all(repo.join("packages/b")).unwrap();
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"shop","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/a/package.json"),
+        r#"{"name":"@scope/a","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/b/package.json"),
+        r#"{"name":"@scope/b","version":"1.0.0","dependencies":{"express":"^4.18.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/a/orders.ts"),
+        "export async function listOrders(): Promise<unknown> {\n  const res = await fetch(process.env.API_URL + \"/orders\");\n  return res.json();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/a/generated/client.ts"),
+        "export async function generated(): Promise<unknown> {\n  const res = await fetch(process.env.API_URL + \"/generated\");\n  return res.json();\n}\n",
+    )
+    .unwrap();
+    let server = "import express from \"express\";\nconst app = express();\napp.get(\"/orders\", (_req, res) => {\n  res.json([{ id: 1 }]);\n});\nexport default app;\n";
+    std::fs::write(repo.join("packages/b/server.ts"), server).unwrap();
+    init_repo(&repo);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/shop.git",
+        ],
+    );
+    std::fs::write(root.join("carrick-workspace.json"), r#"{"repos":["shop"]}"#).unwrap();
+
+    // The config the hosted index is written with, held by the cloud and never
+    // committed: one scan with it in the tree writes blobs whose `config_json`
+    // is that config, at this HEAD and this release's cache version.
+    let config = repo.join("carrick.json");
+    std::fs::write(
+        &config,
+        r#"{"services":[
+            {"name":"a","directory":"packages/a","internalEnvVars":["API_URL"],"exclude":["generated/**"]},
+            {"name":"b","directory":"packages/b","internalEnvVars":["API_URL"]}
+        ]}"#,
+    )
+    .unwrap();
+    run(root, &["refresh", "--workspace", "."], None);
+    let call = |line: u32, path: &str| {
+        json!({"candidate_id":format!("@line:{line}"),"line_number":line,
+            "target":format!("${{process.env.API_URL}}{path}"),"method":"GET","pattern_matched":"fetch(",
+            "call_expression_text":null,"call_expression_line":line,
+            "payload_expression_text":null,"payload_expression_line":null})
+    };
+    // Spans are 1-based and end after the call's closing parenthesis.
+    let at = server.find("app.get(").unwrap();
+    let start = at + 1;
+    let end = start + server[at..].find("});").unwrap() + 2;
+    let mut hosted = blobs(root);
+    for blob in &mut hosted {
+        blob["file_results"] = if blob["service_name"] == "a" {
+            json!({
+                "packages/a/orders.ts":{"mounts":[],"endpoints":[],"data_calls":[call(2, "/orders")]},
+                "packages/a/generated/client.ts":{"mounts":[],"endpoints":[],"data_calls":[call(2, "/generated")]}
+            })
+        } else {
+            json!({"packages/b/server.ts":{"mounts":[],"data_calls":[],"endpoints":[{
+                "candidate_id":format!("span:{start}-{end}"),"line_number":3,"owner_node":"app","method":"GET",
+                "path":"/orders","handler_name":"handler","pattern_matched":"fixture",
+                "call_expression_span_start":start,"call_expression_span_end":end,"resolution_source":"model"
+            }]}})
+        };
+    }
+    // `snapshot` lists a repo once per blob; the project holds `shop` once.
+    let mut stored = snapshot(root, "shop", &hosted);
+    stored["resolution"]["project_repos"][0]["repos"] = json!(["example/shop"]);
+    save_snapshot(root, &stored);
+    std::fs::remove_file(&config).unwrap();
+
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
+    let status = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
+    let states: Vec<(String, String)> = status["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["service"].as_str().unwrap().to_string(),
+                s["hosted_state"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("a".to_string(), "enriched".to_string()),
+            ("b".to_string(), "enriched".to_string())
+        ],
+        "{status:#}"
+    );
+    let orders = check(root, "shop/packages/a/orders.ts");
+    assert!(
+        orders["items"].as_array().unwrap().iter().any(|item| {
+            item["kind"] == "call"
+                && item["path"] == "/orders"
+                && item["counterparts"].as_array().unwrap().iter().any(|c| {
+                    c["role"] == "producer"
+                        && c["service"] == "b"
+                        && c["file"] == "packages/b/server.ts"
+                })
+        }),
+        "{orders:#}"
+    );
+    let excluded = check(root, "shop/packages/a/generated/client.ts");
+    assert!(
+        excluded["items"].as_array().unwrap().is_empty(),
+        "{excluded:#}"
+    );
+    let local = blobs(root);
+    let a = local.iter().find(|b| b["service_name"] == "a").unwrap();
+    assert!(
+        a["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| !c["file_path"].as_str().unwrap().contains("generated")),
+        "{a:#}"
+    );
+    assert!(a["function_definitions"].get("generated").is_none());
+}
