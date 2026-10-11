@@ -958,6 +958,86 @@ fn untrusted_mode_installs_classic_yarn_and_bun_frozen() {
     }
 }
 
+/// A `file:` dependency whose postinstall writes a marker, under a lockfile
+/// the manager itself generated (scripts off, so generating it fires nothing).
+fn yarn_tree_with_postinstall(t: &Untrusted, root: &str, pin: Option<&str>, generate: &str) {
+    write(
+        &t.repo,
+        &format!("{root}/dep/package.json"),
+        r#"{"name":"dep","version":"1.0.0","scripts":{"postinstall":"node postinstall.cjs"}}"#,
+    );
+    write(
+        &t.repo,
+        &format!("{root}/dep/postinstall.cjs"),
+        &t.witness("postinstall"),
+    );
+    let pin = pin
+        .map(|p| format!(r#","packageManager":"{p}""#))
+        .unwrap_or_default();
+    write(
+        &t.repo,
+        &format!("{root}/package.json"),
+        &format!(
+            r#"{{"name":"{root}","private":true{pin},"dependencies":{{"dep":"file:./dep"}}}}"#
+        ),
+    );
+    sh(&t.repo.join(root), generate);
+    let _ = fs::remove_file(t.marker("postinstall"));
+    let _ = fs::remove_dir_all(t.repo.join(root).join("node_modules"));
+    t.commit();
+}
+
+// Classic Yarn accepts `--mode=skip-build` and ignores it, so trying it first
+// ran every dependency's lifecycle script (carrick#2226).
+#[test]
+fn default_mode_installs_classic_yarn_without_running_dependency_scripts() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    let t = Untrusted::new();
+    yarn_tree_with_postinstall(&t, "classic", None, "yarn install --ignore-scripts");
+    let run = t.install_one("classic", "yarn", false);
+    assert_eq!(run.status, 0, "{}", run.text());
+    assert!(
+        !t.marker("postinstall").exists(),
+        "classic Yarn ran a dependency's postinstall in default mode: {}",
+        run.text()
+    );
+    assert!(
+        t.repo.join("classic/node_modules/dep").exists(),
+        "the install happened: {}",
+        run.text()
+    );
+}
+
+#[test]
+fn default_mode_installs_yarn_berry_with_skip_build() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    let t = Untrusted::new();
+    yarn_tree_with_postinstall(
+        &t,
+        "berry",
+        Some("yarn@4.9.2"),
+        "touch yarn.lock && YARN_ENABLE_IMMUTABLE_INSTALLS=0 yarn install --mode=skip-build",
+    );
+    let run = t.install_one("berry", "yarn", false);
+    assert_eq!(run.status, 0, "{}", run.text());
+    assert!(
+        !t.marker("postinstall").exists(),
+        "Berry ran a dependency's postinstall in default mode: {}",
+        run.text()
+    );
+    assert!(
+        run.text().contains("Installed"),
+        "the install happened: {}",
+        run.text()
+    );
+}
+
 #[test]
 fn an_npm_file_dependency_cannot_run_its_preinstall() {
     let t = Untrusted::new();
