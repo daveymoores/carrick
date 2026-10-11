@@ -418,7 +418,7 @@ fn is_graphql_file(path: &Path) -> bool {
 /// through the same test-folder filter: a schema this walk leaves out must not
 /// come back as another API's.
 fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
-    graphql_files_under_within(roots, |root| crate::file_finder::untrusted_bound(root))
+    graphql_files_under_within(roots, crate::file_finder::untrusted_bound)
 }
 
 /// [`graphql_files_under`] with `bound_of` naming where a root's walk stops.
