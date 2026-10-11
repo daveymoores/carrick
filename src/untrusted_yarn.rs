@@ -23,7 +23,10 @@
 //! own files choose, and that manager reads the clone's config, `plugins`
 //! included. Nothing the parent install sets reaches it, so a Berry root whose
 //! `yarn.lock` resolves any package from a git repository is refused too.
-//! Classic lockfiles are not read here (carrick#2258).
+//! So is a classic root whose lockfile does (classic Yarn runs a git
+//! dependency's `prepare` in the clone under `--ignore-scripts`,
+//! carrick#2258), and a Berry root resolving a package with the `exec:`
+//! protocol, which runs a file from the tree to build it (carrick#2257).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -100,31 +103,44 @@ pub fn refusal(install_root: &Path) -> Result<Option<String>, String> {
             shown(&rc, &clone_root)
         )));
     }
-    if let Some(package) = git_resolved_package(&install_root.join(LOCKFILE))? {
-        return Ok(Some(format!(
-            "{} resolves {package} from a git repository, which Yarn prepares by running a \
-             package manager with that repository's own settings",
-            shown(&install_root.join(LOCKFILE), &clone_root)
-        )));
+    let lockfile = install_root.join(LOCKFILE);
+    if let Some((package, fetch)) = code_running_resolution(&lockfile)? {
+        let shown = shown(&lockfile, &clone_root);
+        return Ok(Some(match fetch {
+            Fetch::Git => format!(
+                "{shown} resolves {package} from a git repository, which Yarn prepares by \
+                 running a package manager with that repository's own settings"
+            ),
+            Fetch::Exec => format!(
+                "{shown} resolves {package} with the exec: protocol, which runs a file from the \
+                 repository to build the package"
+            ),
+        }));
     }
     Ok(None)
 }
 
-/// The first package a Berry `yarn.lock` resolves from a git repository, or
-/// `None`. Yarn's git resolver writes every git resolution, whatever URL form
-/// the manifest used, as `<repo>#<query>` with a `commit` key in the query
-/// (`GitUtils.resolveUrl`), and the GitHub fetcher reads the same form. The
-/// reference is percent-decoded first, so a git source wrapped in a `patch:`
-/// resolution is seen too. A missing lockfile resolves nothing; a classic one
-/// is not read (carrick#2258); one that is not a YAML mapping is an error.
-fn git_resolved_package(lockfile: &Path) -> Result<Option<String>, String> {
+/// How Yarn fetches a locked package when fetching it runs code no install
+/// flag turns off.
+#[derive(Debug, PartialEq)]
+enum Fetch {
+    /// Cloned and prepared by a package manager started inside the clone.
+    Git,
+    /// Built by running a file from the tree (Berry's `exec:` protocol).
+    Exec,
+}
+
+/// The first package the root's `yarn.lock` resolves through a [`Fetch`]
+/// that runs code, or `None`. A missing lockfile resolves nothing; a Berry
+/// one that is not a YAML mapping is an error.
+fn code_running_resolution(lockfile: &Path) -> Result<Option<(String, Fetch)>, String> {
     let text = match fs::read_to_string(lockfile) {
         Ok(text) => text,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", lockfile.display())),
     };
     if text.lines().any(|line| line.trim() == "# yarn lockfile v1") {
-        return Ok(None);
+        return Ok(classic_git_package(&text).map(|package| (package, Fetch::Git)));
     }
     let entries = match untagged(
         serde_yaml_ng::from_str::<Value>(&text)
@@ -144,9 +160,9 @@ fn git_resolved_package(lockfile: &Path) -> Result<Option<String>, String> {
             continue;
         };
         if let Some((package, reference)) = split_locator(resolution)
-            && fetched_from_git(reference)
+            && let Some(fetch) = berry_fetch(reference)
         {
-            return Ok(Some(package.to_string()));
+            return Ok(Some((package.to_string(), fetch)));
         }
     }
     Ok(None)
@@ -159,15 +175,90 @@ fn split_locator(locator: &str) -> Option<(&str, &str)> {
     Some((&locator[..at], &locator[at + 1..]))
 }
 
-/// Whether a resolution reference names a git commit: any `#` fragment of the
-/// decoded reference is a query with a `commit` key.
-fn fetched_from_git(reference: &str) -> bool {
-    let decoded = percent_encoding::percent_decode_str(reference).decode_utf8_lossy();
-    decoded.split('#').skip(1).any(|fragment| {
+/// The code-running [`Fetch`] a Berry resolution reference names, if any.
+///
+/// - `exec:<file>`: the exec fetcher runs the file (carrick#2257).
+/// - Git: Yarn's git resolver writes every git resolution, whatever URL form
+///   the manifest used, as `<repo>#<query>` with a `commit` key in the query
+///   (`GitUtils.resolveUrl`), and the GitHub fetcher reads the same form.
+/// - `patch:<source>#<patch>`: the patch fetcher fetches the percent-encoded
+///   source locator first, so the source's own fetch is what runs.
+fn berry_fetch(reference: &str) -> Option<Fetch> {
+    if let Some(patched) = reference.strip_prefix("patch:") {
+        let source = patched.split('#').next().unwrap_or_default();
+        let source = percent_encoding::percent_decode_str(source).decode_utf8_lossy();
+        return split_locator(&source).and_then(|(_, reference)| berry_fetch(reference));
+    }
+    if reference.starts_with("exec:") {
+        return Some(Fetch::Exec);
+    }
+    let names_a_commit = reference.split('#').skip(1).any(|fragment| {
         fragment
             .split('&')
             .any(|pair| pair.split('=').next() == Some("commit"))
-    })
+    });
+    names_a_commit.then_some(Fetch::Git)
+}
+
+/// The first package a classic `yarn.lock` resolves from a git repository
+/// (carrick#2258). Classic Yarn fetches a locked entry with its git fetcher,
+/// which prepares a dependency declaring `prepare` by running an install in
+/// the clone with that clone's settings, `--ignore-scripts` or not. It picks
+/// that fetcher for a `resolved` URL its git resolver claims: one matching its
+/// `GIT_PATTERN_MATCHERS` (`git:`, `git+<protocol>:`, `ssh:`, an `http(s)` URL
+/// ending in `.git`) or an `http(s)` URL of exactly two path segments on a
+/// git host it knows. A hosted shorthand (`github:o/r`, `o/r`) that resolved
+/// over HTTP is locked as a codeload tarball, which the tarball fetcher only
+/// unpacks, so it is not refused.
+fn classic_git_package(text: &str) -> Option<String> {
+    let mut entry: Option<&str> = None;
+    for line in text.lines() {
+        if !line.starts_with([' ', '#']) && line.ends_with(':') {
+            entry = Some(line);
+            continue;
+        }
+        let Some(value) = line.trim_start().strip_prefix("resolved ") else {
+            continue;
+        };
+        let url = value.trim().trim_matches('"');
+        if classic_git_url(url.split('#').next().unwrap_or_default()) {
+            let first = entry?.split(", ").next()?.trim_end_matches(':');
+            let pattern = first.trim_matches('"');
+            return Some(
+                split_locator(pattern)
+                    .map_or(pattern, |(name, _)| name)
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// Classic Yarn's own test for a git `resolved` URL (`GitResolver.isVersion`
+/// applied to the URL without its `#` hash).
+fn classic_git_url(url: &str) -> bool {
+    const GIT_HOSTS: [&str; 4] = ["github.com", "gitlab.com", "bitbucket.com", "bitbucket.org"];
+    if url.starts_with("git:") || url.starts_with("ssh:") {
+        return true;
+    }
+    if let Some(rest) = url.strip_prefix("git+")
+        && rest.contains(':')
+    {
+        return true;
+    }
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    if url.ends_with(".git") {
+        return true;
+    }
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    GIT_HOSTS.contains(&host) && path.split('/').filter(|part| !part.is_empty()).count() == 2
 }
 
 /// The directories whose `.yarnrc.yml` Yarn reads for this root that the
@@ -379,12 +470,8 @@ mod tests {
             \"r@workspace:.\":\n  resolution: \"r@workspace:.\"\n  languageName: unknown\n";
         let clone = clone_with(&[("svc/yarn.lock", lock), ("svc/package.json", "{}")]);
         assert_eq!(answer(&clone, "svc").unwrap(), None);
-        // No lockfile, an empty one, and a classic one are not read for this.
-        for lock in [
-            None,
-            Some(""),
-            Some("# yarn lockfile v1\n\n\ndep@git://h/d.git:\n  resolved \"git://h/d.git#abc\"\n"),
-        ] {
+        // No lockfile and an empty one resolve nothing.
+        for lock in [None, Some("")] {
             let mut files = vec![("svc/package.json", "{}")];
             if let Some(lock) = lock {
                 files.push(("svc/yarn.lock", lock));
@@ -395,6 +482,75 @@ mod tests {
                 "{lock:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_exec_resolution_refuses_bare_or_patched() {
+        for resolution in [
+            "x@exec:./gen.js#./gen.js::hash=51ae02&locator=r%40workspace%3A.",
+            "x@patch:x@exec%3A./gen.js%23./gen.js%3A%3Ahash%3D51ae02#~/.yarn/patches/x.patch::version=1.0.0&hash=d0&locator=r%40workspace%3A.",
+        ] {
+            let lock =
+                format!("__metadata:\n  version: 8\n\n\"x@x\":\n  resolution: \"{resolution}\"\n");
+            let clone = clone_with(&[("svc/yarn.lock", &lock)]);
+            assert_eq!(
+                answer(&clone, "svc").unwrap().as_deref(),
+                Some(
+                    "svc/yarn.lock resolves x with the exec: protocol, which runs a file from \
+                     the repository to build the package"
+                ),
+                "{resolution}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_classic_git_resolution_refuses_in_every_form_classic_writes() {
+        for resolved in [
+            "git://127.0.0.1:9418/dep.git#9f674cc9dd277d1b2fbd3fab0ea75ef7ae905837",
+            "git+ssh://git@github.com/o/dep.git#9f674cc9",
+            "git+https://example.test/o/dep.git#9f674cc9",
+            "git+file:///srv/dep#9f674cc9",
+            "ssh://git@example.test/o/dep.git#9f674cc9",
+            "https://example.test/o/dep.git#9f674cc9",
+            "https://github.com/o/dep#9f674cc9",
+            "https://user@gitlab.com/o/dep#9f674cc9",
+        ] {
+            let lock = format!(
+                "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n# yarn lockfile v1\n\n\n\
+                 left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#abc\"\n\n\
+                 \"dep@x\", \"dep@y\":\n  version \"1.0.0\"\n  resolved \"{resolved}\"\n"
+            );
+            let clone = clone_with(&[("svc/yarn.lock", &lock)]);
+            assert_eq!(
+                answer(&clone, "svc").unwrap().as_deref(),
+                Some(
+                    "svc/yarn.lock resolves dep from a git repository, which Yarn prepares by \
+                     running a package manager with that repository's own settings"
+                ),
+                "{resolved}"
+            );
+        }
+        let scoped = clone_with(&[(
+            "svc/yarn.lock",
+            "# yarn lockfile v1\n\n\"@s/dep@git://h/d.git\":\n  resolved \"git://h/d.git#abc\"\n",
+        )]);
+        assert!(
+            answer(&scoped, "svc")
+                .unwrap()
+                .is_some_and(|r| r.contains("resolves @s/dep from"))
+        );
+    }
+
+    #[test]
+    fn classic_registry_and_codeload_tarballs_are_not_git() {
+        let lock = "# yarn lockfile v1\n\n\n\
+            left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#abc\"\n\n\
+            \"dep@github:o/dep\":\n  version \"1.0.0\"\n  resolved \"https://codeload.github.com/o/dep/tar.gz/9f674cc9\"\n\n\
+            \"arch@https://github.com/o/arch/archive/v1.0.0.tar.gz\":\n  version \"1.0.0\"\n  resolved \"https://github.com/o/arch/archive/v1.0.0.tar.gz\"\n\n\
+            local@file:./local:\n  version \"1.0.0\"\n";
+        let clone = clone_with(&[("svc/yarn.lock", lock)]);
+        assert_eq!(answer(&clone, "svc").unwrap(), None);
     }
 
     #[test]

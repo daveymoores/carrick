@@ -1515,6 +1515,140 @@ fn untrusted_mode_never_lets_a_yarn_git_dependency_load_its_own_config() {
     untrusted.assert_safe("svc", &run);
 }
 
+#[test]
+#[cfg(unix)]
+fn untrusted_mode_never_lets_classic_yarn_prepare_a_git_dependency() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    // Classic Yarn fetches a git dependency that declares `prepare` by
+    // cloning it and running an install in the clone, which runs `prepare`
+    // whatever `--ignore-scripts` says (carrick#2258).
+    let build = |t: &Untrusted, daemon_base: &Path| -> GitDaemon {
+        let dep = daemon_base.join("dep");
+        write(
+            &dep,
+            "package.json",
+            r#"{"name":"dep","version":"1.0.0","scripts":{"prepare":"node prepare.cjs"}}"#,
+        );
+        write(&dep, "prepare.cjs", &t.witness("prepare"));
+        commit_repository(&dep);
+        let daemon = GitDaemon::serve(daemon_base);
+        write(
+            &t.repo,
+            "classic/package.json",
+            &format!(
+                r#"{{"name":"c","private":true,"dependencies":{{"dep":"{}"}}}}"#,
+                daemon.url("dep")
+            ),
+        );
+        // The lockfile, written by Yarn itself into the case's own cache;
+        // writing it prepares the dependency, so its marker is cleared.
+        let cache = t.markers.parent().expect("scratch").join("yarn-cache");
+        sh(
+            &t.repo.join("classic"),
+            &format!(
+                "YARN_CACHE_FOLDER={} yarn install --ignore-scripts && rm -rf node_modules",
+                cache.to_str().expect("utf-8 path")
+            ),
+        );
+        let _ = fs::remove_file(t.marker("prepare"));
+        t.commit();
+        daemon
+    };
+
+    let default = Untrusted::new();
+    let base = default.markers.parent().expect("scratch").join("served");
+    let _daemon = build(&default, &base);
+    let run = default.install_one("classic", "yarn", false);
+    assert!(
+        default.marker("prepare").exists(),
+        "default mode runs the git dependency's prepare, so this case can see it: {}",
+        run.text()
+    );
+
+    let untrusted = Untrusted::new();
+    let base = untrusted.markers.parent().expect("scratch").join("served");
+    let _daemon = build(&untrusted, &base);
+    let run = untrusted.install_one("classic", "yarn", true);
+    assert!(
+        !untrusted.marker("prepare").exists(),
+        "the git dependency's prepare ran in untrusted mode: {}",
+        run.text()
+    );
+    assert!(
+        run.text().contains("::warning::") && run.text().contains("from a git repository"),
+        "the root is refused and named: {}",
+        run.text()
+    );
+    untrusted.assert_safe("classic", &run);
+}
+
+#[test]
+fn untrusted_mode_never_runs_a_yarn_exec_dependency() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    // Yarn Berry's `exec:` protocol builds a package by running a file from
+    // the tree (carrick#2257). The file's content carries the marker path, so
+    // no cache can answer for it. Later Yarns refuse `exec:` when builds are
+    // off, but the tree picks its Yarn, and 4.9.2 runs it.
+    let build = |t: &Untrusted| {
+        write(
+            &t.repo,
+            "svc/package.json",
+            r#"{"name":"s","private":true,"packageManager":"yarn@4.9.2","dependencies":{"x":"exec:./gen.cjs"}}"#,
+        );
+        write(
+            &t.repo,
+            "svc/gen.cjs",
+            &format!(
+                "{}require('fs').writeFileSync(execEnv.buildDir + '/package.json', \
+                 JSON.stringify({{ name: 'x', version: '1.0.0' }}));\n",
+                t.witness("exec")
+            ),
+        );
+        let global = t.markers.parent().expect("scratch").join("yarn-global");
+        sh(
+            &t.repo.join("svc"),
+            &format!(
+                "YARN_GLOBAL_FOLDER={} YARN_ENABLE_IMMUTABLE_INSTALLS=0 \
+                 corepack yarn install --mode=skip-build \
+                 && rm -rf node_modules .yarn .pnp.cjs .pnp.loader.mjs",
+                global.to_str().expect("utf-8 path")
+            ),
+        );
+        let _ = fs::remove_file(t.marker("exec"));
+        t.commit();
+    };
+
+    let default = Untrusted::new();
+    build(&default);
+    let run = default.install_one("svc", "yarn", false);
+    assert!(
+        default.marker("exec").exists(),
+        "default mode runs the exec: file, so this case can see it: {}",
+        run.text()
+    );
+
+    let untrusted = Untrusted::new();
+    build(&untrusted);
+    let run = untrusted.install_one("svc", "yarn", true);
+    assert!(
+        !untrusted.marker("exec").exists(),
+        "the exec: file ran in untrusted mode: {}",
+        run.text()
+    );
+    assert!(
+        run.text().contains("::warning::") && run.text().contains("with the exec: protocol"),
+        "the root is refused and named: {}",
+        run.text()
+    );
+    untrusted.assert_safe("svc", &run);
+}
+
 /// A registry on this machine serving one package: every `.tgz` path is the
 /// tarball, every other path its packument. pnpm asks for the tarball at the
 /// registry's conventional path, which a static directory cannot serve beside

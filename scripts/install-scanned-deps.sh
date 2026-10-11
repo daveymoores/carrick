@@ -62,10 +62,11 @@
 #   - a Yarn root where any `.yarnrc.yml` from it up to the clone root lists
 #     `plugins`, or names a `yarnPath` with no `packageManager` pin (the
 #     version cannot be known without running the repo's file), or whose
-#     Berry `yarn.lock` resolves a package from a git repository (Yarn
-#     prepares it with a package manager that reads the clone's own config,
-#     carrick#2251), is not installed: it warns and the pre-flight refuses
-#     it. The scanner reads those files as YAML (`$CARRICK_CLI
+#     `yarn.lock` resolves a package from a git repository (Berry prepares it
+#     with a package manager that reads the clone's own config, carrick#2251;
+#     classic runs its `prepare`, carrick#2258) or with Berry's `exec:`
+#     protocol (carrick#2257), is not installed: it warns and the pre-flight
+#     refuses it. The scanner reads those files as YAML (`$CARRICK_CLI
 #     __untrusted-yarn-refusal`), so this mode needs CARRICK_CLI for Yarn
 #     roots and refuses them without it;
 #   - corepack never writes `packageManager` into the repo's package.json
