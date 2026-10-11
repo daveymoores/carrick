@@ -1439,7 +1439,12 @@ fn untrusted_mode_never_lets_a_yarn_git_dependency_load_its_own_config() {
     // `.yarnrc.yml` `plugins` load, and no setting of the parent install
     // reaches them. This dependency pins no manager, so the child is the
     // parent's own Yarn. Its commit carries the marker path, which is unique
-    // to the case, so no cache can answer for the clone.
+    // to the case, so no cache can answer for the clone. Yarn 4.9.2
+    // passes `-c core.autocrlf=false` to `git clone` as one argument, which a
+    // current git rejects, so the clone (and the case) would fail before
+    // anything is prepared; the root pins a Yarn that clones. Since then
+    // Yarn fetches only the git repositories `approvedGitRepositories`
+    // names, and the tree's own `.yarnrc.yml` is what names them.
     let build = |t: &Untrusted, daemon_base: &Path| -> GitDaemon {
         let dep = daemon_base.join("dep");
         write(&dep, "package.json", r#"{"name":"dep","version":"1.0.0"}"#);
@@ -1455,9 +1460,14 @@ fn untrusted_mode_never_lets_a_yarn_git_dependency_load_its_own_config() {
             &t.repo,
             "svc/package.json",
             &format!(
-                r#"{{"name":"s","private":true,"packageManager":"yarn@4.9.2","dependencies":{{"dep":"{}"}}}}"#,
+                r#"{{"name":"s","private":true,"packageManager":"yarn@4.17.1","dependencies":{{"dep":"{}"}}}}"#,
                 daemon.url("dep")
             ),
+        );
+        write(
+            &t.repo,
+            "svc/.yarnrc.yml",
+            "approvedGitRepositories:\n  - \"**\"\n",
         );
         // The lockfile, written by Yarn itself. Writing it prepares the
         // dependency too, so the marker it leaves is cleared, and the cache it
