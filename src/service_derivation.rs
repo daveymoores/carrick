@@ -168,7 +168,12 @@ fn resolve_gated(
     no_model: bool,
     previous: impl FnOnce() -> Option<Vec<crate::cloud_storage::CloudRepoData>>,
 ) -> Result<Vec<Config>, String> {
-    let hosted = if no_model { previous() } else { None };
+    // A tree that holds its own config never reads the previous generation.
+    let hosted = if no_model && !has_root_config(root)? {
+        previous()
+    } else {
+        None
+    };
     resolve_with_hosted(root, hosted.as_deref())
 }
 
@@ -807,6 +812,8 @@ mod tests {
         )
         .unwrap();
         let services = resolve_gated(tmp.path(), true, || Some(hosted())).unwrap();
+        assert_eq!(names(&services), ["declared"]);
+        let services = resolve_with_hosted(tmp.path(), Some(&hosted())).unwrap();
         assert_eq!(names(&services), ["declared"]);
     }
 
