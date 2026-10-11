@@ -297,7 +297,7 @@ fn run_generation(
     // restarting at each repo (carrick#1365). Best effort: the same resolution
     // `carrick derive` runs, and a repo it cannot resolve leaves every child
     // counting its own services, as they did.
-    let service_counts = workspace_service_counts(targets);
+    let service_counts = workspace_service_counts(targets, hosted, pass);
     let mut services_done = 0usize;
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
@@ -556,13 +556,20 @@ fn repo_for_service(workspace: &Workspace, blobs: &Path, service: &str) -> Resul
 /// globs and parses nothing: a `carrick.json`, an npm or pnpm workspace, or a
 /// single service. All or nothing — a total that is missing a repo is a total
 /// the count would overshoot, and no count is better than a wrong one.
-fn workspace_service_counts(repos: &[PathBuf]) -> Option<Vec<usize>> {
+pub(super) fn workspace_service_counts(
+    repos: &[PathBuf],
+    hosted: &super::hosted::HostedInput,
+    pass: &Pass,
+) -> Option<Vec<usize>> {
     repos
         .iter()
         .map(|repo| {
-            crate::service_derivation::resolve(repo)
+            // The list each scan will resolve: a no-model pass reads the
+            // hosted configs it is handed below (carrick#2221).
+            let blobs = (!pass.infers()).then(|| hosted.local_blobs(repo));
+            crate::service_derivation::resolve_with_hosted(repo, blobs.as_deref())
                 .ok()
-                .map(|derived| derived.services.len().max(1))
+                .map(|services| services.len().max(1))
         })
         .collect()
 }

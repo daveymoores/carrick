@@ -146,6 +146,90 @@ pub fn workspace_patterns(root: &Path) -> Result<Vec<(String, Vec<String>)>, Str
     Ok(sources)
 }
 
+/// The services a scan of `root` reads (carrick#2221): the ones in the tree's
+/// `carrick.json`, or, for a no-model re-read of a repo without one, the
+/// configs its hosted index was written with.
+///
+/// The preflight (`main.rs`) and the engine both call this, so they see one
+/// list. Only a no-model pass takes the hosted configs: CI, the runner and
+/// every scan that asks the model resolve from the tree as before.
+pub fn resolve_for_scan(root: &Path) -> Result<Vec<Config>, String> {
+    resolve_gated(root, crate::local_mode::no_model(), || {
+        crate::local_mode::hosted::previous_data()
+            .map_err(|e| tracing::debug!("No hosted previous generation for services: {e}"))
+            .ok()
+            .flatten()
+    })
+}
+
+/// [`resolve_for_scan`] with its two inputs from the environment handed in.
+fn resolve_gated(
+    root: &Path,
+    no_model: bool,
+    previous: impl FnOnce() -> Option<Vec<crate::cloud_storage::CloudRepoData>>,
+) -> Result<Vec<Config>, String> {
+    // A tree that holds its own config never reads the previous generation.
+    let hosted = if no_model && !has_root_config(root)? {
+        previous()
+    } else {
+        None
+    };
+    resolve_with_hosted(root, hosted.as_deref())
+}
+
+/// [`resolve_for_scan`] with the hosted blobs handed in, for a caller that
+/// holds them itself (the indexer's progress count) and for tests.
+///
+/// The hosted configs are taken all or nothing: every blob must carry a
+/// `config_json` that parses and names directories this tree holds, or the
+/// list is derived exactly as without them. Half a hosted split and half a
+/// derived one is a split neither side wrote.
+pub fn resolve_with_hosted(
+    root: &Path,
+    hosted: Option<&[crate::cloud_storage::CloudRepoData]>,
+) -> Result<Vec<Config>, String> {
+    if !has_root_config(root)?
+        && let Some(services) = hosted.and_then(|blobs| hosted_services(root, blobs))
+    {
+        tracing::debug!(
+            "Services for {}: the hosted index's configs ({})",
+            root.display(),
+            services.len()
+        );
+        return Ok(services);
+    }
+    let derived = resolve(root)?;
+    tracing::debug!("Services for {}: {}", root.display(), derived.reason);
+    Ok(derived.services)
+}
+
+fn has_root_config(root: &Path) -> Result<bool, String> {
+    // The same test `resolve` makes: a file in the tree always wins.
+    let config_path = root.join("carrick.json");
+    match std::fs::symlink_metadata(&config_path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Could not read {}: {e}", config_path.display())),
+    }
+}
+
+fn hosted_services(
+    root: &Path,
+    blobs: &[crate::cloud_storage::CloudRepoData],
+) -> Option<Vec<Config>> {
+    if blobs.is_empty() {
+        return None;
+    }
+    let mut services = blobs
+        .iter()
+        .map(|blob| serde_json::from_str::<Config>(blob.config_json.as_deref()?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    services.sort_by(|a, b| a.service_name.cmp(&b.service_name));
+    validate(root, &services).ok()?;
+    Config::resolve_nested(&mut services);
+    Some(services)
+}
+
 /// Resolve once, including the validation CI applies before scanning any files.
 pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     let config_path = root.join("carrick.json");
@@ -648,4 +732,133 @@ fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud_storage::CloudRepoData;
+    use serde_json::json;
+
+    /// An npm workspace of two members, `packages/a` and `packages/b`, whose
+    /// manifests derive the split `@scope/a` and `@scope/b`.
+    fn workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        for name in ["a", "b"] {
+            let dir = tmp.path().join("packages").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(r#"{{"name":"@scope/{name}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+        }
+        tmp
+    }
+
+    /// A hosted blob carrying the config its service was indexed with.
+    fn blob(config: Option<serde_json::Value>) -> CloudRepoData {
+        serde_json::from_value(json!({
+            "repo_name":"repo", "endpoints":[],"calls":[],"mounts":[],"apps":{},
+            "imported_handlers":[],"function_definitions":{},
+            "last_updated":"2026-10-10T10:00:00Z","commit_hash":"abc",
+            "file_results":{},
+            "config_json": config.map(|c| c.to_string()),
+        }))
+        .unwrap()
+    }
+
+    /// Served out of order, so the sort is what puts `a` first.
+    fn hosted() -> Vec<CloudRepoData> {
+        vec![
+            blob(Some(
+                json!({"serviceName":"b","directory":"packages/b","internalEnvVars":["API_URL"]}),
+            )),
+            blob(Some(json!({
+                "serviceName":"a","directory":"packages/a",
+                "internalEnvVars":["API_URL"],"exclude":["generated/**"]
+            }))),
+        ]
+    }
+
+    fn names(services: &[Config]) -> Vec<&str> {
+        services
+            .iter()
+            .map(|s| s.service_name.as_deref().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn a_no_model_re_read_takes_the_hosted_configs() {
+        let tmp = workspace();
+        let services = resolve_gated(tmp.path(), true, || Some(hosted())).unwrap();
+        assert_eq!(names(&services), ["a", "b"]);
+        assert!(services[0].internal_env_vars.contains("API_URL"));
+        assert!(services[1].internal_env_vars.contains("API_URL"));
+        assert_eq!(services[0].exclude, ["generated/**"]);
+    }
+
+    #[test]
+    fn a_root_carrick_json_wins_over_the_hosted_configs() {
+        let tmp = workspace();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{"services":[{"name":"declared","directory":"packages/a"}]}"#,
+        )
+        .unwrap();
+        let services = resolve_gated(tmp.path(), true, || Some(hosted())).unwrap();
+        assert_eq!(names(&services), ["declared"]);
+        let services = resolve_with_hosted(tmp.path(), Some(&hosted())).unwrap();
+        assert_eq!(names(&services), ["declared"]);
+    }
+
+    #[test]
+    fn a_scan_that_asks_the_model_derives_from_the_tree() {
+        let tmp = workspace();
+        let services = resolve_gated(tmp.path(), false, || Some(hosted())).unwrap();
+        assert_eq!(names(&services), ["@scope/a", "@scope/b"]);
+    }
+
+    #[test]
+    fn one_blob_without_a_config_falls_back_to_the_derived_split() {
+        let tmp = workspace();
+        let mut blobs = hosted();
+        blobs[1].config_json = None;
+        let services = resolve_gated(tmp.path(), true, || Some(blobs)).unwrap();
+        assert_eq!(names(&services), ["@scope/a", "@scope/b"]);
+        assert!(services.iter().all(|s| s.internal_env_vars.is_empty()));
+    }
+
+    #[test]
+    fn no_hosted_blobs_or_a_directory_this_tree_lacks_falls_back() {
+        let tmp = workspace();
+        let derived = ["@scope/a", "@scope/b"];
+        let services = resolve_gated(tmp.path(), true, || None).unwrap();
+        assert_eq!(names(&services), derived);
+        let services = resolve_gated(tmp.path(), true, || Some(Vec::new())).unwrap();
+        assert_eq!(names(&services), derived);
+        let mut blobs = hosted();
+        blobs.push(blob(Some(
+            json!({"serviceName":"c","directory":"packages/c"}),
+        )));
+        let services = resolve_gated(tmp.path(), true, || Some(blobs)).unwrap();
+        assert_eq!(names(&services), derived);
+    }
+
+    #[test]
+    fn hosted_services_nested_inside_another_are_resolved() {
+        let tmp = workspace();
+        let blobs = vec![
+            blob(Some(json!({"serviceName":"root"}))),
+            blob(Some(json!({"serviceName":"a","directory":"packages/a"}))),
+        ];
+        let services = resolve_gated(tmp.path(), true, || Some(blobs)).unwrap();
+        assert_eq!(names(&services), ["a", "root"]);
+        assert_eq!(services[1].nested_directories, ["packages/a"]);
+    }
 }
