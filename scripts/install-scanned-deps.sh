@@ -51,17 +51,24 @@
 #   - npm runs with every setting that names a program (`git`, `node-options`,
 #     `script-shell`, `shell`, `node-gyp`) set in the environment, which
 #     outranks the tree's `.npmrc` (see `npm_trusted_tools`);
-#   - pnpm installs with `--ignore-pnpmfile`; no pnpm setting in `.npmrc` or
-#     `pnpm-workspace.yaml` starts a program from the tree during a frozen
-#     install without scripts (surveyed on pnpm 9 and 10, carrick#2246);
+#   - pnpm installs with `--ignore-pnpmfile`, which also stops the pnpmfile a
+#     `configDependencies` package ships (pnpm 10 then fails the frozen
+#     install on `pnpmfileChecksum` and warns, carrick#2251); no pnpm setting
+#     in `.npmrc` or `pnpm-workspace.yaml` starts a program from the tree
+#     during a frozen install without scripts (surveyed on pnpm 9 and 10,
+#     carrick#2246);
 #   - Yarn runs with YARN_IGNORE_PATH=1, so the launcher never hands the
 #     install to a committed release, and Berry with YARN_ENABLE_SCRIPTS=0;
 #   - a Yarn root where any `.yarnrc.yml` from it up to the clone root lists
 #     `plugins`, or names a `yarnPath` with no `packageManager` pin (the
-#     version cannot be known without running the repo's file), is not
-#     installed: it warns and the pre-flight refuses it. The scanner reads
-#     those files as YAML (`$CARRICK_CLI __untrusted-yarn-refusal`), so this
-#     mode needs CARRICK_CLI for Yarn roots and refuses them without it;
+#     version cannot be known without running the repo's file), or whose
+#     `yarn.lock` resolves a package from a git repository (Berry prepares it
+#     with a package manager that reads the clone's own config, carrick#2251;
+#     classic runs its `prepare`, carrick#2258) or with Berry's `exec:`
+#     protocol (carrick#2257), is not installed: it warns and the pre-flight
+#     refuses it. The scanner reads those files as YAML (`$CARRICK_CLI
+#     __untrusted-yarn-refusal`), so this mode needs CARRICK_CLI for Yarn
+#     roots and refuses them without it;
 #   - corepack never writes `packageManager` into the repo's package.json
 #     (COREPACK_ENABLE_AUTO_PIN=0), and classic Yarn and bun install frozen, so
 #     no tracked file differs from the commit afterwards.
