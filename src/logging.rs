@@ -77,9 +77,7 @@ pub fn init(verbose: bool, sink: LogSink) {
 
     let terminal_layer = fmt::layer()
         .with_writer(std::io::stderr)
-        .with_target(false)
-        .with_level(false)
-        .without_time()
+        .event_format(TerminalLine)
         // Its own default, stated because the run depends on it: a terminal
         // that has gone away answers every write with an error, and a layer
         // that reported its own write errors would be doing it to the stream
@@ -176,6 +174,31 @@ pub fn init(verbose: bool, sink: LogSink) {
         .with(terminal_layer)
         .try_init();
     emit_run_preamble();
+}
+
+/// How the terminal prints a line: its message and fields, and nothing else.
+///
+/// No time, level or target, as before services had spans. And no span: a
+/// service's analysis runs in a span naming it, so every line the run log
+/// gets from inside it says which service it came from when several run side
+/// by side (carrick#1066). The terminal's lines do not change for it;
+/// tracing-subscriber's own formats cannot leave the span out.
+struct TerminalLine;
+
+impl<S, N> fmt::FormatEvent<S, N> for TerminalLine
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        fmt::FormatFields::format_fields(ctx, writer.by_ref(), event)?;
+        writeln!(writer)
+    }
 }
 
 /// What the file layer writes: this crate at `debug`, everything else at
@@ -1392,6 +1415,56 @@ mod tests {
 
     /// A per-attempt retry line reaches the file at warn and never the
     /// terminal, unless the run is verbose (carrick#1103).
+    /// A line logged inside a service's span reaches the terminal as it did
+    /// before services had spans, and the file with the service named.
+    #[test]
+    fn a_line_in_a_service_s_span_names_it_in_the_file_and_not_on_the_terminal() {
+        let terminal = Shared::default();
+        let file = Shared::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(terminal.clone())
+                    .with_ansi(false)
+                    .event_format(TerminalLine)
+                    .with_filter(EnvFilter::new(terminal_filter(false))),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(file.clone())
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_filter(EnvFilter::new(FILE_FILTER)),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("service", name = "api");
+            let _entered = span.enter();
+            info!(files = 3, "Analyzing service api (1/2)");
+        });
+        // The terminal's format before services had spans, with no span.
+        let before = Shared::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(before.clone())
+                .with_ansi(false)
+                .with_target(false)
+                .with_level(false)
+                .without_time()
+                .with_filter(EnvFilter::new(terminal_filter(false))),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            info!(files = 3, "Analyzing service api (1/2)");
+        });
+        assert_eq!(terminal.text(), before.text());
+        assert_eq!(terminal.text(), "Analyzing service api (1/2) files=3\n");
+        assert!(
+            file.text()
+                .contains("service{name=\"api\"}: carrick::logging::tests: Analyzing service api"),
+            "{}",
+            file.text()
+        );
+    }
+
     #[test]
     fn retry_lines_go_to_the_file_and_not_the_terminal() {
         let terminal = Shared::default();

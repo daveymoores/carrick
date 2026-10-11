@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -2110,6 +2110,9 @@ pub struct TypeSidecar {
     /// memory, recorded for the run ([`Self::note_death`]). Every request
     /// after a death fails the same way, and it is one death.
     death_noted: AtomicBool,
+    /// The highest peak, in bytes, of the processes a restart has replaced:
+    /// see [`Self::peak_resident_bytes`].
+    replaced_peak: AtomicU64,
 }
 
 /// How a sidecar process that is gone came to an end, with what it left to
@@ -2128,6 +2131,35 @@ impl ProcessDeath {
     /// Whether it died of memory, and how ([`MemoryDeath::classify`]).
     pub fn memory_death(&self) -> Option<MemoryDeath> {
         MemoryDeath::classify(self.end, self.heap_line, self.oom_kills_rose)
+    }
+}
+
+/// What it takes to start another sidecar like one already running: its
+/// script, its operation deadline and its scan root. Owned, so a thread of
+/// its own can start one (carrick#1066).
+#[derive(Debug, Clone)]
+pub struct SidecarRecipe {
+    sidecar_path: PathBuf,
+    operation_timeout: Duration,
+    scan_root: Option<PathBuf>,
+}
+
+impl SidecarRecipe {
+    /// A process from this recipe, initialised to `repo_root` and ready. Its
+    /// program is built by its first request.
+    pub fn spawn_scoped(
+        &self,
+        repo_root: &Path,
+        tsconfig_path: Option<&str>,
+    ) -> Result<TypeSidecar, SidecarError> {
+        let sidecar =
+            TypeSidecar::spawn(&self.sidecar_path)?.with_operation_timeout(self.operation_timeout);
+        if let Some(scan_root) = &self.scan_root {
+            sidecar.set_scan_root(scan_root);
+        }
+        sidecar.start_init(repo_root, tsconfig_path);
+        sidecar.wait_ready(ready_budget())?;
+        Ok(sidecar)
     }
 }
 
@@ -2172,6 +2204,7 @@ impl TypeSidecar {
             in_flight_items: AtomicUsize::new(0),
             evidence: Mutex::new(evidence),
             death_noted: AtomicBool::new(false),
+            replaced_peak: AtomicU64::new(0),
         })
     }
 
@@ -2289,14 +2322,28 @@ impl TypeSidecar {
         repo_root: &Path,
         tsconfig_path: Option<&str>,
     ) -> Result<Self, SidecarError> {
-        let sidecar =
-            Self::spawn(&self.sidecar_path)?.with_operation_timeout(self.operation_timeout);
-        if let Some(scan_root) = self.scan_root.lock().unwrap().clone() {
-            sidecar.set_scan_root(&scan_root);
+        self.recipe().spawn_scoped(repo_root, tsconfig_path)
+    }
+
+    /// How to start another process like this one, on any thread.
+    pub fn recipe(&self) -> SidecarRecipe {
+        SidecarRecipe {
+            sidecar_path: self.sidecar_path.clone(),
+            operation_timeout: self.operation_timeout,
+            scan_root: self.scan_root.lock().unwrap().clone(),
         }
-        sidecar.start_init(repo_root, tsconfig_path);
-        sidecar.wait_ready(ready_budget())?;
-        Ok(sidecar)
+    }
+
+    /// The most memory any process of this sidecar has held, in bytes: the
+    /// one running now and every one a restart replaced. `None` when the
+    /// platform cannot say.
+    pub fn peak_resident_bytes(&self) -> Option<u64> {
+        let replaced = self.replaced_peak.load(Ordering::Relaxed);
+        let current = crate::services::machine::peak_resident_bytes(self.pid());
+        match current {
+            Some(bytes) => Some(bytes.max(replaced)),
+            None => (replaced > 0).then_some(replaced),
+        }
     }
 
     /// Name the scanned repo's root: the upper bound of the sidecar's search
@@ -2494,6 +2541,9 @@ impl TypeSidecar {
 
     fn kill(&self) {
         if let Ok(mut child) = self.child.lock() {
+            if let Some(peak) = crate::services::machine::peak_resident_bytes(child.id()) {
+                self.replaced_peak.fetch_max(peak, Ordering::Relaxed);
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -3720,9 +3770,12 @@ impl Drop for TypeSidecar {
         // Give it a moment to exit
         thread::sleep(Duration::from_millis(100));
 
-        // Force kill if still running
+        // Force kill if still running, and reap it: a scan starts a sidecar
+        // per service, and each one left unreaped would stay in the process
+        // table until the scan ends (carrick#1066).
         if let Ok(child) = self.child.get_mut() {
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

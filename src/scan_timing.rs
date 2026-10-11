@@ -127,6 +127,10 @@ struct Recorded {
     local_secs: f64,
     model_secs: f64,
     upload_secs: f64,
+    /// The services of the pass in hand, summed, until the pass ends and its
+    /// wall clock is shared between them ([`Self::pass_ended`]).
+    pass_local_secs: f64,
+    pass_model_secs: f64,
 }
 
 impl Recorded {
@@ -135,8 +139,22 @@ impl Recorded {
     }
 
     fn analysed(&mut self, local_secs: f64, model_secs: f64) {
-        self.local_secs += local_secs;
-        self.model_secs += model_secs;
+        self.pass_local_secs += local_secs;
+        self.pass_model_secs += model_secs;
+    }
+
+    /// Services analysed side by side sum to more than the pass took, so the
+    /// pass's wall clock is what is recorded, split between this machine and
+    /// the model in the proportion of the services' own seconds
+    /// (carrick#1066). The parts then still add up to the wall clock.
+    fn pass_ended(&mut self, wall_secs: f64) {
+        let summed = self.pass_local_secs + self.pass_model_secs;
+        if summed > 0.0 {
+            self.local_secs += wall_secs * self.pass_local_secs / summed;
+            self.model_secs += wall_secs * self.pass_model_secs / summed;
+        }
+        self.pass_local_secs = 0.0;
+        self.pass_model_secs = 0.0;
     }
 
     fn uploaded(&mut self, secs: f64) {
@@ -147,8 +165,8 @@ impl Recorded {
         Split {
             files: self.files.values().sum(),
             services: self.files.len(),
-            local_secs: self.local_secs,
-            model_secs: self.model_secs,
+            local_secs: self.local_secs + self.pass_local_secs,
+            model_secs: self.model_secs + self.pass_model_secs,
             upload_secs: self.upload_secs,
         }
     }
@@ -172,10 +190,22 @@ pub fn files_read(files: usize) {
     record(|recorded| recorded.files_read(service, files));
 }
 
+/// How many files the running service's deterministic pass read, when it has.
+pub fn files_of_current_service() -> Option<usize> {
+    let service = crate::current_service::name().unwrap_or_default();
+    RECORDED.lock().ok()?.as_ref()?.files.get(&service).copied()
+}
+
 /// Attribute one service's analysis: what it spent on this machine, and what
 /// it spent waiting on the model.
 pub fn service_analysed(local_secs: f64, model_secs: f64) {
     record(|recorded| recorded.analysed(local_secs, model_secs));
+}
+
+/// End a pass of services: its wall clock, `wall_secs`, replaces the sum of
+/// what its services recorded, in the same proportion.
+pub fn pass_ended(wall_secs: f64) {
+    record(|recorded| recorded.pass_ended(wall_secs));
 }
 
 /// Attribute the wait on the upload.
@@ -425,12 +455,13 @@ mod tests {
 
         recorded.files_read("api".to_string(), 40);
         recorded.analysed(1.0, 9.0);
+        recorded.files_read("web".to_string(), 12);
+        recorded.analysed(2.0, 0.0);
+        recorded.pass_ended(12.0);
         // The retry: the same service, the same files, more wall clock.
         recorded.files_read("api".to_string(), 40);
         recorded.analysed(0.5, 4.0);
-
-        recorded.files_read("web".to_string(), 12);
-        recorded.analysed(2.0, 0.0);
+        recorded.pass_ended(4.5);
         recorded.uploaded(3.0);
 
         assert_eq!(
@@ -443,6 +474,23 @@ mod tests {
                 upload_secs: 3.0,
             }
         );
+    }
+
+    /// Services side by side: two that each spent 10 s, in a pass that took
+    /// 10 s, record 10 s, split as they spent it. The parts add up to the
+    /// wall clock, not to twice it.
+    #[test]
+    fn services_side_by_side_record_the_pass_s_wall_clock() {
+        let mut recorded = Recorded::default();
+        recorded.files_read("api".to_string(), 40);
+        recorded.analysed(2.0, 8.0);
+        recorded.files_read("web".to_string(), 12);
+        recorded.analysed(4.0, 6.0);
+        recorded.pass_ended(10.0);
+        let split = recorded.split();
+        assert!((split.local_secs - 3.0).abs() < 1e-9, "{split:?}");
+        assert!((split.model_secs - 7.0).abs() < 1e-9, "{split:?}");
+        assert_eq!(split.services, 2);
     }
 
     #[test]

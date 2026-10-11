@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "${ordersBase}/api/orders",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${ordersBase}/api/orders`)",
+      "call_expression_line": 7,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "OrderView",
+      "type_import_source": "./models"
+    },
+    {
+      "candidate_id": "@line:13",
+      "line_number": 13,
+      "target": "${ordersBase}/api/orders/${id}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${ordersBase}/api/orders/${id}`)",
+      "call_expression_line": 13,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "OrderView",
+      "type_import_source": "./models"
+    },
+    {
+      "candidate_id": "@line:19",
+      "line_number": 19,
+      "target": "${catalogBase}/products",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${catalogBase}/products`)",
+      "call_expression_line": 19,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "ProductView",
+      "type_import_source": "./models"
+    }
+  ]
+}

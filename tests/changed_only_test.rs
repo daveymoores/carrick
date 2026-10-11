@@ -312,7 +312,12 @@ impl Workspace {
     }
 
     fn scan_into(&self, store: &Path, flags: &[&str]) -> Scan {
+        self.scan_with(store, flags, &[])
+    }
+
+    fn scan_with(&self, store: &Path, flags: &[&str], env: &[(&str, &str)]) -> Scan {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+        cmd.envs(env.iter().copied());
         cmd.arg(&self.repo)
             .args(["--repo", REPO])
             .args(flags)
@@ -720,6 +725,62 @@ fn an_analysed_service_writes_what_a_full_scan_writes() {
         assert_eq!(
             pinned(scoped[service].clone()),
             pinned(full[service].clone()),
+            "{service}"
+        );
+    }
+}
+
+/// carrick#1066 with carrick#2227: services analysed side by side carry the
+/// rest exactly as one at a time does. The carried service is never handed
+/// to a worker (its stored blob is untouched and no worker names it), and
+/// the two analysed beside each other write the bytes they write one at a
+/// time.
+#[test]
+fn analysed_side_by_side_a_carried_service_is_never_analysed() {
+    let workspace = case();
+    workspace.edit(
+        "apps/api/src/types.ts",
+        "export interface Order {\n  id: string;\n  total?: number;\n}\n",
+    );
+    workspace.commit("B");
+    let before = workspace.blobs();
+    let one_at_a_time_store = workspace.repo.parent().unwrap().join("one-at-a-time");
+    copy_dir(&workspace.store, &one_at_a_time_store);
+    let side_by_side = workspace.scan_with(
+        &workspace.store,
+        &["--changed-only"],
+        &[("CARRICK_SERVICE_CONCURRENCY", "4"), ("RUST_LOG", "info")],
+    );
+    assert_eq!(side_by_side.code, Some(0), "{}", side_by_side.output);
+    assert_analysed(&side_by_side, &["api", "web"]);
+    let analysing: Vec<&str> = side_by_side
+        .output
+        .lines()
+        .filter(|line| line.contains("Analyzing service "))
+        .collect();
+    assert_eq!(analysing.len(), 2, "{}", side_by_side.output);
+    assert!(
+        analysing.iter().all(|line| !line.contains("worker")),
+        "{}",
+        side_by_side.output
+    );
+    let one_at_a_time = workspace.scan_with(
+        &one_at_a_time_store,
+        &["--changed-only"],
+        &[("CARRICK_SERVICE_CONCURRENCY", "1")],
+    );
+    assert_eq!(one_at_a_time.code, Some(0), "{}", one_at_a_time.output);
+    let side_by_side = workspace.blobs();
+    assert_eq!(side_by_side["worker"], before["worker"]);
+    let pinned = |mut blob: serde_json::Value| {
+        blob["last_updated"] = serde_json::Value::Null;
+        serde_json::to_string_pretty(&blob).unwrap()
+    };
+    let one_at_a_time = blobs_in(&one_at_a_time_store);
+    for service in ["api", "web", "worker"] {
+        assert_eq!(
+            pinned(side_by_side[service].clone()),
+            pinned(one_at_a_time[service].clone()),
             "{service}"
         );
     }

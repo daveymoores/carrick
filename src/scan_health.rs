@@ -761,6 +761,22 @@ pub fn type_memory_stop() -> Result<(), TypesOutOfMemory> {
     stop_for_type_memory(fail_on_memory, &registry.type_memory_deaths)
 }
 
+/// [`type_memory_stop`] for one service's analysis: `Err` when this run
+/// stops at a memory death and one was recorded while `service` was being
+/// analysed. A service analysed beside it whose own checker lived is not
+/// stopped by it, and lands (carrick#1066).
+pub fn type_memory_stop_of(service: Option<&str>) -> Result<(), TypesOutOfMemory> {
+    let fail_on_memory = fail_on_type_memory_from_env();
+    let registry = registry().lock().expect("scan health lock");
+    let deaths: Vec<TypeMemoryDeath> = registry
+        .type_memory_deaths
+        .iter()
+        .filter(|death| death.service.as_deref() == service)
+        .cloned()
+        .collect();
+    stop_for_type_memory(fail_on_memory, &deaths)
+}
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
 }

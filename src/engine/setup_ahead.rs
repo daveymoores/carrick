@@ -829,7 +829,7 @@ async fn answer_asked_ahead<Answer>(ahead: Option<Slot<Answer>>, wanted: &str) -
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1594,6 +1594,15 @@ mod tests {
 
     fn tenths(n: u64) -> Duration {
         millis(n * 100)
+    }
+
+    /// What each service of [`LOGGED`] took once its setup was there: its
+    /// read and the rest of its analysis.
+    pub(crate) fn logged_analysis_times() -> Vec<Duration> {
+        LOGGED
+            .iter()
+            .map(|(read, .., rest)| tenths(read + rest))
+            .collect()
     }
 
     /// What a replay of [`LOGGED`] came to.
