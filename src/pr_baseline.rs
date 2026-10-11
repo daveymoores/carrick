@@ -315,7 +315,9 @@ fn stored_site(pair: String, site: String, answer: &DirectionVerdict) -> MainTyp
 ///
 /// Stale when a stored service was scanned from a working tree with
 /// uncommitted changes, or at a commit `differs` says has changes against the
-/// base. A copy at another commit this clone cannot compare, such as the head
+/// base. `differs` is asked about each stored service, so services stored at
+/// different commits are each judged by what that service reads
+/// (carrick#2228). A copy at another commit this clone cannot compare, such as the head
 /// of a squash-merged branch that a laptop index scanned, is not shown to
 /// differ and counts as current: its verdicts are still main's latest answer.
 ///
@@ -327,14 +329,13 @@ fn stored_site(pair: String, site: String, answer: &DirectionVerdict) -> MainTyp
 pub fn main_copy(
     main_self: &[CloudRepoData],
     base: Option<&str>,
-    differs: impl Fn(&str, &str) -> Option<bool>,
+    differs: impl Fn(&CloudRepoData, &str) -> Option<bool>,
     read_alike: impl FnOnce() -> bool,
 ) -> MainCopy {
     let stale = main_self.iter().any(|repo| {
         repo.dirty == Some(true)
-            || base.is_some_and(|base| {
-                repo.commit_hash != base && differs(&repo.commit_hash, base) == Some(true)
-            })
+            || base
+                .is_some_and(|base| repo.commit_hash != base && differs(repo, base) == Some(true))
     });
     let this_version = env!("CARGO_PKG_VERSION");
     let other_scanner = main_self
@@ -1196,9 +1197,9 @@ mod tests {
     #[test]
     fn which_copies_are_stale() {
         let copy = main_copy_with("src/screens/rules.tsx:1", "compatible", true);
-        let cannot_compare = |_: &str, _: &str| None;
-        let differs = |_: &str, _: &str| Some(true);
-        let same_tree = |_: &str, _: &str| Some(false);
+        let cannot_compare = |_: &CloudRepoData, _: &str| None;
+        let differs = |_: &CloudRepoData, _: &str| Some(true);
+        let same_tree = |_: &CloudRepoData, _: &str| Some(false);
         let never_asked = || panic!("a copy this scanner version wrote needs no evidence");
         let one = std::slice::from_ref(&copy);
         assert_eq!(

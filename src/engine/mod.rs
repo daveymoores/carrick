@@ -493,15 +493,20 @@ fn endpoint_delta(
 
 fn main_copy_against_base(
     repo_path: &str,
+    services: &[Config],
     main_self: &[CloudRepoData],
     as_uploaded: &[CloudRepoData],
 ) -> crate::pr_baseline::MainCopy {
     let base = pr_base_commit(repo_path);
     let mut reading = None;
+    // Each stored service by what it reads, so one stored at an older commit
+    // than its siblings is not stale for a change it never reads
+    // (carrick#2228).
+    let judge = crate::change_scope::CopyJudge::new(repo_path, services, main_self);
     let copy = crate::pr_baseline::main_copy(
         main_self,
         base.as_deref(),
-        |copy, base| crate::git_state::differs_under(repo_path, copy, base).ok(),
+        |copy, base| judge.differs(copy, base),
         || {
             let read = match base.as_deref() {
                 None => crate::pr_baseline::UntouchedReading::Unknown(
@@ -1437,7 +1442,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 })
                 .collect();
             let surface_unchanged = crate::pr_baseline::same_surface(&as_uploaded, &main_self_data);
-            let copy = main_copy_against_base(repo_path, &main_self_data, &as_uploaded);
+            let copy = main_copy_against_base(repo_path, &services, &main_self_data, &as_uploaded);
             MainBaselineInput {
                 // The peers are only needed when there is something to run.
                 peers: if surface_unchanged {

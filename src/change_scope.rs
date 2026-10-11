@@ -149,6 +149,16 @@ impl ServiceInputs {
         changed.iter().find(|change| self.reads(change))
     }
 
+    /// Whether `change` touches an input of this service that is not under
+    /// one of its roots.
+    fn reads_outside_roots(&self, change: &ChangedPath) -> bool {
+        let in_root = self.roots.iter().any(|root| {
+            under(&change.path, &root.dir)
+                && !root.left_out.iter().any(|dir| under(&change.path, dir))
+        });
+        !in_root && self.reads(change)
+    }
+
     fn reads(&self, change: &ChangedPath) -> bool {
         let path = change.path.as_str();
         let in_root = self.roots.iter().any(|root| {
@@ -605,6 +615,93 @@ fn top_relative(top: &Path, path: &Path) -> Option<String> {
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
+/// Whether a stored copy of a service differs from the pull request's base,
+/// judged by what that service reads (carrick#2228).
+///
+/// A pull-request run compares its findings with main's stored copy, and a
+/// copy stored at an older commit than the base is still main's when nothing
+/// its service reads changed in between. A service stored alone by a scoped
+/// push leaves the others at older commits, so a whole-tree comparison would
+/// call the copy stale on every pull request.
+///
+/// A copy whose services all sit at one commit was written by one scan of the
+/// whole repository, and is judged by the whole tree as it always was.
+pub struct CopyJudge<'a> {
+    repo_path: &'a str,
+    services: &'a [Config],
+    /// Main's copy sits at more than one commit.
+    scoped: bool,
+    top: Option<PathBuf>,
+    /// The pull request's own changes, base to the scanned tree.
+    pr_changes: std::cell::OnceCell<Result<Vec<ChangedPath>, String>>,
+}
+
+impl<'a> CopyJudge<'a> {
+    pub fn new(repo_path: &'a str, services: &'a [Config], main_self: &[CloudRepoData]) -> Self {
+        let commits: BTreeSet<&str> = main_self
+            .iter()
+            .map(|copy| copy.commit_hash.as_str())
+            .collect();
+        Self {
+            repo_path,
+            services,
+            scoped: commits.len() > 1,
+            top: crate::git_state::toplevel(repo_path).ok(),
+            pr_changes: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether `copy` differs from `base` in anything its service reads.
+    /// `None` when git cannot list the paths changed between them.
+    ///
+    /// Its inputs are computed on the scanned tree, which can differ from the
+    /// base's where the pull request itself edits a file outside the
+    /// service's roots that the service reads: then, and for a copy whose
+    /// service this tree does not configure or whose inputs cannot be read
+    /// whole, the whole trees are compared as before.
+    pub fn differs(&self, copy: &CloudRepoData, base: &str) -> Option<bool> {
+        if copy.commit_hash == base {
+            return Some(false);
+        }
+        let changed =
+            crate::git_state::changed_paths(self.repo_path, &copy.commit_hash, Some(base)).ok()?;
+        let whole_tree =
+            || crate::git_state::differs_under(self.repo_path, &copy.commit_hash, base).ok();
+        if !self.scoped {
+            return whole_tree();
+        }
+        let (Some(service), Some(top)) = (
+            self.services
+                .iter()
+                .find(|service| service.service_name == copy.service_name),
+            self.top.as_deref(),
+        ) else {
+            return whole_tree();
+        };
+        let inputs = service_inputs(self.repo_path, top, service);
+        if inputs.unresolved.is_some() || !inputs.unfollowed_extends.is_empty() {
+            return whole_tree();
+        }
+        let pr_changes = self
+            .pr_changes
+            .get_or_init(|| crate::git_state::changed_paths(self.repo_path, base, None));
+        let pr_edits_an_outside_input = match pr_changes {
+            Ok(pr_changes) => pr_changes
+                .iter()
+                .any(|change| inputs.reads_outside_roots(change)),
+            Err(_) => true,
+        };
+        if pr_edits_an_outside_input {
+            return whole_tree();
+        }
+        Some(
+            changed
+                .iter()
+                .any(|change| is_repo_input(&change.path) || inputs.reads(change)),
+        )
+    }
+}
+
 /// Whether a carried service's join fields differ from its stored blob's: its
 /// type verdicts, its SDK edges and what they left unresolved, and its
 /// boundary (carrick#2227). Read on the payload as the upload would send it,
@@ -902,5 +999,205 @@ mod tests {
         let boundary = payload.boundary.unwrap();
         assert_eq!(boundary.commit_hash, "1234567fff");
         assert_eq!(boundary.files_attempted, 0);
+    }
+
+    // --- carrick#2228: main's copy judged by each service's inputs ---
+
+    use crate::git_state::tests::{committed_repo, git_in};
+    use crate::pr_baseline::{MainCopy, main_copy};
+
+    /// Three services: `web` imports a file of `api` by a relative path, and
+    /// `worker` imports a workspace package by name.
+    fn workspace() -> (tempfile::TempDir, String, Vec<Config>) {
+        let (repo, a) = committed_repo(&[
+            (
+                "package.json",
+                r#"{ "name": "mono", "private": true, "workspaces": ["apps/*", "packages/*"] }"#,
+            ),
+            (
+                "packages/shared/package.json",
+                r#"{ "name": "@fixture/shared", "main": "src/x.ts" }"#,
+            ),
+            ("packages/shared/src/x.ts", "export const x = 1;\n"),
+            ("apps/api/package.json", r#"{ "name": "api" }"#),
+            ("apps/api/src/server.ts", "export const server = 1;\n"),
+            (
+                "apps/api/src/types.ts",
+                "export interface Order { id: string }\n",
+            ),
+            ("apps/web/package.json", r#"{ "name": "web" }"#),
+            (
+                "apps/web/src/checkout.ts",
+                "import type { Order } from \"../../api/src/types\";\nexport const o: Order | null = null;\n",
+            ),
+            (
+                "apps/worker/package.json",
+                r#"{ "name": "worker", "dependencies": { "@fixture/shared": "*" } }"#,
+            ),
+            (
+                "apps/worker/src/job.ts",
+                "import { x } from \"@fixture/shared\";\nexport const job = x;\n",
+            ),
+            ("README.md", "readme\n"),
+        ]);
+        let services = ["api", "web", "worker"]
+            .iter()
+            .map(|name| {
+                serde_json::from_value(serde_json::json!({
+                    "name": name,
+                    "directory": format!("apps/{name}"),
+                }))
+                .unwrap()
+            })
+            .collect();
+        (repo, a, services)
+    }
+
+    fn commit_edit(repo: &Path, path: &str, contents: &str) -> String {
+        std::fs::write(repo.join(path), contents).unwrap();
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-qm", path]);
+        git_in(repo, &["rev-parse", "HEAD"])
+    }
+
+    fn copy_at(service: &str, commit: &str) -> CloudRepoData {
+        let mut copy = stored(commit);
+        copy.service_name = Some(service.to_string());
+        copy.scanner_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        copy
+    }
+
+    fn judged(
+        repo: &Path,
+        services: &[Config],
+        main_self: &[CloudRepoData],
+        base: &str,
+    ) -> MainCopy {
+        let repo_path = repo.to_string_lossy();
+        let judge = CopyJudge::new(&repo_path, services, main_self);
+        main_copy(
+            main_self,
+            Some(base),
+            |copy, base| judge.differs(copy, base),
+            || panic!("this scanner wrote every copy"),
+        )
+    }
+
+    /// Main moved past services it does not touch: `api` was re-stored at B,
+    /// `web` and `worker` stay at A, and nothing they read changed between A
+    /// and B. A PR from B that edits `worker` compares with main's copy.
+    /// The whole-tree comparison called it stale.
+    #[test]
+    fn a_copy_stored_before_a_change_it_does_not_read_is_current() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(
+            repo.path(),
+            "apps/api/src/server.ts",
+            "export const server = 2;\n",
+        );
+        let main_self = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        std::fs::write(
+            repo.path().join("apps/worker/src/job.ts"),
+            "import { x } from \"@fixture/shared\";\nexport const job = x + 1;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Current
+        );
+        // What the whole trees say, for the same copy.
+        let whole = main_copy(
+            &main_self,
+            Some(&b),
+            |copy, base| {
+                crate::git_state::differs_under(
+                    &repo.path().to_string_lossy(),
+                    &copy.commit_hash,
+                    base,
+                )
+                .ok()
+            },
+            || false,
+        );
+        assert_eq!(whole, MainCopy::Stale);
+    }
+
+    /// A change on main to a file `web` imports from `api`'s root leaves
+    /// `web`'s copy at A stale.
+    #[test]
+    fn a_copy_stored_before_a_change_it_reads_is_stale() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(
+            repo.path(),
+            "apps/api/src/types.ts",
+            "export interface Order { id: string; total: number }\n",
+        );
+        let main_self = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Stale
+        );
+    }
+
+    /// A PR that edits a file outside `worker`'s roots that `worker` reads:
+    /// its inputs on this tree may not be the base's, so the whole trees are
+    /// compared, as before.
+    #[test]
+    fn a_pr_editing_an_outside_input_falls_back_to_the_whole_tree() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(
+            repo.path(),
+            "apps/api/src/server.ts",
+            "export const server = 2;\n",
+        );
+        let main_self = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        std::fs::write(
+            repo.path().join("packages/shared/src/x.ts"),
+            "export const x = 2;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Stale
+        );
+    }
+
+    /// A base this clone does not hold, and a copy whose services all sit at
+    /// one commit, get the answer they always got.
+    #[test]
+    fn an_unknown_base_and_a_one_commit_copy_are_judged_as_before() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(repo.path(), "README.md", "changed\n");
+        let mixed = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &mixed, &"f".repeat(40)),
+            MainCopy::Current
+        );
+        let one_commit = [
+            copy_at("api", &a),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &one_commit, &b),
+            MainCopy::Stale,
+            "a README change is a whole-tree difference"
+        );
     }
 }
