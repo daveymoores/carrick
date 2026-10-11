@@ -5,6 +5,14 @@
     "cache_version": 22,
     "intent_cache_version": 2
   },
+  "carrickInputs": {
+    "rule": 1,
+    "source_extensions": ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+    "repo_input_names": ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "deno.lock", "package.json", "pnpm-workspace.yaml", "deno.json", "deno.jsonc", ".gitignore", "carrick.json", ".npmrc", ".yarnrc", ".yarnrc.yml", "bunfig.toml", ".gitmodules", ".gitattributes"],
+    "repo_input_extensions": ["graphql", "gql", "graphqls"],
+    "config_extensions": ["json", "jsonc"],
+    "derive_names": ["netlify.toml", "vercel.json", "serverless.yml", "wrangler.toml", "Dockerfile"]
+  },
   "description": "Maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.",
   "keywords": [
     "typescript",

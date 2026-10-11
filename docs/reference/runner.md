@@ -75,7 +75,7 @@ A service is analysed, and the run logs why, when:
 | `commit_missing` | git cannot compare the stored commit, for example because the clone lacks it. |
 | `unresolved_import` | An import in it or in its closure resolves to nothing, and is neither a declared dependency nor a runtime builtin. |
 | `extends_unfollowed` | A tsconfig `extends` it reads could not be followed. |
-| `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, any `.gitignore`, any `*.graphql`, `*.gql` or `*.graphqls`, or `carrick.json` changed. Every service is analysed. |
+| `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, any `.gitignore`, `.gitattributes` or `.gitmodules`, any `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `bunfig.toml`, any `*.graphql`, `*.gql` or `*.graphqls`, or `carrick.json` changed. Every service is analysed. |
 | `inputs_changed` | A changed path is under a root, in the closure, or under an input directory, or a path was added or deleted in a directory where one of its imports is looked up. |
 
 Otherwise it is carried. Each service gets one `scope:` log line, followed
