@@ -1022,7 +1022,7 @@ fn default_mode_installs_yarn_berry_with_skip_build() {
         &t,
         "berry",
         Some("yarn@4.9.2"),
-        "touch yarn.lock && yarn install --mode=skip-build",
+        "touch yarn.lock && YARN_ENABLE_IMMUTABLE_INSTALLS=0 yarn install --mode=skip-build",
     );
     let run = t.install_one("berry", "yarn", false);
     assert_eq!(run.status, 0, "{}", run.text());
