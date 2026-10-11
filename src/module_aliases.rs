@@ -503,15 +503,9 @@ impl ModuleAliases {
         // Nearest first: the config itself, then what it extends, depth-first
         // in the order TypeScript applies a list (a later entry overrides an
         // earlier one, so it is visited first here).
-        let mut pending: Vec<(PathBuf, usize)> = vec![(config.to_path_buf(), 0)];
-        let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
-        while let Some((file, depth)) = pending.pop() {
-            if depth > MAX_EXTENDS_DEPTH || !visited.insert(file.clone()) {
-                continue;
-            }
-            let Ok(json) = read_jsonc_config(&repo_root.join(&file)) else {
-                continue;
-            };
+        let (chain, unfollowed) = tsconfig_chain(repo_root, config, internal_package_dirs);
+        self.unfollowed_extends.extend(unfollowed);
+        for (file, json) in chain {
             let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
             let options = json.get("compilerOptions");
             if base_url.is_none()
@@ -542,24 +536,6 @@ impl ModuleAliases {
                     .collect();
                 paths = Some((entries, dir.clone()));
             }
-            let extends: Vec<&str> = match json.get("extends") {
-                Some(serde_json::Value::String(one)) => vec![one.as_str()],
-                Some(serde_json::Value::Array(many)) => {
-                    many.iter().filter_map(|v| v.as_str()).collect()
-                }
-                _ => Vec::new(),
-            };
-            // Pushed in declaration order so the LAST entry pops first: it
-            // overrides the earlier ones, and nearest-first reading keeps the
-            // first value seen.
-            for spec in extends {
-                match extends_target(repo_root, &dir, spec, internal_package_dirs) {
-                    Some(next) => pending.push((next, depth + 1)),
-                    None => {
-                        self.unfollowed_extends.insert(spec.to_string());
-                    }
-                }
-            }
         }
         if base_url.is_none() && paths.is_none() {
             return None;
@@ -571,6 +547,48 @@ impl ModuleAliases {
             paths,
         })
     }
+}
+
+/// Every config a tsconfig's `extends` chain reads, `config` first, each
+/// repo-relative, and the `extends` values it could not follow
+/// (carrick#2227). The same walk [`ModuleAliases`] applies to read `paths`.
+pub(crate) fn tsconfig_chain(
+    repo_root: &Path,
+    config: &Path,
+    internal_package_dirs: &BTreeMap<String, PathBuf>,
+) -> (Vec<(PathBuf, serde_json::Value)>, Vec<String>) {
+    let mut chain = Vec::new();
+    let mut unfollowed = Vec::new();
+    let mut pending: Vec<(PathBuf, usize)> = vec![(config.to_path_buf(), 0)];
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    while let Some((file, depth)) = pending.pop() {
+        if depth > MAX_EXTENDS_DEPTH || !visited.insert(file.clone()) {
+            continue;
+        }
+        let Ok(json) = read_jsonc_config(&repo_root.join(&file)) else {
+            continue;
+        };
+        let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        let extends: Vec<String> = match json.get("extends") {
+            Some(serde_json::Value::String(one)) => vec![one.clone()],
+            Some(serde_json::Value::Array(many)) => many
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Pushed in declaration order so the LAST entry pops first: it
+        // overrides the earlier ones, and nearest-first reading keeps the
+        // first value seen.
+        for spec in extends {
+            match extends_target(repo_root, &dir, &spec, internal_package_dirs) {
+                Some(next) => pending.push((next, depth + 1)),
+                None => unfollowed.push(spec),
+            }
+        }
+        chain.push((file, json));
+    }
+    (chain, unfollowed)
 }
 
 /// The config file an `extends` value names, repo-relative. A relative or

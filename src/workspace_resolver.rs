@@ -359,6 +359,49 @@ impl WorkspaceIndex {
             .unwrap_or_default()
     }
 
+    /// The repo-relative directory of the workspace package `specifier`
+    /// names as `from_file` writes it, when [`Self::resolve`] reaches a file
+    /// through that package rather than a relative path or an alias
+    /// (carrick#2227).
+    pub fn package_dir_of(&self, from_file: &Path, specifier: &str) -> Option<PathBuf> {
+        if specifier.starts_with("./") || specifier.starts_with("../") {
+            return None;
+        }
+        if let AliasOutcome::Resolved(_) = self.resolve_alias(from_file, specifier) {
+            return None;
+        }
+        let name = longest_match(specifier, self.internal_packages.keys())?;
+        Some(self.internal_packages[&name].dir.clone())
+    }
+
+    /// Whether a manifest declares the `@types` package that types the bare
+    /// `specifier` (`@types/node` for `node`, `@types/scope__pkg` for
+    /// `@scope/pkg`): the compiler reads such an import from it, with no
+    /// package of that name installed (carrick#2227).
+    pub fn declares_types_for(&self, specifier: &str) -> bool {
+        if specifier.starts_with('.') || specifier.starts_with('/') {
+            return false;
+        }
+        let mut segments = specifier.split('/');
+        let name = match segments.next() {
+            Some(scope) if scope.starts_with('@') => match segments.next() {
+                Some(package) => format!("@types/{}__{package}", &scope[1..]),
+                None => return false,
+            },
+            Some(package) => format!("@types/{package}"),
+            None => return false,
+        };
+        self.external_packages.contains(&name) || self.dev_packages.contains(&name)
+    }
+
+    /// Every workspace package's name and repo-relative directory.
+    pub(crate) fn internal_package_dirs(&self) -> BTreeMap<String, PathBuf> {
+        self.internal_packages
+            .iter()
+            .map(|(name, package)| (name.clone(), package.dir.clone()))
+            .collect()
+    }
+
     /// The source file `specifier` names as written in `importer`, as the
     /// path the call graph keys files by: canonical when that stays inside
     /// the repo, else the plain join.
@@ -883,6 +926,31 @@ mod tests {
             resolve_in_workspace_package_fixture("@fixture/core"),
             Resolution::Internal(PathBuf::from("packages/core/src/index.ts"))
         );
+    }
+
+    /// A bare import is typed by the `@types` package its name maps to, and
+    /// a workspace package's directory is the one it resolves through.
+    #[test]
+    fn a_types_package_accounts_for_the_bare_name_it_types() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("package.json"),
+            r#"{ "name": "root", "devDependencies": { "@types/aws-lambda": "*", "@types/scope__pkg": "*" } }"#,
+        )
+        .unwrap();
+        let index = WorkspaceIndex::build_with_aliases(repo.path(), None);
+        assert!(index.declares_types_for("aws-lambda"));
+        assert!(index.declares_types_for("@scope/pkg/sub"));
+        assert!(!index.declares_types_for("vite"));
+        assert!(!index.declares_types_for("./aws-lambda"));
+
+        let workspace = WorkspaceIndex::build(&workspace_package_root());
+        let importer = Path::new("packages/sdk/src/widgets.ts");
+        assert_eq!(
+            workspace.package_dir_of(importer, "@fixture/core/v2"),
+            Some(PathBuf::from("packages/core"))
+        );
+        assert_eq!(workspace.package_dir_of(importer, "./core"), None);
     }
 
     #[test]

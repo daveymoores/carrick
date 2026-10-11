@@ -35,6 +35,9 @@ struct CliArgs {
     /// `--upload` (`true`) or `--no-upload` (`false`); `None` decides from
     /// the GitHub context as before (carrick#2207).
     upload: Option<bool>,
+    /// `--changed-only`: analyse only the services whose inputs changed
+    /// since their stored index, and carry the rest (carrick#2227).
+    changed_only: bool,
 }
 
 /// The runner's flags (carrick#2207), left out of `carrick --help`: only a
@@ -43,6 +46,7 @@ struct CliArgs {
 const REPO_FLAG: &str = "--repo";
 const UPLOAD_FLAG: &str = "--upload";
 const NO_UPLOAD_FLAG: &str = "--no-upload";
+const CHANGED_ONLY_FLAG: &str = "--changed-only";
 
 impl CliArgs {
     fn parse() -> Self {
@@ -57,6 +61,7 @@ impl CliArgs {
         let mut allow_unprepared = false;
         let mut repo = None;
         let mut upload = None;
+        let mut changed_only = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -90,6 +95,7 @@ impl CliArgs {
                 }
                 UPLOAD_FLAG => upload = Some(true),
                 NO_UPLOAD_FLAG => upload = Some(false),
+                CHANGED_ONLY_FLAG => changed_only = true,
                 arg if !arg.starts_with('-') => {
                     repo_path = arg.to_string();
                 }
@@ -109,6 +115,7 @@ impl CliArgs {
             allow_unprepared,
             repo,
             upload,
+            changed_only,
         }
     }
 
@@ -290,14 +297,20 @@ async fn main() {
     }
 }
 
-/// Record `--repo` and `--upload` / `--no-upload` for the run, or the usage
-/// error either meets (carrick#2207).
+/// Record `--repo`, `--upload` / `--no-upload` and `--changed-only` for the
+/// run, or the usage error one meets (carrick#2207, carrick#2227).
 fn apply_runner_flags(args: &CliArgs) -> Result<(), String> {
     if let Some(value) = &args.repo {
         carrick::utils::declare_repository(declared_repo(value)?);
     }
     if let Some(upload) = args.upload {
         engine::set_upload_switch(upload);
+    }
+    if args.changed_only {
+        if args.no_cache {
+            return Err(carrick::change_scope::NO_CACHE_CONFLICT.to_string());
+        }
+        carrick::change_scope::request();
     }
     carrick::agent_service::init_prompt_runner_from_env()?;
     engine::upload_decision_from_env()
@@ -917,6 +930,26 @@ mod tests {
 
         let cli = CliArgs::parse_from(&args(&["/work/checkout"]));
         assert_eq!((cli.repo, cli.upload), (None, None));
+        assert!(!cli.changed_only);
+
+        let cli = CliArgs::parse_from(&args(&["/work/checkout", "--changed-only"]));
+        assert!(cli.changed_only);
+        assert_eq!(cli.repo_path, "/work/checkout");
+    }
+
+    /// `--changed-only` beside `--no-cache` is a usage error: one asks for
+    /// every service to be analysed again (carrick#2227).
+    #[test]
+    fn changed_only_refuses_no_cache() {
+        let cli = CliArgs::parse_from(&args(&["--changed-only", "--no-cache", "."]));
+        assert_eq!(
+            apply_runner_flags(&cli),
+            Err(
+                "--changed-only cannot be combined with --no-cache, which re-analyses every \
+                 service."
+                    .to_string()
+            )
+        );
     }
 
     /// `--repo` takes an `owner/name` and nothing else, and says so with the

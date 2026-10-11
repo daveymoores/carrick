@@ -33,7 +33,59 @@ carrick <path> --repo <owner/name> --upload
   `close-scan`, reason `no_upload`, so its slot is released straight away. A
   run that failed reports `scan-failed` instead.
 
-Neither flag is listed in `carrick --help`.
+- `--changed-only` analyses only the services whose inputs changed since
+  their stored index, and carries the rest (carrick#2227,
+  `src/change_scope.rs`). A carried service is not analysed and the type
+  checker is never asked about it: its stored generation stands in for it
+  in the cross-service join, as a held-back service's does. Together with
+  `--no-cache` it is a usage error.
+
+None of these flags is listed in `carrick --help`.
+
+## What `--changed-only` analyses
+
+A service's base is its own stored blob's commit; services of one
+repository can sit at different commits. The paths changed since that
+commit are listed from the repository's top level, against the working
+tree, untracked files included.
+
+What a service reads, computed on the tree being scanned:
+
+- its roots: `directory` and every `include`, minus the directories of
+  services nested inside it;
+- its import closure: every walked file's imports and, transitively, the
+  imports of every repository file they reach, resolved by the scanner's own
+  resolver (relative paths, tsconfig `paths`, workspace package names);
+- every workspace package that closure enters, as its whole directory;
+- its tsconfig (the one `carrick.json` names, else the nearest
+  `tsconfig.json` at or above its directory), every config its `extends`
+  chain reads, and each directory or file that config's `include` or
+  `files` names;
+- its manifest and its declared `graphqlSchemas`.
+
+A service is analysed, and the run logs why, when:
+
+| Reason | Condition |
+|---|---|
+| `no_stored` | No stored blob for this repository and service. |
+| `other_scanner` | The stored blob's scanner version or cache version is not this run's. |
+| `stored_dirty` | The stored blob was read from uncommitted changes. |
+| `stored_incomplete` | The stored blob records degraded types, files the model never answered, or candidates no model was asked about. |
+| `config_changed` | Its `carrick.json` entry differs from the stored one. |
+| `commit_missing` | git cannot compare the stored commit, for example because the clone lacks it. |
+| `unresolved_import` | An import in it or in its closure resolves to nothing, and is neither a declared dependency nor a runtime builtin. |
+| `extends_unfollowed` | A tsconfig `extends` it reads could not be followed. |
+| `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, any `.gitignore`, any `*.graphql`, `*.gql` or `*.graphqls`, or `carrick.json` changed. Every service is analysed. |
+| `inputs_changed` | A changed path is under a root, in the closure, or under an input directory, or a path was added or deleted in a directory where one of its imports is looked up. |
+
+Otherwise it is carried. Each service gets one `scope:` log line, followed
+by a summary and the closure walk's wall time.
+
+A carried service's type verdicts, SDK edges and boundary are computed
+again in the join. It is uploaded only when one of those differs from its
+stored blob, stamped with this run's commit, `dirty`, time and build. Every
+other carried service keeps its stored row. A run in upload mode that
+writes nothing ends with `close-scan`, reason `no_change`, and exits 0.
 
 ## Environment
 
@@ -72,7 +124,7 @@ stored blob was written at must be present in the clone.
 |---|---|
 | 0 | The scan finished. What it still owes (pending services, losses allowed by `CARRICK_ALLOW_PARTIAL_ANALYSIS`, budget refusals) is in its summary. |
 | 1 | The scan failed, and the stage was reported to the cloud (`scan-failed` or `preflight-failed`). Includes an unknown argument to the bare scan. |
-| 2 | Usage: an unknown command, a local command's parse error, a `--repo` value that is not `owner/name`, or `--upload` with `CARRICK_OUTPUT_JSON`. |
+| 2 | Usage: an unknown command, a local command's parse error, a `--repo` value that is not `owner/name`, `--upload` with `CARRICK_OUTPUT_JSON`, or `--changed-only` with `--no-cache`. |
 | 3 | Reserved for carrick#2208: the type checker ran out of memory (opt-in). |
 | 101 | Panic. It is first reported as `scan-failed` with reason `panic` (`src/panic_report.rs`). |
 | 129 / 130 / 143 | SIGHUP / SIGINT / SIGTERM (`src/shutdown.rs`). 143 is also an ECS `StopTask` or a Spot reclaim. |
