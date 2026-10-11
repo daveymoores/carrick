@@ -433,27 +433,18 @@ cmd_install_one() {
         warn "Carrick did not install $root with yarn: $refusal. The scan will refuse that service rather than run the repository's code or index \`any\` through its packages."
         return 0
       fi
-      if [ -n "$UNTRUSTED" ]; then
-        # Classic Yarn accepts `--mode=skip-build` without skipping the build,
-        # so the two lines are told apart by what the tree says they are,
-        # never by which command happens to exit 0.
-        if yarn_is_berry "$root"; then
-          run_install "$root" "$log" yarn install --mode=skip-build
-        else
-          # Frozen, or classic rewrites yarn.lock.
-          run_install "$root" "$log" yarn install --frozen-lockfile --ignore-scripts
-        fi
-        status=$?
-      else
-        # Berry understands `--mode=skip-build`; classic understands
-        # `--ignore-scripts`. Each rejects the other's flag, so try both.
+      # Classic Yarn accepts `--mode=skip-build` without skipping the build,
+      # so the two lines are told apart by what the tree says they are,
+      # never by which command happens to exit 0.
+      if yarn_is_berry "$root"; then
         run_install "$root" "$log" yarn install --mode=skip-build
-        status=$?
-        if [ $status -ne 0 ]; then
-          run_install "$root" "$log" yarn install --ignore-scripts
-          status=$?
-        fi
+      elif [ -n "$UNTRUSTED" ]; then
+        # Frozen, or classic rewrites yarn.lock.
+        run_install "$root" "$log" yarn install --frozen-lockfile --ignore-scripts
+      else
+        run_install "$root" "$log" yarn install --ignore-scripts
       fi
+      status=$?
       ;;
     bun)
       if ! command -v bun >/dev/null 2>&1; then
