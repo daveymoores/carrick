@@ -811,6 +811,17 @@ fn is_declaration_file(path: &str) -> bool {
 /// copy wherever its folder sorted first: an import of a workspace package
 /// resolved into the copy, for every service of the repository.
 fn tree_files(repo_root: &Path, names: &[&str]) -> Vec<PathBuf> {
+    // Untrusted, this walk follows links, so one that lands outside the
+    // checkout is not entered or listed (carrick#2260).
+    tree_files_within(
+        repo_root,
+        names,
+        crate::file_finder::untrusted_bound(repo_root).as_deref(),
+    )
+}
+
+/// [`tree_files`] held to `bound` when there is one.
+fn tree_files_within(repo_root: &Path, names: &[&str], bound: Option<&Path>) -> Vec<PathBuf> {
     walkdir::WalkDir::new(repo_root)
         .sort_by_file_name()
         .follow_links(true)
@@ -822,6 +833,7 @@ fn tree_files(repo_root: &Path, names: &[&str]) -> Vec<PathBuf> {
                         .to_str()
                         .is_some_and(|n| MANIFEST_SKIP_DIRS.contains(&n)))
                     && crate::file_finder::git_boundary(e).is_none()
+                    && !bound.is_some_and(|bound| crate::file_finder::links_outside(e, bound))
         })
         .flatten()
         .filter(|e| {
@@ -886,6 +898,50 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// carrick#2260: untrusted, the manifest walk (which follows links) does
+    /// not list a `package.json` reached through a link whose real path is
+    /// outside the checkout; a link that lands inside is still read.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_manifest_walk_skips_links_out_of_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("repo");
+        std::fs::create_dir_all(root.join("packages/own")).unwrap();
+        std::fs::create_dir_all(base.join("outside/pkg")).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: x").unwrap();
+        std::fs::write(root.join("packages/own/package.json"), "{}").unwrap();
+        std::fs::write(base.join("outside/pkg/package.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(base.join("outside/pkg"), root.join("packages/folder")).unwrap();
+        std::os::unix::fs::symlink(
+            base.join("outside/pkg/package.json"),
+            root.join("package.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.join("packages/own"), root.join("packages/inner")).unwrap();
+        let rel = |files: Vec<PathBuf>| -> Vec<String> {
+            files
+                .iter()
+                .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
+                .collect()
+        };
+        let open = rel(tree_files_within(&root, &["package.json"], None));
+        assert!(
+            open.contains(&"packages/folder/package.json".to_string()),
+            "{open:?}"
+        );
+        assert!(open.contains(&"package.json".to_string()), "{open:?}");
+        let bounded = rel(tree_files_within(&root, &["package.json"], Some(&root)));
+        assert_eq!(
+            bounded,
+            vec![
+                "packages/inner/package.json".to_string(),
+                "packages/own/package.json".to_string()
+            ],
+            "{bounded:?}"
+        );
+    }
 
     fn fixture_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-call-candidates")
