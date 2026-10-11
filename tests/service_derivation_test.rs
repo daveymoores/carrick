@@ -181,20 +181,199 @@ fn native_preview_refuses_a_broken_explicit_config_without_writing() {
 }
 
 #[test]
-fn malformed_workspace_and_unmatched_members_are_errors() {
+fn a_workspace_manifest_that_does_not_parse_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
-    for text in [
-        r#"{"workspaces":42}"#,
-        r#"{"workspaces":["missing/*"]}"#,
-        r#"{"workspaces":["../outside/*"]}"#,
-        r#"{"workspaces":["apps/{one,two}"]}"#,
-    ] {
+    for text in [r#"{"workspaces":42}"#, r#"{"workspaces":{"nohoist":[]}}"#] {
         write(dir.path(), "package.json", text);
         assert!(resolve(dir.path()).is_err(), "{text}");
     }
     write(dir.path(), "package.json", "{}");
     write(dir.path(), "pnpm-workspace.yaml", "packages: 42");
     assert!(resolve(dir.path()).is_err());
+}
+
+/// `(serviceName, directory)` for each derived service, in order.
+fn split(
+    derived: &carrick::service_derivation::ServiceDerivation,
+) -> Vec<(Option<&str>, Option<&str>)> {
+    derived
+        .services
+        .iter()
+        .map(|s| (s.service_name.as_deref(), s.directory.as_deref()))
+        .collect()
+}
+
+// carrick#2274: each shape below used to refuse and send the user to a
+// carrick.json nobody writes. Each now derives a split, records what it
+// decided in `notes`, and raises no warning: `carrick init` prints warnings,
+// never notes.
+
+#[test]
+fn an_unsupported_workspace_pattern_is_skipped_and_selects_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    write(
+        &root,
+        "package.json",
+        r#"{"private":true,"workspaces":["../shared","apps/*","apps/{one,two}","/abs/*","!../other"]}"#,
+    );
+    write(&root, "apps/api/package.json", r#"{"name":"api"}"#);
+    write(&root, "apps/web/package.json", r#"{"name":"web"}"#);
+    // The pattern names a real directory outside the repository; it is still
+    // never walked.
+    write(dir.path(), "shared/package.json", r#"{"name":"shared"}"#);
+    let derived = resolve(&root).unwrap();
+    assert_eq!(
+        split(&derived),
+        [
+            (Some("api"), Some("apps/api")),
+            (Some("web"), Some("apps/web"))
+        ]
+    );
+    assert!(derived.warnings.is_empty());
+    assert_eq!(
+        derived.notes[1..],
+        [
+            "skipped_pattern: ../shared",
+            "skipped_pattern: apps/{one,two}",
+            "skipped_pattern: /abs/*",
+            "skipped_pattern: !../other",
+        ]
+    );
+}
+
+#[test]
+fn a_workspace_pattern_that_matches_no_manifest_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"workspaces":["apps/*","tools/*"]}"#,
+    );
+    write(root, "apps/api/package.json", r#"{"name":"api"}"#);
+    write(root, "apps/web/package.json", r#"{"name":"web"}"#);
+    let derived = resolve(root).unwrap();
+    assert_eq!(
+        split(&derived),
+        [
+            (Some("api"), Some("apps/api")),
+            (Some("web"), Some("apps/web"))
+        ]
+    );
+    assert!(derived.warnings.is_empty());
+    assert_eq!(derived.notes[1..], ["skipped_pattern: tools/*"]);
+}
+
+#[test]
+fn patterns_that_select_no_member_leave_one_root_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"whole","workspaces":["empty/*"]}"#,
+    );
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+    let derived = resolve(root).unwrap();
+    // The same service a repository with no workspace derives: the root,
+    // named by its repository.
+    assert_eq!(split(&derived), [(None, None)]);
+    assert!(derived.warnings.is_empty());
+    assert_eq!(derived.notes, ["skipped_pattern: empty/*"]);
+
+    // Every member excluded: no pattern is unmatched, so the root service
+    // carries no note at all.
+    write(
+        root,
+        "package.json",
+        r#"{"workspaces":["apps/*","!apps/*"]}"#,
+    );
+    write(root, "apps/api/package.json", r#"{"name":"api"}"#);
+    let derived = resolve(root).unwrap();
+    assert_eq!(split(&derived), [(None, None)]);
+    assert!(derived.notes.is_empty(), "{:?}", derived.notes);
+}
+
+#[test]
+fn a_duplicated_name_stays_with_the_first_member_and_later_ones_take_their_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"private":true,"workspaces":["apps/*","services/*"]}"#,
+    );
+    write(root, "apps/api/package.json", r#"{"name":"api"}"#);
+    write(
+        root,
+        "apps/web/package.json",
+        r#"{"name":"web","dependencies":{"api":"*"}}"#,
+    );
+    write(root, "services/api/package.json", r#"{"name":"api"}"#);
+    write(root, "services/billing/package.json", r#"{"name":"api"}"#);
+    let derived = resolve(root).unwrap();
+    assert_eq!(
+        split(&derived),
+        [
+            (Some("api"), Some("apps/api")),
+            (Some("web"), Some("apps/web")),
+            (Some("services/api"), Some("services/api")),
+            (Some("services/billing"), Some("services/billing")),
+        ]
+    );
+    assert!(derived.warnings.is_empty());
+    assert_eq!(
+        derived.notes[1..],
+        [
+            "renamed_duplicate: api -> services/api",
+            "renamed_duplicate: api -> services/billing",
+        ]
+    );
+    // A dependency on the name is a dependency on the member that keeps it.
+    assert_eq!(derived.members[0].workspace_dependents, ["web"]);
+    assert!(derived.members[2].workspace_dependents.is_empty());
+    assert!(derived.members[3].workspace_dependents.is_empty());
+    // The proposal round-trips: written as carrick.json, it reads back as the
+    // same services.
+    write(
+        root,
+        "carrick.json",
+        &serde_json::to_string(&derived.config).unwrap(),
+    );
+    let explicit = resolve(root).unwrap();
+    assert_eq!(
+        serde_json::to_value(&derived.services).unwrap(),
+        serde_json::to_value(&explicit.services).unwrap()
+    );
+}
+
+#[test]
+fn the_derive_document_carries_the_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "package.json",
+        r#"{"workspaces":["apps/*","tools/*"]}"#,
+    );
+    write(dir.path(), "apps/api/package.json", r#"{"name":"api"}"#);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["derive", "--workspace"])
+        .arg(dir.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document["repos"][0]["notes"],
+        serde_json::json!(["skipped_pattern: tools/*"])
+    );
+    assert_eq!(document["repos"][0]["warnings"], serde_json::json!([]));
 }
 
 #[test]
