@@ -167,17 +167,21 @@ service_roots() {
 # stop: a monorepo root with a lockfile of its own is not an install of a
 # nested workspace that has one too, so the walk takes the first answer.
 # Prints `manager<TAB>install-root<TAB>lockfile`, or nothing.
+#
+# Every directory is checked to sit inside the scan root BEFORE its lockfile
+# is read, so a service root outside the checkout (carrick#2245) is never
+# looked at, let alone installed.
 nearest_lockfile() {
   local service_root="$1" scan_root="$2" dir found
   dir="$service_root"
   while :; do
+    case "$dir" in "$scan_root" | "$scan_root"/*) ;; *) return 1 ;; esac
     found=$(detect_manager "$dir")
     if [ -n "$found" ]; then
       printf '%s\t%s\t%s\n' "${found%%:*}" "$dir" "${found#*:}"
       return 0
     fi
     [ "$dir" = "$scan_root" ] && return 1
-    case "$dir" in "$scan_root"/*) ;; *) return 1 ;; esac
     dir=$(dirname "$dir")
   done
 }

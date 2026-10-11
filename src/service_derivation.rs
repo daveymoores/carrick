@@ -675,13 +675,55 @@ fn nearest_tsconfig(root: &Path, directory: &Path) -> Option<String> {
     None
 }
 
+/// Whether a path `carrick.json` names, relative to the repository root,
+/// leaves the repository (carrick#2245): absolute, stepping up through `..`
+/// (refused outright, as a workspace pattern is), or resolving through a
+/// symlink to somewhere outside it. `root` is canonical. A path that does not
+/// exist is judged by its text alone; the existence check reports it.
+fn leaves_repository(root: &Path, path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        || root
+            .join(path)
+            .canonicalize()
+            .is_ok_and(|resolved| !resolved.starts_with(root))
+}
+
+/// Every path a service declares must name something inside the repository,
+/// because the scan reads what it names and carries it into the index
+/// (carrick#2245).
 fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
+    // Canonical, so a symlink is judged by where it lands and a root reached
+    // through a symlink of its own (a macOS temp dir) still contains itself.
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| format!("Could not read {}: {e}", root.display()))?;
     for service in services {
         let label = service
             .service_name
             .as_deref()
             .or(service.directory.as_deref())
             .unwrap_or("<unnamed>");
+        if let Some(directory) = &service.directory
+            && leaves_repository(&canonical, directory)
+        {
+            return Err(format!(
+                "Service '{label}' in {} declares directory '{directory}', which is outside the repository '{}'. Name a directory inside the repository, relative to carrick.json.",
+                root.join("carrick.json").display(),
+                root.display()
+            ));
+        }
+        if let Some(include) = service
+            .include
+            .iter()
+            .find(|include| leaves_repository(&canonical, include))
+        {
+            return Err(format!(
+                "Service '{label}' declares include path '{include}', which is outside the repository '{}'. Name a path inside the repository, relative to carrick.json.",
+                root.display()
+            ));
+        }
         if let Some(directory) = &service.directory
             && !root.join(directory).is_dir()
         {
@@ -707,6 +749,17 @@ fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
                 return Err(format!(
                     "Service '{label}' declares tsconfig '{}', which does not exist",
                     path.display()
+                ));
+            }
+            // Relative to the service directory, so `../tsconfig.base.json`
+            // is an ordinary shared config: judged by where it lands.
+            if !path
+                .canonicalize()
+                .is_ok_and(|resolved| resolved.starts_with(&canonical))
+            {
+                return Err(format!(
+                    "Service '{label}' declares tsconfig '{tsconfig}', which is outside the repository '{}'. Name a tsconfig inside the repository, relative to the service directory.",
+                    root.display()
                 ));
             }
             if path

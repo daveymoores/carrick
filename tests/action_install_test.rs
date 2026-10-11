@@ -1297,3 +1297,51 @@ fn untrusted_mode_refuses_a_yarn_root_it_has_no_reader_for() {
     );
     assert!(!t.repo.join("svc/node_modules").exists(), "{text}");
 }
+
+/// carrick#2245. A service root outside the scan root is never prepared, and
+/// its lockfile is never read: the containment check runs before the lookup.
+///
+/// `carrick derive` now refuses such a config, so a stand-in CLI names the
+/// outside root here; this is the installer's own guard, for any answer that
+/// still names one.
+#[cfg(unix)]
+#[test]
+fn a_service_root_outside_the_scan_root_is_never_prepared() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let root = dir.path().join("repo");
+    package_with_lockfile(&root, ".", "inside");
+    package_with_lockfile(dir.path(), "outside", "outside");
+    let cli = dir.path().join("fake-carrick");
+    write(
+        dir.path(),
+        "fake-carrick",
+        &format!(
+            "#!/bin/sh\nprintf '%s' '{}'\n",
+            serde_json::json!({
+                "repos": [{
+                    "path": root,
+                    "services": [{"directory": "."}, {"directory": "../outside"}],
+                }],
+            })
+        ),
+    );
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let detected = run_with(
+        &["detect", root.to_str().expect("utf-8 path")],
+        Some(cli.to_str().expect("utf-8 path")),
+    );
+    assert_eq!(detected.status, 0, "detect exits 0: {}", detected.text());
+    assert!(
+        detected.out.contains("roots=1"),
+        "only the repository root is prepared: {}",
+        detected.text()
+    );
+    assert_eq!(prepared_roots(&detected), ["."], "{}", detected.text());
+    assert!(
+        !detected.text().contains("outside"),
+        "the outside root is never named, so its lockfile was never read: {}",
+        detected.text()
+    );
+}
