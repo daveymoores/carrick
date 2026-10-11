@@ -540,7 +540,8 @@ pub struct DeclaredSchemas {
 /// would ([`crate::file_finder::left_out_below`], carrick#1902), so
 /// `**/*.graphql` reads no schema in a folder git ignores or in another
 /// checkout, and `apps/api/dist/**/*.graphql` still reads an ignored `dist`.
-/// A matched file is parsed here as
+/// A match whose real path is outside the repository, reached through a link,
+/// is not read and is reported (carrick#2249). A matched file is parsed here as
 /// well, so a file that is not a schema, or defines no Query, Mutation or
 /// Subscription field, is reported rather than quietly adding nothing.
 pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> DeclaredSchemas {
@@ -551,6 +552,11 @@ pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> Declar
         require_literal_separator: true,
         require_literal_leading_dot: false,
     };
+    // Canonical, so a link is judged by where it lands and a root reached
+    // through a link of its own (a macOS temp dir) still holds itself.
+    let canonical_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
     for raw in patterns {
         let entry = raw.trim().trim_start_matches("./");
         let relative = Path::new(entry);
@@ -604,6 +610,22 @@ pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> Declar
                     .collect()
             })
             .unwrap_or_default();
+        // A match reached through a link, the file's own or a folder's on
+        // the way, is read only where it really sits inside the repository
+        // (carrick#2249): the entry's text cannot say where a link lands.
+        let (matches, outside): (Vec<PathBuf>, Vec<PathBuf>) = matches
+            .into_iter()
+            .partition(|path| !crate::file_finder::resolves_outside(&canonical_root, path));
+        for path in &outside {
+            declared.problems.push(format!(
+                "`graphqlSchemas` entry '{raw}' matches '{}', whose real path is outside the \
+                 repository, so it was not read",
+                path.strip_prefix(repo_root).unwrap_or(path).display()
+            ));
+        }
+        if !outside.is_empty() && matches.is_empty() {
+            continue;
+        }
         if matches.is_empty() {
             declared.problems.push(format!(
                 "`graphqlSchemas` entry '{raw}' matches no file in this repository, so the \
@@ -2889,6 +2911,55 @@ export const typeDefs = gql`
                     .to_string(),
                 "`graphqlSchemas` file 'dist/types.graphql' defines no Query, Mutation or \
                  Subscription field, so it adds no operations"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// carrick#2249. An entry's text stays inside the repository, but a link
+    /// on the way, a folder's or the file's own, lands outside it: the match
+    /// is not read and is reported. A link that lands inside is read.
+    #[cfg(unix)]
+    #[test]
+    fn declared_schemas_never_read_through_a_link_out_of_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("leak.graphql"), "type Query { leak: String }").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("api")).unwrap();
+        std::fs::write(repo.join("api/real.graphql"), "type Query { real: String }").unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("leak.graphql"),
+            repo.join("api/linked.graphql"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("vendored")).unwrap();
+        std::os::unix::fs::symlink(repo.join("api"), repo.join("alias")).unwrap();
+
+        let declared = resolve_declared_schemas(
+            &repo,
+            &[
+                "api/*.graphql".to_string(),
+                "vendored/*.graphql".to_string(),
+                "alias/real.graphql".to_string(),
+            ],
+        );
+        assert_eq!(
+            declared.files,
+            vec![
+                repo.join("alias/real.graphql"),
+                repo.join("api/real.graphql")
+            ]
+        );
+        assert_eq!(
+            declared.problems,
+            vec![
+                "`graphqlSchemas` entry 'api/*.graphql' matches 'api/linked.graphql', whose real \
+                 path is outside the repository, so it was not read"
+                    .to_string(),
+                "`graphqlSchemas` entry 'vendored/*.graphql' matches 'vendored/leak.graphql', \
+                 whose real path is outside the repository, so it was not read"
                     .to_string(),
             ]
         );
