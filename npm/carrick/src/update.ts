@@ -423,6 +423,9 @@ export function isScanInvocation(argv: string[]): boolean {
   if (first === undefined) return false;
   if (first.startsWith("-")) return false;
   if (SCAN_COMMANDS.has(first)) return true;
+  // The binary's internal `config pull` (src/config_pull.rs). Both words: a
+  // bare `config` is a directory to scan, as the binary reads it.
+  if (first === "config" && argv[1] === "pull") return false;
   return !COMMANDS.has(first);
 }
 

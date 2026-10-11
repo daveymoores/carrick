@@ -201,7 +201,7 @@ fn retry_backoff(retries_so_far: u32) -> Duration {
     Duration::from_secs(2u64 << retries_so_far)
 }
 
-fn is_transient_status(status: reqwest::StatusCode) -> bool {
+pub(crate) fn is_transient_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
@@ -946,7 +946,7 @@ struct GetCrossRepoRequest {
 ///
 /// Exists as a builder rather than a finished `Client` so tests can add
 /// `.no_proxy()` and still exercise the production configuration.
-fn http_client_builder() -> reqwest::ClientBuilder {
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)

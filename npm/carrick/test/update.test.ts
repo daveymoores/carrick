@@ -353,6 +353,8 @@ test("which invocations count as a scan", () => {
   assert.equal(isScanInvocation(["packages/api"]), true);
   assert.equal(isScanInvocation([]), false);
   assert.equal(isScanInvocation(["--help"]), false);
+  assert.equal(isScanInvocation(["config", "pull", "--out", "c.json"]), false);
+  assert.equal(isScanInvocation(["config"]), true);
   // Every name either half of the CLI answers, including the binary's own
   // LOCAL_COMMANDS (src/local_mode/cli.rs).
   for (const command of [
