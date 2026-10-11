@@ -251,6 +251,13 @@ pub fn head_parents(repo_path: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The commit checked out at `repo_path` (carrick#2229).
+pub fn head_commit(repo_path: &str) -> Result<String, String> {
+    Ok(run_git(repo_path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string())
+}
+
 /// Whether the trees of commits `a` and `b` differ under `repo_path`.
 ///
 /// `Err` when either is not a commit id this clone holds, or git could not

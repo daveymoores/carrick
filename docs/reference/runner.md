@@ -40,6 +40,32 @@ carrick <path> --repo <owner/name> --upload
   in the cross-service join, as a held-back service's does. Together with
   `--no-cache` it is a usage error.
 
+- `--pr <number> --pr-head <sha> --pr-base <sha>` scan a pull request's tree
+  outside GitHub Actions (carrick#2229, `src/pr_context.rs`):
+
+  ```
+  carrick <path> --repo <owner/name> --pr <n> --pr-head <sha> --pr-base <sha>
+  ```
+
+  Optionally with `--changed-only`. All three or none; the number is a
+  positive integer and each sha is 40 hex characters. The flags win over
+  `GITHUB_REF`, `GITHUB_RUN_ID` and the `GITHUB_EVENT_PATH` payload, which
+  otherwise supply the same four facts. The result the scan posts carries the
+  number and head from the flags and no run id.
+
+  A pull request scan never uploads: `--pr` with `--upload` is a usage error,
+  and a run that opened a scan ends it with `close-scan`, reason
+  `pull_request`, including when `--changed-only` analysed nothing.
+
+  The checkout must be the pull request's tree, checked before anything is
+  analysed:
+
+  | HEAD | Checkout | Base |
+  |---|---|---|
+  | A merge commit whose second parent is `--pr-head` | merge | the first parent |
+  | `--pr-head` itself | head (a PR with conflicts) | `--pr-base`, the merge base rather than the base branch's tip |
+  | Anything else | refused, exit 2 | |
+
 None of these flags is listed in `carrick --help`.
 
 ## What `--changed-only` analyses

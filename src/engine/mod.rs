@@ -159,6 +159,9 @@ struct UploadContext<'a> {
     event_name: Option<&'a str>,
     /// `GITHUB_REF`.
     git_ref: Option<&'a str>,
+    /// `--pr` was passed: a pull request scan never writes the index
+    /// (carrick#2229).
+    pr_flag: bool,
 }
 
 /// Whether this run uploads, or the usage error `--upload` meets.
@@ -175,6 +178,7 @@ pub fn upload_decision_from_env() -> Result<bool, &'static str> {
             local_dir: env::var(CACHE_DIR_ENV).is_ok(),
             event_name: event_name.as_deref(),
             git_ref: git_ref.as_deref(),
+            pr_flag: crate::pr_context::declared().is_some(),
         },
     )
 }
@@ -204,6 +208,15 @@ fn upload_decision(switch: Option<bool>, context: UploadContext<'_>) -> Result<b
     if context.output_json {
         return match switch {
             Some(true) => Err(UPLOAD_WITH_OUTPUT_JSON),
+            _ => Ok(false),
+        };
+    }
+
+    // A pull request scan outside Actions never writes the index, whatever the
+    // sink: its tree is the PR's, not main's (carrick#2229).
+    if context.pr_flag {
+        return match switch {
+            Some(true) => Err(crate::pr_context::UPLOAD_CONFLICT),
             _ => Ok(false),
         };
     }
@@ -289,9 +302,24 @@ fn suppressed_upload_warning(output_json: bool, local_dir: Option<&str>) -> Opti
     ))
 }
 
-/// The PR number for a `pull_request` run, or None on push/dispatch/local
-/// runs. GitHub sets GITHUB_REF to `refs/pull/<n>/merge` (or `/head`) on PRs;
-/// returning None on any other ref is exactly the "only post on PR runs" gate.
+/// The pull request this run scans, or None on push/dispatch/local runs: the
+/// flags when `main` recorded them (carrick#2229), else the Actions
+/// environment, read at each call as it always was. Returning None is exactly
+/// the "only post on PR runs" gate.
+fn pr_context() -> Option<crate::pr_context::PrContext> {
+    crate::pr_context::resolve(crate::pr_context::declared(), env_pr())
+}
+
+fn env_pr() -> crate::pr_context::EnvPr {
+    crate::pr_context::EnvPr {
+        number: pr_number_from_env(),
+        head: head_sha_from_event(),
+        base: base_sha_from_event(),
+        run_id: run_id_from_env(),
+    }
+}
+
+/// GitHub sets GITHUB_REF to `refs/pull/<n>/merge` (or `/head`) on PRs.
 fn pr_number_from_env() -> Option<u64> {
     let ref_name = env::var("GITHUB_REF").ok()?;
     let rest = ref_name.strip_prefix("refs/pull/")?;
@@ -310,35 +338,35 @@ fn run_id_from_env() -> Option<String> {
 /// needs the head SHA to attach a check run; a merge-ref SHA from GITHUB_SHA
 /// would pin the check to a commit that isn't on the PR branch.
 fn head_sha_from_event() -> Option<String> {
-    let path = env::var("GITHUB_EVENT_PATH").ok()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    let event: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    event
-        .get("pull_request")?
-        .get("head")?
-        .get("sha")?
-        .as_str()
-        .map(str::to_string)
+    event_pull_request_sha("head")
 }
 
 /// `pull_request.base.sha` from the GITHUB_EVENT_PATH event payload, or None
 /// on any failure.
 fn base_sha_from_event() -> Option<String> {
+    event_pull_request_sha("base")
+}
+
+fn event_pull_request_sha(side: &str) -> Option<String> {
     let path = env::var("GITHUB_EVENT_PATH").ok()?;
     let contents = std::fs::read_to_string(path).ok()?;
     let event: serde_json::Value = serde_json::from_str(&contents).ok()?;
     event
         .get("pull_request")?
-        .get("base")?
+        .get(side)?
         .get("sha")?
         .as_str()
         .map(str::to_string)
 }
 
-/// The commit this PR run's tree is based on (carrick-cloud#1408): the first
-/// parent of the merge commit a `pull_request` run checks out, which is what
-/// is on disk, else the event's `pull_request.base.sha`.
+/// The commit this PR run's tree is based on (carrick-cloud#1408): for a
+/// `--pr` run, what `main` read off the checkout (carrick#2229); else the
+/// first parent of the merge commit a `pull_request` run checks out, which is
+/// what is on disk, else the event's `pull_request.base.sha`.
 fn pr_base_commit(repo_path: &str) -> Option<String> {
+    if let Some(declared) = crate::pr_context::declared() {
+        return declared.base.clone();
+    }
     let parents = crate::git_state::head_parents(repo_path).unwrap_or_default();
     if let [base, head] = parents.as_slice()
         && head_sha_from_event().is_none_or(|event_head| event_head == *head)
@@ -628,14 +656,22 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     // The marker first, then the log: the marker is four short fields and the
     // log is up to five megabytes, and a run that is already failing may not
     // get to finish both.
-    report_run_end(&storage, repo_path, &result, upload_switch()).await;
+    report_run_end(
+        &storage,
+        repo_path,
+        &result,
+        upload_switch(),
+        crate::pr_context::declared().is_some(),
+    )
+    .await;
     upload_run_logs(&storage, repo_path).await;
     result
 }
 
 /// The marker a finished run owes the scan it opened, if any.
 ///
-/// A failure says so with `scan-failed`. A run told `--no-upload` sends no
+/// A failure says so with `scan-failed`. A `--pr` run closes with
+/// `pull_request`, and a run told `--no-upload` sends no
 /// write and so no `scan_final`, and without `close-scan` the slot
 /// `start-scan` opened stays held for the quiet window (carrick#2207). Every
 /// other success closed its scan with its last write. Each marker is a no-op
@@ -645,9 +681,18 @@ async fn report_run_end<T: CloudStorage + Sync>(
     repo_path: &str,
     result: &Result<(), Box<dyn std::error::Error>>,
     upload_switch: Option<bool>,
+    pr_flag: bool,
 ) {
     match result {
         Err(error) => report_scan_failure(storage, repo_path, error.as_ref()).await,
+        // A pull request scan outside Actions never writes, and says so
+        // whether or not `--changed-only` left anything to analyse
+        // (carrick#2229).
+        Ok(()) if pr_flag => {
+            storage
+                .report_scan_closed(crate::pr_context::CLOSE_REASON)
+                .await
+        }
         Ok(()) if upload_switch == Some(false) => {
             storage.report_scan_closed(NO_UPLOAD_REASON).await
         }
@@ -1388,7 +1433,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // a baseline, rather than being conflated with a first-ever scan where
     // "new" is meaningless. On non-PR runs the capture is skipped entirely,
     // since the block is suppressed there anyway.
-    let is_pr_run = pr_number_from_env().is_some();
+    let is_pr_run = pr_context().is_some();
     let (had_prior_index, delta_baseline) = if is_pr_run {
         let stored = all_repo_data
             .iter()
@@ -1792,11 +1837,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // comment + check run via the GitHub App, gated on the project's
     // pr_comments_enabled toggle. Best-effort: a relay failure is logged,
     // never fatal. Assembled before `results` moves into the formatter.
-    let pr_result = pr_number_from_env().map(|pr_number| crate::findings::PrResultPayload {
+    let pr_result = pr_context().map(|pr| crate::findings::PrResultPayload {
         repo: repo_name.clone(),
-        pr_number,
-        head_sha: head_sha_from_event(),
-        run_id: run_id_from_env(),
+        pr_number: pr.number,
+        head_sha: pr.head,
+        run_id: pr.run_id,
         topology: topology.clone(),
         stats: crate::findings::ScanStats {
             endpoints: results.endpoints.len(),
@@ -9926,6 +9971,68 @@ mod tests {
         }
     }
 
+    /// `--pr` never uploads: it decides after the `CARRICK_OUTPUT_JSON` guard
+    /// and before every context, `--no-upload` agrees, and `--upload` against
+    /// it is a usage error (carrick#2229).
+    #[test]
+    fn a_pr_flag_never_uploads() {
+        for (name, context, _) in upload_contexts() {
+            let context = UploadContext {
+                pr_flag: true,
+                ..context
+            };
+            for switch in [None, Some(false)] {
+                assert_eq!(upload_decision(switch, context), Ok(false), "{name}");
+            }
+            let expected = if context.output_json {
+                Err(UPLOAD_WITH_OUTPUT_JSON)
+            } else {
+                Err(crate::pr_context::UPLOAD_CONFLICT)
+            };
+            assert_eq!(upload_decision(Some(true), context), expected, "{name}");
+        }
+    }
+
+    /// A `--pr` run on a Bearer scan sends one `close-scan` naming
+    /// `pull_request` and no write, whatever the upload switch says
+    /// (carrick#2229).
+    #[tokio::test]
+    async fn a_pr_run_closes_the_scan_it_opened_with_pull_request() {
+        for switch in [None, Some(false)] {
+            let (base, server) = crate::agent_service::tests::stub_server(vec![(
+                200,
+                serde_json::json!({ "ok": true }).to_string(),
+            )]);
+            let url = format!("{base}/types/check-or-upload");
+            let storage = crate::cloud_storage::AwsStorage::for_test(
+                &url,
+                crate::credentials::CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+                false,
+            );
+            storage.adopt_scan_id("scan_01J");
+            report_run_end(&storage, "/repos/api", &Ok(()), switch, true).await;
+
+            // A run that sent no marker leaves the one answer to this probe;
+            // a run that did finds nobody listening.
+            let _ = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("a client")
+                .post(&url)
+                .json(&serde_json::json!({ "action": "carrick-2229-probe" }))
+                .send()
+                .await;
+            let seen = server.join().expect("the stub server thread");
+            assert_eq!(seen.len(), 1, "{switch:?}: {seen:#?}");
+            let body: serde_json::Value =
+                serde_json::from_str(seen[0].split("\r\n\r\n").nth(1).expect("a body"))
+                    .expect("the body is JSON");
+            assert_eq!(body["action"], "close-scan", "{switch:?}");
+            assert_eq!(body["reason"], "pull_request", "{switch:?}");
+        }
+    }
+
     /// `start-scan` and the preflight marker name the declared repository,
     /// not the origin remote; with nothing declared, the remote as before
     /// (carrick#2207).
@@ -9977,7 +10084,7 @@ mod tests {
         );
         storage.adopt_scan_id("scan_01J");
 
-        report_run_end(&storage, "/repos/api", &Ok(()), Some(false)).await;
+        report_run_end(&storage, "/repos/api", &Ok(()), Some(false), false).await;
 
         // The stub has one answer. A run that sent no marker leaves it to
         // this probe, which the stub then records in the marker's place; a
@@ -10024,7 +10131,7 @@ mod tests {
                 false,
             );
             storage.adopt_scan_id("scan_01J");
-            report_run_end(&storage, "/repos/api", &Ok(()), switch).await;
+            report_run_end(&storage, "/repos/api", &Ok(()), switch, false).await;
 
             reqwest::Client::builder()
                 .no_proxy()

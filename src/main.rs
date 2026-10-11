@@ -38,6 +38,10 @@ struct CliArgs {
     /// `--changed-only`: analyse only the services whose inputs changed
     /// since their stored index, and carry the rest (carrick#2227).
     changed_only: bool,
+    /// `--pr`, `--pr-head`, `--pr-base`: the pull request this checkout is,
+    /// outside GitHub Actions (carrick#2229). Held as written; validated by
+    /// `pr_context::declare_from_flags` in `main`.
+    pr: carrick::pr_context::PrFlags,
 }
 
 /// The runner's flags (carrick#2207), left out of `carrick --help`: only a
@@ -47,6 +51,11 @@ const REPO_FLAG: &str = "--repo";
 const UPLOAD_FLAG: &str = "--upload";
 const NO_UPLOAD_FLAG: &str = "--no-upload";
 const CHANGED_ONLY_FLAG: &str = "--changed-only";
+const PR_FLAG: &str = "--pr";
+const PR_HEAD_FLAG: &str = "--pr-head";
+const PR_BASE_FLAG: &str = "--pr-base";
+/// Flags that take the next argument as their value.
+const VALUE_FLAGS: [&str; 4] = [REPO_FLAG, PR_FLAG, PR_HEAD_FLAG, PR_BASE_FLAG];
 
 impl CliArgs {
     fn parse() -> Self {
@@ -62,6 +71,7 @@ impl CliArgs {
         let mut repo = None;
         let mut upload = None;
         let mut changed_only = false;
+        let mut pr = carrick::pr_context::PrFlags::default();
 
         let mut i = 0;
         while i < args.len() {
@@ -96,6 +106,16 @@ impl CliArgs {
                 UPLOAD_FLAG => upload = Some(true),
                 NO_UPLOAD_FLAG => upload = Some(false),
                 CHANGED_ONLY_FLAG => changed_only = true,
+                PR_FLAG | PR_HEAD_FLAG | PR_BASE_FLAG => {
+                    let flag = args[i].as_str();
+                    i += 1;
+                    let value = Some(args.get(i).cloned().unwrap_or_default());
+                    match flag {
+                        PR_FLAG => pr.number = value,
+                        PR_HEAD_FLAG => pr.head = value,
+                        _ => pr.base = value,
+                    }
+                }
                 arg if !arg.starts_with('-') => {
                     repo_path = arg.to_string();
                 }
@@ -116,6 +136,7 @@ impl CliArgs {
             repo,
             upload,
             changed_only,
+            pr,
         }
     }
 
@@ -306,6 +327,7 @@ fn apply_runner_flags(args: &CliArgs) -> Result<(), String> {
     if let Some(upload) = args.upload {
         engine::set_upload_switch(upload);
     }
+    carrick::pr_context::declare_from_flags(&args.pr, &args.repo_path)?;
     if args.changed_only {
         if args.no_cache {
             return Err(carrick::change_scope::NO_CACHE_CONFLICT.to_string());
@@ -530,7 +552,7 @@ fn unknown_command(argv: &[String]) -> Option<String> {
     let word = argv
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index == 0 || argv[index - 1] != REPO_FLAG)
+        .filter(|(index, _)| *index == 0 || !VALUE_FLAGS.contains(&argv[index - 1].as_str()))
         .map(|(_, arg)| arg)
         .find(|arg| !arg.starts_with('-'))
         .filter(|arg| !arg.is_empty())?;
@@ -979,6 +1001,32 @@ mod tests {
             line.contains("acme/api-fork") && line.contains("acme/api"),
             "{line}"
         );
+    }
+
+    /// The PR flags take the next argument as their value, and it is never
+    /// read as a mistyped command (carrick#2229).
+    #[test]
+    fn pr_flag_values_are_the_flags_own() {
+        let sha = "a".repeat(40);
+        let cli = CliArgs::parse_from(&args(&[
+            "/work/checkout",
+            "--pr",
+            "7",
+            "--pr-head",
+            &sha,
+            "--pr-base",
+            &sha,
+        ]));
+        assert_eq!(cli.pr.number.as_deref(), Some("7"));
+        assert_eq!(cli.pr.head.as_deref(), Some(sha.as_str()));
+        assert_eq!(cli.pr.base.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            CliArgs::parse_from(&args(&["/work/checkout"])).pr,
+            Default::default()
+        );
+        assert_eq!(unknown_command(&args(&["--pr", "7", "."])), None);
+        assert_eq!(unknown_command(&args(&["--pr-head", "abc", "."])), None);
+        assert_eq!(unknown_command(&args(&["--pr-base", "abc", "."])), None);
     }
 
     /// `--repo`'s value is never read as a mistyped command, wherever the

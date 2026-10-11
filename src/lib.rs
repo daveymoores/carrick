@@ -62,6 +62,7 @@ pub mod panic_report;
 pub mod parser;
 pub mod phase_timing;
 pub mod pr_baseline;
+pub mod pr_context;
 pub mod preflight;
 pub mod progress;
 pub mod receiver_origin;
