@@ -371,6 +371,110 @@ pub fn changed_paths(
     Ok(changed)
 }
 
+/// One file that differs between two trees, with the path it was renamed
+/// from when git pairs it with one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// git's status letter: `A`dded, `D`eleted, `M`odified, `R`enamed,
+    /// `T`ype changed.
+    pub status: char,
+    /// The path in the newer tree, or the deleted file's path, relative to
+    /// the repository's top level.
+    pub path: String,
+    /// The path in `from`, for a renamed file.
+    pub previous: Option<String>,
+}
+
+/// The best common ancestor of commits `a` and `b`: where the history of one
+/// left the other's. It is `a` itself when `b` descends from it. `Err` when
+/// either is not a commit this clone holds, or its history stops short of a
+/// common ancestor (a shallow clone).
+pub fn merge_base(repo_path: &str, a: &str, b: &str) -> Result<String, String> {
+    for commit in [a, b] {
+        // As in `changed_paths`: nothing but a hex object name reaches git.
+        if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{commit:?} is not a commit id"));
+        }
+    }
+    let base = run_git(repo_path, &["merge-base", a, b])?
+        .trim()
+        .to_string();
+    if base.is_empty() {
+        return Err(format!("{a} and {b} share no history in this clone"));
+    }
+    Ok(base)
+}
+
+/// Every file that differs between commits `from` and `to`, as
+/// [`changed_paths`] lists them but with a renamed file paired to its old
+/// path (carrick#2285), for a reader that compares a file's two copies. Kept
+/// apart because the scope rule reads an addition and a deletion where this
+/// names a rename. Two commits and never the working tree: what a build step
+/// wrote there is no part of either.
+///
+/// `Err` also for a partial clone: pairing renames reads file contents, and a
+/// copy the clone does not hold would be fetched from its remote.
+pub fn changed_files(repo_path: &str, from: &str, to: &str) -> Result<Vec<FileChange>, String> {
+    for commit in [from, to] {
+        // As in `changed_paths`: nothing but a hex object name reaches git.
+        if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{commit:?} is not a commit id"));
+        }
+        run_git(
+            repo_path,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )?;
+    }
+    if is_partial_clone(repo_path) {
+        return Err("a partial clone does not hold every file's earlier copy".to_string());
+    }
+    let args = ["diff", "--name-status", "-M", "-z", from, to, "--"];
+    let mut fields = nul_paths(run_git(repo_path, &args)?).into_iter();
+    let mut changed = Vec::new();
+    while let Some(status) = fields.next() {
+        let Some(letter) = status.chars().next() else {
+            continue;
+        };
+        // A rename or a copy states two paths, the old one first.
+        let previous = if matches!(letter, 'R' | 'C') {
+            fields.next()
+        } else {
+            None
+        };
+        let Some(path) = fields.next() else { break };
+        changed.push(FileChange {
+            status: letter,
+            path,
+            // A copy leaves its source in place, so the new file is an
+            // addition with nothing behind it.
+            previous: previous.filter(|_| letter == 'R'),
+        });
+    }
+    Ok(changed)
+}
+
+/// The text of `path` (relative to the repository's top level) as `commit`
+/// holds it. Bytes that are not UTF-8 are replaced, so one odd file reads as
+/// text that does not parse and not as git failing. `Err` means git could not
+/// read it.
+pub fn file_at(repo_path: &str, commit: &str, path: &str) -> Result<String, String> {
+    if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{commit:?} is not a commit id"));
+    }
+    let output = Command::new("git")
+        .args(["show", &format!("{commit}:{path}")])
+        .current_dir(repo_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// The repository's top level, as git names it, for the checkout at
 /// `repo_path`.
 pub fn toplevel(repo_path: &str) -> Result<std::path::PathBuf, String> {

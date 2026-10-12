@@ -186,8 +186,6 @@ pub fn parse_file(
     source_map: &Lrc<SourceMap>,
     handler: &Handler,
 ) -> Option<Module> {
-    let (syntax, is_typescript) = syntax_for_path(file_path);
-
     // Read file content
     let file_content = match fs::read_to_string(file_path) {
         Ok(content) => content,
@@ -196,13 +194,31 @@ pub fn parse_file(
             return None;
         }
     };
+    parse_source(
+        file_path,
+        FileName::Real(file_path.to_path_buf()),
+        file_content,
+        source_map,
+        handler,
+    )
+}
+
+/// [`parse_file`] over text already in hand: a copy of `file_path` that is
+/// not the one on disk, such as the one a commit holds (carrick#2285). The
+/// path decides the syntax, as it does for a file read from disk; `name` is
+/// what the source map files the text under, so two copies of one path stay
+/// apart.
+pub fn parse_source(
+    file_path: &Path,
+    name: FileName,
+    file_content: String,
+    source_map: &Lrc<SourceMap>,
+    handler: &Handler,
+) -> Option<Module> {
+    let (syntax, is_typescript) = syntax_for_path(file_path);
 
     // Create source file in the source map
-    let source_file = source_map.new_source_file(
-        // Create an Lrc wrapped FileName
-        Lrc::new(FileName::Real(file_path.to_path_buf())),
-        file_content,
-    );
+    let source_file = source_map.new_source_file(Lrc::new(name), file_content);
 
     // Create lexer and parser
     let lexer = Lexer::new(

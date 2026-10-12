@@ -63,6 +63,7 @@ pub mod parser;
 pub mod phase_timing;
 pub mod pr_baseline;
 pub mod pr_context;
+pub mod pr_functions;
 pub mod preflight;
 pub mod progress;
 pub mod receiver_origin;

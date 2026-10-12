@@ -1560,6 +1560,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             }
         });
 
+    // The functions this PR added, edited or removed (carrick#2285), named
+    // from the base commit's tree and joined to the rows this run holds,
+    // which carry this run's intents and call edges by now. Read here because
+    // the rows are about to move into the analyzer. It decides nothing, and a
+    // run that cannot name them says so in the block.
+    let pr_functions = is_pr_run.then(|| {
+        crate::pr_functions::block_for_run(
+            repo_path,
+            pr_base.as_deref(),
+            &services,
+            &current_services_data,
+        )
+    });
+
     // Which index this PR run compares with and how many packages it shares
     // (carrick#2284), read here for the reason the SDK join's input is read
     // below: the blobs are about to move into the analyzer. These report
@@ -1986,6 +2000,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 sdk_pairs: crate::pr_baseline::sdk_pair_counts(&results.sdk_edges, &evidence.ours),
                 dependencies: evidence.dependencies,
             }),
+        functions: pr_functions,
     });
 
     let formatted = crate::formatter::FormattedOutput::new(results, topology, pr_delta);

@@ -3034,6 +3034,7 @@ mod tests {
             has_types: true,
             baseline: None,
             checked: None,
+            functions: None,
         };
         let request = PostPrResultRequest {
             action: "post-pr-result",

@@ -1062,6 +1062,38 @@ pub struct ExcludedFiles {
     pub files: usize,
 }
 
+/// Whether a walk of `service` would read a source file at `path` (under
+/// `repo_path` as given), judged from the path alone, so it answers for a
+/// file that is no longer on disk (carrick#2285).
+///
+/// The walk's path rules and nothing else: under the service's directory or
+/// an `include` root, not inside a nested service, a source file that is not
+/// a test ([`is_scanned_source`]), under no ignored folder name, and not
+/// excluded. What the walk decides from the tree itself (a separate
+/// checkout, a path git ignores, a link) cannot be asked of a path that is
+/// gone, and is not.
+pub fn service_would_read(
+    repo_path: &str,
+    service: &crate::config::Config,
+    ignore_patterns: &[&str],
+    path: &Path,
+) -> bool {
+    let root = Path::new(repo_path);
+    let own = service_root(root, service);
+    let nested = service
+        .nested_directories
+        .iter()
+        .map(|nested| root.join(nested))
+        .any(|nested| nested != own && nested.starts_with(&own) && path.starts_with(&nested));
+    let under = |scan_root: &Path| {
+        path.starts_with(scan_root)
+            && is_scanned_source(path, scan_root)
+            && !is_ignored(path, scan_root, ignore_patterns)
+    };
+    let read = (under(&own) && !nested) || service.include.iter().any(|inc| under(&root.join(inc)));
+    read && !Exclusion::of_service(root, service).excludes(path, false)
+}
+
 /// [`find_service_files`], with the directories the walk stopped at. The
 /// scan's own walk of a service: it says which links an untrusted walk left
 /// out ([`log_links_outside`]), where the other readers of a service's files
