@@ -1019,6 +1019,97 @@ pub struct PrResultPayload {
     /// run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked: Option<Checked>,
+    /// The functions the PR added, edited or removed (carrick#2285). `None`
+    /// on a run that is not a PR run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions: Option<FunctionsBlock>,
+}
+
+/// The functions a pull request added, edited or removed, named by comparing
+/// each changed file with the copy its base commit holds (carrick#2285), or
+/// why the run could not name them.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum FunctionsBlock {
+    Named(NamedFunctions),
+    Unknown { unknown: FunctionsUnknown },
+}
+
+/// Why a PR run could not name the functions the PR changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionsUnknown {
+    /// The run does not know the commit the PR's tree is based on.
+    NoBaseCommit,
+    /// Git could not read the base commit or a file in it: a clone that does
+    /// not hold it.
+    BaseUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct NamedFunctions {
+    /// At most [`MAX_CHANGED_FUNCTIONS`]: added before edited, exported
+    /// first, then by file and line.
+    pub changed: Vec<ChangedFunction>,
+    /// At most [`MAX_REMOVED_FUNCTIONS`], by file and name.
+    pub removed: Vec<FunctionRef>,
+    pub counts: FunctionCounts,
+}
+
+/// Most entries `functions.changed` carries.
+pub const MAX_CHANGED_FUNCTIONS: usize = 100;
+/// Most entries `functions.removed` carries.
+pub const MAX_REMOVED_FUNCTIONS: usize = 200;
+/// Most entries one function's `calls` or `called_by` carries.
+pub const MAX_FUNCTION_EDGES: usize = 50;
+
+/// A function by where the index holds it: the path the uploaded blob
+/// carries for its file, and its name as the index spells it
+/// (`Class.member` for a method).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FunctionRef {
+    pub file: String,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionChange {
+    Added,
+    Edited,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ChangedFunction {
+    pub file: String,
+    pub name: String,
+    pub line: u32,
+    pub end_line: u32,
+    pub change: FunctionChange,
+    pub exported: bool,
+    /// This run's description of the function, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// The file's path at the base commit, when git reports it renamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_file: Option<String>,
+    /// The functions it calls, as far as the scan resolves them.
+    pub calls: Vec<FunctionRef>,
+    /// The functions in this repo's services that call it.
+    pub called_by: Vec<FunctionRef>,
+}
+
+/// How many functions the PR changed. `added`, `edited` and `removed` count
+/// every one, listed or not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct FunctionCounts {
+    pub added: usize,
+    pub edited: usize,
+    pub removed: usize,
+    /// Listed entries of `changed` that carry no `intent`.
+    pub without_intent: usize,
+    /// Entries left out of `changed` by its cap.
+    pub omitted: usize,
 }
 
 /// The index a PR run compared with: main's copy of this repo and every
@@ -1419,6 +1510,7 @@ mod tests {
             has_types: true,
             baseline: None,
             checked: None,
+            functions: None,
         };
 
         let v = serde_json::to_value(&payload).unwrap();
@@ -1684,6 +1776,7 @@ mod tests {
             has_types: true,
             baseline: None,
             checked: None,
+            functions: None,
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert!(v.get("run_id").is_none());
@@ -1721,6 +1814,7 @@ mod tests {
             has_types: true,
             baseline: None,
             checked: None,
+            functions: None,
         };
         const BARE: &str = r#"{"repo":"r","pr_number":1,"head_sha":null,"topology":{"repo_name":"r","local_service_count":1,"peer_repo_count":0},"stats":{"endpoints":0,"calls":0},"findings":[],"delta":null,"verified":[],"graphql":{"libraries":[],"operations_indexed":false},"has_types":true}"#;
         assert_eq!(serde_json::to_string(&payload).unwrap(), BARE);

@@ -541,6 +541,201 @@ async fn a_pr_result_names_the_index_it_compared_with_and_counts_what_it_checked
     );
 }
 
+/// A repository of its own, written file by file.
+fn written_repo(root: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let repo = unlinked(root).join(name);
+    for (file, source) in files {
+        let path = repo.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    git(&repo, &["init", "-q"]);
+    commit(&repo, "init");
+    repo
+}
+
+/// The `(file_path, name)` of every function row the store holds for `repo`:
+/// the key the cloud joins a PR's function to main's row by.
+fn stored_function_keys(store: &Store, repo: &str) -> Vec<(String, String)> {
+    let mut keys: Vec<(String, String)> = store
+        .repos
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|stored| stored.repo_name == repo)
+        .flat_map(|stored| stored.function_definitions.values())
+        .map(|row| {
+            (
+                row.file_path.to_string_lossy().into_owned(),
+                row.name.clone(),
+            )
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn function_named<'a>(block: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    block["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} in {block:#}"))
+}
+
+/// carrick#2285: a PR result names the functions the PR added, edited or
+/// removed, from the base commit's tree. `m` calls `f` and is not edited:
+/// its description depends on `f`'s, so its intent hash moves in this run,
+/// and it is not listed. A function is named by the file path and the name
+/// main's uploaded row carries, which is what the cloud joins the two by.
+#[tokio::test]
+async fn a_pr_result_names_the_functions_the_pr_changed() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let repo = written_repo(
+        tmp.path(),
+        "toolkit",
+        &[
+            ("package.json", r#"{ "name": "toolkit", "private": true }"#),
+            (
+                "src/a.ts",
+                "export function f(x: number): number {\n  return x + 1;\n}\n\n\
+                 export function g(): string {\n  return \"g\";\n}\n\n\
+                 function h(): void {}\n",
+            ),
+            (
+                "src/b.ts",
+                "export function p(): number {\n  return 1;\n}\n\n\
+                 export const q = (): number => 2;\n",
+            ),
+            (
+                "src/d.ts",
+                "import { f } from \"./a\";\n\nexport function m(): number {\n  return f(1);\n}\n",
+            ),
+            (
+                "src/shelf.ts",
+                "export class Shelf {\n  count(): number {\n    return 1;\n  }\n}\n",
+            ),
+        ],
+    );
+    let store = Store::default();
+    scan(&store, &repo).await;
+    let main_at = head(&repo);
+    let main_keys = stored_function_keys(&store, "toolkit");
+    assert!(
+        main_keys.contains(&("src/a.ts".to_string(), "f".to_string())),
+        "{main_keys:?}"
+    );
+
+    // The PR: `f` edited, a comment above `g`, `h` deleted, `k` new; `b.ts`
+    // renamed untouched; a method edited; `e.ts` new, calling `k`.
+    std::fs::write(
+        repo.join("src/a.ts"),
+        "export function f(x: number): number {\n  return x + 2;\n}\n\n\
+         // A note about g,\n// two lines long.\n\
+         export function g(): string {\n  return \"g\";\n}\n\n\
+         export function k(): number {\n  return 3;\n}\n",
+    )
+    .unwrap();
+    git(&repo, &["mv", "src/b.ts", "src/c.ts"]);
+    std::fs::write(
+        repo.join("src/shelf.ts"),
+        "export class Shelf {\n  count(): number {\n    return 2;\n  }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/e.ts"),
+        "import { k } from \"./a\";\n\nexport function n(): number {\n  return k();\n}\n",
+    )
+    .unwrap();
+    commit(&repo, "pr");
+    event_with_base(tmp.path(), &main_at);
+    let payload = pr_payload(&store, &repo).await;
+    let block = &payload["functions"];
+
+    let mut listed: Vec<(String, String, String)> = block["changed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no functions.changed in {payload:#}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["file"].as_str().unwrap().to_string(),
+                entry["name"].as_str().unwrap().to_string(),
+                entry["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    listed.sort();
+    let entry = |file: &str, name: &str, change: &str| {
+        (file.to_string(), name.to_string(), change.to_string())
+    };
+    assert_eq!(
+        listed,
+        vec![
+            entry("src/a.ts", "f", "edited"),
+            entry("src/a.ts", "k", "added"),
+            entry("src/e.ts", "n", "added"),
+            entry("src/shelf.ts", "Shelf.count", "edited"),
+        ],
+        "g only moved, m was not touched, c.ts is b.ts renamed: {block:#}"
+    );
+    assert_eq!(
+        block["removed"],
+        serde_json::json!([{ "file": "src/a.ts", "name": "h" }]),
+        "{block:#}"
+    );
+    assert_eq!(block["counts"]["added"], serde_json::json!(2), "{block:#}");
+    assert_eq!(block["counts"]["edited"], serde_json::json!(2), "{block:#}");
+    assert_eq!(
+        block["counts"]["removed"],
+        serde_json::json!(1),
+        "{block:#}"
+    );
+
+    // The call edges, by the same file and name.
+    let reference = |file: &str, name: &str| serde_json::json!([{ "file": file, "name": name }]);
+    assert_eq!(
+        function_named(block, "f")["called_by"],
+        reference("src/d.ts", "m"),
+        "{block:#}"
+    );
+    assert_eq!(
+        function_named(block, "n")["calls"],
+        reference("src/a.ts", "k"),
+        "{block:#}"
+    );
+    assert_eq!(
+        function_named(block, "k")["called_by"],
+        reference("src/e.ts", "n"),
+        "{block:#}"
+    );
+
+    // Every edited function is named as main's row names it, a method
+    // included: the cloud finds main's copy by this key and no other.
+    for edited in ["f", "Shelf.count"] {
+        let named = function_named(block, edited);
+        let key = (
+            named["file"].as_str().unwrap().to_string(),
+            named["name"].as_str().unwrap().to_string(),
+        );
+        assert!(
+            main_keys.contains(&key),
+            "{key:?} is not a key main's index holds: {main_keys:?}"
+        );
+    }
+
+    // With no base commit the run says so and names nothing.
+    // SAFETY: the tests in this binary run one at a time (SERIAL).
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    let payload = pr_payload(&store, &repo).await;
+    assert_eq!(
+        payload["functions"],
+        serde_json::json!({ "unknown": "no_base_commit" }),
+        "{payload:#}"
+    );
+}
+
 /// Main's side failing in any way costs the run nothing but the comparison:
 /// the findings it posts are byte for byte the ones a run with no prior index
 /// posts, apart from why neither could compare. (The payload's `delta`
