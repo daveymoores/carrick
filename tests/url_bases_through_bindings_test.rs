@@ -19,6 +19,8 @@
 //!
 //! See `tests/fixtures/url-bases-through-bindings/README.md` for the shapes.
 
+mod support;
+
 use std::process::Command;
 
 fn calls() -> Vec<serde_json::Value> {
@@ -26,7 +28,9 @@ fn calls() -> Vec<serde_json::Value> {
     let fixture = format!("{repo}/tests/fixtures/url-bases-through-bindings");
     let mock_dir = format!("{fixture}/__llm__/");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&fixture));
+    let output = cmd
         .arg(&fixture)
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_MOCK_FIXTURE_DIR", &mock_dir)

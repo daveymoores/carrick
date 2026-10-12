@@ -27,10 +27,9 @@ pub enum LocalCommand {
     /// This is the inferred scan: Carrick Cloud classifies what the
     /// deterministic passes could not, and the result is uploaded. There is no
     /// facts-only form of it — the only product is the inferred index, and a
-    /// pass that states less has no user (carrick#1008). It is refused
-    /// outright until every repo in the workspace has a `carrick.json`,
-    /// because the one paid scan runs against a config someone has read (see
-    /// [`inference_refusal`]). `refresh` still runs no model, but it is the
+    /// pass that states less has no user (carrick#1008). Each repo's services
+    /// are its project config entry, or derived (carrick#2272). `refresh`
+    /// still runs no model, but it is the
     /// session-start hook's command and no first-run copy names it
     /// (cloud#832).
     Index {
@@ -619,10 +618,6 @@ fn build(
 ) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
     let infer = pass.infers();
-    // Before anything is printed about a scan that is not going to happen.
-    if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
-        return Err(refusal);
-    }
     // And before the first repo's scan spends anything on a tree whose types
     // would be `any` (carrick#1254). Every repo is checked here rather than
     // one at a time in the scans, so a workspace is refused whole instead of
@@ -1344,8 +1339,8 @@ fn kept_here_line(repo: &str, reason: crate::progress::NotDispatched) -> String 
 /// `index --detach`: start the build in its own session and answer at once.
 ///
 /// Everything that can refuse this build refuses it HERE, in the process the
-/// user is watching: an unreadable workspace and a repo with no `carrick.json`
-/// are answers, and an answer nobody reads because it went to a log file is
+/// user is watching: an unreadable workspace and an unprepared tree are
+/// answers, and an answer nobody reads because it went to a log file is
 /// not one. What goes to the log is the scan.
 ///
 /// The child is put in a session of its own, so that killing the shell that
@@ -1357,9 +1352,6 @@ fn start_detached(
     allow_unprepared: bool,
 ) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
-    if let Some(refusal) = inference_refusal(&workspace.repos) {
-        return Err(refusal);
-    }
     crate::preflight::allow(allow_unprepared);
     unprepared_refusal(&workspace)?;
     let index_dir = workspace.index_dir();
@@ -1499,50 +1491,6 @@ fn detach_process(command: &mut std::process::Command) {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-}
-
-/// Why this workspace may not be indexed yet, if it may not.
-///
-/// `carrick index` is the paid scan and it is meant to run once, so it runs
-/// against a configuration a person has read rather than one a structural pass
-/// guessed (ruling in carrick-cloud#799). `carrick init` no longer writes
-/// `carrick.json`: it derives the proposal into `.carrick/proposal.json` and
-/// prints the prompt that has an agent turn it into a config. A repo that has
-/// not been through that step would be scanned with its service boundaries
-/// unstated, its env vars undeclared, and no second free attempt.
-///
-/// The refusal names the two things that stand between this machine and the
-/// scan — the config, and the credential — and nothing else. It used to point
-/// at a facts-only pass as a rehearsal; there is no such step in the flow
-/// (carrick#1008, cloud#832), so offering one here would invent a first run
-/// that the scaffold prompt does not describe.
-fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
-    let missing: Vec<&PathBuf> = repos
-        .iter()
-        .filter(|repo| std::fs::symlink_metadata(repo.join("carrick.json")).is_err())
-        .collect();
-    if missing.is_empty() {
-        return None;
-    }
-    let named = missing
-        .iter()
-        .take(5)
-        .map(|repo| repo.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rest = missing.len().saturating_sub(5);
-    Some(format!(
-        "no carrick.json in {named}{}, and `carrick index` is the scan that builds the \
-         index, so it runs after the config exists. `carrick init` wrote the derived services to \
-         .carrick/proposal.json and printed the prompt that has an agent turn it into \
-         carrick.json; read it back against the repo, run `carrick login` if this machine \
-         is not signed in, and run this command once.",
-        if rest > 0 {
-            format!(" and {rest} more")
-        } else {
-            String::new()
-        }
-    ))
 }
 
 /// Why this workspace is not worth scanning yet, if it is not: a service whose
@@ -2225,37 +2173,6 @@ mod tests {
         );
     }
 
-    /// The paid scan runs once, so it runs against a config someone has read.
-    /// A repo that has not been through the scaffold step is named, and the
-    /// refusal says what to do instead of it (carrick-cloud#799). Since
-    /// carrick#1008 this is `carrick index`'s own refusal, not a flag's.
-    #[test]
-    fn the_index_is_refused_until_every_repo_has_a_config() {
-        let workspace = tempfile::tempdir().unwrap();
-        let configured = workspace.path().join("api");
-        let bare = workspace.path().join("web");
-        std::fs::create_dir_all(&configured).unwrap();
-        std::fs::create_dir_all(&bare).unwrap();
-        std::fs::write(configured.join("carrick.json"), "{}").unwrap();
-
-        assert_eq!(inference_refusal(std::slice::from_ref(&configured)), None);
-        let refusal = inference_refusal(&[configured.clone(), bare.clone()]).unwrap();
-        assert!(
-            refusal.contains(&bare.display().to_string()),
-            "the repo without a config is named: {refusal}"
-        );
-        assert!(
-            !refusal.contains(&configured.display().to_string()),
-            "the configured repo is not: {refusal}"
-        );
-        assert!(refusal.contains(".carrick/proposal.json"), "{refusal}");
-        assert!(refusal.contains("carrick index"), "{refusal}");
-        // The two things that stand between this machine and the scan, and
-        // nothing else: there is no rehearsal pass in the flow (cloud#832).
-        assert!(refusal.contains("carrick login"), "{refusal}");
-        assert!(!refusal.contains("carrick refresh"), "{refusal}");
-    }
-
     /// `derive` states the install a scan would refuse over, so `carrick init`
     /// can hand it to the agent before the first scan is refused for it
     /// (carrick#1489). The rule is the preflight's; this pins that it reaches
@@ -2293,19 +2210,6 @@ mod tests {
             serde_json::json!([]),
             "{installed}"
         );
-    }
-
-    /// A long list of unconfigured repos is a folder someone pointed at, not a
-    /// screen of paths.
-    #[test]
-    fn the_refusal_caps_the_repos_it_names() {
-        let workspace = tempfile::tempdir().unwrap();
-        let repos: Vec<PathBuf> = (0..8)
-            .map(|n| workspace.path().join(format!("r{n}")))
-            .collect();
-        let refusal = inference_refusal(&repos).unwrap();
-        assert!(refusal.contains("and 3 more"), "{refusal}");
-        assert!(!refusal.contains("r7"), "{refusal}");
     }
 
     #[test]

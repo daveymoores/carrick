@@ -18,6 +18,8 @@
 //! is what the index says that service contains. Function definitions are
 //! deterministic, so no cassette is needed.
 
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -53,6 +55,7 @@ fn run(repo: &Path) -> (bool, String, tempfile::TempDir) {
     let cassettes = tempfile::tempdir().expect("temp cassette dir");
 
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&repo));
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
@@ -474,7 +477,7 @@ fn every_walk_of_the_tree_leaves_the_same_checkout_out() {
 
     // The source walk, which the pre-flight and the external-call inventory
     // read their files through.
-    let (files, _) = carrick::file_finder::find_files(
+    let files = carrick::file_finder::find_files(
         root.to_str().unwrap(),
         &carrick::packages::MANIFEST_SKIP_DIRS,
     );
@@ -769,7 +772,7 @@ fn every_walk_of_the_tree_leaves_the_same_ignored_copy_out() {
 
     // The source walk, which the pre-flight and the external-call inventory
     // read their files through.
-    let (files, _) = carrick::file_finder::find_files(
+    let files = carrick::file_finder::find_files(
         root.to_str().unwrap(),
         &carrick::packages::MANIFEST_SKIP_DIRS,
     );

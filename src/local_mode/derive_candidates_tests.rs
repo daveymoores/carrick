@@ -299,18 +299,20 @@ fn a_service_past_the_cap_lists_the_most_read_and_counts_the_rest() {
     assert_eq!(env[299]["name"], "VAR_298");
 }
 
-/// A repository with a `carrick.json` gets candidates for the services it
-/// declares, each from its own directory.
+/// A repository of two services gets candidates for each, each from its own
+/// directory.
 #[test]
-fn a_declared_service_gets_candidates_from_its_own_directory() {
+fn each_service_gets_candidates_from_its_own_directory() {
     let dir = tempfile::tempdir().unwrap();
     write_repo(
         dir.path(),
         &[
             (
-                "carrick.json",
-                r#"{"services":[{"serviceName":"orders","directory":"orders"},{"serviceName":"billing","directory":"billing"}]}"#,
+                "package.json",
+                r#"{"name":"root","private":true,"workspaces":["orders","billing"]}"#,
             ),
+            ("orders/package.json", r#"{"name":"orders"}"#),
+            ("billing/package.json", r#"{"name":"billing"}"#),
             (
                 "orders/index.ts",
                 "export const url = process.env.ORDERS_DB;\n",

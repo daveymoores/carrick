@@ -1,6 +1,8 @@
 //! Real scan -> incremental replay -> local read projection, with synthetic
 //! authenticated cache data and a refused loopback proxy. No remote network,
 //! model, upload or developer credential is used.
+mod support;
+
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -27,7 +29,22 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 
 fn spawn(root: &Path, args: &[&str], token: Option<&str>) -> std::process::Output {
+    spawn_configured(root, args, token, None)
+}
+
+/// [`spawn`] with `CARRICK_CONFIG` naming `config`, the project config a
+/// scan reads its services from (carrick#2272).
+fn spawn_configured(
+    root: &Path,
+    args: &[&str],
+    token: Option<&str>,
+    config: Option<&Path>,
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    match config {
+        Some(config) => command.env("CARRICK_CONFIG", config),
+        None => command.env_remove("CARRICK_CONFIG"),
+    };
     command
         .args(args)
         .current_dir(root)
@@ -56,7 +73,11 @@ fn body(args: &[&str], output: &std::process::Output) -> Value {
 }
 
 fn run(root: &Path, args: &[&str], token: Option<&str>) -> Value {
-    let output = spawn(root, args, token);
+    run_configured(root, args, token, None)
+}
+
+fn run_configured(root: &Path, args: &[&str], token: Option<&str>, config: Option<&Path>) -> Value {
+    let output = spawn_configured(root, args, token, config);
     assert!(
         output.status.success(),
         "{args:?}: {}",
@@ -555,11 +576,6 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
     for name in ["catalog-web", "inventory-svc"] {
         let repo = root.join(name);
         copy_tree(&fixtures.join(name), &repo);
-        std::fs::write(
-            repo.join("carrick.json"),
-            format!("{{\"name\":\"{name}\"}}"),
-        )
-        .unwrap();
         init_repo(&repo);
         git(
             &repo,
@@ -576,7 +592,12 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
         r#"{"repos":["catalog-web","inventory-svc"]}"#,
     )
     .unwrap();
-    run(root, &["refresh", "--workspace", "."], None);
+    // Each repo's one service is named for it in the project config.
+    let config = support::project_config(
+        &["catalog-web", "inventory-svc"]
+            .map(|name| (format!("example/{name}"), json!({ "name": name }))),
+    );
+    run_configured(root, &["refresh", "--workspace", "."], None, Some(&config));
     let before = check(root, "inventory-svc/src/inventory.ts");
     let data = blobs(root);
     std::fs::remove_dir_all(root.join("catalog-web")).unwrap();
@@ -677,8 +698,8 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
     );
 }
 
-/// A repo whose hosted index was written with a `carrick.json` its tree does
-/// not hold is re-read with that config, not a derived one (carrick#2221).
+/// A no-model re-read of a repo takes the configs its hosted index was
+/// written with, not a derived split (carrick#2221).
 ///
 /// The tree is an npm workspace whose manifests derive `@scope/a` and
 /// `@scope/b`; the hosted index names the services `a` and `b`, declares the
@@ -687,7 +708,7 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
 /// `read_failed`; read with the hosted configs, both are enriched, the call
 /// pairs with the route, and the excluded file states nothing.
 #[test]
-fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
+fn a_refresh_reads_with_the_hosted_config() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let repo = root.join("shop");
@@ -732,19 +753,18 @@ fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
     );
     std::fs::write(root.join("carrick-workspace.json"), r#"{"repos":["shop"]}"#).unwrap();
 
-    // The config the hosted index is written with, held by the cloud and never
-    // committed: one scan with it in the tree writes blobs whose `config_json`
-    // is that config, at this HEAD and this release's cache version.
-    let config = repo.join("carrick.json");
-    std::fs::write(
-        &config,
-        r#"{"services":[
+    // The config the hosted index is written with, held by the cloud: one
+    // scan that reads it as the project config writes blobs whose
+    // `config_json` is that config, at this HEAD and this release's cache
+    // version.
+    let config = support::project_config(&[(
+        "example/shop".to_string(),
+        json!({"services":[
             {"name":"a","directory":"packages/a","internalEnvVars":["API_URL"],"exclude":["generated/**"]},
             {"name":"b","directory":"packages/b","internalEnvVars":["API_URL"]}
-        ]}"#,
-    )
-    .unwrap();
-    run(root, &["refresh", "--workspace", "."], None);
+        ]}),
+    )]);
+    run_configured(root, &["refresh", "--workspace", "."], None, Some(&config));
     let call = |line: u32, path: &str| {
         json!({"candidate_id":format!("@line:{line}"),"line_number":line,
             "target":format!("${{process.env.API_URL}}{path}"),"method":"GET","pattern_matched":"fetch(",
@@ -774,7 +794,6 @@ fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
     let mut stored = snapshot(root, "shop", &hosted);
     stored["resolution"]["project_repos"][0]["repos"] = json!(["example/shop"]);
     save_snapshot(root, &stored);
-    std::fs::remove_file(&config).unwrap();
 
     run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let status = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));

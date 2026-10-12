@@ -1,5 +1,0 @@
-{
-  "name": "@fixture/notifier",
-  "version": "1.0.0",
-  "main": "src/notifier.ts"
-}

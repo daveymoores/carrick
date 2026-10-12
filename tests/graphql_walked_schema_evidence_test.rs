@@ -32,6 +32,8 @@
 //! | `ops-console` | none | none: `statements` is a call to an external API |
 //! | `storefront-gateway` | `payouts` (route evidence, the known limit) | `payouts` |
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
@@ -77,6 +79,7 @@ fn scan() -> Scan {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&fixture_dir()));
     cmd.arg(fixture_dir())
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")

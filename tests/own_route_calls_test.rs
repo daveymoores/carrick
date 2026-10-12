@@ -15,6 +15,8 @@
 //!
 //! See each fixture's `README.md` for the shape.
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +37,7 @@ fn expected(name: &str) -> serde_json::Value {
 /// The scanner over `root`, replaying the fixture's own model answers.
 fn carrick(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&root));
     cmd.arg(root)
         .env("CARRICK_MOCK_ALL", "1")
         .env(

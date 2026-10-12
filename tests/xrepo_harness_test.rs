@@ -31,6 +31,8 @@
 //! producer→consumer match edges (e.g. repo-b/repo-c → repo-a `/api/users`)
 //! will be asserted directly — see `assert_joined_projection`.
 
+mod support;
+
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -128,6 +130,8 @@ fn phase_a(bin: &Path, repo: &Path, cache_dir: &Path) {
     );
 
     let mut cmd = Command::new(bin);
+
+    support::with_tree_config(&mut cmd, repo);
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
@@ -176,6 +180,7 @@ fn phase_a(bin: &Path, repo: &Path, cache_dir: &Path) {
 fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path) -> (EvalProjection, String) {
     let cassettes = cassette_dir(repo);
     let mut cmd = Command::new(bin);
+    support::with_tree_config(&mut cmd, repo);
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
         // No CARRICK_LOCAL_STORAGE_ISOLATE: download returns all cached repos.

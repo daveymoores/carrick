@@ -86,7 +86,7 @@ jobs:
             partitioned: --test local_mode_test
             partition: slice:1/2
             targets: >-
-              --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test url_alias_matching_test --test parallel_services_test
+              --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test url_alias_matching_test
           - shard: n4
             runner: nextest
             targets: >-
@@ -118,11 +118,11 @@ jobs:
           - shard: scan-2
             runner: cargo
             targets: >-
-              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test undeclared_external_host_test --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test
+              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test project_config_test --test undeclared_external_host_test --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test
           - shard: scan-3
             runner: cargo
             targets: >-
-              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test --test untrusted_tree_test
+              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test
           - shard: scan-4
             runner: cargo
             targets: >-

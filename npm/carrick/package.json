@@ -8,7 +8,7 @@
   "carrickInputs": {
     "rule": 1,
     "source_extensions": ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
-    "repo_input_names": ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "deno.lock", "package.json", "pnpm-workspace.yaml", "deno.json", "deno.jsonc", ".gitignore", "carrick.json", ".npmrc", ".yarnrc", ".yarnrc.yml", "bunfig.toml", ".gitmodules", ".gitattributes"],
+    "repo_input_names": ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "deno.lock", "package.json", "pnpm-workspace.yaml", "deno.json", "deno.jsonc", ".gitignore", ".npmrc", ".yarnrc", ".yarnrc.yml", "bunfig.toml", ".gitmodules", ".gitattributes"],
     "repo_input_extensions": ["graphql", "gql", "graphqls"],
     "config_extensions": ["json", "jsonc"],
     "derive_names": ["netlify.toml", "vercel.json", "serverless.yml", "wrangler.toml", "Dockerfile"]

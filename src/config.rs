@@ -292,120 +292,137 @@ impl Config {
         let mut services = Vec::new();
         for path in file_paths.iter() {
             let content = std::fs::read_to_string(path)?;
-            let root: RootConfig = serde_json::from_str(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            let includes: BTreeMap<String, IncludeDeclarations> = root
-                .includes
-                .into_iter()
-                .map(|(key, decls)| (normalize_include_path(&key), decls))
-                .collect();
-
-            let mut file_services = if root.services.is_empty() {
-                vec![root.flat]
-            } else {
-                root.services
-            };
-
-            // A pattern the matcher cannot read would leave out nothing, and
-            // a reader would take the files it meant as excluded.
-            for service in &file_services {
-                if let Err(reason) = crate::file_finder::Exclusion::check(&service.exclude) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "{}: `exclude` of service '{}': {reason}",
-                            path.display(),
-                            service.service_name.as_deref().unwrap_or("(root)")
-                        ),
-                    ));
-                }
-            }
-
-            let mut inherited: HashSet<String> = HashSet::new();
-            for service in file_services.iter_mut() {
-                for raw in service.include.clone() {
-                    let key = normalize_include_path(&raw);
-                    if let Some(decls) = includes.get(&key) {
-                        service.inherit(decls);
-                        inherited.insert(key);
-                    }
-                }
-            }
-
-            // Distribute the declared operations to the services they name.
-            // Same rule as `includes` below: a block naming a service this
-            // file does not declare is dead config that reads as if it
-            // applies, so it is an error rather than a silent no-op. The
-            // route, when one is declared, is validated here too — a block
-            // whose route cannot be parsed would otherwise fail at graph
-            // build time, far from the file that is wrong.
-            for block in &root.operations {
-                if block.operations.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "{}: `operations` block for service '{}' declares no operations. \
-                             List the values the handler answers, or remove the block.",
-                            path.display(),
-                            block.service
-                        ),
-                    ));
-                }
-                if let Err(reason) = block.parsed_route() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "{}: `operations` block for service '{}': {reason}",
-                            path.display(),
-                            block.service
-                        ),
-                    ));
-                }
-                let mut matched = false;
-                for service in file_services.iter_mut() {
-                    if service.service_name.as_deref() == Some(block.service.as_str()) {
-                        service.declared_operations.push(block.clone());
-                        matched = true;
-                    }
-                }
-                if !matched {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "{}: `operations` declares a block for service '{}', which this \
-                             file does not declare. Name a service from `services`, or remove \
-                             the block.",
-                            path.display(),
-                            block.service
-                        ),
-                    ));
-                }
-            }
-
-            // A key no service includes is dead config that reads as if it
-            // applies. Same reasoning as the engine's check on a directory that
-            // does not exist: silently doing nothing is the failure this
-            // feature exists to remove.
-            if let Some(unused) = includes.keys().find(|key| !inherited.contains(*key)) {
-                // `InvalidInput`, not `InvalidData`: the file parsed fine, its
-                // declarations just don't line up. The engine keys off the kind
-                // to report this as itself rather than as a parse failure.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "{}: `includes` declares '{}', which no service lists in its \
-                         `include`. Add it to a service's `include`, or remove the entry.",
-                        path.display(),
-                        unused
-                    ),
-                ));
-            }
-
-            services.extend(file_services);
+            services.extend(Self::parse_services(&content, &path.display())?);
         }
         Config::resolve_nested(&mut services);
         Ok(services)
+    }
+
+    /// [`Config::load_services`] over one body already in memory: a
+    /// `carrick.json` body held somewhere other than a file, such as one
+    /// repository's entry in the project config (carrick#2272). `label` names
+    /// where it came from in an error, as the path does for a file.
+    pub fn load_services_from_str(
+        content: &str,
+        label: &str,
+    ) -> Result<Vec<Config>, std::io::Error> {
+        let mut services = Self::parse_services(content, &label)?;
+        Config::resolve_nested(&mut services);
+        Ok(services)
+    }
+
+    /// One body's services, before nesting is resolved across the whole list.
+    fn parse_services(
+        content: &str,
+        path: &dyn std::fmt::Display,
+    ) -> Result<Vec<Config>, std::io::Error> {
+        let root: RootConfig = serde_json::from_str(content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let includes: BTreeMap<String, IncludeDeclarations> = root
+            .includes
+            .into_iter()
+            .map(|(key, decls)| (normalize_include_path(&key), decls))
+            .collect();
+
+        let mut file_services = if root.services.is_empty() {
+            vec![root.flat]
+        } else {
+            root.services
+        };
+
+        // A pattern the matcher cannot read would leave out nothing, and
+        // a reader would take the files it meant as excluded.
+        for service in &file_services {
+            if let Err(reason) = crate::file_finder::Exclusion::check(&service.exclude) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{}: `exclude` of service '{}': {reason}",
+                        path,
+                        service.service_name.as_deref().unwrap_or("(root)")
+                    ),
+                ));
+            }
+        }
+
+        let mut inherited: HashSet<String> = HashSet::new();
+        for service in file_services.iter_mut() {
+            for raw in service.include.clone() {
+                let key = normalize_include_path(&raw);
+                if let Some(decls) = includes.get(&key) {
+                    service.inherit(decls);
+                    inherited.insert(key);
+                }
+            }
+        }
+
+        // Distribute the declared operations to the services they name.
+        // Same rule as `includes` below: a block naming a service this
+        // file does not declare is dead config that reads as if it
+        // applies, so it is an error rather than a silent no-op. The
+        // route, when one is declared, is validated here too — a block
+        // whose route cannot be parsed would otherwise fail at graph
+        // build time, far from the file that is wrong.
+        for block in &root.operations {
+            if block.operations.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{}: `operations` block for service '{}' declares no operations. \
+                         List the values the handler answers, or remove the block.",
+                        path, block.service
+                    ),
+                ));
+            }
+            if let Err(reason) = block.parsed_route() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{}: `operations` block for service '{}': {reason}",
+                        path, block.service
+                    ),
+                ));
+            }
+            let mut matched = false;
+            for service in file_services.iter_mut() {
+                if service.service_name.as_deref() == Some(block.service.as_str()) {
+                    service.declared_operations.push(block.clone());
+                    matched = true;
+                }
+            }
+            if !matched {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{}: `operations` declares a block for service '{}', which this \
+                         file does not declare. Name a service from `services`, or remove \
+                         the block.",
+                        path, block.service
+                    ),
+                ));
+            }
+        }
+
+        // A key no service includes is dead config that reads as if it
+        // applies. Same reasoning as the engine's check on a directory that
+        // does not exist: silently doing nothing is the failure this
+        // feature exists to remove.
+        if let Some(unused) = includes.keys().find(|key| !inherited.contains(*key)) {
+            // `InvalidInput`, not `InvalidData`: the file parsed fine, its
+            // declarations just don't line up. The engine keys off the kind
+            // to report this as itself rather than as a parse failure.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: `includes` declares '{}', which no service lists in its \
+                     `include`. Add it to a service's `include`, or remove the entry.",
+                    path, unused
+                ),
+            ));
+        }
+
+        Ok(file_services)
     }
 
     /// Record on each service the directories of the other services that sit

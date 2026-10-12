@@ -17,6 +17,8 @@
 //! pre-fix scanner by construction. The four negative sites are the answer key
 //! for what must still resolve to nothing.
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -43,6 +45,7 @@ fn scan_edges() -> HashMap<String, Vec<Edge>> {
 
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_carrick"));
     let mut cmd = Command::new(&bin);
+    support::with_tree_config(&mut cmd, std::path::Path::new(&fixture_dir()));
     cmd.arg(fixture_dir())
         // The blob is only written when the scan believes it should upload,
         // and `CARRICK_OUTPUT_JSON` suppresses that — so this harness reads

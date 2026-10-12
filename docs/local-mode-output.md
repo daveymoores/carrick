@@ -526,7 +526,7 @@ printed above the sentence, and carried in `running_scans` on the error body.
 | `services[].boundary_lines` | the same pre-rendered lines `check` and `touch` carry |
 | `services[].hosted`, `services[].hosted_state` | the same provenance and replay state as `check` |
 | `hosted_checked_at` | when repository metadata last answered for this workspace |
-| `repos_detected_by` | `carrick_json`, `workspace_manifest`, `siblings`, `single_repo`, or `workspace_overrides` |
+| `repos_detected_by` | `workspace_manifest`, `siblings`, `single_repo`, or `workspace_overrides` |
 | `repos_added`, `repos_excluded` | explicit workspace override paths; absent when empty |
 | `type_check` | what the last build's type check did: `pairs` matched, `judged` of them, `skipped` with the reason when it did not run, and `not_stored[]` of `{ consumer, producer, verdicts, indexed_before_producer, check_skipped }` for verdicts judged here that a consumer's upload does not carry, where `check_skipped` is why that consumer's own scan did not run its check. A laptop scan pairs with the siblings indexed before it, so a consumer scanned before its producer uploads without that verdict. The human `status` and the build's own output print it as lines. Absent on an index written before it existed |
 

@@ -5,6 +5,8 @@
 //! true at once: the refusal happens before the sidecar, the model and the
 //! upload, and it is on the way out of the process rather than in a log.
 
+mod support;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -38,6 +40,7 @@ fn write(root: &Path, relative: &str, contents: &str) {
 
 fn scan(root: &Path, allow: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    support::with_tree_config(&mut command, root);
     command
         .arg(root.to_str().expect("utf-8 path"))
         .env("CARRICK_MOCK_ALL", "1");

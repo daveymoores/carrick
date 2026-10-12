@@ -17,7 +17,8 @@ carrick <path> --repo <owner/name> --upload
     go to the model again;
   - which downloaded copies are this repository's own and which are siblings
     in the cross-repo join;
-  - the repository `start-scan` and the preflight-failed marker name.
+  - the repository `start-scan` and the preflight-failed marker name;
+  - which entry of the `CARRICK_CONFIG` document is this repository's.
 
   Without it the repository is the basename of `GITHUB_REPOSITORY`, else the
   checkout folder's name, and the full name sent to the cloud comes from the
@@ -83,7 +84,7 @@ What a service reads, computed on the tree being scanned:
   imports of every repository file they reach, resolved by the scanner's own
   resolver (relative paths, tsconfig `paths`, workspace package names);
 - every workspace package that closure enters, as its whole directory;
-- its tsconfig (the one `carrick.json` names, else the nearest
+- its tsconfig (the one its config names, else the nearest
   `tsconfig.json` at or above its directory), every config its `extends`
   chain reads, and each directory or file that config's `include` or
   `files` names;
@@ -97,11 +98,11 @@ A service is analysed, and the run logs why, when:
 | `other_scanner` | The stored blob's scanner version or cache version is not this run's. |
 | `stored_dirty` | The stored blob was read from uncommitted changes. |
 | `stored_incomplete` | The stored blob records degraded types, files the model never answered, or candidates no model was asked about. |
-| `config_changed` | Its `carrick.json` entry differs from the stored one. |
+| `config_changed` | Its configuration entry differs from the stored one. |
 | `commit_missing` | git cannot compare the stored commit, for example because the clone lacks it. |
 | `unresolved_import` | An import in it or in its closure resolves to nothing, and is neither a declared dependency nor a runtime builtin. |
 | `extends_unfollowed` | A tsconfig `extends` it reads could not be followed. |
-| `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, any `.gitignore`, `.gitattributes` or `.gitmodules`, any `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `bunfig.toml`, any `*.graphql`, `*.gql` or `*.graphqls`, or `carrick.json` changed. Every service is analysed. |
+| `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, any `.gitignore`, `.gitattributes` or `.gitmodules`, any `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `bunfig.toml`, or any `*.graphql`, `*.gql` or `*.graphqls` changed. Every service is analysed. |
 | `inputs_changed` | A changed path is under a root, in the closure, or under an input directory, or a path was added or deleted in a directory where one of its imports is looked up. |
 
 Otherwise it is carried. Each service gets one `scope:` log line, followed
@@ -118,11 +119,11 @@ writes nothing ends with `close-scan`, reason `no_change`, and exits 0.
 | Variable | What it does |
 |---|---|
 | `CARRICK_TOKEN` | The credential. Overrides the file `carrick login` writes. |
+| `CARRICK_CONFIG` | The path of a `carrick.project-config/1` document (the cloud's `project-config` answer). The services are this repository's entry in it, matched to `--repo` (else the origin remote) without regard to case; with no entry, or a null `config`, they are derived from the manifests. A `carrick.json` in the tree is never read. An unreadable document, another schema, or two entries for the repository fails the scan (`src/project_config.rs`). |
 | `CARRICK_RUN_ID` | The run this scan belongs to, so the scan's log and the runner's join on one key. |
 | `CARRICK_RUN_REPO_COUNT` | How many repositories the run covers, so the cloud waits for all of them before it mails. |
 | `CARRICK_SIDECAR_MAX_OLD_SPACE_MB` | The type checker's V8 heap cap, in MB. `0` passes no cap. |
 | `CARRICK_FAIL_ON_TYPE_MEMORY` | Stop the scan at the first type-checker memory death and exit 3, instead of landing that service without types and exiting 0. |
-| `CARRICK_SERVICE_CONCURRENCY` | How many services are analysed at once. `1` is one at a time. Unset, the scan sizes it from free memory and cores, at most 8. A higher number is honoured even when memory would not allow it. |
 | `CARRICK_ALLOW_UNPREPARED` | Scan a checkout whose dependencies are not installed instead of refusing it. |
 | `CARRICK_PROMPT_ENDPOINT` | Where the four prompt routes (`/analyze-file`, `/generate-intent`, `/framework-detect`, `/framework-guidance`) are sent, instead of the build-time endpoint. `http://127.0.0.1:<port>` or `http://[::1]:<port>` only; anything else is a usage error (exit 2). `/library-claims` and `/types/check-or-upload` keep the build-time endpoint. Headers and bodies are unchanged. |
 | `CARRICK_PROMPT_TIMEOUT_SECS` | The per-request timeout of the four prompt routes, in whole seconds, 1 to 900; anything else is a usage error (exit 2). Unset: 60. Other routes keep 60. |
@@ -153,7 +154,7 @@ stored blob was written at must be present in the clone.
 | 0 | The scan finished. What it still owes (pending services, losses allowed by `CARRICK_ALLOW_PARTIAL_ANALYSIS`, budget refusals) is in its summary. |
 | 1 | The scan failed, and the stage was reported to the cloud (`scan-failed` or `preflight-failed`). Includes an unknown argument to the bare scan. |
 | 2 | Usage: an unknown command, a local command's parse error, a `--repo` value that is not `owner/name`, `--upload` with `CARRICK_OUTPUT_JSON`, or `--changed-only` with `--no-cache`. |
-| 3 | The type checker died of memory and `CARRICK_FAIL_ON_TYPE_MEMORY` was set: it reached its V8 heap limit, or the kernel killed it and the cgroup counted an OOM kill. A death in a service's analysis lands every service whose own type checker lived, and not that one; services not yet started when it died are not started; a death in the cross-service check lands every service without verdicts. The scan was reported as `scan-failed`, with a reason starting `types_out_of_memory:` that names the stage and the heap cap. Run it again on a larger machine (`src/scan_health.rs`, `TypesOutOfMemory`). |
+| 3 | The type checker died of memory and `CARRICK_FAIL_ON_TYPE_MEMORY` was set: it reached its V8 heap limit, or the kernel killed it and the cgroup counted an OOM kill. A death in a service's analysis lands the services before it and not that one; a death in the cross-service check lands every service without verdicts. The scan was reported as `scan-failed`, with a reason starting `types_out_of_memory:` that names the stage and the heap cap. Run it again on a larger machine (`src/scan_health.rs`, `TypesOutOfMemory`). |
 | 101 | Panic. It is first reported as `scan-failed` with reason `panic` (`src/panic_report.rs`). |
 | 129 / 130 / 143 | SIGHUP / SIGINT / SIGTERM (`src/shutdown.rs`). 143 is also an ECS `StopTask` or a Spot reclaim. |
 | other | Killed from outside. 137 is SIGKILL, which on ECS is usually the task's memory limit: read the stop reason. |

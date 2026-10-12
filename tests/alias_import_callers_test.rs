@@ -22,6 +22,8 @@
 //! compiler's: `ts.resolveModuleName` with the fixture's tsconfig resolves
 //! `@/…` and `#pickup/…` and resolves `~/…` to nothing.
 
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
@@ -57,6 +59,7 @@ fn scan(variant: &str) -> Scan {
     let cassettes = tempfile::tempdir().expect("temp cassette dir");
 
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&fixture_dir(variant)));
     cmd.arg(fixture_dir(variant))
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")

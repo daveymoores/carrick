@@ -207,7 +207,6 @@ dependencies = [
  "indicatif",
  "libc",
  "matchit",
- "percent-encoding",
  "regex",
  "reqwest",
  "semver",

@@ -30,6 +30,8 @@
 //! sidecar whose `WriteGuard` refuses nothing (point `CARRICK_SIDECAR_DIR` at
 //! a copy built that way) and this test fails, naming the rewritten file.
 
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -174,6 +176,7 @@ fn scan(repo: &Path) -> String {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    support::with_tree_config(&mut cmd, std::path::Path::new(&repo));
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
