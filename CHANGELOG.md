@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.114](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.113...carrick-v0.3.114) (2026-10-12)
+
+
+### Features
+
+* **findings:** a PR result names the functions the PR added, edited or removed ([#2289](https://github.com/carrick-tools/carrick/issues/2289)) ([d688ac9](https://github.com/carrick-tools/carrick/commit/d688ac9a1d88dd1f2345eed7c6655f7023123665))
+* **findings:** a PR result names the index it compared with and counts what it checked ([#2288](https://github.com/carrick-tools/carrick/issues/2288)) ([6134eaa](https://github.com/carrick-tools/carrick/commit/6134eaa8653f6a150376761c892696dad1a042ac))
+* **findings:** a PR run marks each dependency conflict against main ([#2286](https://github.com/carrick-tools/carrick/issues/2286)) ([366b979](https://github.com/carrick-tools/carrick/commit/366b979a487453f5f3fbff652562967fa933f645))
+
+
+### Bug Fixes
+
+* **deps:** update quinn-proto to 0.11.19 for five security advisories ([#2292](https://github.com/carrick-tools/carrick/issues/2292)) ([#2293](https://github.com/carrick-tools/carrick/issues/2293)) ([f17c046](https://github.com/carrick-tools/carrick/commit/f17c0463dab0546117f3214dfec6924b8867841b))
+* **findings:** a PR scan of `.` names the functions of a service at the repo root ([#2295](https://github.com/carrick-tools/carrick/issues/2295)) ([9f0b16a](https://github.com/carrick-tools/carrick/commit/9f0b16a8d000d1e6fc2631e88ce8c62fc640b78e))
+
 ## [0.3.113](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.112...carrick-v0.3.113) (2026-10-11)
 
 
