@@ -957,11 +957,13 @@ mod tests {
                 RepoPackageInfo {
                     repo_name: "web-frontend".to_string(),
                     version: "3.23.0".to_string(),
+                    spec: String::new(),
                     source_path: PathBuf::from("web-frontend/package.json"),
                 },
                 RepoPackageInfo {
                     repo_name: "payments-svc".to_string(),
                     version: "3.22.0".to_string(),
+                    spec: String::new(),
                     source_path: PathBuf::from("payments-svc/package.json"),
                 },
             ],

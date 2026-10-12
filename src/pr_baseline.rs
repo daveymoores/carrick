@@ -39,10 +39,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Serialize;
 
-use crate::analyzer::ApiEndpointDetails;
+use crate::analyzer::{Analyzer, ApiEndpointDetails, RepoPackageInfo};
 use crate::cloud_storage::{CloudRepoData, DirectionVerdict, ManifestTypeKind};
-use crate::findings::{Finding, OnMainUnknown};
+use crate::findings::{Finding, OnMainUnknown, SpecChange};
 use crate::operation::TypeVerdict;
+use crate::packages::{PackageInfo, Packages};
 
 /// A comparison bucket: kind, pairing, and the consumer file of one site.
 type SiteGroup = (&'static str, String, String);
@@ -258,6 +259,160 @@ pub fn mark_all_on_main(pr: &mut [Finding]) {
             finding.set_on_main(Some(true));
         }
     }
+}
+
+/// What each service of this repo declares, keyed by service id
+/// (`service_name`, else the repo), the key a dependency conflict names its
+/// versions by.
+pub type ServicePackages = BTreeMap<String, Packages>;
+
+/// The declarations of each stored or scanned service of this repo. A service
+/// with no package data declares nothing.
+pub fn service_packages(services: &[CloudRepoData]) -> ServicePackages {
+    services
+        .iter()
+        .map(|service| {
+            (
+                service
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| service.repo_name.clone()),
+                service.packages.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// What a PR run compares its dependency conflicts with (carrick#2283).
+#[derive(Clone, Debug)]
+pub struct DependencyBaseline {
+    /// What this run's services declare.
+    pub pr: ServicePackages,
+    /// What main's copy of them declares.
+    pub main: ServicePackages,
+    pub copy: MainCopy,
+}
+
+/// Mark each dependency conflict of a PR run with whether main has it, and
+/// with the services of this repo whose specifier the PR changed
+/// (carrick#2283). `baseline` is `None` when this repo has no index on main.
+///
+/// Main's side needs no analysis. It is the finding's own versions with this
+/// repo's entries replaced by what main's copy declares, graded by the rule
+/// that graded the finding (`Analyzer::conflict_tier`). Main has the conflict
+/// when that grades at the finding's tier. That answer holds whatever the copy
+/// is; "main does not have it" is only said of a copy that is main as the PR's
+/// base has it, as for a mismatch. A PR that leaves the manifests alone
+/// replaces each entry with itself, so its conflicts are all main's.
+///
+/// Both claims a reader acts on fail closed:
+///
+/// - A service is named as changed only when both sides hold it and the copy
+///   is main as the PR's base has it. Against any other copy the difference
+///   may be main's own since the copy was written. A service only one side
+///   holds may be one the PR adds or removes, or one the copy is missing, and
+///   the declarations cannot tell which.
+/// - "Main does not have it" is not said of a conflict that names a service
+///   of this run main's copy has no entry for. That reads as no index of it
+///   on main ([`OnMainUnknown::NoMainIndex`]).
+pub fn mark_dependency_conflicts(pr: &mut [Finding], baseline: Option<&DependencyBaseline>) {
+    for finding in pr.iter_mut() {
+        let Finding::DependencyConflict {
+            package_name,
+            tier,
+            versions,
+            changed_by_pr,
+            ..
+        } = finding
+        else {
+            continue;
+        };
+        let Some(baseline) = baseline else {
+            finding.set_on_main_unknown(OnMainUnknown::NoMainIndex);
+            continue;
+        };
+        let declared = |side: &'_ ServicePackages, service: &str| {
+            side.get(service)
+                .and_then(|packages| packages.get_dependencies().get(package_name.as_str()))
+                .cloned()
+        };
+        let ours: std::collections::BTreeSet<&String> =
+            baseline.pr.keys().chain(baseline.main.keys()).collect();
+        let mut mains: Vec<RepoPackageInfo> = versions
+            .iter()
+            .filter(|entry| !ours.contains(&entry.repo))
+            .map(|entry| RepoPackageInfo {
+                repo_name: entry.repo.clone(),
+                version: entry.version.clone(),
+                spec: entry.spec.clone(),
+                source_path: entry.source.clone().into(),
+            })
+            .collect();
+        // A service of this run the conflict names, which main's copy has no
+        // entry for: new in the PR, or missing from the copy.
+        let unplaced = versions.iter().any(|entry| {
+            baseline.pr.contains_key(&entry.repo) && !baseline.main.contains_key(&entry.repo)
+        });
+        let mut changes = Vec::new();
+        for service in &ours {
+            let from = declared(&baseline.main, service);
+            let to = declared(&baseline.pr, service);
+            let on_both_sides =
+                baseline.pr.contains_key(*service) && baseline.main.contains_key(*service);
+            if on_both_sides
+                && baseline.copy == MainCopy::Current
+                && let Some(change) = spec_change(service, from.as_ref(), to.as_ref())
+            {
+                changes.push(change);
+            }
+            if let Some(info) = from {
+                mains.push(RepoPackageInfo {
+                    repo_name: service.to_string(),
+                    version: info.version,
+                    spec: info.spec,
+                    source_path: info.source_path,
+                });
+            }
+        }
+        let on_main = Analyzer::conflict_tier(&mains) == Some(tier.as_str());
+        *changed_by_pr = changes;
+        match (on_main, baseline.copy) {
+            (true, _) => finding.set_on_main(Some(true)),
+            (false, MainCopy::Current) if unplaced => {
+                finding.set_on_main_unknown(OnMainUnknown::NoMainIndex)
+            }
+            (false, MainCopy::Current) => finding.set_on_main(Some(false)),
+            (false, MainCopy::Stale) => finding.set_on_main_unknown(OnMainUnknown::MainIndexStale),
+            (false, MainCopy::OtherScanner) => {
+                finding.set_on_main_unknown(OnMainUnknown::MainIndexOtherScanner)
+            }
+        }
+    }
+}
+
+/// The change in one service's written specifier for a package, or `None`
+/// when both sides state the same one. A copy stored before the specifier was
+/// kept has only the cleaned version, so against such a side the versions are
+/// compared and reported: `^4.0.0` against a stored `4.0.0` is no change.
+fn spec_change(
+    service: &str,
+    from: Option<&PackageInfo>,
+    to: Option<&PackageInfo>,
+) -> Option<SpecChange> {
+    let by_version = [from, to].iter().flatten().any(|info| info.spec.is_empty());
+    let written = |info: &PackageInfo| {
+        if by_version {
+            info.version.clone()
+        } else {
+            info.spec.clone()
+        }
+    };
+    let (from, to) = (from.map(written), to.map(written));
+    (from != to).then(|| SpecChange {
+        service: service.to_string(),
+        from,
+        to,
+    })
 }
 
 /// Whether any finding carries a pairing to compare. Without one, the
@@ -1520,5 +1675,391 @@ mod tests {
         mark_all_unknown(&mut pr, OnMainUnknown::NoMainIndex);
         assert_eq!(unknown(&pr[0]), Some(OnMainUnknown::NoMainIndex));
         assert_eq!(unknown(&pr[1]), None);
+    }
+}
+
+/// carrick#2283. One repo with two services, `api` and `web`, and one peer,
+/// `billing`.
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    use crate::findings::{PackageVersionRef, tier};
+    use serde_json::json;
+
+    /// A manifest's dependencies as the scan stores them: the specifier as
+    /// written, and the version with its range operator gone.
+    fn packages(declared: &[(&str, &str)]) -> Packages {
+        stored(
+            &declared
+                .iter()
+                .map(|(name, spec)| (*name, spec.trim_start_matches(['^', '~']), *spec))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Dependencies as `(name, version, spec)`, for a copy stored with no
+    /// written specifier.
+    fn stored(declared: &[(&str, &str, &str)]) -> Packages {
+        Packages {
+            merged_dependencies: declared
+                .iter()
+                .map(|(name, version, spec)| {
+                    (
+                        name.to_string(),
+                        PackageInfo {
+                            name: name.to_string(),
+                            version: version.to_string(),
+                            spec: spec.to_string(),
+                            source_path: "package.json".into(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Packages::default()
+        }
+    }
+
+    fn services(declared: &[(&str, Packages)]) -> ServicePackages {
+        declared
+            .iter()
+            .map(|(service, packages)| (service.to_string(), packages.clone()))
+            .collect()
+    }
+
+    /// The conflict the PR run found: every service's declaration of
+    /// `package`, this repo's as the PR has them.
+    fn conflict(
+        package: &str,
+        tier: &str,
+        pr: &ServicePackages,
+        peers: &[(&str, &str)],
+    ) -> Finding {
+        let ours = pr.iter().filter_map(|(service, packages)| {
+            let info = packages.get_dependencies().get(package)?;
+            Some((service.clone(), info.version.clone(), info.spec.clone()))
+        });
+        let theirs = peers.iter().map(|(service, spec)| {
+            (
+                service.to_string(),
+                spec.trim_start_matches(['^', '~']).to_string(),
+                spec.to_string(),
+            )
+        });
+        Finding::dependency_conflict(
+            package,
+            tier,
+            ours.chain(theirs)
+                .map(|(repo, version, spec)| PackageVersionRef {
+                    source: format!("{repo}/package.json"),
+                    repo,
+                    version,
+                    spec,
+                })
+                .collect(),
+        )
+    }
+
+    /// Mark one conflict and return it as the cloud reads it.
+    fn marked(
+        package: &str,
+        tier: &str,
+        peers: &[(&str, &str)],
+        pr: &ServicePackages,
+        main: Option<(&ServicePackages, MainCopy)>,
+    ) -> serde_json::Value {
+        let mut findings = vec![conflict(package, tier, pr, peers)];
+        let baseline = main.map(|(main, copy)| DependencyBaseline {
+            pr: pr.clone(),
+            main: main.clone(),
+            copy,
+        });
+        mark_dependency_conflicts(&mut findings, baseline.as_ref());
+        serde_json::to_value(&findings[0]).unwrap()
+    }
+
+    const BILLING_ZOD: &[(&str, &str)] = &[("billing", "^3.22.0")];
+    const BILLING_REACT: &[(&str, &str)] = &[("billing", "^18.2.0")];
+
+    /// `api` moves `zod` across a major while the peer stays.
+    fn zod_bump() -> (ServicePackages, ServicePackages) {
+        let web = packages(&[("react", "^18.2.0")]);
+        let main = services(&[
+            ("api", packages(&[("zod", "^3.22.0")])),
+            ("web", web.clone()),
+        ]);
+        let pr = services(&[("api", packages(&[("zod", "^4.0.0")])), ("web", web)]);
+        (main, pr)
+    }
+
+    #[test]
+    fn a_conflict_the_pr_made_is_not_on_main_and_names_the_service() {
+        let (main, pr) = zod_bump();
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(false), "{finding:#}");
+        assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([{ "service": "api", "from": "^3.22.0", "to": "^4.0.0" }]),
+            "{finding:#}"
+        );
+        assert_eq!(finding["versions"][0]["spec"], json!("^4.0.0"));
+    }
+
+    #[test]
+    fn a_conflict_the_pr_left_alone_is_on_main_and_names_no_service() {
+        let side = services(&[
+            ("api", packages(&[("zod", "^3.22.0")])),
+            ("web", packages(&[("react", "^17.0.2")])),
+        ]);
+        // Whatever the copy: a stale one still shows the conflict.
+        for copy in [MainCopy::Current, MainCopy::Stale, MainCopy::OtherScanner] {
+            let finding = marked(
+                "react",
+                tier::MAJOR,
+                BILLING_REACT,
+                &side,
+                Some((&side, copy)),
+            );
+            assert_eq!(finding["on_main"], json!(true), "{copy:?}: {finding:#}");
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+            assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+        }
+    }
+
+    #[test]
+    fn a_conflict_the_pr_moved_without_making_is_on_main_and_names_the_service() {
+        let main = services(&[("web", packages(&[("react", "^17.0.2")]))]);
+        let pr = services(&[("web", packages(&[("react", "^16.14.0")]))]);
+        let finding = marked(
+            "react",
+            tier::MAJOR,
+            BILLING_REACT,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([{ "service": "web", "from": "^17.0.2", "to": "^16.14.0" }]),
+            "{finding:#}"
+        );
+    }
+
+    #[test]
+    fn a_copy_that_is_not_main_never_calls_a_conflict_introduced() {
+        let (main, pr) = zod_bump();
+        for (copy, reason) in [
+            (MainCopy::Stale, "main_index_stale"),
+            (MainCopy::OtherScanner, "main_index_other_scanner"),
+        ] {
+            let finding = marked("zod", tier::MAJOR, BILLING_ZOD, &pr, Some((&main, copy)));
+            assert_eq!(finding["on_main_unknown"], json!(reason), "{finding:#}");
+            assert!(finding.get("on_main").is_none(), "{finding:#}");
+            // The difference may be main's own since the copy was written.
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+        }
+    }
+
+    /// The same holds when such a copy does show the conflict.
+    #[test]
+    fn a_copy_that_is_not_main_names_no_service_as_changed() {
+        let main = services(&[("web", packages(&[("react", "^17.0.2")]))]);
+        let pr = services(&[("web", packages(&[("react", "^16.14.0")]))]);
+        for copy in [MainCopy::Stale, MainCopy::OtherScanner] {
+            let finding = marked(
+                "react",
+                tier::MAJOR,
+                BILLING_REACT,
+                &pr,
+                Some((&main, copy)),
+            );
+            assert_eq!(finding["on_main"], json!(true), "{copy:?}: {finding:#}");
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+        }
+    }
+
+    /// A service main's copy has no entry for may be new in the PR or missing
+    /// from the copy. Its conflict is not called introduced, and it is not
+    /// named as changed.
+    #[test]
+    fn a_service_mains_copy_does_not_hold_is_never_called_introduced() {
+        let api = packages(&[("zod", "^3.22.0")]);
+        let main = services(&[("api", api.clone())]);
+        let pr = services(&[("api", api), ("worker", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(
+            finding["on_main_unknown"],
+            json!("no_main_index"),
+            "{finding:#}"
+        );
+        assert!(finding.get("on_main").is_none(), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+
+        // Main conflicts without it: that much is known.
+        let api = packages(&[("zod", "^4.0.0")]);
+        let main = services(&[("api", api.clone())]);
+        let pr = services(&[("api", api), ("worker", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+    }
+
+    #[test]
+    fn a_run_with_no_main_index_says_so() {
+        let (_, pr) = zod_bump();
+        let finding = marked("zod", tier::MAJOR, BILLING_ZOD, &pr, None);
+        assert_eq!(
+            finding["on_main_unknown"],
+            json!("no_main_index"),
+            "{finding:#}"
+        );
+        assert!(finding.get("on_main").is_none(), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+    }
+
+    /// A copy stored before the specifier was kept holds only the cleaned
+    /// version, and `^17.0.2` against its `17.0.2` is no change.
+    #[test]
+    fn a_copy_with_no_written_specifier_is_compared_by_version() {
+        let pr = services(&[("web", packages(&[("react", "^17.0.2")]))]);
+        let main = services(&[("web", stored(&[("react", "17.0.2", "")]))]);
+        let finding = marked(
+            "react",
+            tier::MAJOR,
+            BILLING_REACT,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+
+        let main = services(&[("web", stored(&[("react", "16.14.0", "")]))]);
+        let finding = marked(
+            "react",
+            tier::MAJOR,
+            BILLING_REACT,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([{ "service": "web", "from": "16.14.0", "to": "17.0.2" }]),
+            "{finding:#}"
+        );
+    }
+
+    /// A service both sides hold that starts or stops declaring the package
+    /// has no specifier on one side. A service only main's copy holds
+    /// (`jobs`) is not named.
+    #[test]
+    fn a_service_that_adds_or_drops_the_package_has_a_null_side() {
+        let main = services(&[
+            ("api", packages(&[("zod", "^4.0.0")])),
+            ("web", packages(&[])),
+            ("jobs", packages(&[("zod", "^4.0.0")])),
+        ]);
+        let pr = services(&[
+            ("api", packages(&[])),
+            ("web", packages(&[("zod", "^4.0.0")])),
+        ]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([
+                { "service": "api", "from": "^4.0.0", "to": null },
+                { "service": "web", "from": null, "to": "^4.0.0" },
+            ]),
+            "{finding:#}"
+        );
+    }
+
+    /// Main is graded by the finding's own rule: two services on one pin that
+    /// is not semver are no conflict, and a conflict at another tier is not
+    /// this one.
+    #[test]
+    fn main_is_graded_by_the_rule_that_graded_the_finding() {
+        let peer: &[(&str, &str)] = &[("billing", "workspace:*")];
+        let main = services(&[("api", packages(&[("ui-kit", "workspace:*")]))]);
+        let pr = services(&[("api", packages(&[("ui-kit", "github:acme/ui-kit")]))]);
+        let finding = marked(
+            "ui-kit",
+            tier::UNPARSEABLE,
+            peer,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(false), "{finding:#}");
+
+        let main = services(&[("api", packages(&[("zod", "next")]))]);
+        let pr = services(&[("api", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(false), "{finding:#}");
+    }
+
+    /// Each marking keeps to its own kind: a mismatch is not marked from the
+    /// declarations, and a dependency conflict is not marked from main's
+    /// analysis or its failure.
+    #[test]
+    fn a_mismatch_and_a_dependency_conflict_are_marked_apart() {
+        let (main, pr) = zod_bump();
+        let pair = "orders-api|PUT|/orders/:id~web|src/a.ts|method";
+        let mismatch = Finding::method_mismatch(
+            "PUT",
+            "/orders/:id",
+            None,
+            vec!["src/a.ts:3".to_string()],
+            "POST",
+        )
+        .with_pair(Some(pair.to_string()));
+        let mut findings = vec![
+            mismatch.clone(),
+            conflict("zod", tier::MAJOR, &pr, BILLING_ZOD),
+        ];
+        let baseline = DependencyBaseline {
+            pr,
+            main,
+            copy: MainCopy::Current,
+        };
+        mark_dependency_conflicts(&mut findings, Some(&baseline));
+        assert_eq!(findings[0], mismatch);
+        let conflict = findings[1].clone();
+
+        mark_all_unknown(&mut findings, OnMainUnknown::MainSideFailed);
+        assert_eq!(findings[1], conflict);
+        mark_all_on_main(&mut findings);
+        assert_eq!(findings[1], conflict);
+        mark_on_main(&mut findings, &MainSide::default(), MainCopy::Stale);
+        assert_eq!(findings[1], conflict);
     }
 }

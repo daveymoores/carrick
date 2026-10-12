@@ -177,6 +177,20 @@ pub struct PackageVersionRef {
     pub repo: String,
     pub version: String,
     pub source: String,
+    /// The specifier as written (`^4.0.0`), which `version` has lost the
+    /// operators of. Omitted when the stored copy carries none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spec: String,
+}
+
+/// One service of this repo whose written specifier for a conflicting package
+/// differs between main's copy and the PR (carrick#2283). A side is `null`
+/// where the service does not declare the package there.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SpecChange {
+    pub service: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 /// Dependency-conflict tier: `"major"` (semver-incompatible major spread,
@@ -353,6 +367,15 @@ pub enum Finding {
         /// [`tier::MAJOR`] or [`tier::UNPARSEABLE`].
         tier: String,
         versions: Vec<PackageVersionRef>,
+        /// The services of this repo whose specifier the PR changed
+        /// (carrick#2283). Empty on a run that is not a PR run, and when the
+        /// PR left the package alone.
+        changed_by_pr: Vec<SpecChange>,
+        /// Whether main has this conflict at the same tier (carrick#2283).
+        /// `None` on a run that is not a PR run, and when it could not tell.
+        on_main: Option<bool>,
+        /// Why a PR run could not tell. Never set beside `on_main`.
+        on_main_unknown: Option<OnMainUnknown>,
     },
     /// Multiple repos encode the same external contract (#379): every side of
     /// the match is a call site, so no indexed service defines the route and
@@ -559,8 +582,8 @@ impl Finding {
     }
 
     /// Whether main already had this finding (carrick-cloud#1369). Clears any
-    /// reason the run could not tell. No-op for every kind that carries no
-    /// pairing.
+    /// reason the run could not tell. No-op for every kind but the mismatches
+    /// and a dependency conflict (carrick#2283).
     pub fn set_on_main(&mut self, value: Option<bool>) {
         match self {
             Finding::TypeMismatch {
@@ -569,6 +592,11 @@ impl Finding {
                 ..
             }
             | Finding::MethodMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            }
+            | Finding::DependencyConflict {
                 on_main,
                 on_main_unknown,
                 ..
@@ -581,7 +609,8 @@ impl Finding {
     }
 
     /// The run could not tell whether main already had this finding, and why
-    /// (carrick-cloud#1408). No-op for every kind that carries no pairing.
+    /// (carrick-cloud#1408). No-op for every kind but the mismatches and a
+    /// dependency conflict (carrick#2283).
     pub fn set_on_main_unknown(&mut self, reason: OnMainUnknown) {
         match self {
             Finding::TypeMismatch {
@@ -590,6 +619,11 @@ impl Finding {
                 ..
             }
             | Finding::MethodMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            }
+            | Finding::DependencyConflict {
                 on_main,
                 on_main_unknown,
                 ..
@@ -633,6 +667,9 @@ impl Finding {
             package_name: package_name.into(),
             tier: tier.into(),
             versions,
+            changed_by_pr: Vec::new(),
+            on_main: None,
+            on_main_unknown: None,
         }
     }
 
@@ -835,10 +872,19 @@ impl Serialize for Finding {
                 package_name,
                 tier,
                 versions,
+                changed_by_pr,
+                on_main,
+                on_main_unknown,
             } => {
                 map.serialize_entry("package_name", package_name)?;
                 map.serialize_entry("tier", tier)?;
                 map.serialize_entry("versions", versions)?;
+                // Omitted when the PR changed nothing, and on a run that is
+                // not a PR run.
+                if !changed_by_pr.is_empty() {
+                    map.serialize_entry("changed_by_pr", changed_by_pr)?;
+                }
+                serialize_on_main(&mut map, on_main, on_main_unknown)?;
             }
             Finding::SharedExternalContract {
                 method,
@@ -1235,6 +1281,7 @@ mod tests {
                         repo: "billing".to_string(),
                         version: "4.0.0".to_string(),
                         source: "package.json".to_string(),
+                        spec: String::new(),
                     }],
                 ),
                 Finding::dependency_conflict("typescript", tier::UNPARSEABLE, vec![]),
@@ -1385,6 +1432,61 @@ mod tests {
                 "call_sites": ["src/widgets-client.ts:33"],
             })
         );
+    }
+
+    fn zod_conflict(spec: &str) -> Finding {
+        Finding::dependency_conflict(
+            "zod",
+            tier::MAJOR,
+            vec![PackageVersionRef {
+                repo: "api".to_string(),
+                version: "4.0.0".to_string(),
+                source: "services/api/package.json".to_string(),
+                spec: spec.to_string(),
+            }],
+        )
+    }
+
+    /// carrick#2283: a dependency conflict nobody marked, from a copy with no
+    /// written specifier, is byte for byte what it was before the PR fields
+    /// existed. Each field appears only when it has something to say, and
+    /// `on_main` never beside `on_main_unknown`.
+    #[test]
+    fn a_dependency_conflict_writes_its_pr_fields_only_when_set() {
+        let bytes = |finding: &Finding| serde_json::to_string(finding).unwrap();
+        const BARE: &str = r#"{"kind":"dependency_conflict","severity":"gap","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json"}]}"#;
+        assert_eq!(bytes(&zod_conflict("")), BARE);
+
+        const WRITTEN: &str = r#"{"kind":"dependency_conflict","severity":"gap","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json","spec":"^4.0.0"}]"#;
+        let mut marked = zod_conflict("^4.0.0");
+        assert_eq!(bytes(&marked), format!("{WRITTEN}}}"));
+
+        marked.set_on_main(Some(false));
+        assert_eq!(bytes(&marked), format!(r#"{WRITTEN},"on_main":false}}"#));
+
+        let Finding::DependencyConflict { changed_by_pr, .. } = &mut marked else {
+            unreachable!()
+        };
+        changed_by_pr.push(SpecChange {
+            service: "api".to_string(),
+            from: Some("^3.22.0".to_string()),
+            to: None,
+        });
+        assert_eq!(
+            bytes(&marked),
+            format!(
+                r#"{WRITTEN},"changed_by_pr":[{{"service":"api","from":"^3.22.0","to":null}}],"on_main":false}}"#
+            )
+        );
+
+        marked.set_on_main_unknown(OnMainUnknown::MainIndexStale);
+        let value = serde_json::to_value(&marked).unwrap();
+        assert_eq!(value["on_main_unknown"], json!("main_index_stale"));
+        assert!(value.get("on_main").is_none(), "{value:#}");
+        marked.set_on_main(Some(true));
+        let value = serde_json::to_value(&marked).unwrap();
+        assert_eq!(value["on_main"], json!(true));
+        assert!(value.get("on_main_unknown").is_none(), "{value:#}");
     }
 
     /// #455: a verified entry's `type_verdict` serializes to the exact

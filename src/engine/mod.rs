@@ -1539,6 +1539,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 } else {
                     all_repo_data.clone()
                 },
+                dependencies: crate::pr_baseline::DependencyBaseline {
+                    pr: crate::pr_baseline::service_packages(&current_services_data),
+                    main: crate::pr_baseline::service_packages(&main_self_data),
+                    copy,
+                },
                 main_self: main_self_data,
                 surface_unchanged,
                 copy,
@@ -1856,6 +1861,19 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // type check retypes: main's sources are not on disk, so its copy is
     // checked from its stored surface alone. The input exists only on a PR
     // run with a prior index.
+    //
+    // A dependency conflict is marked first, from the declarations alone
+    // (carrick#2283): it needs none of main's analysis, so it is marked
+    // whether or not the run has a mismatch and whatever becomes of main's
+    // side below.
+    if is_pr_run {
+        crate::pr_baseline::mark_dependency_conflicts(
+            &mut results.findings,
+            main_baseline_input
+                .as_ref()
+                .map(|input| &input.dependencies),
+        );
+    }
     if let Some(input) = main_baseline_input {
         mark_findings_on_main(&mut results.findings, input, sidecar).await;
     } else if is_pr_run {
@@ -9447,6 +9465,9 @@ async fn analyze_current_repo(
 struct MainBaselineInput {
     peers: Vec<CloudRepoData>,
     main_self: Vec<CloudRepoData>,
+    /// What this run's services and main's copy of them declare, which is
+    /// all a dependency conflict is compared on (carrick#2283).
+    dependencies: crate::pr_baseline::DependencyBaseline,
     /// This run scanned exactly what main's copy describes.
     surface_unchanged: bool,
     /// Whether main's copy is main as this PR's base has it
