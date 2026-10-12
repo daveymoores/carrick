@@ -385,19 +385,37 @@ pub struct FileChange {
     pub previous: Option<String>,
 }
 
-/// [`changed_paths`] with a renamed file paired to its old path
-/// (carrick#2285), for a reader that compares a file's two copies. Kept apart
-/// because the scope rule reads an addition and a deletion where this names a
-/// rename.
+/// The best common ancestor of commits `a` and `b`: where the history of one
+/// left the other's. It is `a` itself when `b` descends from it. `Err` when
+/// either is not a commit this clone holds, or its history stops short of a
+/// common ancestor (a shallow clone).
+pub fn merge_base(repo_path: &str, a: &str, b: &str) -> Result<String, String> {
+    for commit in [a, b] {
+        // As in `changed_paths`: nothing but a hex object name reaches git.
+        if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{commit:?} is not a commit id"));
+        }
+    }
+    let base = run_git(repo_path, &["merge-base", a, b])?
+        .trim()
+        .to_string();
+    if base.is_empty() {
+        return Err(format!("{a} and {b} share no history in this clone"));
+    }
+    Ok(base)
+}
+
+/// Every file that differs between commits `from` and `to`, as
+/// [`changed_paths`] lists them but with a renamed file paired to its old
+/// path (carrick#2285), for a reader that compares a file's two copies. Kept
+/// apart because the scope rule reads an addition and a deletion where this
+/// names a rename. Two commits and never the working tree: what a build step
+/// wrote there is no part of either.
 ///
 /// `Err` also for a partial clone: pairing renames reads file contents, and a
 /// copy the clone does not hold would be fetched from its remote.
-pub fn changed_files(
-    repo_path: &str,
-    from: &str,
-    to: Option<&str>,
-) -> Result<Vec<FileChange>, String> {
-    for commit in std::iter::once(from).chain(to) {
+pub fn changed_files(repo_path: &str, from: &str, to: &str) -> Result<Vec<FileChange>, String> {
+    for commit in [from, to] {
         // As in `changed_paths`: nothing but a hex object name reaches git.
         if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(format!("{commit:?} is not a commit id"));
@@ -410,9 +428,7 @@ pub fn changed_files(
     if is_partial_clone(repo_path) {
         return Err("a partial clone does not hold every file's earlier copy".to_string());
     }
-    let mut args = vec!["diff", "--name-status", "-M", "-z", from];
-    args.extend(to);
-    args.push("--");
+    let args = ["diff", "--name-status", "-M", "-z", from, to, "--"];
     let mut fields = nul_paths(run_git(repo_path, &args)?).into_iter();
     let mut changed = Vec::new();
     while let Some(status) = fields.next() {
@@ -433,26 +449,6 @@ pub fn changed_files(
             // addition with nothing behind it.
             previous: previous.filter(|_| letter == 'R'),
         });
-    }
-    if to.is_none() {
-        changed.extend(
-            nul_paths(run_git(
-                repo_path,
-                &[
-                    "ls-files",
-                    "--others",
-                    "--exclude-standard",
-                    "--full-name",
-                    "-z",
-                ],
-            )?)
-            .into_iter()
-            .map(|path| FileChange {
-                status: 'A',
-                path,
-                previous: None,
-            }),
-        );
     }
     Ok(changed)
 }

@@ -149,8 +149,9 @@ pub struct Scope<'a> {
     pub base: &'a dyn Fn(&str) -> bool,
 }
 
-/// Name the functions that differ between commit `base` and `head` (the
-/// working tree when `None`), for the files `scope` counts.
+/// Name the functions that differ between commits `base` and `head`, for the
+/// files `scope` counts. Both sides are read from git: a PR is its commits,
+/// and a file a build step wrote or rewrote in the working tree is not one.
 ///
 /// A file is compared with its own earlier copy, and a renamed file with the
 /// copy at its old path. A file added whole states every function as added,
@@ -163,7 +164,7 @@ pub struct Scope<'a> {
 pub fn name_changes(
     repo_path: &str,
     base: &str,
-    head: Option<&str>,
+    head: &str,
     scope: &Scope<'_>,
 ) -> Result<Named, String> {
     let canonical = |path: PathBuf| path.canonicalize().unwrap_or(path);
@@ -181,18 +182,16 @@ pub fn name_changes(
                 .join("/"),
         )
     };
-    let base_copy = |path: &str| -> Result<BTreeMap<String, Stated>, String> {
-        let source = crate::git_state::file_at(repo_path, base, path)?;
-        Ok(stated_in(Path::new(path), format!("{base}:{path}"), source))
+    let copy_at = |commit: &str, path: &str| -> Result<BTreeMap<String, Stated>, String> {
+        let source = crate::git_state::file_at(repo_path, commit, path)?;
+        Ok(stated_in(
+            Path::new(path),
+            format!("{commit}:{path}"),
+            source,
+        ))
     };
-    let head_copy = |path: &str| -> Result<BTreeMap<String, Stated>, String> {
-        let source = match head {
-            Some(head) => crate::git_state::file_at(repo_path, head, path)?,
-            // A file discovery could not read states no row either.
-            None => std::fs::read_to_string(top.join(path)).unwrap_or_default(),
-        };
-        Ok(stated_in(Path::new(path), path.to_string(), source))
-    };
+    let base_copy = |path: &str| copy_at(base, path);
+    let head_copy = |path: &str| copy_at(head, path);
 
     let mut named = Named::default();
     for change in crate::git_state::changed_files(repo_path, base, head)? {
@@ -369,8 +368,9 @@ pub fn join_rows<'a>(
     }
 }
 
-/// The `functions` member of a PR run's result: what the PR's tree changed
-/// against `base`, joined to the rows the run holds in `data`.
+/// The `functions` member of a PR run's result: what the PR's commits
+/// changed since they left `base`'s history, joined to the rows the run holds
+/// in `data`.
 ///
 /// A path in the PR's tree is a service's source when the service's walk
 /// reads it. A path only the base holds has no walk to ask, so it is judged
@@ -417,7 +417,17 @@ pub fn block_for_run(
         head: &|file| source(file) && in_head(file),
         base: &|file| source(file) && in_base(file),
     };
-    match name_changes(repo_path, base, None, &scope) {
+    // What the PR changed is what its commits changed since they left the
+    // base branch: the checked-out commit against its merge base with `base`.
+    // On a merge checkout that is `base` itself. Where the checkout is the
+    // PR's own head, `base` may hold commits the branch does not, and a diff
+    // against it would read each of those backwards as the PR's: a function
+    // main removed since would read as one the PR added.
+    let named = crate::git_state::head_commit(repo_path).and_then(|head| {
+        let from = crate::git_state::merge_base(repo_path, base, &head)?;
+        name_changes(repo_path, &from, &head, &scope)
+    });
+    match named {
         Ok(named) => FunctionsBlock::Named(join_rows(
             named,
             data.iter()
@@ -510,12 +520,18 @@ export function n(): number {
 
     /// The PR's tree on top of [`base_repo`]: `a.ts` edited, `b.ts` renamed
     /// to `c.ts` untouched, `d.ts` untouched, `e.ts` new.
-    fn pr_tree(repo: &Path) {
+    fn pr_tree(repo: &Path) -> String {
         std::fs::write(repo.join("a.ts"), A_HEAD).unwrap();
         git_in(repo, &["mv", "b.ts", "c.ts"]);
         std::fs::write(repo.join("e.ts"), E).unwrap();
+        commit_all(repo)
+    }
+
+    /// Commit the working tree, and name the commit.
+    fn commit_all(repo: &Path) -> String {
         git_in(repo, &["add", "-A"]);
-        git_in(repo, &["commit", "-qm", "pr"]);
+        git_in(repo, &["commit", "-qm", "next"]);
+        git_in(repo, &["rev-parse", "HEAD"])
     }
 
     fn everything() -> Scope<'static> {
@@ -553,9 +569,9 @@ export function n(): number {
     #[test]
     fn the_trees_name_what_the_pr_added_edited_and_removed() {
         let (repo, base) = base_repo();
-        pr_tree(repo.path());
+        let head = pr_tree(repo.path());
         let root = repo.path().to_str().unwrap();
-        let named = name_changes(root, &base, None, &everything()).unwrap();
+        let named = name_changes(root, &base, &head, &everything()).unwrap();
         assert_eq!(
             names(&named),
             vec![
@@ -567,11 +583,90 @@ export function n(): number {
         );
         assert_eq!(named.removed, vec![at("a.ts", "h")]);
         assert!(named.changed.iter().all(|c| c.previous_file.is_none()));
+    }
 
-        // Between two commits, as the measurement over history reads it.
-        let head = git_in(repo.path(), &["rev-parse", "HEAD"]);
-        let between = name_changes(root, &base, Some(&head), &everything()).unwrap();
-        assert_eq!(between, named);
+    fn listed(block: &FunctionsBlock) -> (Vec<(String, String, FunctionChange)>, Vec<FunctionRef>) {
+        let FunctionsBlock::Named(named) = block else {
+            panic!("{block:?}")
+        };
+        let mut changed: Vec<_> = named
+            .changed
+            .iter()
+            .map(|f| (f.file.clone(), f.name.clone(), f.change))
+            .collect();
+        changed.sort();
+        (changed, named.removed.clone())
+    }
+
+    /// A branch behind its base. Main has since deleted `h` and edited `f`;
+    /// the PR only adds `e.ts`. Against main's tip the PR's tree would read
+    /// as adding `h` back and editing `f`. It did neither: what it changed is
+    /// what its own commits changed since they left main's history.
+    #[test]
+    fn a_branch_behind_its_base_names_only_its_own_changes() {
+        let (repo, branch_point) = base_repo();
+        let path = repo.path();
+        let root = path.to_str().unwrap();
+        // The PR's branch, from the commit main was at.
+        git_in(path, &["checkout", "-q", "-b", "pr"]);
+        std::fs::write(path.join("e.ts"), E.replace("return k();", "return 1;")).unwrap();
+        commit_all(path);
+        // Main moves on.
+        git_in(path, &["checkout", "-q", "main"]);
+        std::fs::write(
+            path.join("a.ts"),
+            A_BASE
+                .replace("return x + 1;", "return x + 5;")
+                .replace("function h(): void {}\n", ""),
+        )
+        .unwrap();
+        let main_tip = commit_all(path);
+        // The run checks out the PR's head and is told main's tip.
+        git_in(path, &["checkout", "-q", "pr"]);
+        let services = [Config::default()];
+        let own = (
+            vec![("e.ts".to_string(), "n".to_string(), FunctionChange::Added)],
+            Vec::new(),
+        );
+        assert_eq!(
+            listed(&block_for_run(root, Some(&main_tip), &services, &[])),
+            own
+        );
+
+        // A merge checkout descends from the base, so the base is the merge
+        // base and the same changes are named.
+        assert_eq!(
+            listed(&block_for_run(root, Some(&branch_point), &services, &[])),
+            own
+        );
+        git_in(path, &["merge", "-q", "--no-edit", "main"]);
+        assert_eq!(
+            listed(&block_for_run(root, Some(&main_tip), &services, &[])),
+            own
+        );
+    }
+
+    /// Only what is committed is the PR's: a file a build step generated
+    /// before the scan, and a tracked file one rewrote, are not named.
+    #[test]
+    fn what_the_working_tree_holds_uncommitted_is_not_the_prs() {
+        let (repo, base) = base_repo();
+        pr_tree(repo.path());
+        let root = repo.path().to_str().unwrap();
+        let services = [Config::default()];
+        let committed = listed(&block_for_run(root, Some(&base), &services, &[]));
+        assert_eq!(committed.0.len(), 3, "{committed:?}");
+
+        std::fs::write(
+            repo.path().join("generated.ts"),
+            "export function made(): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("d.ts"), D.replace("f(1)", "f(2)")).unwrap();
+        assert_eq!(
+            listed(&block_for_run(root, Some(&base), &services, &[])),
+            committed
+        );
     }
 
     /// A renamed file is compared with the copy at its old path, and an
@@ -585,9 +680,9 @@ export function n(): number {
             B.replace("return 1;", "return 10;"),
         )
         .unwrap();
-        git_in(repo.path(), &["add", "-A"]);
+        let head = commit_all(repo.path());
         let root = repo.path().to_str().unwrap();
-        let named = name_changes(root, &base, None, &everything()).unwrap();
+        let named = name_changes(root, &base, &head, &everything()).unwrap();
         assert_eq!(
             names(&named),
             vec![("c.ts".to_string(), "p".to_string(), FunctionChange::Edited)]
@@ -603,13 +698,14 @@ export function n(): number {
         let (repo, base) = base_repo();
         std::fs::create_dir_all(repo.path().join("vendor")).unwrap();
         git_in(repo.path(), &["mv", "b.ts", "vendor/b.ts"]);
+        let head = commit_all(repo.path());
         let root = repo.path().to_str().unwrap();
         let outside = |file: &str| !file.starts_with("vendor/");
         let moved_out = Scope {
             head: &outside,
             base: &outside,
         };
-        let named = name_changes(root, &base, None, &moved_out).unwrap();
+        let named = name_changes(root, &base, &head, &moved_out).unwrap();
         assert!(named.changed.is_empty(), "{named:?}");
         assert_eq!(
             named.removed,
@@ -621,7 +717,7 @@ export function n(): number {
             head: &inside,
             base: &inside,
         };
-        let named = name_changes(root, &base, None, &moved_in).unwrap();
+        let named = name_changes(root, &base, &head, &moved_in).unwrap();
         assert_eq!(
             names(&named),
             vec![
@@ -658,8 +754,9 @@ export function n(): number {
         ]);
         std::fs::write(repo.path().join("svc/src/a.ts"), A_HEAD).unwrap();
         std::fs::write(repo.path().join("other/a.ts"), A_HEAD).unwrap();
+        let head = commit_all(repo.path());
         let root = repo.path().join("svc");
-        let named = name_changes(root.to_str().unwrap(), &base, None, &everything()).unwrap();
+        let named = name_changes(root.to_str().unwrap(), &base, &head, &everything()).unwrap();
         assert_eq!(
             names(&named),
             vec![
@@ -683,8 +780,9 @@ export function n(): number {
     fn a_copy_that_does_not_parse_states_nothing() {
         let (repo, base) = committed_repo(&[("a.ts", "export function f( {\n")]);
         std::fs::write(repo.path().join("a.ts"), A_BASE).unwrap();
+        let head = commit_all(repo.path());
         let root = repo.path().to_str().unwrap();
-        let named = name_changes(root, &base, None, &everything()).unwrap();
+        let named = name_changes(root, &base, &head, &everything()).unwrap();
         assert_eq!(named.changed.len(), 3, "{named:?}");
         assert!(
             named
@@ -736,6 +834,7 @@ export function n(): number {
         std::fs::write(repo.path().join("notes.md"), "more notes\n").unwrap();
         std::fs::remove_file(repo.path().join("old.ts")).unwrap();
         std::fs::remove_file(repo.path().join("old.test.ts")).unwrap();
+        commit_all(repo.path());
         let root = repo.path().to_str().unwrap();
         let block = block_for_run(root, Some(&base), &[Config::default()], &[]);
         let FunctionsBlock::Named(named) = &block else {
@@ -928,20 +1027,39 @@ export function n(): number {
                 &commits.to_string(),
             ],
         );
-        println!("commit   added edited removed");
+        println!("commit   added edited removed  files      ms");
+        let (mut all_files, mut all_ms) = (0usize, 0u128);
         for commit in log.lines() {
             let parent = git_in(Path::new(&repo), &["rev-parse", &format!("{commit}^")]);
-            match name_changes(&repo, &parent, Some(commit), &scope) {
+            // The changed source files the rule reads, for the cost of each.
+            let files = crate::git_state::changed_files(&repo, &parent, commit)
+                .map(|changed| {
+                    changed
+                        .iter()
+                        .filter(|change| {
+                            read(&change.path) || change.previous.as_deref().is_some_and(read)
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            let started = std::time::Instant::now();
+            let named = name_changes(&repo, &parent, commit, &scope);
+            let took = started.elapsed().as_millis();
+            all_files += files;
+            all_ms += took;
+            match named {
                 Ok(named) => {
                     let count = |change: FunctionChange| {
                         named.changed.iter().filter(|c| c.change == change).count()
                     };
                     println!(
-                        "{} {:>5} {:>6} {:>7}",
+                        "{} {:>5} {:>6} {:>7} {:>6} {:>7}",
                         &commit[..8],
                         count(FunctionChange::Added),
                         count(FunctionChange::Edited),
-                        named.removed.len()
+                        named.removed.len(),
+                        files,
+                        took
                     );
                     // The names, for a count made by hand to be checked
                     // against.
@@ -960,5 +1078,6 @@ export function n(): number {
                 Err(reason) => println!("{} could not be read: {reason}", &commit[..8]),
             }
         }
+        println!("total: {all_files} changed source file(s) in {all_ms} ms");
     }
 }
