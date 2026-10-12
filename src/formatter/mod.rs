@@ -1806,11 +1806,13 @@ mod tests {
                     repo: "billing".to_string(),
                     version: "3.22.0".to_string(),
                     source: "billing/package.json".to_string(),
+                    spec: String::new(),
                 },
                 PackageVersionRef {
                     repo: "web".to_string(),
                     version: "4.0.0".to_string(),
                     source: "web/package.json".to_string(),
+                    spec: String::new(),
                 },
             ],
         )
@@ -2394,6 +2396,7 @@ mod tests {
                 repo: "billing".to_string(),
                 version: "workspace:*".to_string(),
                 source: "billing/package.json".to_string(),
+                spec: String::new(),
             }],
         );
         let output =

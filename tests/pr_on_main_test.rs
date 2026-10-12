@@ -362,6 +362,109 @@ async fn a_pr_run_marks_each_finding_with_whether_main_had_it() {
     assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
 }
 
+/// Declare `name` at `spec` in the repo's manifest.
+fn set_dependency(repo: &Path, name: &str, spec: &str) {
+    let manifest = repo.join("package.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    json["dependencies"][name] = serde_json::json!(spec);
+    std::fs::write(&manifest, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+}
+
+fn conflict_on(findings: &[serde_json::Value], package: &str) -> serde_json::Value {
+    findings
+        .iter()
+        .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == package)
+        .cloned()
+        .unwrap_or_else(|| panic!("no dependency_conflict on {package} in {findings:#?}"))
+}
+
+/// The written specifier each service's entry of a conflict carries.
+fn specs_of(finding: &serde_json::Value) -> Vec<(String, String)> {
+    let mut specs: Vec<(String, String)> = finding["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["repo"].as_str().unwrap().to_string(),
+                entry["spec"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    specs.sort();
+    specs
+}
+
+/// carrick#2283: a PR run says of each dependency conflict whether main has
+/// it and which service's specifier the PR changed. No call here is wrong,
+/// so the run has no mismatch and main's analysis never runs: the conflict is
+/// marked from the manifests alone.
+#[tokio::test]
+async fn a_pr_run_marks_a_dependency_conflict_without_a_mismatch_to_compare() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, consumer) = setup();
+    let store = Store::default();
+    set_dependency(&producer, "zod", "^3.22.0");
+    commit(&producer, "zod 3");
+    scan(&store, &producer).await;
+
+    // No index of the consumer on main: the run cannot tell, and says why.
+    set_dependency(&consumer, "zod", "^4.0.0");
+    commit(&consumer, "zod 4");
+    let findings = pr_scan(&store, &consumer).await;
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["kind"] != "method_mismatch" && f["kind"] != "type_mismatch"),
+        "this run is meant to have no mismatch: {findings:#?}"
+    );
+    let finding = conflict_on(&findings, "zod");
+    assert_eq!(finding["tier"], serde_json::json!("major"), "{finding:#}");
+    assert_eq!(
+        finding["on_main_unknown"],
+        serde_json::json!("no_main_index"),
+        "{finding:#}"
+    );
+    assert!(finding.get("on_main").is_none(), "{finding:#}");
+    assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+
+    // Main agrees with the producer; the PR moves the consumer a major on.
+    set_dependency(&consumer, "zod", "^3.22.0");
+    commit(&consumer, "main: zod 3");
+    scan(&store, &consumer).await;
+    set_dependency(&consumer, "zod", "^4.0.0");
+    commit(&consumer, "pr: zod 4");
+    let runs = main_side_runs();
+    let findings = pr_scan(&store, &consumer).await;
+    assert_eq!(main_side_runs(), runs, "nothing here needs main's analysis");
+    let finding = conflict_on(&findings, "zod");
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+    assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+    assert_eq!(
+        finding["changed_by_pr"],
+        serde_json::json!([{ "service": "inventory-svc", "from": "^3.22.0", "to": "^4.0.0" }]),
+        "{finding:#}"
+    );
+    assert_eq!(
+        specs_of(&finding),
+        vec![
+            ("catalog-web".to_string(), "^3.22.0".to_string()),
+            ("inventory-svc".to_string(), "^4.0.0".to_string()),
+        ],
+        "{finding:#}"
+    );
+
+    // Main has the conflict already; the PR edits a source file and leaves
+    // the manifest alone.
+    scan(&store, &consumer).await;
+    set_consumer_verb(&consumer, "GET", 3);
+    commit(&consumer, "pr: unrelated edit");
+    let finding = conflict_on(&pr_scan(&store, &consumer).await, "zod");
+    assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+    assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+}
+
 /// Main's side failing in any way costs the run nothing but the comparison:
 /// the findings it posts are byte for byte the ones a run with no prior index
 /// posts, apart from why neither could compare. (The payload's `delta`
