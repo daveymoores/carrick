@@ -149,6 +149,23 @@ pub struct Scope<'a> {
     pub base: &'a dyn Fn(&str) -> bool,
 }
 
+/// `path` under `root`, in the form a row's `file_path` uploads in: the
+/// segments below the root, joined by `/`. `None` for a path outside it.
+///
+/// Read segment by segment, never as text, so a `.` segment counts for
+/// nothing wherever it sits: a scan root of `.` with a service directory of
+/// `.` walks `././src/a.ts`, and that is `src/a.ts`.
+fn blob_path(path: &Path, root: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    Some(
+        relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
 /// Name the functions that differ between commits `base` and `head`, for the
 /// files `scope` counts. Both sides are read from git: a PR is its commits,
 /// and a file a build step wrote or rewrote in the working tree is not one.
@@ -172,16 +189,7 @@ pub fn name_changes(
     let root = canonical(PathBuf::from(repo_path));
     // A path git names, in the form the blob carries. `None` for one outside
     // the scan root, which no row is at.
-    let as_blob = |path: &str| -> Option<String> {
-        let relative = top.join(path).strip_prefix(&root).ok()?.to_path_buf();
-        Some(
-            relative
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/"),
-        )
-    };
+    let as_blob = |path: &str| blob_path(&top.join(path), &root);
     let copy_at = |commit: &str, path: &str| -> Result<BTreeMap<String, Stated>, String> {
         let source = crate::git_state::file_at(repo_path, commit, path)?;
         Ok(stated_in(
@@ -400,7 +408,9 @@ pub fn block_for_run(
                     .flat_map(|service| {
                         crate::file_finder::find_service_files(repo_path, service, &skip).0
                     })
-                    .map(|path| crate::engine::repo_relative(&path.to_string_lossy(), repo_path))
+                    // The same form the diff's paths take (`as_blob`), or a
+                    // changed file is never found among the walked ones.
+                    .filter_map(|path| blob_path(&path, Path::new(repo_path)))
                     .collect()
             })
             .contains(file)
@@ -850,6 +860,58 @@ export function n(): number {
         assert_eq!(
             serde_json::to_value(named.counts).unwrap(),
             json!({ "added": 1, "edited": 1, "removed": 2, "without_intent": 2, "omitted": 0 })
+        );
+    }
+
+    /// A path is named by its segments below the root, however many `.`
+    /// segments the root and the service directory put in front of it. A
+    /// scan of `.` whose service directory is `.` walks `././src/a.ts`.
+    #[test]
+    fn a_walked_path_is_named_by_its_segments_below_the_root() {
+        let named = |path: &str, root: &str| blob_path(Path::new(path), Path::new(root));
+        assert_eq!(named("././src/a.ts", "."), Some("src/a.ts".to_string()));
+        assert_eq!(named("./src/a.ts", "."), Some("src/a.ts".to_string()));
+        assert_eq!(
+            named("/repo/./pkg/./src/a.ts", "/repo"),
+            Some("pkg/src/a.ts".to_string())
+        );
+        assert_eq!(
+            named("site/./src/a.ts", "site/"),
+            Some("src/a.ts".to_string())
+        );
+        assert_eq!(named("/elsewhere/a.ts", "/repo"), None);
+    }
+
+    /// A service directory written with `.` segments reads the same files,
+    /// and a function changed in one of them is named by the path its row
+    /// carries.
+    #[test]
+    fn a_service_directory_written_with_dots_names_its_functions() {
+        let (repo, base) = committed_repo(&[
+            ("package.json", r#"{ "name": "fixture", "private": true }"#),
+            ("pkg/a.ts", A_BASE),
+            ("pkg/old.ts", "export function gone(): void {}\n"),
+        ]);
+        std::fs::write(repo.path().join("pkg/a.ts"), A_HEAD).unwrap();
+        std::fs::remove_file(repo.path().join("pkg/old.ts")).unwrap();
+        commit_all(repo.path());
+        let service = Config {
+            directory: Some("./pkg/.".to_string()),
+            ..Config::default()
+        };
+        let block = block_for_run(repo.path().to_str().unwrap(), Some(&base), &[service], &[]);
+        let FunctionsBlock::Named(named) = &block else {
+            panic!("{block:?}")
+        };
+        let listed: Vec<(&str, &str)> = named
+            .changed
+            .iter()
+            .map(|f| (f.file.as_str(), f.name.as_str()))
+            .collect();
+        assert_eq!(listed, vec![("pkg/a.ts", "k"), ("pkg/a.ts", "f")]);
+        assert_eq!(
+            named.removed,
+            vec![at("pkg/a.ts", "h"), at("pkg/old.ts", "gone")]
         );
     }
 
