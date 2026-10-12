@@ -3032,6 +3032,8 @@ mod tests {
                 operations_indexed: false,
             },
             has_types: true,
+            baseline: None,
+            checked: None,
         };
         let request = PostPrResultRequest {
             action: "post-pr-result",

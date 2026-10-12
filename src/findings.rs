@@ -1011,6 +1011,98 @@ pub struct PrResultPayload {
     /// surface reading the payload can say "types were not read" instead of
     /// inferring it from an absent type verdict.
     pub has_types: bool,
+    /// Which index the run compared with (carrick#2284). `None` on a run
+    /// that is not a PR run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<Baseline>,
+    /// What the run checked (carrick#2284). `None` on a run that is not a PR
+    /// run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<Checked>,
+}
+
+/// The index a PR run compared with: main's copy of this repo and every
+/// peer's, by commit (carrick#2284). Two posts for one pull request can
+/// differ because either moved, and this is what shows it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Baseline {
+    /// The commit the PR's tree is based on; `null` when the run does not
+    /// know it.
+    pub base_sha: Option<String>,
+    pub copy: BaselineCopy,
+    /// One entry per stored service of this repo, sorted by service.
+    pub main_index: Vec<MainIndexEntry>,
+    pub peers: PeerIndexes,
+}
+
+/// Whether main's copy of this repo is main as the PR's base has it
+/// (`pr_baseline::MainCopy`), or absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineCopy {
+    Current,
+    Stale,
+    OtherScanner,
+    /// This repo has no index on main.
+    None,
+}
+
+/// One stored service of this repo in main's copy.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MainIndexEntry {
+    /// `null` for an unnamed service.
+    pub service: Option<String>,
+    pub commit: String,
+    /// Omitted when the copy states none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanner_version: Option<String>,
+    /// Written only when the copy was scanned from a tree with uncommitted
+    /// changes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dirty: bool,
+}
+
+/// The peer indexes a run read, as a count and one value that moves when any
+/// of them does.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PeerIndexes {
+    pub count: usize,
+    /// Lowercase hex sha256 over the lines `repo|service|commit`, one per
+    /// peer index, sorted and newline-terminated. An unnamed service is the
+    /// empty string.
+    pub sha256: String,
+}
+
+/// What a PR run checked (carrick#2284).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Checked {
+    pub pairs: PairCounts,
+    pub dependencies: DependencyCounts,
+}
+
+/// Operation pairs (HTTP, GraphQL, socket, pub/sub) with a producer or a
+/// consumer in one of this repo's services, by type verdict. A pair is one
+/// call site against one producer operation. The first three count pairs the
+/// type check reached and say what it answered; `not_compared` counts the
+/// pairs it did not reach, whatever the protocol.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PairCounts {
+    pub compatible: usize,
+    pub unverifiable: usize,
+    pub incompatible: usize,
+    pub not_compared: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DependencyCounts {
+    /// Packages one of this repo's services and at least one other service
+    /// both declare.
+    pub shared: usize,
+    /// Packages whose written specifier the PR changed in a service of this
+    /// repo. Omitted when the run cannot say: this repo has no index on main,
+    /// or main's copy is not main as the PR's base has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<usize>,
 }
 
 #[cfg(test)]
@@ -1316,6 +1408,8 @@ mod tests {
                 operations_indexed: false,
             },
             has_types: true,
+            baseline: None,
+            checked: None,
         };
 
         let v = serde_json::to_value(&payload).unwrap();
@@ -1579,11 +1673,123 @@ mod tests {
                 operations_indexed: false,
             },
             has_types: true,
+            baseline: None,
+            checked: None,
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert!(v.get("run_id").is_none());
         assert_eq!(v["head_sha"], "a".repeat(40));
         assert_eq!(v["delta"], serde_json::Value::Null);
+    }
+
+    /// carrick#2284: a payload with neither member is byte for byte what it
+    /// was before they existed, and with both it carries them in the shape
+    /// the cloud reads, each optional part written only when it has something
+    /// to say.
+    #[test]
+    fn baseline_and_checked_are_written_only_when_the_run_states_them() {
+        let mut payload = PrResultPayload {
+            repo: "r".to_string(),
+            pr_number: 1,
+            head_sha: None,
+            run_id: None,
+            topology: Topology {
+                repo_name: "r".to_string(),
+                local_service_count: 1,
+                peer_repo_count: 0,
+            },
+            stats: ScanStats {
+                endpoints: 0,
+                calls: 0,
+            },
+            findings: vec![],
+            delta: None,
+            verified: vec![],
+            graphql: GraphqlStatus {
+                libraries: vec![],
+                operations_indexed: false,
+            },
+            has_types: true,
+            baseline: None,
+            checked: None,
+        };
+        const BARE: &str = r#"{"repo":"r","pr_number":1,"head_sha":null,"topology":{"repo_name":"r","local_service_count":1,"peer_repo_count":0},"stats":{"endpoints":0,"calls":0},"findings":[],"delta":null,"verified":[],"graphql":{"libraries":[],"operations_indexed":false},"has_types":true}"#;
+        assert_eq!(serde_json::to_string(&payload).unwrap(), BARE);
+
+        payload.baseline = Some(Baseline {
+            base_sha: Some("b".repeat(40)),
+            copy: BaselineCopy::Current,
+            main_index: vec![
+                MainIndexEntry {
+                    service: Some("api".to_string()),
+                    commit: "c".repeat(40),
+                    scanner_version: Some("0.3.113".to_string()),
+                    dirty: true,
+                },
+                MainIndexEntry {
+                    service: None,
+                    commit: "d".repeat(40),
+                    scanner_version: None,
+                    dirty: false,
+                },
+            ],
+            peers: PeerIndexes {
+                count: 12,
+                sha256: "e".repeat(64),
+            },
+        });
+        payload.checked = Some(Checked {
+            pairs: PairCounts {
+                compatible: 22,
+                unverifiable: 5,
+                incompatible: 1,
+                not_compared: 3,
+            },
+            dependencies: DependencyCounts {
+                shared: 41,
+                changed: Some(2),
+            },
+        });
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            v["baseline"],
+            json!({
+                "base_sha": "b".repeat(40),
+                "copy": "current",
+                "main_index": [
+                    { "service": "api", "commit": "c".repeat(40), "scanner_version": "0.3.113", "dirty": true },
+                    { "service": null, "commit": "d".repeat(40) },
+                ],
+                "peers": { "count": 12, "sha256": "e".repeat(64) },
+            })
+        );
+        assert_eq!(
+            v["checked"],
+            json!({
+                "pairs": { "compatible": 22, "unverifiable": 5, "incompatible": 1, "not_compared": 3 },
+                "dependencies": { "shared": 41, "changed": 2 },
+            })
+        );
+
+        let Some(baseline) = &mut payload.baseline else {
+            unreachable!()
+        };
+        baseline.base_sha = None;
+        baseline.copy = BaselineCopy::None;
+        let Some(checked) = &mut payload.checked else {
+            unreachable!()
+        };
+        checked.dependencies.changed = None;
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v["baseline"]["base_sha"], serde_json::Value::Null);
+        assert_eq!(v["baseline"]["copy"], "none");
+        assert_eq!(v["checked"]["dependencies"], json!({ "shared": 41 }));
+        for (copy, word) in [
+            (BaselineCopy::Stale, "stale"),
+            (BaselineCopy::OtherScanner, "other_scanner"),
+        ] {
+            assert_eq!(serde_json::to_value(copy).unwrap(), json!(word));
+        }
     }
 
     /// The wire spellings cloud#599 codes against, pinned exactly: a renderer

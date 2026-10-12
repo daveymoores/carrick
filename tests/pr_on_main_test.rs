@@ -465,6 +465,82 @@ async fn a_pr_run_marks_a_dependency_conflict_without_a_mismatch_to_compare() {
     assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
 }
 
+/// The value a run states for its peer indexes: sha256 over one
+/// `repo|service|commit` line per peer, sorted.
+fn peer_value(lines: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut lines = lines.to_vec();
+    lines.sort();
+    format!("{:x}", Sha256::digest(lines.concat().as_bytes()))
+}
+
+/// carrick#2284: a PR result names the index commits the run compared with
+/// and counts what it checked. The run here is untyped, so every pair it
+/// matched is one it did not compare.
+#[tokio::test]
+async fn a_pr_result_names_the_index_it_compared_with_and_counts_what_it_checked() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, consumer) = setup();
+    let store = Store::default();
+    set_dependency(&producer, "zod", "^3.22.0");
+    commit(&producer, "zod 3");
+    scan(&store, &producer).await;
+    let peers = serde_json::json!({
+        "count": 1,
+        "sha256": peer_value(&[format!("catalog-web||{}\n", head(&producer))]),
+    });
+
+    // No index of the consumer on main.
+    set_dependency(&consumer, "zod", "^3.22.0");
+    commit(&consumer, "zod 3");
+    let payload = pr_payload(&store, &consumer).await;
+    assert_eq!(
+        payload["baseline"],
+        serde_json::json!({
+            "base_sha": null,
+            "copy": "none",
+            "main_index": [],
+            "peers": peers,
+        }),
+        "{payload:#}"
+    );
+    assert_eq!(
+        payload["checked"]["dependencies"],
+        serde_json::json!({ "shared": 1 }),
+        "{payload:#}"
+    );
+
+    // Main's copy, and a PR based on it that moves the shared package.
+    scan(&store, &consumer).await;
+    let main_at = head(&consumer);
+    set_dependency(&consumer, "zod", "^4.0.0");
+    commit(&consumer, "pr: zod 4");
+    event_with_base(tmp.path(), &main_at);
+    let payload = pr_payload(&store, &consumer).await;
+    assert_eq!(
+        payload["baseline"],
+        serde_json::json!({
+            "base_sha": main_at,
+            "copy": "current",
+            "main_index": [{
+                "service": null,
+                "commit": main_at,
+                "scanner_version": env!("CARGO_PKG_VERSION"),
+            }],
+            "peers": peers,
+        }),
+        "{payload:#}"
+    );
+    assert_eq!(
+        payload["checked"],
+        serde_json::json!({
+            "pairs": { "compatible": 0, "unverifiable": 0, "incompatible": 0, "not_compared": 3 },
+            "dependencies": { "shared": 1, "changed": 1 },
+        }),
+        "{payload:#}"
+    );
+}
+
 /// Main's side failing in any way costs the run nothing but the comparison:
 /// the findings it posts are byte for byte the ones a run with no prior index
 /// posts, apart from why neither could compare. (The payload's `delta`
