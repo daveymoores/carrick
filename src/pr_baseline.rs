@@ -305,8 +305,16 @@ pub struct DependencyBaseline {
 /// base has it, as for a mismatch. A PR that leaves the manifests alone
 /// replaces each entry with itself, so its conflicts are all main's.
 ///
-/// This repo's services are those on either side, so a service the PR adds or
-/// removes is compared too.
+/// Both claims a reader acts on fail closed:
+///
+/// - A service is named as changed only when both sides hold it and the copy
+///   is main as the PR's base has it. Against any other copy the difference
+///   may be main's own since the copy was written. A service only one side
+///   holds may be one the PR adds or removes, or one the copy is missing, and
+///   the declarations cannot tell which.
+/// - "Main does not have it" is not said of a conflict that names a service
+///   of this run main's copy has no entry for. That reads as no index of it
+///   on main ([`OnMainUnknown::NoMainIndex`]).
 pub fn mark_dependency_conflicts(pr: &mut [Finding], baseline: Option<&DependencyBaseline>) {
     for finding in pr.iter_mut() {
         let Finding::DependencyConflict {
@@ -340,11 +348,21 @@ pub fn mark_dependency_conflicts(pr: &mut [Finding], baseline: Option<&Dependenc
                 source_path: entry.source.clone().into(),
             })
             .collect();
+        // A service of this run the conflict names, which main's copy has no
+        // entry for: new in the PR, or missing from the copy.
+        let unplaced = versions.iter().any(|entry| {
+            baseline.pr.contains_key(&entry.repo) && !baseline.main.contains_key(&entry.repo)
+        });
         let mut changes = Vec::new();
         for service in &ours {
             let from = declared(&baseline.main, service);
             let to = declared(&baseline.pr, service);
-            if let Some(change) = spec_change(service, from.as_ref(), to.as_ref()) {
+            let on_both_sides =
+                baseline.pr.contains_key(*service) && baseline.main.contains_key(*service);
+            if on_both_sides
+                && baseline.copy == MainCopy::Current
+                && let Some(change) = spec_change(service, from.as_ref(), to.as_ref())
+            {
                 changes.push(change);
             }
             if let Some(info) = from {
@@ -360,6 +378,9 @@ pub fn mark_dependency_conflicts(pr: &mut [Finding], baseline: Option<&Dependenc
         *changed_by_pr = changes;
         match (on_main, baseline.copy) {
             (true, _) => finding.set_on_main(Some(true)),
+            (false, MainCopy::Current) if unplaced => {
+                finding.set_on_main_unknown(OnMainUnknown::NoMainIndex)
+            }
             (false, MainCopy::Current) => finding.set_on_main(Some(false)),
             (false, MainCopy::Stale) => finding.set_on_main_unknown(OnMainUnknown::MainIndexStale),
             (false, MainCopy::OtherScanner) => {
@@ -1840,7 +1861,65 @@ mod dependency_tests {
             let finding = marked("zod", tier::MAJOR, BILLING_ZOD, &pr, Some((&main, copy)));
             assert_eq!(finding["on_main_unknown"], json!(reason), "{finding:#}");
             assert!(finding.get("on_main").is_none(), "{finding:#}");
+            // The difference may be main's own since the copy was written.
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
         }
+    }
+
+    /// The same holds when such a copy does show the conflict.
+    #[test]
+    fn a_copy_that_is_not_main_names_no_service_as_changed() {
+        let main = services(&[("web", packages(&[("react", "^17.0.2")]))]);
+        let pr = services(&[("web", packages(&[("react", "^16.14.0")]))]);
+        for copy in [MainCopy::Stale, MainCopy::OtherScanner] {
+            let finding = marked(
+                "react",
+                tier::MAJOR,
+                BILLING_REACT,
+                &pr,
+                Some((&main, copy)),
+            );
+            assert_eq!(finding["on_main"], json!(true), "{copy:?}: {finding:#}");
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+        }
+    }
+
+    /// A service main's copy has no entry for may be new in the PR or missing
+    /// from the copy. Its conflict is not called introduced, and it is not
+    /// named as changed.
+    #[test]
+    fn a_service_mains_copy_does_not_hold_is_never_called_introduced() {
+        let api = packages(&[("zod", "^3.22.0")]);
+        let main = services(&[("api", api.clone())]);
+        let pr = services(&[("api", api), ("worker", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(
+            finding["on_main_unknown"],
+            json!("no_main_index"),
+            "{finding:#}"
+        );
+        assert!(finding.get("on_main").is_none(), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+
+        // Main conflicts without it: that much is known.
+        let api = packages(&[("zod", "^4.0.0")]);
+        let main = services(&[("api", api.clone())]);
+        let pr = services(&[("api", api), ("worker", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
     }
 
     #[test]
@@ -1887,11 +1966,16 @@ mod dependency_tests {
         );
     }
 
-    /// A service that starts or stops declaring the package has no specifier
-    /// on one side, and a service only one side has is still this repo's.
+    /// A service both sides hold that starts or stops declaring the package
+    /// has no specifier on one side. A service only main's copy holds
+    /// (`jobs`) is not named.
     #[test]
     fn a_service_that_adds_or_drops_the_package_has_a_null_side() {
-        let main = services(&[("api", packages(&[("zod", "^4.0.0")]))]);
+        let main = services(&[
+            ("api", packages(&[("zod", "^4.0.0")])),
+            ("web", packages(&[])),
+            ("jobs", packages(&[("zod", "^4.0.0")])),
+        ]);
         let pr = services(&[
             ("api", packages(&[])),
             ("web", packages(&[("zod", "^4.0.0")])),
