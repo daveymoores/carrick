@@ -522,11 +522,11 @@ fn endpoint_delta(
 
 fn main_copy_against_base(
     repo_path: &str,
+    base: Option<String>,
     services: &[Config],
     main_self: &[CloudRepoData],
     as_uploaded: &[CloudRepoData],
 ) -> crate::pr_baseline::MainCopy {
-    let base = pr_base_commit(repo_path);
     let mut reading = None;
     // Each stored service by what it reads, so one stored at an older commit
     // than its siblings is not stale for a change it never reads
@@ -1518,6 +1518,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .into_iter()
         .partition(|repo| repo.repo_name == repo_name);
     let all_repo_data = peers;
+    let pr_base = is_pr_run.then(|| pr_base_commit(repo_path)).flatten();
+    // Main's copy by commit, read here because the copy moves into the
+    // baseline input below (carrick#2284).
+    let main_index = crate::pr_baseline::main_index(&main_self_data);
     let main_baseline_input =
         (is_pr_run && had_prior_index && !main_self_data.is_empty()).then(|| {
             // Main's copy passed the upload boundary, which replaces machine
@@ -1531,7 +1535,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 })
                 .collect();
             let surface_unchanged = crate::pr_baseline::same_surface(&as_uploaded, &main_self_data);
-            let copy = main_copy_against_base(repo_path, &services, &main_self_data, &as_uploaded);
+            let copy = main_copy_against_base(
+                repo_path,
+                pr_base.clone(),
+                &services,
+                &main_self_data,
+                &as_uploaded,
+            );
             MainBaselineInput {
                 // The peers are only needed when there is something to run.
                 peers: if surface_unchanged {
@@ -1549,6 +1559,37 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 copy,
             }
         });
+
+    // Which index this PR run compares with and how many packages it shares
+    // (carrick#2284), read here for the reason the SDK join's input is read
+    // below: the blobs are about to move into the analyzer. These report
+    // values the run already holds and decide nothing.
+    let pr_evidence = is_pr_run.then(|| {
+        let ours: std::collections::BTreeSet<String> =
+            crate::pr_baseline::service_packages(&current_services_data)
+                .into_keys()
+                .collect();
+        let mut declared = crate::pr_baseline::service_packages(&all_repo_data);
+        declared.extend(crate::pr_baseline::service_packages(&current_services_data));
+        let baseline = main_baseline_input.as_ref();
+        PrEvidence {
+            baseline: crate::findings::Baseline {
+                base_sha: pr_base.clone(),
+                copy: crate::pr_baseline::baseline_copy(baseline.map(|input| input.copy)),
+                main_index: if baseline.is_some() {
+                    main_index
+                } else {
+                    Vec::new()
+                },
+                peers: crate::pr_baseline::peer_indexes(&all_repo_data),
+            },
+            dependencies: crate::findings::DependencyCounts {
+                shared: crate::pr_baseline::shared_packages(&ours, &declared),
+                changed: baseline.and_then(|input| input.dependencies.changed_packages()),
+            },
+            ours,
+        }
+    });
 
     // Peer repos and local service count describe the project topology, which
     // the formatter uses to frame findings (single repo / monorepo / poly-repo)
@@ -1899,6 +1940,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // comment + check run via the GitHub App, gated on the project's
     // pr_comments_enabled toggle. Best-effort: a relay failure is logged,
     // never fatal. Assembled before `results` moves into the formatter.
+    //
+    // Whether each pair's check compared two known types, which decides if a
+    // compatible verdict counts as one (carrick#2284).
+    let pair_directions = analyzer.pair_directions();
     let pr_result = pr_context().map(|pr| crate::findings::PrResultPayload {
         repo: repo_name.clone(),
         pr_number: pr.number,
@@ -1927,6 +1972,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             operations_indexed: results.graphql_operations_indexed,
         },
         has_types,
+        baseline: pr_evidence
+            .as_ref()
+            .map(|evidence| evidence.baseline.clone()),
+        checked: pr_evidence
+            .as_ref()
+            .map(|evidence| crate::findings::Checked {
+                pairs: crate::pr_baseline::pair_counts(
+                    &results.cross_repo_matches,
+                    &evidence.ours,
+                    |pair| pair_directions.for_edge(pair).resolved(),
+                ),
+                sdk_pairs: crate::pr_baseline::sdk_pair_counts(&results.sdk_edges, &evidence.ours),
+                dependencies: evidence.dependencies,
+            }),
     });
 
     let formatted = crate::formatter::FormattedOutput::new(results, topology, pr_delta);
@@ -9458,6 +9517,16 @@ async fn analyze_current_repo(
         data: cloud_data,
         deferred: setup.deferred,
     })
+}
+
+/// What a PR result says of the index the run compared with and of what it
+/// shares with other services (carrick#2284), read off the blobs before they
+/// move into the analyzer.
+struct PrEvidence {
+    baseline: crate::findings::Baseline,
+    dependencies: crate::findings::DependencyCounts,
+    /// This run's services, by the id a match names its sides with.
+    ours: std::collections::BTreeSet<String>,
 }
 
 /// Main's copy of this repo and the peers it is matched against, kept aside
