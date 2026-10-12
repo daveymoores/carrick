@@ -404,42 +404,20 @@ pub fn baseline_copy(copy: Option<MainCopy>) -> BaselineCopy {
     }
 }
 
-/// Count the operation pairs with a producer or a consumer in one of this
-/// repo's services (`ours`, by service id), by type verdict (carrick#2284).
-///
-/// A pair is one matched call site against one producer operation, whatever
-/// the protocol. One the type check did not reach has no verdict and counts
-/// as `not_compared`, so the other three counts are exactly the pairs it did
-/// reach. A shared external contract is not counted at all: both of its sides
-/// are call sites, so there is no producer for a pair to be with.
-///
-/// An SDK-mediated edge is a pair of its own (the consumer's call into the
-/// package against the producer the package calls), counted once under the
-/// worse of its two directions and as `not_compared` when it states neither.
-/// Its sides are its consumer and its producer, never the package's repo.
-pub fn pair_counts(
-    matches: &[CrossRepoMatch],
-    sdk_edges: &[SdkEdge],
-    ours: &BTreeSet<String>,
-) -> PairCounts {
-    let direct = matches
-        .iter()
-        .filter(|pair| pair.relationship == carrick_match::MatchRelationship::ProducerConsumer)
-        .filter(|pair| ours.contains(&pair.producer_repo) || ours.contains(&pair.consumer_repo))
-        .map(|pair| pair.type_verdict);
-    let through_sdk = sdk_edges
-        .iter()
-        .filter(|edge| ours.contains(&edge.producer_repo) || ours.contains(&edge.consumer_repo))
-        .map(|edge| {
-            let request = edge.request.as_ref().map(|direction| direction.verdict);
-            let response = edge.response.as_ref().map(|direction| direction.verdict);
-            match (request, response) {
-                (Some(request), Some(response)) => Some(request.combine(response)),
-                (one, other) => one.or(other),
-            }
-        });
+/// What a verdict counts as: itself, except that `Compatible` over types the
+/// check could not fully read is `Unverifiable`. The probe raises no
+/// diagnostic against an `any` or `unknown`, so such a verdict compared
+/// nothing, and a count of compatible pairs must not hold it.
+fn counted_as(verdict: TypeVerdict, resolved: bool) -> TypeVerdict {
+    match verdict {
+        TypeVerdict::Compatible if !resolved => TypeVerdict::Unverifiable,
+        other => other,
+    }
+}
+
+fn tally(verdicts: impl Iterator<Item = Option<TypeVerdict>>) -> PairCounts {
     let mut counts = PairCounts::default();
-    for verdict in direct.chain(through_sdk) {
+    for verdict in verdicts {
         match verdict {
             Some(TypeVerdict::Compatible) => counts.compatible += 1,
             Some(TypeVerdict::Unverifiable) => counts.unverifiable += 1,
@@ -448,6 +426,62 @@ pub fn pair_counts(
         }
     }
     counts
+}
+
+/// Count the operation pairs with a producer or a consumer in one of this
+/// repo's services (`ours`, by service id), by type verdict (carrick#2284).
+///
+/// A pair is one matched call site against one producer operation, whatever
+/// the protocol, and each one counted outside `not_compared` is one type
+/// comparison this run made. One the type check did not reach has no verdict
+/// and counts as `not_compared`. `compatible` holds only pairs `resolved`
+/// says were compared over two known types on every direction
+/// (`EdgeDirections::resolved`); a compatible verdict that was not counts as
+/// `unverifiable`. A shared external contract is not counted at all: both of
+/// its sides are call sites, so there is no producer for a pair to be with.
+pub fn pair_counts(
+    matches: &[CrossRepoMatch],
+    ours: &BTreeSet<String>,
+    resolved: impl Fn(&CrossRepoMatch) -> bool,
+) -> PairCounts {
+    tally(
+        matches
+            .iter()
+            .filter(|pair| pair.relationship == carrick_match::MatchRelationship::ProducerConsumer)
+            .filter(|pair| ours.contains(&pair.producer_repo) || ours.contains(&pair.consumer_repo))
+            .map(|pair| {
+                pair.type_verdict
+                    .map(|verdict| counted_as(verdict, resolved(pair)))
+            }),
+    )
+}
+
+/// Count the SDK-mediated edges with a consumer or a producer in one of this
+/// repo's services, by type verdict (carrick#2284). `None` when there is none.
+///
+/// Counted apart from [`pair_counts`] because an edge's verdict is carried
+/// from the match the package's own call formed: counting it beside that
+/// match would state two comparisons where one ran. Each edge counts once,
+/// under the worse of the directions it states, each read as [`pair_counts`]
+/// reads a verdict, and as `not_compared` when it states neither. Its sides
+/// are its consumer and its producer, never the package's repo.
+pub fn sdk_pair_counts(sdk_edges: &[SdkEdge], ours: &BTreeSet<String>) -> Option<PairCounts> {
+    let mut edges = sdk_edges
+        .iter()
+        .filter(|edge| ours.contains(&edge.producer_repo) || ours.contains(&edge.consumer_repo))
+        .peekable();
+    edges.peek()?;
+    Some(tally(edges.map(|edge| {
+        let stated = |direction: &Option<DirectionVerdict>| {
+            direction
+                .as_ref()
+                .map(|direction| counted_as(direction.verdict, direction.resolved))
+        };
+        match (stated(&edge.request), stated(&edge.response)) {
+            (Some(request), Some(response)) => Some(request.combine(response)),
+            (one, other) => one.or(other),
+        }
+    })))
 }
 
 /// Mark each dependency conflict of a PR run with whether main has it, and
@@ -2372,11 +2406,11 @@ mod evidence_tests {
     fn sdk_edge(
         consumer: &str,
         producer: &str,
-        request: Option<&str>,
-        response: Option<&str>,
+        request: Option<(&str, bool)>,
+        response: Option<(&str, bool)>,
     ) -> SdkEdge {
-        let direction = |verdict: Option<&str>| {
-            verdict.map(|verdict| json!({ "verdict": verdict, "resolved": true }))
+        let direction = |stated: Option<(&str, bool)>| {
+            stated.map(|(verdict, resolved)| json!({ "verdict": verdict, "resolved": resolved }))
         };
         serde_json::from_value(json!({
             "consumer_repo": consumer,
@@ -2438,49 +2472,110 @@ mod evidence_tests {
             // No producer to be a pair with.
             shared_contract,
         ];
-        assert_eq!(pair_counts(&matches, &[], &ours()), counts(1, 1, 1, 1));
+        assert_eq!(pair_counts(&matches, &ours(), |_| true), counts(1, 1, 1, 1));
         assert_eq!(
-            pair_counts(&matches, &[], &BTreeSet::new()),
+            pair_counts(&matches, &BTreeSet::new(), |_| true),
             PairCounts::default()
         );
     }
 
+    /// The probe raises no diagnostic over an `any`, so a compatible verdict
+    /// the check did not reach over two known types compared nothing. It
+    /// counts as unverifiable. The other verdicts count as they read.
+    #[test]
+    fn a_compatible_verdict_over_unknown_types_counts_as_unverifiable() {
+        let matches = vec![
+            pair("api", "billing", "/orders", Some(TypeVerdict::Compatible)),
+            pair("api", "billing", "/carts", Some(TypeVerdict::Compatible)),
+            pair("api", "billing", "/users", Some(TypeVerdict::Incompatible)),
+            pair("api", "billing", "/health", None),
+        ];
+        let known = |pair: &CrossRepoMatch| pair.producer_key.ends_with("/orders");
+        assert_eq!(pair_counts(&matches, &ours(), known), counts(1, 1, 1, 1));
+    }
+
+    /// What the engine asks of each pair: every direction the check filed
+    /// compared two known types, and it filed at least one.
+    #[test]
+    fn an_edge_is_resolved_only_when_every_filed_direction_is() {
+        use crate::analyzer::{EdgeDirections, PairDirectionOutcome};
+        let direction = |resolved: bool| {
+            Some(PairDirectionOutcome {
+                verdict: TypeVerdict::Compatible,
+                reason: None,
+                resolved,
+                unresolved_reason: None,
+                notes: Vec::new(),
+                producer_wider: false,
+            })
+        };
+        let edge = |request, response| EdgeDirections { request, response };
+        assert!(edge(direction(true), direction(true)).resolved());
+        assert!(edge(None, direction(true)).resolved());
+        assert!(!edge(direction(true), direction(false)).resolved());
+        assert!(!edge(direction(false), None).resolved());
+        assert!(!edge(None, None).resolved());
+    }
+
+    const KNOWN: bool = true;
+
     #[test]
     fn an_sdk_edge_counts_once_under_its_worse_direction() {
         let worse = |request, response| {
-            pair_counts(
-                &[],
-                &[sdk_edge("web", "billing", request, response)],
-                &ours(),
-            )
+            sdk_pair_counts(&[sdk_edge("web", "billing", request, response)], &ours())
+                .expect("the edge is this repo's")
         };
         assert_eq!(
-            worse(Some("compatible"), Some("compatible")),
+            worse(Some(("compatible", KNOWN)), Some(("compatible", KNOWN))),
             counts(1, 0, 0, 0)
         );
         assert_eq!(
-            worse(Some("compatible"), Some("unverifiable")),
+            worse(Some(("compatible", KNOWN)), Some(("unverifiable", KNOWN))),
             counts(0, 1, 0, 0)
         );
         assert_eq!(
-            worse(Some("incompatible"), Some("unverifiable")),
+            worse(Some(("incompatible", KNOWN)), Some(("unverifiable", KNOWN))),
             counts(0, 0, 1, 0)
         );
-        assert_eq!(worse(None, Some("compatible")), counts(1, 0, 0, 0));
+        assert_eq!(worse(None, Some(("compatible", KNOWN))), counts(1, 0, 0, 0));
         assert_eq!(worse(None, None), counts(0, 0, 0, 1));
+        // A compatible direction over unknown types is unverifiable.
+        assert_eq!(
+            worse(Some(("compatible", KNOWN)), Some(("compatible", !KNOWN))),
+            counts(0, 1, 0, 0)
+        );
 
         // Its sides are its consumer and its producer: the package's repo is
         // neither, and an edge between two peers is not this repo's.
         let edges = vec![
-            sdk_edge("billing", "api", Some("compatible"), None),
-            sdk_edge("billing", "ledger", Some("incompatible"), None),
+            sdk_edge("billing", "api", Some(("compatible", KNOWN)), None),
+            sdk_edge("billing", "ledger", Some(("incompatible", KNOWN)), None),
         ];
         let mut with_sdk_repo = ours();
         with_sdk_repo.insert("ledger-sdk".to_string());
-        assert_eq!(pair_counts(&[], &edges, &ours()), counts(1, 0, 0, 0));
-        assert_eq!(
-            pair_counts(&[], &[edges[1].clone()], &with_sdk_repo),
-            PairCounts::default()
-        );
+        assert_eq!(sdk_pair_counts(&edges, &ours()), Some(counts(1, 0, 0, 0)));
+        assert_eq!(sdk_pair_counts(&edges[1..], &with_sdk_repo), None);
+        assert_eq!(sdk_pair_counts(&[], &ours()), None);
+    }
+
+    /// An edge and the direct pair its verdict was carried from are counted
+    /// in different places, so one comparison is stated once.
+    #[test]
+    fn an_sdk_edge_is_never_counted_among_the_direct_pairs() {
+        // The package's own call, in a service of this repo, against a peer.
+        let matches = vec![pair(
+            "billing",
+            "api",
+            "/v1/payments",
+            Some(TypeVerdict::Compatible),
+        )];
+        let edges = vec![sdk_edge(
+            "web",
+            "billing",
+            Some(("compatible", KNOWN)),
+            Some(("compatible", KNOWN)),
+        )];
+        assert_eq!(pair_counts(&matches, &ours(), |_| true), counts(1, 0, 0, 0));
+        assert_eq!(sdk_pair_counts(&edges, &ours()), Some(counts(1, 0, 0, 0)));
     }
 }

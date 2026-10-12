@@ -1076,7 +1076,14 @@ pub struct PeerIndexes {
 /// What a PR run checked (carrick#2284).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Checked {
+    /// Direct producer-consumer pairs. Each one outside `not_compared` is one
+    /// type comparison this run made.
     pub pairs: PairCounts,
+    /// SDK-mediated edges, whose verdict is carried from the match the
+    /// package's own call formed and is no comparison of its own. Omitted
+    /// when the run has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdk_pairs: Option<PairCounts>,
     pub dependencies: DependencyCounts,
 }
 
@@ -1084,7 +1091,9 @@ pub struct Checked {
 /// consumer in one of this repo's services, by type verdict. A pair is one
 /// call site against one producer operation. The first three count pairs the
 /// type check reached and say what it answered; `not_compared` counts the
-/// pairs it did not reach, whatever the protocol.
+/// pairs it did not reach, whatever the protocol. `compatible` holds only
+/// pairs compared over two known types: a compatible verdict over an `any`
+/// or `unknown` counts as `unverifiable`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PairCounts {
     pub compatible: usize,
@@ -1745,6 +1754,12 @@ mod tests {
                 incompatible: 1,
                 not_compared: 3,
             },
+            sdk_pairs: Some(PairCounts {
+                compatible: 4,
+                unverifiable: 0,
+                incompatible: 1,
+                not_compared: 2,
+            }),
             dependencies: DependencyCounts {
                 shared: 41,
                 changed: Some(2),
@@ -1767,6 +1782,7 @@ mod tests {
             v["checked"],
             json!({
                 "pairs": { "compatible": 22, "unverifiable": 5, "incompatible": 1, "not_compared": 3 },
+                "sdk_pairs": { "compatible": 4, "unverifiable": 0, "incompatible": 1, "not_compared": 2 },
                 "dependencies": { "shared": 41, "changed": 2 },
             })
         );
@@ -1780,7 +1796,9 @@ mod tests {
             unreachable!()
         };
         checked.dependencies.changed = None;
+        checked.sdk_pairs = None;
         let v = serde_json::to_value(&payload).unwrap();
+        assert!(v["checked"].get("sdk_pairs").is_none(), "{v:#}");
         assert_eq!(v["baseline"]["base_sha"], serde_json::Value::Null);
         assert_eq!(v["baseline"]["copy"], "none");
         assert_eq!(v["checked"]["dependencies"], json!({ "shared": 41 }));

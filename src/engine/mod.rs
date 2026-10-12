@@ -1940,6 +1940,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // comment + check run via the GitHub App, gated on the project's
     // pr_comments_enabled toggle. Best-effort: a relay failure is logged,
     // never fatal. Assembled before `results` moves into the formatter.
+    //
+    // Whether each pair's check compared two known types, which decides if a
+    // compatible verdict counts as one (carrick#2284).
+    let pair_directions = analyzer.pair_directions();
     let pr_result = pr_context().map(|pr| crate::findings::PrResultPayload {
         repo: repo_name.clone(),
         pr_number: pr.number,
@@ -1976,9 +1980,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .map(|evidence| crate::findings::Checked {
                 pairs: crate::pr_baseline::pair_counts(
                     &results.cross_repo_matches,
-                    &results.sdk_edges,
                     &evidence.ours,
+                    |pair| pair_directions.for_edge(pair).resolved(),
                 ),
+                sdk_pairs: crate::pr_baseline::sdk_pair_counts(&results.sdk_edges, &evidence.ours),
                 dependencies: evidence.dependencies,
             }),
     });

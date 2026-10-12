@@ -776,6 +776,36 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }
 
+/// carrick#2284, with the real sidecar: the pairs the type check reached are
+/// counted under what it answered, and a type the PR breaks moves its pairs
+/// from compatible to incompatible.
+#[tokio::test]
+async fn a_typed_pr_result_counts_each_compared_pair_under_its_verdict() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan_with(&store, &producer, true).await;
+    scan_with(&store, &consumer, true).await;
+
+    set_consumer_verb(&consumer, "GET", 3);
+    commit(&consumer, "pr: unrelated edit above the call");
+    let agreeing = pr_payload_with(&store, &consumer, true).await["checked"]["pairs"].clone();
+
+    set_consumer_count_type(&consumer, "string");
+    commit(&consumer, "pr: string count");
+    let broken = pr_payload_with(&store, &consumer, true).await["checked"]["pairs"].clone();
+
+    // The consumer's three calls share the response type the PR breaks.
+    assert_eq!(
+        agreeing,
+        serde_json::json!({ "compatible": 3, "unverifiable": 0, "incompatible": 0, "not_compared": 0 })
+    );
+    assert_eq!(
+        broken,
+        serde_json::json!({ "compatible": 0, "unverifiable": 0, "incompatible": 3, "not_compared": 0 })
+    );
+}
+
 /// The two-service repo whose consumer reads a response field off calls that
 /// publish no comparable type, so only the retype check (carrick#1491) can
 /// judge them: `web/src/checkout.ts` reads `response.data.x` after the calls

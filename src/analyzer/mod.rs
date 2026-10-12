@@ -782,6 +782,18 @@ impl EdgeDirections {
     pub fn is_empty(&self) -> bool {
         self.request.is_none() && self.response.is_none()
     }
+
+    /// Whether the check compared two known types on every direction it filed
+    /// for this edge. False when it filed none. A `Compatible` verdict on an
+    /// edge that is not resolved is the probe raising no diagnostic over an
+    /// `any` or `unknown`, which is no comparison (see `verdict_state_for`).
+    pub fn resolved(&self) -> bool {
+        !self.is_empty()
+            && [&self.request, &self.response]
+                .into_iter()
+                .flatten()
+                .all(|direction| direction.resolved)
+    }
 }
 
 /// Every checked pair's outcome, kept per DIRECTION and joined to an edge by
