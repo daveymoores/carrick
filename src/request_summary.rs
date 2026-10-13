@@ -1024,7 +1024,7 @@ struct OwnGetter {
 impl FileIr {
     /// A span start this file's [`BindingUse`]s record (discovery
     /// numbering) in SWC numbering, as [`Site::span_start`] is.
-    fn swc_start(&self, lo: u32) -> u32 {
+    pub(crate) fn swc_start(&self, lo: u32) -> u32 {
         lo.saturating_sub(self.source_start) + SWC_SPAN_BASE
     }
 

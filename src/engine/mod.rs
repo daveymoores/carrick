@@ -1439,6 +1439,25 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             );
         }
     }
+    // 4d. A model row at a call through the repository's own code takes the
+    // request that call reaches (carrick#1146). Here, because the request is
+    // usually written in another service: this is the first point at which
+    // every service's rows and definitions are in hand, and the last before
+    // the payloads and the cross-service check are built from them. A
+    // carried or held-back service is read and never written: the generation
+    // the index serves stands in for it.
+    {
+        let mut services: Vec<crate::call_through::ServiceRows<'_>> = runs
+            .iter_mut()
+            .map(|run| crate::call_through::ServiceRows {
+                writable: !run.carried && !run.held_back,
+                data: &mut run.data,
+                sites: &run.call_through,
+            })
+            .collect();
+        crate::call_through::settle(&mut services);
+    }
+
     // Whether this run leaves a service short of a complete index. A missing
     // function description alone does not: it never held an index back.
     let incomplete = runs.iter().any(|run| run.owed.thins_the_index());
@@ -2182,6 +2201,9 @@ struct ServiceRun {
     /// Not analysed: `data` is its stored generation (`--changed-only`,
     /// carrick#2227).
     carried: bool,
+    /// The definitions each of its model call rows goes through, for the
+    /// pass that settles them once every service is read (carrick#1146).
+    call_through: crate::call_through::CallThroughSites,
 }
 
 impl ServiceRun {
@@ -2198,6 +2220,7 @@ impl ServiceRun {
             owed: durability::OwedWork::default(),
             held_back: false,
             carried: true,
+            call_through: Default::default(),
         }
     }
 }
@@ -2429,6 +2452,7 @@ impl ServiceScan {
             owed,
             held_back: false,
             carried: false,
+            call_through: analysis.call_through,
         })
     }
 }
@@ -4095,6 +4119,11 @@ async fn analyze_current_repo_incremental(
             return Ok(ServiceAnalysis {
                 data: cloud_data,
                 deferred: setup.deferred,
+                call_through: crate::call_through::read_sites(
+                    &merged_results,
+                    &request_inputs,
+                    repo_path,
+                ),
             });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
@@ -9665,6 +9694,11 @@ async fn analyze_current_repo(
     Ok(ServiceAnalysis {
         data: cloud_data,
         deferred: setup.deferred,
+        call_through: crate::call_through::read_sites(
+            &analysis_result.file_results,
+            &request_inputs,
+            repo_path,
+        ),
     })
 }
 
