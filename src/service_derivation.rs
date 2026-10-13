@@ -27,6 +27,12 @@ pub struct ServiceDerivation {
     /// found. It rides in `.carrick/proposal.json` and the quickstart, and the
     /// terminal never prints it — printed, it was a warning marker on a first
     /// run that had raised no warning at all (carrick#1032).
+    ///
+    /// It also carries one fact per decision this run made in place of
+    /// refusing (carrick#2274): `skipped_pattern: <pattern>` for a workspace
+    /// pattern that is unsupported or matched no manifest, and
+    /// `renamed_duplicate: <name> -> <directory>` for a later member whose
+    /// package name an earlier one holds. Nothing prints them either.
     pub notes: Vec<String>,
 }
 
@@ -261,6 +267,9 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let sources = workspace_patterns(&root)?;
     let mut members: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    // What this derivation decided in place of refusing, one fact each, for
+    // `notes` (carrick#2274).
+    let mut decided = Vec::new();
     let mut reasons = sources
         .iter()
         .map(|(name, _)| name.clone())
@@ -280,19 +289,25 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                     .unwrap_or(raw)
                     .trim_start_matches("./")
                     .trim_end_matches('/');
-                if pattern.is_empty()
+                // A pattern this walk cannot read inside the repository
+                // selects nothing, as a package manager that cannot match it
+                // would select nothing: the rest of the split stands
+                // (carrick#2274).
+                let compiled = if pattern.is_empty()
                     || Path::new(pattern).is_absolute()
                     || pattern.contains(['{', '}', '\\'])
                     || Path::new(pattern)
                         .components()
                         .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
                 {
-                    return Err(format!(
-                        "Unsupported workspace pattern '{raw}'; use repository-relative glob paths or an explicit carrick.json."
-                    ));
-                }
-                let compiled = glob::Pattern::new(pattern)
-                    .map_err(|e| format!("Invalid workspace pattern '{raw}': {e}"))?;
+                    None
+                } else {
+                    glob::Pattern::new(pattern).ok()
+                };
+                let Some(compiled) = compiled else {
+                    decided.push(format!("skipped_pattern: {raw}"));
+                    continue;
+                };
                 if raw.starts_with('!') {
                     negative.push(compiled);
                 } else {
@@ -345,9 +360,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         }
         for (raw, _, seen) in positive {
             if !seen {
-                return Err(format!(
-                    "Workspace pattern '{raw}' matched no package manifests; correct it or declare services in carrick.json."
-                ));
+                decided.push(format!("skipped_pattern: {raw}"));
             }
         }
     }
@@ -369,10 +382,9 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
             members.entry(directory).or_insert(manifest);
         }
     }
+    // Patterns that select no member leave the repository one root service,
+    // as it is when it declares no workspace at all (carrick#2274).
     if members.is_empty() {
-        if !sources.is_empty() && sources.iter().any(|(_, patterns)| !patterns.is_empty()) {
-            return Err("Workspace patterns select no services; declare the intended services in carrick.json.".into());
-        }
         members.insert(root.clone(), root.join("package.json"));
     }
     let mut names = BTreeSet::new();
@@ -393,13 +405,22 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 (!relative.as_os_str().is_empty())
                     .then(|| relative.to_string_lossy().replace('\\', "/"))
             });
-        if let Some(name) = &name
-            && !names.insert(name.clone())
-        {
-            return Err(format!(
-                "Derived service name '{name}' is duplicated; declare unique names in carrick.json."
-            ));
-        }
+        // The first member in directory order keeps a name two manifests
+        // declare; each later one is named by its repository-relative
+        // directory, which no other member holds (carrick#2274).
+        let name = match name {
+            Some(name) if !names.insert(name.clone()) => {
+                let directory = relative.to_string_lossy().replace('\\', "/");
+                if !names.insert(directory.clone()) {
+                    return Err(format!(
+                        "Derived service name '{directory}' is duplicated; declare unique names in carrick.json."
+                    ));
+                }
+                decided.push(format!("renamed_duplicate: {name} -> {directory}"));
+                Some(directory)
+            }
+            name => name,
+        };
         let tsconfig = if crate::deno_support::service_manifest(
             &root,
             &Config {
@@ -438,6 +459,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     if has_deno {
         notes.push("Deno services use their existing manifests and require Deno on PATH for type resolution.".into());
     }
+    notes.extend(decided);
     let members = member_facts(&root, &services);
     Ok(ServiceDerivation {
         reason: if reasons.is_empty() {

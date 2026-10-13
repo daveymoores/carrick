@@ -419,8 +419,9 @@ fn derive(root: Option<&Path>, candidates: bool) -> Result<serde_json::Value, St
         // library beside each service; `config` stays the carrick.json
         // skeleton, which those facts are not part of (carrick#994).
         // `warnings` is what this derivation found and a caller prints;
-        // `notes` is the standing advice about a proposal of this shape, which
-        // rides in this document and nowhere else (carrick#1032).
+        // `notes` is the standing advice about a proposal of this shape and
+        // the facts of a split derived in place of a refusal, which ride in
+        // this document and nowhere else (carrick#1032, carrick#2274).
         // `not_installed` is the preflight's own dependency rule, asked before
         // the handoff rather than by a refused scan: `carrick init` puts the
         // install in the agent's instruction (carrick#1489, carrick#1254).
