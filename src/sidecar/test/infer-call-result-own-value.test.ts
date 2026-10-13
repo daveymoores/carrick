@@ -214,8 +214,8 @@ describe('carrick#2282: a return statement answers only for a call of its own fu
  * and `!` peeled, is the tracked name. Any other use that is not a member
  * read is a whole read, and the answer stays the call's own value.
  *
- * Two readings are kept on purpose. A platform body read (`res.blob()`) is
- * the body, as `res.json()` is. And where the call's own value is untyped
+ * Two readings are kept on purpose. An expression that holds a platform body
+ * read that is not json or text (`await res.blob()`) holds the body. And where the call's own value is untyped
  * (`unknown`, `any`), a call that takes it whole is the first place the
  * source states a type for it, so the walk still follows it (carrick#1375).
  */
@@ -301,8 +301,8 @@ export async function blobBody() {
 
 export async function bufferBody() {
   const bufferRes = await fetch(url + '/buffer');
-  const buffer = await bufferRes.arrayBuffer();
-  console.log(buffer);
+  const bytes = new Uint8Array(await bufferRes.arrayBuffer());
+  console.log(bytes);
 }
 
 export async function untypedThenParsed() {
@@ -428,9 +428,9 @@ describe('carrick#2112: a later expression answers for a call only when it resta
     );
   });
 
-  it('still reads a platform body read that is not json or text as the body', async () => {
+  it('still reads the expression that holds a platform body read that is not json or text', async () => {
     assert.strictEqual(await callResult('Blob', "fetch(url + '/blob')", 'const blobRes'), 'Blob');
-    assert.strictEqual(await callResult('Buffer', "fetch(url + '/buffer')", 'const bufferRes'), 'ArrayBuffer');
+    assert.strictEqual(await callResult('Buffer', "fetch(url + '/buffer')", 'const bufferRes'), 'Uint8Array<ArrayBuffer>');
   });
 
   it('still follows an untyped value into the call that first states its type', async () => {
