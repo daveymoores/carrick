@@ -3343,14 +3343,28 @@ fn hash_workspace_package_jsons(
 ) -> Result<String, std::io::Error> {
     let repo_root = Path::new(repo_path);
     let inputs = crate::deno_support::resolution_inputs(repo_root, &packages.source_paths)?;
-    // The root and a manifest may name one tree two ways (a symlink on the
-    // way in, resolved in one and not the other). The key is the path inside
-    // the tree either way: an absolute key would make the hash differ between
-    // two checkouts of one commit, and the setup would be asked for again.
+    // A manifest's key is part of what every stored blob's hash was computed
+    // from, so it stays what was written for each way of naming the root
+    // (carrick#2314, pinned by `tests/manifest_hash_pin_test.rs`):
+    //
+    // - A manifest under `repo_root` as spelled: its path inside the tree.
+    // - A relative manifest path (the root was named `.` or by a relative
+    //   path, and `repo_root` is its canonical form): the path as written,
+    //   `./apps/api/package.json`. It names no machine, and every blob
+    //   stored by a scan run as `carrick .` was hashed with it. Making it
+    //   agree with the absolute spelling is carrick#1715.
+    // - An absolute manifest path `repo_root` does not prefix (a symlink on
+    //   the way in, resolved in one and not the other): its path inside the
+    //   tree. Written as it stands it would name the directory the checkout
+    //   sits in, and a second checkout of one commit would ask for its setup
+    //   again.
     let canonical_root = repo_root.canonicalize().ok();
     let inside = |path: &Path| -> Option<PathBuf> {
         if let Ok(relative) = path.strip_prefix(repo_root) {
             return Some(relative.to_path_buf());
+        }
+        if path.is_relative() {
+            return None;
         }
         let root = canonical_root.as_ref()?;
         let parent = path.parent()?.canonicalize().ok()?;
@@ -11016,6 +11030,29 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap(),
                 expected,
                 "root {root:?}, manifest under {manifest_root:?}"
+            );
+        }
+    }
+
+    /// carrick#2314: a manifest the scan named by a relative path (the root
+    /// was `.` or a relative path) keeps that spelling as its key, against a
+    /// root that is canonical by then. Every blob stored by a scan run as
+    /// `carrick .` was hashed with it.
+    #[test]
+    fn a_relative_manifest_path_is_keyed_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for written in ["./apps/api/package.json", "tree/apps/api/package.json"] {
+            let packages = Packages {
+                source_paths: vec![PathBuf::from(written)],
+                ..Default::default()
+            };
+            // Nothing is read at a relative path from a test's own directory:
+            // the key is what this pins.
+            assert_eq!(
+                hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap(),
+                hash_file_content(&format!("{written}\0missing\0")),
+                "{written}"
             );
         }
     }
