@@ -355,13 +355,22 @@ pub fn decide(
 }
 
 /// What a stored blob says it still owed when it was written: degraded types,
-/// files the model never answered, candidates no model was asked about.
+/// a type extraction problem short of that, files the model never answered,
+/// candidates no model was asked about.
 fn owed_work(stored: &CloudRepoData) -> Option<String> {
     if let Some(degraded) = &stored.types_degraded {
         return Some(format!(
             "the stored index lost its types ({})",
             degraded.stage
         ));
+    }
+    // A status without a degradation: the extraction config was asked for and
+    // did not arrive, so machinery wrappers stayed wrapped, or the capture
+    // answered without a stub. The types the blob holds are what a contract
+    // check would compare, and only an analysis asks for the config again
+    // (carrick#2301).
+    if stored.type_extraction_status.is_some() {
+        return Some("the stored index recorded a type extraction problem".to_string());
     }
     let boundary = stored.boundary.as_ref()?;
     if boundary.files_lost.total > 0 {
@@ -1082,6 +1091,12 @@ mod tests {
         });
         assert_eq!(
             reason(&decide_with(Some(&degraded), Ok(&changes), api_inputs())),
+            Some(Reason::StoredIncomplete)
+        );
+        let mut wrapped = stored("abcdef1234");
+        wrapped.type_extraction_status = Some("machinery unwrapping disabled this run".to_string());
+        assert_eq!(
+            reason(&decide_with(Some(&wrapped), Ok(&changes), api_inputs())),
             Some(Reason::StoredIncomplete)
         );
         let mut lost = stored("abcdef1234");
