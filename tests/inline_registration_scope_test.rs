@@ -1224,6 +1224,42 @@ async fn a_helper_called_from_two_scopes_is_served_under_both() {
 
 #[tokio::test]
 #[serial]
+async fn a_hand_on_reached_from_three_scopes_is_one_mount_and_serves_each() {
+    // Two scopes in one file and one in another all hand their instance to
+    // `registerAllRoutes`, which hands it on. The hand-on is stated once, and
+    // every scope that reaches it carries its own prefix through.
+    let scopes = answer(
+        "src/helper-two-scopes-chain.ts",
+        &[
+            ("// first scope", "app", "api", "/a", None),
+            ("// second scope", "app", "api", "/b", None),
+        ],
+        &[],
+    );
+    let result = analyze_with(
+        vec![scopes, scope_only("src/helper-chain.ts"), team_items()],
+        &["src/all-routes.ts"],
+    )
+    .await;
+    assert_eq!(
+        served(&result),
+        set(&[
+            "GET /a/teams/:id/items",
+            "GET /b/teams/:id/items",
+            "GET /api/v1/teams/:id/items"
+        ])
+    );
+    let hand_ons = result
+        .mount_graph
+        .get_mounts()
+        .iter()
+        .filter(|edge| edge.child == "registerItemRoutes")
+        .count();
+    assert_eq!(hand_ons, 1);
+}
+
+#[tokio::test]
+#[serial]
 async fn two_helpers_of_one_file_handed_one_scope_keep_their_paths() {
     // Both helpers are mounted from the scope, and both resolve to one file.
     // The graph does not decide which of the two a route belongs to, so
