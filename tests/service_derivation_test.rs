@@ -23,6 +23,8 @@ fn npm_services_use_member_names_and_nearest_tsconfig_and_roundtrip_identically(
         r#"{"name":"@sample/api","dependencies":{"@sample/shared":"workspace:*"}}"#,
     );
     write(root, "packages/api/tsconfig.json", "{}");
+    // A member is a service when it holds source (carrick#2298).
+    write(root, "packages/api/src/server.ts", "export const port = 1;");
     write(
         root,
         "packages/shared/package.json",

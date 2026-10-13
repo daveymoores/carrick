@@ -949,7 +949,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // 3. Resolve the services declared for this repo (one for the common
     //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
-    let services = resolve_services(repo_path)?;
+    let crate::service_derivation::ScanServices {
+        services,
+        declared,
+        without_source: members_without_source,
+    } = resolve_services(repo_path)?;
     let multi_service = services.len() > 1;
     if multi_service {
         info!("Resolved {} services in {}", services.len(), repo_name);
@@ -1083,6 +1087,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // place, every analysed one's outcome in its.
     let mut outcomes: Vec<Option<ServiceOutcome>> = outcomes.into_iter().map(Some).collect();
     let mut first_failure = None;
+    // Services nobody declared whose walk read no source (carrick#2298).
+    let mut without_source = Vec::new();
     for (index, service) in services.iter().enumerate() {
         let Some(at) = scan_index[index] else {
             // Carried, which only a service with a stored generation is, and
@@ -1098,10 +1104,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .expect("every analysed service has an outcome")
         {
             Ok(run) => runs.push(run),
+            Err(error) if !declared && error.is::<NoSourceFiles>() => {
+                without_source.push((index, error));
+            }
             Err(error) => {
                 first_failure.get_or_insert((index, error));
             }
         }
+    }
+    // No service of the run holds source: the scan target is wrong, which is
+    // the failure it always was.
+    if runs.is_empty() && first_failure.is_none() && !without_source.is_empty() {
+        first_failure = Some(without_source.remove(0));
     }
     if let Some((index, error)) = first_failure {
         // Not a model failure — those defer, they do not reach here — so
@@ -1135,10 +1149,42 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     git_state.dirty,
                     unchanged_at_start.as_ref(),
                 );
+                // The landing is an upload and says so while it runs. The
+                // failure it follows was raised in the analysis, and the
+                // stage the run reports is that one (carrick#2298). With
+                // services analysed side by side it is the last stage any of
+                // them entered, as `scan_stage` keeps it.
+                let failed_in = crate::scan_stage::current();
                 upload_service_payloads(storage, &payloads, no_cache, false, &boundary).await;
+                crate::scan_stage::enter(failed_in);
             }
         }
         return Err(error);
+    }
+    // The services left out take no further part: everything below reads
+    // `services`, `scan_index` and `runs` position for position.
+    let services_without_source: Vec<String> = without_source
+        .iter()
+        .map(|(index, _)| {
+            let service = &services[*index];
+            service
+                .service_name
+                .clone()
+                .or_else(|| service.directory.clone())
+                .unwrap_or_else(|| "(root)".to_string())
+        })
+        .collect();
+    let (services, scan_index): (Vec<Config>, Vec<Option<usize>>) = services
+        .into_iter()
+        .zip(scan_index)
+        .enumerate()
+        .filter(|(index, _)| !without_source.iter().any(|(left_out, _)| left_out == index))
+        .map(|(_, kept)| kept)
+        .unzip();
+    // Said on the terminal once, in the run's closing lines.
+    let left_out_lines = without_source_lines(&members_without_source, &services_without_source);
+    for line in &left_out_lines {
+        debug!("{line}");
     }
 
     // 4a. A dispatched run ends here, and this is its whole product: every
@@ -2008,7 +2054,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // The last lines of the run: what it could not classify (carrick#705). An
     // answer that ends without its boundary reads as a complete one.
-    print_boundaries(&boundaries);
+    print_boundaries(&boundaries, &left_out_lines);
     print_graphql_notices(&graphql_notices);
 
     if let Some(payload) = pr_result {
@@ -2244,8 +2290,12 @@ impl ServiceScan {
         .await
         // The one place the error is flattened: what is not the model's to
         // defer ends the run with its words, and nothing downstream reads its
-        // type.
-        .map_err(|error| error.to_string().into())
+        // type. Except a walk that read no source, which the run may leave
+        // out instead (carrick#2298).
+        .map_err(|error| match error.downcast::<NoSourceFiles>() {
+            Ok(no_source) => no_source as Box<dyn std::error::Error + Send + Sync>,
+            Err(error) => error.to_string().into(),
+        })
     }
 
     /// [`Self::analyze`] inside the service's [`crate::current_service`] scope.
@@ -2524,11 +2574,21 @@ fn local_boundaries(
 /// Stdout, beside the report it belongs to. The eval projection mode returns
 /// long before this, so the machine-readable output on stdout is never mixed
 /// with it.
-fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
-    if boundaries.is_empty() {
+///
+/// `left_out` is the services the run did not analyse because they hold no
+/// source ([`without_source_lines`]): they have no boundary of their own, and
+/// a block that did not name them would read as covering every service.
+fn print_boundaries(
+    boundaries: &[(String, crate::boundary::ServiceBoundary)],
+    left_out: &[String],
+) {
+    if boundaries.is_empty() && left_out.is_empty() {
         return;
     }
     crate::outln!("\nWhat this scan could not classify");
+    for line in left_out {
+        crate::outln!("{line}");
+    }
     for (service, boundary) in boundaries {
         for line in boundary.lines(service) {
             crate::outln!("{line}");
@@ -7434,10 +7494,9 @@ fn discover_files_and_symbols(
                     .join("; ")
             )
         };
-        return Err(format!(
+        return Err(Box::new(NoSourceFiles(format!(
             "No JS/TS source files found under {scope} in '{repo_path}'. {advice}"
-        )
-        .into());
+        ))));
     }
     for left_out in &left_out {
         info!("{}", left_out_line(left_out));
@@ -7847,8 +7906,61 @@ fn semantics_schedule_applies(generation: PreviousGeneration) -> bool {
 /// A config that exists but cannot be parsed, or that declares paths that
 /// don't exist, is a hard error: silently falling back to defaults would
 /// ignore the user's declared service layout and upload a wrong index.
-fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
-    crate::service_derivation::resolve_for_scan(std::path::Path::new(repo_path)).map_err(Into::into)
+///
+/// The list comes with where it came from: a service nobody declared that
+/// holds no source is left out of the run rather than failing it
+/// (carrick#2298).
+fn resolve_services(
+    repo_path: &str,
+) -> Result<crate::service_derivation::ScanServices, Box<dyn std::error::Error>> {
+    crate::service_derivation::scan_services(std::path::Path::new(repo_path)).map_err(Into::into)
+}
+
+/// A service's walk read no source file.
+///
+/// Typed because the run decides on it: for a service somebody declared in
+/// `carrick.json` it is a wrong path and fails the scan; a service nobody
+/// declared is left out and named in the run's closing lines (carrick#2298).
+#[derive(Debug)]
+struct NoSourceFiles(String);
+
+impl std::fmt::Display for NoSourceFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoSourceFiles {}
+
+/// What the run's closing lines say about the services it left out because
+/// they hold no source (carrick#2298): the workspace members the derivation
+/// dropped, in one line, then one line for each service whose walk read
+/// nothing.
+fn without_source_lines(members: &[String], services: &[String]) -> Vec<String> {
+    /// Directories named before the rest become a count.
+    const NAMED: usize = 5;
+    let mut lines = Vec::new();
+    if !members.is_empty() {
+        let mut named = members
+            .iter()
+            .take(NAMED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if members.len() > NAMED {
+            named.push_str(&format!(" and {} more", members.len() - NAMED));
+        }
+        lines.push(format!(
+            "{} workspace member(s) left out, no JS/TS source: {named}",
+            members.len()
+        ));
+    }
+    lines.extend(
+        services.iter().map(|service| {
+            format!("{service}: left out, the scan read no JS/TS source file in it")
+        }),
+    );
+    lines
 }
 
 /// Build-artifact directories to skip everywhere.
@@ -14281,7 +14393,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     #[test]
     fn resolve_services_without_config_defaults_to_single_service() {
         let tmp = tempfile::tempdir().unwrap();
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 1);
         assert!(services[0].directory.is_none());
     }
@@ -14347,7 +14461,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         )
         .unwrap();
 
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 3);
         assert!(services[0].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
         assert!(services[1].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
@@ -14399,7 +14515,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         )
         .unwrap();
 
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].directory.as_deref(), Some("svc"));
     }

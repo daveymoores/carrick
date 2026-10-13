@@ -28,6 +28,11 @@ pub struct ServiceDerivation {
     /// terminal never prints it — printed, it was a warning marker on a first
     /// run that had raised no warning at all (carrick#1032).
     pub notes: Vec<String>,
+    /// Workspace members that are no service because they hold no source
+    /// file, as repo-relative directories (carrick#2298). A scan names them in
+    /// its closing lines; the derive document carries them in `notes`.
+    #[serde(skip)]
+    pub without_source: Vec<String>,
 }
 
 /// The manifest facts that decide application from library.
@@ -154,6 +159,26 @@ pub fn workspace_patterns(root: &Path) -> Result<Vec<(String, Vec<String>)>, Str
 /// list. Only a no-model pass takes the hosted configs: CI, the runner and
 /// every scan that asks the model resolve from the tree as before.
 pub fn resolve_for_scan(root: &Path) -> Result<Vec<Config>, String> {
+    scan_services(root).map(|scan| scan.services)
+}
+
+/// [`resolve_for_scan`]'s list, with what the engine needs to know about
+/// where it came from (carrick#2298).
+#[derive(Debug)]
+pub struct ScanServices {
+    pub services: Vec<Config>,
+    /// The list is the tree's own `carrick.json`: somebody named each
+    /// service, so one that holds no source is a wrong path and fails the
+    /// scan. A list nobody wrote (derived from manifests, or the hosted
+    /// index's) leaves such a service out and says so.
+    pub declared: bool,
+    /// Workspace members the derivation left out because they hold no source
+    /// file, as repo-relative directories.
+    pub without_source: Vec<String>,
+}
+
+/// The services a scan of `root` reads and where the list came from.
+pub fn scan_services(root: &Path) -> Result<ScanServices, String> {
     resolve_gated(root, crate::local_mode::no_model(), || {
         crate::local_mode::hosted::previous_data()
             .map_err(|e| tracing::debug!("No hosted previous generation for services: {e}"))
@@ -162,19 +187,19 @@ pub fn resolve_for_scan(root: &Path) -> Result<Vec<Config>, String> {
     })
 }
 
-/// [`resolve_for_scan`] with its two inputs from the environment handed in.
+/// [`scan_services`] with its two inputs from the environment handed in.
 fn resolve_gated(
     root: &Path,
     no_model: bool,
     previous: impl FnOnce() -> Option<Vec<crate::cloud_storage::CloudRepoData>>,
-) -> Result<Vec<Config>, String> {
+) -> Result<ScanServices, String> {
     // A tree that holds its own config never reads the previous generation.
     let hosted = if no_model && !has_root_config(root)? {
         previous()
     } else {
         None
     };
-    resolve_with_hosted(root, hosted.as_deref())
+    scan_services_with_hosted(root, hosted.as_deref())
 }
 
 /// [`resolve_for_scan`] with the hosted blobs handed in, for a caller that
@@ -188,19 +213,33 @@ pub fn resolve_with_hosted(
     root: &Path,
     hosted: Option<&[crate::cloud_storage::CloudRepoData]>,
 ) -> Result<Vec<Config>, String> {
-    if !has_root_config(root)?
-        && let Some(services) = hosted.and_then(|blobs| hosted_services(root, blobs))
-    {
+    scan_services_with_hosted(root, hosted).map(|scan| scan.services)
+}
+
+fn scan_services_with_hosted(
+    root: &Path,
+    hosted: Option<&[crate::cloud_storage::CloudRepoData]>,
+) -> Result<ScanServices, String> {
+    let declared = has_root_config(root)?;
+    if !declared && let Some(services) = hosted.and_then(|blobs| hosted_services(root, blobs)) {
         tracing::debug!(
             "Services for {}: the hosted index's configs ({})",
             root.display(),
             services.len()
         );
-        return Ok(services);
+        return Ok(ScanServices {
+            services,
+            declared,
+            without_source: Vec::new(),
+        });
     }
     let derived = resolve(root)?;
     tracing::debug!("Services for {}: {}", root.display(), derived.reason);
-    Ok(derived.services)
+    Ok(ScanServices {
+        services: derived.services,
+        declared,
+        without_source: derived.without_source,
+    })
 }
 
 fn has_root_config(root: &Path) -> Result<bool, String> {
@@ -253,6 +292,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 services,
                 warnings: Vec::new(),
                 notes: Vec::new(),
+                without_source: Vec::new(),
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -369,6 +409,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
             members.entry(directory).or_insert(manifest);
         }
     }
+    let without_source = leave_out_members_without_source(&root, &mut members);
     if members.is_empty() {
         if !sources.is_empty() && sources.iter().any(|(_, patterns)| !patterns.is_empty()) {
             return Err("Workspace patterns select no services; declare the intended services in carrick.json.".into());
@@ -438,6 +479,11 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     if has_deno {
         notes.push("Deno services use their existing manifests and require Deno on PATH for type resolution.".into());
     }
+    notes.extend(
+        without_source
+            .iter()
+            .map(|directory| format!("skipped_no_source: {directory}")),
+    );
     let members = member_facts(&root, &services);
     Ok(ServiceDerivation {
         reason: if reasons.is_empty() {
@@ -450,7 +496,72 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         config,
         warnings,
         notes,
+        without_source,
     })
+}
+
+/// Take out of `members` every workspace member that holds no source file,
+/// and return their repo-relative directories (carrick#2298).
+///
+/// A package manager's member is a directory with a manifest. A service is
+/// source: a member that holds none (a configuration package, a package of
+/// assets) has nothing a scan can index, and as a service it failed the scan
+/// of every other member.
+///
+/// When no member holds source, none is taken out: nothing says which
+/// directory was meant, and the scan reports the tree as it does a repository
+/// with no source at all.
+fn leave_out_members_without_source(
+    root: &Path,
+    members: &mut BTreeMap<PathBuf, PathBuf>,
+) -> Vec<String> {
+    let directories: BTreeSet<PathBuf> = members.keys().cloned().collect();
+    let without: Vec<PathBuf> = directories
+        .iter()
+        .filter(|directory| !holds_source(directory, &directories))
+        .cloned()
+        .collect();
+    if without.len() == directories.len() {
+        return Vec::new();
+    }
+    without
+        .into_iter()
+        .map(|directory| {
+            members.remove(&directory);
+            let relative = directory.strip_prefix(root).unwrap_or(&directory);
+            if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                relative.to_string_lossy().replace('\\', "/")
+            }
+        })
+        .collect()
+}
+
+/// Whether `directory` holds a file with one of the extensions a scan reads
+/// ([`crate::file_finder::SOURCE_EXTENSIONS`], the list the npm manifest
+/// publishes as `carrickInputs.source_extensions`), outside the other
+/// members' own directories. Stops at the first one.
+///
+/// The extension alone, as the published rule is: whether the scan's walk
+/// then reads the file (a test, a path git ignores, an `exclude`) is the
+/// walk's question, and the scan answers it for each service nobody declared.
+fn holds_source(directory: &Path, members: &BTreeSet<PathBuf>) -> bool {
+    walkdir::WalkDir::new(directory)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || (entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name != ".git" && !MANIFEST_SKIP_DIRS.contains(&name))
+                    && !members.contains(entry.path()))
+        })
+        .flatten()
+        .any(|entry| {
+            entry.file_type().is_file() && crate::file_finder::has_source_extension(entry.path())
+        })
 }
 
 /// The manifest a service's own directory holds, npm's before Deno's.
@@ -846,7 +957,9 @@ mod tests {
     #[test]
     fn a_no_model_re_read_takes_the_hosted_configs() {
         let tmp = workspace();
-        let services = resolve_gated(tmp.path(), true, || Some(hosted())).unwrap();
+        let services = resolve_gated(tmp.path(), true, || Some(hosted()))
+            .unwrap()
+            .services;
         assert_eq!(names(&services), ["a", "b"]);
         assert!(services[0].internal_env_vars.contains("API_URL"));
         assert!(services[1].internal_env_vars.contains("API_URL"));
@@ -861,7 +974,9 @@ mod tests {
             r#"{"services":[{"name":"declared","directory":"packages/a"}]}"#,
         )
         .unwrap();
-        let services = resolve_gated(tmp.path(), true, || Some(hosted())).unwrap();
+        let services = resolve_gated(tmp.path(), true, || Some(hosted()))
+            .unwrap()
+            .services;
         assert_eq!(names(&services), ["declared"]);
         let services = resolve_with_hosted(tmp.path(), Some(&hosted())).unwrap();
         assert_eq!(names(&services), ["declared"]);
@@ -870,7 +985,9 @@ mod tests {
     #[test]
     fn a_scan_that_asks_the_model_derives_from_the_tree() {
         let tmp = workspace();
-        let services = resolve_gated(tmp.path(), false, || Some(hosted())).unwrap();
+        let services = resolve_gated(tmp.path(), false, || Some(hosted()))
+            .unwrap()
+            .services;
         assert_eq!(names(&services), ["@scope/a", "@scope/b"]);
     }
 
@@ -879,7 +996,9 @@ mod tests {
         let tmp = workspace();
         let mut blobs = hosted();
         blobs[1].config_json = None;
-        let services = resolve_gated(tmp.path(), true, || Some(blobs)).unwrap();
+        let services = resolve_gated(tmp.path(), true, || Some(blobs))
+            .unwrap()
+            .services;
         assert_eq!(names(&services), ["@scope/a", "@scope/b"]);
         assert!(services.iter().all(|s| s.internal_env_vars.is_empty()));
     }
@@ -888,15 +1007,19 @@ mod tests {
     fn no_hosted_blobs_or_a_directory_this_tree_lacks_falls_back() {
         let tmp = workspace();
         let derived = ["@scope/a", "@scope/b"];
-        let services = resolve_gated(tmp.path(), true, || None).unwrap();
+        let services = resolve_gated(tmp.path(), true, || None).unwrap().services;
         assert_eq!(names(&services), derived);
-        let services = resolve_gated(tmp.path(), true, || Some(Vec::new())).unwrap();
+        let services = resolve_gated(tmp.path(), true, || Some(Vec::new()))
+            .unwrap()
+            .services;
         assert_eq!(names(&services), derived);
         let mut blobs = hosted();
         blobs.push(blob(Some(
             json!({"serviceName":"c","directory":"packages/c"}),
         )));
-        let services = resolve_gated(tmp.path(), true, || Some(blobs)).unwrap();
+        let services = resolve_gated(tmp.path(), true, || Some(blobs))
+            .unwrap()
+            .services;
         assert_eq!(names(&services), derived);
     }
 
@@ -907,7 +1030,9 @@ mod tests {
             blob(Some(json!({"serviceName":"root"}))),
             blob(Some(json!({"serviceName":"a","directory":"packages/a"}))),
         ];
-        let services = resolve_gated(tmp.path(), true, || Some(blobs)).unwrap();
+        let services = resolve_gated(tmp.path(), true, || Some(blobs))
+            .unwrap()
+            .services;
         assert_eq!(names(&services), ["a", "root"]);
         assert_eq!(services[1].nested_directories, ["packages/a"]);
     }
