@@ -9,6 +9,7 @@ pub mod boundary;
 pub mod call_base;
 pub mod call_graph;
 pub mod call_site_extractor;
+pub mod call_through;
 pub mod change_scope;
 pub mod client_semantics;
 pub mod cloud_storage;
