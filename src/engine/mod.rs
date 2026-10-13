@@ -1744,12 +1744,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     let analyzer = match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar)
         .await
     {
-        Ok((mut analyzer, type_check)) => {
+        Ok((analyzer, type_check)) => {
             // For the indexer that spawned this scan, which swallows the
             // warning a skipped check logs (carrick#1490). A no-op anywhere
             // else.
             crate::progress::report_type_check(&type_check);
-            analyzer.set_source_root(repo_name.clone(), PathBuf::from(repo_path));
             analyzer
         }
         Err(e) => {
