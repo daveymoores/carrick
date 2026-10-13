@@ -429,7 +429,10 @@ function onUnwidenedLines(plan: ProbePlan, diagnostic: RawDiagnostic): boolean {
  *   there), not on its top-type gates, not on its assignment;
  * - its own declarations typecheck (the alias is not poisoned);
  * - the member-level walk ran over it and found no `any`/`unknown`, which
- *   would assign to whatever the other side declares.
+ *   would assign to whatever the other side declares;
+ * - the same walk found none on the two published sides either. A mismatch
+ *   that is not a fact stays the mismatch it was: the reading would be
+ *   clearing it against a member that accepts anything.
  */
 function unwidenedReadingFits(input: ClassifyInput): boolean {
   const { plan, probeDiags, poisonReason } = input;
@@ -438,7 +441,7 @@ function unwidenedReadingFits(input: ClassifyInput): boolean {
   const sent = plan.sentEndpoint;
   if (poisonReason(sent.service_name, unwidenedAliasOf(sent.alias))) return false;
   const walked = input.deepFindings?.sentUnwidened;
-  return walked !== undefined && walked.length === 0;
+  return walked !== undefined && walked.length === 0 && factness(input).resolved;
 }
 
 /**

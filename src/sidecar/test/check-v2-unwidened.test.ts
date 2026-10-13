@@ -386,6 +386,25 @@ describe('the unwidened reading in the probe and the classifier (carrick#1538)',
       assert.strictEqual(deepAny.bucket, 'incompatible');
     });
 
+    it('a mismatch that is not a fact stays the mismatch it was', () => {
+      // The consumer holds a member that accepts anything, so the reading
+      // fitting it proves nothing.
+      const v = classifyPair({
+        plan,
+        probeDiags: [mismatch],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: {
+          sent: [],
+          expected: [{ kind: 'any', path: 'meta', reason: 'declared' }],
+          sentUnwidened: [],
+        },
+      });
+      assert.strictEqual(v.bucket, 'incompatible');
+      assert.strictEqual(v.resolved, false);
+      assert.strictEqual(v.unresolved_side, 'consumer');
+    });
+
     it('a reading whose own declarations do not typecheck clears nothing', () => {
       const v = classifyPair({
         plan,
