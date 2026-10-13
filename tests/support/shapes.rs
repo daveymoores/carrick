@@ -60,8 +60,14 @@ pub fn flat_module(tag: &str, n: usize) -> Shape {
     Shape { source, starts }
 }
 
+/// The handler the route array's route `i` names.
+pub fn route_array_handler(i: usize) -> String {
+    format!("handleRoute{i}")
+}
+
 /// A module whose one exported array literal holds `n` route objects and is
-/// most of the file.
+/// most of the file. Route `i` answers `GET /{tag}/routes/{i}` with the
+/// function [`route_array_handler`] names, written in the route object.
 pub fn route_array(tag: &str, n: usize) -> Shape {
     let mut source = String::from("const SERVICE = \"generated\";\n\n");
     source.push_str("export const routes = [\n");
@@ -70,7 +76,12 @@ pub fn route_array(tag: &str, n: usize) -> Shape {
         source.push_str("  {\n");
         writeln!(source, "    method: \"GET\",").unwrap();
         writeln!(source, "    path: \"/{tag}/routes/{i}\",").unwrap();
-        writeln!(source, "    handler: (req: any, res: any) => {{").unwrap();
+        writeln!(
+            source,
+            "    handler: function {}(req: any, res: any) {{",
+            route_array_handler(i)
+        )
+        .unwrap();
         source.push_str("      ");
         starts.push(source.len());
         writeln!(source, "res.json({{ service: SERVICE, route: {i} }});").unwrap();
