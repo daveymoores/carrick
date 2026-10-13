@@ -171,3 +171,115 @@ describe('carrick#1605: the bundle follows a name through its re-exports', () =>
     assert.match(failure.reason, /not found/);
   });
 });
+
+/**
+ * carrick#2304: a package of the checkout that a package manager links into a
+ * service's `node_modules` is the user's own source. The compiler marks every
+ * file it reaches through a `node_modules` lookup as an external library,
+ * whatever the file's real path, so that flag alone read the sibling package
+ * as installed and every type named through it lost its explicit anchor.
+ */
+const LINKED_FILES: Record<string, string> = {
+  'packages/shapes/package.json': JSON.stringify({
+    name: '@depot/shapes',
+    type: 'module',
+    types: './src/index.ts',
+    exports: { '.': { types: './src/index.ts', default: './src/index.ts' } },
+  }),
+  'packages/shapes/src/index.ts': "export * from './crate.js';\nexport type { Pallet } from './pallet.js';\n",
+  'packages/shapes/src/crate.ts':
+    'export interface Crate { id: string; weightKg: number; fragile: boolean | null }\n',
+  'packages/shapes/src/pallet.ts':
+    "import type { Crate } from './crate.js';\nexport interface Pallet { id: string; crates: Crate[] }\n",
+  'packages/web/package.json': JSON.stringify({ name: '@depot/web', type: 'module' }),
+  'packages/web/tsconfig.json': JSON.stringify({
+    compilerOptions: {
+      target: 'ES2022',
+      module: 'NodeNext',
+      moduleResolution: 'NodeNext',
+      strict: true,
+      skipLibCheck: true,
+    },
+    include: ['src'],
+  }),
+  // Installed: a real directory under `node_modules`, not a package of the checkout.
+  'packages/web/node_modules/shelf-lib/package.json': JSON.stringify({
+    name: 'shelf-lib',
+    version: '1.0.0',
+    types: './index.d.ts',
+  }),
+  'packages/web/node_modules/shelf-lib/index.d.ts': 'export interface Shelf { id: string; slots: number }\n',
+  'packages/web/src/api.ts':
+    "import type { Crate } from '@depot/shapes';\nexport type { Crate } from '@depot/shapes';\nexport type First = Crate;\n",
+  'packages/web/src/reexp.ts': "export type { Shelf } from 'shelf-lib';\n",
+};
+
+describe('carrick#2304: a package of the checkout linked through node_modules is followed', () => {
+  let client: SidecarClient;
+  let repo: string;
+
+  before(async () => {
+    // The real path: the compiler names a linked package's files by it.
+    repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-2304-')));
+    for (const [rel, text] of Object.entries(LINKED_FILES)) {
+      const abs = path.join(repo, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, text);
+    }
+    // The checkout is the nearest `.git` above the service root.
+    fs.mkdirSync(path.join(repo, '.git'));
+    const scope = path.join(repo, 'packages/web/node_modules/@depot');
+    fs.mkdirSync(scope, { recursive: true });
+    fs.symlinkSync('../../../shapes', path.join(scope, 'shapes'), 'dir');
+    client = new SidecarClient();
+    await client.start();
+    await client.send({ action: 'init', request_id: 'init', repo_root: path.join(repo, 'packages/web') });
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  async function bundle(symbol_name: string, source_file: string, alias: string): Promise<BundleShape> {
+    return client.send<BundleShape>(
+      {
+        action: 'bundle',
+        request_id: alias,
+        symbols: [{ symbol_name, source_file, alias }],
+      },
+      30000
+    );
+  }
+
+  const CRATE = '{ id: string; weightKg: number; fragile: boolean | null; }';
+  const PALLET = `{ id: string; crates: ${CRATE}[]; }`;
+
+  /** The bundle declares `alias` with exactly `body`, and reports no failure. */
+  function assertDeclares(res: BundleShape, alias: string, body: string): void {
+    assert.strictEqual(res.symbol_failures, undefined, JSON.stringify(res.symbol_failures));
+    const dts = collapse(res.dts_content ?? '');
+    assert.ok(
+      dts.includes(`export interface ${alias} ${body}`) || dts.includes(`export type ${alias} = ${body};`),
+      `expected ${alias} to be ${body}, got: ${dts}`
+    );
+  }
+
+  it('resolves a type named at the linked package index, through `export *` and `export { X } from`', async () => {
+    const index = path.join(repo, 'packages/shapes/src/index.ts');
+    assertDeclares(await bundle('Crate', index, 'Crate_Index'), 'Crate_Index', CRATE);
+    assertDeclares(await bundle('Pallet', index, 'Pallet_Index'), 'Pallet_Index', PALLET);
+  });
+
+  it('resolves the same type named at a service file that re-exports the package', async () => {
+    assertDeclares(await bundle('Crate', 'src/api.ts', 'Crate_Service'), 'Crate_Service', CRATE);
+  });
+
+  it('keeps a package installed as a real directory under node_modules a failure, with the same reason', async () => {
+    const res = await bundle('Shelf', 'src/reexp.ts', 'Shelf_Service');
+    assert.strictEqual(res.dts_content, undefined, `${res.dts_content}`);
+    const failure = res.symbol_failures?.find((f) => f.symbol_name === 'Shelf');
+    assert.ok(failure, `expected a symbol failure: ${JSON.stringify(res)}`);
+    assert.strictEqual(failure.reason, "Symbol 'Shelf' is re-exported from an installed package in src/reexp.ts");
+  });
+});
