@@ -1120,6 +1120,19 @@ async fn a_helper_that_only_hands_the_instance_on_carries_the_prefix() {
 
 #[tokio::test]
 #[serial]
+async fn a_plugin_that_only_hands_the_instance_on_carries_the_prefix() {
+    // `api.register(registerAllRoutes)`: the function is called with the
+    // instance first, and hands it on.
+    let result = analyze_with(
+        vec![scope_only("src/helper-plugin.ts"), team_items()],
+        &["src/all-routes.ts"],
+    )
+    .await;
+    assert_eq!(served(&result), set(&["GET /api/v1/teams/:id/items"]));
+}
+
+#[tokio::test]
+#[serial]
 async fn an_instance_is_followed_three_functions_on_and_no_further() {
     let result = analyze(vec![scope_only("src/helper-depth-3.ts"), chain()]).await;
     assert_eq!(served(&result), set(&["GET /api/v1/leaf"]));
