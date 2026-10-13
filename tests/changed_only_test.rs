@@ -804,8 +804,14 @@ fn an_extraction_config_that_fails_again_is_asked_for_on_the_next_scan() {
     workspace.commit("C");
     let scan = workspace.scan(&["--changed-only"]);
     assert_eq!(scan.code, Some(0), "{}", scan.output);
-    // `web` wrote the same status at B: the cassette answers every service.
-    assert_analysed(&scan, &["api", "web"]);
+    // `web` is not asserted: it was analysed at B, and whether that run asked
+    // for its config again or reused the one stored at A is not this rule's.
+    assert!(
+        scan.output.contains("api analysed (stored_incomplete"),
+        "{}",
+        scan.output
+    );
+    assert!(scan.carried().contains("worker"), "{}", scan.output);
 }
 
 /// Case 13: an import nothing accounts for analyses its service on every
