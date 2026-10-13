@@ -674,6 +674,107 @@ async fn two_handlers_for_one_documented_path_are_not_merged() {
     );
 }
 
+// --- a registering file the model states no row for (carrick#2303) --------
+//
+// The model's answer for the registering file is empty. The source still
+// states the callback, the instance it is handed and what it registers on
+// that instance, so the scope and its mounts are read from the source.
+
+/// A registering file the model stated nothing for.
+fn empty(file: &str) -> (String, FileAnalysisResult) {
+    docs(file)
+}
+
+#[tokio::test]
+#[serial]
+async fn a_scope_the_model_left_empty_takes_the_prefix_its_service_documents() {
+    let result = analyze(vec![
+        empty("src/documented.ts"),
+        item_detail(),
+        docs("src/docs.ts"),
+    ])
+    .await;
+    assert_eq!(handler_serves(&result), set(&["GET /api/v1/items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 1);
+    assert_eq!(result.stats.mount_prefixes_unread, 0);
+    assert_eq!(
+        item_rows(&result),
+        vec![(
+            "item-detail.ts".to_string(),
+            "Some(DescriptorRoute)".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_scope_the_model_left_empty_and_nothing_documents_records_its_prefix_unread() {
+    let result = analyze(vec![empty("src/documented.ts"), item_detail()]).await;
+    assert_eq!(handler_serves(&result), set(&["GET /items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 0);
+    assert_eq!(result.stats.mount_prefixes_unread, 1);
+    let line = line_of("src/documented.ts", "app.register(");
+    assert_eq!(
+        result
+            .unread_mount_prefixes
+            .iter()
+            .map(|record| record.scope_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("api@src/documented.ts:{line}").as_str()]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_stated_inner_mount_is_not_stated_twice() {
+    // The model stated the inner registration and not the outer one. The
+    // source read finds the same call, and the model's row is the one kept.
+    let result = analyze(vec![unstated("src/documented.ts"), item_detail()]).await;
+    let mounts = result.mount_graph.get_mounts();
+    let inner: Vec<_> = mounts
+        .iter()
+        .filter(|edge| edge.child == "itemDetailRoutes")
+        .collect();
+    assert_eq!(inner.len(), 1, "{mounts:?}");
+    assert_eq!(mounts.len(), 2, "the scope and its one mount: {mounts:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_function_that_registers_nothing_is_not_a_mount() {
+    // `onError` is imported and passed first to a call on the scope's
+    // parameter, exactly as a plugin is. Its module also declares a router
+    // whose routes hang from a parameter of the same name, so only the span
+    // of the function that was passed tells the two apart.
+    let status = answer(
+        "src/errors.ts",
+        &[],
+        &[("app.get('/status'", "app", "GET", "/status")],
+    );
+    let index = answer(
+        "src/status-index.ts",
+        &[(
+            "server.register(statusRoutes",
+            "server",
+            "statusRoutes",
+            "/internal",
+            Some("./errors"),
+        )],
+        &[],
+    );
+    let result = analyze(vec![empty("src/not-a-plugin.ts"), status, index]).await;
+    let mounts = result.mount_graph.get_mounts();
+    assert!(
+        mounts
+            .iter()
+            .all(|edge| edge.child == "statusRoutes" && edge.parent == "server"),
+        "{mounts:?}"
+    );
+    assert_eq!(served(&result), set(&["GET /internal/status"]));
+    assert!(result.unread_mount_prefixes.is_empty());
+    assert_eq!(result.stats.mount_prefixes_unread, 0);
+}
+
 #[test]
 fn the_fixture_root_is_on_disk() {
     assert!(Path::new(&root()).join("src/nullish.ts").is_file());
