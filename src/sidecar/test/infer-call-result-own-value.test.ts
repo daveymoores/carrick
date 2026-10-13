@@ -377,13 +377,12 @@ describe('carrick#2112: a later expression answers for a call only when it resta
   });
 
   it('reads the call, not a value computed from a spread of its result', async () => {
-    // A destructuring declaration has no type of its own for the walk to
-    // read, so the inferrer states none here and the row is left to the
-    // capture's own read of the call. What matters is that the value computed
-    // later is no longer the answer.
-    const text = await callResult('Spread', 'api.getPage(id)', 'const { items } = await api.getPage(id)');
-    assert.notStrictEqual(text, 'number');
-    assert.strictEqual(text, 'any');
+    // A destructuring declaration has no type of its own (the checker answers
+    // `any` for it), so the value is read off the pattern that takes it apart.
+    assert.strictEqual(
+      await callResult('Spread', 'api.getPage(id)', 'const { items } = await api.getPage(id)'),
+      'Page'
+    );
   });
 
   it('reads the list the call declares where it is mapped in place', async () => {
