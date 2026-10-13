@@ -235,3 +235,185 @@ describe('carrick#2056: string literals compare by value, not by quotes', () => 
     }
   });
 });
+
+/**
+ * carrick#2114: a call located by its first line alone bound a shorter
+ * sibling call.
+ *
+ * A wrapped call's locator is its first line (`load({`). No node has that
+ * text, so every node holding it is a candidate, and the smallest won: a
+ * shorter call of the same opening a few lines away, whatever line the
+ * locator stated.
+ *
+ * Among the nodes that hold the text, the ones whose own text OPENS with it
+ * are the ones a first-line locator names. Where there is one, the nearest to
+ * the stated line wins, then the smallest. Where there is none (a fragment
+ * from the middle of a node) the smallest holder wins, as before.
+ */
+const SIBLINGS_TS = `interface Totals { total: number }
+interface Thing { id: string }
+interface Other { label: string }
+declare const api: {
+  getTotals(id: string): Promise<Totals>;
+  getTotalsByDay(id: string): Promise<Totals[]>;
+};
+declare function load<T>(o: { run: () => Promise<T>; staleMs: number }): Promise<T>;
+declare function retry<T>(run: () => Promise<T>): Promise<T>;
+declare function boxed<T>(value: T): { inner: T };
+declare function useThing<T>(o: { key: string; read: () => T }): { data: T };
+declare const client: { send(scope: string, kind: string, value: string): Promise<{ ok: boolean }> };
+declare const thing: Thing;
+declare const other: Other;
+
+export async function both(id: string) {
+  const [totals, byDay] = await Promise.all([
+    load({ // first
+      run: () => api.getTotals(id),
+      staleMs: 1,
+    }),
+    load({ // second
+      run: () => api.getTotalsByDay(id), // second property
+      staleMs: 1,
+    }),
+  ]);
+  console.log(totals, byDay);
+}
+
+export async function wrapped(id: string) {
+  const r = await retry(() => // retry line
+    load({
+      run: () => api.getTotalsByDay(id),
+      staleMs: 1,
+    })
+  );
+  console.log(r);
+}
+
+export function nested(seed: number) {
+  const twice = boxed(boxed(seed));
+  console.log(twice);
+}
+
+export async function push(scope: string, value: string) {
+  await client.send(scope, 'kind', value);
+  const sent = { scope, kind: 'kind', value };
+  console.log(sent);
+}
+
+export function hooks() {
+  const a = useThing({ // hook a
+    key: 'a',
+    read: () => thing,
+  });
+  const b = useThing({ // hook b
+    key: 'the-longer-b',
+    read: () => other,
+  });
+  console.log(a, b);
+}
+`;
+
+describe('carrick#2114: a first-line locator binds the call on its own line', () => {
+  let client: SidecarClient;
+  let repoDir: string;
+  let sourcePath: string;
+
+  const siblingLine = (marker: string): number => {
+    const index = SIBLINGS_TS.split('\n').findIndex((line) => line.includes(marker));
+    assert.ok(index >= 0, `fixture has no line holding ${JSON.stringify(marker)}`);
+    return index + 1;
+  };
+
+  before(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-2114-'));
+    fs.writeFileSync(
+      path.join(repoDir, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          strict: true,
+          module: 'esnext',
+          moduleResolution: 'bundler',
+          target: 'es2022',
+          lib: ['es2022', 'dom'],
+          skipLibCheck: true,
+        },
+        include: ['src'],
+      })
+    );
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    sourcePath = path.join(repoDir, 'src', 'siblings.ts');
+    fs.writeFileSync(sourcePath, SIBLINGS_TS);
+
+    client = new SidecarClient();
+    await client.start();
+    await client.send({ action: 'init', request_id: 'init-2114', repo_root: repoDir });
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  const infer = async (
+    alias: string,
+    kind: 'call_result' | 'request_body',
+    expression: string,
+    at: string
+  ): Promise<string | undefined> => {
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: `infer-${alias}`,
+      requests: [
+        {
+          file_path: sourcePath,
+          line_number: siblingLine(at),
+          expression_text: expression,
+          expression_line: siblingLine(at),
+          infer_kind: kind,
+          alias,
+        },
+      ],
+    });
+    const inferred = response.inferred_types?.find((t) => t.alias === alias);
+    return inferred ? collapse(inferred.type_string) : undefined;
+  };
+
+  it('reads the longer of two sibling calls at its own line', async () => {
+    assert.strictEqual(await infer('Second', 'call_result', 'load({', '// second'), 'Totals[]');
+  });
+
+  it('reads the shorter sibling at its own line', async () => {
+    assert.strictEqual(await infer('First', 'call_result', 'load({', '// first'), 'Totals');
+  });
+
+  it('binds the nearer call when the stated line is one off', async () => {
+    assert.strictEqual(
+      await infer('OffByOne', 'call_result', 'load({', '// second property'),
+      'Totals[]'
+    );
+  });
+
+  it('does not prefer a wrapper that starts on the stated line but does not open with the text', async () => {
+    assert.strictEqual(await infer('Wrapped', 'call_result', 'load({', '// retry line'), 'Totals[]');
+  });
+
+  it('still binds the innermost of two nested calls on one line', async () => {
+    assert.strictEqual(await infer('Nested', 'call_result', 'boxed(', 'boxed(boxed(seed))'), '{ inner: number; }');
+  });
+
+  it('leaves a fragment from the middle of an argument list on the smallest node holding it', async () => {
+    // Nothing opens with this text, so the rule for a first line does not
+    // apply and the stated line decides nothing: a rule that preferred any
+    // node starting on that line would bind the call, and publish its
+    // response as the request.
+    assert.strictEqual(
+      await infer('Fragment', 'request_body', "'kind', value", "client.send(scope, 'kind', value)"),
+      '{ scope: string; kind: string; value: string; }'
+    );
+  });
+
+  it('reads each of two calls that open alike as its own', async () => {
+    assert.strictEqual(await infer('HookB', 'call_result', 'useThing({', '// hook b'), '{ data: Other; }');
+    assert.strictEqual(await infer('HookA', 'call_result', 'useThing({', '// hook a'), '{ data: Thing; }');
+  });
+});
