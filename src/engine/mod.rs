@@ -7605,6 +7605,7 @@ fn discover_files_and_symbols(
                     computed_requires,
                     field_types: func_extractor.field_types,
                     instances: crate::receiver_type::module_scope_types(&module),
+                    factories: crate::receiver_type::factory_tables(&module),
                 },
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
