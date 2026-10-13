@@ -111,6 +111,9 @@ impl Scope {
 pub struct ThisRun<'a> {
     pub scanner_version: &'a str,
     pub cache_version: u32,
+    /// Whether this run asks the model: only such a run can ask for an
+    /// extraction config a stored blob went without.
+    pub asks_model: bool,
 }
 
 /// One root a service's walk reads: a directory relative to the repository's
@@ -308,7 +311,7 @@ pub fn decide(
             "the stored index was read from uncommitted changes",
         );
     }
-    if let Some(owed) = owed_work(stored) {
+    if let Some(owed) = owed_work(stored, this_run) {
         return Scope::analysed(Reason::StoredIncomplete, owed);
     }
     if stored.config_json.as_deref() != config_json {
@@ -355,22 +358,28 @@ pub fn decide(
 }
 
 /// What a stored blob says it still owed when it was written: degraded types,
-/// a type extraction problem short of that, files the model never answered,
+/// an extraction config that never arrived, files the model never answered,
 /// candidates no model was asked about.
-fn owed_work(stored: &CloudRepoData) -> Option<String> {
+fn owed_work(stored: &CloudRepoData, this_run: ThisRun<'_>) -> Option<String> {
     if let Some(degraded) = &stored.types_degraded {
         return Some(format!(
             "the stored index lost its types ({})",
             degraded.stage
         ));
     }
-    // A status without a degradation: the extraction config was asked for and
-    // did not arrive, so machinery wrappers stayed wrapped, or the capture
-    // answered without a stub. The types the blob holds are what a contract
-    // check would compare, and only an analysis asks for the config again
-    // (carrick#2301).
-    if stored.type_extraction_status.is_some() {
-        return Some("the stored index recorded a type extraction problem".to_string());
+    // The extraction config was asked for and did not arrive, so the blob's
+    // types kept their machinery wrappers and are what a contract check would
+    // compare. A blob keeps the config it was analysed with, an empty rule
+    // set included, so a recorded status beside no config is the one case an
+    // analysis repairs: it asks for the config again (carrick#2301). A status
+    // beside a config (a capture that produced no stub) is not: nothing an
+    // analysis asks for would change it. A run that asks no model cannot ask
+    // for the config either.
+    if this_run.asks_model
+        && stored.type_extraction_status.is_some()
+        && stored.cached_extraction_config.is_none()
+    {
+        return Some("the stored index was written without its extraction config".to_string());
     }
     let boundary = stored.boundary.as_ref()?;
     if boundary.files_lost.total > 0 {
@@ -823,6 +832,7 @@ mod tests {
     const THIS: ThisRun<'static> = ThisRun {
         scanner_version: "1.0.0",
         cache_version: 7,
+        asks_model: true,
     };
 
     fn stored(commit: &str) -> CloudRepoData {
@@ -1098,6 +1108,29 @@ mod tests {
         assert_eq!(
             reason(&decide_with(Some(&wrapped), Ok(&changes), api_inputs())),
             Some(Reason::StoredIncomplete)
+        );
+        // A run that asks no model cannot ask for the config.
+        let no_model = ThisRun {
+            asks_model: false,
+            ..THIS
+        };
+        let carried = decide(
+            Some(&wrapped),
+            no_model,
+            Some("{\"serviceName\":\"api\"}"),
+            Ok(&changes),
+            api_inputs,
+        );
+        assert_eq!(reason(&carried), None);
+        // A status beside a config is not this rule's: the config arrived,
+        // and analysing again would ask for nothing new.
+        let mut no_stub = stored("abcdef1234");
+        no_stub.type_extraction_status =
+            Some("v2 type capture degraded: no stub package was produced".to_string());
+        no_stub.cached_extraction_config = Some(Default::default());
+        assert_eq!(
+            reason(&decide_with(Some(&no_stub), Ok(&changes), api_inputs())),
+            None
         );
         let mut lost = stored("abcdef1234");
         lost.boundary = Some(crate::boundary::ServiceBoundary {

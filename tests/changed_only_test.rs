@@ -804,14 +804,37 @@ fn an_extraction_config_that_fails_again_is_asked_for_on_the_next_scan() {
     workspace.commit("C");
     let scan = workspace.scan(&["--changed-only"]);
     assert_eq!(scan.code, Some(0), "{}", scan.output);
-    // `web` is not asserted: it was analysed at B, and whether that run asked
-    // for its config again or reused the one stored at A is not this rule's.
+    // `web` was analysed at B with the config its blob kept from A, so it
+    // asked for none, recorded no problem, and is carried here.
+    assert_analysed(&scan, &["api"]);
     assert!(
         scan.output.contains("api analysed (stored_incomplete"),
         "{}",
         scan.output
     );
-    assert!(scan.carried().contains("worker"), "{}", scan.output);
+}
+
+/// carrick#2301, what must not change: a status recorded beside an extraction
+/// config (a capture that produced no stub) is nothing an analysis repairs,
+/// so its service is carried.
+#[test]
+fn a_stored_status_beside_an_extraction_config_is_carried() {
+    let workspace = case();
+    let path = blob_path(&workspace.store, "worker");
+    let mut blob: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        blob["cached_extraction_config"].is_object(),
+        "worker's blob keeps the config it was analysed with"
+    );
+    blob["type_extraction_status"] =
+        serde_json::json!("v2 type capture degraded: no stub package was produced");
+    std::fs::write(&path, serde_json::to_string_pretty(&blob).unwrap()).unwrap();
+    touch_web(&workspace);
+    workspace.commit("B");
+    let scan = workspace.scan(&["--changed-only"]);
+    assert_eq!(scan.code, Some(0), "{}", scan.output);
+    assert_analysed(&scan, &["web"]);
 }
 
 /// Case 13: an import nothing accounts for analyses its service on every
