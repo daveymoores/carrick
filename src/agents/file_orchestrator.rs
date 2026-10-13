@@ -139,6 +139,11 @@ pub struct ListedCandidate {
 pub const PART_WINDOW_BYTES: usize = 64_000;
 pub const PART_CONTEXT_BYTES: usize = 16_000;
 
+/// The most bytes of another module's source a prompt carries: an attached
+/// wrapper module is cut to this, and a declaration shown beside a part's
+/// window is shown by its first line when it is over it (carrick#2308).
+pub const WRAPPER_SNIPPET_MAX: usize = 4_000;
+
 /// One part's answer, beside the window of the file the part was asked about
 /// (carrick#2308).
 #[derive(Debug, Clone)]
@@ -2693,7 +2698,6 @@ impl FileOrchestrator {
         // another file would import. Keyed by canonical file path. The whole
         // (size-capped) file is the context snippet: wrappers are small client
         // modules, and slicing exact function spans buys little over the cap.
-        const WRAPPER_SNIPPET_MAX: usize = 4_000;
         let mut wrapper_map: HashMap<PathBuf, WrapperModule> = HashMap::new();
         for pf in &pending {
             // Rescued files (graphql/messaging fall-throughs) carry no HTTP

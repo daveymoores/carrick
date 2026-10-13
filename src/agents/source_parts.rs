@@ -40,9 +40,8 @@ use crate::swc_scanner::SWC_SPAN_BASE;
 mod shapes;
 
 /// A declaration over this many bytes is shown by its first line only: the
-/// cap an attached wrapper module is held to (`WRAPPER_SNIPPET_MAX` in
-/// `file_orchestrator.rs`).
-pub const CONTEXT_DECLARATION_MAX: usize = 4_000;
+/// cap an attached wrapper module is held to.
+pub const CONTEXT_DECLARATION_MAX: usize = crate::agents::file_orchestrator::WRAPPER_SNIPPET_MAX;
 
 /// Two runs of shown lines this close together are shown as one: the lines
 /// between them cost less than the line that would say they are missing.
@@ -1216,7 +1215,7 @@ export function register(app: any) {
         // is not: the import table says what it says.
         let last = &parts[2];
         assert_eq!(last.context, [(2, 2), (4, 6), (8, 8)]);
-        assert_eq!(last.enclosing, [register.clone()]);
+        assert_eq!(last.enclosing, std::slice::from_ref(&register));
         assert!(!last.context.contains(&(3, 3)), "an unused declaration");
 
         // The inline handler declares `shared` again. Its window names that

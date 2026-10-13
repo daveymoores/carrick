@@ -1590,13 +1590,33 @@ async fn rows_with_no_candidate_are_kept_once() {
 /// Each lands at `<out>/<shape>/src/<shape>.ts` beside a `package.json`. The
 /// probe below cuts a named file of such a tree, and two builds' whole
 /// prompts for one are compared by dumping both (`CARRICK_EVAL_DUMP_DIR`).
+///
+/// The route array's tree also holds `expected.json`: each route's method,
+/// path and handler, which is the answer its merged parts are checked against.
 #[test]
 #[ignore = "a helper run by hand: it writes to a directory named in the environment"]
 fn write_the_generated_shapes() {
+    const ROUTES: usize = 400;
     let out = PathBuf::from(std::env::var("CARRICK_SHAPES_OUT").expect("CARRICK_SHAPES_OUT"));
-    for (name, shape) in shapes::every_shape("generated", 400) {
+    for (name, shape) in shapes::every_shape("generated", ROUTES) {
         let root = out.join(name);
         std::fs::create_dir_all(root.join("src")).unwrap();
+        if name == "route_array" {
+            let expected: Vec<Value> = (0..ROUTES)
+                .map(|i| {
+                    json!({
+                        "method": "GET",
+                        "path": format!("/generated/routes/{i}"),
+                        "handler": shapes::route_array_handler(i),
+                    })
+                })
+                .collect();
+            std::fs::write(
+                root.join("expected.json"),
+                serde_json::to_string_pretty(&expected).unwrap(),
+            )
+            .unwrap();
+        }
         std::fs::write(
             root.join("package.json"),
             format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
