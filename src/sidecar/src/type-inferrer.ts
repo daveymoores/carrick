@@ -3313,7 +3313,16 @@ export class TypeInferrer {
       return { terminal: chainRead, projectionOnly: false, projections: [] };
     }
 
-    const returnStmt = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
+    // A return statement answers only for a call of the function it returns
+    // from (carrick#2282). The nearest `return` above a call in a callback is
+    // an OUTER function's, and its expression is what that function hands
+    // back with the callback inside it: a command table, a client object, a
+    // UI element.
+    const nearestReturn = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
+    const returnStmt =
+      nearestReturn && this.findContainingFunctionForNode(nearestReturn) === func
+        ? nearestReturn
+        : undefined;
     if (returnStmt) {
       const returnExpr = returnStmt.getExpression();
       if (returnExpr) {
