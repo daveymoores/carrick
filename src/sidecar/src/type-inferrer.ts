@@ -384,8 +384,8 @@ const WHOLE_BODY_READS = new Set(['json', 'text']);
 
 /**
  * The other zero-argument reads the platform `Response` takes its whole body
- * out with, in a form that is neither JSON nor text. What one yields is the
- * body the call answered with, as it is for the two above (carrick#2112).
+ * out with, in a form that is neither JSON nor text. The expression that
+ * holds one holds the body the call answered with (carrick#2112).
  */
 const BINARY_BODY_READS = new Set(['arrayBuffer', 'blob', 'bytes', 'formData']);
 
@@ -3420,12 +3420,6 @@ export class TypeInferrer {
             lastNode = this.statedPayloadAroundBodyRead(bodyRead) ?? bodyRead;
             continue;
           }
-          const binaryRead = this.bodyReadOnReceiver(expr, BINARY_BODY_READS);
-          if (binaryRead) {
-            sawWholeRead = true;
-            lastNode = binaryRead;
-            continue;
-          }
           // carrick#1375: how the source reads the value decides whether this
           // site states a payload at all. A member read takes a PART of it; a
           // return, an argument, an alias or a parse reads the value itself.
@@ -3474,12 +3468,19 @@ export class TypeInferrer {
         // in full (carrick#1375). Any other use computes something else from
         // the value (`describe(page)`, `Math.max(...items.map(…))`,
         // `rows.map(…)`, `flag && render(row)`): it reads the value whole, and
-        // the answer stays the call's own (carrick#2112).
+        // the answer stays the call's own (carrick#2112). An expression that
+        // takes the body out of a transport response in a form that is not
+        // JSON or text (`new Uint8Array(await res.arrayBuffer())`) holds the
+        // body, and answers as it did.
         if (
           this.expressionUsesNames(expr, currentNames) &&
           !this.usesNamesOnlyByProjection(expr, currentNames)
         ) {
-          if (callValueIsUntyped || this.restatesTrackedValue(expr, currentNames)) {
+          if (
+            callValueIsUntyped ||
+            this.restatesTrackedValue(expr, currentNames) ||
+            this.holdsBinaryBodyRead(expr, currentNames)
+          ) {
             lastNode = expr;
           } else {
             sawWholeRead = true;
@@ -3495,6 +3496,17 @@ export class TypeInferrer {
     }
 
     return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /** `expr` holds a binary whole-body read taken on a tracked name. */
+  private holdsBinaryBodyRead(expr: Node, names: string[]): boolean {
+    return expr
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .some(
+        (id) =>
+          this.isIdentifierUsage(id, names) &&
+          this.bodyReadOnReceiver(id, BINARY_BODY_READS) !== undefined
+      );
   }
 
   /**
