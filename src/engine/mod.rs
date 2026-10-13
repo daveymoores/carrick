@@ -1013,6 +1013,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             crate::change_scope::ThisRun {
                 scanner_version: env!("CARGO_PKG_VERSION"),
                 cache_version: CACHE_VERSION,
+                asks_model: !crate::local_mode::no_model(),
             },
         )
     } else {
@@ -3342,12 +3343,24 @@ fn hash_workspace_package_jsons(
 ) -> Result<String, std::io::Error> {
     let repo_root = Path::new(repo_path);
     let inputs = crate::deno_support::resolution_inputs(repo_root, &packages.source_paths)?;
+    // The root and a manifest may name one tree two ways (a symlink on the
+    // way in, resolved in one and not the other). The key is the path inside
+    // the tree either way: an absolute key would make the hash differ between
+    // two checkouts of one commit, and the setup would be asked for again.
+    let canonical_root = repo_root.canonicalize().ok();
+    let inside = |path: &Path| -> Option<PathBuf> {
+        if let Ok(relative) = path.strip_prefix(repo_root) {
+            return Some(relative.to_path_buf());
+        }
+        let root = canonical_root.as_ref()?;
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.strip_prefix(root).ok()?.join(path.file_name()?))
+    };
     let mut keyed: Vec<(String, &PathBuf)> = inputs
         .iter()
         .map(|path| {
-            let relative = path
-                .strip_prefix(repo_root)
-                .unwrap_or(path)
+            let relative = inside(path)
+                .unwrap_or_else(|| path.clone())
                 .to_string_lossy()
                 .to_string();
             (relative, path)
@@ -10980,6 +10993,31 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             hash_workspace_package_jsons(&packages, dir.path().to_str().unwrap()).unwrap(),
             hash_file_content("package.json\0{}\0")
         );
+    }
+
+    /// A tree reached through a symlink hashes as the tree itself, whichever
+    /// of the root and the manifest path went through the link: the hash is
+    /// what decides whether a stored setup is replayed, and two checkouts of
+    /// one commit must agree on it.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifest_hash_does_not_depend_on_how_the_tree_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(real.join("apps/api")).unwrap();
+        std::fs::write(real.join("apps/api/package.json"), "{}").unwrap();
+        let link = real.parent().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let expected = hash_file_content("apps/api/package.json\0{}\0");
+        for (root, manifest_root) in [(&real, &link), (&link, &real), (&real, &real)] {
+            let packages =
+                Packages::new(vec![manifest_root.join("apps/api/package.json")]).unwrap();
+            assert_eq!(
+                hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap(),
+                expected,
+                "root {root:?}, manifest under {manifest_root:?}"
+            );
+        }
     }
 
     #[test]
