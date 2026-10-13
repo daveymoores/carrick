@@ -43,7 +43,7 @@ use tracing::debug;
 use crate::agents::file_analyzer_agent::{FileAnalysisResult, MountResult};
 use crate::binding_scope::{BindingKey, ident_key};
 use crate::graphql_document_sites::unwrap_expression;
-use crate::import_bindings::{BindingResolver, DEFAULT_EXPORT};
+use crate::import_bindings::BindingResolver;
 use crate::request_summary::literal_specifier;
 
 /// How many bindings a prefix read may follow before it gives up.
@@ -105,17 +105,9 @@ pub struct InnerRegistration {
     pub method: String,
     /// `F`, as this file names it.
     pub identifier: String,
-    /// Where `F` is imported from; `None` for a function this file declares.
-    pub import: Option<ImportedName>,
-}
-
-/// The import a local binding names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportedName {
-    /// The module specifier, as written.
-    pub specifier: String,
-    /// The name the module exports it under (`default` for a default import).
-    pub exported: String,
+    /// The specifier `F` is imported from, as written; `None` for a function
+    /// this file declares.
+    pub import_source: Option<String>,
 }
 
 /// A registration scope whose prefix the source does not state as a literal.
@@ -261,15 +253,15 @@ impl Visit for InnerFinder<'_> {
             return;
         };
         let key = ident_key(passed);
-        let import = self.values.imports.get(&key).cloned();
-        if import.is_none() && !self.values.functions.contains(&key) {
+        let import_source = self.values.imports.get(&key).cloned();
+        if import_source.is_none() && !self.values.functions.contains(&key) {
             return; // a value this file binds some other way names no function
         }
         self.found.push(InnerRegistration {
             line: u32::try_from(self.source_map.lookup_char_pos(call.span.lo).line).unwrap_or(0),
             method: method.sym.to_string(),
             identifier: passed.sym.to_string(),
-            import,
+            import_source,
         });
     }
 }
@@ -399,7 +391,7 @@ impl Visit for SiteFinder<'_> {
 struct DeclaredValues {
     values: HashMap<BindingKey, Expr>,
     /// The value imports of the module, by the binding each declares.
-    imports: HashMap<BindingKey, ImportedName>,
+    imports: HashMap<BindingKey, String>,
     /// The bindings that name a function this module declares: a function
     /// declaration, or a declarator initialised with a function.
     functions: HashSet<BindingKey>,
@@ -465,28 +457,13 @@ impl Visit for DeclaredValues {
         }
         let specifier = import.src.value.to_string_lossy().into_owned();
         for named in &import.specifiers {
-            let (local, exported) = match named {
-                ImportSpecifier::Named(named) if !named.is_type_only => (
-                    &named.local,
-                    match &named.imported {
-                        Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(name)) => {
-                            name.value.to_string_lossy().into_owned()
-                        }
-                        None => named.local.sym.to_string(),
-                    },
-                ),
-                ImportSpecifier::Default(default) => (&default.local, DEFAULT_EXPORT.to_string()),
+            let local = match named {
+                ImportSpecifier::Named(named) if !named.is_type_only => &named.local,
+                ImportSpecifier::Default(default) => &default.local,
                 // A namespace binds a module, never one function of it.
                 _ => continue,
             };
-            self.imports.insert(
-                ident_key(local),
-                ImportedName {
-                    specifier: specifier.clone(),
-                    exported,
-                },
-            );
+            self.imports.insert(ident_key(local), specifier.clone());
         }
     }
 
@@ -965,10 +942,13 @@ pub fn mount_unstated_registrations(
                     if mount_stated_at(result, inner.line) {
                         continue;
                     }
-                    let (declaring, name) = match &inner.import {
-                        Some(import) => {
+                    let (declaring, name) = match &inner.import_source {
+                        // By the name this file gives it, as the graph reads
+                        // the emitted row's child: an import the graph cannot
+                        // follow (one renamed on the way in) is not decided.
+                        Some(specifier) => {
                             let Some(resolved) =
-                                resolver.resolve(&importer, &import.specifier, &import.exported)
+                                resolver.resolve(&importer, specifier, &inner.identifier)
                             else {
                                 continue;
                             };
@@ -1007,7 +987,7 @@ pub fn mount_unstated_registrations(
                         parent_node: site.param.clone(),
                         child_node: inner.identifier.clone(),
                         mount_path: String::new(),
-                        import_source: inner.import.as_ref().map(|import| import.specifier.clone()),
+                        import_source: inner.import_source.clone(),
                         pattern_matched: format!("{}.{}(", site.param, inner.method),
                     });
                 }
@@ -1200,20 +1180,12 @@ mod tests {
         site.inner_registrations.clone()
     }
 
-    fn inner(
-        line: u32,
-        method: &str,
-        identifier: &str,
-        import: Option<(&str, &str)>,
-    ) -> InnerRegistration {
+    fn inner(line: u32, method: &str, identifier: &str, import: Option<&str>) -> InnerRegistration {
         InnerRegistration {
             line,
             method: method.to_string(),
             identifier: identifier.to_string(),
-            import: import.map(|(specifier, exported)| ImportedName {
-                specifier: specifier.to_string(),
-                exported: exported.to_string(),
-            }),
+            import_source: import.map(str::to_string),
         }
     }
 
@@ -1223,8 +1195,8 @@ mod tests {
         assert_eq!(
             inner_of(source),
             vec![
-                inner(6, "register", "itemRoutes", Some(("./items", "items"))),
-                inner(7, "use", "orders", Some(("./orders", "default"))),
+                inner(6, "register", "itemRoutes", Some("./items")),
+                inner(7, "use", "orders", Some("./orders")),
                 inner(8, "register", "local", None),
                 inner(9, "register", "arrow", None),
             ]
