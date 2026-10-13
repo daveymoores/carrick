@@ -142,8 +142,18 @@ fn stated(file: &str, prefix_text: &str) -> (String, FileAnalysisResult) {
 }
 
 async fn analyze(answers: Vec<(String, FileAnalysisResult)>) -> FileCentricAnalysisResult {
-    // SAFETY: serial test; env vars are process-global. Every file has a
-    // canned answer, so nothing is dispatched; the mock is a backstop.
+    analyze_with(answers, &[]).await
+}
+
+/// [`analyze`] with `unanswered` files scanned beside the answered ones: a
+/// file with no canned answer goes through the scan as it would in a run.
+async fn analyze_with(
+    answers: Vec<(String, FileAnalysisResult)>,
+    unanswered: &[&str],
+) -> FileCentricAnalysisResult {
+    // SAFETY: serial test; env vars are process-global. Every file a model
+    // would be asked about has a canned answer, so nothing is dispatched; the
+    // mock is a backstop.
     unsafe {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
     }
@@ -151,6 +161,7 @@ async fn analyze(answers: Vec<(String, FileAnalysisResult)>) -> FileCentricAnaly
     let files: Vec<PathBuf> = answers
         .iter()
         .map(|(path, _)| PathBuf::from(path))
+        .chain(unanswered.iter().map(|file| root.join(file)))
         .collect();
     let cached: HashMap<String, FileAnalysisResult> = answers.into_iter().collect();
     FileOrchestrator::new(AgentService::new())
@@ -1001,6 +1012,237 @@ async fn a_function_that_registers_nothing_is_not_a_mount() {
     assert_eq!(served(&result), set(&["GET /internal/status"]));
     assert!(result.unread_mount_prefixes.is_empty());
     assert_eq!(result.stats.mount_prefixes_unread, 0);
+}
+
+// carrick#2316: a callback that hands its instance to a helper as an
+// argument. `registerItemRoutes(api, deps)` is a plain call, so no model row
+// states a mount there. The source states which parameter of the helper
+// receives the scope's instance, and the helper's own rows say whether it
+// registers on it.
+
+/// A registering file whose outer registration the model stated with the
+/// literal prefix, and nothing for the calls inside the callback.
+fn scope_only(file: &str) -> (String, FileAnalysisResult) {
+    answer(
+        file,
+        &[("app.register(", "app", "api", "/api/v1", None)],
+        &[],
+    )
+}
+
+fn team_items() -> (String, FileAnalysisResult) {
+    answer(
+        "src/team-items.ts",
+        &[],
+        &[(
+            "app.get('/teams/:id/items'",
+            "app",
+            "GET",
+            "/teams/:id/items",
+        )],
+    )
+}
+
+fn team_notes() -> (String, FileAnalysisResult) {
+    answer(
+        "src/team-notes.ts",
+        &[],
+        &[(
+            "app.get('/teams/:id/notes'",
+            "app",
+            "GET",
+            "/teams/:id/notes",
+        )],
+    )
+}
+
+fn admin_routes() -> (String, FileAnalysisResult) {
+    answer(
+        "src/admin-routes.ts",
+        &[],
+        &[("app.get('/admin/users'", "app", "GET", "/admin/users")],
+    )
+}
+
+fn chain() -> (String, FileAnalysisResult) {
+    answer(
+        "src/chain.ts",
+        &[],
+        &[("app.get('/leaf'", "app", "GET", "/leaf")],
+    )
+}
+
+/// The children the graph holds a mount for.
+fn mounted(result: &FileCentricAnalysisResult) -> BTreeSet<String> {
+    result
+        .mount_graph
+        .get_mounts()
+        .iter()
+        .map(|edge| edge.child.clone())
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn a_helper_handed_the_scopes_instance_takes_its_prefix() {
+    let result = analyze(vec![scope_only("src/helper-first.ts"), team_items()]).await;
+    assert_eq!(served(&result), set(&["GET /api/v1/teams/:id/items"]));
+    assert!(result.unread_mount_prefixes.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn a_helper_that_takes_the_instance_second_takes_its_prefix() {
+    let result = analyze(vec![scope_only("src/helper-second.ts"), team_notes()]).await;
+    assert_eq!(served(&result), set(&["GET /api/v1/teams/:id/notes"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_helper_that_only_hands_the_instance_on_carries_the_prefix() {
+    // `registerAllRoutes` registers nothing itself. Its file holds no row the
+    // model reads, so it goes through the scan as any such file does, with no
+    // canned answer.
+    let result = analyze_with(
+        vec![scope_only("src/helper-chain.ts"), team_items()],
+        &["src/all-routes.ts"],
+    )
+    .await;
+    assert_eq!(served(&result), set(&["GET /api/v1/teams/:id/items"]));
+    let mounts = result.mount_graph.get_mounts();
+    assert!(
+        mounts
+            .iter()
+            .any(|edge| edge.parent == "registerAllRoutes" && edge.child == "registerItemRoutes"),
+        "the hand-on is a mount of the file that makes it: {mounts:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_instance_is_followed_three_functions_on_and_no_further() {
+    let result = analyze(vec![scope_only("src/helper-depth-3.ts"), chain()]).await;
+    assert_eq!(served(&result), set(&["GET /api/v1/leaf"]));
+    let result = analyze(vec![scope_only("src/helper-depth-4.ts"), chain()]).await;
+    assert_eq!(served(&result), set(&["GET /leaf"]));
+    assert_eq!(mounted(&result), set(&["api"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_helper_called_with_another_instance_keeps_its_path() {
+    // `registerAdminRoutes(app)` is called inside the callback with the
+    // instance the plugin itself was given.
+    let result = analyze(vec![
+        scope_only("src/helper-other-instance.ts"),
+        team_items(),
+        admin_routes(),
+    ])
+    .await;
+    assert_eq!(
+        served(&result),
+        set(&["GET /api/v1/teams/:id/items", "GET /admin/users"])
+    );
+    assert!(!mounted(&result).contains("registerAdminRoutes"));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_member_a_wrapped_value_and_a_spread_are_not_the_instance() {
+    let result = analyze(vec![
+        scope_only("src/helper-not-the-instance.ts"),
+        team_items(),
+        team_notes(),
+        admin_routes(),
+    ])
+    .await;
+    assert_eq!(
+        served(&result),
+        set(&[
+            "GET /teams/:id/items",
+            "GET /teams/:id/notes",
+            "GET /admin/users"
+        ])
+    );
+    assert_eq!(mounted(&result), set(&["api"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn another_binding_with_the_parameters_name_is_not_the_instance() {
+    let result = analyze(vec![scope_only("src/helper-shadowed.ts"), team_items()]).await;
+    assert_eq!(served(&result), set(&["GET /teams/:id/items"]));
+    assert_eq!(mounted(&result), set(&["api"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_helper_that_registers_nothing_on_the_instance_is_not_a_mount() {
+    // `attachHooks` adds a hook. Its module also declares a router whose
+    // routes hang from a parameter of the same name, so only the span of the
+    // function that was called tells the two apart.
+    let hooks = answer(
+        "src/request-hooks.ts",
+        &[],
+        &[("app.get('/hook-status'", "app", "GET", "/hook-status")],
+    );
+    let result = analyze(vec![scope_only("src/helper-hook.ts"), hooks]).await;
+    assert_eq!(served(&result), set(&["GET /hook-status"]));
+    assert_eq!(mounted(&result), set(&["api"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_helper_called_from_two_scopes_is_served_under_both() {
+    let scopes = answer(
+        "src/helper-two-scopes.ts",
+        &[
+            ("// first scope", "app", "api", "/a", None),
+            ("// second scope", "app", "api", "/b", None),
+        ],
+        &[],
+    );
+    let result = analyze(vec![scopes, team_items()]).await;
+    assert_eq!(
+        served(&result),
+        set(&["GET /a/teams/:id/items", "GET /b/teams/:id/items"])
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn two_helpers_of_one_file_handed_one_scope_keep_their_paths() {
+    // Both helpers are mounted from the scope, and both resolve to one file.
+    // The graph does not decide which of the two a route belongs to, so
+    // neither route takes the prefix: the refusal is pinned here.
+    let pair = answer(
+        "src/pair.ts",
+        &[],
+        &[
+            ("app.get('/left'", "app", "GET", "/left"),
+            ("app.get('/right'", "app", "GET", "/right"),
+        ],
+    );
+    let result = analyze(vec![scope_only("src/helper-pair.ts"), pair]).await;
+    assert_eq!(served(&result), set(&["GET /left", "GET /right"]));
+    assert!(mounted(&result).contains("registerLeft"));
+    assert!(mounted(&result).contains("registerRight"));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_helper_declared_beside_the_scope_keeps_its_path() {
+    // The mount is stated, but a function the registering file declares is
+    // not a binding the graph attributes routes to, so the route keeps its
+    // path. Pinned as it stands today.
+    let local = answer(
+        "src/helper-local.ts",
+        &[("app.register(", "app", "api", "/api/v1", None)],
+        &[("server.get('/local'", "server", "GET", "/local")],
+    );
+    let result = analyze(vec![local]).await;
+    assert_eq!(served(&result), set(&["GET /local"]));
+    assert!(mounted(&result).contains("registerLocalRoutes"));
 }
 
 #[test]

@@ -27,6 +27,14 @@
 //! file's rows are in ([`mount_unstated_registrations`]) each one the model
 //! stated no mount for becomes a mount row, where the function it names
 //! registers on its own first parameter.
+//!
+//! A callback that hands its instance to a helper as an argument is read the
+//! same way (carrick#2316): `helper(api, deps)` inside the callback mounts
+//! `helper` from the scope when the function registers on the parameter that
+//! receives the instance, or passes that parameter on to a function that
+//! does. The instance is followed by binding from the callback's parameter to
+//! each function's parameter, never by name, and a call that hands over
+//! anything else (a member, a call's result, a spread) is not followed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -48,6 +56,10 @@ use crate::request_summary::literal_specifier;
 
 /// How many bindings a prefix read may follow before it gives up.
 const MAX_BINDING_DEPTH: usize = 4;
+
+/// How many functions an instance is followed through after the one the
+/// callback hands it to (carrick#2316).
+const MAX_PASS_ON_DEPTH: usize = 3;
 
 /// What a prefix expression reads to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,21 +105,48 @@ pub struct RegistrationSite {
     pub inner_registrations: Vec<InnerRegistration>,
 }
 
-/// A call `P.m(F, …)` inside a registration callback, where `P` is the
-/// callback's first parameter and `F` an identifier bound to an import or to
-/// a function this file declares. Whether `F` registers anything is not
-/// something this file says: see [`mount_unstated_registrations`].
+/// A call inside a registration callback that hands the callback's instance
+/// `P` (its first parameter) to a function `F`, an identifier bound to an
+/// import or to a function this file declares:
+///
+/// * `P.m(F, …)`, which calls `F` with the instance first;
+/// * `F(…, P, …)`, which calls `F` with the instance at the position `P` is
+///   written at (carrick#2316).
+///
+/// Whether `F` registers anything is not something this file says: see
+/// [`mount_unstated_registrations`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnerRegistration {
     /// The call's start line.
     pub line: u32,
-    /// `m`, kept for the emitted row's `pattern_matched`.
-    pub method: String,
+    /// `m` of `P.m(F, …)`, kept for the emitted row's `pattern_matched`;
+    /// `None` for the bare call `F(…, P, …)`.
+    pub method: Option<String>,
     /// `F`, as this file names it.
     pub identifier: String,
     /// The specifier `F` is imported from, as written; `None` for a function
     /// this file declares.
     pub import_source: Option<String>,
+    /// Which parameter of `F` receives the instance, counted from 0.
+    pub position: usize,
+}
+
+impl InnerRegistration {
+    /// The call as a mount row of the file that makes it, hanging from
+    /// `instance`: the name the file gives the instance handed over.
+    fn mount_row(&self, instance: &str) -> MountResult {
+        MountResult {
+            line_number: i32::try_from(self.line).unwrap_or(i32::MAX),
+            parent_node: instance.to_string(),
+            child_node: self.identifier.clone(),
+            mount_path: String::new(),
+            import_source: self.import_source.clone(),
+            pattern_matched: match &self.method {
+                Some(method) => format!("{instance}.{method}("),
+                None => format!("{}(", self.identifier),
+            },
+        }
+    }
 }
 
 /// A registration scope whose prefix the source does not state as a literal.
@@ -217,10 +256,12 @@ pub fn collect_registration_sites(
     finder.sites
 }
 
-/// Reads the calls a registration callback makes on its own first parameter
-/// (carrick#2303). The parameter and the function passed are both read by
-/// binding, so a name the callback or a block inside it declares again is
-/// never taken for either.
+/// Reads the calls that hand one instance to a function (carrick#2303,
+/// carrick#2316): inside a registration callback the instance is the
+/// callback's first parameter, and inside a function the instance was passed
+/// to it is the parameter that received it. The instance and the function are
+/// both read by binding, so a name a block inside declares again is never
+/// taken for either.
 struct InnerFinder<'s> {
     source_map: &'s Lrc<SourceMap>,
     values: &'s DeclaredValues,
@@ -228,15 +269,24 @@ struct InnerFinder<'s> {
     found: Vec<InnerRegistration>,
 }
 
-impl Visit for InnerFinder<'_> {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        call.visit_children_with(self);
-        let Callee::Expr(callee) = &call.callee else {
-            return;
-        };
-        let Expr::Member(member) = unwrap_expression(callee) else {
-            return;
-        };
+impl InnerFinder<'_> {
+    /// The function an identifier names: `Some(import specifier)` for an
+    /// import, `Some(None)` for a function this file declares, `None` for a
+    /// value this file binds some other way, which names no function.
+    fn function_named(&self, ident: &Ident) -> Option<Option<String>> {
+        let key = ident_key(ident);
+        match self.values.imports.get(&key) {
+            Some(specifier) => Some(Some(specifier.clone())),
+            None => self.values.functions.contains(&key).then_some(None),
+        }
+    }
+
+    fn line(&self, call: &CallExpr) -> u32 {
+        u32::try_from(self.source_map.lookup_char_pos(call.span.lo).line).unwrap_or(0)
+    }
+
+    /// `P.m(F, …)`: `F` is called with the instance first.
+    fn passed_to_the_instance(&mut self, call: &CallExpr, member: &MemberExpr) {
         let Expr::Ident(receiver) = unwrap_expression(&member.obj) else {
             return;
         };
@@ -252,17 +302,57 @@ impl Visit for InnerFinder<'_> {
         let Expr::Ident(passed) = unwrap_expression(&first.expr) else {
             return;
         };
-        let key = ident_key(passed);
-        let import_source = self.values.imports.get(&key).cloned();
-        if import_source.is_none() && !self.values.functions.contains(&key) {
-            return; // a value this file binds some other way names no function
-        }
+        let Some(import_source) = self.function_named(passed) else {
+            return;
+        };
         self.found.push(InnerRegistration {
-            line: u32::try_from(self.source_map.lookup_char_pos(call.span.lo).line).unwrap_or(0),
-            method: method.sym.to_string(),
+            line: self.line(call),
+            method: Some(method.sym.to_string()),
             identifier: passed.sym.to_string(),
             import_source,
+            position: 0,
         });
+    }
+
+    /// `F(…, P, …)`: `F` is called with the instance at the position it is
+    /// written at. A spread argument leaves every position after it unknown,
+    /// and an instance written twice names no one parameter, so neither is
+    /// recorded. An argument that only holds the instance (`P.inner`,
+    /// `wrap(P)`, `{ P }`) is another value.
+    fn handed_the_instance(&mut self, call: &CallExpr, function: &Ident) {
+        if call.args.iter().any(|arg| arg.spread.is_some()) {
+            return;
+        }
+        let mut positions = call.args.iter().enumerate().filter(|(_, arg)| {
+            matches!(unwrap_expression(&arg.expr), Expr::Ident(passed) if ident_key(passed) == self.param)
+        });
+        let (Some((position, _)), None) = (positions.next(), positions.next()) else {
+            return;
+        };
+        let Some(import_source) = self.function_named(function) else {
+            return;
+        };
+        self.found.push(InnerRegistration {
+            line: self.line(call),
+            method: None,
+            identifier: function.sym.to_string(),
+            import_source,
+            position,
+        });
+    }
+}
+
+impl Visit for InnerFinder<'_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        call.visit_children_with(self);
+        let Callee::Expr(callee) = &call.callee else {
+            return;
+        };
+        match unwrap_expression(callee) {
+            Expr::Member(member) => self.passed_to_the_instance(call, member),
+            Expr::Ident(function) => self.handed_the_instance(call, function),
+            _ => {}
+        }
     }
 }
 
@@ -757,12 +847,18 @@ fn mount_stated_at(result: &FileAnalysisResult, line: u32) -> bool {
         .any(|mount| u32::try_from(mount.line_number) == Ok(line))
 }
 
-/// Where a declared function starts and ends, and the name of its first
-/// parameter.
+/// Where a declared function starts and ends, the name of each parameter, and
+/// what its body hands each parameter on to.
 struct FunctionHead {
-    first_param: String,
+    /// The parameters by position: the name of a plain one, `None` for a
+    /// destructured, defaulted or rest parameter, which holds no instance
+    /// this pass can name.
+    params: Vec<Option<String>>,
     start_line: u32,
     end_line: u32,
+    /// The bare calls in the body that hand a plain parameter to a function,
+    /// each with the position of the parameter handed over (carrick#2316).
+    passes_on: Vec<(usize, InnerRegistration)>,
 }
 
 /// The functions a module declares by name, read on demand: only the modules
@@ -770,7 +866,7 @@ struct FunctionHead {
 struct FunctionHeads {
     source_map: Lrc<SourceMap>,
     handler: Handler,
-    by_file: HashMap<PathBuf, Vec<(String, Option<FunctionHead>)>>,
+    by_file: HashMap<PathBuf, Vec<(String, FunctionHead)>>,
 }
 
 impl FunctionHeads {
@@ -786,18 +882,22 @@ impl FunctionHeads {
         }
     }
 
-    /// The one function `file` declares as `name`, when its first parameter
-    /// is a plain name. A name the module declares twice is not decided.
+    /// The one function `file` declares as `name`. A name the module declares
+    /// twice is not decided.
     fn head(&mut self, file: &Path, name: &str) -> Option<&FunctionHead> {
         if !self.by_file.contains_key(file) {
-            let mut collector = HeadCollector {
-                source_map: &self.source_map,
-                heads: Vec::new(),
-            };
+            let mut heads = Vec::new();
             if let Some(module) = crate::parser::parse_file(file, &self.source_map, &self.handler) {
+                let mut values = DeclaredValues::default();
+                module.visit_with(&mut values);
+                let mut collector = HeadCollector {
+                    source_map: &self.source_map,
+                    values: &values,
+                    heads: Vec::new(),
+                };
                 module.visit_with(&mut collector);
+                heads = collector.heads;
             }
-            let heads = collector.heads;
             self.by_file.insert(file.to_path_buf(), heads);
         }
         let mut named = self
@@ -809,39 +909,78 @@ impl FunctionHeads {
         if named.next().is_some() {
             return None;
         }
-        head.as_ref()
+        Some(head)
     }
 }
 
 struct HeadCollector<'s> {
     source_map: &'s Lrc<SourceMap>,
-    heads: Vec<(String, Option<FunctionHead>)>,
+    values: &'s DeclaredValues,
+    heads: Vec<(String, FunctionHead)>,
 }
 
-impl HeadCollector<'_> {
-    fn record(&mut self, name: &Ident, first_param: Option<&Pat>, span: swc_common::Span) {
+impl<'s> HeadCollector<'s> {
+    /// Record one named function. `read_body` runs a finder over the
+    /// function's body.
+    fn record<'p>(
+        &mut self,
+        name: &Ident,
+        params: impl Iterator<Item = &'p Pat>,
+        span: swc_common::Span,
+        read_body: impl Fn(&mut InnerFinder<'s>),
+    ) {
         let line =
             |pos| u32::try_from(self.source_map.lookup_char_pos(pos).line).unwrap_or(u32::MAX);
-        let head = match first_param {
-            Some(Pat::Ident(param)) => Some(FunctionHead {
-                first_param: param.id.sym.to_string(),
+        let mut names = Vec::new();
+        let mut passes_on = Vec::new();
+        for (position, param) in params.enumerate() {
+            let Pat::Ident(param) = param else {
+                names.push(None);
+                continue;
+            };
+            names.push(Some(param.id.sym.to_string()));
+            let mut finder = InnerFinder {
+                source_map: self.source_map,
+                values: self.values,
+                param: ident_key(&param.id),
+                found: Vec::new(),
+            };
+            read_body(&mut finder);
+            // `p.m(F)` inside a plain function is a mount the model states
+            // or nothing: only the hand-on of the instance itself is read.
+            passes_on.extend(
+                finder
+                    .found
+                    .into_iter()
+                    .filter(|found| found.method.is_none())
+                    .map(|found| (position, found)),
+            );
+        }
+        passes_on.sort_by_key(|(_, found)| found.line);
+        self.heads.push((
+            name.sym.to_string(),
+            FunctionHead {
+                params: names,
                 start_line: line(span.lo),
                 end_line: line(span.hi),
-            }),
-            _ => None,
-        };
-        self.heads.push((name.sym.to_string(), head));
+                passes_on,
+            },
+        ));
+    }
+
+    fn record_function(&mut self, name: &Ident, function: &Function) {
+        self.record(
+            name,
+            function.params.iter().map(|param| &param.pat),
+            function.span,
+            |finder| function.body.visit_with(finder),
+        );
     }
 }
 
 impl Visit for HeadCollector<'_> {
     fn visit_fn_decl(&mut self, decl: &FnDecl) {
-        let function = &decl.function;
-        self.record(
-            &decl.ident,
-            function.params.first().map(|param| &param.pat),
-            function.span,
-        );
+        self.record_function(&decl.ident, &decl.function);
         decl.visit_children_with(self);
     }
 
@@ -850,12 +989,7 @@ impl Visit for HeadCollector<'_> {
         // expression: the name is a declaration only where the module exports
         // it, which is what the caller's resolver has already decided.
         if let Some(name) = &function.ident {
-            let inner = &function.function;
-            self.record(
-                name,
-                inner.params.first().map(|param| &param.pat),
-                inner.span,
-            );
+            self.record_function(name, &function.function);
         }
         function.visit_children_with(self);
     }
@@ -863,12 +997,14 @@ impl Visit for HeadCollector<'_> {
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
         if let (Pat::Ident(name), Some(init)) = (&declarator.name, &declarator.init) {
             match unwrap_expression(init) {
-                Expr::Arrow(arrow) => self.record(&name.id, arrow.params.first(), arrow.span),
-                Expr::Fn(function) if function.ident.is_none() => self.record(
-                    &name.id,
-                    function.function.params.first().map(|param| &param.pat),
-                    function.function.span,
-                ),
+                Expr::Arrow(arrow) => {
+                    self.record(&name.id, arrow.params.iter(), arrow.span, |finder| {
+                        arrow.body.visit_with(finder)
+                    })
+                }
+                Expr::Fn(function) if function.ident.is_none() => {
+                    self.record_function(&name.id, &function.function)
+                }
                 _ => {}
             }
         }
@@ -876,19 +1012,137 @@ impl Visit for HeadCollector<'_> {
     }
 }
 
+/// Follows an instance from the function it is handed to through the
+/// functions that function hands it on to (carrick#2316).
+struct InstanceTrace<'a> {
+    key_by_canonical: &'a HashMap<PathBuf, String>,
+    /// The resolver the mount graph reads a mount's child through, so a
+    /// function this decides is one the graph can attribute routes to.
+    resolver: BindingResolver,
+    heads: FunctionHeads,
+    /// The functions on the walk, so one that hands the instance back to a
+    /// function already on it ends there.
+    walking: Vec<(PathBuf, String, usize)>,
+}
+
+impl InstanceTrace<'_> {
+    /// The function a file names `identifier`: the module that declares it
+    /// and its name there. By the name the file gives it, as the graph reads
+    /// the emitted row's child: an import the graph cannot follow (one
+    /// renamed on the way in) is not decided.
+    fn declaration(
+        &mut self,
+        file: &Path,
+        registration: &InnerRegistration,
+    ) -> Option<(PathBuf, String)> {
+        match &registration.import_source {
+            Some(specifier) => {
+                let resolved = self
+                    .resolver
+                    .resolve(file, specifier, &registration.identifier)?;
+                // An export with no name to find is not decided.
+                Some((resolved.file, resolved.local_name?))
+            }
+            None => Some((file.to_path_buf(), registration.identifier.clone())),
+        }
+    }
+
+    /// Whether the function `declaring` declares as `name` registers on the
+    /// parameter at `position`: a stated route or mount inside its span hangs
+    /// from that parameter, or its body hands that parameter to a function
+    /// for which the same holds, at most [`MAX_PASS_ON_DEPTH`] functions on.
+    ///
+    /// Each hand-on that reaches a registration is pushed to `hand_ons` as a
+    /// mount row of the file that makes the call, hanging from the parameter:
+    /// the graph resolves that name to the binding the file was mounted
+    /// under, exactly as it resolves a route's owner, so the prefix of the
+    /// scope reaches the function the instance ends in. A line that already
+    /// holds a mount is the model's and is left to it.
+    fn registers(
+        &mut self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        declaring: &Path,
+        name: &str,
+        position: usize,
+        depth: usize,
+        hand_ons: &mut Vec<(String, MountResult)>,
+    ) -> bool {
+        let Some(key) = self.key_by_canonical.get(declaring) else {
+            return false;
+        };
+        let Some(rows) = file_results.get(key) else {
+            return false;
+        };
+        let Some(head) = self.heads.head(declaring, name) else {
+            return false;
+        };
+        let Some(Some(param)) = head.params.get(position) else {
+            return false;
+        };
+        let inside = |line: i32| {
+            u32::try_from(line).is_ok_and(|line| line >= head.start_line && line <= head.end_line)
+        };
+        let mut registers = rows
+            .mounts
+            .iter()
+            .any(|mount| &mount.parent_node == param && inside(mount.line_number))
+            || rows.endpoints.iter().any(|endpoint| {
+                &endpoint.owner_node == param
+                    && is_served_path(&endpoint.path)
+                    && inside(endpoint.line_number)
+            });
+        if depth >= MAX_PASS_ON_DEPTH {
+            return registers;
+        }
+        let walked = (declaring.to_path_buf(), name.to_string(), position);
+        if self.walking.contains(&walked) {
+            return registers;
+        }
+        let param = param.clone();
+        let passes_on: Vec<InnerRegistration> = head
+            .passes_on
+            .iter()
+            .filter(|(from, pass)| *from == position && !mount_stated_at(rows, pass.line))
+            .map(|(_, pass)| pass.clone())
+            .collect();
+        self.walking.push(walked);
+        for pass in passes_on {
+            let Some((file, function)) = self.declaration(declaring, &pass) else {
+                continue;
+            };
+            if self.registers(
+                file_results,
+                &file,
+                &function,
+                pass.position,
+                depth + 1,
+                hand_ons,
+            ) {
+                registers = true;
+                hand_ons.push((key.clone(), pass.mount_row(&param)));
+            }
+        }
+        self.walking.pop();
+        registers
+    }
+}
+
 /// State the mounts a registration callback makes and the model did not
 /// (carrick#2303). Returns how many mount rows the files gained, and the
 /// scopes this made whose prefix the source does not state as a literal.
 ///
-/// An inner registration `P.m(F)` becomes a mount row of its file when both
-/// hold:
+/// An inner registration, `P.m(F)` or `F(…, P, …)`, becomes a mount row of
+/// its file when both hold:
 ///
 /// * the file's rows hold no mount at that line, so a model row always wins
 ///   and nothing is stated twice;
-/// * `F` resolves to a function whose first parameter is a plain name, and at
-///   least one stated route or mount inside that function's span hangs from
-///   that parameter. A function that registers nothing on its first parameter
-///   (an error handler, a hook) is not mounted.
+/// * `F` resolves to a function whose parameter at the position the instance
+///   is handed to is a plain name, and that function registers on it
+///   ([`InstanceTrace::registers`]): at least one stated route or mount
+///   inside the function's span hangs from that parameter, or the function
+///   hands the parameter on to one for which that holds (carrick#2316). A
+///   function that registers nothing on the instance (an error handler, a
+///   hook) is not mounted.
 ///
 /// The second reads another file's rows, which is why this runs once every
 /// file's rows are in, and to a fixed point: a function whose only
@@ -919,10 +1173,12 @@ pub fn mount_unstated_registrations(
     let mut order: Vec<&UnstatedRegistrations> = pending.iter().collect();
     order.sort_by(|a, b| a.file_key.cmp(&b.file_key));
 
-    // The resolver the mount graph reads a mount's child through, so a
-    // function this decides is one the graph can attribute routes to.
-    let mut resolver = BindingResolver::new();
-    let mut heads = FunctionHeads::new();
+    let mut trace = InstanceTrace {
+        key_by_canonical: &key_by_canonical,
+        resolver: BindingResolver::new(),
+        heads: FunctionHeads::new(),
+        walking: Vec::new(),
+    };
     let mut emitted = 0usize;
     loop {
         let mut progressed = false;
@@ -934,6 +1190,7 @@ pub fn mount_unstated_registrations(
                 continue;
             };
             let mut rows: Vec<MountResult> = Vec::new();
+            let mut hand_ons: Vec<(String, MountResult)> = Vec::new();
             for site in &file.sites {
                 if registers_a_route(result, site) {
                     continue;
@@ -942,58 +1199,41 @@ pub fn mount_unstated_registrations(
                     if mount_stated_at(result, inner.line) {
                         continue;
                     }
-                    let (declaring, name) = match &inner.import_source {
-                        // By the name this file gives it, as the graph reads
-                        // the emitted row's child: an import the graph cannot
-                        // follow (one renamed on the way in) is not decided.
-                        Some(specifier) => {
-                            let Some(resolved) =
-                                resolver.resolve(&importer, specifier, &inner.identifier)
-                            else {
-                                continue;
-                            };
-                            let Some(name) = resolved.local_name else {
-                                continue; // an export with no name to find
-                            };
-                            (resolved.file, name)
-                        }
-                        None => (importer.clone(), inner.identifier.clone()),
-                    };
-                    let Some(declaring_rows) = key_by_canonical
-                        .get(&declaring)
-                        .and_then(|key| file_results.get(key))
-                    else {
+                    let Some((declaring, name)) = trace.declaration(&importer, inner) else {
                         continue;
                     };
-                    let Some(head) = heads.head(&declaring, &name) else {
-                        continue;
-                    };
-                    let inside = |line: i32| {
-                        u32::try_from(line)
-                            .is_ok_and(|line| line >= head.start_line && line <= head.end_line)
-                    };
-                    let registers = declaring_rows.mounts.iter().any(|mount| {
-                        mount.parent_node == head.first_param && inside(mount.line_number)
-                    }) || declaring_rows.endpoints.iter().any(|endpoint| {
-                        endpoint.owner_node == head.first_param
-                            && is_served_path(&endpoint.path)
-                            && inside(endpoint.line_number)
-                    });
-                    if !registers {
-                        continue;
+                    if trace.registers(
+                        file_results,
+                        &declaring,
+                        &name,
+                        inner.position,
+                        0,
+                        &mut hand_ons,
+                    ) {
+                        rows.push(inner.mount_row(&site.param));
                     }
-                    rows.push(MountResult {
-                        line_number: i32::try_from(inner.line).unwrap_or(i32::MAX),
-                        parent_node: site.param.clone(),
-                        child_node: inner.identifier.clone(),
-                        mount_path: String::new(),
-                        import_source: inner.import_source.clone(),
-                        pattern_matched: format!("{}.{}(", site.param, inner.method),
-                    });
                 }
             }
             if rows.is_empty() {
                 continue;
+            }
+            // The hand-ons first: one in this file is then among the rows the
+            // scope pass reads below.
+            for (key, row) in hand_ons {
+                let Some(target) = file_results.get_mut(&key) else {
+                    continue;
+                };
+                // One function reached from two scopes hands on once.
+                if u32::try_from(row.line_number).is_ok_and(|line| mount_stated_at(target, line)) {
+                    continue;
+                }
+                debug!(
+                    "Mount read from the source at {}:{}: {} is handed on to {} and the model \
+                     stated no mount there",
+                    key, row.line_number, row.parent_node, row.child_node
+                );
+                target.mounts.push(row);
+                emitted += 1;
             }
             let Some(result) = file_results.get_mut(&file.file_key) else {
                 continue;
@@ -1183,9 +1423,10 @@ mod tests {
     fn inner(line: u32, method: &str, identifier: &str, import: Option<&str>) -> InnerRegistration {
         InnerRegistration {
             line,
-            method: method.to_string(),
+            method: Some(method.to_string()),
             identifier: identifier.to_string(),
             import_source: import.map(str::to_string),
+            position: 0,
         }
     }
 
@@ -1201,6 +1442,54 @@ mod tests {
                 inner(9, "register", "arrow", None),
             ]
         );
+    }
+
+    fn handed(
+        line: u32,
+        identifier: &str,
+        import: Option<&str>,
+        position: usize,
+    ) -> InnerRegistration {
+        InnerRegistration {
+            line,
+            method: None,
+            identifier: identifier.to_string(),
+            import_source: import.map(str::to_string),
+            position,
+        }
+    }
+
+    #[test]
+    fn a_callback_records_the_functions_it_hands_its_parameter_to() {
+        // First, second, awaited, through a cast, and to a function this
+        // file declares: each with the position the instance is written at.
+        let source = "import { first, second } from './routes';\nimport third from './third';\nfunction local(deps, app) {}\napp.register(async (api) => {\n  first(api, deps);\n  second(deps, api);\n  await third(api as Server);\n  local(deps, api);\n});";
+        assert_eq!(
+            inner_of(source),
+            vec![
+                handed(5, "first", Some("./routes"), 0),
+                handed(6, "second", Some("./routes"), 1),
+                handed(7, "third", Some("./third"), 0),
+                handed(8, "local", None, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_that_does_not_hand_over_the_instance_itself_is_not_recorded() {
+        // A member of it, a value made from it, an object holding it, a
+        // spread before it, the instance twice, a callee that names no
+        // function, and a method of some other object.
+        let source = "import { routes } from './routes';\nconst table = { a: 1 };\napp.register(async (api) => {\n  routes(api.inner);\n  routes(wrap(api));\n  routes({ api });\n  routes(...rest, api);\n  routes(...[api]);\n  routes(api, api);\n  table(api);\n  undeclared(api);\n  registry.add(api);\n  routes(deps);\n});";
+        assert_eq!(inner_of(source), vec![]);
+    }
+
+    #[test]
+    fn another_binding_of_the_parameters_name_is_not_handed_on() {
+        let source = "import { routes } from './routes';\napp.register(async (api) => {\n  {\n    const api = other();\n    routes(api);\n  }\n  list.forEach((api) => routes(api));\n});";
+        let found = sites(source);
+        let outer = found.iter().find(|site| site.line == 2).expect("outer");
+        assert!(outer.inner_registrations.is_empty(), "{outer:?}");
     }
 
     #[test]
