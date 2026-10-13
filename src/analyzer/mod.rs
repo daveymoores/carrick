@@ -1600,6 +1600,10 @@ pub struct Analyzer {
     /// Merged manifest entries across every participating repo, for the
     /// alias -> display-name map the findings projection uses.
     type_manifests: Vec<crate::cloud_storage::TypeManifestEntry>,
+    /// The repo this run scanned and the directory its sources sit in, set by
+    /// the engine. Call sites of that repo are repo-relative; with no root, or
+    /// for another repo's call, a source file cannot be read here.
+    source_root: Option<(String, PathBuf)>,
 }
 
 /// One structured type-compat outcome for a matched (producer, consumer,
@@ -1751,6 +1755,7 @@ impl Analyzer {
             mount_graph: None,
             pair_outcomes: None,
             type_manifests: Vec::new(),
+            source_root: None,
         }
     }
 
@@ -1805,6 +1810,12 @@ impl Analyzer {
     /// Store the merged manifest entries (all repos) for display-name mapping.
     pub fn set_type_manifests(&mut self, entries: Vec<crate::cloud_storage::TypeManifestEntry>) {
         self.type_manifests = entries;
+    }
+
+    /// Say where the scanned repo's sources are, so a suggestion can be
+    /// checked against the file it is about (carrick#2318).
+    pub fn set_source_root(&mut self, repo_name: String, root: PathBuf) {
+        self.source_root = Some((repo_name, root));
     }
 
     pub fn add_repo_packages(&mut self, repo_name: String, packages: Packages) {
@@ -2098,6 +2109,54 @@ impl Analyzer {
         }
 
         "UNKNOWN_API".to_string()
+    }
+
+    /// Whether `call`'s env-var base `name` is one its own file never
+    /// mentions, so a configuration suggestion naming it would ask the user
+    /// to declare something the source does not contain (carrick#2318).
+    ///
+    /// Only a row that is a candidate (the model's, or an inline literal's)
+    /// can state a base the source does not hold; a deterministic row read
+    /// its base off the file. A file that cannot be read here, such as one
+    /// of another repo's, cannot be judged, so the base stands.
+    fn base_is_unsupported_by_source(
+        call: &ApiEndpointDetails,
+        name: &str,
+        source_root: Option<&(String, PathBuf)>,
+        text_by_file: &mut HashMap<PathBuf, Option<String>>,
+    ) -> bool {
+        if call
+            .resolution_source
+            .is_some_and(|source| !source.is_candidate())
+        {
+            return false;
+        }
+        let Some((repo, root)) = source_root else {
+            return false;
+        };
+        if call.repo_name.as_deref() != Some(repo.as_str()) {
+            return false;
+        }
+        // The call's location is `file:line`.
+        let location = call.file_path.to_string_lossy();
+        let file = match location.rsplit_once(':') {
+            Some((file, line)) if line.bytes().all(|b| b.is_ascii_digit()) => file,
+            _ => &location,
+        };
+        let text = text_by_file
+            .entry(root.join(file))
+            .or_insert_with_key(|path| std::fs::read_to_string(path).ok());
+        let Some(text) = text else {
+            return false;
+        };
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+        !text.match_indices(name).any(|(start, found)| {
+            !text[..start].chars().next_back().is_some_and(is_ident)
+                && !text[start + found.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_ident)
+        })
     }
 
     /// Check if a route represents an environment variable base URL.
@@ -2443,6 +2502,8 @@ impl Analyzer {
         // (env_var, METHOD, path) → call sites.
         let mut env_var_calls: BTreeMap<(String, String, String), BTreeSet<String>> =
             BTreeMap::new();
+        // File text read once per file for the env-var suggestion guard.
+        let mut source_text_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
         // The single producer each method-mismatch finding names: suppressed
         // from the orphan list so a wrong-verb call reports once, as a risk —
         // not as a missing+orphaned pair. Its exact-path siblings keep their
@@ -2581,6 +2642,18 @@ impl Analyzer {
                     continue;
                 }
                 if !self.config.is_internal_call(&canonical_env_var_route) {
+                    // A suggestion asks the user to declare this name, so the
+                    // file the call sits in must read or bind it (#2318). A
+                    // base a deterministic pass read stands on the source by
+                    // construction; the model's own row may have made one up.
+                    if Self::base_is_unsupported_by_source(
+                        call,
+                        &env_var_name,
+                        self.source_root.as_ref(),
+                        &mut source_text_cache,
+                    ) {
+                        continue;
+                    }
                     env_var_calls
                         .entry((env_var_name, method.to_string(), normalized_path))
                         .or_default()
@@ -8170,6 +8243,53 @@ mod tests {
         attach_verified_type_verdicts(&mut verified, &matches, &dirs);
         assert_eq!(verified[0].type_verdict, Some(TypeVerdict::Unverifiable));
         assert!(!verified[0].producer_wider);
+    }
+
+    /// carrick#2318: the suggestion guard reads the call's own file, matches a
+    /// whole identifier, leaves a deterministic row alone, and cannot judge a
+    /// file it cannot read or a repo it holds no root for.
+    #[test]
+    fn a_suggested_base_must_be_named_by_the_file_the_call_sits_in() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.ts"),
+            "const base = process.env.REAL_URL;\nfetch(`${base}/x`);\n",
+        )
+        .expect("write");
+        let root = ("svc".to_string(), dir.path().to_path_buf());
+        let call = |file: &str, source: Option<ResolutionSource>, repo: &str| {
+            let mut c = http_call("GET", "${X}/x", file);
+            c.resolution_source = source;
+            c.repo_name = Some(repo.to_string());
+            c
+        };
+        let judge = |c: &ApiEndpointDetails, name: &str| {
+            Analyzer::base_is_unsupported_by_source(c, name, Some(&root), &mut HashMap::new())
+        };
+        let model = Some(ResolutionSource::Model);
+
+        assert!(!judge(&call("a.ts:2", model, "svc"), "REAL_URL"));
+        assert!(judge(&call("a.ts:2", model, "svc"), "MADE_UP"));
+        assert!(
+            judge(&call("a.ts:2", model, "svc"), "REAL"),
+            "a name inside a longer identifier is not the name"
+        );
+        assert!(
+            !judge(
+                &call("a.ts:2", Some(ResolutionSource::EnvBasePath), "svc"),
+                "MADE_UP"
+            ),
+            "a base a deterministic pass read is not second-guessed"
+        );
+        assert!(!judge(&call("gone.ts:2", model, "svc"), "MADE_UP"));
+        assert!(!judge(&call("a.ts:2", model, "other"), "MADE_UP"));
+        assert!(!Analyzer::base_is_unsupported_by_source(
+            &call("a.ts:2", model, "svc"),
+            "MADE_UP",
+            None,
+            &mut HashMap::new()
+        ));
     }
 
     /// A consumer location outside the GitHub Actions workspace passes through
