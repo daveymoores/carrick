@@ -1756,6 +1756,10 @@ impl FileOrchestrator {
         // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut unread_prefixes: Vec<crate::registration_scope::UnreadPrefix> = Vec::new();
+        // Registration callbacks holding a registration the model stated no
+        // mount for (carrick#2303), decided once every file's rows are in.
+        let mut unstated_registrations: Vec<crate::registration_scope::UnstatedRegistrations> =
+            Vec::new();
         let mut stats = ProcessingStats::default();
         // Every path that reaches a prompt is reduced against this (see
         // `PendingFile::prompt_path`). The engine canonicalizes `repo_path`
@@ -1976,6 +1980,7 @@ impl FileOrchestrator {
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
             dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
             unread_prefixes: &mut Vec<crate::registration_scope::UnreadPrefix>,
+            unstated_registrations: &mut Vec<crate::registration_scope::UnstatedRegistrations>,
         ) {
             // A model row at a site whose callee provably sends nothing is
             // the model reading a request into a name (carrick#1555).
@@ -2051,6 +2056,15 @@ impl FileOrchestrator {
             );
             stats.mount_prefixes_unread += unread.len();
             unread_prefixes.extend(unread);
+            // What a callback registers and the model did not state is
+            // decided against the rows of the file that declares it
+            // (carrick#2303), so the sites wait for every file.
+            unstated_registrations.extend(crate::registration_scope::UnstatedRegistrations::of(
+                adjusted,
+                &pf.registration_sites,
+                &pf.path_str,
+                &pf.prompt_path,
+            ));
 
             // Drop LLM-emitted pub/sub ops whose topic has no literal
             // witness in the file's source (carrick#311): the analyzer
@@ -3540,6 +3554,7 @@ impl FileOrchestrator {
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
                         &mut unread_prefixes,
+                        &mut unstated_registrations,
                     );
 
                     stats.total_mounts += adjusted.mounts.len();
@@ -3621,6 +3636,7 @@ impl FileOrchestrator {
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
                         &mut unread_prefixes,
+                        &mut unstated_registrations,
                     );
                     Self::count_unemitted_literal_candidates(
                         &deterministic,
@@ -3913,6 +3929,27 @@ impl FileOrchestrator {
                 wrapper_call_joins.linked, wrapper_call_joins.ambiguous
             );
         }
+
+        // PHASE 5f (carrick#2303): the mounts a registration callback makes
+        // and the model did not state, read from the source. Last before the
+        // graph, which reads the scopes and the unread prefixes this adds
+        // exactly as it reads the ones the per-file pass made.
+        let (source_mounts, unread) = crate::registration_scope::mount_unstated_registrations(
+            &mut file_results,
+            &unstated_registrations,
+            Path::new(""),
+        );
+        if source_mounts > 0 {
+            debug!(
+                "  - Mounts read from the source where the model stated none: {} (scopes with an \
+                 unread prefix: {})",
+                source_mounts,
+                unread.len()
+            );
+            stats.total_mounts += source_mounts;
+        }
+        stats.mount_prefixes_unread += unread.len();
+        unread_prefixes.extend(unread);
 
         // STEP 5: Build aggregated mount graph from all file results
         let (mount_graph, corroborated) = self.build_mount_graph_reading_scopes(
