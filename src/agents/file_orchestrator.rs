@@ -8149,9 +8149,31 @@ impl FileOrchestrator {
         // row with no case that restates a route the model also states as
         // cases is then dropped whichever order the model answered in, rather
         // than taking the route before its cases reach it.
+        //
+        // A `body` case on a method that carries no request body is not a case
+        // (carrick#2110). GET and HEAD send none, so what the handler switched
+        // on was read off the URL, and a query parameter belongs to the path
+        // (`dispatch::DispatchLocation`). The row loses the case before
+        // anything is compared with it, and the rows that then agree are one
+        // row by the rule every restated route already takes below.
+        let mut bodyless_cases_dropped = 0usize;
         let (cases, plain): (Vec<EndpointResult>, Vec<EndpointResult>) = endpoints
             .into_iter()
+            .map(|mut endpoint| {
+                if Self::states_a_body_case_without_a_body(&endpoint) {
+                    endpoint.dispatch = None;
+                    bodyless_cases_dropped += 1;
+                }
+                endpoint
+            })
             .partition(|endpoint| endpoint.dispatch.is_some());
+        if bodyless_cases_dropped > 0 {
+            debug!(
+                "Dropped the body case from {} model endpoint row(s) in {}: the method carries \
+                 no request body",
+                bodyless_cases_dropped, file_path
+            );
+        }
         for mut endpoint in cases.into_iter().chain(plain) {
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
@@ -8203,7 +8225,7 @@ impl FileOrchestrator {
                             );
                             taken[index] = Taken::Cases;
                             if !Self::restates_a_kept_row(
-                                &result.endpoints[deterministic_rows..],
+                                &mut result.endpoints[deterministic_rows..],
                                 &row,
                                 file_path,
                             ) {
@@ -8288,7 +8310,7 @@ impl FileOrchestrator {
             // agrees with a deterministic row must fold onto it and keep its
             // source, which is the twin search below.
             if Self::restates_a_kept_row(
-                &result.endpoints[deterministic_rows..],
+                &mut result.endpoints[deterministic_rows..],
                 &endpoint,
                 file_path,
             ) {
@@ -9052,23 +9074,39 @@ impl FileOrchestrator {
         }
     }
 
+    /// Whether a model row states a `body` dispatch case on a method that
+    /// carries no request body (carrick#2110). GET and HEAD are the two HTTP
+    /// defines that way, so the field such a handler switches on is read off
+    /// the URL. A `header` case is a case on any method.
+    fn states_a_body_case_without_a_body(endpoint: &EndpointResult) -> bool {
+        endpoint
+            .dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.location == crate::dispatch::DispatchLocation::Body)
+            && ["GET", "HEAD"]
+                .iter()
+                .any(|method| endpoint.method.eq_ignore_ascii_case(method))
+    }
+
     /// Whether `endpoint` restates a row the join has already kept for this
-    /// file, by [`Self::model_row_key`]. Logged when it does.
+    /// file, by [`Self::model_row_key`]. Logged when it does, and the kept
+    /// row takes the type anchors it does not state from the one dropped.
     fn restates_a_kept_row(
-        kept: &[EndpointResult],
+        kept: &mut [EndpointResult],
         endpoint: &EndpointResult,
         file_path: &str,
     ) -> bool {
         let key = Self::model_row_key(endpoint);
-        let restates = kept.iter().any(|row| Self::model_row_key(row) == key);
-        if restates {
-            warn!(
-                "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
-                 emitted for this file: dropped",
-                endpoint.method, endpoint.path, file_path
-            );
-        }
-        restates
+        let Some(row) = kept.iter_mut().find(|row| Self::model_row_key(row) == key) else {
+            return false;
+        };
+        warn!(
+            "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
+             emitted for this file: dropped",
+            endpoint.method, endpoint.path, file_path
+        );
+        Self::carry_type_anchors(row, endpoint);
+        true
     }
 
     /// A model row with no dispatch case, for a route the model also states
@@ -18449,6 +18487,103 @@ export { routes };
         // route's own payload, so it carries the type anchor.
         assert_eq!(result.endpoints[0].candidate_id, "happy");
         assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// A GET carries no request body, so a `body` case on one is not a case
+    /// (carrick#2110): two values a handler reads off the query string are one
+    /// route stated twice. The row kept is the first, and it takes the type
+    /// anchor it does not state from the row dropped. A `header` case on the
+    /// same method, and a `body` case on a method that carries one, stay.
+    #[test]
+    fn a_body_case_on_a_method_with_no_body_is_dropped_and_the_rows_are_one() {
+        let case = |location: crate::dispatch::DispatchLocation, value: &str| {
+            Some(crate::dispatch::Dispatch {
+                location,
+                field: "mode".to_string(),
+                value: value.to_string(),
+            })
+        };
+        let (body, header) = (
+            crate::dispatch::DispatchLocation::Body,
+            crate::dispatch::DispatchLocation::Header,
+        );
+        let mut candidates = HashMap::new();
+        let mut rows = Vec::new();
+        for (line, method, path, location) in [
+            (10i32, "GET", "/reports/:id", body),
+            (20, "head", "/reports/:id", body),
+            (30, "GET", "/feed", header),
+            (40, "POST", "/reports", body),
+        ] {
+            let id = format!("site{line}");
+            let mut candidate = candidate_with_snippet(&id, Some(&format!("'{path}'")));
+            candidate.span_start = line as u32 * 10;
+            candidate.span_end = line as u32 * 10 + 5;
+            candidate.line_number = line as usize;
+            candidate.end_line = line as usize;
+            candidate.callee_object = "app".to_string();
+            candidate.callee_property = Some(method.to_ascii_lowercase());
+            candidates.insert(id.clone(), candidate);
+            for (value, response) in [("simple", None), ("advanced", Some("report"))] {
+                rows.push(EndpointResult {
+                    handler_declaration_line: None,
+                    registration_literal: None,
+                    view_module: false,
+                    candidate_id: id.clone(),
+                    line_number: line,
+                    owner_node: "app".to_string(),
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    handler_name: "<anonymous>".to_string(),
+                    pattern_matched: "app.".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: response.map(str::to_string),
+                    response_expression_line: response.map(|_| line),
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    resolution_source: None,
+                    dispatch: case(location, value),
+                });
+            }
+        }
+
+        let (result, _) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: rows,
+                ..Default::default()
+            },
+            &candidates,
+            "src/reports.ts",
+        );
+
+        let mut kept: Vec<(i32, Option<String>, Option<&str>)> = result
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.line_number,
+                    endpoint.dispatch.as_ref().map(|case| case.key()),
+                    endpoint.response_expression_text.as_deref(),
+                )
+            })
+            .collect();
+        kept.sort();
+        let key = |location, value: &str| case(location, value).map(|case| case.key());
+        assert_eq!(
+            kept,
+            vec![
+                (10, None, Some("report")),
+                (20, None, Some("report")),
+                (30, key(header, "advanced"), Some("report")),
+                (30, key(header, "simple"), None),
+                (40, key(body, "advanced"), Some("report")),
+                (40, key(body, "simple"), None),
+            ],
+        );
     }
 
     /// Two routers declared in one file and mounted at different prefixes
