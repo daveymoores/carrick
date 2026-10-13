@@ -2,6 +2,7 @@ pub mod file_analyzer_agent;
 pub mod file_orchestrator;
 pub mod framework_guidance_agent;
 pub mod schemas;
+pub mod source_parts;
 
 // File-centric analysis types (new architecture)
 // These are re-exported for external use

@@ -24,6 +24,7 @@ use crate::{
             MountResult, PubsubOperation, ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
+        source_parts::{Limits, ShownLines, SourceCut, SourcePart},
     },
     call_base::resolve_call_base,
     cloud_storage::{ManifestRole, ManifestTypeKind},
@@ -133,54 +134,19 @@ pub struct ListedCandidate {
     pub span_end: u32,
 }
 
-/// A run of consecutive candidate groups of one file, asked about in one
-/// request (carrick#1898).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CandidatePart {
-    /// Where the part's first group sits among the file's groups in source
-    /// order. It orders a file's parts and names one.
-    pub first_group: usize,
-    /// The part's groups, in source order. A group is the candidates that
-    /// share a start, each given as its position in the prompt's listing.
-    pub groups: Vec<Vec<usize>>,
-}
+/// The most bytes of source one part's window holds, and the most bytes of
+/// declarations shown beside it (carrick#2308). See
+/// [`crate::agents::source_parts`] for how a file is cut under them.
+pub const PART_WINDOW_BYTES: usize = 64_000;
+pub const PART_CONTEXT_BYTES: usize = 16_000;
 
-impl CandidatePart {
-    /// The part's candidates as positions in the prompt's listing, in the
-    /// order the prompt lists them.
-    pub fn candidates(&self) -> Vec<usize> {
-        let mut positions: Vec<usize> = self.groups.iter().flatten().copied().collect();
-        positions.sort_unstable();
-        positions
-    }
-
-    /// The two halves of a part of several groups, split at its middle group.
-    /// `None` for a single group: its candidates are never separated.
-    pub fn halves(&self) -> Option<(Self, Self)> {
-        if self.groups.len() < 2 {
-            return None;
-        }
-        let middle = self.groups.len() / 2;
-        Some((
-            Self {
-                first_group: self.first_group,
-                groups: self.groups[..middle].to_vec(),
-            },
-            Self {
-                first_group: self.first_group + middle,
-                groups: self.groups[middle..].to_vec(),
-            },
-        ))
-    }
-
-    /// The part's name in a log line and a dump: its first and last group.
-    pub fn label(&self) -> String {
-        format!(
-            "{:04}-{:04}",
-            self.first_group,
-            self.first_group + self.groups.len().saturating_sub(1)
-        )
-    }
+/// One part's answer, beside the window of the file the part was asked about
+/// (carrick#2308).
+#[derive(Debug, Clone)]
+pub struct PartAnswer {
+    /// The part's window: its first and last line.
+    pub window: (u32, u32),
+    pub answer: FileAnalysisResult,
 }
 
 /// A file's candidates as groups in source order: the candidates that share a
@@ -197,126 +163,174 @@ fn candidate_groups(listed: &[ListedCandidate]) -> Vec<Vec<usize>> {
     by_start.into_values().collect()
 }
 
-/// The parts a file is asked in: runs of consecutive groups in source order,
-/// each holding at most `max_candidates` (carrick#1898).
+/// The rows of one kind that echo no listed candidate, as a set keyed by what
+/// each states and its line (carrick#2308).
 ///
-/// A function of the file's candidates and nothing else, so the same file is
-/// asked in the same parts on every scan. A group that alone holds more than
-/// the limit is a part on its own.
-pub fn candidate_parts(listed: &[ListedCandidate], max_candidates: usize) -> Vec<CandidatePart> {
-    let mut parts: Vec<CandidatePart> = Vec::new();
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut held = 0;
-    let mut first_group = 0;
-    for (index, group) in candidate_groups(listed).into_iter().enumerate() {
-        if !groups.is_empty() && held + group.len() > max_candidates {
-            parts.push(CandidatePart {
-                first_group,
-                groups: std::mem::take(&mut groups),
-            });
-            first_group = index;
-            held = 0;
-        }
-        held += group.len();
-        groups.push(group);
-    }
-    if !groups.is_empty() {
-        parts.push(CandidatePart {
-            first_group,
-            groups,
-        });
-    }
-    parts
+/// A row keeps the place it was first stated in. Where a later part states
+/// the same key, its row takes that place only when it ranks higher.
+struct KeyedRows<T> {
+    rows: Vec<(T, u8)>,
+    place: HashMap<String, usize>,
 }
 
-/// Append the rows of `more` that `rows` does not hold already, byte for
-/// byte as they serialize.
-fn append_unseen_rows<T: serde::Serialize>(
-    rows: &mut Vec<T>,
-    seen: &mut HashSet<String>,
-    more: Vec<T>,
-) {
-    for row in more {
-        match serde_json::to_string(&row) {
-            Ok(key) => {
-                if seen.insert(key) {
-                    rows.push(row);
+impl<T> KeyedRows<T> {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            place: HashMap::new(),
+        }
+    }
+
+    /// Keep `row` under `key`, which is what the row states as JSON. A row
+    /// whose key cannot be written is kept: nothing says it repeats.
+    fn keep(&mut self, key: serde_json::Result<String>, row: T, rank: u8) {
+        let Ok(key) = key else {
+            self.rows.push((row, rank));
+            return;
+        };
+        match self.place.get(&key) {
+            Some(place) => {
+                if rank > self.rows[*place].1 {
+                    self.rows[*place] = (row, rank);
                 }
             }
-            // A row that cannot be compared is kept: nothing says it repeats.
-            Err(_) => rows.push(row),
+            None => {
+                self.place.insert(key, self.rows.len());
+                self.rows.push((row, rank));
+            }
         }
+    }
+
+    fn into_rows(self) -> Vec<T> {
+        self.rows.into_iter().map(|(row, _)| row).collect()
     }
 }
 
-/// The one answer a file asked in parts stores (carrick#1898).
+/// The one answer a file asked in parts stores (carrick#1898, carrick#2308).
 ///
-/// `answers` holds each part's answer beside the part's `first_group`, in
-/// whatever order the parts completed. The result does not depend on that
-/// order:
+/// `answers` holds each part's answer beside the part's window, in whatever
+/// order the parts completed. The result does not depend on that order:
 ///
-/// - route and call rows are every part's rows, ordered by where their
-///   candidate sits in the source; rows of one candidate keep the order their
-///   part gave them, and a row whose id names no listed candidate follows the
-///   rows that do, in part order;
-/// - the rows that carry no candidate id (mounts, pub/sub and GraphQL
-///   operations, dispatch tables) are a set: every part reads the whole file
-///   and may state the same one, so a row is kept the first time it is
-///   stated, parts taken in source order, and an exact repeat is dropped.
+/// - route and call rows that echo a listed candidate id are every part's
+///   rows, ordered by where their candidate sits in the source; rows of one
+///   candidate keep the order their part gave them;
+/// - every other row (a mount, a pub/sub or GraphQL operation, a consumer
+///   locate, a dispatch table, and a route or call row that echoes no listed
+///   id) is one of a set keyed by what it states and its line. Where two
+///   parts state the same key, the row from the part whose window holds that
+///   line is kept, and where no such part states it, the first in source
+///   order. A row is never dropped only because its line is outside the
+///   window of the part that stated it;
+/// - for a GraphQL field, a row that names a resolver function is kept over a
+///   row that names none.
 pub fn merge_part_answers(
     listed: &[ListedCandidate],
-    mut answers: Vec<(usize, FileAnalysisResult)>,
+    mut answers: Vec<PartAnswer>,
 ) -> FileAnalysisResult {
-    answers.sort_by_key(|(first_group, _)| *first_group);
+    answers.sort_by_key(|part| part.window);
     let place_in_source: HashMap<&str, usize> = candidate_groups(listed)
         .into_iter()
         .flatten()
         .enumerate()
         .map(|(place, position)| (listed[position].candidate_id.as_str(), place))
         .collect();
-    let place = |candidate_id: &str| {
-        place_in_source
-            .get(candidate_id)
-            .copied()
-            .unwrap_or(usize::MAX)
-    };
 
     let mut merged = FileAnalysisResult::default();
-    let mut mounts = HashSet::new();
-    let mut graphql_operations = HashSet::new();
-    let mut pubsub_operations = HashSet::new();
-    let mut graphql_consumer_locates = HashSet::new();
-    let mut dispatch_tables = HashSet::new();
-    for (_, part) in answers {
-        merged.endpoints.extend(part.endpoints);
-        merged.data_calls.extend(part.data_calls);
-        append_unseen_rows(&mut merged.mounts, &mut mounts, part.mounts);
-        append_unseen_rows(
-            &mut merged.graphql_operations,
-            &mut graphql_operations,
-            part.graphql_operations,
-        );
-        append_unseen_rows(
-            &mut merged.pubsub_operations,
-            &mut pubsub_operations,
-            part.pubsub_operations,
-        );
-        append_unseen_rows(
-            &mut merged.graphql_consumer_locates,
-            &mut graphql_consumer_locates,
-            part.graphql_consumer_locates,
-        );
-        append_unseen_rows(
-            &mut merged.dispatch_tables,
-            &mut dispatch_tables,
-            part.dispatch_tables,
-        );
+    let mut unlisted_endpoints = KeyedRows::new();
+    let mut unlisted_calls = KeyedRows::new();
+    let mut mounts = KeyedRows::new();
+    let mut graphql_operations = KeyedRows::new();
+    let mut pubsub_operations = KeyedRows::new();
+    let mut graphql_consumer_locates = KeyedRows::new();
+    let mut dispatch_tables = KeyedRows::new();
+    for PartAnswer { window, answer } in answers {
+        // Whether the part that states a row at `line` is the one whose
+        // window holds that line.
+        let held = |line: i64| -> u8 {
+            u8::from((i64::from(window.0)..=i64::from(window.1)).contains(&line))
+        };
+        for row in answer.endpoints {
+            if place_in_source.contains_key(row.candidate_id.as_str()) {
+                merged.endpoints.push(row);
+                continue;
+            }
+            let key = serde_json::to_string(&(
+                &row.candidate_id,
+                row.line_number,
+                &row.method,
+                &row.path,
+            ));
+            let rank = held(row.line_number.into());
+            unlisted_endpoints.keep(key, row, rank);
+        }
+        for row in answer.data_calls {
+            if place_in_source.contains_key(row.candidate_id.as_str()) {
+                merged.data_calls.push(row);
+                continue;
+            }
+            let key = serde_json::to_string(&(
+                &row.candidate_id,
+                row.line_number,
+                &row.method,
+                &row.target,
+            ));
+            let rank = held(row.line_number.into());
+            unlisted_calls.keep(key, row, rank);
+        }
+        for row in answer.mounts {
+            let key = serde_json::to_string(&(
+                row.line_number,
+                &row.parent_node,
+                &row.child_node,
+                &row.mount_path,
+            ));
+            let rank = held(row.line_number.into());
+            mounts.keep(key, row, rank);
+        }
+        for row in answer.pubsub_operations {
+            let key = serde_json::to_string(&(row.line_number, &row.topic, &row.role));
+            let rank = held(row.line_number.into());
+            pubsub_operations.keep(key, row, rank);
+        }
+        for row in answer.graphql_operations {
+            // A field has one row. One that names its resolver outranks one
+            // that names none, whichever window stated it.
+            let key = serde_json::to_string(&(&row.kind, &row.field));
+            let rank = 2 * u8::from(row.resolver_function.is_some())
+                + row.resolver_line.map_or(0, |line| held(line.into()));
+            graphql_operations.keep(key, row, rank);
+        }
+        for row in answer.graphql_consumer_locates {
+            // A locate states no line, and two parts that name different
+            // types for one document are two statements.
+            let key = serde_json::to_string(&row);
+            graphql_consumer_locates.keep(key, row, 0);
+        }
+        for row in answer.dispatch_tables {
+            let key = serde_json::to_string(&(
+                row.location,
+                &row.field,
+                &row.handler_name,
+                row.line_number,
+            ));
+            let rank = row.line_number.map_or(0, |line| held(line.into()));
+            dispatch_tables.keep(key, row, rank);
+        }
     }
     // Stable, so the rows of one candidate stay in the order their part gave.
-    merged.endpoints.sort_by_key(|row| place(&row.candidate_id));
+    merged
+        .endpoints
+        .sort_by_key(|row| place_in_source[row.candidate_id.as_str()]);
     merged
         .data_calls
-        .sort_by_key(|row| place(&row.candidate_id));
+        .sort_by_key(|row| place_in_source[row.candidate_id.as_str()]);
+    merged.endpoints.extend(unlisted_endpoints.into_rows());
+    merged.data_calls.extend(unlisted_calls.into_rows());
+    merged.mounts = mounts.into_rows();
+    merged.graphql_operations = graphql_operations.into_rows();
+    merged.pubsub_operations = pubsub_operations.into_rows();
+    merged.graphql_consumer_locates = graphql_consumer_locates.into_rows();
+    merged.dispatch_tables = dispatch_tables.into_rows();
     merged
 }
 
@@ -1520,44 +1534,50 @@ impl FileOrchestrator {
     /// Ask about a file in parts, after the cloud's verdict that its whole
     /// answer does not fit one response (carrick#1898).
     ///
-    /// The file's candidates are split into parts ([`candidate_parts`]) of at
-    /// most the number the verdict states, or [`MAX_PART_CANDIDATES`] when it
-    /// states none. Each part is asked on its own, and the answers are merged
-    /// into the one answer the file stores ([`merge_part_answers`]). A part whose own
-    /// answer is cut is halved by groups and its halves asked, down to a
-    /// single group; a single group that is cut loses the file with that
+    /// The file is cut into windows of its lines
+    /// ([`crate::agents::source_parts`], carrick#2308), each of at most
+    /// [`PART_WINDOW_BYTES`] and at most the candidates the verdict states,
+    /// or [`MAX_PART_CANDIDATES`] when it states none. A file with no
+    /// candidate is cut by size alone. Each part is asked on its own, showing
+    /// its window and the declarations the window uses and not the file, and
+    /// the answers are merged into the one answer the file stores
+    /// ([`merge_part_answers`]).
+    ///
+    /// A part whose own answer is cut is halved between its items
+    /// ([`SourceCut::halves`]) and its halves asked, down to a single group
+    /// of candidates; a part that cannot be halved loses the file with that
     /// verdict. A part that fails any other way loses the file with that
     /// failure. Either way nothing of the file's answer is kept, and when
     /// several parts fail it is the first in source order that is reported.
     ///
-    /// A file with no candidate has nothing to be split by, and is lost with
-    /// the verdict it was given.
+    /// A file that is one window is the request that was cut. It is not sent
+    /// again: it is halved first. A file that does not parse here cannot be
+    /// cut, and is lost with the verdict it was given.
     async fn ask_in_parts(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
         verdict: crate::agent_service::AgentCallError,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        // The verdict's own limit when it states one, read once: a part that
-        // is cut in its turn is halved, whatever its verdict states.
-        let limit = verdict.max_part_candidates().unwrap_or(MAX_PART_CANDIDATES);
-        let mut wave = candidate_parts(file.listed, limit);
-        if wave.is_empty() {
+        let Some(cut) = SourceCut::of(Path::new(file.prompt_path), file.content, file.listed)
+        else {
             return Err(Box::new(verdict));
+        };
+        let limits = Limits {
+            window_bytes: PART_WINDOW_BYTES,
+            context_bytes: PART_CONTEXT_BYTES,
+            // The verdict's own limit when it states one, read once: a part
+            // that is cut in its turn is halved, whatever its verdict states.
+            candidates: verdict.max_part_candidates().unwrap_or(MAX_PART_CANDIDATES),
+        };
+        let mut wave = cut.parts(&limits);
+        if let [whole] = wave.as_slice() {
+            let Some((front, back)) = cut.halves(whole, &limits) else {
+                return Err(Box::new(verdict));
+            };
+            wave = vec![front, back];
         }
         let named = modules_named_by_candidates(file);
-        // The request that was cut, to tell a part that would repeat it.
-        let whole = self.file_analyzer.prompt_for(
-            file.prompt_path,
-            file.content,
-            guidance,
-            file.candidate_hints,
-            file.candidate_contexts,
-            file.imported_symbols,
-            file.graphql_producer_hints,
-            file.graphql_consumer_hints,
-            file.wrapper_context,
-        );
         debug!(
             "{}: the answer does not fit one response; asking about its {} candidate(s) in {} part(s)",
             file.prompt_path,
@@ -1565,29 +1585,29 @@ impl FileOrchestrator {
             wave.len()
         );
 
-        let mut answers: Vec<(usize, FileAnalysisResult)> = Vec::new();
+        let mut answers: Vec<PartAnswer> = Vec::new();
         while !wave.is_empty() {
-            let outcomes = futures::future::join_all(wave.iter().map(|part| {
-                self.ask_part(
-                    file,
-                    guidance,
-                    part,
-                    named.as_deref(),
-                    whole.as_ref(),
-                    &verdict,
-                )
-            }))
+            let outcomes = futures::future::join_all(
+                wave.iter()
+                    .map(|part| self.ask_part(file, guidance, &cut, part, named.as_deref())),
+            )
             .await;
             // `join_all` answers in the order it was given the parts, which is
             // source order, so the failure kept is the first in the source
             // whichever request came back first.
-            let mut halves: Vec<CandidatePart> = Vec::new();
+            let mut halves: Vec<SourcePart> = Vec::new();
             let mut lost: Option<Box<dyn std::error::Error>> = None;
             for (part, outcome) in wave.iter().zip(outcomes) {
                 match outcome {
-                    Ok(answer) => answers.push((part.first_group, answer)),
+                    Ok(answer) => answers.push(PartAnswer {
+                        window: part.window(),
+                        answer,
+                    }),
                     Err(error) if lost.is_some() => drop(error),
-                    Err(error) => match (cut_verdict(error.as_ref()).is_some(), part.halves()) {
+                    Err(error) => match (
+                        cut_verdict(error.as_ref()).is_some(),
+                        cut.halves(part, &limits),
+                    ) {
                         (true, Some((front, back))) => {
                             debug!(
                                 "{}: the answer for part {} does not fit either; asking its halves",
@@ -1613,22 +1633,25 @@ impl FileOrchestrator {
         Ok(merge_part_answers(file.listed, answers))
     }
 
-    /// Ask about one part of a file: the file's own prompt, listing only the
-    /// part's candidates and carrying only the modules those candidates name
-    /// through an import (carrick#1898).
+    /// Ask about one part of a file (carrick#1898, carrick#2308): the file's
+    /// own prompt, showing the part's window and what the window uses in
+    /// place of the file, listing only the part's candidates and only the
+    /// imports its shown lines name, and carrying only the modules its
+    /// candidates name through an import.
     ///
-    /// A part whose prompt is byte for byte the request that was cut is not
-    /// sent: its verdict is the one already given.
+    /// A part that lists no candidate carries the modules its window names
+    /// through an import, and every part of a file with no candidate at all
+    /// carries every module the file imports: such a file is asked about
+    /// because it imports one.
     async fn ask_part(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
-        part: &CandidatePart,
+        cut: &SourceCut,
+        part: &SourcePart,
         named: Option<&[BTreeSet<usize>]>,
-        whole: Option<&crate::agents::file_analyzer_agent::AnalysisPrompt>,
-        verdict: &crate::agent_service::AgentCallError,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        let positions = part.candidates();
+        let positions = &part.candidates;
         let hints: Vec<String> = positions
             .iter()
             .map(|position| file.candidate_hints[*position].clone())
@@ -1637,34 +1660,63 @@ impl FileOrchestrator {
             .iter()
             .map(|position| file.candidate_contexts[*position].clone())
             .collect();
+        let shown = part.shown();
+        let shown_names = cut.names_on(&shown);
+        let places: Option<BTreeSet<usize>> = if file.listed.is_empty() {
+            // A file with no candidate records no name for its modules, and a
+            // module that cannot be shown to be unnamed is not left out.
+            None
+        } else if positions.is_empty() {
+            let window = ShownLines {
+                window: part.window(),
+                runs: vec![part.window()],
+                markers: false,
+            };
+            let window_names = cut.names_on(&window);
+            Some(
+                file.wrapper_imports
+                    .iter()
+                    .filter(|(name, _)| window_names.contains(name.as_str()))
+                    .flat_map(|(_, modules)| modules.iter().copied())
+                    .collect(),
+            )
+        } else {
+            named.map(|named| {
+                positions
+                    .iter()
+                    .flat_map(|position| named[*position].iter().copied())
+                    .collect()
+            })
+        };
         // In the context's own order, which is the modules' sorted order.
-        let modules: Vec<String> = match named {
-            Some(named) => positions
-                .iter()
-                .flat_map(|position| named[*position].iter().copied())
-                .collect::<BTreeSet<usize>>()
+        let modules: Vec<String> = match places {
+            Some(places) => places
                 .into_iter()
                 .map(|place| file.wrapper_context[place].clone())
                 .collect(),
             None => file.wrapper_context.to_vec(),
         };
-        let prompt = self.file_analyzer.prompt_for(
+        let imported_symbols: HashMap<String, ImportedSymbol> = file
+            .imported_symbols
+            .iter()
+            .filter(|(local, _)| shown_names.contains(local.as_str()))
+            .map(|(local, symbol)| (local.clone(), symbol.clone()))
+            .collect();
+        let prompt = self.file_analyzer.prompt_for_part(
             file.prompt_path,
             file.content,
+            &shown,
             guidance,
             &hints,
             &contexts,
-            file.imported_symbols,
+            &imported_symbols,
             file.graphql_producer_hints,
             file.graphql_consumer_hints,
             &modules,
         );
         let Some(prompt) = prompt else {
-            return Err(Box::new(verdict.clone()));
+            return Ok(FileAnalysisResult::default());
         };
-        if whole.is_some_and(|whole| whole.text == prompt.text) {
-            return Err(Box::new(verdict.clone()));
-        }
         self.file_analyzer
             .analyze_part_prompt(file.prompt_path, &part.label(), &prompt, guidance)
             .await
@@ -22967,124 +23019,16 @@ export async function POST(request: Request): Promise<Response> {
             .collect()
     }
 
-    /// The candidate ids each part holds, part by part.
-    fn ids_by_part(listed: &[ListedCandidate], parts: &[CandidatePart]) -> Vec<Vec<String>> {
-        parts
-            .iter()
-            .map(|part| {
-                part.candidates()
-                    .into_iter()
-                    .map(|position| listed[position].candidate_id.clone())
-                    .collect()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn candidates_that_share_a_start_stay_in_one_part() {
-        // Two singles, a chain of three links, one single. At three a part,
-        // the chain cannot join the two singles, and it is not cut to fit.
-        let listed = listed_at(&[(10, 20), (30, 40), (50, 90), (50, 80), (50, 70), (100, 110)]);
-        let parts = candidate_parts(&listed, 3);
-        assert_eq!(
-            parts,
-            [
-                CandidatePart {
-                    first_group: 0,
-                    groups: vec![vec![0], vec![1]],
-                },
-                CandidatePart {
-                    first_group: 2,
-                    groups: vec![vec![2, 3, 4]],
-                },
-                CandidatePart {
-                    first_group: 3,
-                    groups: vec![vec![5]],
-                },
-            ]
-        );
-        assert!(
-            parts.iter().all(|part| part.candidates().len() <= 3),
-            "no part holds more than the limit"
-        );
-    }
-
-    #[test]
-    fn a_group_larger_than_the_limit_is_a_part_on_its_own() {
-        let listed = listed_at(&[(1, 5), (10, 90), (10, 80), (10, 70), (10, 60), (95, 99)]);
-        let sizes: Vec<usize> = candidate_parts(&listed, 2)
-            .iter()
-            .map(|part| part.candidates().len())
-            .collect();
-        assert_eq!(sizes, [1, 4, 1]);
-    }
-
-    #[test]
-    fn a_file_with_no_candidates_has_no_parts() {
-        assert!(candidate_parts(&[], MAX_PART_CANDIDATES).is_empty());
-    }
-
-    /// The parts are runs in SOURCE order, whatever order the prompt lists
-    /// the candidates in, and they are the same parts for the same
-    /// candidates listed in any order.
-    #[test]
-    fn the_parts_depend_on_the_candidates_and_not_on_the_order_they_are_listed_in() {
-        let in_source_order = listed_at(&[(10, 20), (30, 40), (30, 35), (50, 60), (70, 80)]);
-        let expected = ids_by_part(&in_source_order, &candidate_parts(&in_source_order, 2));
-        assert_eq!(
-            expected,
-            [
-                vec!["span:10-20"],
-                vec!["span:30-40", "span:30-35"],
-                vec!["span:50-60", "span:70-80"],
-            ]
-        );
-
-        // The same candidates, listed late ones first.
-        let listed = listed_at(&[(70, 80), (30, 40), (10, 20), (50, 60), (30, 35)]);
-        let parts = candidate_parts(&listed, 2);
-        let mut by_part = ids_by_part(&listed, &parts);
-        let mut expected_sets = expected.clone();
-        for ids in by_part.iter_mut().chain(expected_sets.iter_mut()) {
-            ids.sort();
-        }
-        assert_eq!(by_part, expected_sets, "the same candidates in each part");
-        // Within a part, the prompt's own listing order is kept.
-        assert_eq!(parts[2].candidates(), [0, 3]);
-        assert_eq!(
-            candidate_parts(&listed, 2),
-            parts,
-            "and the same on every call"
-        );
-    }
-
-    #[test]
-    fn a_part_is_halved_at_its_middle_group_down_to_one_group() {
-        let listed = listed_at(&[(1, 2), (3, 9), (3, 8), (10, 11), (12, 13), (14, 15)]);
-        let whole = candidate_parts(&listed, MAX_PART_CANDIDATES);
-        assert_eq!(whole.len(), 1);
-        assert_eq!(whole[0].label(), "0000-0004");
-
-        let (front, back) = whole[0].halves().expect("five groups halve");
-        assert_eq!(front.groups, [vec![0], vec![1, 2]]);
-        assert_eq!(back.groups, [vec![3], vec![4], vec![5]]);
-        assert_eq!((front.first_group, back.first_group), (0, 2));
-        assert_eq!(
-            (front.label(), back.label()),
-            ("0000-0001".into(), "0002-0004".into())
-        );
-
-        let (single, chain) = front.halves().expect("two groups halve");
-        assert_eq!((single.groups.len(), chain.groups.len()), (1, 1));
-        assert!(single.halves().is_none(), "one group is not halved");
-        assert!(
-            chain.halves().is_none(),
-            "a group of two candidates is one group, and is not separated"
-        );
-    }
-
     fn part_answer(value: serde_json::Value) -> FileAnalysisResult {
         serde_json::from_value(value).expect("a part answer")
+    }
+
+    /// `answer` as the part whose window is `window` gave it.
+    fn answered(window: (u32, u32), answer: &FileAnalysisResult) -> PartAnswer {
+        PartAnswer {
+            window,
+            answer: answer.clone(),
+        }
     }
 
     fn route_row(candidate_id: &str, path: &str) -> serde_json::Value {
@@ -23143,8 +23087,8 @@ export async function POST(request: Request): Promise<Response> {
             "/unlisted-by-second",
         ];
         for answers in [
-            vec![(0, first.clone()), (2, second.clone())],
-            vec![(2, second), (0, first)],
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
         ] {
             let merged = merge_part_answers(&listed, answers);
             let paths: Vec<&str> = merged
@@ -23173,8 +23117,8 @@ export async function POST(request: Request): Promise<Response> {
             ],
         }));
         for answers in [
-            vec![(0, first.clone()), (1, second.clone())],
-            vec![(1, second), (0, first)],
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
         ] {
             let merged = merge_part_answers(&listed, answers);
             let children: Vec<&str> = merged
@@ -23185,14 +23129,182 @@ export async function POST(request: Request): Promise<Response> {
             assert_eq!(
                 children,
                 ["shared", "only-first", "only-second"],
-                "each exact row once, in the order the parts state them in source order"
+                "each row once, in the order the parts state them in source order"
             );
             assert_eq!(
                 merged.pubsub_operations.len(),
                 2,
-                "a row that differs in any field is a row of its own"
+                "a row that states another role is a row of its own"
             );
         }
+    }
+
+    /// carrick#2308: two parts that state the same row disagree only in what
+    /// they could see. The part whose window holds the row's line saw the
+    /// row itself; another part saw it as a declaration its window uses.
+    #[test]
+    fn of_two_parts_that_state_a_row_the_one_whose_window_holds_its_line_is_kept() {
+        let mount = |line: i32, seen_by: &str| {
+            serde_json::json!({
+                "line_number": line,
+                "parent_node": "table",
+                "child_node": "child",
+                "mount_path": "/",
+                "import_source": null,
+                "pattern_matched": seen_by,
+            })
+        };
+        let topic = |line: i32, seen_by: &str| {
+            serde_json::json!({
+                "topic": "ready", "role": "publisher", "line_number": line, "broker": seen_by,
+            })
+        };
+        // Line 7 is in the second part's window. Line 40 is in neither.
+        let first = part_answer(serde_json::json!({
+            "mounts": [mount(7, "first"), mount(40, "first")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [topic(7, "first"), topic(40, "first")],
+            "dispatch_tables": [
+                { "location": "body", "field": "action", "values": ["a"], "line_number": 7 },
+            ],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [mount(40, "second"), mount(7, "second")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [topic(40, "second"), topic(7, "second")],
+            "dispatch_tables": [
+                { "location": "body", "field": "action", "values": ["a", "b"], "line_number": 7 },
+            ],
+        }));
+        for answers in [
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
+        ] {
+            let merged = merge_part_answers(&[], answers);
+            let mounts: Vec<(i32, &str)> = merged
+                .mounts
+                .iter()
+                .map(|row| (row.line_number, row.pattern_matched.as_str()))
+                .collect();
+            assert_eq!(
+                mounts,
+                [(7, "second"), (40, "first")],
+                "the window that holds the line, else the first part in source order"
+            );
+            let topics: Vec<(i32, Option<&str>)> = merged
+                .pubsub_operations
+                .iter()
+                .map(|row| (row.line_number, row.broker.as_deref()))
+                .collect();
+            assert_eq!(topics, [(7, Some("second")), (40, Some("first"))]);
+            let [table] = merged.dispatch_tables.as_slice() else {
+                panic!("one table: {:?}", merged.dispatch_tables);
+            };
+            assert_eq!(table.values, ["a", "b"]);
+        }
+    }
+
+    /// A row is never dropped only because its line is outside the window of
+    /// the one part that stated it.
+    #[test]
+    fn a_row_stated_once_is_kept_wherever_its_line_is() {
+        let only = part_answer(serde_json::json!({
+            "mounts": [{
+                "line_number": 900, "parent_node": "table", "child_node": "far",
+                "mount_path": "/far", "import_source": null, "pattern_matched": ".use(",
+            }],
+            "endpoints": [route_row("line:900", "/far")],
+            "data_calls": [],
+            "pubsub_operations": [{ "topic": "far", "role": "subscriber", "line_number": 900 }],
+        }));
+        let merged = merge_part_answers(&[], vec![answered((1, 4), &only)]);
+        assert_eq!(
+            (
+                merged.mounts.len(),
+                merged.endpoints.len(),
+                merged.pubsub_operations.len()
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    /// A route or call row that echoes no listed candidate is one of a set
+    /// too: two parts that state the same one state it once.
+    #[test]
+    fn a_route_row_that_echoes_no_listed_candidate_is_kept_once() {
+        let listed = listed_at(&[(10, 20)]);
+        let first = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [route_row("span:10-20", "/a"), route_row("line:99", "/unlisted")],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [route_row("line:99", "/unlisted"), route_row("line:99", "/other")],
+        }));
+        let merged = merge_part_answers(
+            &listed,
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
+        );
+        let paths: Vec<&str> = merged
+            .endpoints
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/a", "/unlisted", "/other"]);
+    }
+
+    #[test]
+    fn a_graphql_row_that_names_a_resolver_is_kept_over_one_that_names_none() {
+        let located = serde_json::json!({
+            "kind": "query", "field": "order",
+            "resolver_function": null, "resolver_line": null,
+            "primary_type_symbol": null, "type_import_source": null,
+            "backing_type_symbol": "Order",
+        });
+        let resolved = |line: i32, name: &str| {
+            serde_json::json!({
+                "kind": "query", "field": "order",
+                "resolver_function": name, "resolver_line": line,
+                "primary_type_symbol": "Order", "type_import_source": null,
+            })
+        };
+        let graphql = |rows: Vec<serde_json::Value>| {
+            part_answer(serde_json::json!({
+                "mounts": [], "endpoints": [], "data_calls": [], "graphql_operations": rows,
+            }))
+        };
+        // The first part saw no function return the field. The second holds
+        // the resolver. A third saw the resolver as a declaration it uses.
+        let first = graphql(vec![located]);
+        let second = graphql(vec![resolved(7, "resolveOrder")]);
+        let third = graphql(vec![resolved(7, "seenFromAfar")]);
+        for answers in [
+            vec![
+                answered((1, 4), &first),
+                answered((5, 9), &second),
+                answered((10, 12), &third),
+            ],
+            vec![
+                answered((10, 12), &third),
+                answered((5, 9), &second),
+                answered((1, 4), &first),
+            ],
+        ] {
+            let merged = merge_part_answers(&[], answers);
+            let [row] = merged.graphql_operations.as_slice() else {
+                panic!("one row a field: {:?}", merged.graphql_operations);
+            };
+            assert_eq!(row.resolver_function.as_deref(), Some("resolveOrder"));
+        }
+        // With no window holding the resolver, the first part that names one.
+        let merged = merge_part_answers(
+            &[],
+            vec![answered((1, 4), &first), answered((10, 12), &third)],
+        );
+        assert_eq!(
+            merged.graphql_operations[0].resolver_function.as_deref(),
+            Some("seenFromAfar")
+        );
     }
 
     /// The spans of the calls in `source` that start with `callee`, one a
