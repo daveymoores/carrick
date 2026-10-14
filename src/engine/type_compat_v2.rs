@@ -2987,6 +2987,23 @@ fn outcome_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sidecar's check pre-gate keeps its own copy of this rule
+    /// (`pathNamesAMember`, carrick#1398); both read one case table.
+    #[test]
+    fn path_names_a_member_follows_the_shared_case_table() {
+        let table: serde_json::Value = serde_json::from_str(include_str!(
+            "../sidecar/test/fixtures/path-names-a-member.json"
+        ))
+        .unwrap();
+        let cases = table["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let path = case[0].as_str().unwrap();
+            let expected = case[1].as_bool().unwrap();
+            assert_eq!(path_names_a_member(path), expected, "path {path:?}");
+        }
+    }
     use crate::cloud_storage::{ManifestTypeState, TypeEvidence};
     use crate::services::type_sidecar::InferKind;
     use crate::type_manifest::{build_manifest_type_alias, build_manifest_type_alias_with_site_id};
