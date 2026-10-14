@@ -305,6 +305,14 @@ export async function bufferBody() {
   console.log(bytes);
 }
 
+declare function readJson<T>(response: Response, operation: string): Promise<T>;
+
+export async function parsedThroughAHelper() {
+  const helperRes = await fetch(url + '/token');
+  const token: { access: string; expires: number } = await readJson(helperRes, 'exchange');
+  console.log(token);
+}
+
 export async function untypedThenParsed() {
   const raw = await readRaw();
   const item = parseItem(raw);
@@ -436,6 +444,16 @@ describe('carrick#2112: a later expression answers for a call only when it resta
   it('still reads the expression that holds a platform body read that is not json or text', async () => {
     assert.strictEqual(await callResult('Blob', "fetch(url + '/blob')", 'const blobRes'), 'Blob');
     assert.strictEqual(await callResult('Buffer', "fetch(url + '/buffer')", 'const bufferRes'), 'Uint8Array<ArrayBuffer>');
+  });
+
+  // A helper that takes the transport response and reads its body, with the
+  // body's type stated on the binding: the read of the body, as `res.json()`
+  // is, and the annotation states it.
+  it('still reads the body a helper takes out of the response, typed at its binding', async () => {
+    assert.strictEqual(
+      await callResult('ParseHelper', "fetch(url + '/token')", 'const helperRes'),
+      '{ access: string; expires: number; }'
+    );
   });
 
   it('still follows an untyped value into the call that first states its type', async () => {

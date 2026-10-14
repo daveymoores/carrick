@@ -3371,6 +3371,10 @@ export class TypeInferrer {
       // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375).
       const callValue = this.unwrapPromiseType(callExpr.getType());
       const callValueIsUntyped = callValue.isAny() || callValue.isUnknown();
+      // A transport response handed whole to a helper is a body read through
+      // that helper (`const data: T = await parseJson(response)`), as
+      // `response.json()` is one in place.
+      const callValueIsTransport = this.typeIsOrContainsResponseMachinery(callValue);
       const startPos = callExpr.getStart();
       const candidates = this.collectDefUseNodes(func);
 
@@ -3479,7 +3483,8 @@ export class TypeInferrer {
           if (
             callValueIsUntyped ||
             this.restatesTrackedValue(expr, currentNames) ||
-            this.holdsBinaryBodyRead(expr, currentNames)
+            this.holdsBinaryBodyRead(expr, currentNames) ||
+            (callValueIsTransport && this.handsTrackedValueToACall(expr, currentNames))
           ) {
             lastNode = expr;
           } else {
@@ -3496,6 +3501,21 @@ export class TypeInferrer {
     }
 
     return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /**
+   * `expr` declares a name for what a call returns when it is handed a
+   * tracked name whole (`const data: T = await parseJson(response, 'op')`).
+   */
+  private handsTrackedValueToACall(expr: Node, names: string[]): boolean {
+    if (!Node.isVariableDeclaration(expr)) return false;
+    const init = this.unwrapExpressionNode(expr.getInitializer());
+    return (
+      Node.isCallExpression(init) &&
+      init
+        .getArguments()
+        .some((argument) => this.isIdentifierUsage(this.unwrapExpressionNode(argument), names))
+    );
   }
 
   /** `expr` holds a binary whole-body read taken on a tracked name. */
