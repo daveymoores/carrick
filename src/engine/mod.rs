@@ -1182,9 +1182,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .filter(|(index, _)| !without_source.iter().any(|(left_out, _)| left_out == index))
         .map(|(_, kept)| kept)
         .unzip();
-    // Said on the terminal once, in the run's closing lines.
-    let left_out_lines = without_source_lines(&members_without_source, &services_without_source);
-    for line in &left_out_lines {
+    // What the index lacks is not told to a person reading the scan: the
+    // debug log keeps it (carrick#2298).
+    for line in without_source_lines(&members_without_source, &services_without_source) {
         debug!("{line}");
     }
 
@@ -2055,7 +2055,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // The last lines of the run: what it could not classify (carrick#705). An
     // answer that ends without its boundary reads as a complete one.
-    print_boundaries(&boundaries, &left_out_lines);
+    print_boundaries(&boundaries);
     print_graphql_notices(&graphql_notices);
 
     if let Some(payload) = pr_result {
@@ -2576,20 +2576,14 @@ fn local_boundaries(
 /// long before this, so the machine-readable output on stdout is never mixed
 /// with it.
 ///
-/// `left_out` is the services the run did not analyse because they hold no
-/// source ([`without_source_lines`]): they have no boundary of their own, and
-/// a block that did not name them would read as covering every service.
-fn print_boundaries(
-    boundaries: &[(String, crate::boundary::ServiceBoundary)],
-    left_out: &[String],
-) {
-    if boundaries.is_empty() && left_out.is_empty() {
+/// The services left out for holding no source are not named here
+/// ([`without_source_lines`] goes to the debug log): a gap in the index is
+/// told to the agent that reads the results, not to a person.
+fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
+    if boundaries.is_empty() {
         return;
     }
     crate::outln!("\nWhat this scan could not classify");
-    for line in left_out {
-        crate::outln!("{line}");
-    }
     for (service, boundary) in boundaries {
         for line in boundary.lines(service) {
             crate::outln!("{line}");
@@ -7947,7 +7941,7 @@ fn resolve_services(
 ///
 /// Typed because the run decides on it: for a service somebody declared in
 /// `carrick.json` it is a wrong path and fails the scan; a service nobody
-/// declared is left out and named in the run's closing lines (carrick#2298).
+/// declared is left out and named in the debug log (carrick#2298).
 #[derive(Debug)]
 struct NoSourceFiles(String);
 
@@ -7959,8 +7953,8 @@ impl std::fmt::Display for NoSourceFiles {
 
 impl std::error::Error for NoSourceFiles {}
 
-/// What the run's closing lines say about the services it left out because
-/// they hold no source (carrick#2298): the workspace members the derivation
+/// What the debug log says about the services the run left out because they
+/// hold no source (carrick#2298): the workspace members the derivation
 /// dropped, in one line, then one line for each service whose walk read
 /// nothing.
 fn without_source_lines(members: &[String], services: &[String]) -> Vec<String> {

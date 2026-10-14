@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
@@ -450,6 +450,18 @@ pub fn plan<'a>(
                     "scope: {label} carried (inputs unchanged since {})",
                     short(commit)
                 ),
+                // A stored index that lacks something is a gap in the index: the
+                // person reading the scan is not told why, the debug log is.
+                Scope::Analysed {
+                    reason: Reason::StoredIncomplete,
+                    detail,
+                } => {
+                    info!("scope: {label} analysed");
+                    debug!(
+                        "scope: {label} analysed ({}: {detail})",
+                        Reason::StoredIncomplete.as_str()
+                    );
+                }
                 Scope::Analysed { reason, detail } => {
                     info!("scope: {label} analysed ({}: {detail})", reason.as_str())
                 }

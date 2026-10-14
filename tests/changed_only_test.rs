@@ -271,6 +271,8 @@ fn copy_dir(src: &Path, dst: &Path) {
 struct Scan {
     output: String,
     code: Option<i32>,
+    /// Every line of the run's own debug log (`~/.carrick/logs`).
+    log: String,
 }
 
 impl Scan {
@@ -290,12 +292,28 @@ impl Scan {
             .filter_map(|line| {
                 let rest = &line[line.find(prefix)? + prefix.len()..];
                 let (service, verdict) = rest.split_once(' ')?;
-                verdict
-                    .starts_with(&format!("{how} ("))
+                (verdict == how || verdict.starts_with(&format!("{how} (")))
                     .then(|| service.to_string())
             })
             .collect()
     }
+}
+
+/// Every line under `home/.carrick/logs`.
+fn read_logs(home: &Path) -> String {
+    let mut log = String::new();
+    let mut dirs = vec![home.join(".carrick/logs")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                log.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    log
 }
 
 /// A workspace with its scan cassettes and the store a scan writes to.
@@ -316,8 +334,11 @@ impl Workspace {
     }
 
     fn scan_with(&self, store: &Path, flags: &[&str], env: &[(&str, &str)]) -> Scan {
+        let home = self._tmp.path().join("home");
+        let _ = std::fs::remove_dir_all(&home);
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
         cmd.envs(env.iter().copied());
+        cmd.env("HOME", &home);
         cmd.arg(&self.repo)
             .args(["--repo", REPO])
             .args(flags)
@@ -352,6 +373,7 @@ impl Workspace {
                 String::from_utf8_lossy(&result.stderr)
             ),
             code: result.status.code(),
+            log: read_logs(&home),
         }
     }
 
@@ -744,6 +766,30 @@ fn touch_web(workspace: &Workspace) {
     );
 }
 
+/// A person reading the scan is not told why a service was analysed again
+/// when the reason is a gap in its stored index; the debug log is.
+fn assert_reason_only_in_the_log(scan: &Scan, service: &str) {
+    assert!(
+        !scan.output.contains("stored_incomplete")
+            && !scan.output.contains("without its extraction config"),
+        "{}",
+        scan.output
+    );
+    assert!(
+        scan.output
+            .contains(&format!("scope: {service} analysed\n")),
+        "the scope line stays, without its reason: {}",
+        scan.output
+    );
+    assert!(
+        scan.log.contains(&format!(
+            "scope: {service} analysed (stored_incomplete: the stored index was written without its extraction config)"
+        )),
+        "{}",
+        scan.log
+    );
+}
+
 /// carrick#2301: a stored blob whose extraction config did not arrive owes
 /// that work. A change to `web` alone analyses `api` too, the config is asked
 /// for again, and `api`'s types are captured with it. `worker`, whose blob
@@ -756,11 +802,7 @@ fn a_service_stored_without_its_extraction_config_is_analysed_again() {
     let scan = workspace.scan(&["--changed-only"]);
     assert_eq!(scan.code, Some(0), "{}", scan.output);
     assert_analysed(&scan, &["api", "web"]);
-    assert!(
-        scan.output.contains("api analysed (stored_incomplete"),
-        "{}",
-        scan.output
-    );
+    assert_reason_only_in_the_log(&scan, "api");
     let blobs = workspace.blobs();
     assert_eq!(blobs["api"]["commit_hash"], head.as_str());
     assert_eq!(
@@ -807,11 +849,7 @@ fn an_extraction_config_that_fails_again_is_asked_for_on_the_next_scan() {
     // `web` was analysed at B with the config its blob kept from A, so it
     // asked for none, recorded no problem, and is carried here.
     assert_analysed(&scan, &["api"]);
-    assert!(
-        scan.output.contains("api analysed (stored_incomplete"),
-        "{}",
-        scan.output
-    );
+    assert_reason_only_in_the_log(&scan, "api");
 }
 
 /// carrick#2301, what must not change: a status recorded beside an extraction
