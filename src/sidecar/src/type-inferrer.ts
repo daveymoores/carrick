@@ -7514,13 +7514,23 @@ export class TypeInferrer {
    *
    * Anything else may be a read of the body and makes this false: a property
    * read, a call whose value is used, a parameter handed whole to another
-   * function. No method or property name is consulted. A handler with no
-   * parameter has nothing to read from.
+   * function, or a call in the chain handed an argument that can receive what
+   * the parameter gives (`argumentCanReceive`: a callback, an object with a
+   * method), as in `request.pipe(dest)`, `request.on('data', cb)` and
+   * `request.json().then(cb)`. No method or property name is consulted. A
+   * handler with no parameter, or one that uses `this`, proves nothing: it may
+   * read the message from `this` or a closure.
    */
   private handlerReadsNothingFromItsParameters(handler: FunctionLike): boolean {
-    const parameters = new Set<Node>(handler.getParameters());
+    // A declared `this` parameter, or any `this` in the body, is a way in the
+    // walk below does not follow.
+    const parameters = new Set<Node>(
+      handler.getParameters().filter((parameter) => parameter.getName() !== 'this')
+    );
+    if (parameters.size === 0) return false;
     const body = handler.getBody();
     if (!body) return false;
+    if (body.getFirstDescendantByKind(SyntaxKind.ThisKeyword)) return false;
     const namesAParameter = (identifier: Node): boolean =>
       (identifier.getSymbol()?.getDeclarations() ?? []).some((declaration) => {
         const parameter = Node.isParameterDeclaration(declaration)
@@ -7541,6 +7551,11 @@ export class TypeInferrer {
         if (Node.isPropertyAccessExpression(parent) && parent.getExpression() === top) {
           top = parent;
         } else if (Node.isCallExpression(parent) && parent.getExpression() === top) {
+          // A send hands the parameter data; an argument able to receive may
+          // be where the body goes.
+          if (parent.getArguments().some((argument) => this.argumentCanReceive(argument))) {
+            return false;
+          }
           lastCall = parent;
           top = parent;
         } else if (
@@ -7565,6 +7580,45 @@ export class TypeInferrer {
       if (!discarded && !returned) return false;
     }
     return true;
+  }
+
+  /**
+   * True unless `argument` is proven to be data that cannot receive anything
+   * from the call it is handed to (carrick#827). Data is a primitive or literal,
+   * `null`/`undefined`, or an object with no call or construct signature and
+   * no callable member; an array of such, or a union all of whose members are.
+   * A callback, an object with a method (a stream, an emitter), or a type the
+   * compiler cannot state (`any`, `unknown`, a type parameter) can receive.
+   * Sibling of `callResultIsPlainData`, which reads a call's result and so
+   * rejects primitives and empty objects; an argument of either is data.
+   */
+  private argumentCanReceive(argument: Node): boolean {
+    const canReceive = (type: Type, depth: number): boolean => {
+      if (depth > 3) return true;
+      if (type.isAny() || type.isUnknown() || type.isTypeParameter()) return true;
+      if (type.isUnion()) {
+        return type.getUnionTypes().some((member) => canReceive(member, depth + 1));
+      }
+      if (type.isIntersection()) {
+        return type.getIntersectionTypes().some((member) => canReceive(member, depth + 1));
+      }
+      const element = type.getArrayElementType();
+      if (element) return canReceive(element, depth + 1);
+      if (type.isTuple()) {
+        return type.getTupleElements().some((member) => canReceive(member, depth + 1));
+      }
+      if (!type.isObject()) return false;
+      if (this.isCallableType(type)) return true;
+      const indexed = type.getStringIndexType() ?? type.getNumberIndexType();
+      const callable = (held: Type): boolean =>
+        held.isAny() ||
+        (held.isUnion()
+          ? held.getUnionTypes().some((member) => this.isCallableType(member))
+          : this.isCallableType(held));
+      if (indexed && callable(indexed)) return true;
+      return type.getProperties().some((member) => callable(member.getTypeAtLocation(argument)));
+    };
+    return canReceive(argument.getType(), 0);
   }
 
   /**
