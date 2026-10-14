@@ -72,6 +72,7 @@ pub mod receiver_type;
 pub mod registration_scope;
 pub mod request_summary;
 pub mod retry_budget;
+pub mod return_flow;
 pub mod scan_health;
 pub mod scan_spend;
 pub mod scan_stage;

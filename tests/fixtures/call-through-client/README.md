@@ -22,7 +22,7 @@ invented, a sibling's route, and one correct path. Rows whose id starts with
 `model:` join no candidate, so they have no span and are placed by their line.
 
 Rows that take the request their call reaches (`commands.ts` lines 9, 15, 21,
-46, 101, 145, 151 and 157; `hooks.ts` lines 9, 14 and 19) carry the reached operation, the
+46, 64, 101, 145, 151, 157, 164 and 176; `hooks.ts` lines 9, 14 and 19) carry the reached operation, the
 source `request_summary`, the role `wrapper_call` and `reaches_request`. Line
 21 is stated twice by the model and is one row afterwards. The correct row
 (`commands.ts:28`) keeps its `model` source and its type entry, and gains the
@@ -41,6 +41,17 @@ Types at the corrected rows:
 A type is kept only where the function called hands back the request's parsed
 body unchanged, as the request summaries read it (carrick#1601).
 
+Where a call reaches more than one request, the request is the one whose value
+the functions hand back. A request awaited and dropped, or whose value only
+goes into the arguments of another request, is a side request
+(`src/return_flow.rs`):
+
+| Site | Side request | Reached |
+|---|---|---|
+| `commands.ts:64` | the client's health probe, a request a fact states | `GET /api/v1/runs/:id` |
+| `commands.ts:164` | the client's health probe, a `fetch` only the model reads | `GET /api/v1/runs/:id` |
+| `commands.ts:176` | the token handed to the request returned | `GET /api/v1/runs/:id` |
+
 No corrected row carries a request type: a call's arguments are the called
 function's parameters, not a request body.
 
@@ -49,14 +60,13 @@ Rows that stay as the model stated them:
 | Site | Why |
 |---|---|
 | `commands.ts:57` | the helper called reaches two operations |
-| `commands.ts:64` | every method of that client also requests the health route |
 | `commands.ts:70` | nothing resolves the receiver |
 | `commands.ts:76` | the function called writes its URL from its parameters, so no row states its request |
 | `commands.ts:82` | the site writes the route |
 | `commands.ts:88` | the site also writes a request of its own |
 | `commands.ts:94` | only the model states the request the function called makes |
 | `commands.ts:127` | the site makes a request itself, inside a call that reaches another |
-| `commands.ts:139` | the function called asks for a token and also makes a `fetch` only the model reads |
+| `commands.ts:139` | the function called asks for a token and returns a `fetch` only the model reads |
 | `hooks.ts:24` | two callbacks, and nothing says which makes the request |
 
 `commands.ts:113` writes its route into a function of the same file; the

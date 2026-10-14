@@ -98,6 +98,37 @@ pub struct CallThroughSites {
     /// carrick#1601): every `return` hands back the body one request answers
     /// with, or a call of a function that does.
     pub hands_back_body: HashSet<DefinitionSite>,
+    /// The service's resolved calls whose value never reaches the return of
+    /// the function they are written in, or reaches it only as another
+    /// call's argument ([`crate::return_flow`]), by file, line and the
+    /// definition called. A call not listed hands its value back.
+    pub side_calls: HashMap<SideKey, SideCall>,
+}
+
+/// A resolved call: the repository-relative file and line it is written on,
+/// and the definition it reaches.
+pub type SideKey = (String, u32, DefinitionSite);
+
+/// How a call that is not returned is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SideCall {
+    /// Its value is dropped.
+    Discarded,
+    /// Its value goes only into the arguments of these calls, each of which
+    /// reaches the return. It is a side request when every one of them makes
+    /// a request: the value is that request's input, not its answer.
+    InputTo(Vec<Outer>),
+}
+
+/// A call whose arguments another call's value goes into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outer {
+    /// A row of the service is written on its line: a request.
+    Request,
+    /// It reaches this definition, which may or may not make a request.
+    Calls(DefinitionSite),
+    /// Nothing says what it is.
+    Unknown,
 }
 
 /// Read, for each model call row of one service, the definitions its call
@@ -121,6 +152,7 @@ pub fn read_sites(
 ) -> CallThroughSites {
     let root = repo_path.trim_end_matches('/');
     let hands_back_body = hands_back_body(definitions, root, passes_body);
+    let side_calls = read_side_calls(file_results, inputs, root);
     let mut keys: Vec<&String> = file_results
         .iter()
         .filter(|(_, result)| result.data_calls.iter().any(is_model_row))
@@ -131,6 +163,7 @@ pub fn read_sites(
         return CallThroughSites {
             rows: Vec::new(),
             hands_back_body,
+            side_calls,
         };
     }
 
@@ -192,7 +225,88 @@ pub fn read_sites(
     CallThroughSites {
         rows,
         hands_back_body,
+        side_calls,
     }
+}
+
+/// Every resolved call of the service whose value is not handed back by the
+/// function it is written in ([`SideCall`]).
+fn read_side_calls(
+    file_results: &HashMap<String, FileAnalysisResult>,
+    inputs: &RequestSummaryInputs,
+    root: &str,
+) -> HashMap<SideKey, SideCall> {
+    // Lines a row of the service is written on, per file.
+    let mut row_lines: HashMap<String, HashSet<u32>> = HashMap::new();
+    for (key, result) in file_results {
+        let lines = row_lines
+            .entry(crate::engine::repo_relative(key, root))
+            .or_default();
+        lines.extend(
+            result
+                .data_calls
+                .iter()
+                .filter_map(|call| u32::try_from(call.line_number).ok()),
+        );
+    }
+    let mut side_calls = HashMap::new();
+    let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
+    paths.sort();
+    for path in paths {
+        let ir = &inputs.files[path];
+        let resolved: HashMap<(u32, u32), DefinitionSite> = inputs
+            .sites
+            .sites_in(path)
+            .map(|(lo, hi, file, line)| {
+                (
+                    (ir.swc_start(lo), ir.swc_start(hi)),
+                    DefinitionSite {
+                        file: crate::engine::repo_relative(&file.to_string_lossy(), root),
+                        line,
+                    },
+                )
+            })
+            .collect();
+        if resolved.is_empty() {
+            continue;
+        }
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        let Some(module) = parse_file(path, &cm, &handler) else {
+            continue;
+        };
+        let positions = Positions { cm: &cm };
+        let relative = crate::engine::repo_relative(&path.to_string_lossy(), root);
+        let rows_here = row_lines.get(&relative);
+        let flows = crate::return_flow::call_flows(&module);
+        for (span, flow) in &flows {
+            let extent = positions.extent(*span);
+            let Some(target) = resolved.get(&(extent.lo, extent.hi)) else {
+                continue;
+            };
+            let side = match flow {
+                crate::return_flow::Flow::Returned => continue,
+                crate::return_flow::Flow::Discarded => SideCall::Discarded,
+                crate::return_flow::Flow::Through(outers) => SideCall::InputTo(
+                    outers
+                        .iter()
+                        .map(|outer| {
+                            let outer = positions.extent(*outer);
+                            if rows_here.is_some_and(|lines| lines.contains(&outer.line)) {
+                                Outer::Request
+                            } else if let Some(definition) = resolved.get(&(outer.lo, outer.hi)) {
+                                Outer::Calls(definition.clone())
+                            } else {
+                                Outer::Unknown
+                            }
+                        })
+                        .collect(),
+                ),
+            };
+            side_calls.insert((relative.clone(), extent.line, target.clone()), side);
+        }
+    }
+    side_calls
 }
 
 /// The service's definitions a call of which is worth the request's parsed
@@ -634,8 +748,13 @@ pub struct Settled {
 /// reads) the anchor names a function's own result, and the entries are
 /// dropped and counted.
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
-    let graph = ReachGraph::of(services.iter().map(|service| &*service.data));
+    let mut graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
+    graph.side_calls = sites
+        .iter()
+        .flat_map(|sites| sites.side_calls.iter())
+        .map(|(key, side)| (key.clone(), side.clone()))
+        .collect();
     let hands_back_body: HashSet<&DefinitionSite> = sites
         .iter()
         .flat_map(|sites| &sites.hands_back_body)
@@ -767,6 +886,10 @@ struct ReachGraph {
     request_lines: HashMap<DefinitionSite, BTreeSet<u32>>,
     /// Definition -> the rows inside its lines that no fact states.
     unstated: HashMap<DefinitionSite, Vec<Unstated>>,
+    /// Every service's side calls ([`CallThroughSites::side_calls`]).
+    side_calls: HashMap<SideKey, SideCall>,
+    /// Whether a definition makes a request, as far as it has been asked.
+    makes_request: std::cell::RefCell<HashMap<DefinitionSite, bool>>,
 }
 
 impl ReachGraph {
@@ -883,33 +1006,44 @@ impl ReachGraph {
 
     /// Collect the requests written in `start` and in the definitions it
     /// reaches within [`MAX_EDGE_DEPTH`] call edges, and the rows no fact
-    /// states there.
+    /// states there, each with whether it was reached only through a side
+    /// call ([`SideCall`]).
     ///
     /// A request's own call (the one edge written on a request row's line)
     /// leads into how the request is made, a transport and the primitive it
     /// calls: a row no fact states past it is that request's, not another.
     /// Every other path counts the rows it reaches. A definition two paths
-    /// reach is walked once on each.
+    /// reach is walked once on each, and a request reached both through a
+    /// side call and not is not a side request.
     fn walk<'g>(
         &'g self,
         start: &DefinitionSite,
-        reached: &mut BTreeMap<&'g str, &'g Reached>,
-        unstated: &mut BTreeMap<&'g str, Vec<&'g Unstated>>,
+        reached: &mut BTreeMap<&'g str, (&'g Reached, bool)>,
+        unstated: &mut BTreeMap<&'g str, (Vec<&'g Unstated>, bool)>,
     ) {
-        let mut seen: HashSet<(&DefinitionSite, bool)> = HashSet::new();
-        let mut queue: VecDeque<(&DefinitionSite, usize, bool)> = VecDeque::new();
+        let mut seen: HashSet<(&DefinitionSite, bool, bool)> = HashSet::new();
+        let mut queue: VecDeque<(&DefinitionSite, usize, bool, bool)> = VecDeque::new();
         let Some((start, _)) = self.calls.get_key_value(start) else {
             return;
         };
-        seen.insert((start, false));
-        queue.push_back((start, 0, false));
-        while let Some((definition, depth, within_request)) = queue.pop_front() {
+        seen.insert((start, false, false));
+        queue.push_back((start, 0, false, false));
+        while let Some((definition, depth, within_request, side)) = queue.pop_front() {
             for request in self.requests.get(definition).into_iter().flatten() {
-                reached.insert(request.site.as_str(), request);
+                let entry = reached
+                    .entry(request.site.as_str())
+                    .or_insert((request, side));
+                entry.1 &= side;
             }
             if !within_request {
                 for row in self.unstated.get(definition).into_iter().flatten() {
-                    unstated.entry(row.site.as_str()).or_default().push(row);
+                    let entry = unstated
+                        .entry(row.site.as_str())
+                        .or_insert_with(|| (Vec::new(), side));
+                    if !entry.0.iter().any(|known| std::ptr::eq(*known, row)) {
+                        entry.0.push(row);
+                    }
+                    entry.1 &= side;
                 }
             }
             if depth == MAX_EDGE_DEPTH {
@@ -922,15 +1056,70 @@ impl ReachGraph {
                 let Some((callee, _)) = self.calls.get_key_value(&edge.to) else {
                     continue;
                 };
-                let request_call = edge.line != 0
-                    && edge.count == 1
-                    && request_lines.is_some_and(|lines| lines.contains(&edge.line));
+                let one_call = edge.line != 0 && edge.count == 1;
+                let request_call =
+                    one_call && request_lines.is_some_and(|lines| lines.contains(&edge.line));
                 let within = within_request || request_call;
-                if seen.insert((callee, within)) {
-                    queue.push_back((callee, depth + 1, within));
+                let side = side || (one_call && self.side_edge(definition, edge));
+                if seen.insert((callee, within, side)) {
+                    queue.push_back((callee, depth + 1, within, side));
                 }
             }
         }
+    }
+
+    /// Whether the one call `edge` names, written in `from`, is a side call:
+    /// its value is dropped, or goes only into the arguments of calls that
+    /// make a request.
+    fn side_edge(&self, from: &DefinitionSite, edge: &Edge) -> bool {
+        match self
+            .side_calls
+            .get(&(from.file.clone(), edge.line, edge.to.clone()))
+        {
+            None => false,
+            Some(SideCall::Discarded) => true,
+            Some(SideCall::InputTo(outers)) => {
+                !outers.is_empty()
+                    && outers.iter().all(|outer| match outer {
+                        Outer::Request => true,
+                        Outer::Calls(definition) => self.makes_a_request(definition),
+                        Outer::Unknown => false,
+                    })
+            }
+        }
+    }
+
+    /// Whether `start`, or a definition it reaches within [`MAX_EDGE_DEPTH`]
+    /// call edges, writes a request row of any source.
+    fn makes_a_request(&self, start: &DefinitionSite) -> bool {
+        if let Some(known) = self.makes_request.borrow().get(start) {
+            return *known;
+        }
+        let mut seen: HashSet<&DefinitionSite> = HashSet::new();
+        let mut queue: VecDeque<(&DefinitionSite, usize)> = VecDeque::new();
+        let mut found = false;
+        if let Some((start, _)) = self.calls.get_key_value(start) {
+            seen.insert(start);
+            queue.push_back((start, 0));
+        }
+        while let Some((definition, depth)) = queue.pop_front() {
+            if self.requests.contains_key(definition) || self.unstated.contains_key(definition) {
+                found = true;
+                break;
+            }
+            if depth == MAX_EDGE_DEPTH {
+                continue;
+            }
+            for edge in self.calls.get(definition).into_iter().flatten() {
+                if let Some((callee, _)) = self.calls.get_key_value(&edge.to)
+                    && seen.insert(callee)
+                {
+                    queue.push_back((callee, depth + 1));
+                }
+            }
+        }
+        self.makes_request.borrow_mut().insert(start.clone(), found);
+        found
     }
 }
 
@@ -970,50 +1159,102 @@ impl<'g> Decider<'g> {
     /// through that settles on the same operation (a command calling a
     /// command): the model's row at a `fetch` beside a token request, or a
     /// row of unknown source, leaves the step unproven.
+    ///
+    /// Where the step reaches more than that, the request is the one whose
+    /// value the functions hand back: the step is read again without the
+    /// requests reached only through a side call (a probe awaited and
+    /// dropped, a token handed to the request returned). Where that leaves
+    /// none, or still more than one, the row is left alone.
     fn decide(&mut self, row: &SiteRow) -> Reach<'g> {
         let graph = self.graph;
         for (position, step) in row.steps.iter().enumerate() {
             // By site, so a request two paths reach is one request.
-            let mut reached: BTreeMap<&'g str, &'g Reached> = BTreeMap::new();
-            let mut unstated: BTreeMap<&'g str, Vec<&'g Unstated>> = BTreeMap::new();
+            let mut reached: BTreeMap<&'g str, (&'g Reached, bool)> = BTreeMap::new();
+            let mut unstated: BTreeMap<&'g str, (Vec<&'g Unstated>, bool)> = BTreeMap::new();
             for definition in step {
                 graph.walk(definition, &mut reached, &mut unstated);
             }
-            // A site a fact states is that fact's request.
-            unstated.retain(|site, _| !reached.contains_key(site));
+            // A site a fact states is that fact's request, and the row's own
+            // site is the call being decided.
+            let own_site = format!("{}:{}", row.file, row.line);
+            unstated.retain(|site, _| !reached.contains_key(site) && *site != own_site);
             if reached.is_empty() && unstated.is_empty() {
                 continue;
             }
-            let operations: BTreeSet<Operation> = reached
-                .values()
-                .map(|request| operation_of(request))
-                .collect();
-            if operations.len() > 1 {
-                return Reach::Several;
+            let every = self.judge(&reached, &unstated, false);
+            if matches!(every, Reach::One { .. }) {
+                return self.placed(every, position);
             }
-            let (Some(first), Some(operation)) = (
-                reached.values().next().copied(),
-                operations.into_iter().next(),
-            ) else {
-                return Reach::Unstated;
-            };
-            let own_site = format!("{}:{}", row.file, row.line);
-            for (site, rows) in unstated {
-                if site == own_site {
-                    continue;
-                }
-                for unstated in rows {
-                    if !self.settles_on(unstated, &operation) {
-                        return Reach::Unstated;
-                    }
-                }
+            let side =
+                reached.values().any(|(_, side)| *side) || unstated.values().any(|(_, side)| *side);
+            if !side {
+                return every;
             }
-            return Reach::One {
-                request: first,
-                by_own_callee: position == 0,
+            let returned = self.judge(&reached, &unstated, true);
+            return match returned {
+                Reach::One { .. } => self.placed(returned, position),
+                Reach::None => every,
+                other => other,
             };
         }
         Reach::None
+    }
+
+    /// `reach` with whether the row's own callee decided.
+    fn placed(&self, reach: Reach<'g>, position: usize) -> Reach<'g> {
+        match reach {
+            Reach::One { request, .. } => Reach::One {
+                request,
+                by_own_callee: position == 0,
+            },
+            other => other,
+        }
+    }
+
+    /// The one operation the requests of a step name, every one of them or
+    /// (`returned_only`) the ones not reached only through a side call.
+    /// `Reach::None` when that leaves no request.
+    fn judge(
+        &mut self,
+        reached: &BTreeMap<&'g str, (&'g Reached, bool)>,
+        unstated: &BTreeMap<&'g str, (Vec<&'g Unstated>, bool)>,
+        returned_only: bool,
+    ) -> Reach<'g> {
+        let kept = |side: bool| !(returned_only && side);
+        let requests: Vec<&'g Reached> = reached
+            .values()
+            .filter(|(_, side)| kept(*side))
+            .map(|(request, _)| *request)
+            .collect();
+        let rows: Vec<&'g Unstated> = unstated
+            .values()
+            .filter(|(_, side)| kept(*side))
+            .flat_map(|(rows, _)| rows.iter().copied())
+            .collect();
+        if requests.is_empty() && rows.is_empty() {
+            return Reach::None;
+        }
+        let operations: BTreeSet<Operation> = requests
+            .iter()
+            .map(|request| operation_of(request))
+            .collect();
+        if operations.len() > 1 {
+            return Reach::Several;
+        }
+        let (Some(first), Some(operation)) =
+            (requests.first().copied(), operations.into_iter().next())
+        else {
+            return Reach::Unstated;
+        };
+        for unstated in rows {
+            if !self.settles_on(unstated, &operation) {
+                return Reach::Unstated;
+            }
+        }
+        Reach::One {
+            request: first,
+            by_own_callee: false,
+        }
     }
 
     /// Whether `row` is a call-through row that settles on `operation`. A

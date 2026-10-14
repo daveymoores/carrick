@@ -19,3 +19,35 @@ export class ProbedClient {
 export function createProbedClient(): ProbedClient {
   return new ProbedClient();
 }
+
+/**
+ * The same client, whose probe is a `fetch` only the model reads, made once
+ * per client from the origin it was built with. The probe's value is
+ * dropped, so the request each method hands back is the one its call
+ * reaches.
+ */
+export class ModelProbedClient {
+  private probed?: Promise<void>;
+
+  constructor(private readonly origin: string) {}
+
+  getRun(id: string) {
+    return this.perform(() => getRun({ client: transport, path: { id } }));
+  }
+
+  private async perform<T>(call: () => Promise<{ data: unknown }>): Promise<T> {
+    await this.probe();
+    return (await call()).data as T;
+  }
+
+  private probe(): Promise<void> {
+    this.probed ??= (async () => {
+      await fetch(`${new URL(this.origin).origin}/health`);
+    })();
+    return this.probed;
+  }
+}
+
+export function createModelProbedClient(origin: string): ModelProbedClient {
+  return new ModelProbedClient(origin);
+}
