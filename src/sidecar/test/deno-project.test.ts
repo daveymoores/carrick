@@ -224,6 +224,42 @@ export type Configured = DomainGlobal;
   });
 
   /**
+   * carrick#2317: a file of a Deno service that declares a global
+   * augmentation, and that the anchored file does not import, is a root of the
+   * program the anchors are read in, as it is of the service's own check.
+   */
+  it('reads a member a `declare global` declares in a file of the graph the anchored file does not import (carrick#2317)', () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-')));
+    const write = (file: string, text: string): void => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    };
+    try {
+      write('deno.json', JSON.stringify({ compilerOptions: { strict: true } }));
+      write('augment.ts', `export {};
+declare global {
+  interface Request { tenant: { id: string; plan: 'basic' | 'team' } }
+}
+`);
+      const handler = `export function tenantOf(request: Request) {
+  return request.tenant;
+}
+`;
+      write('main.ts', handler);
+      const result = captureStub({ repoRoot: root, serviceName: 'app', outDir: path.join(root, '.carrick/stub'), anchors: [
+        { kind: 'infer', alias: 'Tenant', source_file: 'main.ts', anchor_origin: 'deterministic-infer', expression_text: 'request.tenant', line_number: 2 },
+      ] });
+      assert.equal(result.success, true, result.errors.join('\n'));
+      const surface = fs.readFileSync(path.join(result.stub_dir, 'types/surface.d.ts'), 'utf8');
+      const record = result.aliases.find(a => a.alias === 'Tenant')!;
+      assert.equal(record.self_check, 'ok', JSON.stringify(record) + surface);
+      assert.equal(record.top_type_at_self_check, false);
+      assert.equal(record.any_provenance, undefined);
+      assert.match(surface.replace(/\s+/g, ' '), /export type Tenant = \{ id: string; plan: "basic" \| "team"; \}/);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  /**
    * carrick#1260: a Deno service resolves npm types out of the Deno cache
    * (`$DENO_DIR/npm/<registry-host>/<name>/<version>/...`), a path that holds
    * no `node_modules` segment. The receiver-type answer that lets the driver
