@@ -1321,6 +1321,29 @@ async fn a_local_function_that_hands_the_instance_on_carries_the_scopes_prefix()
 
 #[tokio::test]
 #[serial]
+async fn same_named_local_functions_in_two_files_keep_their_own_scope() {
+    // Each file declares a local `relay` and hands its scope's instance to
+    // it. A local function is a node of its own file: neither file's routes
+    // take the other file's prefix.
+    let a = answer(
+        "src/relay-same-name-a.ts",
+        &[("app.register(", "app", "api", "/a", None)],
+        &[],
+    );
+    let b = answer(
+        "src/relay-same-name-b.ts",
+        &[("app.register(", "app", "api", "/b", None)],
+        &[],
+    );
+    let result = analyze(vec![a, b, team_items(), team_notes()]).await;
+    assert_eq!(
+        served(&result),
+        set(&["GET /a/teams/:id/items", "GET /b/teams/:id/notes"])
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn two_hand_ons_on_one_line_are_two_mounts() {
     let result = analyze_with(
         vec![scope_only("src/helper-both.ts"), team_items(), team_notes()],

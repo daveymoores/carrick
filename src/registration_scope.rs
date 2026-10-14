@@ -133,12 +133,13 @@ pub struct InnerRegistration {
 
 impl InnerRegistration {
     /// The call as a mount row of the file that makes it, hanging from
-    /// `instance`: the name the file gives the instance handed over.
-    fn mount_row(&self, instance: &str) -> MountResult {
+    /// `instance`, the node the instance handed over is, and mounting
+    /// `child`, the node the function called is ([`InstanceTrace::node`]).
+    fn mount_row(&self, instance: &str, child: &str) -> MountResult {
         MountResult {
             line_number: i32::try_from(self.line).unwrap_or(i32::MAX),
             parent_node: instance.to_string(),
-            child_node: self.identifier.clone(),
+            child_node: child.to_string(),
             mount_path: String::new(),
             import_source: self.import_source.clone(),
             pattern_matched: match &self.method {
@@ -1016,6 +1017,9 @@ impl Visit for HeadCollector<'_> {
 /// functions that function hands it on to (carrick#2316).
 struct InstanceTrace<'a> {
     key_by_canonical: &'a HashMap<PathBuf, String>,
+    /// The canonical directory the keys resolve against, so a node of one
+    /// file is named by its repo-relative path.
+    root: Option<PathBuf>,
     /// The resolver the mount graph reads a mount's child through, so a
     /// function this decides is one the graph can attribute routes to.
     resolver: BindingResolver,
@@ -1026,6 +1030,37 @@ struct InstanceTrace<'a> {
 }
 
 impl InstanceTrace<'_> {
+    /// The node `registration` mounts, for the function `function` that
+    /// `declaring` declares and the call reaches. The graph keys mounts by
+    /// name, so a function the file declares and that hands the instance on
+    /// is named by its file and line ([`scope_id`]): two files each handing
+    /// their own scope to a local function of the same name stay two nodes,
+    /// and neither's hand-ons take the other's prefix. An imported function
+    /// keeps the name the file gives it, which the graph resolves through
+    /// the import's binding.
+    fn node(
+        &mut self,
+        declaring: &Path,
+        registration: &InnerRegistration,
+        function: &str,
+    ) -> String {
+        if registration.import_source.is_some() {
+            return registration.identifier.clone();
+        }
+        let file = self
+            .root
+            .as_deref()
+            .and_then(|root| declaring.strip_prefix(root).ok())
+            .map(|relative| relative.to_string_lossy().into_owned())
+            .or_else(|| self.key_by_canonical.get(declaring).cloned());
+        match (file, self.heads.head(declaring, function)) {
+            (Some(file), Some(head)) if !head.passes_on.is_empty() => {
+                scope_id(function, &file, head.start_line)
+            }
+            _ => registration.identifier.clone(),
+        }
+    }
+
     /// The function a file names `identifier`: the module that declares it
     /// and its name there. By the name the file gives it, as the graph reads
     /// the emitted row's child: an import the graph cannot follow (one
@@ -1053,20 +1088,22 @@ impl InstanceTrace<'_> {
     /// for which the same holds, at most [`MAX_PASS_ON_DEPTH`] functions on.
     ///
     /// Each hand-on that reaches a registration is pushed to `hand_ons` as a
-    /// mount row of the file that makes the call, hanging from `name`, the
-    /// function the call runs in: that is the node the row that reached the
-    /// function mounts. A function its own file reaches by name is a local
-    /// child of that file and is kept as it is, so the hand-on composes under
-    /// the scope that made the call. The parameter would resolve file-first to
-    /// the binding the file is mounted under, which is not the scope the call
-    /// runs in. An imported function resolves through the binding of the
-    /// import that reached it. A line that already holds a mount is the
-    /// model's and is left to it.
+    /// mount row of the file that makes the call, hanging from `node`, the
+    /// node the row that reached the function mounts ([`Self::node`]). A
+    /// function its own file reaches is a local child of that file, named by
+    /// file and line, and kept as it is, so the hand-on composes under the
+    /// scope that made the call and under no other file's. The parameter
+    /// would resolve file-first to the binding the file is mounted under,
+    /// which is not the scope the call runs in. An imported function
+    /// resolves through the binding of the import that reached it. A line
+    /// that already holds a mount is the model's and is left to it.
+    #[allow(clippy::too_many_arguments)]
     fn registers(
         &mut self,
         file_results: &HashMap<String, FileAnalysisResult>,
         declaring: &Path,
         name: &str,
+        node: &str,
         position: usize,
         depth: usize,
         hand_ons: &mut Vec<(String, MountResult)>,
@@ -1086,9 +1123,9 @@ impl InstanceTrace<'_> {
         let inside = |line: i32| {
             u32::try_from(line).is_ok_and(|line| line >= head.start_line && line <= head.end_line)
         };
-        // A hand-on this pass wrote hangs from the function's name.
+        // A hand-on this pass wrote hangs from the function's node.
         let mut registers = rows.mounts.iter().any(|mount| {
-            (&mount.parent_node == param || mount.parent_node == name) && inside(mount.line_number)
+            (&mount.parent_node == param || mount.parent_node == node) && inside(mount.line_number)
         }) || rows.endpoints.iter().any(|endpoint| {
             &endpoint.owner_node == param
                 && is_served_path(&endpoint.path)
@@ -1112,16 +1149,18 @@ impl InstanceTrace<'_> {
             let Some((file, function)) = self.declaration(declaring, &pass) else {
                 continue;
             };
+            let child = self.node(&file, &pass, &function);
             if self.registers(
                 file_results,
                 &file,
                 &function,
+                &child,
                 pass.position,
                 depth + 1,
                 hand_ons,
             ) {
                 registers = true;
-                hand_ons.push((key.clone(), pass.mount_row(name)));
+                hand_ons.push((key.clone(), pass.mount_row(node, &child)));
             }
         }
         self.walking.pop();
@@ -1177,6 +1216,7 @@ pub fn mount_unstated_registrations(
 
     let mut trace = InstanceTrace {
         key_by_canonical: &key_by_canonical,
+        root: file_root.canonicalize().ok(),
         resolver: BindingResolver::new(),
         heads: FunctionHeads::new(),
         walking: Vec::new(),
@@ -1204,15 +1244,17 @@ pub fn mount_unstated_registrations(
                     let Some((declaring, name)) = trace.declaration(&importer, inner) else {
                         continue;
                     };
+                    let node = trace.node(&declaring, inner, &name);
                     if trace.registers(
                         file_results,
                         &declaring,
                         &name,
+                        &node,
                         inner.position,
                         0,
                         &mut hand_ons,
                     ) {
-                        rows.push(inner.mount_row(&site.param));
+                        rows.push(inner.mount_row(&site.param, &node));
                     }
                 }
             }
