@@ -3561,7 +3561,9 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// The symbol is kept where it is the read or one member of it beside
 /// another body, kept at the read's depth where the read is a list of it,
 /// and dropped otherwise, so the inference defines the alias
-/// (`arbitrate_model_symbol`). No relation, no change.
+/// (`arbitrate_model_symbol`). No relation, no change. A symbol dropped only
+/// because the read adds `null` or `undefined` to it is not reported in
+/// `changed`: it still names the body.
 ///
 /// Every request the arbitration did not keep as it came in is reported in
 /// `changed` (carrick#1779): the manifest stamped the rejected symbol onto the
@@ -3658,6 +3660,19 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
     let mut arbitrated = ArbitratedAnchors::default();
     for (req, decided) in explicit.iter().zip(decisions) {
         let change = match (&decided, req.alias.as_deref()) {
+            // The read is the symbol or `null`/`undefined` (carrick#2111): the
+            // inference defines the alias so the `null` is published, and the
+            // symbol still names the body, so the row keeps it.
+            (None, Some(alias))
+                if names_producer_response(req)
+                    && inferred_by_alias.get(alias).is_some_and(|inf| {
+                        reads_producer_response(&inf.infer_kind)
+                            && inf.model_symbol_relation.as_ref().map(|r| r.relation)
+                                == Some(SymbolRelationKind::Nullable)
+                    }) =>
+            {
+                None
+            }
             (None, Some(alias)) => Some((alias, None)),
             // Both arms keep a request whose symbol is the root, so a
             // re-aimed one always names another symbol.
@@ -3763,7 +3778,9 @@ pub(crate) fn producer_response_model_symbols(
 /// - the same type, or one member of the read beside another body: kept;
 /// - the read is a list of it: kept, at the read's depth;
 /// - anything else, and the symbol with only `null` or `undefined` beside
-///   it: dropped (`None`), so the inference defines the alias.
+///   it: dropped (`None`), so the inference defines the alias. The second
+///   is not reported as a change: the symbol still names the body, and the
+///   manifest row keeps it.
 fn arbitrate_model_symbol(
     req: &SymbolRequest,
     alias: &str,
@@ -6398,26 +6415,40 @@ mod tests {
 
     #[test]
     fn a_model_symbol_that_is_not_the_read_is_dropped_and_reported() {
-        for relation in [SymbolRelationKind::Different, SymbolRelationKind::Nullable] {
-            let explicit = vec![symbol_request("ItemDto", "Alias_Response", None)];
-            let inferred = vec![related(
-                "Alias_Response",
-                InferKind::ResponseBody,
-                relation,
-                None,
-            )];
-            let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
-            assert!(arbitrated.requests.is_empty(), "{relation:?}");
-            assert_eq!(
-                arbitrated.changed,
-                vec![AnchorChange {
-                    alias: "Alias_Response".to_string(),
-                    rejected: "ItemDto".to_string(),
-                    reaimed: None,
-                }],
-                "{relation:?}"
-            );
-        }
+        let explicit = vec![symbol_request("ItemDto", "Alias_Response", None)];
+        let inferred = vec![related(
+            "Alias_Response",
+            InferKind::ResponseBody,
+            SymbolRelationKind::Different,
+            None,
+        )];
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        assert!(arbitrated.requests.is_empty());
+        assert_eq!(
+            arbitrated.changed,
+            vec![AnchorChange {
+                alias: "Alias_Response".to_string(),
+                rejected: "ItemDto".to_string(),
+                reaimed: None,
+            }]
+        );
+    }
+
+    /// `find(id): User | undefined` with the model symbol `User`: the
+    /// inference defines the alias, so the `undefined` is published, and the
+    /// row still names `User`, which is the body.
+    #[test]
+    fn a_model_symbol_the_read_adds_null_to_is_dropped_and_still_names_the_row() {
+        let explicit = vec![symbol_request("ItemDto", "Alias_Response", None)];
+        let inferred = vec![related(
+            "Alias_Response",
+            InferKind::FunctionReturn,
+            SymbolRelationKind::Nullable,
+            None,
+        )];
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        assert!(arbitrated.requests.is_empty());
+        assert!(arbitrated.changed.is_empty(), "{:?}", arbitrated.changed);
     }
 
     /// The relation is a producer's response read only. A consumer call, a
