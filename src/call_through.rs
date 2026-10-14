@@ -48,7 +48,7 @@ use tracing::debug;
 
 use crate::agents::file_analyzer_agent::{DataCallResult, FileAnalysisResult, ResolutionSource};
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::cloud_storage::{CloudRepoData, ManifestRole};
+use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::OperationKey;
@@ -562,6 +562,9 @@ pub struct Settled {
     /// row's call is not the call that reaches the request: what it returns
     /// is another function's result.
     pub types_not_carried: usize,
+    /// Corrected rows that kept their response entry and lost their request
+    /// entry: the call's arguments are the called function's parameters.
+    pub requests_not_carried: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -570,13 +573,15 @@ pub struct Settled {
 /// | Reached | The row |
 /// |---|---|
 /// | One operation, the row's own | stays the model's and keeps its type anchors; gains `role: wrapper_call` and `reaches_request` |
-/// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its consumer type entries are keyed to the reached operation |
+/// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its response type entry is keyed to the reached operation and its request type entry goes |
 /// | None, or several | left as it is, and counted |
 ///
-/// A corrected row keeps the types anchored at it only where the row's call
-/// is itself the call that reaches the request (its own callee decided):
-/// what that call returns is what the caller reads of the request, so the
-/// pair is judged against the reached operation's producer. Where a spread
+/// A corrected row keeps the RESPONSE type anchored at it, and only where the
+/// row's call is itself the call that reaches the request (its own callee
+/// decided): what that call returns is what the caller reads of the request,
+/// so the pair is judged against the reached operation's producer. Its
+/// request entry always goes: the call's arguments are the called function's
+/// parameters, not a request body. Where a spread
 /// call or a callback decided, the row's call is another function's (a hook,
 /// a runner), the anchor names that function's result, and the entries are
 /// dropped and counted.
@@ -594,9 +599,13 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     by_own_callee,
                 } => match apply(service.data, row, request, by_own_callee) {
                     Some(Change::Relabelled) => settled.relabelled += 1,
-                    Some(Change::Corrected { types_dropped }) => {
+                    Some(Change::Corrected {
+                        types_dropped,
+                        request_dropped,
+                    }) => {
                         corrected += 1;
                         settled.types_not_carried += usize::from(types_dropped);
+                        settled.requests_not_carried += usize::from(request_dropped);
                     }
                     None => {}
                 },
@@ -611,10 +620,11 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
     }
     debug!(
-        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's); left alone: {} reach no request row, {} reach several operations (carrick#1146)",
+        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations (carrick#1146)",
         settled.relabelled,
         settled.corrected,
         settled.types_not_carried,
+        settled.requests_not_carried,
         settled.reaches_none,
         settled.reaches_several
     );
@@ -830,6 +840,9 @@ enum Change {
         /// The row held consumer type entries and they were dropped, because
         /// the row's call is not the call that reaches the request.
         types_dropped: bool,
+        /// The row kept its response entry and its request entry was
+        /// dropped: a call's arguments are not a request body.
+        request_dropped: bool,
     },
 }
 
@@ -937,6 +950,7 @@ fn apply(
     // check judges them against its producer. Where another call decided, or
     // the site already holds a row for the reached operation, they go.
     let mut types_dropped = false;
+    let mut request_dropped = false;
     if let (Some(manifest), Some((method, path))) = (data.type_manifest.as_mut(), before.as_http())
     {
         let method = normalize_manifest_method(method);
@@ -956,6 +970,16 @@ fn apply(
                 &normalize_manifest_method(&reached.method),
                 reached.canonical_path.clone(),
             );
+            // The response entry only. The call's arguments are the called
+            // function's parameters, not a request body, so a request-side
+            // check at a call through is wrong by construction: the request
+            // entry goes, as it does at a call to a function that builds its
+            // own body (`drop_call_through_entries`).
+            let before = manifest.len();
+            manifest.retain(|entry| {
+                !(at_the_row(entry) && entry.type_kind == ManifestTypeKind::Request)
+            });
+            request_dropped = manifest.len() < before;
             for entry in manifest.iter_mut().filter(|entry| at_the_row(entry)) {
                 entry.key = carried.clone();
             }
@@ -965,7 +989,10 @@ fn apply(
             types_dropped = !twin && manifest.len() < before;
         }
     }
-    Some(Change::Corrected { types_dropped })
+    Some(Change::Corrected {
+        types_dropped,
+        request_dropped,
+    })
 }
 
 #[cfg(test)]

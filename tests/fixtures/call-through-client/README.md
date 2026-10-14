@@ -34,6 +34,9 @@ Types at the corrected rows:
 | `commands.ts:46` | `SavedRun`, a stale copy that requires a field the API no longer sends: kept and judged incompatible |
 | `hooks.ts:9`, `:14`, `:19` | anchored at a hook's or a runner's call, whose result is not what the request returns: dropped and counted |
 
+No corrected row carries a request type: a call's arguments are the called
+function's parameters, not a request body.
+
 Rows that stay as the model stated them:
 
 | Site | Why |
