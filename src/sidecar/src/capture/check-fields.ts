@@ -148,12 +148,16 @@ export function comparedTypes(
     file ??
     program.getSourceFiles().find((sf) => sf.fileName.endsWith(`/probes/${plan.fileName}`));
   if (!source) return undefined;
-  const declared =
-    declaredConstType(source, checker, 'sentComparand') ??
-    declaredConstType(source, checker, 'sent');
+  // A pair compared around its open members (carrick#1398) is judged on the
+  // opened comparand, so that is the type every reader of the pair reads.
+  const openPair = plan.openAssignmentLine !== undefined;
+  const declared = openPair
+    ? declaredConstType(source, checker, 'sentOpen')
+    : (declaredConstType(source, checker, 'sentComparand') ??
+      declaredConstType(source, checker, 'sent'));
   const expected = declaredConstType(source, checker, 'expected');
   if (!declared || !expected) return undefined;
-  const wire = declaredConstType(source, checker, 'sentWire');
+  const wire = declaredConstType(source, checker, openPair ? 'sentOpenWire' : 'sentWire');
   // Whether serialising changes anything observable about the sent type.
   const wireApplied =
     wire !== undefined &&
@@ -209,7 +213,7 @@ export function pairFieldReports(
 function declaredConstType(
   file: ts.SourceFile,
   checker: ts.TypeChecker,
-  name: 'sent' | 'sentComparand' | 'sentWire' | 'expected'
+  name: 'sent' | 'sentComparand' | 'sentWire' | 'sentOpen' | 'sentOpenWire' | 'expected'
 ): { type: ts.Type; node: ts.Node } | undefined {
   for (const statement of file.statements) {
     if (!ts.isVariableStatement(statement)) continue;

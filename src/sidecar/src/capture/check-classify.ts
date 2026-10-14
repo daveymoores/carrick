@@ -27,7 +27,13 @@
  */
 
 import type { CheckVerdict } from './api.js';
-import { decisiveAssignmentLine, type GateName, type ProbePlan, type Side } from './check-probe.js';
+import {
+  decisiveAssignmentLine,
+  openedHeadline,
+  type GateName,
+  type ProbePlan,
+  type Side,
+} from './check-probe.js';
 import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
 import type { PairDeepFindings } from './check-deep.js';
 import type { DispatchUnion } from './check-union.js';
@@ -414,6 +420,59 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
  * reaches `bucket`, `resolved` or `unresolved_reason`, and the pair's verdict
  * is decided above before this is read.
  */
+/**
+ * A pair whose capture found an open type (`unknown`, `any`) under a named
+ * member, compared on the rest (carrick#1398). `held` is the verdict the
+ * capture pre-gate writes for the pair, which is what the pair reads unless
+ * the rest disagrees.
+ *
+ * One way only. A mismatch on the typed members is a fact whatever the open
+ * member holds, so it files `incompatible`, still `resolved: false` and naming
+ * the open member. An agreement is not stated: every other outcome, a clean
+ * probe included, returns `held` unchanged.
+ *
+ * The mismatch must show where `classifyPair` reads one AND on the opened
+ * line. The first alone can be the sent side's open member itself, which says
+ * nothing about a field; the opened line alone can fail where the types agree
+ * (mapping drops a class's private members and a construct signature). The
+ * diagnostic is the opened line's, so it names the fields that differ and not
+ * the open member.
+ */
+export function classifyHeldPair(input: ClassifyInput, held: CheckVerdict): CheckVerdict {
+  const verdict = classifyPair(input);
+  if (verdict.bucket !== 'incompatible') return held;
+  const { plan, probeDiags, scrubCtx } = input;
+  const opened = probeDiags.find(
+    (d) => d.line === plan.openAssignmentLine && ASSIGNMENT_CODES.has(d.code)
+  );
+  if (!opened) return held;
+  const fact = factness(input);
+  return {
+    pair_id: verdict.pair_id,
+    pair_key: verdict.pair_key,
+    codes: verdict.codes,
+    notes: verdict.notes,
+    bucket: 'incompatible',
+    diagnostic:
+      scrubDiagnostic(
+        openedHeadline(opened.message),
+        scrubCtx,
+        plan.sentEndpoint.alias,
+        plan.expectedEndpoint.alias
+      ) + namedFields(input, scrubCtx),
+    // The walk after install names the open member. Should it find none (the
+    // capture's `any` came from an import the install then resolved), the
+    // capture's finding still stands: the pair was compared around it.
+    ...(fact.resolved
+      ? {
+          resolved: false,
+          unresolved_reason: held.unresolved_reason,
+          ...(held.unresolved_side ? { unresolved_side: held.unresolved_side } : {}),
+        }
+      : fact),
+  };
+}
+
 function pairNotes(input: ClassifyInput, scrubCtx: ScrubContext): string[] {
   const report = input.fieldReport;
   if (!report) return [];

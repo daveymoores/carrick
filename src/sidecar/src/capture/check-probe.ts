@@ -139,6 +139,13 @@ export interface ProbePlan {
    * the form that actually travels.
    */
   wireAssignmentLine?: number;
+  /**
+   * 1-based line of the assignment that sends the value with the sent side's
+   * open members (`unknown`, `any`) read as `any` (carrick#1398), in the form
+   * the decisive line sends it. Present only on a probe built for a pair whose
+   * capture found an open type under a named member; see `openedSentLines`.
+   */
+  openAssignmentLine?: number;
 }
 
 /** The assignment line whose diagnostic decides the bucket. */
@@ -186,7 +193,8 @@ export function decisiveAssignmentLine(plan: ProbePlan): number {
  */
 export function buildProbe(
   spec: CheckPairSpec,
-  packageOf: (serviceName: string) => string
+  packageOf: (serviceName: string) => string,
+  options: { openSent?: boolean } = {}
 ): ProbePlan {
   const id = pairId(spec);
   const direction = directionFor(spec.protocol, spec.type_kind);
@@ -395,6 +403,13 @@ export function buildProbe(
     wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
   }
 
+  let openAssignmentLine: number | undefined;
+  if (options.openSent) {
+    for (const line of openedSentLines(spec.protocol === 'http')) {
+      openAssignmentLine = push(line);
+    }
+  }
+
   return {
     pairId: id,
     spec,
@@ -407,5 +422,53 @@ export function buildProbe(
     gateLines,
     assignmentLine,
     wireAssignmentLine,
+    openAssignmentLine,
   };
+}
+
+/**
+ * The lines that compare a pair around the sent side's open members
+ * (carrick#1398), appended after every line `buildProbe` writes for any pair,
+ * so the gates and both assignments keep their lines and read the type as
+ * captured. The last line is the assignment.
+ *
+ * An open member on the EXPECTED side already compares around itself: an
+ * `unknown` member accepts anything and an `any` member assigns both ways. An
+ * `unknown` member on the SENT side fails against any typed member, and that
+ * failure is about the open member, not about a field. So the sent side's
+ * `unknown` members are read as `any` here, at every depth, and only here.
+ *
+ * The root is mapped by a generic homomorphic type, so a union is mapped
+ * member by member and an array stays an array, and the compiler prints the
+ * comparand as `OpenRoot<…>` (see `openedHeadline`). A function member is
+ * kept whole: a mapped function loses its call signature.
+ *
+ * Mapping drops what a class declares `private` or `protected`, as `JsonWire`
+ * already does on the decisive line, so this line alone can fail where the
+ * types agree. The classifier reads it only where the decisive line failed
+ * too (`classifyHeldPair`).
+ */
+function openedSentLines(http: boolean): string[] {
+  const lines = [
+    `type OpenMember<T> = unknown extends T ? any : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: OpenMember<T[K]> } : T;`,
+    `type OpenRoot<T> = { [K in keyof T]: OpenMember<T[K]> };`,
+    `declare const sentOpen: OpenRoot<Sent>;`,
+  ];
+  if (!http) return [...lines, `const expectedOpen: Expected = sentOpen;`];
+  // The wire form of the opened type, written as `WireSent` writes the
+  // declared one, so this line asks the decisive line's question.
+  return [
+    ...lines,
+    `type WireSentOpen = [OpenRoot<Sent>] extends [Expected] ? OpenRoot<Sent> : (JsonWireSame<JsonWire<OpenRoot<Sent>>, OpenRoot<Sent>> extends true ? OpenRoot<Sent> : JsonWire<OpenRoot<Sent>>);`,
+    `declare const sentOpenWire: WireSentOpen;`,
+    `const expectedOpenWire: Expected = sentOpenWire;`,
+  ];
+}
+
+/**
+ * The compiler prints the opened comparand as `OpenRoot<…>` around the sent
+ * alias; the headline names the sent alias as the declared line's does.
+ */
+export function openedHeadline(text: string): string {
+  return text.replace(/'OpenRoot<([A-Za-z_$][\w$]*)>'/g, "'$1'");
 }

@@ -32,6 +32,7 @@ import type {
 } from './api.js';
 import { buildProbe, type ProbePlan } from './check-probe.js';
 import {
+  classifyHeldPair,
   classifyPair,
   parseTscOutput,
   type RawDiagnostic,
@@ -188,9 +189,12 @@ function binPath(name: string): string {
 function unverifiableAll(
   plans: ProbePlan[],
   gate: string,
-  diagnostic: string
+  diagnostic: string,
+  held: Map<string, CheckVerdict>
 ): CheckVerdict[] {
-  return plans.map((plan) => ({
+  // A pair the capture pre-gate holds a verdict for keeps it, whatever the
+  // install or the compiler then does (carrick#1833, carrick#1398).
+  return plans.map((plan) => held.get(plan.pairId) ?? ({
     pair_id: plan.pairId,
     pair_key: plan.spec.pair_key,
     bucket: 'unverifiable' as const,
@@ -202,7 +206,7 @@ function unverifiableAll(
     // Nothing was compared here, so there is nothing to observe about the
     // comparison (carrick#1341). Empty is the honest answer, not a default.
     notes: [],
-  }));
+  } satisfies CheckVerdict));
 }
 
 function sortVerdicts(verdicts: CheckVerdict[]): CheckVerdict[] {
@@ -228,7 +232,7 @@ export async function runCheck(
   // explicitly instead (design Check step 2).
   if (!fs.existsSync(pnpmPath)) {
     // Capture-decay verdicts stand without isolation too (carrick#1833).
-    const { preGated, probing } = preGate(
+    const { preGated, probing, held } = preGate(
       planPairs(opts, (s) => `@carrick/${s}`),
       readStubAliasRecords(opts.stubs)
     );
@@ -242,7 +246,8 @@ export async function runCheck(
         ...unverifiableAll(
           probing,
           'isolation:unavailable',
-          'type isolation unavailable (pnpm missing); compatibility cannot be verified.'
+          'type isolation unavailable (pnpm missing); compatibility cannot be verified.',
+          held
         ),
         ...preGated,
       ]),
@@ -293,7 +298,13 @@ export async function runCheck(
   }
 
   const aliasRecords = readStubAliasRecords(opts.stubs);
-  const { preGated, probing } = preGate(plans, aliasRecords);
+  const gated = preGate(plans, aliasRecords);
+  const { preGated, held } = gated;
+  // A pair compared on the rest of its type is probed with its sent side's
+  // open members opened (carrick#1398).
+  const probing = gated.probing.map((plan) =>
+    held.has(plan.pairId) ? buildProbe(plan.spec, ws.packageOf, { openSent: true }) : plan
+  );
   writeProbes(ws, probing);
 
   const errors: string[] = [];
@@ -319,7 +330,8 @@ export async function runCheck(
         probing,
         'install:failed',
         'workspace dependency install failed; compatibility cannot be verified.' +
-          (installError ? ` Installer output: ${installError}` : '')
+          (installError ? ` Installer output: ${installError}` : ''),
+        held
       ),
       // Capture-decay verdicts stand regardless of the install outcome.
       ...preGated,
@@ -383,7 +395,8 @@ export async function runCheck(
         'tsc:abnormal-termination',
         `the type checker terminated abnormally (exit code ${tsc.code ?? 'null'}); ` +
           'compatibility cannot be verified.' +
-          (excerpt ? ` Compiler output: ${excerpt}` : '')
+          (excerpt ? ` Compiler output: ${excerpt}` : ''),
+        held
       ),
       ...preGated,
       ...unresolved,
@@ -444,8 +457,8 @@ export async function runCheck(
   const unionsByPair = pairDispatchUnions(probeProgram, probing);
 
   const verdicts = sortVerdicts([
-    ...probing.map((plan) =>
-      classifyPair({
+    ...probing.map((plan) => {
+      const input = {
         plan,
         probeDiags: probeDiagsByPair.get(plan.pairId) ?? [],
         poisonReason,
@@ -454,8 +467,10 @@ export async function runCheck(
         fieldReport: fieldsByPair.get(plan.pairId),
         dispatchUnion: unionsByPair.get(plan.pairId),
         rawTextSide: rawTextSideOf(plan, aliasRecords),
-      })
-    ),
+      };
+      const kept = held.get(plan.pairId);
+      return kept ? classifyHeldPair(input, kept) : classifyPair(input);
+    }),
     ...preGated,
     ...unresolved,
   ]);
@@ -520,16 +535,17 @@ interface DeepDecayHit {
 function preGate(
   plans: ProbePlan[],
   aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
-): { preGated: CheckVerdict[]; probing: ProbePlan[] } {
+): { preGated: CheckVerdict[]; probing: ProbePlan[]; held: Map<string, CheckVerdict> } {
   const preGated: CheckVerdict[] = [];
   const probing: ProbePlan[] = [];
+  const held = new Map<string, CheckVerdict>();
   for (const plan of plans) {
     const hit = deepDecayOf(plan, aliasRecords);
     if (!hit) {
       probing.push(plan);
       continue;
     }
-    preGated.push({
+    const verdict: CheckVerdict = {
       pair_id: plan.pairId,
       pair_key: plan.spec.pair_key,
       // `any` is a confirmed baked top type -> gate_caught_baked_any; `unknown`
@@ -553,9 +569,63 @@ function preGate(
           ? `the ${hit.side} type is too deep or wide to verify at '${hit.path}'`
           : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}'`,
       notes: [],
-    });
+    };
+    // carrick#1398: a pair whose every finding is an open type under a named
+    // member is compared on the rest of its type. The verdict above is kept
+    // beside it, and stands unless the rest disagrees (`classifyHeldPair`).
+    // GraphQL stays here: its envelope unwrap reads an `any` member as no
+    // payload, so an opened comparand would change what is unwrapped.
+    if (plan.spec.protocol !== 'graphql' && comparesAroundFindings(plan, aliasRecords)) {
+      held.set(plan.pairId, verdict);
+      probing.push(plan);
+      continue;
+    }
+    preGated.push(verdict);
   }
-  return { preGated, probing };
+  return { preGated, probing, held };
+}
+
+/**
+ * True when every capture finding on either side of the pair is an `any` or
+ * `unknown` under a named member, so the rest of the type can be compared.
+ * An exhausted budget, or a top type at no named member (the root, a root
+ * element, a root index signature), leaves nothing to compare.
+ */
+function comparesAroundFindings(
+  plan: ProbePlan,
+  aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
+): boolean {
+  return (['producer', 'consumer'] as const).every((side) => {
+    const endpoint = plan.spec[side];
+    const findings = aliasRecords.get(endpoint.service_name)?.get(endpoint.alias)?.any_provenance ?? [];
+    return findings.every(
+      (finding) => finding.kind !== 'budget_exhausted' && pathNamesAMember(finding.path)
+    );
+  });
+}
+
+/**
+ * True when a deep-walk path passes through a named member. The walk writes a
+ * member as its name (`a`, `a.b`), an element or type argument as `<n>`, an
+ * index signature as `[index]` and a callable return as `()`; a path made of
+ * the last three alone sits at the root of the type or inside a container,
+ * never in a field. The same rule as `path_names_a_member` in
+ * `src/engine/type_compat_v2.rs`, which decides the manifest state of a row;
+ * the two are held to one case table (`check-v2-open-member.test.ts`).
+ */
+export function pathNamesAMember(path: string): boolean {
+  const rest = path.split('[index]').join('').split('()').join('');
+  let inArgument = false;
+  for (const c of rest) {
+    if (c === '<') {
+      inArgument = true;
+    } else if (c === '>') {
+      inArgument = false;
+    } else if (c !== '.' && !inArgument) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

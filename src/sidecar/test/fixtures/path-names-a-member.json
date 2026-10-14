@@ -1,0 +1,20 @@
+{
+  "_comment": "Deep-walk paths and whether each passes through a named member. Read by the sidecar's check pre-gate test (check-v2-open-member.test.ts) and by the Rust manifest state's test (src/engine/type_compat_v2.rs), so the two copies of the rule stay one rule (carrick#1398).",
+  "cases": [
+    ["", false],
+    ["a", true],
+    ["a.b", true],
+    ["items<0>.evidence", true],
+    ["<0>.a", true],
+    ["[index].a", true],
+    ["().a", true],
+    ["a<0>", true],
+    ["<0>", false],
+    ["<0><1>", false],
+    ["[index]", false],
+    ["()", false],
+    ["()<0>", false],
+    ["<0>[index]", false],
+    ["[index]<0>", false]
+  ]
+}
