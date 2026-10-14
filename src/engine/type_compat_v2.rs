@@ -4324,6 +4324,7 @@ mod tests {
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         }
     }
 
@@ -5351,6 +5352,7 @@ mod tests {
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         };
 
         let infer = vec![
@@ -5483,6 +5485,7 @@ mod tests {
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -6249,6 +6252,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         };
 
         let explicit = vec![

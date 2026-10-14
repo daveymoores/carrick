@@ -275,6 +275,15 @@ export const InferRequestSchema = BaseRequestSchema.extend({
   action: z.literal('infer'),
   requests: z.array(InferRequestItemSchema).min(1, 'At least one infer request is required'),
   extraction_config: ExtractionConfigSchema.optional(),
+  model_symbols: z
+    .array(
+      z.object({
+        alias: z.string().min(1),
+        symbol_name: z.string().min(1),
+        source_file: z.string().min(1),
+      })
+    )
+    .optional(),
 });
 
 export const HealthRequestSchema = BaseRequestSchema.extend({
