@@ -3313,7 +3313,21 @@ export class TypeInferrer {
       return { terminal: chainRead, projectionOnly: false, projections: [] };
     }
 
-    const returnStmt = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
+    // A return statement answers only for a call of the function it returns
+    // from (carrick#2282). The nearest `return` above a call in a callback is
+    // an OUTER function's, and its expression is what that function hands
+    // back with the callback inside it: a command table, a client object, a
+    // UI element. The one callback it does answer for is the executor of a
+    // promise it returns (`return new Promise<T>((resolve) => { request(…,
+    // (res) => resolve(…)) })`): what the caller receives is what that
+    // promise settles with, and the call made in the executor produces it.
+    const nearestReturn = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
+    const returnStmt =
+      nearestReturn &&
+      (this.findContainingFunctionForNode(nearestReturn) === func ||
+        this.callIsInReturnedPromiseExecutor(nearestReturn, func))
+        ? nearestReturn
+        : undefined;
     if (returnStmt) {
       const returnExpr = returnStmt.getExpression();
       if (returnExpr) {
@@ -3455,6 +3469,25 @@ export class TypeInferrer {
     }
 
     return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /**
+   * `func`, the function a call is made in, is the executor of the promise
+   * `returnStmt` returns: `return new Promise<T>((resolve, reject) => { … })`
+   * (carrick#2282). The promise is recognised by the language's await
+   * protocol on the constructed value, never by a name.
+   */
+  private callIsInReturnedPromiseExecutor(
+    returnStmt: Node,
+    func: FunctionLike | undefined
+  ): boolean {
+    if (!func || !Node.isReturnStatement(returnStmt)) return false;
+    const returned = this.unwrapExpressionNode(returnStmt.getExpression());
+    if (!Node.isNewExpression(returned)) return false;
+    const [executor] = returned.getArguments();
+    if (!executor || this.unwrapExpressionNode(executor) !== func) return false;
+    const constructed = returned.getType();
+    return this.unwrapPromiseType(constructed) !== constructed;
   }
 
   /**
