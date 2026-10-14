@@ -450,12 +450,15 @@ fn path_names_a_member(path: &str) -> bool {
 /// payload (carrick#1375). `serialised_body_unread`: a handler returns a status
 /// and a body string it serialised itself, and a return builds that string in a
 /// way the inferrer cannot read, so the envelope is never the contract
-/// (carrick#2200).
+/// (carrick#2200). `argument_not_the_body`: the located request value is an
+/// argument of a function the repository declares, and that function does not
+/// send it as the body or as an object literal built from it (carrick#2115).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
     "projected_value_only",
     "serialised_body_unread",
+    "argument_not_the_body",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -5004,6 +5007,35 @@ mod tests {
             "a blind inference without a decision keeps its infer anchor, got {:?}",
             anchors[1]
         );
+    }
+
+    /// carrick#2115: a request locator on an argument of a function the
+    /// repository declares, which that function does not send as the body, is
+    /// answered `unknown` with `argument_not_the_body`. That is a decision:
+    /// the capture's raw locator re-run would publish the argument again.
+    #[test]
+    fn derive_anchors_keeps_an_argument_not_the_body_decision() {
+        let mut decided = inferred("Endpoint_owner_Request", "unknown", None, None);
+        decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "argument_not_the_body".to_string(),
+            detail: None,
+        }];
+        let infer = vec![response_body_infer("Endpoint_owner_Request")];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[decided], &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_owner_Request");
+                assert_eq!(type_text, "unknown");
+            }
+            other => panic!("argument_not_the_body must stay a literal unknown, got {other:?}"),
+        }
     }
 
     /// carrick#2200: a handler that returns a status and a body string it

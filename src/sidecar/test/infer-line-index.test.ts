@@ -112,6 +112,9 @@ function referenceMatch(
       return best;
     });
   const exact = candidates.filter((c) => c.text === target);
+  // carrick#2115: a parameter's own name loses to a use of the same text.
+  const used = exact.filter((c) => !inferrer.isParameterDeclarationName(c.node));
+  if (used.length > 0) return pick(used.map((c) => c.node));
   if (exact.length > 0) return pick(exact.map((c) => c.node));
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target)) return undefined;
   const containing = candidates.filter((c) => c.text.includes(target));

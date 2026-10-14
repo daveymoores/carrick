@@ -258,7 +258,22 @@ interface PayloadCandidate {
 }
 
 /** A function that can build a response: one with a body to read. */
-type BuilderFunction = FunctionDeclaration | ArrowFunction | FunctionExpression;
+type BuilderFunction = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
+
+/**
+ * What a function the repository declares does with one parameter, or with
+ * the arguments of a call into it (carrick#2115): sends it unchanged as the
+ * body, builds the body as an object literal from it, puts it anywhere else
+ * (`elsewhere`: a URL, a header, a query), or uses it in ways that disagree.
+ */
+type ParameterBodyReading =
+  | { kind: 'forwarded' }
+  | { kind: 'built'; literal: ObjectLiteralExpression }
+  | { kind: 'elsewhere' }
+  | { kind: 'undecided'; why: string };
+
+/** Hops `bodyThroughDeclaredCallee` follows a parameter through declared functions. */
+const ARGUMENT_BODY_MAX_HOPS = 3;
 
 /**
  * How a repository's own response builder fills an envelope (carrick#2200):
@@ -3107,6 +3122,30 @@ export class TypeInferrer {
       });
     }
 
+    // carrick#2115: the located node is an argument of a call into a function
+    // this repository declares (`client.setTags(id, tags)`), or that call
+    // itself. What the call sends is what the function does with its
+    // parameters: the argument unchanged, an object literal it builds from
+    // them (`{ tags }`), or nothing that can be decided.
+    const throughCallee = this.bodyThroughDeclaredCallee(unwrapped);
+    if (throughCallee.kind === 'built' || throughCallee.kind === 'forwarded') {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} reaches a function the ` +
+          `repository declares; reading the body it sends (${throughCallee.kind})`
+      );
+      unwrapped = throughCallee.node;
+    } else if (throughCallee.kind === 'abstain') {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number}: ${throughCallee.why}; ` +
+          'the located value is not the request body'
+      );
+      return this.decidedAbstain(request, this.getNodeLocation(unwrapped), {
+        path: '',
+        kind: 'unknown',
+        reason: 'argument_not_the_body',
+      });
+    }
+
     // A `fetch` body is almost always `JSON.stringify(payload)`, whose own type
     // is the useless `string`. Drill to the serialized argument so the consumer
     // request shape is the payload's type, not `string`. General: any
@@ -5846,13 +5885,16 @@ export class TypeInferrer {
 
   /**
    * The single function a callee symbol declares with a body: a function
-   * declaration, or a variable initialised with an arrow or function
-   * expression.
+   * declaration, a method (of a class or an object literal), or a variable
+   * initialised with an arrow or function expression.
    */
   private builderFunctionOf(symbol: TsSymbol): BuilderFunction | undefined {
     const bodies: BuilderFunction[] = [];
     for (const declaration of symbol.getDeclarations()) {
-      if (Node.isFunctionDeclaration(declaration) && declaration.getBody()) {
+      if (
+        (Node.isFunctionDeclaration(declaration) || Node.isMethodDeclaration(declaration)) &&
+        declaration.getBody()
+      ) {
         bodies.push(declaration);
       } else if (Node.isVariableDeclaration(declaration)) {
         const initializer = declaration.getInitializer();
@@ -5861,6 +5903,388 @@ export class TypeInferrer {
       }
     }
     return bodies.length === 1 ? bodies[0] : undefined;
+  }
+
+  /**
+   * carrick#2115: the request body a located value reaches through a function
+   * the repository declares.
+   *
+   * - The located value is an argument of a call into such a function: its
+   *   parameter's uses decide (`parameterBodyReading`). Sent unchanged, the
+   *   argument is the body (`forwarded`); built into an object literal, the
+   *   literal is (`built`); anything else, the argument is not the body.
+   * - The located value is such a call itself, and the call is not itself an
+   *   argument or a member value (where its result is what is sent): the
+   *   body is what the function sends from its arguments. Exactly one
+   *   argument sent unchanged, or one literal they build, is the body; none
+   *   is a call that sends no body it can be read from when the function
+   *   returns a promise, and a payload builder's own result otherwise (left
+   *   to the path below).
+   * - The callee resolves to a declaration with no body to read (an
+   *   interface or abstract method, an overload set with no implementation):
+   *   nothing says what it sends.
+   *
+   * A value the handler received (a decorated parameter, a value read off a
+   * platform request) is a producer read, never a send, and is left alone,
+   * as is every call into lib or an installed package.
+   */
+  private bodyThroughDeclaredCallee(
+    located: Node
+  ):
+    | { kind: 'none' }
+    | { kind: 'forwarded' | 'built'; node: Node }
+    | { kind: 'abstain'; why: string } {
+    if (this.isReceivedRequestValue(located)) return { kind: 'none' };
+
+    let position = located;
+    while (true) {
+      const parent = position.getParent();
+      if (
+        parent &&
+        (Node.isParenthesizedExpression(parent) ||
+          Node.isAsExpression(parent) ||
+          Node.isSatisfiesExpression(parent) ||
+          Node.isNonNullExpression(parent) ||
+          Node.isAwaitExpression(parent))
+      ) {
+        position = parent;
+        continue;
+      }
+      break;
+    }
+    const parent = position.getParent();
+
+    if (parent && Node.isCallExpression(parent) && parent.getArguments().includes(position)) {
+      const index = parent.getArguments().indexOf(position);
+      const callee = this.declaredCalleeFunction(parent);
+      if (callee === undefined) return { kind: 'none' };
+      if (callee === 'bodiless') {
+        // A value declared ambiently (`declare const transport: …`) stands
+        // for code outside the repository, as lib does. A signature that
+        // declares where it takes its body (`data?: D`), or a parameter
+        // typed to take any value, says the argument is sent. Any other
+        // bodiless signature says nothing about what is sent.
+        const param = this.resolvedParameterAt(parent, index);
+        if (
+          this.calleeValueIsAmbient(parent) ||
+          this.requestBodySlots(parent)[index] !== undefined ||
+          !param?.getTypeNode() ||
+          this.typeNodeStatesNothing(param.getTypeNode()!)
+        ) {
+          return { kind: 'none' };
+        }
+        return { kind: 'abstain', why: 'the callee the repository declares has no body to read' };
+      }
+      const reading = this.argumentBodyReading(
+        parent,
+        index,
+        callee,
+        0,
+        new Set([callee])
+      );
+      if (reading.kind === 'forwarded') return { kind: 'forwarded', node: located };
+      if (reading.kind === 'built') return { kind: 'built', node: reading.literal };
+      return {
+        kind: 'abstain',
+        why:
+          reading.kind === 'undecided'
+            ? reading.why
+            : 'the callee puts the located argument somewhere other than the body it sends',
+      };
+    }
+
+    if (!Node.isCallExpression(located) || this.isSentValuePosition(position)) {
+      return { kind: 'none' };
+    }
+    const callee = this.declaredCalleeFunction(located);
+    if (callee === undefined) return { kind: 'none' };
+    if (callee === 'bodiless') {
+      if (this.calleeValueIsAmbient(located)) return { kind: 'none' };
+      return { kind: 'abstain', why: 'the callee the repository declares has no body to read' };
+    }
+    const args = located.getArguments();
+    const forwarded: Node[] = [];
+    const built = new Set<ObjectLiteralExpression>();
+    for (let index = 0; index < args.length; index++) {
+      const reading = this.argumentBodyReading(located, index, callee, 0, new Set([callee]));
+      if (reading.kind === 'undecided') return { kind: 'abstain', why: reading.why };
+      if (reading.kind === 'forwarded') forwarded.push(args[index]);
+      if (reading.kind === 'built') built.add(reading.literal);
+    }
+    if (forwarded.length + built.size > 1) {
+      return { kind: 'abstain', why: 'more than one argument of the call reaches the body it sends' };
+    }
+    if (forwarded.length === 1) return { kind: 'forwarded', node: forwarded[0] };
+    const literal = [...built][0];
+    if (literal) return { kind: 'built', node: literal };
+    if (callee.getReturnType().getProperty('then')) {
+      return { kind: 'abstain', why: 'no argument of the call reaches a body it sends' };
+    }
+    return { kind: 'none' };
+  }
+
+  /**
+   * True when `node` is where a value is sent or handed on: a call argument,
+   * a member value of an object literal, an array element, or the operand of
+   * a spread.
+   */
+  private isSentValuePosition(position: Node): boolean {
+    const parent = position.getParent();
+    if (!parent) return false;
+    if (Node.isCallExpression(parent)) return parent.getArguments().includes(position);
+    return (
+      Node.isPropertyAssignment(parent) ||
+      Node.isShorthandPropertyAssignment(parent) ||
+      Node.isArrayLiteralExpression(parent) ||
+      Node.isSpreadElement(parent) ||
+      Node.isSpreadAssignment(parent)
+    );
+  }
+
+  /**
+   * True when `node` reads a value its own function received as a request: a
+   * parameter that carries decorators, or a value rooted at a parameter typed
+   * by a framework's request machinery (`req.body`).
+   */
+  private isReceivedRequestValue(node: Node): boolean {
+    let root = node;
+    while (
+      Node.isPropertyAccessExpression(root) ||
+      Node.isElementAccessExpression(root) ||
+      Node.isParenthesizedExpression(root) ||
+      Node.isNonNullExpression(root) ||
+      Node.isAsExpression(root) ||
+      Node.isAwaitExpression(root)
+    ) {
+      root = root.getExpression();
+    }
+    if (!Node.isIdentifier(root)) return false;
+    return (root.getSymbol()?.getDeclarations() ?? []).some(
+      (declaration) =>
+        Node.isParameterDeclaration(declaration) &&
+        (declaration.getDecorators().length > 0 ||
+          this.typeIsFrameworkMachinery(declaration.getType()))
+    );
+  }
+
+  /**
+   * True when the value a call is made on is declared ambiently: the callee
+   * itself (`declare function send(…)`), or the root of the member chain it
+   * is read from (`declare const transport: …` for `transport.put(…)`), in a
+   * `declare` statement or a declaration file.
+   */
+  private calleeValueIsAmbient(call: CallExpression): boolean {
+    let root: Node = call.getExpression();
+    while (Node.isPropertyAccessExpression(root) || Node.isElementAccessExpression(root)) {
+      root = root.getExpression();
+    }
+    if (!Node.isIdentifier(root)) return false;
+    let symbol = root.getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    return (symbol?.getDeclarations() ?? []).some(
+      (declaration) =>
+        declaration.getSourceFile().isDeclarationFile() ||
+        [declaration, ...declaration.getAncestors()].some(
+          (n) => Node.isAmbientable(n) && n.hasDeclareKeyword()
+        )
+    );
+  }
+
+  /** The declaration of the parameter a call's `index`th argument fills, as the checker resolves the call. */
+  private resolvedParameterAt(call: CallExpression, index: number): ParameterDeclaration | undefined {
+    let declaration: Node | undefined;
+    try {
+      declaration = this.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration();
+    } catch {
+      return undefined;
+    }
+    if (!declaration || !('getParameters' in declaration)) return undefined;
+    const param = (declaration as unknown as { getParameters(): ParameterDeclaration[] }).getParameters()[
+      index
+    ];
+    return param && !param.isRestParameter() ? param : undefined;
+  }
+
+  /**
+   * The function a call reaches when the repository declares it: the one
+   * declaration with a body (`builderFunctionOf`), `'bodiless'` when the
+   * repository declares it with none, `undefined` for lib, an installed
+   * package, or a callee with no symbol.
+   */
+  private declaredCalleeFunction(call: CallExpression): BuilderFunction | 'bodiless' | undefined {
+    let symbol = call.getExpression().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    if (!symbol || symbol.getDeclarations().length === 0) return undefined;
+    if (this.symbolIsLibOrExternalOrigin(symbol)) return undefined;
+    return this.builderFunctionOf(symbol) ?? 'bodiless';
+  }
+
+  /** What `callee` does with the parameter the call's `index`th argument fills. */
+  private argumentBodyReading(
+    call: CallExpression,
+    index: number,
+    callee: BuilderFunction,
+    hops: number,
+    visited: Set<BuilderFunction>
+  ): ParameterBodyReading {
+    const argument = call.getArguments()[index];
+    if (!argument || Node.isSpreadElement(argument)) {
+      return { kind: 'undecided', why: 'the argument is spread over the parameters' };
+    }
+    const param = callee.getParameters()[index];
+    if (!param || param.isRestParameter()) {
+      return { kind: 'undecided', why: 'the argument fills no single parameter' };
+    }
+    if (!Node.isIdentifier(param.getNameNode())) {
+      return { kind: 'undecided', why: 'the parameter is destructured' };
+    }
+    const reading = this.parameterBodyReading(callee, index, hops, visited);
+    if (reading.kind === 'built' && this.parameterNamesTypeParameter(callee, param)) {
+      return { kind: 'undecided', why: "the parameter's type is one of the callee's type parameters" };
+    }
+    return reading;
+  }
+
+  /** True when a parameter's declared type names one of its function's type parameters. */
+  private parameterNamesTypeParameter(fn: BuilderFunction, param: ParameterDeclaration): boolean {
+    const typeNode = param.getTypeNode();
+    if (!typeNode) return false;
+    const own = new Set(fn.getTypeParameters().map((tp) => tp.getName()));
+    if (own.size === 0) return false;
+    return [typeNode, ...typeNode.getDescendantsOfKind(SyntaxKind.Identifier)].some(
+      (n) => Node.isIdentifier(n) && own.has(n.getText())
+    );
+  }
+
+  /**
+   * Where every use of `fn`'s `index`th parameter goes. Every use must agree.
+   * A use is sent unchanged (`forwarded`) as an argument in a body slot of
+   * the call's signature (`requestBodySlots`), as the value of a body-named
+   * member (`BODY_MEMBER_NAMES`) of an object literal handed to a call, or
+   * either through `JSON.stringify(use)`. A use inside an object literal that
+   * is itself sent that way builds the body (`built`). A use handed to
+   * another function the repository declares is read there, at most
+   * `ARGUMENT_BODY_MAX_HOPS` deep, each function once. Any other use is
+   * `elsewhere`; a parameter with no use goes nowhere.
+   */
+  private parameterBodyReading(
+    fn: BuilderFunction,
+    index: number,
+    hops: number,
+    visited: Set<BuilderFunction>
+  ): ParameterBodyReading {
+    const params = fn.getParameters();
+    const body = fn.getBody();
+    if (!body) return { kind: 'undecided', why: 'the callee has no body to read' };
+    const uses = body
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .filter((id) => this.parameterIndexOf(id, params) === index);
+    if (uses.length === 0) return { kind: 'elsewhere' };
+
+    let agreed: ParameterBodyReading | undefined;
+    for (const use of uses) {
+      const reading = this.sentValueReading(use, hops, visited);
+      if (reading.kind === 'undecided') return reading;
+      if (!agreed) {
+        agreed = reading;
+        continue;
+      }
+      const same =
+        agreed.kind === reading.kind &&
+        (agreed.kind !== 'built' || (reading.kind === 'built' && agreed.literal === reading.literal));
+      if (!same) {
+        return { kind: 'undecided', why: "the parameter's uses disagree on what is sent" };
+      }
+    }
+    return agreed ?? { kind: 'elsewhere' };
+  }
+
+  /**
+   * What a value inside a declared function becomes in the request it sends:
+   * see `parameterBodyReading`. An object literal holding the value is read
+   * the same way, and builds the body when it is sent unchanged.
+   */
+  private sentValueReading(
+    value: Node,
+    hops: number,
+    visited: Set<BuilderFunction>
+  ): ParameterBodyReading {
+    let position: Node = value;
+    const climb = () => {
+      while (true) {
+        const parent = position.getParent();
+        if (
+          parent &&
+          (Node.isParenthesizedExpression(parent) ||
+            Node.isAsExpression(parent) ||
+            Node.isSatisfiesExpression(parent) ||
+            Node.isNonNullExpression(parent))
+        ) {
+          position = parent;
+          continue;
+        }
+        break;
+      }
+    };
+    climb();
+    const stringify = position.getParent();
+    if (
+      stringify &&
+      Node.isCallExpression(stringify) &&
+      stringify.getArguments()[0] === position &&
+      this.unwrapJsonStringifyArg(stringify) !== stringify
+    ) {
+      position = stringify;
+      climb();
+    }
+
+    const parent = position.getParent();
+    if (!parent) return { kind: 'elsewhere' };
+
+    if (Node.isCallExpression(parent)) {
+      const argIndex = parent.getArguments().indexOf(position);
+      if (argIndex < 0) return { kind: 'elsewhere' };
+      if (this.requestBodySlots(parent)[argIndex]?.kind === 'body') return { kind: 'forwarded' };
+      const callee = this.declaredCalleeFunction(parent);
+      if (!callee || callee === 'bodiless') return { kind: 'elsewhere' };
+      if (visited.has(callee) || hops + 1 > ARGUMENT_BODY_MAX_HOPS) {
+        return { kind: 'undecided', why: 'the argument is handed on further than the reading follows' };
+      }
+      return this.argumentBodyReading(parent, argIndex, callee, hops + 1, new Set([...visited, callee]));
+    }
+
+    const member =
+      (Node.isPropertyAssignment(parent) && parent.getInitializer() === position) ||
+      (Node.isShorthandPropertyAssignment(parent) && parent.getNameNode() === position)
+        ? parent
+        : undefined;
+    if (!member) return { kind: 'elsewhere' };
+    const literal = member.getParent();
+    if (!Node.isObjectLiteralExpression(literal)) return { kind: 'elsewhere' };
+    if (BODY_MEMBER_NAMES.has(member.getName()) && this.isHandedToCall(literal)) {
+      return { kind: 'forwarded' };
+    }
+    const outer = this.sentValueReading(literal, hops, visited);
+    if (outer.kind === 'forwarded') return { kind: 'built', literal };
+    return outer;
+  }
+
+  /** True when an object literal (through transparent wrappers) is a call argument. */
+  private isHandedToCall(literal: ObjectLiteralExpression): boolean {
+    let position: Node = literal;
+    while (true) {
+      const parent = position.getParent();
+      if (
+        parent &&
+        (Node.isParenthesizedExpression(parent) ||
+          Node.isAsExpression(parent) ||
+          Node.isSatisfiesExpression(parent))
+      ) {
+        position = parent;
+        continue;
+      }
+      return !!parent && Node.isCallExpression(parent) && parent.getArguments().includes(position);
+    }
   }
 
   /**
@@ -8902,7 +9326,15 @@ export class TypeInferrer {
     if (candidates.length === 0) return undefined;
 
     // Try exact match (normalized whitespace)
+    // A parameter's own name is where a value is declared, not where it is
+    // used: `items.map((id) => send(id))` names `id` twice, and the locator
+    // means the use (carrick#2115). The declaration is kept only when nothing
+    // else matches.
     const exactMatches = candidates.filter((c) => c.text === normalizedTarget);
+    const usedMatches = exactMatches.filter((c) => !this.isParameterDeclarationName(c.node));
+    if (usedMatches.length > 0) {
+      return this.pickBestMatch(usedMatches.map((c) => c.node), lineNumber) as T;
+    }
     if (exactMatches.length > 0) {
       return this.pickBestMatch(exactMatches.map((c) => c.node), lineNumber) as T;
     }
@@ -9047,6 +9479,13 @@ export class TypeInferrer {
    * Pick the best match from a set of candidate nodes:
    * smallest range, then closest to target line.
    */
+  /** True for a parameter declaration, or the identifier that names one. */
+  private isParameterDeclarationName(node: Node): boolean {
+    if (Node.isParameterDeclaration(node)) return true;
+    const parent = node.getParent();
+    return !!parent && Node.isParameterDeclaration(parent) && parent.getNameNode() === node;
+  }
+
   private pickBestMatch(nodes: Node[], targetLine?: number): Node {
     return nodes.reduce((best, current) => {
       const bestRange = best.getEnd() - best.getStart();
