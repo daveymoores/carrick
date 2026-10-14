@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.115](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.114...carrick-v0.3.115) (2026-10-14)
+
+
+### Bug Fixes
+
+* **cache:** a root named `.` or by a relative path keeps the manifest hash already stored for it ([#2315](https://github.com/carrick-tools/carrick/issues/2315)) ([b826fdc](https://github.com/carrick-tools/carrick/commit/b826fdcdc40c1d6f56e74916c1400a589f2f2cce)), closes [#2314](https://github.com/carrick-tools/carrick/issues/2314)
+* **changed-only:** a stored type extraction problem is owed work ([#2302](https://github.com/carrick-tools/carrick/issues/2302)) ([6711cca](https://github.com/carrick-tools/carrick/commit/6711cca1e9bb38eec3215087468d792131df7c72))
+* **derive:** a workspace member with no source is no service, and does not fail the scan ([#2305](https://github.com/carrick-tools/carrick/issues/2305)) ([0bd06b4](https://github.com/carrick-tools/carrick/commit/0bd06b4b762895f0dc62fc12107a7bdf7ef0e7f6)), closes [#2298](https://github.com/carrick-tools/carrick/issues/2298)
+* **parser:** a file without a source extension is not handed to the script parser ([#2320](https://github.com/carrick-tools/carrick/issues/2320)) ([3f7d712](https://github.com/carrick-tools/carrick/commit/3f7d71219faa950de3cb56a3be5ce25ba8a2caec)), closes [#2300](https://github.com/carrick-tools/carrick/issues/2300)
+* **scan:** index gaps go to the debug log, not the scan output a person reads ([#2345](https://github.com/carrick-tools/carrick/issues/2345)) ([b49f57d](https://github.com/carrick-tools/carrick/commit/b49f57d2c5a186b962eb487e8dd093614e8732df))
+* **scope:** read a registration scope and its mounts from the source when the model states no row ([#2311](https://github.com/carrick-tools/carrick/issues/2311)) ([d5c9310](https://github.com/carrick-tools/carrick/commit/d5c931061c73438c101d4c6f41356fda238c3c46))
+* **sidecar:** follow a re-export into a package of the checkout linked through node_modules ([#2306](https://github.com/carrick-tools/carrick/issues/2306)) ([22735f4](https://github.com/carrick-tools/carrick/commit/22735f44126bc5b2e1dfe06a9df62fac6cccbf46)), closes [#2304](https://github.com/carrick-tools/carrick/issues/2304)
+
 ## [0.3.114](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.113...carrick-v0.3.114) (2026-10-12)
 
 
