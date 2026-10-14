@@ -209,6 +209,32 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "model:133",
+      "line_number": 133,
+      "target": "/getRun",
+      "method": "GET",
+      "pattern_matched": "getClient().getRun(",
+      "call_expression_text": "getClient().getRun(id)",
+      "call_expression_line": 133,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:139",
+      "line_number": 139,
+      "target": "/showRunInline",
+      "method": "GET",
+      "pattern_matched": "showRunInline(",
+      "call_expression_text": "showRunInline(\"latest\")",
+      "call_expression_line": 139,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }

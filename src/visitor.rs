@@ -298,6 +298,12 @@ pub enum CalleeShape {
     },
     /// `obj.foo(...)`, where `obj` is a plain identifier.
     Member(String),
+    /// `f().foo(...)` or `(await f()).foo(...)`: a member of what a call to
+    /// the bare identifier `f` returns ([`factory_call`]), read as a `const`
+    /// bound by that call is (carrick#1146). The factory itself is in the
+    /// call's [`ReceiverBinding::factory`], set once lexical scope says `f`
+    /// is not a parameter or a destructured name.
+    FactoryResult,
 }
 
 /// One call site inside a function body, as written in the AST.
@@ -357,6 +363,9 @@ struct LexicalBinding {
 struct LexicalReceivers {
     bindings: HashMap<Id, LexicalBinding>,
     calls: HashMap<swc_common::Span, Id>,
+    /// `f().m()` -> the binding `f` names and whether the call is awaited
+    /// (carrick#1146).
+    factory_calls: HashMap<swc_common::Span, (Id, bool)>,
     /// Whether the declarators being walked belong to a `const` declaration.
     in_const: bool,
 }
@@ -392,11 +401,27 @@ impl LexicalReceivers {
     }
 
     fn record_call(&mut self, expr: &Expr, span: swc_common::Span) {
-        if let Expr::Member(member) = expr
-            && let Expr::Ident(object) = &*member.obj
-        {
+        let Expr::Member(member) = expr else {
+            return;
+        };
+        if let Expr::Ident(object) = &*member.obj {
             self.calls.insert(span, object.to_id());
+        } else if let Some((callee, awaited)) = factory_call(&member.obj) {
+            self.factory_calls.insert(span, (callee.to_id(), awaited));
         }
+    }
+
+    /// The factory call `callee(…)` names, unless `callee` is bound by a
+    /// pattern: a parameter or a destructured name is a value handed in, not
+    /// the function a same-named declaration or import would resolve to.
+    fn factory(&self, callee: &Id, awaited: bool) -> Option<FactoryCall> {
+        self.bindings
+            .get(callee)
+            .is_none_or(|binding| !binding.pattern_bound)
+            .then(|| FactoryCall {
+                callee: callee.0.to_string(),
+                awaited,
+            })
     }
 
     fn receiver(&self, id: &Id) -> ReceiverBinding {
@@ -405,21 +430,11 @@ impl LexicalReceivers {
         };
         let mut receiver = binding.receiver.clone();
         receiver.declared = binding.declared_id.is_some();
-        // A callee bound by a pattern is a value handed in, not the function
-        // a same-named declaration or import would resolve to.
         receiver.factory = binding
             .factory
             .as_ref()
             .filter(|_| !receiver.declared)
-            .filter(|(callee, _)| {
-                self.bindings
-                    .get(callee)
-                    .is_none_or(|callee| !callee.pattern_bound)
-            })
-            .map(|(callee, awaited)| FactoryCall {
-                callee: callee.0.to_string(),
-                awaited: *awaited,
-            });
+            .and_then(|(callee, awaited)| self.factory(callee, *awaited));
         let mut current = binding;
         let mut seen = HashSet::new();
         while receiver.origin.is_none() {
@@ -822,10 +837,11 @@ impl CalleeCollector<'_> {
         self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
-    /// Record the callee of one call site. Four shapes are kept: a bare
-    /// identifier, a member access on an identifier or on `this`, and
+    /// Record the callee of one call site. Five shapes are kept: a bare
+    /// identifier, a member access on an identifier or on `this`,
     /// `this.field.foo()` — a two-level chain whose root the enclosing class
-    /// body declares (carrick#782).
+    /// body declares (carrick#782) — and `f().foo()`, a member of what a call
+    /// to a bare identifier returns (carrick#1146).
     ///
     /// Everything else (`a.b.c()`, `super.x()`, `getHandler()()`) is
     /// deliberately dropped: it cannot be resolved to a definition without
@@ -889,6 +905,18 @@ impl CalleeCollector<'_> {
                             receiver: ReceiverBinding::default(),
                         });
                     }
+                    // `f().foo()`: read off the object as written, since the
+                    // unwrapping above also strips `as T`, which states a
+                    // type of its own. One level only: in `f().m().n()` the
+                    // object of `.n` is a call of a member, which names no
+                    // one function.
+                    _ if factory_call(&member.obj).is_some() => self.out.push(CalleeRef {
+                        name,
+                        shape: CalleeShape::FactoryResult,
+                        line,
+                        span,
+                        receiver: ReceiverBinding::default(),
+                    }),
                     _ => {}
                 }
             }
@@ -1352,6 +1380,13 @@ impl FunctionDefinitionExtractor {
             resolved.visit_with(&mut lexical);
         });
         for call in self.callee_refs.values_mut().flatten() {
+            if call.shape == CalleeShape::FactoryResult {
+                call.receiver.factory = lexical
+                    .factory_calls
+                    .get(&call.span)
+                    .and_then(|(callee, awaited)| lexical.factory(callee, *awaited));
+                continue;
+            }
             if let Some(id) = lexical.calls.get(&call.span) {
                 call.receiver = lexical.receiver(id);
                 let target_id = lexical

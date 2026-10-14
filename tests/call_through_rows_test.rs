@@ -294,6 +294,21 @@ fn a_method_call_on_a_factory_bound_client_takes_the_request_the_method_reaches(
     );
 }
 
+/// `getClient().getRun(id)`: the method is called on the factory's result
+/// inline. The row there, and the row at a command that calls that one, take
+/// the request `getRun` writes (carrick#1146).
+#[test]
+fn a_method_called_on_a_factory_calls_result_takes_the_request_the_method_reaches() {
+    assert_eq!(
+        row_at("cli", COMMANDS, 133),
+        corrected("GET", "/api/v1/runs/:id", 5)
+    );
+    assert_eq!(
+        row_at("cli", COMMANDS, 139),
+        corrected("GET", "/api/v1/runs/:id", 5)
+    );
+}
+
 #[test]
 fn a_command_that_calls_another_command_takes_the_request_and_loses_the_invented_base() {
     assert_eq!(
@@ -408,6 +423,8 @@ fn a_corrected_row_never_carries_a_request_entry() {
         ("cli", COMMANDS, 21),
         ("cli", COMMANDS, 46),
         ("cli", COMMANDS, 101),
+        ("cli", COMMANDS, 133),
+        ("cli", COMMANDS, 139),
         ("web", HOOKS, 9),
         ("web", HOOKS, 14),
         ("web", HOOKS, 19),
@@ -421,9 +438,10 @@ fn a_corrected_row_never_carries_a_request_entry() {
             "no request type is checked at a call through ({file}:{line}): {requests:#?}"
         );
     }
-    // Lines 9, 21, 46 and 101 of `commands.ts` keep their response entry.
+    // Lines 9, 21, 46, 101, 133 and 139 of `commands.ts` keep their response
+    // entry.
     assert!(
-        settled_line().contains("4 kept the response type and lost the request type)"),
+        settled_line().contains("6 kept the response type and lost the request type)"),
         "{}",
         settled_line()
     );

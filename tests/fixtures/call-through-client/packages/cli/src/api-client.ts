@@ -52,3 +52,8 @@ export class Client {
 export function createClient(): Client {
   return new Client(transport);
 }
+
+/** No annotation: the body's only statement returns the factory's call. */
+export function getClient() {
+  return createClient();
+}

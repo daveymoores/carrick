@@ -22,4 +22,10 @@ answer key for what states no class: a promise never awaited, an interface, a
 union, a body with two `return` statements, a `let`, a destructured binding, a
 factory that is a parameter, and a chain four functions deep.
 
+The callers from `showInline` on call the member on the factory's result
+inline (`createClient().getRun(id)`), which states what the `const` form
+states. `showInline`, `showInlineRemote`, `listInline` and `showInlineChained`
+record the member edge (only the first member of a chain is read). A factory
+that is a parameter, an interface, and an `as` assertion record none.
+
 Driven by `tests/factory_receiver_test.rs`.
