@@ -1,0 +1,9 @@
+{
+  "name": "@fixture/app",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/commands.ts",
+  "dependencies": {
+    "@fixture/sdk": "workspace:*"
+  }
+}

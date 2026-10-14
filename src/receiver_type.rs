@@ -40,6 +40,10 @@
 //! Only identifier bindings are read: a destructured or rest pattern binds a
 //! part of a value, and which part decides what the value is.
 //!
+//! A `const` initialised by a call to a function (`const client =
+//! createClient()`) states no class at the binding. The declaration of the
+//! function called can, and [`factory_tables`] reads that (carrick#1146).
+//!
 //! Within one scope, a name bound twice to different types is ambiguous and
 //! dropped rather than picked between, and so is a name bound once with a type
 //! and once without. Mirrors [`crate::receiver_origin`], which answers the
@@ -139,8 +143,9 @@ pub fn class_field_types(class: &Class) -> ReceiverTypes {
 /// names a class, or a `new X()` initialiser. An anonymous
 /// `export default new X()` has no binding name and is keyed by the default
 /// export's name (`default`, which is not a valid identifier and so cannot
-/// collide). A factory's result (`makeService()`) states nothing and is not
-/// recorded.
+/// collide). A factory's result (`makeService()`) states nothing here and is
+/// not recorded in this table: [`factory_tables`] records the call, and the
+/// factory's own declaration decides.
 pub fn module_scope_types(module: &Module) -> ReceiverTypes {
     let mut collector = ReceiverTypeCollector::default();
     for item in &module.body {
@@ -192,6 +197,245 @@ pub(crate) fn constructed_type_ident(expr: &Expr) -> Option<&Ident> {
         Expr::TsSatisfies(satisfies) => constructed_type_ident(&satisfies.expr),
         _ => None,
     }
+}
+
+/// A binding initialised by a call to a function named by a bare identifier:
+/// `const client = createClient()` or `const client = await createClient()`
+/// (carrick#1146).
+///
+/// The call states no class. The DECLARATION of the function it calls can
+/// ([`StatedReturn`]), and that is a statement in the source as an annotation
+/// on the binding would be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactoryCall {
+    /// The function called, as the binding's file names it.
+    pub callee: String,
+    /// Whether the call's value is awaited before it is bound.
+    pub awaited: bool,
+}
+
+/// The bare identifier an initialiser calls, and whether the result is
+/// awaited, through the wrappers that pass a value along without restating its
+/// type. `f() as T` is not read: the assertion states a type of its own.
+///
+/// A member callee (`factory.create()`), an optional call and a call of a
+/// call state nothing here: which function runs is not named by one
+/// identifier.
+pub(crate) fn factory_call(expr: &Expr) -> Option<(&Ident, bool)> {
+    match expr {
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) => match &**callee {
+                Expr::Ident(ident) => Some((ident, false)),
+                _ => None,
+            },
+            _ => None,
+        },
+        Expr::Await(await_expr) => factory_call(&await_expr.arg).map(|(ident, _)| (ident, true)),
+        Expr::Paren(paren) => factory_call(&paren.expr),
+        Expr::TsNonNull(non_null) => factory_call(&non_null.expr),
+        Expr::TsSatisfies(satisfies) => factory_call(&satisfies.expr),
+        _ => None,
+    }
+}
+
+/// What a function's declaration states its call returns (carrick#1146).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatedReturn {
+    /// An instance of the class this identifier names in the function's own
+    /// module. `promised` when the caller receives a promise of it.
+    Class { name: String, promised: bool },
+    /// Whatever a call to this function returns: the body's only statement
+    /// returns that call. `promised` when the function is `async`.
+    Call { callee: String, promised: bool },
+}
+
+/// The two tables one module contributes to reading a receiver bound from a
+/// factory call (carrick#1146).
+#[derive(Debug, Default, Clone)]
+pub struct FactoryTables {
+    /// Module-scope function -> what its declaration states it returns.
+    pub returns: HashMap<String, StatedReturn>,
+    /// Module-scope `const` -> the factory call that initialises it, for a
+    /// binding the module states no class for by annotation or `new`.
+    pub bindings: HashMap<String, FactoryCall>,
+}
+
+/// Read a module's top level for [`FactoryTables`].
+///
+/// A function states a class in two ways, and no other:
+///
+/// - a return type annotation that names one type, or `Promise` of one;
+/// - with no annotation, a body whose only statement returns `new C(…)`, or
+///   returns a call to a function named by a bare identifier.
+///
+/// An annotation that is anything else (a union, a qualified name, the
+/// function's own type parameter) states no class, and the body is then not
+/// read in its place: the annotation is what the function declares. A body
+/// with a second statement states nothing, because nothing here says which
+/// `return` runs.
+///
+/// A name declared twice at the top level with different statements is
+/// dropped, as [`ReceiverTypeCollector`] drops a binding declared twice.
+pub fn factory_tables(module: &Module) -> FactoryTables {
+    let mut returns: HashMap<String, Option<StatedReturn>> = HashMap::new();
+    let mut bindings: HashMap<String, Option<FactoryCall>> = HashMap::new();
+    fn record<T: PartialEq>(
+        table: &mut HashMap<String, Option<T>>,
+        name: String,
+        value: Option<T>,
+    ) {
+        match table.get(&name) {
+            Some(existing) if *existing == value => {}
+            Some(_) => {
+                table.insert(name, None);
+            }
+            None => {
+                table.insert(name, value);
+            }
+        }
+    }
+    for item in &module.body {
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            _ => continue,
+        };
+        match decl {
+            Decl::Fn(function) => record(
+                &mut returns,
+                function.ident.sym.to_string(),
+                function_stated_return(&function.function),
+            ),
+            Decl::Var(var) => {
+                for declarator in &var.decls {
+                    let Pat::Ident(ident) = &declarator.name else {
+                        continue;
+                    };
+                    let name = ident.id.sym.to_string();
+                    match declarator.init.as_deref() {
+                        Some(Expr::Arrow(arrow)) => {
+                            record(&mut returns, name, arrow_stated_return(arrow));
+                        }
+                        Some(Expr::Fn(function)) => {
+                            record(
+                                &mut returns,
+                                name,
+                                function_stated_return(&function.function),
+                            );
+                        }
+                        init => {
+                            let stated = (var.kind == VarDeclKind::Const
+                                && ident.type_ann.is_none())
+                            .then(|| init.and_then(factory_call))
+                            .flatten()
+                            .map(|(callee, awaited)| FactoryCall {
+                                callee: callee.sym.to_string(),
+                                awaited,
+                            });
+                            record(&mut bindings, name, stated);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    FactoryTables {
+        returns: returns
+            .into_iter()
+            .filter_map(|(name, stated)| stated.map(|stated| (name, stated)))
+            .collect(),
+        bindings: bindings
+            .into_iter()
+            .filter_map(|(name, stated)| stated.map(|stated| (name, stated)))
+            .collect(),
+    }
+}
+
+fn function_stated_return(function: &Function) -> Option<StatedReturn> {
+    let returned = function
+        .body
+        .as_ref()
+        .and_then(|body| match body.stmts.as_slice() {
+            [Stmt::Return(statement)] => statement.arg.as_deref(),
+            _ => None,
+        });
+    stated_return(
+        function.return_type.as_deref(),
+        function.type_params.as_deref(),
+        function.is_async,
+        returned,
+    )
+}
+
+fn arrow_stated_return(arrow: &ArrowExpr) -> Option<StatedReturn> {
+    let returned = match &*arrow.body {
+        ArrowFunctionBody::Expr(expr) => Some(&**expr),
+        ArrowFunctionBody::FunctionBody(body) => match body.stmts.as_slice() {
+            [Stmt::Return(statement)] => statement.arg.as_deref(),
+            _ => None,
+        },
+    };
+    stated_return(
+        arrow.return_type.as_deref(),
+        arrow.type_params.as_deref(),
+        arrow.is_async,
+        returned,
+    )
+}
+
+/// `returned` is the expression the body's only statement returns, when the
+/// body is that one statement.
+fn stated_return(
+    annotation: Option<&TsTypeAnn>,
+    type_params: Option<&TsTypeParamDecl>,
+    is_async: bool,
+    returned: Option<&Expr>,
+) -> Option<StatedReturn> {
+    if let Some(annotation) = annotation {
+        let TsType::TsTypeRef(reference) = &*annotation.type_ann else {
+            return None;
+        };
+        let TsEntityName::Ident(head) = &reference.type_name else {
+            return None;
+        };
+        let (named, promised) = match reference.type_params.as_deref() {
+            None => (head, false),
+            // `Promise<C>`. Any other generic head names the class its head
+            // does, as a binding's annotation is read.
+            Some(arguments) if &*head.sym == "Promise" => match arguments.params.as_slice() {
+                [argument] => match &**argument {
+                    TsType::TsTypeRef(inner) => match &inner.type_name {
+                        TsEntityName::Ident(inner) => (inner, true),
+                        TsEntityName::TsQualifiedName(_) => return None,
+                    },
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            Some(_) => (head, false),
+        };
+        let own_parameter = type_params
+            .is_some_and(|declared| declared.params.iter().any(|p| p.name.sym == named.sym));
+        if own_parameter || &*named.sym == "Promise" {
+            return None;
+        }
+        return Some(StatedReturn::Class {
+            name: named.sym.to_string(),
+            promised,
+        });
+    }
+    let returned = returned?;
+    if let Some(class) = constructed_type_ident(returned) {
+        return Some(StatedReturn::Class {
+            name: class.sym.to_string(),
+            promised: is_async,
+        });
+    }
+    factory_call(returned).map(|(callee, _)| StatedReturn::Call {
+        callee: callee.sym.to_string(),
+        promised: is_async,
+    })
 }
 
 /// Reads one function's declared receiver types. Drive it over the function's
@@ -323,6 +567,157 @@ mod tests {
     fn a_constructed_local_states_its_class() {
         let types = types(r#"const client = new ApiClient("http://x");"#);
         assert_eq!(types.get("client").map(String::as_str), Some("ApiClient"));
+    }
+
+    fn factories(source: &str) -> FactoryTables {
+        let (_, module) =
+            parse_standalone_module(Path::new("factories.ts"), source).expect("parses");
+        factory_tables(&module)
+    }
+
+    fn class(name: &str, promised: bool) -> StatedReturn {
+        StatedReturn::Class {
+            name: name.to_string(),
+            promised,
+        }
+    }
+
+    #[test]
+    fn a_return_annotation_states_the_class_a_function_returns() {
+        let tables = factories(
+            r#"
+            export function createClient(): ApiClient { return build(); }
+            export async function openClient(): Promise<ApiClient> { return build(); }
+            export const makeClient = (): ApiClient<Run> => build();
+            "#,
+        );
+        assert_eq!(
+            tables.returns.get("createClient"),
+            Some(&class("ApiClient", false))
+        );
+        assert_eq!(
+            tables.returns.get("openClient"),
+            Some(&class("ApiClient", true))
+        );
+        assert_eq!(
+            tables.returns.get("makeClient"),
+            Some(&class("ApiClient", false))
+        );
+    }
+
+    #[test]
+    fn a_sole_return_states_what_an_unannotated_function_returns() {
+        let tables = factories(
+            r#"
+            export function createClient() { return new ApiClient("http://x"); }
+            export const makeClient = () => new ApiClient("http://x");
+            export async function openClient() { return new ApiClient("http://x"); }
+            export function getClient() { return createClient(); }
+            export const sharedClient = async () => await openClient();
+            "#,
+        );
+        assert_eq!(
+            tables.returns.get("createClient"),
+            Some(&class("ApiClient", false))
+        );
+        assert_eq!(
+            tables.returns.get("makeClient"),
+            Some(&class("ApiClient", false))
+        );
+        assert_eq!(
+            tables.returns.get("openClient"),
+            Some(&class("ApiClient", true))
+        );
+        assert_eq!(
+            tables.returns.get("getClient"),
+            Some(&StatedReturn::Call {
+                callee: "createClient".to_string(),
+                promised: false,
+            })
+        );
+        assert_eq!(
+            tables.returns.get("sharedClient"),
+            Some(&StatedReturn::Call {
+                callee: "openClient".to_string(),
+                promised: true,
+            })
+        );
+    }
+
+    #[test]
+    fn an_annotation_that_names_no_one_type_states_nothing_and_hides_the_body() {
+        let tables = factories(
+            r#"
+            export function either(): ApiClient | BatchClient { return new ApiClient(); }
+            export function qualified(): core.ApiClient { return new ApiClient(); }
+            export function generic<T>(): T { return new ApiClient() as T; }
+            export function many(): Promise<ApiClient[]> { return load(); }
+            export function bare(): Promise { return load(); }
+            "#,
+        );
+        assert!(tables.returns.is_empty(), "{:?}", tables.returns);
+    }
+
+    #[test]
+    fn a_body_with_a_second_statement_states_nothing() {
+        let tables = factories(
+            r#"
+            export function byMode(batch: boolean) {
+              if (batch) { return new BatchClient(); }
+              return new ApiClient();
+            }
+            export function logged() {
+              log("creating");
+              return new ApiClient();
+            }
+            export const viaMember = () => registry.create();
+            export const viaLocal = () => { const c = new ApiClient(); return c; };
+            "#,
+        );
+        assert!(tables.returns.is_empty(), "{:?}", tables.returns);
+    }
+
+    #[test]
+    fn a_function_declared_twice_with_different_returns_is_dropped() {
+        let tables = factories(
+            r#"
+            export function create(): ApiClient;
+            export function create(mode: string): BatchClient;
+            export function create(mode?: string) { return pick(mode); }
+            "#,
+        );
+        assert_eq!(tables.returns.get("create"), None);
+    }
+
+    #[test]
+    fn a_module_scope_const_bound_from_a_factory_call_is_recorded() {
+        let tables = factories(
+            r#"
+            export const client = createClient();
+            export const remote = await openClient();
+            export let rebound = createClient();
+            export const typed: ApiClient = createClient();
+            export const viaMember = registry.create();
+            export const asserted = createClient() as BatchClient;
+            export const { part } = createClient();
+            function inner() { const hidden = createClient(); return hidden; }
+            "#,
+        );
+        assert_eq!(
+            tables.bindings.get("client"),
+            Some(&FactoryCall {
+                callee: "createClient".to_string(),
+                awaited: false,
+            })
+        );
+        assert_eq!(
+            tables.bindings.get("remote"),
+            Some(&FactoryCall {
+                callee: "openClient".to_string(),
+                awaited: true,
+            })
+        );
+        assert_eq!(tables.bindings.len(), 2, "{:?}", tables.bindings);
     }
 
     #[test]
