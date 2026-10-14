@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.116](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.115...carrick-v0.3.116) (2026-10-14)
+
+
+### Features
+
+* **call-graph:** a receiver bound from a factory call takes the class the factory states ([#2328](https://github.com/carrick-tools/carrick/issues/2328)) ([5fb814b](https://github.com/carrick-tools/carrick/commit/5fb814b8754239f5efe398e6393787321117f72a)), closes [#1146](https://github.com/carrick-tools/carrick/issues/1146)
+
+
+### Bug Fixes
+
+* **deps:** bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349 ([#2376](https://github.com/carrick-tools/carrick/issues/2376)) ([7f36fd7](https://github.com/carrick-tools/carrick/commit/7f36fd798c391793dc5f2391c68e52706ba5eedf))
+* **git_state:** compare commit trees without reading file contents ([#2366](https://github.com/carrick-tools/carrick/issues/2366)) ([3f9aac7](https://github.com/carrick-tools/carrick/commit/3f9aac71f05d1e42ed2dfed70fdac3e61fef5a88))
+* **join:** a body case on a GET or HEAD route is not a dispatch case ([#2324](https://github.com/carrick-tools/carrick/issues/2324)) ([efa9c00](https://github.com/carrick-tools/carrick/commit/efa9c002cc47d9aad9fe4fece65cc1a3208f9c6e))
+* **sidecar:** a call located by its first line binds the call on its own line ([#2330](https://github.com/carrick-tools/carrick/issues/2330)) ([9c7d484](https://github.com/carrick-tools/carrick/commit/9c7d484c06dd3f1e9692bca8c570fe40165726c2)), closes [#2114](https://github.com/carrick-tools/carrick/issues/2114)
+* **sidecar:** a call result deferred on a type parameter is read through its branches ([#2336](https://github.com/carrick-tools/carrick/issues/2336)) ([af0c7f4](https://github.com/carrick-tools/carrick/commit/af0c7f44d1315b02b740fd0fbc7462f3d94b0199)), closes [#1841](https://github.com/carrick-tools/carrick/issues/1841)
+* **sidecar:** a later expression answers for a call only when it restates the value ([#2332](https://github.com/carrick-tools/carrick/issues/2332)) ([3961c39](https://github.com/carrick-tools/carrick/commit/3961c3942256d31af939cc4e58bdcf86433d23a3))
+* **sidecar:** a literal already asserted as const is not marked again by the unwidened reading ([#2344](https://github.com/carrick-tools/carrick/issues/2344)) ([800660f](https://github.com/carrick-tools/carrick/commit/800660f35d5cea98d04360e5edb6cb539a39ad4c)), closes [#2343](https://github.com/carrick-tools/carrick/issues/2343)
+* **sidecar:** a narrowed unknown and object state no shape ([#2337](https://github.com/carrick-tools/carrick/issues/2337)) ([62e8457](https://github.com/carrick-tools/carrick/commit/62e8457624a8b3ff9cc3c40854da3891247ad6e8)), closes [#2116](https://github.com/carrick-tools/carrick/issues/2116)
+* **sidecar:** a published mismatch is judged again with the producer's unwidened response ([#2333](https://github.com/carrick-tools/carrick/issues/2333)) ([4b7b608](https://github.com/carrick-tools/carrick/commit/4b7b60863dca4d8f1a242c3ca0f90c66c77830e5))
+* **sidecar:** a registration whose handler reads nothing takes no request body ([#2340](https://github.com/carrick-tools/carrick/issues/2340)) ([4dcbf9c](https://github.com/carrick-tools/carrick/commit/4dcbf9c5b25f8ae548752c30f169fcc1bfde9bb9))
+* **sidecar:** the capture reads its anchors in a program that holds the project's augmentation files ([#2327](https://github.com/carrick-tools/carrick/issues/2327)) ([e783397](https://github.com/carrick-tools/carrick/commit/e783397d6929cbd86e20c2ebf4ad500a04992d4a))
+* **sidecar:** the compiler arbitrates a producer's model symbol against the read ([#2335](https://github.com/carrick-tools/carrick/issues/2335)) ([266a8fd](https://github.com/carrick-tools/carrick/commit/266a8fde3886a22142de82968f1d923b1cd1ffab))
+
 ## [0.3.115](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.114...carrick-v0.3.115) (2026-10-14)
 
 
