@@ -14,3 +14,9 @@ export interface SavedRun {
   state: string;
   savedBy: string;
 }
+
+/** What a caller reads of a run, with the time it was read. */
+export interface StampedRun {
+  run: Run;
+  readAt: number;
+}

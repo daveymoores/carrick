@@ -37,3 +37,17 @@ export async function send(base: string, path: string) {
 /** The API serves this path under another verb. */
 export const archiveRun = (options: RequestOptions) =>
   (options.client ?? transport).post({ url: "/api/v1/runs/{id}/archive", ...options });
+
+const RUNS_ORIGIN = process.env.RUNS_ORIGIN || "http://localhost:3000";
+
+/** A request whose parsed body is handed back unchanged. */
+export async function readRun(id: string) {
+  const response = await fetch(`${RUNS_ORIGIN}/api/v1/runs/${id}`, { method: "GET" });
+  return response.json();
+}
+
+/** The same request, its parsed body inside an envelope of its own. */
+export async function readRunStamped(id: string) {
+  const response = await fetch(`${RUNS_ORIGIN}/api/v1/runs/${id}`, { method: "GET" });
+  return { run: await response.json(), readAt: Date.now() };
+}

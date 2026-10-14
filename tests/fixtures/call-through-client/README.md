@@ -6,7 +6,9 @@ Four services:
 
 - `packages/client` writes the requests: seven as request specs
   (`transport.get({ url: "/api/v1/runs/{id}" })`), one as a `fetch` with a
-  literal path, and one whose whole URL is its parameters.
+  literal path, one whose whole URL is its parameters, and two as a `fetch`
+  on a declared environment base: one hands back its parsed body, the other
+  wraps it in an envelope.
 - `packages/cli` reaches them through a client class, a factory, and commands
   that call other commands.
 - `apps/web` reaches them from hook arguments: a call spread into the hook's
@@ -20,7 +22,7 @@ invented, a sibling's route, and one correct path. Rows whose id starts with
 `model:` join no candidate, so they have no span and are placed by their line.
 
 Rows that take the request their call reaches (`commands.ts` lines 9, 15, 21,
-46 and 101; `hooks.ts` lines 9, 14 and 19) carry the reached operation, the
+46, 101, 145, 151 and 157; `hooks.ts` lines 9, 14 and 19) carry the reached operation, the
 source `request_summary`, the role `wrapper_call` and `reaches_request`. Line
 21 is stated twice by the model and is one row afterwards. The correct row
 (`commands.ts:28`) keeps its `model` source and its type entry, and gains the
@@ -30,9 +32,14 @@ Types at the corrected rows:
 
 | Site | The type anchored there |
 |---|---|
-| `commands.ts:9` | `Run`, which matches what the API sends: kept under the reached operation and judged compatible |
-| `commands.ts:46` | `SavedRun`, a stale copy that requires a field the API no longer sends: kept and judged incompatible |
+| `commands.ts:145` | `Run`, which matches what the API sends; the function called hands back the parsed body: kept under the reached operation and judged compatible |
+| `commands.ts:157` | `SavedRun`, a stale copy that requires a field the API no longer sends: kept and judged incompatible |
+| `commands.ts:151` | anchored at a call whose function wraps the body in an envelope: dropped and counted |
+| `commands.ts:9`, `:21`, `:46`, `:101` | anchored at a client method that returns `.data` of what a request spec returns, a shape nothing here states: dropped and counted |
 | `hooks.ts:9`, `:14`, `:19` | anchored at a hook's or a runner's call, whose result is not what the request returns: dropped and counted |
+
+A type is kept only where the function called hands back the request's parsed
+body unchanged, as the request summaries read it (carrick#1601).
 
 No corrected row carries a request type: a call's arguments are the called
 function's parameters, not a request body.
@@ -49,6 +56,7 @@ Rows that stay as the model stated them:
 | `commands.ts:88` | the site also writes a request of its own |
 | `commands.ts:94` | only the model states the request the function called makes |
 | `commands.ts:127` | the site makes a request itself, inside a call that reaches another |
+| `commands.ts:139` | the function called asks for a token and also makes a `fetch` only the model reads |
 | `hooks.ts:24` | two callbacks, and nothing says which makes the request |
 
 `commands.ts:113` writes its route into a function of the same file; the

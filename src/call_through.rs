@@ -93,6 +93,11 @@ pub struct SiteRow {
 #[derive(Debug, Default, Clone)]
 pub struct CallThroughSites {
     pub rows: Vec<SiteRow>,
+    /// The service's definitions whose call is worth their request's parsed
+    /// body unchanged ([`crate::request_summary::RequestSummaryIndex::passes_body`],
+    /// carrick#1601): every `return` hands back the body one request answers
+    /// with, or a call of a function that does.
+    pub hands_back_body: HashSet<DefinitionSite>,
 }
 
 /// Read, for each model call row of one service, the definitions its call
@@ -104,12 +109,18 @@ pub struct CallThroughSites {
 /// sits inside it. A row whose call cannot be placed is not read either.
 ///
 /// `file_results` is the service's joined rows, keyed absolute or relative to
-/// `repo_path`.
+/// `repo_path`. `passes_body` answers, for a declaring module's canonical
+/// path and a function's name, whether a call of it is worth its request's
+/// parsed body; it is read for the service's own `definitions`.
 pub fn read_sites(
     file_results: &HashMap<String, FileAnalysisResult>,
     inputs: &RequestSummaryInputs,
     repo_path: &str,
+    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+    passes_body: &dyn Fn(&Path, &str) -> bool,
 ) -> CallThroughSites {
+    let root = repo_path.trim_end_matches('/');
+    let hands_back_body = hands_back_body(definitions, root, passes_body);
     let mut keys: Vec<&String> = file_results
         .iter()
         .filter(|(_, result)| result.data_calls.iter().any(is_model_row))
@@ -117,10 +128,12 @@ pub fn read_sites(
         .collect();
     keys.sort();
     if keys.is_empty() {
-        return CallThroughSites::default();
+        return CallThroughSites {
+            rows: Vec::new(),
+            hands_back_body,
+        };
     }
 
-    let root = repo_path.trim_end_matches('/');
     // The discovery tables are keyed by the file as it was walked, which is
     // not always the spelling a row's key joins to.
     let mut walked: Option<HashMap<PathBuf, &PathBuf>> = None;
@@ -176,7 +189,36 @@ pub fn read_sites(
             &resolved,
         ));
     }
-    CallThroughSites { rows }
+    CallThroughSites {
+        rows,
+        hands_back_body,
+    }
+}
+
+/// The service's definitions a call of which is worth the request's parsed
+/// body unchanged, named as every service names a definition.
+fn hands_back_body(
+    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+    root: &str,
+    passes_body: &dyn Fn(&Path, &str) -> bool,
+) -> HashSet<DefinitionSite> {
+    definitions
+        .values()
+        .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
+        .filter_map(|definition| {
+            let file = definition.file_path.to_string_lossy();
+            let absolute = if definition.file_path.is_absolute() {
+                definition.file_path.clone()
+            } else {
+                Path::new(root).join(&definition.file_path)
+            };
+            let canonical = absolute.canonicalize().unwrap_or(absolute);
+            passes_body(&canonical, &definition.name).then(|| DefinitionSite {
+                file: crate::engine::repo_relative(&file, root),
+                line: definition.line_number,
+            })
+        })
+        .collect()
 }
 
 /// A row this pass may settle: the model's own reading, with nothing linking
@@ -558,6 +600,10 @@ pub struct Settled {
     pub reaches_none: usize,
     /// Rows left alone because their call reaches more than one operation.
     pub reaches_several: usize,
+    /// Rows left alone because their call also reaches a request no fact
+    /// states (the model's row at a `fetch`, a row of unknown source): what
+    /// that request is, nothing here can say, so one operation is unproven.
+    pub reaches_unstated: usize,
     /// Corrected rows whose consumer type entries were dropped, because the
     /// row's call is not the call that reaches the request: what it returns
     /// is another function's result.
@@ -573,31 +619,55 @@ pub struct Settled {
 /// | Reached | The row |
 /// |---|---|
 /// | One operation, the row's own | stays the model's and keeps its type anchors; gains `role: wrapper_call` and `reaches_request` |
-/// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its response type entry is keyed to the reached operation and its request type entry goes |
-/// | None, or several | left as it is, and counted |
+/// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its response type entry is keyed to the reached operation where the call hands back the request's parsed body, and goes otherwise; its request type entry goes |
+/// | None, several, or one beside a request no fact states | left as it is, and counted |
 ///
-/// A corrected row keeps the RESPONSE type anchored at it, and only where the
+/// A corrected row keeps the RESPONSE type anchored at it only where the
 /// row's call is itself the call that reaches the request (its own callee
-/// decided): what that call returns is what the caller reads of the request,
-/// so the pair is judged against the reached operation's producer. Its
-/// request entry always goes: the call's arguments are the called function's
-/// parameters, not a request body. Where a spread
-/// call or a callback decided, the row's call is another function's (a hook,
-/// a runner), the anchor names that function's result, and the entries are
+/// decided) and that callee hands back the request's parsed body unchanged
+/// (the service's request summaries say so, carrick#1601): only then is what
+/// the call returns what the caller reads of the request, so the pair is
+/// judged against the reached operation's producer. Its request entry always
+/// goes: the call's arguments are the called function's parameters, not a
+/// request body. Anywhere else (a spread call or a callback decided, or the
+/// callee returns an envelope, a mapped object, or a value nothing here
+/// reads) the anchor names a function's own result, and the entries are
 /// dropped and counted.
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let graph = ReachGraph::of(services.iter().map(|service| &*service.data));
+    let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
+    let hands_back_body: HashSet<&DefinitionSite> = sites
+        .iter()
+        .flat_map(|sites| &sites.hands_back_body)
+        .collect();
+    let mut decider = Decider::new(&graph, &sites);
     let mut settled = Settled::default();
     for service in services.iter_mut().filter(|service| service.writable) {
         let mut corrected = 0;
         for row in &service.sites.rows {
-            match graph.decide(row) {
+            match decider.decide(row) {
                 Reach::None => settled.reaches_none += 1,
                 Reach::Several => settled.reaches_several += 1,
+                Reach::Unstated => settled.reaches_unstated += 1,
                 Reach::One {
                     request,
                     by_own_callee,
-                } => match apply(service.data, row, request, by_own_callee) {
+                } => match apply(
+                    service.data,
+                    row,
+                    request,
+                    // What the row's call returns is the request's parsed
+                    // body only where its own callee decided and every
+                    // definition that callee goes through hands that body
+                    // back unchanged (carrick#1601).
+                    by_own_callee
+                        && row.steps.first().is_some_and(|callee| {
+                            !callee.is_empty()
+                                && callee
+                                    .iter()
+                                    .all(|definition| hands_back_body.contains(definition))
+                        }),
+                ) {
                     Some(Change::Relabelled) => settled.relabelled += 1,
                     Some(Change::Corrected {
                         types_dropped,
@@ -620,13 +690,14 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
     }
     debug!(
-        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations (carrick#1146)",
+        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146)",
         settled.relabelled,
         settled.corrected,
         settled.types_not_carried,
         settled.requests_not_carried,
         settled.reaches_none,
-        settled.reaches_several
+        settled.reaches_several,
+        settled.reaches_unstated
     );
     settled
 }
@@ -647,6 +718,8 @@ struct Reached {
 enum Reach<'g> {
     None,
     Several,
+    /// The call also reaches a request no fact states.
+    Unstated,
     One {
         request: &'g Reached,
         /// The row's own callee reached it, not a spread call or a callback.
@@ -654,14 +727,46 @@ enum Reach<'g> {
     },
 }
 
+/// An operation as [`ReachGraph::decide`] tells two requests apart.
+type Operation = (String, String, String);
+
+fn operation_of(request: &Reached) -> Operation {
+    (
+        request.method.to_uppercase(),
+        request.canonical_path.clone(),
+        crate::dispatch::Dispatch::key_suffix(request.dispatch.as_ref()),
+    )
+}
+
+/// One call edge: the definition called, the line the call is written on
+/// (zero when unknown) and how many times the caller makes it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Edge {
+    to: DefinitionSite,
+    line: u32,
+    count: u32,
+}
+
+/// A row no fact states: the model's own, or one of unknown source.
+#[derive(Debug, Clone)]
+struct Unstated {
+    method: String,
+    target_url: String,
+    site: String,
+}
+
 /// Every service's definitions and the requests each one writes.
 #[derive(Default)]
 struct ReachGraph {
     /// Definition -> the definitions it calls, and the ones the definitions
     /// written inside it call.
-    calls: HashMap<DefinitionSite, Vec<DefinitionSite>>,
+    calls: HashMap<DefinitionSite, Vec<Edge>>,
     /// Definition -> the request rows written inside its lines.
     requests: HashMap<DefinitionSite, Vec<Reached>>,
+    /// Definition -> the lines inside it that a request row is written on.
+    request_lines: HashMap<DefinitionSite, BTreeSet<u32>>,
+    /// Definition -> the rows inside its lines that no fact states.
+    unstated: HashMap<DefinitionSite, Vec<Unstated>>,
 }
 
 impl ReachGraph {
@@ -674,7 +779,7 @@ impl ReachGraph {
         // rows inside its lines whichever definition is innermost.
         let mut graph = Self::default();
         // File -> each definition's first and last line, and what it calls.
-        let mut by_file: HashMap<String, Vec<(u32, u32, Vec<DefinitionSite>)>> = HashMap::new();
+        let mut by_file: HashMap<String, Vec<(u32, u32, Vec<Edge>)>> = HashMap::new();
         for data in services.clone() {
             // The file-level owner of module-scope calls is no function: no
             // call reaches it, and its lines are the whole file.
@@ -692,9 +797,13 @@ impl ReachGraph {
                         definition
                             .calls
                             .iter()
-                            .map(|call| DefinitionSite {
-                                file: call.file_path.clone(),
-                                line: call.line_number,
+                            .map(|call| Edge {
+                                to: DefinitionSite {
+                                    file: call.file_path.clone(),
+                                    line: call.line_number,
+                                },
+                                line: call.call_site_line,
+                                count: call.call_count,
                             })
                             .collect(),
                     ));
@@ -722,11 +831,11 @@ impl ReachGraph {
             let Some(mount_graph) = data.mount_graph.as_ref() else {
                 continue;
             };
-            for call in mount_graph
-                .data_calls
-                .iter()
-                .filter(|call| is_request_row(call))
-            {
+            for call in &mount_graph.data_calls {
+                let request = is_request_row(call);
+                if !request && !is_unstated_row(call) {
+                    continue;
+                }
                 let Some((file, line)) = site_of(call) else {
                     continue;
                 };
@@ -736,14 +845,17 @@ impl ReachGraph {
                     .flatten()
                     .filter(|(first, last, _)| *first <= line && line <= *last);
                 for (first, _, _) in holding {
-                    graph
-                        .requests
-                        .entry(DefinitionSite {
-                            file: file.to_string(),
-                            line: *first,
-                        })
-                        .or_default()
-                        .push(Reached {
+                    let definition = DefinitionSite {
+                        file: file.to_string(),
+                        line: *first,
+                    };
+                    if request {
+                        graph
+                            .request_lines
+                            .entry(definition.clone())
+                            .or_default()
+                            .insert(line);
+                        graph.requests.entry(definition).or_default().push(Reached {
                             method: call.method.clone(),
                             target_url: call.target_url.clone(),
                             canonical_path: call.canonical_path.clone(),
@@ -752,72 +864,183 @@ impl ReachGraph {
                             dispatch: call.dispatch.clone(),
                             site: call.file_location.clone(),
                         });
+                    } else {
+                        graph
+                            .unstated
+                            .entry(definition)
+                            .or_default()
+                            .push(Unstated {
+                                method: call.method.clone(),
+                                target_url: call.target_url.clone(),
+                                site: call.file_location.clone(),
+                            });
+                    }
                 }
             }
         }
         graph
     }
 
+    /// Collect the requests written in `start` and in the definitions it
+    /// reaches within [`MAX_EDGE_DEPTH`] call edges, and the rows no fact
+    /// states there.
+    ///
+    /// A request's own call (the one edge written on a request row's line)
+    /// leads into how the request is made, a transport and the primitive it
+    /// calls: a row no fact states past it is that request's, not another.
+    /// Every other path counts the rows it reaches. A definition two paths
+    /// reach is walked once on each.
+    fn walk<'g>(
+        &'g self,
+        start: &DefinitionSite,
+        reached: &mut BTreeMap<&'g str, &'g Reached>,
+        unstated: &mut BTreeMap<&'g str, Vec<&'g Unstated>>,
+    ) {
+        let mut seen: HashSet<(&DefinitionSite, bool)> = HashSet::new();
+        let mut queue: VecDeque<(&DefinitionSite, usize, bool)> = VecDeque::new();
+        let Some((start, _)) = self.calls.get_key_value(start) else {
+            return;
+        };
+        seen.insert((start, false));
+        queue.push_back((start, 0, false));
+        while let Some((definition, depth, within_request)) = queue.pop_front() {
+            for request in self.requests.get(definition).into_iter().flatten() {
+                reached.insert(request.site.as_str(), request);
+            }
+            if !within_request {
+                for row in self.unstated.get(definition).into_iter().flatten() {
+                    unstated.entry(row.site.as_str()).or_default().push(row);
+                }
+            }
+            if depth == MAX_EDGE_DEPTH {
+                continue;
+            }
+            let request_lines = self.request_lines.get(definition);
+            for edge in self.calls.get(definition).into_iter().flatten() {
+                // A callee no service indexes is a definition outside the
+                // scan: nothing is known of what it writes.
+                let Some((callee, _)) = self.calls.get_key_value(&edge.to) else {
+                    continue;
+                };
+                let request_call = edge.line != 0
+                    && edge.count == 1
+                    && request_lines.is_some_and(|lines| lines.contains(&edge.line));
+                let within = within_request || request_call;
+                if seen.insert((callee, within)) {
+                    queue.push_back((callee, depth + 1, within));
+                }
+            }
+        }
+    }
+}
+
+/// The walk over every row, deciding each once: a row another row's walk
+/// reaches is decided where it is reached.
+struct Decider<'g> {
+    graph: &'g ReachGraph,
+    /// Every service's call-through rows, by `file_location`.
+    through: HashMap<String, Vec<&'g SiteRow>>,
+    /// A call-through row's decided operation, by its site, method and target.
+    decided: HashMap<(String, String, String), Option<Operation>>,
+    in_progress: HashSet<(String, String, String)>,
+}
+
+impl<'g> Decider<'g> {
+    fn new(graph: &'g ReachGraph, sites: &[&'g CallThroughSites]) -> Self {
+        let mut through: HashMap<String, Vec<&'g SiteRow>> = HashMap::new();
+        for row in sites.iter().flat_map(|sites| &sites.rows) {
+            through
+                .entry(format!("{}:{}", row.file, row.line))
+                .or_default()
+                .push(row);
+        }
+        Self {
+            graph,
+            through,
+            decided: HashMap::new(),
+            in_progress: HashSet::new(),
+        }
+    }
+
     /// The request the first step of `row` that reaches any decides.
-    fn decide(&self, row: &SiteRow) -> Reach<'_> {
+    ///
+    /// A step decides on ONE operation only when every request it reaches is
+    /// stated by a fact and is that operation. A row no fact states that the
+    /// step also reaches is another request unless it is itself a call
+    /// through that settles on the same operation (a command calling a
+    /// command): the model's row at a `fetch` beside a token request, or a
+    /// row of unknown source, leaves the step unproven.
+    fn decide(&mut self, row: &SiteRow) -> Reach<'g> {
+        let graph = self.graph;
         for (position, step) in row.steps.iter().enumerate() {
             // By site, so a request two paths reach is one request.
-            let mut reached: BTreeMap<&str, &Reached> = BTreeMap::new();
+            let mut reached: BTreeMap<&'g str, &'g Reached> = BTreeMap::new();
+            let mut unstated: BTreeMap<&'g str, Vec<&'g Unstated>> = BTreeMap::new();
             for definition in step {
-                self.walk(definition, &mut reached);
+                graph.walk(definition, &mut reached, &mut unstated);
             }
-            let Some(first) = reached.values().next() else {
+            // A site a fact states is that fact's request.
+            unstated.retain(|site, _| !reached.contains_key(site));
+            if reached.is_empty() && unstated.is_empty() {
                 continue;
-            };
-            let operations: BTreeSet<(String, &str, String)> = reached
+            }
+            let operations: BTreeSet<Operation> = reached
                 .values()
-                .map(|request| {
-                    (
-                        request.method.to_uppercase(),
-                        request.canonical_path.as_str(),
-                        crate::dispatch::Dispatch::key_suffix(request.dispatch.as_ref()),
-                    )
-                })
+                .map(|request| operation_of(request))
                 .collect();
-            return match operations.len() {
-                1 => Reach::One {
-                    request: first,
-                    by_own_callee: position == 0,
-                },
-                _ => Reach::Several,
+            if operations.len() > 1 {
+                return Reach::Several;
+            }
+            let (Some(first), Some(operation)) = (
+                reached.values().next().copied(),
+                operations.into_iter().next(),
+            ) else {
+                return Reach::Unstated;
+            };
+            let own_site = format!("{}:{}", row.file, row.line);
+            for (site, rows) in unstated {
+                if site == own_site {
+                    continue;
+                }
+                for unstated in rows {
+                    if !self.settles_on(unstated, &operation) {
+                        return Reach::Unstated;
+                    }
+                }
+            }
+            return Reach::One {
+                request: first,
+                by_own_callee: position == 0,
             };
         }
         Reach::None
     }
 
-    /// Collect the requests written in `start` and in the definitions it
-    /// reaches within [`MAX_EDGE_DEPTH`] call edges, each definition once.
-    fn walk<'g>(&'g self, start: &DefinitionSite, reached: &mut BTreeMap<&'g str, &'g Reached>) {
-        let mut seen: HashSet<&DefinitionSite> = HashSet::new();
-        let mut queue: VecDeque<(&DefinitionSite, usize)> = VecDeque::new();
-        let Some((start, _)) = self.calls.get_key_value(start) else {
-            return;
+    /// Whether `row` is a call-through row that settles on `operation`. A
+    /// row met again while it is being decided proves nothing.
+    fn settles_on(&mut self, row: &Unstated, operation: &Operation) -> bool {
+        let Some(through) = self.through.get(&row.site).and_then(|rows| {
+            rows.iter()
+                .copied()
+                .find(|through| through.method == row.method && through.target == row.target_url)
+        }) else {
+            return false;
         };
-        seen.insert(start);
-        queue.push_back((start, 0));
-        while let Some((definition, depth)) = queue.pop_front() {
-            for request in self.requests.get(definition).into_iter().flatten() {
-                reached.insert(request.site.as_str(), request);
-            }
-            if depth == MAX_EDGE_DEPTH {
-                continue;
-            }
-            for callee in self.calls.get(definition).into_iter().flatten() {
-                // A callee no service indexes is a definition outside the
-                // scan: nothing is known of what it writes.
-                let Some((callee, _)) = self.calls.get_key_value(callee) else {
-                    continue;
-                };
-                if seen.insert(callee) {
-                    queue.push_back((callee, depth + 1));
-                }
-            }
+        let key = (row.site.clone(), row.method.clone(), row.target_url.clone());
+        if let Some(decided) = self.decided.get(&key) {
+            return decided.as_ref() == Some(operation);
         }
+        if !self.in_progress.insert(key.clone()) {
+            return false;
+        }
+        let decided = match self.decide(through) {
+            Reach::One { request, .. } => Some(operation_of(request)),
+            _ => None,
+        };
+        self.in_progress.remove(&key);
+        let settles = decided.as_ref() == Some(operation);
+        self.decided.insert(key, decided);
+        settles
     }
 }
 
@@ -826,6 +1049,15 @@ fn is_request_row(call: &DataFetchingCall) -> bool {
     call.resolution_source
         .is_some_and(|source| source != ResolutionSource::Model)
         && call.role != Some(ConsumerRole::WrapperCall)
+}
+
+/// A row no fact states and nothing marks as a call through: the model's
+/// reading of a request, or a row whose source the scan did not record.
+fn is_unstated_row(call: &DataFetchingCall) -> bool {
+    call.resolution_source
+        .is_none_or(|source| source == ResolutionSource::Model)
+        && call.role != Some(ConsumerRole::WrapperCall)
+        && call.reaches_request.is_none()
 }
 
 /// The file and line a row's `file_location` packs.
@@ -847,13 +1079,15 @@ enum Change {
 }
 
 /// Change the one row of `data` that `row` names to what `reached` states.
-/// `None` when the blob holds no such row: the graph build keeps fewer rows
-/// than the analysis stated.
+/// `carries_response`: the row's call is worth the request's parsed body
+/// unchanged, so the response type anchored there is the request's. `None`
+/// when the blob holds no such row: the graph build keeps fewer rows than the
+/// analysis stated.
 fn apply(
     data: &mut CloudRepoData,
     row: &SiteRow,
     reached: &Reached,
-    by_own_callee: bool,
+    carries_response: bool,
 ) -> Option<Change> {
     let location = format!("{}:{}", row.file, row.line);
     let graph = data.mount_graph.as_mut()?;
@@ -935,7 +1169,7 @@ fn apply(
             operation.key = OperationKey::http(&reached.method, reached.canonical_path.clone());
             operation.dispatch = reached.dispatch.clone();
             operation.resolution_source = Some(ResolutionSource::RequestSummary);
-            if !by_own_callee {
+            if !carries_response {
                 operation.request_type = None;
                 operation.response_type = None;
             }
@@ -943,12 +1177,14 @@ fn apply(
     }
 
     // The types anchored at the site were captured under the operation the
-    // model stated. Where the row's call is the call that reaches the
-    // request, what it returns is what the caller reads of that request: the
-    // entries keep their captured types (the alias names the site, not the
-    // operation) and take the reached operation's key, so the cross-service
-    // check judges them against its producer. Where another call decided, or
-    // the site already holds a row for the reached operation, they go.
+    // model stated. Where the row's call hands back the request's parsed body
+    // unchanged, what it returns is what the caller reads of that request:
+    // the entries keep their captured types (the alias names the site, not
+    // the operation) and take the reached operation's key, so the
+    // cross-service check judges them against its producer. Anywhere else
+    // the call's value is a function's own result (an envelope, a mapped
+    // object, a hook's state), as at any call #1601 restates at a caller, or
+    // the site already holds a row for the reached operation: they go.
     let mut types_dropped = false;
     let mut request_dropped = false;
     if let (Some(manifest), Some((method, path))) = (data.type_manifest.as_mut(), before.as_http())
@@ -965,7 +1201,7 @@ fn apply(
                         entry_method == method && entry_path == path
                     })
         };
-        if by_own_callee && !twin {
+        if carries_response && !twin {
             let carried = OperationKey::http(
                 &normalize_manifest_method(&reached.method),
                 reached.canonical_path.clone(),

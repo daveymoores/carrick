@@ -442,6 +442,12 @@ pub struct FileCentricAnalysisResult {
     pub bundled_types: Option<String>,
     /// Type resolution result from sidecar
     pub type_resolution: Option<TypeResolutionResult>,
+    /// The functions a call of which is worth its request's parsed body
+    /// unchanged, by declaring module's canonical path and name
+    /// ([`RequestSummaryIndex::passes_body`], carrick#1601). Read again once
+    /// every service is analysed, where a call into another service's
+    /// function is settled (carrick#1146).
+    pub passes_body: HashSet<(PathBuf, String)>,
 }
 
 /// What a routing convention said about one file: whether it CLAIMED the file
@@ -3317,6 +3323,7 @@ impl FileOrchestrator {
                 unread_mount_prefixes: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
+                passes_body: HashSet::new(),
             });
         }
 
@@ -3973,6 +3980,7 @@ impl FileOrchestrator {
             unread_mount_prefixes: unread_prefixes,
             bundled_types: None,
             type_resolution: None,
+            passes_body: summaries.passes_body_set().clone(),
         })
     }
 

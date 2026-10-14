@@ -1897,6 +1897,7 @@ mod tests {
             file_results: HashMap::new(),
             raw_model_results: HashMap::new(),
             stats: Default::default(),
+            passes_body: Default::default(),
         };
 
         let data = CloudRepoData::from_multi_agent_results(
