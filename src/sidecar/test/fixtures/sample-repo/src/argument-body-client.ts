@@ -61,6 +61,7 @@ export class ItemsClient {
 /** Methods written as arrow-valued properties of an object literal. */
 export const notesApi = {
   create: (note: Rename) => transport.post('/notes', { body: note }),
+  relabel: (id: string, label: string) => transport.post(`/notes/${id}`, { body: { label } }),
 };
 
 /** A sender a factory returns: no body the reading can reach at the call. */

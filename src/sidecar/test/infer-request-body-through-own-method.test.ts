@@ -177,6 +177,11 @@ describe('request body through a function the repository declares (carrick#2115)
       assert.strictEqual(row?.type_string, '{ title: string; }');
     });
 
+    it('an arrow-valued object property builds the body from a non-body argument', async () => {
+      const row = await infer('NotesRelabel', "'urgent'", "notesApi.relabel(noteId, 'urgent')");
+      assert.strictEqual(row?.type_string, '{ label: string; }');
+    });
+
     it('a callee whose body cannot be found keeps the argument', async () => {
       const row = await infer('FactorySender', 'renamed', 'sendRename(renamed)');
       assert.strictEqual(row?.type_string, '{ title: string; }');

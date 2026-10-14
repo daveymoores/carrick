@@ -33,8 +33,9 @@ export async function byId(item: Item, kept: Item, id: string, tagged: string[],
   await client.label(id, labelled);
 }
 
-export async function arrows(note: Rename, renamed: Rename, project: string, rev: number | null, store: DraftStore) {
+export async function arrows(note: Rename, renamed: Rename, project: string, rev: number | null, store: DraftStore, noteId: string) {
   await notesApi.create(note);
+  await notesApi.relabel(noteId, 'urgent');
   await sendRename(renamed);
   await store.put(project, rev);
 }
