@@ -335,6 +335,62 @@ fn a_row_the_model_stated_correctly_stays_the_models_and_keeps_its_type_anchor()
     );
 }
 
+/// The model stated the request right at a query library's helper, which
+/// reaches it through a callback, and named the factory's input type for the
+/// helper's call (carrick#2367). That call is the helper's, not the
+/// request's, so the type the model named there goes and is counted.
+#[test]
+fn a_row_confirmed_through_a_callback_loses_the_type_the_model_named_for_it() {
+    assert_eq!(
+        row_at("web", HOOKS, 34),
+        Row {
+            method: "GET".to_string(),
+            target: "/api/v1/runs/${id}".to_string(),
+            path: "/api/v1/runs/:id".to_string(),
+            source: "model".to_string(),
+            role: Some("wrapper_call".to_string()),
+            reaches: Some(format!("{REQUESTS}:5")),
+        }
+    );
+    let entries = consumer_entries_at("web", HOOKS, 34);
+    assert!(
+        entries.iter().all(|entry| entry["type_kind"] != "response"
+            && entry["primary_type_symbol"] != "RunQueryInput"),
+        "no type the model named for the helper's call is kept: {entries:#?}"
+    );
+    assert_eq!(response_verdicts_at(HOOKS, 34), []);
+    assert!(
+        settled_line()
+            .contains("(1 lost the type the model named for a call that is not the request's)"),
+        "{}",
+        settled_line()
+    );
+}
+
+/// The same shape where the model named no type: the entry the compiler read
+/// at the call stays.
+#[test]
+fn a_row_confirmed_through_a_callback_keeps_the_type_the_compiler_read() {
+    assert_eq!(
+        row_at("web", HOOKS, 29),
+        Row {
+            method: "GET".to_string(),
+            target: "/api/v1/status".to_string(),
+            path: "/api/v1/status".to_string(),
+            source: "model".to_string(),
+            role: Some("wrapper_call".to_string()),
+            reaches: Some(format!("{REQUESTS}:23")),
+        }
+    );
+    let entries = consumer_entries_at("web", HOOKS, 29);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["type_kind"] == "response" && entry["is_explicit"] == false),
+        "the compiler's read at the call is kept: {entries:#?}"
+    );
+}
+
 /// The corrected row's own call is the call that reaches the request, and the
 /// function it calls hands back the request's parsed body unchanged, so the
 /// type anchored at it is what the caller reads of that request: it is kept

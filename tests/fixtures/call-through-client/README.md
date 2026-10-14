@@ -12,8 +12,8 @@ Four services:
 - `packages/cli` reaches them through a client class, a factory, and commands
   that call other commands.
 - `apps/web` reaches them from hook arguments: a call spread into the hook's
-  options, a callback among them, and a callback handed to one of the app's
-  own functions.
+  options, a callback among them, a callback handed to one of the app's own
+  functions, and a callback handed to a query library's options helper.
 - `services/api` serves the routes.
 
 The cassette under `__llm__/` states what a model states at a call that writes
@@ -54,6 +54,14 @@ goes into the arguments of another request, is a side request
 
 No corrected row carries a request type: a call's arguments are the called
 function's parameters, not a request body.
+
+Rows the model stated correctly at a call that reaches the request through a
+callback (carrick#2367) keep their source and gain the role and the link:
+
+| Site | The type anchored there |
+|---|---|
+| `hooks.ts:34` | `RunQueryInput`, the factory's input type the model named for a query library's helper: dropped and counted |
+| `hooks.ts:29` | no type named by the model; the compiler's read at the call is kept |
 
 Rows that stay as the model stated them:
 
