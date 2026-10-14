@@ -413,6 +413,32 @@ fn a_corrected_row_whose_call_returns_another_shape_carries_no_type() {
     }
 }
 
+/// Every method of the client makes a request of its own before the one it
+/// hands back, and drops its value: a probe. The request the call reaches is
+/// the one whose value the method returns, whether the probe is a request a
+/// fact states (line 64) or one only the model reads (line 164).
+#[test]
+fn a_call_whose_client_drops_a_probe_takes_the_request_it_hands_back() {
+    for line in [64, 164] {
+        assert_eq!(
+            row_at("cli", COMMANDS, line),
+            corrected("GET", "/api/v1/runs/:id", 5),
+            "{COMMANDS}:{line}"
+        );
+    }
+}
+
+/// The function called asks for a token and hands it to the request it
+/// returns. The token is that request's input, not what the call answers
+/// with, so the call reaches the run.
+#[test]
+fn a_token_handed_to_the_returned_request_is_not_the_request_reached() {
+    assert_eq!(
+        row_at("cli", COMMANDS, 176),
+        corrected("GET", "/api/v1/runs/:id", 5)
+    );
+}
+
 /// The function called asks for a token, a request a fact states, and then
 /// makes a `fetch` only the model reads. The token is not the one operation
 /// the call reaches, so the row stays as the model stated it, and is counted.
@@ -443,7 +469,7 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     assert!(
-        settled_line().contains("(8 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(11 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -525,8 +551,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
             57,
             as_stated("GET", "/api/v1/run-and-list", "/api/v1/run-and-list"),
         ),
-        // Every method of this client also requests the health route.
-        ("cli", COMMANDS, 64, as_stated("GET", "/getRun", "/getRun")),
         // Nothing resolves the receiver.
         (
             "cli",

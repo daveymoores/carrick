@@ -1,6 +1,6 @@
-import { ping, readRun, readRunStamped, send } from "@fixture/client";
+import { getRun, ping, readRun, readRunStamped, send, transport } from "@fixture/client";
 import { createClient } from "./api-client";
-import { createProbedClient } from "./probed-client";
+import { createModelProbedClient, createProbedClient } from "./probed-client";
 import type { Run, SavedRun, StampedRun, Status } from "./types";
 
 /** A command that calls one client method. */
@@ -155,5 +155,24 @@ export async function showStamped(id: string) {
 /** The caller's copy of the type requires a field the API no longer sends. */
 export async function showReadStale(id: string) {
   const run: SavedRun = await readRun(id);
+  return run;
+}
+
+/** Every method of this client also makes a request only the model reads, and drops it. */
+export async function showModelProbed(id: string, origin: string) {
+  const probed = createModelProbedClient(origin);
+  const run = await probed.getRun(id);
+  return run;
+}
+
+/** Asks for a token and hands it to the request it returns. */
+async function authorizedRun(id: string) {
+  const token = await loadToken();
+  return getRun({ client: transport, path: { id }, body: token });
+}
+
+/** The function called reaches the token request and the run request. */
+export async function showAuthorized(id: string) {
+  const run = await authorizedRun(id);
   return run;
 }

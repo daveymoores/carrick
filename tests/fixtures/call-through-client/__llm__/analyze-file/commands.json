@@ -274,6 +274,32 @@
       "payload_expression_line": null,
       "primary_type_symbol": "SavedRun",
       "type_import_source": "./types"
+    },
+    {
+      "candidate_id": "model:164",
+      "line_number": 164,
+      "target": "/api/v1/probed-runs/${id}",
+      "method": "GET",
+      "pattern_matched": "probed.getRun(",
+      "call_expression_text": "probed.getRun(id)",
+      "call_expression_line": 164,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:176",
+      "line_number": 176,
+      "target": "/authorized",
+      "method": "GET",
+      "pattern_matched": "authorizedRun(",
+      "call_expression_text": "authorizedRun(id)",
+      "call_expression_line": 176,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }
