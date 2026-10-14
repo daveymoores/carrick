@@ -18,7 +18,10 @@
  * A handler that reads anything from a parameter keeps the undecided answer
  * it had: a property read, a zero-argument call it uses the value of, or the
  * parameter handed whole to another function may each be the body read, and
- * this cannot tell. No method or property name is consulted.
+ * this cannot tell. So may a call on a parameter that is handed something
+ * able to receive (a callback, or an object with a method: `request.pipe(dest)`,
+ * `request.on('data', cb)`, `request.json().then(cb)`). A handler with no
+ * parameter proves nothing either. No method or property name is consulted.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -29,12 +32,20 @@ import * as path from 'node:path';
 import { SidecarClient } from './helpers.js';
 
 const ROUTES_TS = `interface Result { y: number }
-interface Incoming { json(): Promise<any>; body: any; params: { id: string } }
+interface Incoming {
+  json(): Promise<any>;
+  body: any;
+  params: { id: string };
+  pipe<T extends { write(chunk: unknown): void }>(destination: T): T;
+  on(event: string, listener: (chunk: unknown) => void): Incoming;
+}
 interface Outgoing { json(value: unknown): void; status(code: number): Outgoing; send(value?: unknown): void }
 declare const app: {
   post(path: string, handler: (request: Incoming, reply: Outgoing) => unknown): void;
 };
+declare const parser: { write(chunk: unknown): void; end(): void };
 declare function audit(request: Incoming): void;
+declare function store(body: unknown): void;
 declare const result: Result;
 
 app.post('/sends-only', (request, reply) => {
@@ -45,6 +56,40 @@ app.post('/returns-a-send', (request, reply) => reply.status(201).send(result));
 
 app.post('/no-parameters', () => {
   return result;
+});
+
+app.post('/sends-a-primitive', (request, reply) => {
+  reply.status(201).send('ok');
+});
+
+app.post('/pipes-the-request', (request, reply) => {
+  request.pipe(parser);
+  reply.send();
+});
+
+app.post('/listens-on-the-request', (request, reply) => {
+  const chunks: unknown[] = [];
+  request.on('data', (chunk) => {
+    chunks.push(chunk);
+  });
+  reply.send();
+});
+
+app.post('/reads-through-a-callback', (request, reply) => {
+  request.json().then(store);
+  reply.send();
+});
+
+app.post('/reads-through-this', function (this: { request: Incoming }) {
+  return this.request.body;
+});
+
+app.post('/reads-through-this-beside-parameters', function (
+  this: { request: { body: Result } },
+  request,
+  reply
+) {
+  reply.json(this.request.body);
 });
 
 app.post('/reads-a-property', (request, reply) => {
@@ -172,8 +217,8 @@ describe('carrick#827: a registration whose handler reads nothing takes no reque
     await decidedNoBody('/returns-a-send');
   });
 
-  it('decides no body where the handler takes no parameter', async () => {
-    await decidedNoBody('/no-parameters');
+  it('decides no body where the handler sends a primitive', async () => {
+    await decidedNoBody('/sends-a-primitive');
   });
 
   // A handler that reads anything from a parameter is left undecided, as it
@@ -184,6 +229,16 @@ describe('carrick#827: a registration whose handler reads nothing takes no reque
     '/echoes-a-read',
     '/hands-the-request-on',
     '/reads-a-path-parameter',
+    // A call on a parameter that hands it something able to receive (a
+    // callback, an object with methods) may move the body into it.
+    '/pipes-the-request',
+    '/listens-on-the-request',
+    '/reads-through-a-callback',
+    // With no parameter there is nothing to prove the handler reads nothing:
+    // it may read the message from elsewhere (`this`, a closure).
+    '/no-parameters',
+    '/reads-through-this',
+    '/reads-through-this-beside-parameters',
   ]) {
     it(`stays undecided where the handler reads from a parameter (${route})`, async () => {
       assert.strictEqual(await requestBody(route), undefined);
