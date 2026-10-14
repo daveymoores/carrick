@@ -10,5 +10,5 @@ export { registerComputedRoutes } from './computed-routes';
 export { registerBuiltRoutes } from './built-routes';
 export { registerSpreadRoutes } from './spread-routes';
 export { documentedRoutes } from './docs';
-export { default as registerLegacyRoutes } from './legacy';
-export { legacyPlugin } from './legacy-host';
+export { registerLegacyRoutes } from './legacy';
+export { legacyPlugin } from './older';
