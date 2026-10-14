@@ -382,6 +382,13 @@ const BODY_MEMBER_NAMES = new Set(['data', 'body', 'json']);
  */
 const WHOLE_BODY_READS = new Set(['json', 'text']);
 
+/**
+ * The other zero-argument reads the platform `Response` takes its whole body
+ * out with, in a form that is neither JSON nor text. The expression that
+ * holds one holds the body the call answered with (carrick#2112).
+ */
+const BINARY_BODY_READS = new Set(['arrayBuffer', 'blob', 'bytes', 'formData']);
+
 /** The body format a caller names to read a response as raw text (carrick#1842). */
 const RAW_TEXT_FORMAT = 'text';
 
@@ -3359,6 +3366,15 @@ export class TypeInferrer {
       const projections: Node[] = [];
       /** The value itself was read: returned, passed, aliased, or body-read. */
       let sawWholeRead = false;
+      // Where the call's own value states no type, a call that takes it whole
+      // is the first place the source states one, and the walk follows it
+      // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375).
+      const callValue = this.unwrapPromiseType(callExpr.getType());
+      const callValueIsUntyped = callValue.isAny() || callValue.isUnknown();
+      // A transport response handed whole to a helper is a body read through
+      // that helper (`const data: T = await parseJson(response)`), as
+      // `response.json()` is one in place.
+      const callValueIsTransport = this.typeIsOrContainsResponseMachinery(callValue);
       const startPos = callExpr.getStart();
       const candidates = this.collectDefUseNodes(func);
 
@@ -3447,28 +3463,95 @@ export class TypeInferrer {
           }
         }
 
-        // The last expression the value flows into is the call's payload — a
-        // cast, a parse, an alias. An expression that only reads MEMBERS out
-        // of it is a projection and states a part of the payload, never the
-        // payload: the hook that derives `query.data?.flags` off a query
-        // result published a boolean map as the expected response of a call
-        // whose envelope the client declares in full (carrick#1375).
+        // A later expression answers for the call only where it RESTATES the
+        // value: an alias, a cast, a typed binding. An expression that only
+        // reads MEMBERS out of it is a projection and states a part of the
+        // payload, never the payload: the hook that derives
+        // `query.data?.flags` off a query result published a boolean map as
+        // the expected response of a call whose envelope the client declares
+        // in full (carrick#1375). Any other use computes something else from
+        // the value (`describe(page)`, `Math.max(...items.map(…))`,
+        // `rows.map(…)`, `flag && render(row)`): it reads the value whole, and
+        // the answer stays the call's own (carrick#2112). An expression that
+        // takes the body out of a transport response in a form that is not
+        // JSON or text (`new Uint8Array(await res.arrayBuffer())`) holds the
+        // body, and answers as it did.
         if (
           this.expressionUsesNames(expr, currentNames) &&
           !this.usesNamesOnlyByProjection(expr, currentNames)
         ) {
-          lastNode = expr;
+          if (
+            callValueIsUntyped ||
+            this.restatesTrackedValue(expr, currentNames) ||
+            this.holdsBinaryBodyRead(expr, currentNames) ||
+            (callValueIsTransport && this.handsTrackedValueToACall(expr, currentNames))
+          ) {
+            lastNode = expr;
+          } else {
+            sawWholeRead = true;
+          }
         }
       }
 
       return {
-        terminal: lastNode,
+        terminal: this.destructuredValueTerminal(lastNode, binding.node, callExpr, callValueIsTransport),
         projectionOnly: projections.length > 0 && !sawWholeRead,
         projections,
       };
     }
 
     return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /**
+   * Where the walk ends on the call's own destructuring binding (`const {
+   * tasks } = await api.list()`), the declaration has no type of its own: the
+   * checker answers `any` for it. The value it takes apart is the call's, so
+   * the call answers (carrick#2112). Not for a transport value: a helper's
+   * `{ body, response }` read as text would bypass the capture's machinery
+   * guard, so that binding stays unread and the capture answers the row.
+   */
+  private destructuredValueTerminal(
+    lastNode: Node,
+    bindingNode: Node,
+    callExpr: CallExpression,
+    callValueIsTransport: boolean
+  ): Node {
+    if (
+      lastNode !== bindingNode ||
+      callValueIsTransport ||
+      !Node.isVariableDeclaration(lastNode) ||
+      Node.isIdentifier(lastNode.getNameNode())
+    ) {
+      return lastNode;
+    }
+    return callExpr;
+  }
+
+  /**
+   * `expr` declares a name for what a call returns when it is handed a
+   * tracked name whole (`const data: T = await parseJson(response, 'op')`).
+   */
+  private handsTrackedValueToACall(expr: Node, names: string[]): boolean {
+    if (!Node.isVariableDeclaration(expr)) return false;
+    const init = this.unwrapExpressionNode(expr.getInitializer());
+    return (
+      Node.isCallExpression(init) &&
+      init
+        .getArguments()
+        .some((argument) => this.isIdentifierUsage(this.unwrapExpressionNode(argument), names))
+    );
+  }
+
+  /** `expr` holds a binary whole-body read taken on a tracked name. */
+  private holdsBinaryBodyRead(expr: Node, names: string[]): boolean {
+    return expr
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .some(
+        (id) =>
+          this.isIdentifierUsage(id, names) &&
+          this.bodyReadOnReceiver(id, BINARY_BODY_READS) !== undefined
+      );
   }
 
   /**
@@ -3488,6 +3571,23 @@ export class TypeInferrer {
     if (!executor || this.unwrapExpressionNode(executor) !== func) return false;
     const constructed = returned.getType();
     return this.unwrapPromiseType(constructed) !== constructed;
+  }
+
+  /**
+   * `expr` declares a name for the tracked value as it is: its initializer,
+   * with the wrappers that leave a value what it was peeled (parentheses,
+   * `await`, `as`, `satisfies`, `!`), is a tracked name (carrick#2112). The
+   * declaration's type is then the value's, as the source restates it.
+   */
+  private restatesTrackedValue(expr: Node, names: string[]): boolean {
+    if (!Node.isVariableDeclaration(expr)) return false;
+    let value: Node | undefined = expr.getInitializer();
+    for (;;) {
+      const peeled: Node | undefined = value && this.unwrapExpressionNode(value);
+      value = peeled && Node.isSatisfiesExpression(peeled) ? peeled.getExpression() : peeled;
+      if (value === peeled) break;
+    }
+    return !!value && this.isIdentifierUsage(value, names);
   }
 
   /**
@@ -4244,15 +4344,19 @@ export class TypeInferrer {
    * The zero-argument whole-body read that takes `receiver` as its receiver,
    * `res.json()` or `res.text()`, or `undefined`. A text read is a body read
    * like a json one (carrick#1842): without it, `return res.text()` left the
-   * walk on the response binding and published the transport object.
+   * walk on the response binding and published the transport object. `reads`
+   * names the reads asked for.
    */
-  private bodyReadOnReceiver(receiver: Node): Node | undefined {
+  private bodyReadOnReceiver(
+    receiver: Node,
+    reads: ReadonlySet<string> = WHOLE_BODY_READS
+  ): Node | undefined {
     const access = receiver.getParent();
     if (
       !access ||
       !Node.isPropertyAccessExpression(access) ||
       access.getExpression() !== receiver ||
-      !WHOLE_BODY_READS.has(access.getName())
+      !reads.has(access.getName())
     ) {
       return undefined;
     }
