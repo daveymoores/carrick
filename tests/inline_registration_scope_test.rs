@@ -1294,6 +1294,45 @@ async fn a_helper_declared_beside_the_scope_keeps_its_path() {
     assert!(mounted(&result).contains("registerLocalRoutes"));
 }
 
+#[tokio::test]
+#[serial]
+async fn a_local_function_that_hands_the_instance_on_carries_the_scopes_prefix() {
+    // `relay` is declared in the file that makes the scope and hands the
+    // instance to an imported helper. The hand-on runs inside the scope, not
+    // at the top of the file, so the routes take the scope's prefix under the
+    // prefix the file itself is mounted under, never the file's alone.
+    let index = answer(
+        "src/relay-index.ts",
+        &[(
+            "server.register(plugin",
+            "server",
+            "plugin",
+            "/root",
+            Some("./relay-local"),
+        )],
+        &[],
+    );
+    let result = analyze(vec![index, scope_only("src/relay-local.ts"), team_items()]).await;
+    assert_eq!(served(&result), set(&["GET /root/api/v1/teams/:id/items"]));
+
+    let result = analyze(vec![scope_only("src/relay-local.ts"), team_items()]).await;
+    assert_eq!(served(&result), set(&["GET /api/v1/teams/:id/items"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn two_hand_ons_on_one_line_are_two_mounts() {
+    let result = analyze_with(
+        vec![scope_only("src/helper-both.ts"), team_items(), team_notes()],
+        &["src/both-routes.ts"],
+    )
+    .await;
+    assert_eq!(
+        served(&result),
+        set(&["GET /api/v1/teams/:id/items", "GET /api/v1/teams/:id/notes"])
+    );
+}
+
 #[test]
 fn the_fixture_root_is_on_disk() {
     assert!(Path::new(&root()).join("src/nullish.ts").is_file());

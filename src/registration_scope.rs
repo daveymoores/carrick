@@ -1053,11 +1053,15 @@ impl InstanceTrace<'_> {
     /// for which the same holds, at most [`MAX_PASS_ON_DEPTH`] functions on.
     ///
     /// Each hand-on that reaches a registration is pushed to `hand_ons` as a
-    /// mount row of the file that makes the call, hanging from the parameter:
-    /// the graph resolves that name to the binding the file was mounted
-    /// under, exactly as it resolves a route's owner, so the prefix of the
-    /// scope reaches the function the instance ends in. A line that already
-    /// holds a mount is the model's and is left to it.
+    /// mount row of the file that makes the call, hanging from `name`, the
+    /// function the call runs in: that is the node the row that reached the
+    /// function mounts. A function its own file reaches by name is a local
+    /// child of that file and is kept as it is, so the hand-on composes under
+    /// the scope that made the call. The parameter would resolve file-first to
+    /// the binding the file is mounted under, which is not the scope the call
+    /// runs in. An imported function resolves through the binding of the
+    /// import that reached it. A line that already holds a mount is the
+    /// model's and is left to it.
     fn registers(
         &mut self,
         file_results: &HashMap<String, FileAnalysisResult>,
@@ -1082,15 +1086,14 @@ impl InstanceTrace<'_> {
         let inside = |line: i32| {
             u32::try_from(line).is_ok_and(|line| line >= head.start_line && line <= head.end_line)
         };
-        let mut registers = rows
-            .mounts
-            .iter()
-            .any(|mount| &mount.parent_node == param && inside(mount.line_number))
-            || rows.endpoints.iter().any(|endpoint| {
-                &endpoint.owner_node == param
-                    && is_served_path(&endpoint.path)
-                    && inside(endpoint.line_number)
-            });
+        // A hand-on this pass wrote hangs from the function's name.
+        let mut registers = rows.mounts.iter().any(|mount| {
+            (&mount.parent_node == param || mount.parent_node == name) && inside(mount.line_number)
+        }) || rows.endpoints.iter().any(|endpoint| {
+            &endpoint.owner_node == param
+                && is_served_path(&endpoint.path)
+                && inside(endpoint.line_number)
+        });
         if depth >= MAX_PASS_ON_DEPTH {
             return registers;
         }
@@ -1098,7 +1101,6 @@ impl InstanceTrace<'_> {
         if self.walking.contains(&walked) {
             return registers;
         }
-        let param = param.clone();
         let passes_on: Vec<InnerRegistration> = head
             .passes_on
             .iter()
@@ -1119,7 +1121,7 @@ impl InstanceTrace<'_> {
                 hand_ons,
             ) {
                 registers = true;
-                hand_ons.push((key.clone(), pass.mount_row(&param)));
+                hand_ons.push((key.clone(), pass.mount_row(name)));
             }
         }
         self.walking.pop();
@@ -1223,8 +1225,15 @@ pub fn mount_unstated_registrations(
                 let Some(target) = file_results.get_mut(&key) else {
                     continue;
                 };
-                // One function reached from two scopes hands on once.
-                if u32::try_from(row.line_number).is_ok_and(|line| mount_stated_at(target, line)) {
+                // One function reached from two scopes hands on once. Kept
+                // apart by the call, not the line: `a(app); b(app);` is two
+                // hand-ons. A line the model stated a mount on never reaches
+                // here, as `registers` skips its calls.
+                if target.mounts.iter().any(|mount| {
+                    mount.line_number == row.line_number
+                        && mount.parent_node == row.parent_node
+                        && mount.child_node == row.child_node
+                }) {
                     continue;
                 }
                 debug!(
