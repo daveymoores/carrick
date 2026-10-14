@@ -1364,9 +1364,16 @@ export class TypeInferrer {
     if (provenance && provenance.length > 0) {
       inferred.any_provenance = provenance;
     }
-    this.relateModelSymbol(request, inferred, [
-      unwrapResult.wasUnwrapped ? unwrapResult.payloadType : awaitedType,
-    ]);
+    // The relation is asked only of the function the row's own line names.
+    // A locator that binds inside a callback of the handler (`user` in
+    // `this.users.find((user) => user.id === id)`) reaches this with that
+    // callback, whose return is not the route's, and a read of the wrong
+    // function must never displace the symbol the model named.
+    if (startLineOf(func) === request.line_number) {
+      this.relateModelSymbol(request, inferred, [
+        unwrapResult.wasUnwrapped ? unwrapResult.payloadType : awaitedType,
+      ]);
+    }
     return inferred;
   }
 

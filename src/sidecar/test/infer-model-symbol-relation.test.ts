@@ -95,6 +95,11 @@ export function holdsAny() {
 export function readsAny() {
   return loadAny();
 }
+export class ItemsController {
+  findOne(id: string): ItemDto | undefined { // method
+    return rows.find((row) => row.id === id); // predicate
+  }
+}
 `;
 
 interface Relation {
@@ -241,6 +246,44 @@ describe('carrick#2111: the model symbol of a producer response is related to th
 
   it('answers nothing for a consumer call, whose text can be a later expression', async () => {
     assert.strictEqual((await relate('listOfSymbol', 'ItemDto', 'call_result')).relation, undefined);
+  });
+
+  // A locator that binds inside a callback of the handler reads the callback,
+  // not the route: `row` here is answered with the predicate's `boolean`. A
+  // read of the wrong function must never displace the symbol the model
+  // named, so the relation is asked only of the function the row's line names.
+  it('answers nothing where the locator binds inside a callback of the handler', async () => {
+    for (const kind of ['function_return', 'response_body'] as const) {
+      const alias = `Alias_findOne_${kind}`;
+      const response = await client.send<InferShape>({
+        action: 'infer',
+        request_id: `infer-${alias}`,
+        requests: [
+          {
+            file_path: routesPath,
+            line_number: lineOf('// method'),
+            expression_text: 'row',
+            expression_line: lineOf('// predicate'),
+            infer_kind: kind,
+            alias,
+          },
+        ],
+        model_symbols: [{ alias, symbol_name: 'ItemDto', source_file: 'src/index.ts' }],
+      });
+      const inferred = response.inferred_types?.find((t) => t.alias === alias);
+      assert.strictEqual(inferred?.model_symbol_relation, undefined, `${kind}: ${inferred?.type_string}`);
+    }
+    // The same method read as itself relates as the source states it.
+    const alias = 'Alias_findOne_itself';
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: `infer-${alias}`,
+      requests: [
+        { file_path: routesPath, line_number: lineOf('// method'), infer_kind: 'function_return', alias },
+      ],
+      model_symbols: [{ alias, symbol_name: 'ItemDto', source_file: 'src/index.ts' }],
+    });
+    assert.strictEqual(response.inferred_types?.[0]?.model_symbol_relation?.relation, 'nullable');
   });
 
   it('answers nothing where no symbol was sent for the alias', async () => {
