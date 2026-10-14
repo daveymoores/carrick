@@ -48,7 +48,7 @@ use tracing::debug;
 
 use crate::agents::file_analyzer_agent::{DataCallResult, FileAnalysisResult, ResolutionSource};
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind};
+use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind, TypeManifestEntry};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::OperationKey;
@@ -80,6 +80,10 @@ pub struct SiteRow {
     pub method: String,
     /// The target the model stated.
     pub target: String,
+    /// The type the model named for the row's call (`primary_type_symbol`),
+    /// read off the row itself. The manifest entry's own symbol is not this:
+    /// where the model named none, it is stamped from the compiler's read.
+    pub model_symbol: Option<String>,
     /// The definitions reached, in the order they are read. The first step
     /// that reaches a request decides:
     ///
@@ -407,6 +411,7 @@ fn read_file_sites(
             line,
             method,
             target: call.target.clone(),
+            model_symbol: call.primary_type_symbol.clone(),
             steps: vec![
                 reached(&[extent.span()]),
                 reached(&site.spread_calls),
@@ -725,6 +730,10 @@ pub struct Settled {
     /// Corrected rows that kept their response entry and lost their request
     /// entry: the call's arguments are the called function's parameters.
     pub requests_not_carried: usize,
+    /// Confirmed rows, settled through a spread call or a callback, that lost
+    /// the type entry anchored on the symbol the model named for the row: the
+    /// model named it for the outer call, which is another function's.
+    pub model_types_not_kept: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -732,7 +741,7 @@ pub struct Settled {
 ///
 /// | Reached | The row |
 /// |---|---|
-/// | One operation, the row's own | stays the model's and keeps its type anchors; gains `role: wrapper_call` and `reaches_request` |
+/// | One operation, the row's own | stays the model's and keeps its type anchors, except one on the model's symbol where a spread call or a callback decided; gains `role: wrapper_call` and `reaches_request` |
 /// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its response type entry is keyed to the reached operation where the call hands back the request's parsed body, and goes otherwise; its request type entry goes |
 /// | None, several, or one beside a request no fact states | left as it is, and counted |
 ///
@@ -747,6 +756,13 @@ pub struct Settled {
 /// callee returns an envelope, a mapped object, or a value nothing here
 /// reads) the anchor names a function's own result, and the entries are
 /// dropped and counted.
+///
+/// A confirmed row keeps its entries, with one exception for the same reason:
+/// where a spread call or a callback decided, an explicit entry anchored on
+/// the symbol the model named for the row goes and is counted. The model named
+/// it for the outer call (a query-options factory's input type, say), which is
+/// another function's. An entry the compiler read at the row stays: an
+/// implicit one, or an explicit one under another symbol.
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let mut graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
@@ -775,6 +791,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     service.data,
                     row,
                     request,
+                    by_own_callee,
                     // What the row's call returns is the request's parsed
                     // body only where its own callee decided and every
                     // definition that callee goes through hands that body
@@ -787,7 +804,10 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                                     .all(|definition| hands_back_body.contains(definition))
                         }),
                 ) {
-                    Some(Change::Relabelled) => settled.relabelled += 1,
+                    Some(Change::Relabelled { model_type_dropped }) => {
+                        settled.relabelled += 1;
+                        settled.model_types_not_kept += usize::from(model_type_dropped);
+                    }
                     Some(Change::Corrected {
                         types_dropped,
                         request_dropped,
@@ -809,8 +829,9 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
     }
     debug!(
-        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146)",
+        "Call-through rows settled: {} confirmed ({} lost the type the model named for a call that is not the request's), {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146, carrick#2367)",
         settled.relabelled,
+        settled.model_types_not_kept,
         settled.corrected,
         settled.types_not_carried,
         settled.requests_not_carried,
@@ -1308,7 +1329,11 @@ fn site_of(call: &DataFetchingCall) -> Option<(&str, u32)> {
 }
 
 enum Change {
-    Relabelled,
+    Relabelled {
+        /// The row lost the explicit entry anchored on the symbol the model
+        /// named for it, because a spread call or a callback decided.
+        model_type_dropped: bool,
+    },
     Corrected {
         /// The row held consumer type entries and they were dropped, because
         /// the row's call is not the call that reaches the request.
@@ -1320,7 +1345,8 @@ enum Change {
 }
 
 /// Change the one row of `data` that `row` names to what `reached` states.
-/// `carries_response`: the row's call is worth the request's parsed body
+/// `by_own_callee`: the row's own callee decided, not a spread call or a
+/// callback. `carries_response`: the row's call is worth the request's parsed body
 /// unchanged, so the response type anchored there is the request's. `None`
 /// when the blob holds no such row: the graph build keeps fewer rows than the
 /// analysis stated.
@@ -1328,6 +1354,7 @@ fn apply(
     data: &mut CloudRepoData,
     row: &SiteRow,
     reached: &Reached,
+    by_own_callee: bool,
     carries_response: bool,
 ) -> Option<Change> {
     let location = format!("{}:{}", row.file, row.line);
@@ -1344,6 +1371,7 @@ fn apply(
     let own = call.method.eq_ignore_ascii_case(&reached.method)
         && call.dispatch == reached.dispatch
         && carrick_match::paths_match(&reached.canonical_path, &call.canonical_path);
+    let before = OperationKey::http(&call.method, call.canonical_path.clone());
     if own {
         let call = &mut graph.data_calls[index];
         call.role = Some(ConsumerRole::WrapperCall);
@@ -1352,10 +1380,29 @@ fn apply(
             "  - {location}: the model's {} {} is the call through to {}",
             call.method, call.canonical_path, reached.site
         );
-        return Some(Change::Relabelled);
+        // The model named its symbol for the row's own call. Where a spread
+        // call or a callback reached the request, that call is another
+        // function's (a query-options factory, a hook), and the symbol is
+        // what the model saw around it, not what the request returns. The
+        // entries the compiler read at the row stay.
+        let mut model_type_dropped = false;
+        if !by_own_callee
+            && let Some(symbol) = row.model_symbol.as_deref()
+            && let (Some(manifest), Some((method, path))) =
+                (data.type_manifest.as_mut(), before.as_http())
+        {
+            let at_the_row = consumer_entry_at(row, method, path);
+            let before = manifest.len();
+            manifest.retain(|entry| {
+                !(at_the_row(entry)
+                    && entry.is_explicit
+                    && entry.primary_type_symbol.as_deref() == Some(symbol))
+            });
+            model_type_dropped = manifest.len() < before;
+        }
+        return Some(Change::Relabelled { model_type_dropped });
     }
 
-    let before = OperationKey::http(&call.method, call.canonical_path.clone());
     let before_dispatch = call.dispatch.clone();
     debug!(
         "  - {location}: the model's {} {} becomes {} {}, the request written at {}",
@@ -1430,18 +1477,7 @@ fn apply(
     let mut request_dropped = false;
     if let (Some(manifest), Some((method, path))) = (data.type_manifest.as_mut(), before.as_http())
     {
-        let method = normalize_manifest_method(method);
-        let at_the_row = |entry: &crate::cloud_storage::TypeManifestEntry| {
-            entry.role == ManifestRole::Consumer
-                && entry.file_path == row.file
-                && entry.line_number == row.line
-                && entry
-                    .key
-                    .as_http()
-                    .is_some_and(|(entry_method, entry_path)| {
-                        entry_method == method && entry_path == path
-                    })
-        };
+        let at_the_row = consumer_entry_at(row, method, path);
         if carries_response && !twin {
             let carried = OperationKey::http(
                 &normalize_manifest_method(&reached.method),
@@ -1470,6 +1506,27 @@ fn apply(
         types_dropped,
         request_dropped,
     })
+}
+
+/// Whether a manifest entry is a consumer type anchored at `row`, under the
+/// operation the row was indexed as.
+fn consumer_entry_at<'a>(
+    row: &'a SiteRow,
+    method: &str,
+    path: &'a str,
+) -> impl Fn(&TypeManifestEntry) -> bool + 'a {
+    let method = normalize_manifest_method(method);
+    move |entry| {
+        entry.role == ManifestRole::Consumer
+            && entry.file_path == row.file
+            && entry.line_number == row.line
+            && entry
+                .key
+                .as_http()
+                .is_some_and(|(entry_method, entry_path)| {
+                    entry_method == method && entry_path == path
+                })
+    }
 }
 
 #[cfg(test)]
@@ -1675,5 +1732,161 @@ mod tests {
         for other in ["/", "orders", "//", "${}", "${}orders", "a/b", ""] {
             assert!(!writes_a_route(other), "{other}");
         }
+    }
+
+    // --- carrick#2367: the model's symbol at a row confirmed through a callback ---
+
+    const SITE_FILE: &str = "src/options.ts";
+    const SITE_LINE: u32 = 4;
+
+    /// The model's row at `SITE_FILE:SITE_LINE`, stated as `GET /api/v1/runs`
+    /// with `symbol` as the type it named.
+    fn site_row(symbol: Option<&str>) -> SiteRow {
+        SiteRow {
+            file: SITE_FILE.to_string(),
+            line: SITE_LINE,
+            method: "GET".to_string(),
+            target: "/api/v1/runs".to_string(),
+            model_symbol: symbol.map(str::to_string),
+            steps: Vec::new(),
+        }
+    }
+
+    /// The request the row's call reaches: the operation the model stated.
+    fn reached_runs() -> Reached {
+        Reached {
+            method: "GET".to_string(),
+            target_url: "/api/v1/runs".to_string(),
+            canonical_path: "/api/v1/runs".to_string(),
+            host: None,
+            base: None,
+            dispatch: None,
+            site: "src/requests.ts:8".to_string(),
+        }
+    }
+
+    /// A consumer response entry at the row.
+    fn entry(is_explicit: bool, symbol: Option<&str>) -> serde_json::Value {
+        let state = if is_explicit { "explicit" } else { "implicit" };
+        serde_json::json!({
+            "protocol": "http", "method": "GET", "path": "/api/v1/runs",
+            "role": "consumer", "type_kind": "response", "type_alias": "Endpoint_runs_Response",
+            "file_path": SITE_FILE, "line_number": SITE_LINE,
+            "is_explicit": is_explicit, "type_state": state,
+            "primary_type_symbol": symbol,
+            "evidence": {
+                "file_path": SITE_FILE, "line_number": SITE_LINE, "infer_kind": "call_result",
+                "is_explicit": is_explicit, "type_state": state
+            }
+        })
+    }
+
+    /// A service holding the model's row and `entries` at it.
+    fn service_with(entries: Vec<serde_json::Value>) -> CloudRepoData {
+        let mut data: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "web", "service_name": "web",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {}, "imported_handlers": [],
+            "function_definitions": {},
+            "last_updated": "2026-10-14T00:00:00Z",
+            "commit_hash": "aaaa1111",
+            "type_manifest": entries,
+        }))
+        .expect("a service deserializes");
+        let mut graph = crate::mount_graph::MountGraph::default();
+        graph.data_calls.push(DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "/api/v1/runs".to_string(),
+            canonical_path: "/api/v1/runs".to_string(),
+            client: "queryOptions(".to_string(),
+            file_location: format!("{SITE_FILE}:{SITE_LINE}"),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(SITE_LINE),
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ResolutionSource::Model),
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+            own_route: false,
+        });
+        data.mount_graph = Some(graph);
+        data
+    }
+
+    /// Confirm the row and return whether it lost the model's entry, with the
+    /// symbols of the entries left at it.
+    fn confirm(
+        model_symbol: Option<&str>,
+        entries: Vec<serde_json::Value>,
+        by_own_callee: bool,
+    ) -> (bool, Vec<Option<String>>) {
+        let mut data = service_with(entries);
+        let change = apply(
+            &mut data,
+            &site_row(model_symbol),
+            &reached_runs(),
+            by_own_callee,
+            false,
+        );
+        let Some(Change::Relabelled { model_type_dropped }) = change else {
+            panic!("the row is confirmed");
+        };
+        let call = &data.mount_graph.as_ref().unwrap().data_calls[0];
+        assert_eq!(call.role, Some(ConsumerRole::WrapperCall));
+        assert_eq!(call.reaches_request.as_deref(), Some("src/requests.ts:8"));
+        let left = data
+            .type_manifest
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.primary_type_symbol)
+            .collect();
+        (model_type_dropped, left)
+    }
+
+    /// The model named the factory's input type for the outer call; the
+    /// request was reached through the callback inside it.
+    #[test]
+    fn a_row_confirmed_through_a_callback_loses_the_type_the_model_named() {
+        assert_eq!(
+            confirm(Some("Options"), vec![entry(true, Some("Options"))], false),
+            (true, vec![])
+        );
+    }
+
+    #[test]
+    fn a_row_confirmed_through_a_callback_keeps_the_type_the_compiler_read() {
+        // The compiler's read, stamped with the model's symbol or not.
+        assert_eq!(
+            confirm(
+                Some("Options"),
+                vec![entry(false, Some("Options")), entry(false, None)],
+                false
+            ),
+            (false, vec![Some("Options".to_string()), None])
+        );
+        // A source annotation under another symbol.
+        assert_eq!(
+            confirm(Some("Options"), vec![entry(true, Some("Run"))], false),
+            (false, vec![Some("Run".to_string())])
+        );
+        // The model named nothing; the entry's symbol is the compiler's.
+        assert_eq!(
+            confirm(None, vec![entry(true, Some("Run"))], false),
+            (false, vec![Some("Run".to_string())])
+        );
+    }
+
+    /// The row's own call reached the request, so what it returns is what
+    /// the caller reads of it, and the model's symbol names that.
+    #[test]
+    fn a_row_confirmed_by_its_own_callee_keeps_the_type_the_model_named() {
+        assert_eq!(
+            confirm(Some("Run"), vec![entry(true, Some("Run"))], true),
+            (false, vec![Some("Run".to_string())])
+        );
     }
 }

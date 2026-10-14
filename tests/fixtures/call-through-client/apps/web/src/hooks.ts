@@ -1,7 +1,7 @@
-import { useQuery } from "@fixture/query";
-import { getRunOptions, listRuns, recordAudit } from "@fixture/client";
+import { queryOptions, useQuery } from "@fixture/query";
+import { getRun, getRunOptions, getStatus, listRuns, recordAudit } from "@fixture/client";
 import { retry, withSpinner } from "./spinner";
-import type { RunList } from "./models";
+import type { RunList, RunQueryInput } from "./models";
 declare const vendor: { send(body: unknown): Promise<unknown> };
 
 /** The hook is spread the options a client function returns. */
@@ -23,3 +23,16 @@ export async function auditVisit(entry: unknown) {
 export async function sendWithRetry(body: unknown) {
   await retry(() => vendor.send(body), { onRetry: () => recordAudit({ body }) });
 }
+
+/** The hook is handed one callback, and the model states its request. */
+export function useStatus() {
+  return useQuery({ queryKey: ["status"], queryFn: () => getStatus() });
+}
+
+/** Query options built by the query library's helper around one callback. */
+export const runQueryOptions = (options: RunQueryInput) => {
+  return queryOptions({
+    queryKey: ["run", options.path],
+    queryFn: () => getRun(options),
+  });
+};
