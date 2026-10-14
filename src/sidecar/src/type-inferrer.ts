@@ -3071,9 +3071,28 @@ export class TypeInferrer {
           this.getNodeLocation(registrationHandler)
         );
       }
-      // A genuinely payload-less handler (no typed request read): do NOT fall
-      // through to read the registration call's return type, which would emit a
-      // spurious framework type. Report unresolved, as before this capability.
+      // carrick#827: the handler reads nothing from its parameters, so the
+      // route takes no request body, and that is a decision. Left undecided,
+      // the capture re-reads this same span and publishes the registration
+      // call's own type (`void` wherever the server library resolves) as the
+      // route's request contract.
+      if (this.handlerReadsNothingFromItsParameters(registrationHandler)) {
+        this.log(
+          `Route registration at ${request.file_path}:${request.line_number}: its handler reads ` +
+            'nothing from its parameters; the route takes no request body'
+        );
+        return this.decidedAbstain(request, this.getNodeLocation(registrationHandler), {
+          path: '',
+          kind: 'unknown',
+          reason: 'no_request_body',
+          detail:
+            "the route's handler reads nothing from its parameters (each use of one is a call " +
+            'whose value it discards or returns), so the route takes no request body',
+        });
+      }
+      // A handler that reads from a parameter and states no type at the read:
+      // do NOT fall through to read the registration call's return type, which
+      // would emit a spurious framework type. Report unresolved, as before.
       this.log(
         `Route registration at ${request.file_path}:${request.line_number} has no typed request read; leaving unresolved`
       );
@@ -7483,6 +7502,69 @@ export class TypeInferrer {
     }
 
     return undefined;
+  }
+
+  /**
+   * True when `handler` reads nothing from the incoming message (carrick#827):
+   * every use of one of its parameters, named or destructured, is the receiver
+   * of a call chain whose value the handler discards or returns
+   * (`reply.json(result)`, `return c.status(201).json(result)`). That is a
+   * send. A returned chain must end in a call that takes an argument, so a
+   * read handed straight back (`return request.json()`) is not one.
+   *
+   * Anything else may be a read of the body and makes this false: a property
+   * read, a call whose value is used, a parameter handed whole to another
+   * function. No method or property name is consulted. A handler with no
+   * parameter has nothing to read from.
+   */
+  private handlerReadsNothingFromItsParameters(handler: FunctionLike): boolean {
+    const parameters = new Set<Node>(handler.getParameters());
+    const body = handler.getBody();
+    if (!body) return false;
+    const namesAParameter = (identifier: Node): boolean =>
+      (identifier.getSymbol()?.getDeclarations() ?? []).some((declaration) => {
+        const parameter = Node.isParameterDeclaration(declaration)
+          ? declaration
+          : Node.isBindingElement(declaration)
+            ? declaration.getFirstAncestorByKind(SyntaxKind.Parameter)
+            : undefined;
+        return parameter !== undefined && parameters.has(parameter);
+      });
+    for (const identifier of body.getDescendantsOfKind(SyntaxKind.Identifier)) {
+      if (!namesAParameter(identifier)) continue;
+      // Climb the call chain the parameter is the root receiver of.
+      let top: Node = identifier;
+      let lastCall: CallExpression | undefined;
+      for (;;) {
+        const parent = top.getParent();
+        if (!parent) break;
+        if (Node.isPropertyAccessExpression(parent) && parent.getExpression() === top) {
+          top = parent;
+        } else if (Node.isCallExpression(parent) && parent.getExpression() === top) {
+          lastCall = parent;
+          top = parent;
+        } else if (
+          (Node.isAwaitExpression(parent) ||
+            Node.isParenthesizedExpression(parent) ||
+            Node.isNonNullExpression(parent)) &&
+          parent.getExpression() === top
+        ) {
+          top = parent;
+        } else {
+          break;
+        }
+      }
+      // The chain has to end in a call: a property read yields a value.
+      if (!lastCall || this.unwrapExpressionNode(top) !== lastCall) return false;
+      const holder = top.getParent();
+      const discarded = !!holder && Node.isExpressionStatement(holder);
+      const returned =
+        !!holder &&
+        (Node.isReturnStatement(holder) || (holder === handler && handler.getBody() === top)) &&
+        lastCall.getArguments().length > 0;
+      if (!discarded && !returned) return false;
+    }
+    return true;
   }
 
   /**
