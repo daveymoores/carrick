@@ -3759,6 +3759,10 @@ export class TypeInferrer {
     where: string,
     callArgs: Type[]
   ): { payload: Type } | { abstain: string } | undefined {
+    const deferred = this.deferredConditionalPayload(type, at, projections, where, callArgs);
+    if (deferred !== undefined) {
+      return deferred;
+    }
     const shape = this.resultCarrierArguments(type, at, callArgs);
     if (!shape) {
       return undefined;
@@ -3841,6 +3845,93 @@ export class TypeInferrer {
   }
 
   /**
+   * carrick#1841: the branches of a conditional type the compiler left
+   * deferred on a type parameter, each with its promise-like peeled, or
+   * `undefined` for any other type.
+   *
+   * Inside a generic function whose result depends on a type parameter it has
+   * not fixed (`<Throw extends boolean>(o) => client.get<Table, Errors,
+   * Throw>(…)`), the call's result is such a conditional. The compiler states
+   * what its branches allow itself: the constraint of the conditional, which
+   * is its apparent type. No branch is read off the alias's declaration.
+   */
+  private deferredConditionalBranches(type: Type): Type[] | undefined {
+    const compilerType = type.compilerType;
+    if (!(compilerType.flags & ts.TypeFlags.Conditional)) return undefined;
+    const checked = (compilerType as ts.ConditionalType).checkType;
+    if (!(checked.flags & ts.TypeFlags.TypeParameter)) return undefined;
+    let apparent: Type;
+    try {
+      apparent = type.getApparentType();
+    } catch {
+      return undefined;
+    }
+    if (apparent === type || apparent.isUnknown() || apparent.isAny()) return undefined;
+    const members = apparent.isUnion() ? apparent.getUnionTypes() : [apparent];
+    return members.map((member) => this.unwrapThenableType(this.unwrapPromiseType(member)));
+  }
+
+  /**
+   * carrick#1841: what a call result deferred on a type parameter carries,
+   * read through its branches. `undefined` where `type` is no such
+   * conditional, or none of its branches is a result carrier, and the type
+   * keeps the answer it had.
+   *
+   * Each branch that is a carrier is read by the carrier read, with the
+   * call's own type arguments. Every one of them must name the same payload,
+   * by the compiler's type identity, and every other branch must hold that
+   * payload as the type of one of its members (the branch a client answers
+   * with when it throws on failure holds the body and no error side). Then
+   * the payload is the body whichever branch the caller fixes. A carrier
+   * branch that states no contract decides for the whole. Branches that
+   * disagree state none: the conditional is the client's bookkeeping and is
+   * never published as written.
+   */
+  private deferredConditionalPayload(
+    type: Type,
+    at: Node,
+    projections: Node[],
+    where: string,
+    callArgs: Type[]
+  ): { payload: Type } | { abstain: string } | undefined {
+    const branches = this.deferredConditionalBranches(type);
+    if (!branches) return undefined;
+    const reads = branches.map((branch) => ({
+      branch,
+      read: this.resultCarrierPayload(branch, at, projections, where, callArgs),
+    }));
+    const carriers = reads.flatMap((entry) => (entry.read ? [entry.read] : []));
+    if (carriers.length === 0) return undefined;
+    const abstained = carriers.find((read): read is { abstain: string } => 'abstain' in read);
+    if (abstained) return abstained;
+    const [{ payload }] = carriers as Array<{ payload: Type }>;
+    const isPayload = (candidate: Type): boolean => candidate.compilerType === payload.compilerType;
+    if (!(carriers as Array<{ payload: Type }>).every((read) => isPayload(read.payload))) {
+      return {
+        abstain:
+          "the call's result depends on a type parameter and its branches carry different " +
+          'bodies, so this site states no response contract',
+      };
+    }
+    const holdsPayload = (branch: Type): boolean =>
+      branch.getProperties().some((property) => {
+        try {
+          return isPayload(property.getTypeAtLocation(at));
+        } catch {
+          return false;
+        }
+      });
+    if (!reads.every((entry) => entry.read !== undefined || holdsPayload(entry.branch))) {
+      return {
+        abstain:
+          "the call's result depends on a type parameter and one of its branches does not " +
+          'hold the body the others carry, so this site states no response contract',
+      };
+    }
+    return { payload };
+  }
+
+  /**
    * The value of a response table's one success row, for a table a carrier
    * holds as itself rather than through its body. `undefined` where the table
    * has more than one success row: their union has no single type here.
@@ -3901,6 +3992,16 @@ export class TypeInferrer {
   ):
     | { carrier: Type; carried: Type[]; bodies: Map<Type, Type>; readOffCall: boolean }
     | undefined {
+    // carrick#1841: a conditional deferred on a type parameter is a carrier
+    // where one of its branches is.
+    const deferredBranches = this.deferredConditionalBranches(type);
+    if (deferredBranches) {
+      for (const branch of deferredBranches) {
+        const shape = this.resultCarrierArguments(branch, at, callArgs);
+        if (shape) return shape;
+      }
+      return undefined;
+    }
     const carrier = this.unwrapThenableType(this.unwrapPromiseType(type));
     if (!carrier.isUnion()) {
       return undefined;
