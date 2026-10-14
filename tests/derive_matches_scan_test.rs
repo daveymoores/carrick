@@ -236,6 +236,25 @@ struct Scan {
     /// The `service_name` of every blob the run stored; `None` is the service
     /// at the repository root.
     stored: BTreeSet<Option<String>>,
+    /// Every line of the run's own debug log (`~/.carrick/logs`).
+    log: String,
+}
+
+/// Every line under `home/.carrick/logs`.
+fn read_logs(home: &Path) -> String {
+    let mut log = String::new();
+    let mut dirs = vec![home.join(".carrick/logs")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                log.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    log
 }
 
 /// Scan `repo` with the built binary as the GitHub Action does: from inside
@@ -243,9 +262,12 @@ struct Scan {
 fn scan(repo: &Path, path: &str, store: &Path) -> Scan {
     let _ = std::fs::remove_dir_all(store);
     std::fs::create_dir_all(store).unwrap();
+    let home = store.with_file_name("home");
+    let _ = std::fs::remove_dir_all(&home);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(path)
         .current_dir(repo)
+        .env("HOME", &home)
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_SKIP_INTENTS", "1")
         .env("CARRICK_ALLOW_UNPREPARED", "1")
@@ -285,6 +307,7 @@ fn scan(repo: &Path, path: &str, store: &Path) -> Scan {
             String::from_utf8_lossy(&run.stderr)
         ),
         stored,
+        log: read_logs(&home),
     }
 }
 
@@ -357,9 +380,9 @@ fn a_member_whose_only_source_is_another_members_is_no_service() {
 }
 
 /// The scan of that workspace, run as the Action runs it and by its absolute
-/// path: it succeeds, the member with source is indexed, and the closing
-/// lines name the member derive left out and the service whose walk read
-/// nothing. Once with every service in a subdirectory and once with a service
+/// path: it succeeds, the member with source is indexed, and the member derive
+/// left out and the service whose walk read nothing are in the debug log and
+/// not in what a person reads. Once with every service in a subdirectory and once with a service
 /// at the repository root.
 #[test]
 fn a_scan_leaves_out_what_holds_no_source_and_indexes_the_rest() {
@@ -378,19 +401,20 @@ fn a_scan_leaves_out_what_holds_no_source_and_indexes_the_rest() {
                 indexed.insert(None);
             }
             assert_eq!(run.stored, indexed, "{name} at {path}: {said}");
-            let closing = said
-                .split("What this scan could not classify")
-                .nth(1)
-                .unwrap_or_else(|| panic!("{name} at {path} states no boundary: {said}"));
-            assert!(
-                closing
-                    .contains("1 workspace member(s) left out, no JS/TS source: packages/settings"),
-                "{name} at {path}: {said}"
-            );
-            assert!(
-                closing.contains("checks: left out, the scan read no JS/TS source file in it"),
-                "{name} at {path}: {said}"
-            );
+            for line in [
+                "1 workspace member(s) left out, no JS/TS source: packages/settings",
+                "checks: left out, the scan read no JS/TS source file in it",
+            ] {
+                assert!(
+                    !said.contains(line),
+                    "{name} at {path}: a person is told what the index lacks: {said}"
+                );
+                assert!(
+                    run.log.contains(line),
+                    "{name} at {path}: the debug log keeps it: {}",
+                    run.log
+                );
+            }
         }
     }
 }
