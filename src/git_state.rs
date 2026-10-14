@@ -263,6 +263,12 @@ pub fn head_commit(repo_path: &str) -> Result<String, String> {
 /// `Err` when either is not a commit id this clone holds, or git could not
 /// answer: a commit that is not here cannot be compared, which is not the
 /// same as one that differs.
+///
+/// Answered from the two trees alone, so a partial clone that holds them but
+/// not every file's contents answers offline (carrick#2365). `diff-tree` is
+/// plumbing: it compares entries by object id and reads no diff driver,
+/// textconv or external diff, which porcelain `git diff --quiet` may run and
+/// which make it fetch missing contents.
 pub fn differs_under(repo_path: &str, a: &str, b: &str) -> Result<bool, String> {
     for commit in [a, b] {
         // A value that is not a hex object name never reaches git's argument
@@ -275,18 +281,31 @@ pub fn differs_under(repo_path: &str, a: &str, b: &str) -> Result<bool, String> 
             &["cat-file", "-e", &format!("{commit}^{{commit}}")],
         )?;
     }
-    let status = Command::new("git")
-        .args(["diff", "--quiet", "--no-renames", a, b, "--", "."])
+    let output = Command::new("git")
+        .args([
+            "diff-tree",
+            "--quiet",
+            "-r",
+            "--no-renames",
+            a,
+            b,
+            "--",
+            ".",
+        ])
         .current_dir(repo_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .status()
+        .output()
         .map_err(|e| e.to_string())?;
-    match status.code() {
+    match output.status.code() {
         Some(0) => Ok(false),
         Some(1) => Ok(true),
-        _ => Err(format!("git diff exited {status}")),
+        _ => Err(format!(
+            "git diff-tree exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
     }
 }
 
@@ -1179,7 +1198,7 @@ pub(crate) mod tests {
     /// lazy fetch fails loudly (carrick#2212). `a.txt` changed between the
     /// stored commit and HEAD, so the stored copy of it is not held; `b.txt`
     /// did not change. Returns the clone and the stored commit.
-    fn partial_clone_without_remote(
+    pub(crate) fn partial_clone_without_remote(
         filter: bool,
     ) -> (tempfile::TempDir, std::path::PathBuf, String) {
         let root = tempfile::TempDir::new().unwrap();

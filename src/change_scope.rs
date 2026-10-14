@@ -1229,7 +1229,7 @@ mod tests {
 
     // --- carrick#2228: main's copy judged by each service's inputs ---
 
-    use crate::git_state::tests::{committed_repo, git_in};
+    use crate::git_state::tests::{committed_repo, git_in, partial_clone_without_remote};
     use crate::pr_baseline::{MainCopy, main_copy};
 
     /// Three services: `web` imports a file of `api` by a relative path, and
@@ -1425,5 +1425,29 @@ mod tests {
             MainCopy::Stale,
             "a README change is a whole-tree difference"
         );
+    }
+
+    /// A blobless clone holds both commits' trees but not the stored commit's
+    /// copy of a file that changed since, and no remote answers. Whether the
+    /// trees differ is a question about trees: it is answered offline, and a
+    /// copy stored before that change is stale (carrick#2365). Some git
+    /// versions read file contents for `git diff --quiet`, fail to fetch them
+    /// and leave the copy counted as current. A full clone answers the same.
+    #[test]
+    fn a_blobless_clone_compares_trees_without_fetching_contents() {
+        for filter in [true, false] {
+            let (_root, clone, base) = partial_clone_without_remote(filter);
+            let head = git_in(&clone, &["rev-parse", "HEAD"]);
+            assert_eq!(
+                crate::git_state::differs_under(&clone.to_string_lossy(), &base, &head),
+                Ok(true),
+                "blobless: {filter}"
+            );
+            assert_eq!(
+                judged(&clone, &[], &[copy_at("api", &base)], &head),
+                MainCopy::Stale,
+                "blobless: {filter}"
+            );
+        }
     }
 }
