@@ -435,8 +435,7 @@ impl Visit for Tables {
 
 /// One enclosing loop during the walk.
 struct Frame {
-    /// The names its pattern binds, each with the index of its part.
-    bindings: Vec<(BindingKey, usize)>,
+    bindings: Bindings,
     /// The loop, or why it is unread.
     read: Result<Loop, String>,
 }
@@ -476,8 +475,11 @@ fn bound_keys(pat: &Pat) -> Vec<BindingKey> {
     names.0
 }
 
+/// The names a loop pattern binds, each with the index of the part it reads.
+type Bindings = Vec<(BindingKey, usize)>;
+
 /// A loop pattern's bindings and parts, or why it is not read.
-fn pattern_parts(pat: &Pat) -> Result<(Vec<(BindingKey, usize)>, Vec<Part>), String> {
+fn pattern_parts(pat: &Pat) -> Result<(Bindings, Vec<Part>), String> {
     let mut bindings = Vec::new();
     let mut parts = Vec::new();
     let mut bind = |key: BindingKey, part: Part| {
