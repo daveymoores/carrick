@@ -28,3 +28,14 @@ case it sends. `replay` keeps one edge to the route with its case unknown: the
 route exists, so it is not a missing endpoint. Before carrick#2048 the first
 case to reach the join replaced the layout's row and the others were
 discarded, so two of the three calls that state a case matched no route.
+
+## A `GET` handler that switches on a search parameter (carrick#2110)
+
+`app/api/reports/route.ts` exports `GET` alone. The handler reads `view` off
+the URL's search parameters and answers `totals`, `trend` and `export` from
+three branches. A dispatch case has two locations, a body field and a header,
+so the model answer states one row per value with location `body`, echoing
+the same three kinds of id as the table above.
+
+A `GET` carries no request body, so none of the three is a case. The scan
+must keep one `GET /api/reports` row with no case, stated by the file layout.

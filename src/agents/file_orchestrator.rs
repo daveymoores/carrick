@@ -8109,7 +8109,8 @@ impl FileOrchestrator {
         // A dispatch table is a fact about a HANDLER, not about a candidate:
         // there is no deterministic row for it to be joined onto and no
         // candidate id to drop it for. It travels through with the mounts.
-        result.dispatch_tables = dispatch_tables;
+        result.dispatch_tables =
+            Self::tables_with_a_body(dispatch_tables, &endpoints, &result.endpoints, file_path);
 
         // --- the producer side -------------------------------------------
 
@@ -8149,9 +8150,25 @@ impl FileOrchestrator {
         // row with no case that restates a route the model also states as
         // cases is then dropped whichever order the model answered in, rather
         // than taking the route before its cases reach it.
+        //
+        // A `body` case on a method that carries no request body is not a case
+        // (carrick#2110). GET and HEAD send none, so what the handler switched
+        // on was read off the URL, and a query parameter belongs to the path
+        // (`dispatch::DispatchLocation`). The row loses the case before
+        // anything is compared with it, and the readings of one route are
+        // folded into one row first, keeping only the anchors they all state
+        // (`fold_bodyless_cases`), so every path below sees one row.
+        let (endpoints, bodyless_cases_dropped) = Self::fold_bodyless_cases(endpoints);
         let (cases, plain): (Vec<EndpointResult>, Vec<EndpointResult>) = endpoints
             .into_iter()
             .partition(|endpoint| endpoint.dispatch.is_some());
+        if bodyless_cases_dropped > 0 {
+            debug!(
+                "Dropped the body case from {} model endpoint row(s) in {}: the method carries \
+                 no request body",
+                bodyless_cases_dropped, file_path
+            );
+        }
         for mut endpoint in cases.into_iter().chain(plain) {
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
@@ -9050,6 +9067,145 @@ impl FileOrchestrator {
             type_import_source: anchors.type_import_source,
             ..route.clone()
         }
+    }
+
+    /// Whether a model row states a `body` dispatch case on a method that
+    /// carries no request body (carrick#2110). GET and HEAD are the two HTTP
+    /// defines that way, so the field such a handler switches on is read off
+    /// the URL. A `header` case is a case on any method.
+    fn states_a_body_case_without_a_body(endpoint: &EndpointResult) -> bool {
+        endpoint
+            .dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.location == crate::dispatch::DispatchLocation::Body)
+            && Self::carries_no_body(&endpoint.method)
+    }
+
+    /// Fold the rows that lost a `body` case on a method with no request body
+    /// (carrick#2110) into one row per route, by [`Self::model_row_key`]. Every
+    /// other row passes through untouched and in order; a folded row sits
+    /// where the first of its readings did. Returns how many rows lost a case.
+    ///
+    /// Each branch of such a handler answers its own response, and one row
+    /// carries one type. An anchor is kept only where every folded reading
+    /// states the same one (text and line together, since one text at two
+    /// lines is two expressions); otherwise the row states none and its
+    /// consumers are unverifiable rather than judged against one branch.
+    fn fold_bodyless_cases(endpoints: Vec<EndpointResult>) -> (Vec<EndpointResult>, usize) {
+        let mut out: Vec<EndpointResult> = Vec::with_capacity(endpoints.len());
+        let mut folded: HashMap<String, usize> = HashMap::new();
+        let mut cleared = 0usize;
+        for mut endpoint in endpoints {
+            if !Self::states_a_body_case_without_a_body(&endpoint) {
+                out.push(endpoint);
+                continue;
+            }
+            endpoint.dispatch = None;
+            cleared += 1;
+            match folded.entry(Self::model_row_key(&endpoint)) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    Self::keep_agreeing_anchors(&mut out[*at.get()], &endpoint);
+                }
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(out.len());
+                    out.push(endpoint);
+                }
+            }
+        }
+        (out, cleared)
+    }
+
+    /// Keep each type anchor of `into` only where `other` states the very
+    /// same one; clear it otherwise, so a reading that states none, or a
+    /// different one, leaves the row stating none.
+    fn keep_agreeing_anchors(into: &mut EndpointResult, other: &EndpointResult) {
+        if (&into.payload_expression_text, into.payload_expression_line)
+            != (
+                &other.payload_expression_text,
+                other.payload_expression_line,
+            )
+        {
+            into.payload_expression_text = None;
+            into.payload_expression_line = None;
+        }
+        if (
+            &into.response_expression_text,
+            into.response_expression_line,
+        ) != (
+            &other.response_expression_text,
+            other.response_expression_line,
+        ) {
+            into.response_expression_text = None;
+            into.response_expression_line = None;
+        }
+        if into.emission_style != other.emission_style {
+            into.emission_style = None;
+        }
+        if (&into.primary_type_symbol, &into.type_import_source)
+            != (&other.primary_type_symbol, &other.type_import_source)
+        {
+            into.primary_type_symbol = None;
+            into.type_import_source = None;
+        }
+    }
+
+    /// The dispatch tables a file's answer states, less a `body` table whose
+    /// cases no call can send (carrick#2110). The switch reads the URL when
+    /// the rows that reach it all serve methods with no request body: either
+    /// the table's own handler serves only those, or every row that states a
+    /// body case on the table's field is on one (the switch may sit in a
+    /// helper the route handler calls, which states no row of its own).
+    /// Where no row of this file says either, the table is kept.
+    ///
+    /// The join cannot see which route calls a helper, so it proves this only
+    /// for the whole file: every route the file states, the model's rows and
+    /// the deterministic ones alike, is on GET or HEAD. One route on any
+    /// other method may reach the switch with a body, case stated or not, and
+    /// then every table is kept (fail closed).
+    fn tables_with_a_body(
+        tables: Vec<crate::dispatch::DispatchTable>,
+        model_rows: &[EndpointResult],
+        stated_rows: &[EndpointResult],
+        file_path: &str,
+    ) -> Vec<crate::dispatch::DispatchTable> {
+        let mut routes = model_rows.iter().chain(stated_rows).peekable();
+        let only_bodyless_routes =
+            routes.peek().is_some() && routes.all(|route| Self::carries_no_body(&route.method));
+        if !only_bodyless_routes {
+            return tables;
+        }
+        tables
+            .into_iter()
+            .filter(|table| {
+                if table.location != crate::dispatch::DispatchLocation::Body {
+                    return true;
+                }
+                // A row has to speak for the table: its handler serves a
+                // route here, or a row states a body case on its field.
+                let reached = model_rows.iter().any(|row| {
+                    table.handler_name.as_deref() == Some(row.handler_name.as_str())
+                        || row.dispatch.as_ref().is_some_and(|case| {
+                            case.location == crate::dispatch::DispatchLocation::Body
+                                && case.field == table.field
+                        })
+                });
+                if reached {
+                    debug!(
+                        "Dropped the body dispatch table on '{}' in {}: every route the file \
+                         states is on a method that carries no request body",
+                        table.field, file_path
+                    );
+                }
+                !reached
+            })
+            .collect()
+    }
+
+    /// GET and HEAD: the two HTTP methods that carry no request body.
+    fn carries_no_body(method: &str) -> bool {
+        ["GET", "HEAD"]
+            .iter()
+            .any(|bodyless| method.eq_ignore_ascii_case(bodyless))
     }
 
     /// Whether `endpoint` restates a row the join has already kept for this
@@ -18449,6 +18605,256 @@ export { routes };
         // route's own payload, so it carries the type anchor.
         assert_eq!(result.endpoints[0].candidate_id, "happy");
         assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// A GET carries no request body, so a `body` case on one is not a case
+    /// (carrick#2110): two values a handler reads off the query string are one
+    /// route stated twice, folded into one row. Each branch answers its own
+    /// response and one row carries one type, so the row keeps a response
+    /// only where every branch states the same one: two different responses,
+    /// or one stated beside one not, leave it stating none (unverifiable),
+    /// never the first branch's. A `header` case on the same method, and a
+    /// `body` case on a method that carries one, stay cases. A route a method
+    /// with a body states twice keeps the first row as it was: the fold's
+    /// anchor rule is the bodyless fold's alone.
+    #[test]
+    fn a_body_case_on_a_method_with_no_body_is_dropped_and_the_rows_are_one() {
+        let case = |location: crate::dispatch::DispatchLocation, value: &str| {
+            Some(crate::dispatch::Dispatch {
+                location,
+                field: "mode".to_string(),
+                value: value.to_string(),
+            })
+        };
+        let (body, header) = (
+            crate::dispatch::DispatchLocation::Body,
+            crate::dispatch::DispatchLocation::Header,
+        );
+        let mut candidates = HashMap::new();
+        let mut rows = Vec::new();
+        let one_reading = [("simple", None), ("advanced", Some("report"))];
+        for (line, method, path, location, readings) in [
+            (
+                10i32,
+                "GET",
+                "/reports/:id",
+                Some(body),
+                [("simple", Some("summary")), ("advanced", Some("report"))],
+            ),
+            (20, "head", "/reports/:id", Some(body), one_reading),
+            (
+                25,
+                "GET",
+                "/totals",
+                Some(body),
+                [("simple", Some("totals")), ("advanced", Some("totals"))],
+            ),
+            (30, "GET", "/feed", Some(header), one_reading),
+            (40, "POST", "/reports", Some(body), one_reading),
+            (50, "POST", "/orders", None, one_reading),
+        ] {
+            let id = format!("site{line}");
+            let mut candidate = candidate_with_snippet(&id, Some(&format!("'{path}'")));
+            candidate.span_start = line as u32 * 10;
+            candidate.span_end = line as u32 * 10 + 5;
+            candidate.line_number = line as usize;
+            candidate.end_line = line as usize;
+            candidate.callee_object = "app".to_string();
+            candidate.callee_property = Some(method.to_ascii_lowercase());
+            candidates.insert(id.clone(), candidate);
+            for (value, response) in readings {
+                rows.push(EndpointResult {
+                    handler_declaration_line: None,
+                    registration_literal: None,
+                    view_module: false,
+                    candidate_id: id.clone(),
+                    line_number: line,
+                    owner_node: "app".to_string(),
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    handler_name: "<anonymous>".to_string(),
+                    pattern_matched: "app.".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: response.map(str::to_string),
+                    response_expression_line: response.map(|_| line),
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    resolution_source: None,
+                    dispatch: location.and_then(|location| case(location, value)),
+                });
+            }
+        }
+
+        let (result, _) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: rows,
+                ..Default::default()
+            },
+            &candidates,
+            "src/reports.ts",
+        );
+
+        let mut kept: Vec<(i32, Option<String>, Option<&str>)> = result
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.line_number,
+                    endpoint.dispatch.as_ref().map(|case| case.key()),
+                    endpoint.response_expression_text.as_deref(),
+                )
+            })
+            .collect();
+        kept.sort();
+        let key = |location, value: &str| case(location, value).map(|case| case.key());
+        assert_eq!(
+            kept,
+            vec![
+                (10, None, None),
+                (20, None, None),
+                (25, None, Some("totals")),
+                (30, key(header, "advanced"), Some("report")),
+                (30, key(header, "simple"), None),
+                (40, key(body, "advanced"), Some("report")),
+                (40, key(body, "simple"), None),
+                (50, None, None),
+            ],
+        );
+    }
+
+    /// A `body` dispatch table whose cases no call can send (carrick#2110) is
+    /// not carried, and that is proven only when every route the file states
+    /// is GET or HEAD. One POST in the file, stated by the model with no case
+    /// or by the file layout, may call the same helper with a body, so every
+    /// table stays. A `header` table, and a body table no row speaks for,
+    /// always stay.
+    #[test]
+    fn a_body_dispatch_table_on_a_handler_with_no_body_is_dropped() {
+        let row = |method: &str, handler: &str, case: Option<&str>| EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: format!("{method}-{handler}"),
+            line_number: 1,
+            owner_node: String::new(),
+            method: method.to_string(),
+            path: format!("/{handler}"),
+            handler_name: handler.to_string(),
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: case.map(|field| crate::dispatch::Dispatch {
+                location: DispatchLocation::Body,
+                field: field.to_string(),
+                value: "a".to_string(),
+            }),
+        };
+        let table = |location: DispatchLocation, handler: Option<&str>, field: &str| {
+            crate::dispatch::DispatchTable {
+                location,
+                field: field.to_string(),
+                values: vec!["a".to_string(), "b".to_string()],
+                handler_name: handler.map(str::to_string),
+                file_path: String::new(),
+                line_number: None,
+                service_name: None,
+                repo_name: None,
+            }
+        };
+        // Each file: its model rows, its deterministic rows, and the tables
+        // that must survive (by handler and field) out of the three offered.
+        let offered = || {
+            vec![
+                table(DispatchLocation::Body, Some("reads"), "view"),
+                table(DispatchLocation::Header, Some("reads"), "view"),
+                table(DispatchLocation::Body, Some("helper"), "mode"),
+                table(DispatchLocation::Body, Some("elsewhere"), "other"),
+            ]
+        };
+        let every = [
+            (DispatchLocation::Body, "reads", "view"),
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "helper", "mode"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let header_and_unspoken = [
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let files: Vec<(&str, Vec<EndpointResult>, Vec<EndpointResult>, &[_])> = vec![
+            // Every route is GET or HEAD: the handler's table and the
+            // helper's table (linked by the body case on `mode`) go.
+            (
+                "only GET and HEAD",
+                vec![
+                    row("GET", "reads", None),
+                    row("HEAD", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![],
+                &header_and_unspoken,
+            ),
+            // A POST in the same file may call the helper, with no case
+            // stated: nothing proves the switch is GET-only.
+            (
+                "a POST with no case",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("POST", "submit", None),
+                ],
+                vec![],
+                &every,
+            ),
+            // The POST is stated by the file layout, not by the model.
+            (
+                "a deterministic POST",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![row("POST", "POST", None)],
+                &every,
+            ),
+        ];
+        for (label, model_rows, stated_rows, survive) in files {
+            let kept: Vec<(DispatchLocation, String, String)> =
+                FileOrchestrator::tables_with_a_body(
+                    offered(),
+                    &model_rows,
+                    &stated_rows,
+                    "src/reports.ts",
+                )
+                .into_iter()
+                .map(|table| {
+                    (
+                        table.location,
+                        table.handler_name.unwrap_or_default(),
+                        table.field,
+                    )
+                })
+                .collect();
+            let survive: Vec<(DispatchLocation, String, String)> = survive
+                .iter()
+                .map(|(location, handler, field)| {
+                    (*location, handler.to_string(), field.to_string())
+                })
+                .collect();
+            assert_eq!(kept, survive, "{label}");
+        }
     }
 
     /// Two routers declared in one file and mounted at different prefixes
