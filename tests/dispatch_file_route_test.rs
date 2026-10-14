@@ -133,7 +133,11 @@ fn a_file_route_that_dispatches_on_its_body_keeps_every_case() {
 /// A `GET` carries no request body, so the three values its handler reads off
 /// a search parameter are not dispatch cases, whatever location the model
 /// wrote for them (carrick#2110). The route is one row with no case, stated
-/// by the file layout, and it keeps a response anchor from the answer.
+/// by the file layout. Its three branches answer three responses, and the
+/// route's response is all three, never the first branch's alone. The join
+/// keeps no one branch's response anchor (the unit test
+/// `a_body_case_on_a_method_with_no_body_is_dropped_and_the_rows_are_one`
+/// pins that); the type here is the handler's own inferred return.
 #[test]
 fn a_get_file_route_that_switches_on_a_search_parameter_is_one_row() {
     let reports = endpoints_at(REPORTS);
@@ -143,6 +147,13 @@ fn a_get_file_route_that_switches_on_a_search_parameter_is_one_row() {
     assert!(report["dispatch"].is_null(), "no case: {report}");
     assert_eq!(report["resolution_source"], "file_based_route");
     assert_eq!(report["file"], "app/api/reports/route.ts");
+    let response = report["expanded_definition"].as_str().unwrap_or_default();
+    for branch in ["totals", "trend", "rows"] {
+        assert!(
+            response.contains(branch),
+            "the route answers every branch's response, `{branch}` too: {report}"
+        );
+    }
 }
 
 /// Each call links to the route once: one edge per call. A call that states

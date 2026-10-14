@@ -8109,7 +8109,7 @@ impl FileOrchestrator {
         // A dispatch table is a fact about a HANDLER, not about a candidate:
         // there is no deterministic row for it to be joined onto and no
         // candidate id to drop it for. It travels through with the mounts.
-        result.dispatch_tables = dispatch_tables;
+        result.dispatch_tables = Self::tables_with_a_body(dispatch_tables, &endpoints, file_path);
 
         // --- the producer side -------------------------------------------
 
@@ -8154,18 +8154,12 @@ impl FileOrchestrator {
         // (carrick#2110). GET and HEAD send none, so what the handler switched
         // on was read off the URL, and a query parameter belongs to the path
         // (`dispatch::DispatchLocation`). The row loses the case before
-        // anything is compared with it, and the rows that then agree are one
-        // row by the rule every restated route already takes below.
-        let mut bodyless_cases_dropped = 0usize;
+        // anything is compared with it, and the readings of one route are
+        // folded into one row first, keeping only the anchors they all state
+        // (`fold_bodyless_cases`), so every path below sees one row.
+        let (endpoints, bodyless_cases_dropped) = Self::fold_bodyless_cases(endpoints);
         let (cases, plain): (Vec<EndpointResult>, Vec<EndpointResult>) = endpoints
             .into_iter()
-            .map(|mut endpoint| {
-                if Self::states_a_body_case_without_a_body(&endpoint) {
-                    endpoint.dispatch = None;
-                    bodyless_cases_dropped += 1;
-                }
-                endpoint
-            })
             .partition(|endpoint| endpoint.dispatch.is_some());
         if bodyless_cases_dropped > 0 {
             debug!(
@@ -8225,7 +8219,7 @@ impl FileOrchestrator {
                             );
                             taken[index] = Taken::Cases;
                             if !Self::restates_a_kept_row(
-                                &mut result.endpoints[deterministic_rows..],
+                                &result.endpoints[deterministic_rows..],
                                 &row,
                                 file_path,
                             ) {
@@ -8310,7 +8304,7 @@ impl FileOrchestrator {
             // agrees with a deterministic row must fold onto it and keep its
             // source, which is the twin search below.
             if Self::restates_a_kept_row(
-                &mut result.endpoints[deterministic_rows..],
+                &result.endpoints[deterministic_rows..],
                 &endpoint,
                 file_path,
             ) {
@@ -9083,30 +9077,157 @@ impl FileOrchestrator {
             .dispatch
             .as_ref()
             .is_some_and(|dispatch| dispatch.location == crate::dispatch::DispatchLocation::Body)
-            && ["GET", "HEAD"]
-                .iter()
-                .any(|method| endpoint.method.eq_ignore_ascii_case(method))
+            && Self::carries_no_body(&endpoint.method)
+    }
+
+    /// Fold the rows that lost a `body` case on a method with no request body
+    /// (carrick#2110) into one row per route, by [`Self::model_row_key`]. Every
+    /// other row passes through untouched and in order; a folded row sits
+    /// where the first of its readings did. Returns how many rows lost a case.
+    ///
+    /// Each branch of such a handler answers its own response, and one row
+    /// carries one type. An anchor is kept only where every folded reading
+    /// states the same one (text and line together, since one text at two
+    /// lines is two expressions); otherwise the row states none and its
+    /// consumers are unverifiable rather than judged against one branch.
+    fn fold_bodyless_cases(endpoints: Vec<EndpointResult>) -> (Vec<EndpointResult>, usize) {
+        let mut out: Vec<EndpointResult> = Vec::with_capacity(endpoints.len());
+        let mut folded: HashMap<String, usize> = HashMap::new();
+        let mut cleared = 0usize;
+        for mut endpoint in endpoints {
+            if !Self::states_a_body_case_without_a_body(&endpoint) {
+                out.push(endpoint);
+                continue;
+            }
+            endpoint.dispatch = None;
+            cleared += 1;
+            match folded.entry(Self::model_row_key(&endpoint)) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    Self::keep_agreeing_anchors(&mut out[*at.get()], &endpoint);
+                }
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(out.len());
+                    out.push(endpoint);
+                }
+            }
+        }
+        (out, cleared)
+    }
+
+    /// Keep each type anchor of `into` only where `other` states the very
+    /// same one; clear it otherwise, so a reading that states none, or a
+    /// different one, leaves the row stating none.
+    fn keep_agreeing_anchors(into: &mut EndpointResult, other: &EndpointResult) {
+        if (&into.payload_expression_text, into.payload_expression_line)
+            != (
+                &other.payload_expression_text,
+                other.payload_expression_line,
+            )
+        {
+            into.payload_expression_text = None;
+            into.payload_expression_line = None;
+        }
+        if (
+            &into.response_expression_text,
+            into.response_expression_line,
+        ) != (
+            &other.response_expression_text,
+            other.response_expression_line,
+        ) {
+            into.response_expression_text = None;
+            into.response_expression_line = None;
+        }
+        if into.emission_style != other.emission_style {
+            into.emission_style = None;
+        }
+        if (&into.primary_type_symbol, &into.type_import_source)
+            != (&other.primary_type_symbol, &other.type_import_source)
+        {
+            into.primary_type_symbol = None;
+            into.type_import_source = None;
+        }
+    }
+
+    /// The dispatch tables a file's answer states, less a `body` table whose
+    /// cases no call can send (carrick#2110). The switch reads the URL when
+    /// the rows that reach it all serve methods with no request body: either
+    /// the table's own handler serves only those, or every row that states a
+    /// body case on the table's field is on one (the switch may sit in a
+    /// helper the route handler calls, which states no row of its own).
+    /// Where no row of this file says either, the table is kept.
+    fn tables_with_a_body(
+        tables: Vec<crate::dispatch::DispatchTable>,
+        endpoints: &[EndpointResult],
+        file_path: &str,
+    ) -> Vec<crate::dispatch::DispatchTable> {
+        // Some(true) when `rows` is non-empty and every one of them is on a
+        // method with no body; None when there is no row to say.
+        fn all_bodyless<'a>(rows: impl Iterator<Item = &'a EndpointResult>) -> Option<bool> {
+            let mut any = false;
+            for row in rows {
+                any = true;
+                if !FileOrchestrator::carries_no_body(&row.method) {
+                    return Some(false);
+                }
+            }
+            any.then_some(true)
+        }
+        tables
+            .into_iter()
+            .filter(|table| {
+                if table.location != crate::dispatch::DispatchLocation::Body {
+                    return true;
+                }
+                let by_handler = table.handler_name.as_deref().and_then(|handler| {
+                    all_bodyless(
+                        endpoints
+                            .iter()
+                            .filter(|endpoint| endpoint.handler_name == handler),
+                    )
+                });
+                let by_field = all_bodyless(endpoints.iter().filter(|endpoint| {
+                    endpoint.dispatch.as_ref().is_some_and(|case| {
+                        case.location == crate::dispatch::DispatchLocation::Body
+                            && case.field == table.field
+                    })
+                }));
+                let unsendable = by_handler == Some(true) || by_field == Some(true);
+                if unsendable {
+                    debug!(
+                        "Dropped the body dispatch table on '{}' in {}: the rows that reach it \
+                         serve only methods that carry no request body",
+                        table.field, file_path
+                    );
+                }
+                !unsendable
+            })
+            .collect()
+    }
+
+    /// GET and HEAD: the two HTTP methods that carry no request body.
+    fn carries_no_body(method: &str) -> bool {
+        ["GET", "HEAD"]
+            .iter()
+            .any(|bodyless| method.eq_ignore_ascii_case(bodyless))
     }
 
     /// Whether `endpoint` restates a row the join has already kept for this
-    /// file, by [`Self::model_row_key`]. Logged when it does, and the kept
-    /// row takes the type anchors it does not state from the one dropped.
+    /// file, by [`Self::model_row_key`]. Logged when it does.
     fn restates_a_kept_row(
-        kept: &mut [EndpointResult],
+        kept: &[EndpointResult],
         endpoint: &EndpointResult,
         file_path: &str,
     ) -> bool {
         let key = Self::model_row_key(endpoint);
-        let Some(row) = kept.iter_mut().find(|row| Self::model_row_key(row) == key) else {
-            return false;
-        };
-        warn!(
-            "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
-             emitted for this file: dropped",
-            endpoint.method, endpoint.path, file_path
-        );
-        Self::carry_type_anchors(row, endpoint);
-        true
+        let restates = kept.iter().any(|row| Self::model_row_key(row) == key);
+        if restates {
+            warn!(
+                "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
+                 emitted for this file: dropped",
+                endpoint.method, endpoint.path, file_path
+            );
+        }
+        restates
     }
 
     /// A model row with no dispatch case, for a route the model also states
@@ -18491,9 +18612,14 @@ export { routes };
 
     /// A GET carries no request body, so a `body` case on one is not a case
     /// (carrick#2110): two values a handler reads off the query string are one
-    /// route stated twice. The row kept is the first, and it takes the type
-    /// anchor it does not state from the row dropped. A `header` case on the
-    /// same method, and a `body` case on a method that carries one, stay.
+    /// route stated twice, folded into one row. Each branch answers its own
+    /// response and one row carries one type, so the row keeps a response
+    /// only where every branch states the same one: two different responses,
+    /// or one stated beside one not, leave it stating none (unverifiable),
+    /// never the first branch's. A `header` case on the same method, and a
+    /// `body` case on a method that carries one, stay cases. A route a method
+    /// with a body states twice keeps the first row as it was: the fold's
+    /// anchor rule is the bodyless fold's alone.
     #[test]
     fn a_body_case_on_a_method_with_no_body_is_dropped_and_the_rows_are_one() {
         let case = |location: crate::dispatch::DispatchLocation, value: &str| {
@@ -18509,11 +18635,26 @@ export { routes };
         );
         let mut candidates = HashMap::new();
         let mut rows = Vec::new();
-        for (line, method, path, location) in [
-            (10i32, "GET", "/reports/:id", body),
-            (20, "head", "/reports/:id", body),
-            (30, "GET", "/feed", header),
-            (40, "POST", "/reports", body),
+        let one_reading = [("simple", None), ("advanced", Some("report"))];
+        for (line, method, path, location, readings) in [
+            (
+                10i32,
+                "GET",
+                "/reports/:id",
+                Some(body),
+                [("simple", Some("summary")), ("advanced", Some("report"))],
+            ),
+            (20, "head", "/reports/:id", Some(body), one_reading),
+            (
+                25,
+                "GET",
+                "/totals",
+                Some(body),
+                [("simple", Some("totals")), ("advanced", Some("totals"))],
+            ),
+            (30, "GET", "/feed", Some(header), one_reading),
+            (40, "POST", "/reports", Some(body), one_reading),
+            (50, "POST", "/orders", None, one_reading),
         ] {
             let id = format!("site{line}");
             let mut candidate = candidate_with_snippet(&id, Some(&format!("'{path}'")));
@@ -18524,7 +18665,7 @@ export { routes };
             candidate.callee_object = "app".to_string();
             candidate.callee_property = Some(method.to_ascii_lowercase());
             candidates.insert(id.clone(), candidate);
-            for (value, response) in [("simple", None), ("advanced", Some("report"))] {
+            for (value, response) in readings {
                 rows.push(EndpointResult {
                     handler_declaration_line: None,
                     registration_literal: None,
@@ -18546,7 +18687,7 @@ export { routes };
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
-                    dispatch: case(location, value),
+                    dispatch: location.and_then(|location| case(location, value)),
                 });
             }
         }
@@ -18576,12 +18717,104 @@ export { routes };
         assert_eq!(
             kept,
             vec![
-                (10, None, Some("report")),
-                (20, None, Some("report")),
+                (10, None, None),
+                (20, None, None),
+                (25, None, Some("totals")),
                 (30, key(header, "advanced"), Some("report")),
                 (30, key(header, "simple"), None),
                 (40, key(body, "advanced"), Some("report")),
                 (40, key(body, "simple"), None),
+                (50, None, None),
+            ],
+        );
+    }
+
+    /// A `body` dispatch table whose cases no call can send (carrick#2110) is
+    /// not carried: its handler serves only methods with no request body, or
+    /// (for a switch in a helper the route calls) every row stating a body
+    /// case on its field is on one. A `header` table, a body table whose
+    /// handler or field also reaches a method with a body, and a body table
+    /// no row of the file speaks for are all kept.
+    #[test]
+    fn a_body_dispatch_table_on_a_handler_with_no_body_is_dropped() {
+        let row = |method: &str, handler: &str, case: Option<&str>| EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: format!("{method}-{handler}"),
+            line_number: 1,
+            owner_node: String::new(),
+            method: method.to_string(),
+            path: format!("/{handler}"),
+            handler_name: handler.to_string(),
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: case.map(|field| crate::dispatch::Dispatch {
+                location: DispatchLocation::Body,
+                field: field.to_string(),
+                value: "a".to_string(),
+            }),
+        };
+        let table = |location: DispatchLocation, handler: Option<&str>, field: &str| {
+            crate::dispatch::DispatchTable {
+                location,
+                field: field.to_string(),
+                values: vec!["a".to_string(), "b".to_string()],
+                handler_name: handler.map(str::to_string),
+                file_path: String::new(),
+                line_number: None,
+                service_name: None,
+                repo_name: None,
+            }
+        };
+        let endpoints = [
+            row("GET", "reads", None),
+            row("HEAD", "reads", None),
+            row("GET", "mixed", None),
+            row("POST", "mixed", None),
+            row("GET", "anonymous", Some("mode")),
+            row("GET", "anonymous", Some("mode")),
+            row("GET", "anonymous", Some("kind")),
+            row("POST", "anonymous", Some("kind")),
+        ];
+        let tables = vec![
+            table(DispatchLocation::Body, Some("reads"), "view"),
+            table(DispatchLocation::Header, Some("reads"), "view"),
+            table(DispatchLocation::Body, Some("mixed"), "view"),
+            table(DispatchLocation::Body, Some("elsewhere"), "view"),
+            table(DispatchLocation::Body, None, "view"),
+            table(DispatchLocation::Body, Some("helper"), "mode"),
+            table(DispatchLocation::Body, Some("helper"), "kind"),
+        ];
+
+        let kept: Vec<(DispatchLocation, Option<String>, String)> =
+            FileOrchestrator::tables_with_a_body(tables, &endpoints, "src/reports.ts")
+                .into_iter()
+                .map(|table| (table.location, table.handler_name, table.field))
+                .collect();
+
+        let named = |handler: &str| Some(handler.to_string());
+        assert_eq!(
+            kept,
+            vec![
+                (DispatchLocation::Header, named("reads"), "view".to_string()),
+                (DispatchLocation::Body, named("mixed"), "view".to_string()),
+                (
+                    DispatchLocation::Body,
+                    named("elsewhere"),
+                    "view".to_string()
+                ),
+                (DispatchLocation::Body, None, "view".to_string()),
+                (DispatchLocation::Body, named("helper"), "kind".to_string()),
             ],
         );
     }
