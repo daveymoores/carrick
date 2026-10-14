@@ -3793,7 +3793,7 @@ fn arbitrate_model_symbol(
             ..req.clone()
         }),
         SymbolRelationKind::Nullable | SymbolRelationKind::Different => {
-            info!(
+            debug!(
                 alias = %alias,
                 explicit_symbol = %req.symbol_name,
                 relation = ?relation.relation,
