@@ -3489,7 +3489,7 @@ export class TypeInferrer {
       }
 
       return {
-        terminal: this.bindingValueNode(lastNode),
+        terminal: lastNode,
         projectionOnly: projections.length > 0 && !sawWholeRead,
         projections,
       };
@@ -3526,18 +3526,6 @@ export class TypeInferrer {
     if (!executor || this.unwrapExpressionNode(executor) !== func) return false;
     const constructed = returned.getType();
     return this.unwrapPromiseType(constructed) !== constructed;
-  }
-
-  /**
-   * The node that carries the type of the value a declaration binds. A
-   * declaration that destructures (`const { items } = await load()`) has no
-   * type of its own, and the checker answers `any` for it; its pattern holds
-   * the type of the value it takes apart (carrick#2112).
-   */
-  private bindingValueNode(node: Node): Node {
-    if (!Node.isVariableDeclaration(node)) return node;
-    const name = node.getNameNode();
-    return Node.isIdentifier(name) ? node : name;
   }
 
   /**
