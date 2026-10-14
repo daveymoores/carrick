@@ -313,6 +313,13 @@ export async function parsedThroughAHelper() {
   console.log(token);
 }
 
+declare function fetchEnvelope(path: string): Promise<{ body: Item; response: Response }>;
+
+export async function destructuredEnvelope() {
+  const { body: envelopeBody } = await fetchEnvelope('/envelope');
+  console.log(envelopeBody);
+}
+
 export async function untypedThenParsed() {
   const raw = await readRaw();
   const item = parseItem(raw);
@@ -385,16 +392,11 @@ describe('carrick#2112: a later expression answers for a call only when it resta
   });
 
   it('reads the call, not a value computed from a spread of its result', async () => {
-    // A destructuring declaration has no type of its own: the checker answers
-    // `any` for it, so the inferrer states none here and the capture's own
-    // read of the call answers the row, behind its machinery guard. Reading
-    // the pattern instead was measured and rejected: a helper that returns
-    // `{ body, response }` then publishes that envelope, where the capture
-    // degrades it. What matters here is that the value computed later is no
-    // longer the answer.
+    // A destructuring declaration has no type of its own (the checker answers
+    // `any` for it), so the call answers for the value it takes apart.
     assert.strictEqual(
       await callResult('Spread', 'api.getPage(id)', 'const { items } = await api.getPage(id)'),
-      'any'
+      'Page'
     );
   });
 
@@ -453,6 +455,15 @@ describe('carrick#2112: a later expression answers for a call only when it resta
     assert.strictEqual(
       await callResult('ParseHelper', "fetch(url + '/token')", 'const helperRes'),
       '{ access: string; expires: number; }'
+    );
+  });
+
+  // A helper's own envelope around a transport response is never published
+  // from the inferrer: its text would bypass the capture's machinery guard.
+  it('leaves a destructured transport envelope to the capture', async () => {
+    assert.strictEqual(
+      await callResult('DestructuredEnvelope', "fetchEnvelope('/envelope')", 'const { body: envelopeBody }'),
+      'any'
     );
   });
 

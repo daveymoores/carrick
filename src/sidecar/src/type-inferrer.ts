@@ -3494,13 +3494,38 @@ export class TypeInferrer {
       }
 
       return {
-        terminal: lastNode,
+        terminal: this.destructuredValueTerminal(lastNode, binding.node, callExpr, callValueIsTransport),
         projectionOnly: projections.length > 0 && !sawWholeRead,
         projections,
       };
     }
 
     return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /**
+   * Where the walk ends on the call's own destructuring binding (`const {
+   * tasks } = await api.list()`), the declaration has no type of its own: the
+   * checker answers `any` for it. The value it takes apart is the call's, so
+   * the call answers (carrick#2112). Not for a transport value: a helper's
+   * `{ body, response }` read as text would bypass the capture's machinery
+   * guard, so that binding stays unread and the capture answers the row.
+   */
+  private destructuredValueTerminal(
+    lastNode: Node,
+    bindingNode: Node,
+    callExpr: CallExpression,
+    callValueIsTransport: boolean
+  ): Node {
+    if (
+      lastNode !== bindingNode ||
+      callValueIsTransport ||
+      !Node.isVariableDeclaration(lastNode) ||
+      Node.isIdentifier(lastNode.getNameNode())
+    ) {
+      return lastNode;
+    }
+    return callExpr;
   }
 
   /**
