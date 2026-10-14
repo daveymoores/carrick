@@ -68,6 +68,7 @@ import {
   constituents,
   httpStatus,
   statesNoBody,
+  statesNoShape,
   statusKeyCode,
   statusTableOf,
   successEntries,
@@ -5517,6 +5518,12 @@ export class TypeInferrer {
     wire: WireFormat = 'declared'
   ): string {
     try {
+      // carrick#2116: a narrowed `unknown` or `object`, at the root or as a
+      // member of the root union, states no shape. It would print `{}` or
+      // `object` and be judged as a body that lacks every field.
+      if (statesNoShape(this.project.getTypeChecker().compilerObject, type.compilerType)) {
+        return 'unknown';
+      }
       const expanded = expandTypeStructural(type, this.expandOrigin(), { wire });
       // A wire print that differs from the declared one is the answer even
       // without an inlined object: a bare `Date` payload sends a string.
