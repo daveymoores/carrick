@@ -125,16 +125,40 @@ fn read_blobs(storage: &Path) -> BTreeMap<String, (PathBuf, serde_json::Value)> 
 
 /// Scan a committed copy of the fixture offline, once for the whole binary.
 fn blobs() -> &'static Blobs {
-    static BLOBS: OnceLock<Blobs> = OnceLock::new();
-    BLOBS.get_or_init(|| {
+    &scan().0
+}
+
+/// The line the pass logs at debug about what it settled, read from the run
+/// log the scan keeps under its home directory.
+fn settled_line() -> &'static str {
+    &scan().1
+}
+
+fn scan() -> &'static (Blobs, String) {
+    static SCAN: OnceLock<(Blobs, String)> = OnceLock::new();
+    SCAN.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = committed_copy(tmp.path());
         let storage = tmp.path().join("storage");
         std::fs::create_dir_all(&storage).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
         let mut cmd = scan_command(&repo, &storage);
         cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
-            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"));
+            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
+            .env("HOME", &home);
         run(cmd);
+        let settled = std::fs::read_dir(home.join(".carrick/logs/runs"))
+            .expect("the scan keeps a run log")
+            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+            .flat_map(|log| {
+                log.lines()
+                    .filter(|line| line.contains("Call-through rows settled"))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .expect("the pass logs what it settled");
         let blobs: Blobs = read_blobs(&storage)
             .into_iter()
             .map(|(service, (_, blob))| (service, blob))
@@ -144,8 +168,35 @@ fn blobs() -> &'static Blobs {
             SERVICES,
             "every service uploads one blob"
         );
-        blobs
+        (blobs, settled)
     })
+}
+
+/// The response verdicts stored for the call at `file:line`, each with the
+/// producer operation it was judged against.
+fn response_verdicts_at(file: &str, line: u32) -> Vec<(String, String)> {
+    let site = format!("{file}:{line}");
+    blobs()
+        .values()
+        .flat_map(|blob| {
+            blob["compat_verdicts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .flat_map(|pair| {
+            let producer = text(&pair["producer_key"]).unwrap_or_default();
+            pair["sites"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|at| at["consumer_location"] == site.as_str())
+                .filter_map(|at| text(&at["response"]["verdict"]))
+                .map(|verdict| (producer.clone(), verdict))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn text(value: &serde_json::Value) -> Option<String> {
@@ -284,23 +335,66 @@ fn a_row_the_model_stated_correctly_stays_the_models_and_keeps_its_type_anchor()
     );
 }
 
+/// The corrected row's own call is the call that reaches the request, so the
+/// type anchored at it is what the caller reads of that request: it is kept
+/// under the reached operation and judged against that operation's producer.
 #[test]
-fn a_corrected_row_carries_no_type_entry() {
-    for (service, file, line) in [
-        ("cli", COMMANDS, 9),
-        ("cli", COMMANDS, 15),
-        ("cli", COMMANDS, 21),
-        ("cli", COMMANDS, 46),
-        ("web", HOOKS, 9),
-        ("web", HOOKS, 14),
-        ("web", HOOKS, 19),
-    ] {
-        let entries = consumer_entries_at(service, file, line);
+fn a_corrected_row_keeps_its_type_and_is_judged_against_the_reached_operation() {
+    let entries = consumer_entries_at("cli", COMMANDS, 9);
+    assert!(
+        entries.iter().any(|entry| {
+            entry["type_kind"] == "response"
+                && entry["method"] == "GET"
+                && entry["path"] == "/api/v1/runs/:id"
+                && entry["primary_type_symbol"] == "Run"
+        }),
+        "the response entry is keyed to the reached operation: {entries:#?}"
+    );
+    assert!(
+        entries.iter().all(|entry| entry["path"] != "/getRun"),
+        "no entry keeps the path the model made up: {entries:#?}"
+    );
+    assert_eq!(
+        response_verdicts_at(COMMANDS, 9),
+        [(
+            "http|GET|/api/v1/runs/:id".to_string(),
+            "compatible".to_string()
+        )]
+    );
+}
+
+/// The caller's type is a stale copy: it requires a field the API no longer
+/// sends. The model's row named a path nothing serves, so nothing was
+/// compared; the corrected row is compared and the break is found.
+#[test]
+fn a_stale_type_at_a_corrected_row_is_found() {
+    assert_eq!(
+        response_verdicts_at(COMMANDS, 46),
+        [(
+            "http|PUT|/api/v1/runs/:id".to_string(),
+            "incompatible".to_string()
+        )]
+    );
+}
+
+/// The request is reached through a callback or a spread call, so the row's
+/// call is the hook's and the type anchored there is the hook's result, not
+/// what the request returns. Those entries go, and are counted.
+#[test]
+fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
+    for (file, line) in [(HOOKS, 9), (HOOKS, 14), (HOOKS, 19)] {
+        let entries = consumer_entries_at("web", file, line);
         assert!(
             entries.is_empty(),
-            "no type is asked for at a call through ({file}:{line}): {entries:?}"
+            "no type is carried from a hook's call ({file}:{line}): {entries:#?}"
         );
+        assert_eq!(response_verdicts_at(file, line), []);
     }
+    assert!(
+        settled_line().contains("(3 lost the types anchored at a call that is not the request's)"),
+        "{}",
+        settled_line()
+    );
 }
 
 #[test]
@@ -512,7 +606,11 @@ fn the_boundary_counts_the_settled_rows() {
         .iter()
         .filter_map(text)
         .collect();
-    for line in [9, 15, 21, 46, 101] {
+    // Lines 9 and 46 carry a resolved type. Line 15 never held a type entry
+    // (the model's base kept its key off every route), so no type is asked
+    // for there. A corrected row whose carried entry resolved no type (lines
+    // 21 and 101) is a call missing its type like any other.
+    for line in [9, 15, 46] {
         let site = format!("({COMMANDS}:{line})");
         assert!(
             !untyped.iter().any(|reason| reason.ends_with(&site)),

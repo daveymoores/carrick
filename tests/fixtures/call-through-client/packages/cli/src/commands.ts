@@ -1,12 +1,12 @@
 import { ping, send } from "@fixture/client";
 import { createClient } from "./api-client";
 import { createProbedClient } from "./probed-client";
-import type { Status } from "./types";
+import type { Run, SavedRun, Status } from "./types";
 
 /** A command that calls one client method. */
 export async function showRun(id: string) {
   const client = createClient();
-  const run = await client.getRun(id);
+  const run: Run = await client.getRun(id);
   return run;
 }
 
@@ -43,7 +43,7 @@ async function save(id: string, token: unknown) {
 
 /** Both functions reach a request. The row is the call to `save`. */
 export async function saveWithToken(id: string) {
-  const saved = await save(id, await loadToken());
+  const saved: SavedRun = await save(id, await loadToken());
   return saved;
 }
 

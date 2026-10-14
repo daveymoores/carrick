@@ -1,7 +1,7 @@
 import { useQuery } from "@fixture/query";
 import { getRunOptions, listRuns, recordAudit } from "@fixture/client";
 import { retry, withSpinner } from "./spinner";
-
+import type { RunList } from "./models";
 declare const vendor: { send(body: unknown): Promise<unknown> };
 
 /** The hook is spread the options a client function returns. */
@@ -11,7 +11,7 @@ export function useRun(id: string) {
 
 /** The hook is handed one callback, which calls into the client. */
 export function useRuns() {
-  return useQuery({ queryKey: ["runs"], queryFn: () => listRuns() });
+  return useQuery<RunList>({ queryKey: ["runs"], queryFn: () => listRuns() });
 }
 
 /** A callback handed to one of the app's own functions. */

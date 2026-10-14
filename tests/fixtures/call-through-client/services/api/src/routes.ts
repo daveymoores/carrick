@@ -1,5 +1,5 @@
 import express from "express";
-
+import type { Run } from "./types";
 const app = express();
 app.use(express.json());
 
@@ -8,11 +8,11 @@ app.get("/api/v1/runs", (_req, res) => {
 });
 
 app.get("/api/v1/runs/:id", (req, res) => {
-  res.json({ id: req.params.id, state: "done" });
+  res.json({ id: req.params.id, state: "done" } satisfies Run);
 });
 
 app.put("/api/v1/runs/:id", (req, res) => {
-  res.json({ id: req.params.id, state: req.body.state });
+  res.json({ id: req.params.id, state: req.body.state } satisfies Run);
 });
 
 app.get("/api/v1/status", (_req, res) => {

@@ -26,6 +26,14 @@ source `request_summary`, the role `wrapper_call` and `reaches_request`. Line
 (`commands.ts:28`) keeps its `model` source and its type entry, and gains the
 role and the link.
 
+Types at the corrected rows:
+
+| Site | The type anchored there |
+|---|---|
+| `commands.ts:9` | `Run`, which matches what the API sends: kept under the reached operation and judged compatible |
+| `commands.ts:46` | `SavedRun`, a stale copy that requires a field the API no longer sends: kept and judged incompatible |
+| `hooks.ts:9`, `:14`, `:19` | anchored at a hook's or a runner's call, whose result is not what the request returns: dropped and counted |
+
 Rows that stay as the model stated them:
 
 | Site | Why |
