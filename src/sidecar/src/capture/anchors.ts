@@ -21,7 +21,7 @@ import {
 import { typeIsOrContainsMachinery } from './machinery.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
-import { statusTableBody } from './status-table.js';
+import { statesNoShape, statusTableBody } from './status-table.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
   unresolvedAtAnchor,
@@ -496,6 +496,13 @@ function finishInferAnchor(
       const recovered = checker.getTypeAtLocation(literalNode);
       if (!isTopType(recovered)) type = recovered;
     }
+  }
+  // carrick#2116: a narrowed `unknown` (the checker's own empty object type)
+  // and `object` state no shape, at the root or as a member of the root
+  // union. Printed they read `{}` and `object`, and would be judged as a
+  // shape that lacks every field. They are read as the `unknown` they are.
+  if (statesNoShape(checker, type)) {
+    type = checker.getUnknownType();
   }
   // carrick#766: a LINE-ONLY anchor whose type came back a bare top type has
   // no evidence on either side, so it must abstain.

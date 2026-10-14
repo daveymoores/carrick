@@ -941,6 +941,7 @@ export {
   constituents,
   httpStatus,
   statesNoBody,
+  statesNoShape,
   statusKeyCode,
   statusTableBody,
   statusTableOf,
