@@ -166,7 +166,7 @@ describe('carrick#2317: one project', () => {
     'src/globals.d.ts': [
       'export {};',
       'declare global {',
-      "  interface Request { tenant: { id: string; plan: 'free' | 'paid' } }",
+      "  interface Request { tenant: { id: string; plan: 'basic' | 'team' } }",
       '}',
       '',
     ].join('\n'),
@@ -220,7 +220,7 @@ describe('carrick#2317: one project', () => {
       anchors: [inferAnchor('Tenant', 'src/tenant.ts', tenant, 'request.tenant')],
     });
     assert.ok(result.success, result.errors.join('\n'));
-    assertTyped(result, 'Tenant', [/id: string/, /plan: "free" \| "paid"/]);
+    assertTyped(result, 'Tenant', [/id: string/, /plan: "basic" \| "team"/]);
   });
 
   it('makes no root of a file that declares no augmentation: the stub is the same with and without it', () => {

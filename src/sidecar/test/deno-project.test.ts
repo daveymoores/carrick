@@ -238,7 +238,7 @@ export type Configured = DomainGlobal;
       write('deno.json', JSON.stringify({ compilerOptions: { strict: true } }));
       write('augment.ts', `export {};
 declare global {
-  interface Request { tenant: { id: string; plan: 'free' | 'paid' } }
+  interface Request { tenant: { id: string; plan: 'basic' | 'team' } }
 }
 `);
       const handler = `export function tenantOf(request: Request) {
@@ -255,7 +255,7 @@ declare global {
       assert.equal(record.self_check, 'ok', JSON.stringify(record) + surface);
       assert.equal(record.top_type_at_self_check, false);
       assert.equal(record.any_provenance, undefined);
-      assert.match(surface.replace(/\s+/g, ' '), /export type Tenant = \{ id: string; plan: "free" \| "paid"; \}/);
+      assert.match(surface.replace(/\s+/g, ' '), /export type Tenant = \{ id: string; plan: "basic" \| "team"; \}/);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
