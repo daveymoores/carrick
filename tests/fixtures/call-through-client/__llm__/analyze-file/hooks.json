@@ -1,0 +1,58 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/v1/runs/${id}",
+      "method": "GET",
+      "pattern_matched": "useQuery(",
+      "call_expression_text": "useQuery({ ...getRunOptions({ path: { id } }) })",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:14",
+      "line_number": 14,
+      "target": "/api/runs",
+      "method": "GET",
+      "pattern_matched": "useQuery(",
+      "call_expression_text": "useQuery({ queryKey: [\"runs\"], queryFn: () => listRuns() })",
+      "call_expression_line": 14,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "RunList",
+      "type_import_source": "./models"
+    },
+    {
+      "candidate_id": "model:19",
+      "line_number": 19,
+      "target": "/audit",
+      "method": "POST",
+      "pattern_matched": "withSpinner(",
+      "call_expression_text": "withSpinner(() => recordAudit({ body: entry }))",
+      "call_expression_line": 19,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:24",
+      "line_number": 24,
+      "target": "/vendor/send",
+      "method": "POST",
+      "pattern_matched": "retry(",
+      "call_expression_text": "retry(() => vendor.send(body), { onRetry: () => recordAudit({ body }) })",
+      "call_expression_line": 24,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

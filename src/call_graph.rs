@@ -71,7 +71,9 @@
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::{BindingResolver, DEFAULT_EXPORT, Lookup, ResolvedBinding};
 use crate::parser::parse_file;
-use crate::receiver_type::{ReceiverTypes, module_scope_types};
+use crate::receiver_type::{
+    FactoryCall, FactoryTables, ReceiverTypes, StatedReturn, factory_tables, module_scope_types,
+};
 use crate::visitor::{
     CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, FunctionDefinitionExtractor,
     ImportSymbolExtractor, ImportedSymbol, SymbolKind,
@@ -143,6 +145,9 @@ pub struct FileCallIndex {
     /// TokenService()`. What lets `tokens.issue()` in an importing file
     /// resolve to `TokenService.issue`.
     pub instances: ReceiverTypes,
+    /// What each module-scope function states it returns, and the module-scope
+    /// bindings a factory call initialises ([`factory_tables`], carrick#1146).
+    pub factories: FactoryTables,
 }
 
 /// What resolution reads from a file OUTSIDE the scanned service, parsed on
@@ -152,6 +157,7 @@ struct ExternalModule {
     definitions: HashMap<String, u32>,
     imports: HashMap<String, ImportedSymbol>,
     instances: ReceiverTypes,
+    factories: FactoryTables,
 }
 
 /// One class member a workspace package's surface publishes.
@@ -178,6 +184,29 @@ fn class_member(key: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((class, member))
+}
+
+/// How many functions a factory may hand its result through before one states
+/// the class: `getClient()` returning `createClient()` returning `new C()` is
+/// three functions, two hops (carrick#1146).
+const FACTORY_CHAIN_DEPTH: usize = 2;
+
+/// One module's resolution tables, wherever the module sits: in the scanned
+/// service's index, or outside it and parsed on first use.
+#[derive(Clone)]
+enum ModuleRef<'a> {
+    Indexed(&'a FileCallIndex),
+    External(PathBuf),
+}
+
+impl ModuleRef<'_> {
+    /// The path an import written in this module resolves from.
+    fn importer(&self) -> PathBuf {
+        match self {
+            Self::Indexed(index) => index.path.clone(),
+            Self::External(file) => file.clone(),
+        }
+    }
 }
 
 /// Where a resolved call lands.
@@ -573,21 +602,25 @@ impl ImportedBindings {
 
 /// The definition each resolved call site reaches, keyed by the file the site
 /// is written in (as walked, like [`FileCallIndex::path`]) and the site's
-/// span start in the discovery source map.
+/// span start and end in the discovery source map.
 ///
 /// The edge list on a [`FunctionDefinition`] says WHICH functions a function
 /// calls; it cannot say which call reaches which, because it is deduplicated
 /// and carries a line, not a span. A request summary is instantiated per call
 /// site with that site's own arguments (carrick#1555), so it needs the site.
+///
+/// Keyed by start AND end: a call made on what another call returns
+/// (`getClient().getRun(id)`) starts where that call does, and both are
+/// resolved sites (carrick#1146).
 #[derive(Debug, Default)]
 pub struct CallSiteTargets {
-    /// Span start -> the site's span end and the definition it reaches.
-    by_file: HashMap<PathBuf, HashMap<u32, ReachedAt>>,
+    /// (span start, span end) -> the definition the site reaches.
+    by_file: HashMap<PathBuf, BTreeMap<(u32, u32), ReachedAt>>,
 }
 
-/// A resolved call site's span end, and the definition (file as walked,
-/// definition key) it reaches.
-type ReachedAt = (u32, (PathBuf, String));
+/// The definition (file as walked, definition key) a resolved call site
+/// reaches, and the line that definition opens on.
+type ReachedAt = ((PathBuf, String), u32);
 
 impl CallSiteTargets {
     fn record(&mut self, file: &Path, span: swc_common::Span, target: &Target) {
@@ -595,23 +628,37 @@ impl CallSiteTargets {
             return;
         }
         self.by_file.entry(file.to_path_buf()).or_default().insert(
-            span.lo.0,
-            (span.hi.0, (target.file.clone(), target.key.clone())),
+            (span.lo.0, span.hi.0),
+            ((target.file.clone(), target.key.clone()), target.line),
         );
+    }
+
+    /// Every call site of `file` that resolution followed: its span start and
+    /// end in the discovery source map, and the file and opening line of the
+    /// definition it reaches. The file and line are how a definition is named
+    /// across services, where a definition key is one service's own
+    /// (carrick#1146).
+    pub fn sites_in(&self, file: &Path) -> impl Iterator<Item = (u32, u32, &Path, u32)> {
+        self.by_file.get(file).into_iter().flat_map(|sites| {
+            sites
+                .iter()
+                .map(|((lo, hi), ((target, _), line))| (*lo, *hi, target.as_path(), *line))
+        })
     }
 
     /// The definition (file as walked, definition key) the call whose span
     /// starts at `span_lo` in `file` reaches, if resolution followed it.
     ///
     /// A call made on what another call returns (`make().send()`) starts
-    /// where that call does, so this names the inner call's definition for
-    /// both; [`Self::target_at`] tells them apart. The request summaries
-    /// still read this one (carrick#1695).
+    /// where that call does, so this names the shortest call at that start,
+    /// the inner one; [`Self::target_at`] tells them apart. The request
+    /// summaries still read this one (carrick#1695).
     pub fn target(&self, file: &Path, span_lo: u32) -> Option<&(PathBuf, String)> {
         self.by_file
             .get(file)?
-            .get(&span_lo)
-            .map(|(_, target)| target)
+            .range((span_lo, 0)..=(span_lo, u32::MAX))
+            .next()
+            .map(|(_, (target, _))| target)
     }
 
     /// The definition the call spanning exactly `span_lo..span_hi` reaches
@@ -619,9 +666,8 @@ impl CallSiteTargets {
     pub fn target_at(&self, file: &Path, span_lo: u32, span_hi: u32) -> Option<&(PathBuf, String)> {
         self.by_file
             .get(file)?
-            .get(&span_lo)
-            .filter(|(hi, _)| *hi == span_hi)
-            .map(|(_, target)| target)
+            .get(&(span_lo, span_hi))
+            .map(|(target, _)| target)
     }
 }
 
@@ -888,6 +934,7 @@ impl<'a> CallResolver<'a> {
                         .collect(),
                     imports: call_resolution_imports(&module, imports.imported_symbols).0,
                     instances: module_scope_types(&module),
+                    factories: factory_tables(&module),
                 }
             });
             self.external.insert(file.to_path_buf(), parsed);
@@ -943,6 +990,12 @@ impl<'a> CallResolver<'a> {
                 self.resolve_class_member(index, &declared, &callee.name)
             }
             CalleeShape::Member(_) => self.resolve_member(index, callee),
+            // `f().x()`: the member of the class `f`'s declaration states,
+            // exactly as for `const c = f(); c.x()` (carrick#1146).
+            CalleeShape::FactoryResult => {
+                let factory = callee.receiver.factory.as_ref()?;
+                self.resolve_factory_member(&ModuleRef::Indexed(index), factory, &callee.name)
+            }
         }
     }
 
@@ -991,8 +1044,124 @@ impl<'a> CallResolver<'a> {
         if callee.receiver.declared {
             return None;
         }
-        let specifier = callee.receiver.origin.as_deref()?;
-        self.resolve_surface_member(specifier, &callee.name)
+        if let Some(specifier) = callee.receiver.origin.as_deref()
+            && let Some(target) = self.resolve_surface_member(specifier, &callee.name)
+        {
+            return Some(target);
+        }
+        let factory = callee.receiver.factory.as_ref()?;
+        self.resolve_factory_member(&ModuleRef::Indexed(index), factory, &callee.name)
+    }
+
+    /// `client.foo(...)` where `const client = createClient()`: the member of
+    /// the class the declaration of `createClient` states it returns
+    /// (carrick#1146).
+    ///
+    /// Tried last, so every edge the forms above already state is unchanged.
+    /// The class name is resolved in the module that WRITES it, the factory's
+    /// own: a class that module declares, or the one its import names. So two
+    /// classes of one name in two files are never confused, and a name that
+    /// is an interface, a type alias or a type parameter reaches no member
+    /// and states no edge.
+    ///
+    /// A factory whose call yields a promise states the class only where the
+    /// binding awaits it.
+    fn resolve_factory_member(
+        &mut self,
+        module: &ModuleRef<'a>,
+        factory: &FactoryCall,
+        member: &str,
+    ) -> Option<Target> {
+        let (module, class, promised) =
+            self.factory_class(module, &factory.callee, FACTORY_CHAIN_DEPTH)?;
+        if promised && !factory.awaited {
+            return None;
+        }
+        if let Some(target) = self.definition_in(&module, member_keys(&class, member)) {
+            return Some(target);
+        }
+        let symbol = self.import_in(&module, &class)?;
+        let binding = self.resolve_import(&module.importer(), &symbol)?;
+        let declaring_class = binding
+            .local_name
+            .clone()
+            .unwrap_or_else(|| symbol.imported_name.clone());
+        self.lookup_in_file(&binding.file, member_keys(&declaring_class, member))
+    }
+
+    /// The class a call to `function`, as `module` names it, returns: the
+    /// module that writes the class name, the name, and whether the caller
+    /// receives a promise of it. `hops` is how many more functions the walk
+    /// may pass through when one returns another's call.
+    fn factory_class(
+        &mut self,
+        module: &ModuleRef<'a>,
+        function: &str,
+        hops: usize,
+    ) -> Option<(ModuleRef<'a>, String, bool)> {
+        let (module, stated) = match self.stated_return(module, function) {
+            Some(stated) => (module.clone(), stated),
+            // Not a function of this module: the one its import names.
+            None => {
+                let symbol = self.import_in(module, function)?;
+                if matches!(symbol.kind, SymbolKind::Namespace) {
+                    return None;
+                }
+                let binding = self.resolve_import(&module.importer(), &symbol)?;
+                let declared = binding
+                    .local_name
+                    .clone()
+                    .unwrap_or_else(|| symbol.imported_name.clone());
+                let module = self.module_ref(binding.file);
+                let stated = self.stated_return(&module, &declared)?;
+                (module, stated)
+            }
+        };
+        match stated {
+            StatedReturn::Class { name, promised } => Some((module, name, promised)),
+            StatedReturn::Call { callee, promised } => {
+                let hops = hops.checked_sub(1)?;
+                let (module, class, inner) = self.factory_class(&module, &callee, hops)?;
+                Some((module, class, promised || inner))
+            }
+        }
+    }
+
+    fn module_ref(&self, file: PathBuf) -> ModuleRef<'a> {
+        match self.per_file.get(&file) {
+            Some(index) => ModuleRef::Indexed(index),
+            None => ModuleRef::External(file),
+        }
+    }
+
+    fn stated_return(&mut self, module: &ModuleRef<'a>, function: &str) -> Option<StatedReturn> {
+        match module {
+            ModuleRef::Indexed(index) => index.factories.returns.get(function).cloned(),
+            ModuleRef::External(file) => self
+                .external_module(file)?
+                .factories
+                .returns
+                .get(function)
+                .cloned(),
+        }
+    }
+
+    fn import_in(&mut self, module: &ModuleRef<'a>, local: &str) -> Option<ImportedSymbol> {
+        match module {
+            ModuleRef::Indexed(index) => index.imports.get(local).cloned(),
+            ModuleRef::External(file) => self.external_module(file)?.imports.get(local).cloned(),
+        }
+    }
+
+    fn definition_in(
+        &mut self,
+        module: &ModuleRef<'a>,
+        keys: impl IntoIterator<Item = String>,
+    ) -> Option<Target> {
+        match module {
+            ModuleRef::Indexed(index) => keys.into_iter().find_map(|key| same_file(index, key)),
+            ModuleRef::External(file) => self.lookup_in_file(file, keys),
+        }
     }
 
     /// `obj.foo(...)` where `obj`'s value traces back to a workspace package:
@@ -1154,7 +1323,22 @@ impl<'a> CallResolver<'a> {
     fn resolve_instance_member(&mut self, binding: &ResolvedBinding, name: &str) -> Option<Target> {
         // A binding with no local name is an anonymous default export.
         let local = binding.local_name.as_deref().unwrap_or(DEFAULT_EXPORT);
-        let (class, import) = self.module_instance(&binding.file, local)?;
+        let Some((class, import)) = self.module_instance(&binding.file, local) else {
+            // `export const tokens = makeTokens()`: the module states no class
+            // for the binding, and the factory's declaration may
+            // (carrick#1146).
+            let module = self.module_ref(binding.file.clone());
+            let factory = match &module {
+                ModuleRef::Indexed(index) => index.factories.bindings.get(local).cloned(),
+                ModuleRef::External(file) => self
+                    .external_module(file)?
+                    .factories
+                    .bindings
+                    .get(local)
+                    .cloned(),
+            }?;
+            return self.resolve_factory_member(&module, &factory, name);
+        };
         let Some(symbol) = import else {
             return self.lookup_in_file(&binding.file, member_keys(&class, name));
         };
@@ -1442,6 +1626,48 @@ mod tests {
     use swc_ecma_visit::VisitWith;
     use tempfile::TempDir;
 
+    /// `getClient().getRun(id)`: the outer call starts where the inner one
+    /// does. Both are kept (carrick#1146); `target` still answers the inner
+    /// call, as it did when only one call per start was recorded, and
+    /// `target_at` answers each.
+    #[test]
+    fn two_sites_with_one_start_are_both_kept() {
+        let file = Path::new("/repo/src/commands.ts");
+        let reached = |key: &str, line: u32| Target {
+            file: PathBuf::from("/repo/src/client.ts"),
+            key: key.to_string(),
+            line,
+        };
+        let span = |lo: u32, hi: u32| {
+            swc_common::Span::new(swc_common::BytePos(lo), swc_common::BytePos(hi))
+        };
+        let mut sites = CallSiteTargets::default();
+        // Outer first, so an insert keyed by start alone would lose it.
+        sites.record(file, span(10, 32), &reached("Client.getRun", 7));
+        sites.record(file, span(10, 21), &reached("getClient", 3));
+
+        let answer = |found: Option<&(PathBuf, String)>| found.map(|(_, key)| key.clone());
+        assert_eq!(
+            answer(sites.target(file, 10)),
+            Some("getClient".to_string())
+        );
+        assert_eq!(
+            answer(sites.target_at(file, 10, 21)),
+            Some("getClient".to_string())
+        );
+        assert_eq!(
+            answer(sites.target_at(file, 10, 32)),
+            Some("Client.getRun".to_string())
+        );
+        assert_eq!(sites.target_at(file, 10, 30), None);
+        let mut listed: Vec<(u32, u32, u32)> = sites
+            .sites_in(file)
+            .map(|(lo, hi, _, line)| (lo, hi, line))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, vec![(10, 21, 3), (10, 32, 7)]);
+    }
+
     /// Parse each `(relative path, source)` pair into the same shape discovery
     /// builds: the merged definition map plus the per-file call index.
     fn scan(files: &[(&str, &str)]) -> (TempDir, HashMap<String, FunctionDefinition>) {
@@ -1528,6 +1754,7 @@ mod tests {
                 computed_requires,
                 field_types: functions.field_types,
                 instances: module_scope_types(&module),
+                factories: factory_tables(&module),
             };
             per_file.insert(path.clone(), index);
             per_file_definitions.push((path.clone(), functions.function_definitions));
@@ -3002,6 +3229,60 @@ mod tests {
             "{:?}",
             callee_names(&defs, "read")
         );
+        drop(dir);
+    }
+
+    /// A receiver bound from a factory call takes the class the factory's
+    /// declaration states (carrick#1146), and the class name is read in the
+    /// module that writes it: two files each declare a `Client`, and each
+    /// factory reaches its own.
+    #[test]
+    fn a_factory_bound_receiver_resolves_to_the_class_its_factory_states() {
+        let (dir, defs) = scan(&[
+            (
+                "src/runs/client.ts",
+                "export class Client {\n  get(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "src/runs/factory.ts",
+                "import { Client } from \"./client\";\n\
+                 export function createRuns(): Client {\n  return new Client();\n}\n",
+            ),
+            (
+                "src/mail/client.ts",
+                "export class Client {\n  get(id: string) {\n    return id;\n  }\n}\n\
+                 export const createMail = () => new Client();\n\
+                 export const mail = createMail();\n",
+            ),
+            (
+                "src/read.ts",
+                "import { createRuns } from \"./runs/factory\";\n\
+                 import { createMail, mail } from \"./mail/client\";\n\
+                 export function readRun(id: string) {\n  \
+                 const runs = createRuns();\n  return runs.get(id);\n}\n\
+                 export function readMail(id: string) {\n  \
+                 const client = createMail();\n  return client.get(id);\n}\n\
+                 export function readShared(id: string) {\n  return mail.get(id);\n}\n",
+            ),
+        ]);
+
+        let run = callee_names(&defs, "readRun");
+        assert_eq!(run, ["Client.get", "createRuns"]);
+        let files = callee_files(&defs, "readRun");
+        assert!(files[0].ends_with("src/runs/client.ts"), "{files:?}");
+
+        let files = callee_files(&defs, "readMail");
+        assert_eq!(
+            callee_names(&defs, "readMail"),
+            ["Client.get", "createMail"]
+        );
+        assert!(files[0].ends_with("src/mail/client.ts"), "{files:?}");
+
+        // An imported module-scope binding its module initialises from a
+        // factory call.
+        let files = callee_files(&defs, "readShared");
+        assert_eq!(callee_names(&defs, "readShared"), ["Client.get"]);
+        assert!(files[0].ends_with("src/mail/client.ts"), "{files:?}");
         drop(dir);
     }
 
