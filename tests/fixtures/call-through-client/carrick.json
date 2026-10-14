@@ -6,11 +6,7 @@
       "directory": "packages/client",
       "internalEnvVars": ["RUNS_ORIGIN"]
     },
-    {
-      "serviceName": "cli",
-      "directory": "packages/cli",
-      "internalEnvVars": ["RUNS_ORIGIN"]
-    },
+    { "serviceName": "cli", "directory": "packages/cli" },
     { "serviceName": "web", "directory": "apps/web" }
   ]
 }
