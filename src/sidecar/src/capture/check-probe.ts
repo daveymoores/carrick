@@ -139,7 +139,32 @@ export interface ProbePlan {
    * the form that actually travels.
    */
   wireAssignmentLine?: number;
+  /**
+   * 1-based line where the second reading of the sent side starts
+   * (carrick#1538): the import of the producer's UNWIDENED alias, its
+   * top-type gates and one more assignment, all after every other line, so no
+   * line above it moves. Present only when the caller named that alias.
+   *
+   * Nothing from this line on is an import line, a gate line or an assignment
+   * line of the plan. The classifier reads these lines for one question only:
+   * whether a mismatch on the published type holds for the type the handler
+   * sends with no literal widened.
+   */
+  unwidenedFromLine?: number;
 }
+
+/**
+ * The surface export that carries a response alias's unwidened reading
+ * (carrick#1516). The scanner names it when it asks the capture for one
+ * (`unwidened_alias` in `src/engine/type_compat_v2.rs`); this is the same
+ * name, read back.
+ */
+export function unwidenedAliasOf(alias: string): string {
+  return `${alias}_Unwidened`;
+}
+
+/** The local name the probe imports the unwidened alias under. */
+export const UNWIDENED_LOCAL_NAME = 'SentUnwidened';
 
 /** The assignment line whose diagnostic decides the bucket. */
 /**
@@ -183,10 +208,18 @@ export function decisiveAssignmentLine(plan: ProbePlan): number {
  * Build one probe, recording the exact line of every gate and the assignment so
  * the classifier never depends on hard-coded offsets. `packageOf` maps a
  * service name to its workspace package specifier (e.g. `@carrick/orders`).
+ *
+ * `unwidenedAliasFor` answers, for a producer that is the sending side, the
+ * surface export that carries its unwidened reading (carrick#1538), when its
+ * stub ships one. The probe of an `http` response then ends with a second
+ * assignment of that reading, in the wire form. Without an answer the
+ * probe is what it always was, byte for byte. A consumer that sends (a request
+ * body) is never asked: the reading is of a handler's return.
  */
 export function buildProbe(
   spec: CheckPairSpec,
-  packageOf: (serviceName: string) => string
+  packageOf: (serviceName: string) => string,
+  unwidenedAliasFor?: (sentProducer: CheckPairEndpoint) => string | undefined
 ): ProbePlan {
   const id = pairId(spec);
   const direction = directionFor(spec.protocol, spec.type_kind);
@@ -395,6 +428,42 @@ export function buildProbe(
     wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
   }
 
+  // The unwidened reading (carrick#1538). A handler that returns
+  // `cond ? 'a' : 'b'` publishes `string`, because a literal widens where it
+  // is inferred, and a consumer that declares `'a' | 'b'` then mismatches a
+  // response it reads correctly. The capture keeps the reading with no literal
+  // widened beside the published alias, and it is assigned here a second time.
+  //
+  // Everything sits after the lines above, the import included, and none of it
+  // is recorded as an import, gate or assignment line: a missing export, a top
+  // type or a mismatch here says only that the second reading did not clear
+  // the pair, and the verdict on the published type stands.
+  //
+  // Only an `http` response gets one. It is the one pair a producer sends on
+  // whose decisive assignment a second reading can mirror, here in the wire
+  // form. A GraphQL pair compares an unwrapped comparand (above), which a
+  // plain assignment of the reading would not mirror, and on every other
+  // protocol the consumer is the sender (the direction table).
+  let unwidenedFromLine: number | undefined;
+  const sentUnwidenedAlias =
+    direction.sent === 'producer' && spec.protocol === 'http'
+      ? unwidenedAliasFor?.(sentEndpoint)
+      : undefined;
+  if (sentUnwidenedAlias !== undefined) {
+    const local = UNWIDENED_LOCAL_NAME;
+    unwidenedFromLine = push(
+      `import type { ${sentUnwidenedAlias} as ${local} } from '${sentPkg}';`
+    );
+    push(`type _G_unwidened_any = Assert<Not<IsAny<${local}>>>;`);
+    push(`type _G_unwidened_unknown = Assert<Not<IsUnknown<${local}>>>;`);
+    push(`type _G_unwidened_never = Assert<Not<IsNever<${local}>>>;`);
+    push(
+      `type WireSentUnwidened = [${local}] extends [Expected] ? ${local} : (JsonWireSame<JsonWire<${local}>, ${local}> extends true ? ${local} : JsonWire<${local}>);`
+    );
+    push(`declare const sentWireUnwidened: WireSentUnwidened;`);
+    push(`const expectedWireUnwidened: Expected = sentWireUnwidened;`);
+  }
+
   return {
     pairId: id,
     spec,
@@ -407,5 +476,6 @@ export function buildProbe(
     gateLines,
     assignmentLine,
     wireAssignmentLine,
+    ...(unwidenedFromLine === undefined ? {} : { unwidenedFromLine }),
   };
 }

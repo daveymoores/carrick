@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import type {
   CaptureAliasRecord,
+  CheckPairEndpoint,
   CheckOptions,
   CompilerEnd,
   CheckProgressPhase,
@@ -30,7 +31,7 @@ import type {
   CheckVerdict,
   DegradedService,
 } from './api.js';
-import { buildProbe, type ProbePlan } from './check-probe.js';
+import { buildProbe, unwidenedAliasOf, type ProbePlan } from './check-probe.js';
 import {
   classifyPair,
   parseTscOutput,
@@ -267,11 +268,12 @@ export async function runCheck(
   };
 
   // Generate probes. A pair naming a service with no stub is unverifiable.
+  const aliasRecords = readStubAliasRecords(opts.stubs);
   const plans: ProbePlan[] = [];
   const unresolved: CheckVerdict[] = [];
   for (const spec of opts.pairs) {
     try {
-      plans.push(buildProbe(spec, ws.packageOf));
+      plans.push(buildProbe(spec, ws.packageOf, unwidenedAliasIn(aliasRecords)));
     } catch {
       unresolved.push({
         pair_id: '',
@@ -292,7 +294,6 @@ export async function runCheck(
     v.pair_id = fnvOfSpec(spec);
   }
 
-  const aliasRecords = readStubAliasRecords(opts.stubs);
   const { preGated, probing } = preGate(plans, aliasRecords);
   writeProbes(ws, probing);
 
@@ -499,6 +500,25 @@ function readStubAliasRecords(
     }
   }
   return byService;
+}
+
+/**
+ * The unwidened reading a producer's stub ships beside one of its aliases
+ * (carrick#1538), as `buildProbe` asks for it. Read from the same manifest the
+ * pre-gate reads. A reading the capture already found a member-level
+ * `any`/`unknown` in is not offered: it would assign to whatever the other
+ * side declares.
+ */
+function unwidenedAliasIn(
+  aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
+): (sentProducer: CheckPairEndpoint) => string | undefined {
+  return (sentProducer) => {
+    const record = aliasRecords
+      .get(sentProducer.service_name)
+      ?.get(unwidenedAliasOf(sentProducer.alias));
+    if (!record || record.any_provenance?.length) return undefined;
+    return record.alias;
+  };
 }
 
 interface DeepDecayHit {

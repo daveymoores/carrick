@@ -470,7 +470,12 @@ export interface CheckPairSpec {
 }
 
 /**
- * Four-bucket classifier output (pinned decision 7):
+ * Classifier output: the four buckets of pinned decision 7, and one more
+ * (carrick#1538).
+ *  - producer_wider: the published sent type mismatches and the handler's
+ *    return, read with no literal widened, does not. What travels agrees, so
+ *    it is stored as compatible with the class beside it, and it carries no
+ *    diagnostic.
  *  - compatible: no diagnostics; the value-level assignment holds.
  *  - incompatible: an assignment-class diagnostic (TS2322/2741/...) — real
  *    compiler text is the report.
@@ -483,7 +488,8 @@ export type VerdictBucket =
   | 'compatible'
   | 'incompatible'
   | 'unverifiable'
-  | 'gate_caught_baked_any';
+  | 'gate_caught_baked_any'
+  | 'producer_wider';
 
 export interface CheckVerdict {
   /** Deterministic FNV-1a hash of the pair (never a temp path). */

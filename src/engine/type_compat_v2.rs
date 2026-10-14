@@ -4156,6 +4156,47 @@ mod tests {
         assert!(!outcome.resolved);
     }
 
+    /// carrick#1538: the check itself files `producer_wider`, for a consumer
+    /// that states its type. The verdict reads off the wire into its own
+    /// bucket, is no retype candidate, survives the passes that rewrite a
+    /// mismatch, and is stored as a compatible fact with the class beside it.
+    #[test]
+    fn a_producer_wider_check_verdict_is_stored_compatible_with_the_class() {
+        let pair = retype_pair(ManifestTypeKind::Response, Some("{ scope: string; }"));
+        let frame = serde_json::json!({
+            "pair_id": "id",
+            "pair_key": pair.spec.pair_key,
+            "bucket": "producer_wider",
+            "codes": [2322],
+            "resolved": true,
+            "notes": [],
+        });
+        let verdict: crate::services::type_sidecar::CheckVerdict =
+            serde_json::from_value(frame).expect("the check frame deserialises");
+        assert_eq!(verdict.bucket, VerdictBucket::ProducerWider);
+        assert!(!consumer_to_blame(&verdict));
+
+        let outcome = outcome_for(
+            &pair,
+            verdict.bucket,
+            verdict.gate.clone(),
+            verdict.diagnostic.clone(),
+            verdict.resolved,
+            verdict.unresolved_reason.clone(),
+            verdict.notes.clone(),
+        );
+        let mut outcomes = vec![outcome];
+        hold_back_same_service_mismatches(&mut outcomes);
+        abstain_on_unstated_modes(std::slice::from_ref(&pair), &mut outcomes);
+        assert_eq!(outcomes[0].bucket, VerdictBucket::ProducerWider);
+
+        let half = stored_response_half(&outcomes[0]);
+        assert_eq!(half.verdict, crate::operation::TypeVerdict::Compatible);
+        assert!(half.producer_wider);
+        assert!(half.resolved);
+        assert_eq!(half.reason, None);
+    }
+
     /// The CI log states each unverified pair and why (carrick#1491): the
     /// smoke run listed a pair as not verifiable and printed no reason.
     #[test]

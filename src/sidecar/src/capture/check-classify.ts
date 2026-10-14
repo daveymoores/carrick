@@ -1,5 +1,5 @@
 /**
- * Diagnostic parsing + four-bucket classification for the v2 check phase.
+ * Diagnostic parsing + bucket classification for the v2 check phase.
  *
  * The judge is the vendored `tsc` CLI with `--pretty false`, run from the
  * workspace root so file locations print workspace-relative (no temp path in
@@ -16,6 +16,8 @@
  *   raw-text read marked on a side        -> unverifiable (text, even agreeing)
  *   assignment error, sent union taken in part by a weak expected type
  *                                         -> unverifiable (carrick#1995)
+ *   assignment error on the published type that the sent side's unwidened
+ *   reading does not repeat               -> producer_wider (carrick#1538)
  *   assignment-class error                -> incompatible
  *   no diagnostics                        -> compatible     [lowest precedence]
  *
@@ -27,7 +29,13 @@
  */
 
 import type { CheckVerdict } from './api.js';
-import { decisiveAssignmentLine, type GateName, type ProbePlan, type Side } from './check-probe.js';
+import {
+  decisiveAssignmentLine,
+  unwidenedAliasOf,
+  type GateName,
+  type ProbePlan,
+  type Side,
+} from './check-probe.js';
 import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
 import type { PairDeepFindings } from './check-deep.js';
 import type { DispatchUnion } from './check-union.js';
@@ -139,7 +147,11 @@ export interface ClassifyInput {
 /** Classify one pair into exactly one bucket, honouring the precedence order. */
 export function classifyPair(input: ClassifyInput): CheckVerdict {
   const { plan, probeDiags, poisonReason, scrubCtx } = input;
-  const codes = [...new Set(probeDiags.map((d) => d.code))].sort((a, b) => a - b);
+  // The lines of the unwidened reading (carrick#1538) answer one question, in
+  // 5b below. Their diagnostics are no part of what the published pair raised.
+  const codes = [
+    ...new Set(probeDiags.filter((d) => !onUnwidenedLines(plan, d)).map((d) => d.code)),
+  ].sort((a, b) => a - b);
   // `notes` sits on `base` so EVERY bucket carries it, including the
   // compatible one (carrick#1341). The two statements it holds are true of a
   // pair that agreed — an optionality gap assigns, and the wire allowance is
@@ -320,6 +332,14 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       ),
     };
   }
+  // 5b. Or the mismatch is the published type's alone (carrick#1538): a
+  //     literal widened where the handler's return was inferred. The handler's
+  //     return read with no literal widened fits what the other side expects,
+  //     so what travels agrees and only the published type is wider. Its own
+  //     bucket, which carries no diagnostic: a reason is read as a mismatch.
+  if (assignDiag && unwidenedReadingFits(input)) {
+    return { ...base, bucket: 'producer_wider', ...factness(input) };
+  }
   if (assignDiag) {
     const text = scrubDiagnostic(
       assignDiag.message,
@@ -393,6 +413,35 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
 
   // 6. No diagnostics -> compatible.
   return { ...base, bucket: 'compatible', ...factness(input) };
+}
+
+function onUnwidenedLines(plan: ProbePlan, diagnostic: RawDiagnostic): boolean {
+  return plan.unwidenedFromLine !== undefined && diagnostic.line >= plan.unwidenedFromLine;
+}
+
+/**
+ * Whether the sent side's unwidened reading clears a mismatch on its published
+ * type (carrick#1538). Every condition must hold, and each absence leaves the
+ * published verdict as it is:
+ *
+ * - the probe carries the reading (its stub ships the unwidened alias);
+ * - the compiler raised nothing on its lines: not on the import (the export is
+ *   there), not on its top-type gates, not on its assignment;
+ * - its own declarations typecheck (the alias is not poisoned);
+ * - the member-level walk ran over it and found no `any`/`unknown`, which
+ *   would assign to whatever the other side declares;
+ * - the same walk found none on the two published sides either. A mismatch
+ *   that is not a fact stays the mismatch it was: the reading would be
+ *   clearing it against a member that accepts anything.
+ */
+function unwidenedReadingFits(input: ClassifyInput): boolean {
+  const { plan, probeDiags, poisonReason } = input;
+  if (plan.unwidenedFromLine === undefined) return false;
+  if (probeDiags.some((d) => onUnwidenedLines(plan, d))) return false;
+  const sent = plan.sentEndpoint;
+  if (poisonReason(sent.service_name, unwidenedAliasOf(sent.alias))) return false;
+  const walked = input.deepFindings?.sentUnwidened;
+  return walked !== undefined && walked.length === 0 && factness(input).resolved;
 }
 
 /**
