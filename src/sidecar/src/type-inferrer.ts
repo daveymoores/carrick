@@ -8919,6 +8919,24 @@ export class TypeInferrer {
     const MIN_REVERSE_MATCH_COVERAGE = 0.5;
     const containingMatches = candidates.filter((c) => c.text.includes(normalizedTarget));
     if (containingMatches.length > 0) {
+      // A text that is only a wrapped call's first line (`load({`) is held by
+      // every sibling that opens alike, and the smallest of them is not the
+      // one the locator names (carrick#2114). The nodes whose own text OPENS
+      // with the text are the ones a first line names: among those the stated
+      // line decides, then size. A fragment from the middle of a node opens
+      // nothing, and stays on the smallest node holding it.
+      const opening =
+        lineNumber === undefined
+          ? []
+          : containingMatches.filter((c) => c.text.startsWith(normalizedTarget));
+      if (lineNumber !== undefined && opening.length > 0) {
+        const distance = (c: { node: T }) => Math.abs(startLineOf(c.node) - lineNumber);
+        const nearest = Math.min(...opening.map(distance));
+        return this.pickBestMatch(
+          opening.filter((c) => distance(c) === nearest).map((c) => c.node),
+          lineNumber
+        ) as T;
+      }
       return this.pickBestMatch(containingMatches.map((c) => c.node), lineNumber) as T;
     }
     const reverseMatches = candidates.filter(
