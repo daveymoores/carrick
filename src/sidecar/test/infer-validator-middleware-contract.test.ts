@@ -20,7 +20,7 @@
  *     `infer-schema-direction.test.ts`, carrick#1101).
  *
  * A validator bound to a non-body part declares no request body, and a route
- * that declares nothing stays unresolved — never a framework internal.
+ * that declares nothing publishes no request type, never a framework internal.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -197,7 +197,7 @@ describe('validator-middleware request contracts', () => {
     );
   });
 
-  it('leaves a route that declares nothing unresolved', async () => {
+  it('decides no body for a route that declares nothing and whose handler only sends', async () => {
     const span = registrationSpan('get', '/health');
     const type = await inferRequest(client, 'HealthRequestSpan', {
       line_number: span.line,
@@ -205,10 +205,13 @@ describe('validator-middleware request contracts', () => {
       span_end: span.end,
     });
 
+    // carrick#827: the handler reads nothing from its parameter, so the
+    // answer is a decided `unknown` and never a framework internal. Left
+    // unresolved, the capture re-read the registration call and published it.
     assert.strictEqual(
-      type,
-      undefined,
-      `a route with no declared request body must stay unresolved, got: ${type}`
+      type?.trim(),
+      'unknown',
+      `a route whose handler reads nothing takes no request body, got: ${type}`
     );
   });
 

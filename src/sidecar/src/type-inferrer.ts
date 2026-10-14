@@ -3071,9 +3071,28 @@ export class TypeInferrer {
           this.getNodeLocation(registrationHandler)
         );
       }
-      // A genuinely payload-less handler (no typed request read): do NOT fall
-      // through to read the registration call's return type, which would emit a
-      // spurious framework type. Report unresolved, as before this capability.
+      // carrick#827: the handler reads nothing from its parameters, so the
+      // route takes no request body, and that is a decision. Left undecided,
+      // the capture re-reads this same span and publishes the registration
+      // call's own type (`void` wherever the server library resolves) as the
+      // route's request contract.
+      if (this.handlerReadsNothingFromItsParameters(registrationHandler)) {
+        this.log(
+          `Route registration at ${request.file_path}:${request.line_number}: its handler reads ` +
+            'nothing from its parameters; the route takes no request body'
+        );
+        return this.decidedAbstain(request, this.getNodeLocation(registrationHandler), {
+          path: '',
+          kind: 'unknown',
+          reason: 'no_request_body',
+          detail:
+            "the route's handler reads nothing from its parameters (each use of one is a call " +
+            'whose value it discards or returns), so the route takes no request body',
+        });
+      }
+      // A handler that reads from a parameter and states no type at the read:
+      // do NOT fall through to read the registration call's return type, which
+      // would emit a spurious framework type. Report unresolved, as before.
       this.log(
         `Route registration at ${request.file_path}:${request.line_number} has no typed request read; leaving unresolved`
       );
@@ -7483,6 +7502,123 @@ export class TypeInferrer {
     }
 
     return undefined;
+  }
+
+  /**
+   * True when `handler` reads nothing from the incoming message (carrick#827):
+   * every use of one of its parameters, named or destructured, is the receiver
+   * of a call chain whose value the handler discards or returns
+   * (`reply.json(result)`, `return c.status(201).json(result)`). That is a
+   * send. A returned chain must end in a call that takes an argument, so a
+   * read handed straight back (`return request.json()`) is not one.
+   *
+   * Anything else may be a read of the body and makes this false: a property
+   * read, a call whose value is used, a parameter handed whole to another
+   * function, or a call in the chain handed an argument that can receive what
+   * the parameter gives (`argumentCanReceive`: a callback, an object with a
+   * method), as in `request.pipe(dest)`, `request.on('data', cb)` and
+   * `request.json().then(cb)`. No method or property name is consulted. A
+   * handler with no parameter, or one that uses `this`, proves nothing: it may
+   * read the message from `this` or a closure.
+   */
+  private handlerReadsNothingFromItsParameters(handler: FunctionLike): boolean {
+    // A declared `this` parameter, or any `this` in the body, is a way in the
+    // walk below does not follow.
+    const parameters = new Set<Node>(
+      handler.getParameters().filter((parameter) => parameter.getName() !== 'this')
+    );
+    if (parameters.size === 0) return false;
+    const body = handler.getBody();
+    if (!body) return false;
+    if (body.getFirstDescendantByKind(SyntaxKind.ThisKeyword)) return false;
+    const namesAParameter = (identifier: Node): boolean =>
+      (identifier.getSymbol()?.getDeclarations() ?? []).some((declaration) => {
+        const parameter = Node.isParameterDeclaration(declaration)
+          ? declaration
+          : Node.isBindingElement(declaration)
+            ? declaration.getFirstAncestorByKind(SyntaxKind.Parameter)
+            : undefined;
+        return parameter !== undefined && parameters.has(parameter);
+      });
+    for (const identifier of body.getDescendantsOfKind(SyntaxKind.Identifier)) {
+      if (!namesAParameter(identifier)) continue;
+      // Climb the call chain the parameter is the root receiver of.
+      let top: Node = identifier;
+      let lastCall: CallExpression | undefined;
+      for (;;) {
+        const parent = top.getParent();
+        if (!parent) break;
+        if (Node.isPropertyAccessExpression(parent) && parent.getExpression() === top) {
+          top = parent;
+        } else if (Node.isCallExpression(parent) && parent.getExpression() === top) {
+          // A send hands the parameter data; an argument able to receive may
+          // be where the body goes.
+          if (parent.getArguments().some((argument) => this.argumentCanReceive(argument))) {
+            return false;
+          }
+          lastCall = parent;
+          top = parent;
+        } else if (
+          (Node.isAwaitExpression(parent) ||
+            Node.isParenthesizedExpression(parent) ||
+            Node.isNonNullExpression(parent)) &&
+          parent.getExpression() === top
+        ) {
+          top = parent;
+        } else {
+          break;
+        }
+      }
+      // The chain has to end in a call: a property read yields a value.
+      if (!lastCall || this.unwrapExpressionNode(top) !== lastCall) return false;
+      const holder = top.getParent();
+      const discarded = !!holder && Node.isExpressionStatement(holder);
+      const returned =
+        !!holder &&
+        (Node.isReturnStatement(holder) || (holder === handler && handler.getBody() === top)) &&
+        lastCall.getArguments().length > 0;
+      if (!discarded && !returned) return false;
+    }
+    return true;
+  }
+
+  /**
+   * True unless `argument` is proven to be data that cannot receive anything
+   * from the call it is handed to (carrick#827). Data is a primitive or literal,
+   * `null`/`undefined`, or an object with no call or construct signature and
+   * no callable member; an array of such, or a union all of whose members are.
+   * A callback, an object with a method (a stream, an emitter), or a type the
+   * compiler cannot state (`any`, `unknown`, a type parameter) can receive.
+   * Sibling of `callResultIsPlainData`, which reads a call's result and so
+   * rejects primitives and empty objects; an argument of either is data.
+   */
+  private argumentCanReceive(argument: Node): boolean {
+    const canReceive = (type: Type, depth: number): boolean => {
+      if (depth > 3) return true;
+      if (type.isAny() || type.isUnknown() || type.isTypeParameter()) return true;
+      if (type.isUnion()) {
+        return type.getUnionTypes().some((member) => canReceive(member, depth + 1));
+      }
+      if (type.isIntersection()) {
+        return type.getIntersectionTypes().some((member) => canReceive(member, depth + 1));
+      }
+      const element = type.getArrayElementType();
+      if (element) return canReceive(element, depth + 1);
+      if (type.isTuple()) {
+        return type.getTupleElements().some((member) => canReceive(member, depth + 1));
+      }
+      if (!type.isObject()) return false;
+      if (this.isCallableType(type)) return true;
+      const indexed = type.getStringIndexType() ?? type.getNumberIndexType();
+      const callable = (held: Type): boolean =>
+        held.isAny() ||
+        (held.isUnion()
+          ? held.getUnionTypes().some((member) => this.isCallableType(member))
+          : this.isCallableType(held));
+      if (indexed && callable(indexed)) return true;
+      return type.getProperties().some((member) => callable(member.getTypeAtLocation(argument)));
+    };
+    return canReceive(argument.getType(), 0);
   }
 
   /**
