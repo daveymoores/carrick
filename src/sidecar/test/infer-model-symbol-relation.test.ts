@@ -95,6 +95,14 @@ export function holdsAny() {
 export function readsAny() {
   return loadAny();
 }
+declare const app: { get(path: string, handler: () => unknown): void };
+app.get(
+  '/wrapped-registration', // registration
+  () => {
+    const item: ItemDto = { id: rows[0].id };
+    return { item };
+  }
+);
 export class ItemsController {
   findOne(id: string): ItemDto | undefined { // method
     return rows.find((row) => row.id === id); // predicate
@@ -284,6 +292,24 @@ describe('carrick#2111: the model symbol of a producer response is related to th
       model_symbols: [{ alias, symbol_name: 'ItemDto', source_file: 'src/index.ts' }],
     });
     assert.strictEqual(response.inferred_types?.[0]?.model_symbol_relation?.relation, 'nullable');
+  });
+
+  it('relates the handler of a registration that opens on the row line, wherever the handler opens', async () => {
+    const alias = 'Alias_registration';
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: `infer-${alias}`,
+      requests: [
+        {
+          file_path: routesPath,
+          line_number: lineOf('// registration') - 1,
+          infer_kind: 'function_return',
+          alias,
+        },
+      ],
+      model_symbols: [{ alias, symbol_name: 'ItemDto', source_file: 'src/index.ts' }],
+    });
+    assert.strictEqual(response.inferred_types?.[0]?.model_symbol_relation?.relation, 'different');
   });
 
   it('answers nothing where no symbol was sent for the alias', async () => {

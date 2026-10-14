@@ -855,6 +855,17 @@ export class TypeInferrer {
   }
 
   /**
+   * `func` is the function the row's line names: it opens on that line (a
+   * method under its decorators, an exported handler), or it is the handler
+   * of the registration that opens there (`app.post<…>(\n '/path',\n async
+   * (request) => { … })`, or a named handler declared elsewhere).
+   */
+  private isTheRowsOwnFunction(request: InferRequestItem, func: FunctionLike): boolean {
+    if (startLineOf(func) === request.line_number) return true;
+    return this.registrationAtLine(func.getSourceFile(), request.line_number)?.handler === func;
+  }
+
+  /**
    * The declared type of a symbol the model named, found as the bundle finds
    * it (through a barrel's re-exports), in a file this program already
    * holds. A name that declares a value and no type resolves to nothing.
@@ -1369,7 +1380,7 @@ export class TypeInferrer {
     // `this.users.find((user) => user.id === id)`) reaches this with that
     // callback, whose return is not the route's, and a read of the wrong
     // function must never displace the symbol the model named.
-    if (startLineOf(func) === request.line_number) {
+    if (this.modelSymbols.has(inferred.alias) && this.isTheRowsOwnFunction(request, func)) {
       this.relateModelSymbol(request, inferred, [
         unwrapResult.wasUnwrapped ? unwrapResult.payloadType : awaitedType,
       ]);
