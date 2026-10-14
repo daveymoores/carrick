@@ -46,6 +46,7 @@ import type {
   InferSlotTiming,
   InferredType,
   InferKind,
+  ModelSymbol,
   SourceLocation,
   StatedBody,
   ExtractionConfig,
@@ -53,6 +54,8 @@ import type {
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
+import { declarationSite } from './bundler.js';
+import { printedTypeHoldsTopType, relateSymbolToRead } from './symbol-relation.js';
 import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
@@ -305,6 +308,8 @@ interface RecoveredPayload {
   /** Every payload node that fed `typeString`. */
   nodes: Node[];
   anchorType?: Type;
+  /** The type of each distinct payload that fed `typeString` (carrick#2111). */
+  readTypes: Type[];
   statedTypeNode?: Node;
   /** carrick#2054: see `InferredType.response_modes`. */
   responseModes?: ResponseModes;
@@ -709,9 +714,11 @@ export class TypeInferrer {
   infer(
     requests: InferRequestItem[],
     extractionConfig?: ExtractionConfig,
-    onRequestDone?: InferRequestDone
+    onRequestDone?: InferRequestDone,
+    modelSymbols?: ModelSymbol[]
   ): InferResult {
     const started = performance.now();
+    this.modelSymbols = new Map((modelSymbols ?? []).map((symbol) => [symbol.alias, symbol]));
     const inferredTypes: InferredType[] = [];
     const errors: string[] = [];
     /** Response inferences the unwidened reading re-reads (carrick#1516). */
@@ -804,6 +811,79 @@ export class TypeInferrer {
       timing: inferTiming(timings),
       errors: errors.length > 0 ? errors : undefined,
     };
+  }
+
+  /** The types the model named, by the alias of the row each is for (carrick#2111). */
+  private modelSymbols = new Map<string, ModelSymbol>();
+
+  /**
+   * carrick#2111: where the model named a type for the response this request
+   * reads, record on `inferred` how that type relates to the compiler's type
+   * of what the handler sends (`read`, one type per surviving branch). The
+   * driver keeps, re-depths or drops the model's symbol on the answer.
+   *
+   * Nothing is recorded, and the symbol stands, where there is nothing to
+   * compare: the symbol does not resolve in this program, or the published
+   * read holds `any` or `unknown` somewhere.
+   */
+  private relateModelSymbol(
+    request: InferRequestItem,
+    inferred: InferredType,
+    read: ReadonlyArray<Type | undefined>
+  ): void {
+    if (request.infer_kind !== 'response_body' && request.infer_kind !== 'function_return') return;
+    const named = this.modelSymbols.get(inferred.alias);
+    if (!named) return;
+    const types = read.filter((type): type is Type => type !== undefined);
+    if (types.length !== read.length || types.length === 0) return;
+    if (printedTypeHoldsTopType(inferred.type_string)) return;
+    try {
+      const symbolType = this.modelSymbolType(named);
+      if (!symbolType) return;
+      const answer = relateSymbolToRead(
+        this.project.getTypeChecker().compilerObject,
+        symbolType.compilerType,
+        types.map((type) => type.compilerType)
+      );
+      if (answer) inferred.model_symbol_relation = answer;
+    } catch (err) {
+      // The relation only ever adds an answer; it never costs one.
+      this.logError(
+        `Model symbol relation failed for ${inferred.alias}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
+   * `func` is the function the row's line names: it opens on that line (a
+   * method under its decorators, an exported handler), or it is the handler
+   * of the registration that opens there (`app.post<…>(\n '/path',\n async
+   * (request) => { … })`, or a named handler declared elsewhere).
+   */
+  private isTheRowsOwnFunction(request: InferRequestItem, func: FunctionLike): boolean {
+    if (startLineOf(func) === request.line_number) return true;
+    return this.registrationAtLine(func.getSourceFile(), request.line_number)?.handler === func;
+  }
+
+  /**
+   * The declared type of a symbol the model named, found as the bundle finds
+   * it (through a barrel's re-exports), in a file this program already
+   * holds. A name that declares a value and no type resolves to nothing.
+   */
+  private modelSymbolType(named: ModelSymbol): Type | undefined {
+    const absolutePath = path.isAbsolute(named.source_file)
+      ? named.source_file
+      : path.resolve(this.repoRoot, named.source_file);
+    const sourceFile = this.project.getSourceFile(absolutePath);
+    if (!sourceFile) return undefined;
+    const site = declarationSite(sourceFile, named.symbol_name, named.source_file, this.expandOrigin());
+    if ('reason' in site) return undefined;
+    const declaration =
+      site.sourceFile.getInterface(site.name) ??
+      site.sourceFile.getTypeAlias(site.name) ??
+      site.sourceFile.getClass(site.name) ??
+      site.sourceFile.getEnum(site.name);
+    return declaration?.getType();
   }
 
   /**
@@ -1295,6 +1375,16 @@ export class TypeInferrer {
     if (provenance && provenance.length > 0) {
       inferred.any_provenance = provenance;
     }
+    // The relation is asked only of the function the row's own line names.
+    // A locator that binds inside a callback of the handler (`user` in
+    // `this.users.find((user) => user.id === id)`) reaches this with that
+    // callback, whose return is not the route's, and a read of the wrong
+    // function must never displace the symbol the model named.
+    if (this.modelSymbols.has(inferred.alias) && this.isTheRowsOwnFunction(request, func)) {
+      this.relateModelSymbol(request, inferred, [
+        unwrapResult.wasUnwrapped ? unwrapResult.payloadType : awaitedType,
+      ]);
+    }
     return inferred;
   }
 
@@ -1713,7 +1803,7 @@ export class TypeInferrer {
     }
 
     const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(payloadType));
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       typeString,
       false,
@@ -1723,6 +1813,10 @@ export class TypeInferrer {
       anchor.depth,
       this.primaryTypeSymbolSource(anchor.element)
     );
+    this.relateModelSymbol(request, inferred, [
+      unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
+    ]);
+    return inferred;
   }
 
   /**
@@ -2024,6 +2118,7 @@ export class TypeInferrer {
       writtenAnchor ? writtenAnchor.source : resolvedSource
     );
     if (recovered.responseModes) inferred.response_modes = recovered.responseModes;
+    this.relateModelSymbol(request, inferred, recovered.readTypes);
     return inferred;
   }
 
@@ -5511,6 +5606,7 @@ export class TypeInferrer {
       // A union joined several payloads, so there is no single anchor — the
       // same rule the wrapper-unwrap path applies.
       anchorType: distinct.length === 1 ? distinct[0].anchorType : undefined,
+      readTypes: distinct.map((c) => c.anchorType),
       statedTypeNode:
         distinct.length === 1 ? distinct[0].statedTypeNode : undefined,
     };

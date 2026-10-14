@@ -1054,6 +1054,10 @@ enum SidecarRequest {
         requests: Vec<InferRequestItem>,
         #[serde(skip_serializing_if = "Option::is_none")]
         extraction_config: Option<ExtractionConfig>,
+        /// carrick#2111: the model's symbol for each producer response an
+        /// item of `requests` reads, joined by alias.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        model_symbols: Vec<ModelSymbol>,
     },
     #[serde(rename = "capture_v2")]
     CaptureV2 {
@@ -1269,6 +1273,49 @@ pub struct InferredType {
     /// each value receives. `type_string` is unchanged by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_modes: Option<InferredResponseModes>,
+    /// carrick#2111, a producer's response read only: how the type the model
+    /// named for this row ([`ModelSymbol`]) relates to the type read here.
+    /// `None` where the model named none or the sidecar could compare
+    /// nothing. Read by `demote_witnessed_borrowed_anchors`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_symbol_relation: Option<ModelSymbolRelation>,
+}
+
+/// A type the model named for a producer's response, sent beside the infer
+/// request that reads the same response (carrick#2111). Mirrors the sidecar's
+/// `ModelSymbol` (src/sidecar/src/types.ts).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelSymbol {
+    /// The alias the explicit request and the infer item share.
+    pub alias: String,
+    pub symbol_name: String,
+    /// The file the model says declares or exports it.
+    pub source_file: String,
+}
+
+/// How a model symbol relates to the compiler's type of what the handler
+/// sends (carrick#2111). The sidecar decides it by assignability both ways.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSymbolRelation {
+    pub relation: SymbolRelationKind,
+    /// List levels of the read around the symbol; present for `List`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolRelationKind {
+    /// One type. A list's own `readonly` does not count.
+    Same,
+    /// The read is a list of the symbol.
+    List,
+    /// The symbol is one member of the read's union, beside another body.
+    Member,
+    /// The read is the symbol or `null`/`undefined`.
+    Nullable,
+    /// Anything else: the symbol does not name the body.
+    Different,
 }
 
 /// Where in the incoming message a field is read from (carrick#2054).
@@ -2727,6 +2774,18 @@ impl TypeSidecar {
         requests: &[InferRequestItem],
         extraction_config: Option<&ExtractionConfig>,
     ) -> Result<SidecarResponse, SidecarError> {
+        self.infer_types_beside_model_symbols(requests, extraction_config, &[])
+    }
+
+    /// `infer_types`, with the model's symbol for each producer response the
+    /// requests read (carrick#2111). The sidecar answers on each inferred
+    /// type how the symbol relates to what it read.
+    fn infer_types_beside_model_symbols(
+        &self,
+        requests: &[InferRequestItem],
+        extraction_config: Option<&ExtractionConfig>,
+        model_symbols: &[ModelSymbol],
+    ) -> Result<SidecarResponse, SidecarError> {
         self.ensure_ready()?;
 
         if requests.is_empty() {
@@ -2758,6 +2817,7 @@ impl TypeSidecar {
             extraction_config: extraction_config
                 .filter(|config| !config.rules.is_empty())
                 .cloned(),
+            model_symbols: model_symbols.to_vec(),
         };
 
         self.send_request(&request)?;
@@ -3081,7 +3141,11 @@ impl TypeSidecar {
         // relative to its anchor symbol. The explicit bundle below needs that
         // depth before it runs (#306).
         if !infer.is_empty() {
-            let infer_response = self.infer_types(infer, extraction_config)?;
+            let infer_response = self.infer_types_beside_model_symbols(
+                infer,
+                extraction_config,
+                &producer_response_model_symbols(explicit, infer),
+            )?;
             if let Some(inferred) = infer_response.inferred_types {
                 result.inferred_types = inferred;
             }
@@ -3490,6 +3554,17 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// declaration file is known, and dropped otherwise, so the alias is defined
 /// by the inference itself. The fan-in keep above applies to both witnesses.
 ///
+/// The third witness is the compiler's own relation of the model's symbol to
+/// what a producer's handler sends (carrick#2111). A producer response's
+/// inference (`response_body`, `function_return`) carries
+/// `model_symbol_relation` where the sidecar could compare the two types.
+/// The symbol is kept where it is the read or one member of it beside
+/// another body, kept at the read's depth where the read is a list of it,
+/// and dropped otherwise, so the inference defines the alias
+/// (`arbitrate_model_symbol`). No relation, no change. A symbol dropped only
+/// because the read adds `null` or `undefined` to it is not reported in
+/// `changed`: it still names the body.
+///
 /// Every request the arbitration did not keep as it came in is reported in
 /// `changed` (carrick#1779): the manifest stamped the rejected symbol onto the
 /// alias's row before any of this ran, and only this function knows the row
@@ -3528,6 +3603,12 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                 && let Some(stated) = inf.stated_body.as_ref()
             {
                 return arbitrate_stated_body(req, alias, inf, stated);
+            }
+            if reads_producer_response(&inf.infer_kind)
+                && names_producer_response(req)
+                && let Some(relation) = inf.model_symbol_relation.as_ref()
+            {
+                return arbitrate_model_symbol(req, alias, relation);
             }
             if !req.payload_borrow_witness {
                 return Some(req.clone());
@@ -3579,6 +3660,19 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
     let mut arbitrated = ArbitratedAnchors::default();
     for (req, decided) in explicit.iter().zip(decisions) {
         let change = match (&decided, req.alias.as_deref()) {
+            // The read is the symbol or `null`/`undefined` (carrick#2111): the
+            // inference defines the alias so the `null` is published, and the
+            // symbol still names the body, so the row keeps it.
+            (None, Some(alias))
+                if names_producer_response(req)
+                    && inferred_by_alias.get(alias).is_some_and(|inf| {
+                        reads_producer_response(&inf.infer_kind)
+                            && inf.model_symbol_relation.as_ref().map(|r| r.relation)
+                                == Some(SymbolRelationKind::Nullable)
+                    }) =>
+            {
+                None
+            }
             (None, Some(alias)) => Some((alias, None)),
             // Both arms keep a request whose symbol is the root, so a
             // re-aimed one always names another symbol.
@@ -3630,6 +3724,86 @@ pub struct AnchorChange {
 pub struct AnchorRoot {
     pub symbol: String,
     pub source_file: String,
+}
+
+/// An infer kind that reads what a producer sends (carrick#2111). Not a
+/// `call_result`, whose text can be a later expression of the caller's, and
+/// not a request body or a pub/sub payload.
+fn reads_producer_response(kind: &InferKind) -> bool {
+    matches!(kind, InferKind::ResponseBody | InferKind::FunctionReturn)
+}
+
+/// A request the model's symbol relation may decide (carrick#2111): not a
+/// status table named for a consumer, not a borrowed pub/sub anchor, and not
+/// one whose depth the caller stated (a GraphQL list marker).
+fn names_producer_response(req: &SymbolRequest) -> bool {
+    !req.consumer_response && !req.payload_borrow_witness && req.array_depth.is_none()
+}
+
+/// The model's symbol for each producer response `infer` reads: an explicit
+/// request and an infer item that share an alias no other explicit request
+/// carries (carrick#2111).
+pub(crate) fn producer_response_model_symbols(
+    explicit: &[SymbolRequest],
+    infer: &[InferRequestItem],
+) -> Vec<ModelSymbol> {
+    let read: HashSet<&str> = infer
+        .iter()
+        .filter(|item| reads_producer_response(&item.infer_kind))
+        .filter_map(|item| item.alias.as_deref())
+        .collect();
+    let mut alias_counts: HashMap<&str, usize> = HashMap::new();
+    for req in explicit {
+        if let Some(alias) = req.alias.as_deref() {
+            *alias_counts.entry(alias).or_insert(0) += 1;
+        }
+    }
+    explicit
+        .iter()
+        .filter(|req| names_producer_response(req))
+        .filter_map(|req| {
+            let alias = req.alias.as_deref()?;
+            (read.contains(alias) && alias_counts.get(alias) == Some(&1)).then(|| ModelSymbol {
+                alias: alias.to_string(),
+                symbol_name: req.symbol_name.clone(),
+                source_file: req.source_file.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The carrick#2111 arm of `demote_witnessed_borrowed_anchors`: the compiler
+/// related the model's symbol to what the handler sends.
+///
+/// - the same type, or one member of the read beside another body: kept;
+/// - the read is a list of it: kept, at the read's depth;
+/// - anything else, and the symbol with only `null` or `undefined` beside
+///   it: dropped (`None`), so the inference defines the alias. The second
+///   is not reported as a change: the symbol still names the body, and the
+///   manifest row keeps it.
+fn arbitrate_model_symbol(
+    req: &SymbolRequest,
+    alias: &str,
+    relation: &ModelSymbolRelation,
+) -> Option<SymbolRequest> {
+    match relation.relation {
+        SymbolRelationKind::Same | SymbolRelationKind::Member => Some(req.clone()),
+        SymbolRelationKind::List => Some(SymbolRequest {
+            array_depth: relation.depth.filter(|depth| *depth > 0),
+            ..req.clone()
+        }),
+        SymbolRelationKind::Nullable | SymbolRelationKind::Different => {
+            debug!(
+                alias = %alias,
+                explicit_symbol = %req.symbol_name,
+                relation = ?relation.relation,
+                "[type_sidecar] producer anchor arbitration: the compiler's type of the \
+                 response is not the model's symbol; dropping the explicit anchor so the \
+                 inference defines the alias"
+            );
+            None
+        }
+    }
 }
 
 /// The carrick#1749 arm of `demote_witnessed_borrowed_anchors`: the source
@@ -3716,6 +3890,12 @@ pub(crate) fn apply_inferred_array_depth(
     let mut depth_by_alias: HashMap<&str, (&str, u32)> = HashMap::new();
     let mut unnamed_depth_by_alias: HashMap<&str, u32> = HashMap::new();
     for inf in inferred {
+        // The compiler related the model's symbol to this read, and that
+        // relation carries the depth (carrick#2111): `Same` for a symbol that
+        // names the list itself must not gain a level here.
+        if reads_producer_response(&inf.infer_kind) && inf.model_symbol_relation.is_some() {
+            continue;
+        }
         let Some(depth) = inf.array_depth.filter(|d| *d > 0) else {
             continue;
         };
@@ -4491,6 +4671,11 @@ mod tests {
                         max_depth: Some(2),
                     }],
                 }),
+                model_symbols: vec![ModelSymbol {
+                    alias: "A".into(),
+                    symbol_name: "Order".into(),
+                    source_file: "src/types.ts".into(),
+                }],
             },
             SidecarRequest::CaptureV2 {
                 request_id: id(),
@@ -5536,6 +5721,7 @@ mod tests {
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         }
     }
 
@@ -6171,6 +6357,251 @@ mod tests {
 
         assert_eq!(arbitrated.requests, explicit);
         assert!(arbitrated.changed.is_empty(), "{:?}", arbitrated.changed);
+    }
+
+    // ------------------------------------------------------------------
+    // carrick#2111: the model's symbol against the compiler's read
+    // ------------------------------------------------------------------
+
+    /// A producer's response read that carries the sidecar's relation.
+    fn related(
+        alias: &str,
+        kind: InferKind,
+        relation: SymbolRelationKind,
+        depth: Option<u32>,
+    ) -> InferredType {
+        InferredType {
+            infer_kind: kind,
+            model_symbol_relation: Some(ModelSymbolRelation { relation, depth }),
+            ..inferred(alias, None, None)
+        }
+    }
+
+    #[test]
+    fn a_model_symbol_the_read_is_or_holds_as_a_member_is_kept() {
+        for relation in [SymbolRelationKind::Same, SymbolRelationKind::Member] {
+            let explicit = vec![symbol_request("ItemDto", "Alias_Response", None)];
+            let inferred = vec![related(
+                "Alias_Response",
+                InferKind::FunctionReturn,
+                relation,
+                None,
+            )];
+            let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+            assert_eq!(arbitrated.requests, explicit, "{relation:?}");
+            assert!(arbitrated.changed.is_empty(), "{relation:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_symbol_the_read_is_a_list_of_is_kept_at_the_reads_depth() {
+        let explicit = vec![symbol_request("ItemDto", "Alias_Response", None)];
+        for kind in [InferKind::FunctionReturn, InferKind::ResponseBody] {
+            let inferred = vec![related(
+                "Alias_Response",
+                kind,
+                SymbolRelationKind::List,
+                Some(2),
+            )];
+            let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+            assert_eq!(
+                arbitrated.requests,
+                vec![symbol_request("ItemDto", "Alias_Response", Some(2))]
+            );
+            // The row still names the symbol, so nothing is restamped.
+            assert!(arbitrated.changed.is_empty(), "{:?}", arbitrated.changed);
+        }
+    }
+
+    #[test]
+    fn a_model_symbol_that_is_not_the_read_is_dropped_and_reported() {
+        let explicit = vec![symbol_request("ItemDto", "Alias_Response", None)];
+        let inferred = vec![related(
+            "Alias_Response",
+            InferKind::ResponseBody,
+            SymbolRelationKind::Different,
+            None,
+        )];
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        assert!(arbitrated.requests.is_empty());
+        assert_eq!(
+            arbitrated.changed,
+            vec![AnchorChange {
+                alias: "Alias_Response".to_string(),
+                rejected: "ItemDto".to_string(),
+                reaimed: None,
+            }]
+        );
+    }
+
+    /// `find(id): User | undefined` with the model symbol `User`: the
+    /// inference defines the alias, so the `undefined` is published, and the
+    /// row still names `User`, which is the body.
+    #[test]
+    fn a_model_symbol_the_read_adds_null_to_is_dropped_and_still_names_the_row() {
+        let explicit = vec![symbol_request("ItemDto", "Alias_Response", None)];
+        let inferred = vec![related(
+            "Alias_Response",
+            InferKind::FunctionReturn,
+            SymbolRelationKind::Nullable,
+            None,
+        )];
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        assert!(arbitrated.requests.is_empty());
+        assert!(arbitrated.changed.is_empty(), "{:?}", arbitrated.changed);
+    }
+
+    /// The relation is a producer's response read only. A consumer call, a
+    /// status table named for a consumer, a borrowed pub/sub anchor and a
+    /// request whose depth the caller stated each keep the answer they had.
+    #[test]
+    fn a_relation_decides_nothing_outside_a_producers_response_read() {
+        let different = |kind: InferKind| {
+            vec![related(
+                "Alias_Response",
+                kind,
+                SymbolRelationKind::Different,
+                None,
+            )]
+        };
+        let plain = symbol_request("ItemDto", "Alias_Response", None);
+
+        for kind in [
+            InferKind::CallResult,
+            InferKind::RequestBody,
+            InferKind::FunctionParam,
+            InferKind::Expression,
+        ] {
+            let kept =
+                demote_witnessed_borrowed_anchors(std::slice::from_ref(&plain), &different(kind));
+            assert_eq!(kept.requests, vec![plain.clone()]);
+        }
+
+        let table = SymbolRequest {
+            consumer_response: true,
+            ..plain.clone()
+        };
+        let witnessed = SymbolRequest {
+            payload_borrow_witness: true,
+            ..plain.clone()
+        };
+        let stated_depth = symbol_request("ItemDto", "Alias_Response", Some(1));
+        for req in [table, witnessed, stated_depth] {
+            let kept = demote_witnessed_borrowed_anchors(
+                std::slice::from_ref(&req),
+                &different(InferKind::ResponseBody),
+            );
+            assert_eq!(kept.requests, vec![req]);
+        }
+    }
+
+    /// A symbol that names the list itself (`type Items = Item[]`) reads
+    /// `Same`. The read's own depth must not be copied onto it, named or not.
+    #[test]
+    fn a_related_read_does_not_also_lend_its_depth() {
+        let explicit = vec![symbol_request("Items", "Alias_Response", None)];
+        for symbol in [None, Some("Items")] {
+            let inferred = vec![InferredType {
+                infer_kind: InferKind::ResponseBody,
+                model_symbol_relation: Some(ModelSymbolRelation {
+                    relation: SymbolRelationKind::Same,
+                    depth: None,
+                }),
+                ..inferred("Alias_Response", symbol, Some(1))
+            }];
+            assert_eq!(apply_inferred_array_depth(&explicit, &inferred), explicit);
+        }
+    }
+
+    #[test]
+    fn model_symbols_are_sent_for_producer_response_reads_only() {
+        let item = |alias: &str, infer_kind: InferKind| InferRequestItem {
+            file_path: "src/routes.ts".into(),
+            line_number: 4,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind,
+            alias: Some(alias.into()),
+            param_name: None,
+        };
+        let explicit = vec![
+            symbol_request("ItemDto", "Returned", None),
+            symbol_request("ItemDto", "Sent", None),
+            symbol_request("ItemDto", "Called", None),
+            symbol_request("ItemDto", "Unread", None),
+            symbol_request("ItemDto", "Twice", None),
+            symbol_request("OtherDto", "Twice", None),
+            symbol_request("ItemDto", "Listed", Some(1)),
+            SymbolRequest {
+                consumer_response: true,
+                ..symbol_request("Table", "Tabled", None)
+            },
+            SymbolRequest {
+                payload_borrow_witness: true,
+                ..symbol_request("Event", "Borrowed", None)
+            },
+        ];
+        let infer = vec![
+            item("Returned", InferKind::FunctionReturn),
+            item("Sent", InferKind::ResponseBody),
+            item("Called", InferKind::CallResult),
+            item("Twice", InferKind::ResponseBody),
+            item("Listed", InferKind::ResponseBody),
+            item("Tabled", InferKind::ResponseBody),
+            item("Borrowed", InferKind::ResponseBody),
+        ];
+
+        let sent = producer_response_model_symbols(&explicit, &infer);
+
+        assert_eq!(
+            sent.iter().map(|s| s.alias.as_str()).collect::<Vec<_>>(),
+            vec!["Returned", "Sent"]
+        );
+        assert_eq!(sent[0].symbol_name, "ItemDto");
+        assert_eq!(sent[0].source_file, explicit[0].source_file);
+    }
+
+    /// The relation rides the inferred type over stdio; an answer without
+    /// one, or from a sidecar that never sends it, reads as none.
+    #[test]
+    fn an_inference_reads_its_model_symbol_relation() {
+        let read = |relation: serde_json::Value| -> InferredType {
+            let mut json = serde_json::json!({
+                "alias": "A",
+                "type_string": "{ id: string; }[]",
+                "is_explicit": false,
+                "source_location": { "file_path": "src/a.ts", "start_line": 1, "end_line": 1 },
+                "infer_kind": "response_body",
+            });
+            if !relation.is_null() {
+                json["model_symbol_relation"] = relation;
+            }
+            serde_json::from_value(json).unwrap()
+        };
+        assert_eq!(read(serde_json::Value::Null).model_symbol_relation, None);
+        assert_eq!(
+            read(serde_json::json!({ "relation": "list", "depth": 1 })).model_symbol_relation,
+            Some(ModelSymbolRelation {
+                relation: SymbolRelationKind::List,
+                depth: Some(1),
+            })
+        );
+        for (text, kind) in [
+            ("same", SymbolRelationKind::Same),
+            ("member", SymbolRelationKind::Member),
+            ("nullable", SymbolRelationKind::Nullable),
+            ("different", SymbolRelationKind::Different),
+        ] {
+            assert_eq!(
+                read(serde_json::json!({ "relation": text })).model_symbol_relation,
+                Some(ModelSymbolRelation {
+                    relation: kind,
+                    depth: None,
+                })
+            );
+        }
     }
 
     #[test]

@@ -399,10 +399,15 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
     );
     const results = [...byProject(request.requests, (item) => item.file_path)].map(
       ([key, items]) =>
-        projectComponents(key).typeInferrer.infer(items, request.extraction_config, () => {
-          done += 1;
-          report();
-        })
+        projectComponents(key).typeInferrer.infer(
+          items,
+          request.extraction_config,
+          () => {
+            done += 1;
+            report();
+          },
+          request.model_symbols
+        )
     );
     const result =
       results.length === 1

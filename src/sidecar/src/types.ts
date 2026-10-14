@@ -243,6 +243,40 @@ export interface InferRequest extends BaseRequest {
   requests: InferRequestItem[];
   /** Agent-generated extraction config for machinery unwrapping */
   extraction_config?: ExtractionConfig;
+  /**
+   * carrick#2111: the type the model named for a producer's response, by the
+   * alias of the request that reads the same response. The inferrer answers
+   * how each relates to what it read (`InferredType.model_symbol_relation`).
+   */
+  model_symbols?: ModelSymbol[];
+}
+
+/** A type the model named for the row `alias` is for (carrick#2111). */
+export interface ModelSymbol {
+  alias: string;
+  symbol_name: string;
+  /** The file the model says declares or exports it. */
+  source_file: string;
+}
+
+/**
+ * carrick#2111: how the type the model named for a producer's response
+ * relates to the compiler's type of what the handler sends. The compiler
+ * decides, by assignability both ways (`symbol-relation.ts`).
+ *
+ * Reported only where both resolve and the read holds no `any` or `unknown`.
+ * No entry means nothing was compared, and the model's symbol stands.
+ */
+export interface ModelSymbolRelation {
+  /**
+   * `same`: one type. `list`: the read is a list of the symbol, `depth`
+   * levels. `member`: the symbol is one member of the read's union.
+   * `nullable`: the read is the symbol or `null`/`undefined`. `different`:
+   * anything else.
+   */
+  relation: 'same' | 'list' | 'member' | 'nullable' | 'different';
+  /** List levels of the read around the symbol; present for `list`. */
+  depth?: number;
 }
 
 /**
@@ -1067,6 +1101,12 @@ export interface InferredType {
    * stated, or when the only annotation is further away than the read.
    */
   stated_body?: StatedBody;
+  /**
+   * carrick#2111, a producer's response read only: how the type the model
+   * named for this row relates to the type read here. Absent where the model
+   * named none, or nothing could be compared.
+   */
+  model_symbol_relation?: ModelSymbolRelation;
   /**
    * carrick#1836: the declarations behind the names `type_string` prints that
    * the request's file does not resolve. The printer writes names bare where

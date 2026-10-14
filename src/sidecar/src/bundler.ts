@@ -116,7 +116,7 @@ function declaredName(declaration: Node): string | undefined {
  * it is: a model names a type where the consumer imports it from, usually a
  * barrel that only has `export *`.
  */
-function declarationSite(
+export function declarationSite(
   sourceFile: SourceFile,
   name: string,
   label: string,
