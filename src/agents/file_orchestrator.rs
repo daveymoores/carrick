@@ -8109,7 +8109,8 @@ impl FileOrchestrator {
         // A dispatch table is a fact about a HANDLER, not about a candidate:
         // there is no deterministic row for it to be joined onto and no
         // candidate id to drop it for. It travels through with the mounts.
-        result.dispatch_tables = Self::tables_with_a_body(dispatch_tables, &endpoints, file_path);
+        result.dispatch_tables =
+            Self::tables_with_a_body(dispatch_tables, &endpoints, &result.endpoints, file_path);
 
         // --- the producer side -------------------------------------------
 
@@ -9155,22 +9156,23 @@ impl FileOrchestrator {
     /// body case on the table's field is on one (the switch may sit in a
     /// helper the route handler calls, which states no row of its own).
     /// Where no row of this file says either, the table is kept.
+    ///
+    /// The join cannot see which route calls a helper, so it proves this only
+    /// for the whole file: every route the file states, the model's rows and
+    /// the deterministic ones alike, is on GET or HEAD. One route on any
+    /// other method may reach the switch with a body, case stated or not, and
+    /// then every table is kept (fail closed).
     fn tables_with_a_body(
         tables: Vec<crate::dispatch::DispatchTable>,
-        endpoints: &[EndpointResult],
+        model_rows: &[EndpointResult],
+        stated_rows: &[EndpointResult],
         file_path: &str,
     ) -> Vec<crate::dispatch::DispatchTable> {
-        // Some(true) when `rows` is non-empty and every one of them is on a
-        // method with no body; None when there is no row to say.
-        fn all_bodyless<'a>(rows: impl Iterator<Item = &'a EndpointResult>) -> Option<bool> {
-            let mut any = false;
-            for row in rows {
-                any = true;
-                if !FileOrchestrator::carries_no_body(&row.method) {
-                    return Some(false);
-                }
-            }
-            any.then_some(true)
+        let mut routes = model_rows.iter().chain(stated_rows).peekable();
+        let only_bodyless_routes =
+            routes.peek().is_some() && routes.all(|route| Self::carries_no_body(&route.method));
+        if !only_bodyless_routes {
+            return tables;
         }
         tables
             .into_iter()
@@ -9178,28 +9180,23 @@ impl FileOrchestrator {
                 if table.location != crate::dispatch::DispatchLocation::Body {
                     return true;
                 }
-                let by_handler = table.handler_name.as_deref().and_then(|handler| {
-                    all_bodyless(
-                        endpoints
-                            .iter()
-                            .filter(|endpoint| endpoint.handler_name == handler),
-                    )
+                // A row has to speak for the table: its handler serves a
+                // route here, or a row states a body case on its field.
+                let reached = model_rows.iter().any(|row| {
+                    table.handler_name.as_deref() == Some(row.handler_name.as_str())
+                        || row.dispatch.as_ref().is_some_and(|case| {
+                            case.location == crate::dispatch::DispatchLocation::Body
+                                && case.field == table.field
+                        })
                 });
-                let by_field = all_bodyless(endpoints.iter().filter(|endpoint| {
-                    endpoint.dispatch.as_ref().is_some_and(|case| {
-                        case.location == crate::dispatch::DispatchLocation::Body
-                            && case.field == table.field
-                    })
-                }));
-                let unsendable = by_handler == Some(true) || by_field == Some(true);
-                if unsendable {
+                if reached {
                     debug!(
-                        "Dropped the body dispatch table on '{}' in {}: the rows that reach it \
-                         serve only methods that carry no request body",
+                        "Dropped the body dispatch table on '{}' in {}: every route the file \
+                         states is on a method that carries no request body",
                         table.field, file_path
                     );
                 }
-                !unsendable
+                !reached
             })
             .collect()
     }
@@ -18730,11 +18727,11 @@ export { routes };
     }
 
     /// A `body` dispatch table whose cases no call can send (carrick#2110) is
-    /// not carried: its handler serves only methods with no request body, or
-    /// (for a switch in a helper the route calls) every row stating a body
-    /// case on its field is on one. A `header` table, a body table whose
-    /// handler or field also reaches a method with a body, and a body table
-    /// no row of the file speaks for are all kept.
+    /// not carried, and that is proven only when every route the file states
+    /// is GET or HEAD. One POST in the file, stated by the model with no case
+    /// or by the file layout, may call the same helper with a body, so every
+    /// table stays. A `header` table, and a body table no row speaks for,
+    /// always stay.
     #[test]
     fn a_body_dispatch_table_on_a_handler_with_no_body_is_dropped() {
         let row = |method: &str, handler: &str, case: Option<&str>| EndpointResult {
@@ -18776,47 +18773,88 @@ export { routes };
                 repo_name: None,
             }
         };
-        let endpoints = [
-            row("GET", "reads", None),
-            row("HEAD", "reads", None),
-            row("GET", "mixed", None),
-            row("POST", "mixed", None),
-            row("GET", "anonymous", Some("mode")),
-            row("GET", "anonymous", Some("mode")),
-            row("GET", "anonymous", Some("kind")),
-            row("POST", "anonymous", Some("kind")),
-        ];
-        let tables = vec![
-            table(DispatchLocation::Body, Some("reads"), "view"),
-            table(DispatchLocation::Header, Some("reads"), "view"),
-            table(DispatchLocation::Body, Some("mixed"), "view"),
-            table(DispatchLocation::Body, Some("elsewhere"), "view"),
-            table(DispatchLocation::Body, None, "view"),
-            table(DispatchLocation::Body, Some("helper"), "mode"),
-            table(DispatchLocation::Body, Some("helper"), "kind"),
-        ];
-
-        let kept: Vec<(DispatchLocation, Option<String>, String)> =
-            FileOrchestrator::tables_with_a_body(tables, &endpoints, "src/reports.ts")
-                .into_iter()
-                .map(|table| (table.location, table.handler_name, table.field))
-                .collect();
-
-        let named = |handler: &str| Some(handler.to_string());
-        assert_eq!(
-            kept,
+        // Each file: its model rows, its deterministic rows, and the tables
+        // that must survive (by handler and field) out of the three offered.
+        let offered = || {
             vec![
-                (DispatchLocation::Header, named("reads"), "view".to_string()),
-                (DispatchLocation::Body, named("mixed"), "view".to_string()),
-                (
-                    DispatchLocation::Body,
-                    named("elsewhere"),
-                    "view".to_string()
-                ),
-                (DispatchLocation::Body, None, "view".to_string()),
-                (DispatchLocation::Body, named("helper"), "kind".to_string()),
-            ],
-        );
+                table(DispatchLocation::Body, Some("reads"), "view"),
+                table(DispatchLocation::Header, Some("reads"), "view"),
+                table(DispatchLocation::Body, Some("helper"), "mode"),
+                table(DispatchLocation::Body, Some("elsewhere"), "other"),
+            ]
+        };
+        let every = [
+            (DispatchLocation::Body, "reads", "view"),
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "helper", "mode"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let header_and_unspoken = [
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let files: Vec<(&str, Vec<EndpointResult>, Vec<EndpointResult>, &[_])> = vec![
+            // Every route is GET or HEAD: the handler's table and the
+            // helper's table (linked by the body case on `mode`) go.
+            (
+                "only GET and HEAD",
+                vec![
+                    row("GET", "reads", None),
+                    row("HEAD", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![],
+                &header_and_unspoken,
+            ),
+            // A POST in the same file may call the helper, with no case
+            // stated: nothing proves the switch is GET-only.
+            (
+                "a POST with no case",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("POST", "submit", None),
+                ],
+                vec![],
+                &every,
+            ),
+            // The POST is stated by the file layout, not by the model.
+            (
+                "a deterministic POST",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![row("POST", "POST", None)],
+                &every,
+            ),
+        ];
+        for (label, model_rows, stated_rows, survive) in files {
+            let kept: Vec<(DispatchLocation, String, String)> =
+                FileOrchestrator::tables_with_a_body(
+                    offered(),
+                    &model_rows,
+                    &stated_rows,
+                    "src/reports.ts",
+                )
+                .into_iter()
+                .map(|table| {
+                    (
+                        table.location,
+                        table.handler_name.unwrap_or_default(),
+                        table.field,
+                    )
+                })
+                .collect();
+            let survive: Vec<(DispatchLocation, String, String)> = survive
+                .iter()
+                .map(|(location, handler, field)| {
+                    (*location, handler.to_string(), field.to_string())
+                })
+                .collect();
+            assert_eq!(kept, survive, "{label}");
+        }
     }
 
     /// Two routers declared in one file and mounted at different prefixes
