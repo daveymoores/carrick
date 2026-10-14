@@ -335,12 +335,24 @@ fn a_row_the_model_stated_correctly_stays_the_models_and_keeps_its_type_anchor()
     );
 }
 
-/// The corrected row's own call is the call that reaches the request, so the
+/// The corrected row's own call is the call that reaches the request, and the
+/// function it calls hands back the request's parsed body unchanged, so the
 /// type anchored at it is what the caller reads of that request: it is kept
 /// under the reached operation and judged against that operation's producer.
 #[test]
 fn a_corrected_row_keeps_its_type_and_is_judged_against_the_reached_operation() {
-    let entries = consumer_entries_at("cli", COMMANDS, 9);
+    assert_eq!(
+        row_at("cli", COMMANDS, 145),
+        Row {
+            method: "GET".to_string(),
+            target: "${process.env.RUNS_ORIGIN}/api/v1/runs/${id}".to_string(),
+            path: "/api/v1/runs/:id".to_string(),
+            source: "request_summary".to_string(),
+            role: Some("wrapper_call".to_string()),
+            reaches: Some(format!("{REQUESTS}:45")),
+        }
+    );
+    let entries = consumer_entries_at("cli", COMMANDS, 145);
     assert!(
         entries.iter().any(|entry| {
             entry["type_kind"] == "response"
@@ -351,11 +363,11 @@ fn a_corrected_row_keeps_its_type_and_is_judged_against_the_reached_operation() 
         "the response entry is keyed to the reached operation: {entries:#?}"
     );
     assert!(
-        entries.iter().all(|entry| entry["path"] != "/getRun"),
+        entries.iter().all(|entry| entry["path"] != "/read"),
         "no entry keeps the path the model made up: {entries:#?}"
     );
     assert_eq!(
-        response_verdicts_at(COMMANDS, 9),
+        response_verdicts_at(COMMANDS, 145),
         [(
             "http|GET|/api/v1/runs/:id".to_string(),
             "compatible".to_string()
@@ -369,11 +381,51 @@ fn a_corrected_row_keeps_its_type_and_is_judged_against_the_reached_operation() 
 #[test]
 fn a_stale_type_at_a_corrected_row_is_found() {
     assert_eq!(
-        response_verdicts_at(COMMANDS, 46),
+        response_verdicts_at(COMMANDS, 157),
         [(
-            "http|PUT|/api/v1/runs/:id".to_string(),
+            "http|GET|/api/v1/runs/:id".to_string(),
             "incompatible".to_string()
         )]
+    );
+}
+
+/// carrick#1601: a call of a function that does not hand back its request's
+/// parsed body unchanged is worth that function's own result. The function
+/// called wraps the body in an envelope (`readRunStamped`), or the client
+/// method called returns a member of what a transport returns (`Client.send`
+/// reads `.data` of a request spec's value, whose shape nothing here
+/// states). The row still takes the operation, and the type anchored there
+/// goes: judged against the producer, it would read as a break that is not
+/// there.
+#[test]
+fn a_corrected_row_whose_call_returns_another_shape_carries_no_type() {
+    assert_eq!(
+        row_at("cli", COMMANDS, 151).reaches,
+        Some(format!("{REQUESTS}:51"))
+    );
+    for line in [9, 46, 151] {
+        let entries = consumer_entries_at("cli", COMMANDS, line);
+        assert!(
+            entries.is_empty(),
+            "no type is carried from a call that returns another shape ({COMMANDS}:{line}): {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(COMMANDS, line), []);
+    }
+}
+
+/// The function called asks for a token, a request a fact states, and then
+/// makes a `fetch` only the model reads. The token is not the one operation
+/// the call reaches, so the row stays as the model stated it, and is counted.
+#[test]
+fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_it() {
+    assert_eq!(
+        row_at("cli", COMMANDS, 139),
+        as_stated("GET", "/tokened", "/tokened")
+    );
+    assert!(
+        settled_line().contains("2 reach a request only the model states"),
+        "{}",
+        settled_line()
     );
 }
 
@@ -391,7 +443,7 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     assert!(
-        settled_line().contains("(3 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(8 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -408,6 +460,9 @@ fn a_corrected_row_never_carries_a_request_entry() {
         ("cli", COMMANDS, 21),
         ("cli", COMMANDS, 46),
         ("cli", COMMANDS, 101),
+        ("cli", COMMANDS, 145),
+        ("cli", COMMANDS, 151),
+        ("cli", COMMANDS, 157),
         ("web", HOOKS, 9),
         ("web", HOOKS, 14),
         ("web", HOOKS, 19),
@@ -421,9 +476,9 @@ fn a_corrected_row_never_carries_a_request_entry() {
             "no request type is checked at a call through ({file}:{line}): {requests:#?}"
         );
     }
-    // Lines 9, 21, 46 and 101 of `commands.ts` keep their response entry.
+    // Lines 145 and 157 of `commands.ts` keep their response entry.
     assert!(
-        settled_line().contains("4 kept the response type and lost the request type)"),
+        settled_line().contains("2 kept the response type and lost the request type)"),
         "{}",
         settled_line()
     );
@@ -585,6 +640,16 @@ fn every_request_row_is_unchanged() {
                 "model".to_string()
             ),
             spec(39, "POST /api/v1/runs/:id/archive"),
+            (
+                format!("{REQUESTS}:45"),
+                "GET /api/v1/runs/:id".to_string(),
+                "env_base_path".to_string()
+            ),
+            (
+                format!("{REQUESTS}:51"),
+                "GET /api/v1/runs/:id".to_string(),
+                "env_base_path".to_string()
+            ),
         ]
     );
 }
@@ -630,19 +695,18 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Fifteen rows the model alone states; six were corrected.
-    assert_eq!(boundary["model_only_rows"], 9, "{boundary}");
+    // Twenty rows the model alone states; nine were corrected.
+    assert_eq!(boundary["model_only_rows"], 11, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(text)
         .collect();
-    // Lines 9 and 46 carry a resolved type. Line 15 never held a type entry
-    // (the model's base kept its key off every route), so no type is asked
-    // for there. A corrected row whose carried entry resolved no type (lines
-    // 21 and 101) is a call missing its type like any other.
-    for line in [9, 15, 46] {
+    // Lines 145 and 157 carry a resolved type. Line 15 never held a type
+    // entry (the model's base kept its key off every route), so no type is
+    // asked for there.
+    for line in [15, 145, 157] {
         let site = format!("({COMMANDS}:{line})");
         assert!(
             !untyped.iter().any(|reason| reason.ends_with(&site)),

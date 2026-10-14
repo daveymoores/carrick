@@ -209,6 +209,71 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:134",
+      "line_number": 134,
+      "target": "/api/v1/fetched",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(target, { headers: { authorization: String(token) } })",
+      "call_expression_line": 134,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:139",
+      "line_number": 139,
+      "target": "/tokened",
+      "method": "GET",
+      "pattern_matched": "tokenThenFetch(",
+      "call_expression_text": "tokenThenFetch(target)",
+      "call_expression_line": 139,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:145",
+      "line_number": 145,
+      "target": "/read",
+      "method": "GET",
+      "pattern_matched": "readRun(",
+      "call_expression_text": "readRun(id)",
+      "call_expression_line": 145,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Run",
+      "type_import_source": "./types"
+    },
+    {
+      "candidate_id": "model:151",
+      "line_number": 151,
+      "target": "/stamped",
+      "method": "GET",
+      "pattern_matched": "readRunStamped(",
+      "call_expression_text": "readRunStamped(id)",
+      "call_expression_line": 151,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "StampedRun",
+      "type_import_source": "./types"
+    },
+    {
+      "candidate_id": "model:157",
+      "line_number": 157,
+      "target": "/read-stale",
+      "method": "GET",
+      "pattern_matched": "readRun(",
+      "call_expression_text": "readRun(id)",
+      "call_expression_line": 157,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "SavedRun",
+      "type_import_source": "./types"
     }
   ]
 }

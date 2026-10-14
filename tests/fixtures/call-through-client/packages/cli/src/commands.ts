@@ -1,7 +1,7 @@
-import { ping, send } from "@fixture/client";
+import { ping, readRun, readRunStamped, send } from "@fixture/client";
 import { createClient } from "./api-client";
 import { createProbedClient } from "./probed-client";
-import type { Run, SavedRun, Status } from "./types";
+import type { Run, SavedRun, StampedRun, Status } from "./types";
 
 /** A command that calls one client method. */
 export async function showRun(id: string) {
@@ -126,4 +126,34 @@ async function audited<T>(work: Promise<T>) {
 export async function postAudited(target: string) {
   const reply = await audited(fetch(target, { method: "POST" }));
   return reply;
+}
+
+/** Asks for a token, then requests a URL only the model reads. */
+async function tokenThenFetch(target: string) {
+  const token = await loadToken();
+  return fetch(target, { headers: { authorization: String(token) } });
+}
+
+/** The function called reaches the token request and one no fact states. */
+export async function showTokened(target: string) {
+  const reply = await tokenThenFetch(target);
+  return reply;
+}
+
+/** The function called hands back its request's parsed body. */
+export async function showRead(id: string) {
+  const run: Run = await readRun(id);
+  return run;
+}
+
+/** The function called hands back the body inside an envelope of its own. */
+export async function showStamped(id: string) {
+  const stamped: StampedRun = await readRunStamped(id);
+  return stamped;
+}
+
+/** The caller's copy of the type requires a field the API no longer sends. */
+export async function showReadStale(id: string) {
+  const run: SavedRun = await readRun(id);
+  return run;
 }

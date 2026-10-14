@@ -27,6 +27,32 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:45",
+      "line_number": 45,
+      "target": "${RUNS_ORIGIN}/api/v1/runs/${id}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${RUNS_ORIGIN}/api/v1/runs/${id}`)",
+      "call_expression_line": 45,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:51",
+      "line_number": 51,
+      "target": "${RUNS_ORIGIN}/api/v1/runs/${id}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${RUNS_ORIGIN}/api/v1/runs/${id}`)",
+      "call_expression_line": 51,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }

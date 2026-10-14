@@ -4116,14 +4116,21 @@ async fn analyze_current_repo_incremental(
             // phases add up to `analysis` rather than falling short of it.
             crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
+            let call_through = crate::call_through::read_sites(
+                &merged_results,
+                &request_inputs,
+                repo_path,
+                &cloud_data.function_definitions,
+                &|file, function| {
+                    analysis
+                        .passes_body
+                        .contains(&(file.to_path_buf(), function.to_string()))
+                },
+            );
             return Ok(ServiceAnalysis {
                 data: cloud_data,
                 deferred: setup.deferred,
-                call_through: crate::call_through::read_sites(
-                    &merged_results,
-                    &request_inputs,
-                    repo_path,
-                ),
+                call_through,
             });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
@@ -9691,14 +9698,21 @@ async fn analyze_current_repo(
     ));
     crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
+    let call_through = crate::call_through::read_sites(
+        &analysis_result.file_results,
+        &request_inputs,
+        repo_path,
+        &cloud_data.function_definitions,
+        &|file, function| {
+            analysis_result
+                .passes_body
+                .contains(&(file.to_path_buf(), function.to_string()))
+        },
+    );
     Ok(ServiceAnalysis {
         data: cloud_data,
         deferred: setup.deferred,
-        call_through: crate::call_through::read_sites(
-            &analysis_result.file_results,
-            &request_inputs,
-            repo_path,
-        ),
+        call_through,
     })
 }
 
