@@ -391,7 +391,39 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     assert!(
-        settled_line().contains("(3 lost the types anchored at a call that is not the request's)"),
+        settled_line().contains("(3 lost the types anchored at a call that is not the request's,"),
+        "{}",
+        settled_line()
+    );
+}
+
+/// At a call through, the arguments are the called function's parameters and
+/// not a request body, so no corrected row carries a request entry, and the
+/// rows that kept a response type are counted as having lost the request's.
+#[test]
+fn a_corrected_row_never_carries_a_request_entry() {
+    for (service, file, line) in [
+        ("cli", COMMANDS, 9),
+        ("cli", COMMANDS, 15),
+        ("cli", COMMANDS, 21),
+        ("cli", COMMANDS, 46),
+        ("cli", COMMANDS, 101),
+        ("web", HOOKS, 9),
+        ("web", HOOKS, 14),
+        ("web", HOOKS, 19),
+    ] {
+        let requests: Vec<serde_json::Value> = consumer_entries_at(service, file, line)
+            .into_iter()
+            .filter(|entry| entry["type_kind"] == "request")
+            .collect();
+        assert!(
+            requests.is_empty(),
+            "no request type is checked at a call through ({file}:{line}): {requests:#?}"
+        );
+    }
+    // Lines 9, 21, 46 and 101 of `commands.ts` keep their response entry.
+    assert!(
+        settled_line().contains("4 kept the response type and lost the request type)"),
         "{}",
         settled_line()
     );
