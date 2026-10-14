@@ -1,5 +1,16 @@
 // carrick#2115: callers of argument-body-client.ts. One request_body item per call.
-import { ItemsClient, Rename, configure, sendJson, draftPayload, DraftService } from './argument-body-client';
+import {
+  ItemsClient,
+  Item,
+  Rename,
+  configure,
+  sendJson,
+  draftPayload,
+  DraftService,
+  DraftStore,
+  notesApi,
+  sendRename,
+} from './argument-body-client';
 
 declare const client: ItemsClient;
 declare const axiosLike: { post<T = unknown, D = unknown>(url: string, data?: D): Promise<T> };
@@ -11,6 +22,21 @@ export async function run(owner: string, id: string, picked: string[], chosen: s
   await client.removeOwner(owner);
   await client.removeVia(owner, picked);
   await client.archive(id, { reason: 'stale' });
+}
+
+export async function byId(item: Item, kept: Item, id: string, tagged: string[], owner: string, many: string[], labelled: string[]) {
+  await client.update(item);
+  await client.save(kept);
+  await client.replaceTags(id, tagged);
+  await client.removeMany(owner, many);
+  await client.retitle(id, 'renamed');
+  await client.label(id, labelled);
+}
+
+export async function arrows(note: Rename, renamed: Rename, project: string, rev: number | null, store: DraftStore) {
+  await notesApi.create(note);
+  await sendRename(renamed);
+  await store.put(project, rev);
 }
 
 export async function each(owner: string, lists: string[][]) {

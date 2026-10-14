@@ -12,6 +12,11 @@ export interface Rename {
   title: string;
 }
 
+export interface Item {
+  id: string;
+  title: string;
+}
+
 export class ItemsClient {
   removeItems(owner: string, ids: string[]) {
     return transport.delete(`/owners/${owner}/items`, { body: { ids } });
@@ -31,6 +36,42 @@ export class ItemsClient {
   archive(id: string, note?: { reason?: string }) {
     return transport.post(`/items/${id}/archive`, { body: note ?? {} });
   }
+  update(item: Item) {
+    return transport.put(`/items/${item.id}`, { body: item });
+  }
+  save(item: Item) {
+    if (!item) throw new Error('nothing to save');
+    console.info('saving', item.id);
+    return transport.put(`/items/${item.id}`, { body: item });
+  }
+  replaceTags(id: string, tags: string[]) {
+    const opts = { body: tags };
+    return transport.put(`/items/${id}/tags`, opts);
+  }
+  removeMany(owner: string, ids: string[]) {
+    const body = { ids };
+    return transport.delete(`/owners/${owner}/items`, { body });
+  }
+  label(id: string, tags: string[]) {
+    return transport.put(`/items/${id}/labels`, { body: { labels: tags, count: tags.length } });
+  }
+  retitle = (id: string, title: string) => transport.put(`/items/${id}`, { body: { title } });
+}
+
+/** Methods written as arrow-valued properties of an object literal. */
+export const notesApi = {
+  create: (note: Rename) => transport.post('/notes', { body: note }),
+};
+
+/** A sender a factory returns: no body the reading can reach at the call. */
+export function makeSender() {
+  return (payload: Rename) => transport.post('/renames', { body: payload });
+}
+export const sendRename = makeSender();
+
+/** An abstract method: no body anywhere to read. */
+export abstract class DraftStore {
+  abstract put(project: string, expectedRevision: number | null): Promise<unknown>;
 }
 
 export function configure(host: string, port: number): Promise<{ endpoint: string }> {

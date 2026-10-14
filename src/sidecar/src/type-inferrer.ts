@@ -29,6 +29,7 @@ import {
   type ArrowFunction,
   type BinaryExpression,
   type FunctionExpression,
+  type Identifier,
   type MethodDeclaration,
   type CallExpression,
   type ObjectLiteralExpression,
@@ -5885,8 +5886,9 @@ export class TypeInferrer {
 
   /**
    * The single function a callee symbol declares with a body: a function
-   * declaration, a method (of a class or an object literal), or a variable
-   * initialised with an arrow or function expression.
+   * declaration, a method (of a class or an object literal), or a variable,
+   * class field or object-literal property initialised with an arrow or
+   * function expression.
    */
   private builderFunctionOf(symbol: TsSymbol): BuilderFunction | undefined {
     const bodies: BuilderFunction[] = [];
@@ -5896,7 +5898,11 @@ export class TypeInferrer {
         declaration.getBody()
       ) {
         bodies.push(declaration);
-      } else if (Node.isVariableDeclaration(declaration)) {
+      } else if (
+        Node.isVariableDeclaration(declaration) ||
+        Node.isPropertyDeclaration(declaration) ||
+        Node.isPropertyAssignment(declaration)
+      ) {
         const initializer = declaration.getInitializer();
         const fn = initializer ? this.peelTransparentExpression(initializer) : undefined;
         if (fn && (Node.isArrowFunction(fn) || Node.isFunctionExpression(fn))) bodies.push(fn);
@@ -6107,16 +6113,40 @@ export class TypeInferrer {
 
   /**
    * The function a call reaches when the repository declares it: the one
-   * declaration with a body (`builderFunctionOf`), `'bodiless'` when the
-   * repository declares it with none, `undefined` for lib, an installed
-   * package, or a callee with no symbol.
+   * declaration with a body (`builderFunctionOf`), `'bodiless'` when every
+   * declaration provably has none (`isBodilessDeclaration`), `undefined` for
+   * lib, an installed package, a callee with no symbol, or one whose body
+   * the reading cannot find (`const send = makeSender()`).
    */
   private declaredCalleeFunction(call: CallExpression): BuilderFunction | 'bodiless' | undefined {
     let symbol = call.getExpression().getSymbol();
     if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
     if (!symbol || symbol.getDeclarations().length === 0) return undefined;
     if (this.symbolIsLibOrExternalOrigin(symbol)) return undefined;
-    return this.builderFunctionOf(symbol) ?? 'bodiless';
+    const fn = this.builderFunctionOf(symbol);
+    if (fn) return fn;
+    const bodiless = symbol.getDeclarations().every((d) => this.isBodilessDeclaration(d));
+    return bodiless ? 'bodiless' : undefined;
+  }
+
+  /**
+   * True when a declaration states a signature that has no body anywhere: an
+   * interface or type-literal member, an abstract member, or a function or
+   * method signature with no implementation.
+   */
+  private isBodilessDeclaration(declaration: Node): boolean {
+    if (
+      Node.isMethodSignature(declaration) ||
+      Node.isPropertySignature(declaration) ||
+      Node.isCallSignatureDeclaration(declaration)
+    ) {
+      return true;
+    }
+    if (Node.isMethodDeclaration(declaration) || Node.isFunctionDeclaration(declaration)) {
+      return !declaration.getBody();
+    }
+    if (Node.isPropertyDeclaration(declaration)) return declaration.isAbstract();
+    return false;
   }
 
   /** What `callee` does with the parameter the call's `index`th argument fills. */
@@ -6166,6 +6196,12 @@ export class TypeInferrer {
    * another function the repository declares is read there, at most
    * `ARGUMENT_BODY_MAX_HOPS` deep, each function once. Any other use is
    * `elsewhere`; a parameter with no use goes nowhere.
+   *
+   * A use that sends nothing (a field read for the URL, a guard, a log call)
+   * agrees with every other use. A use inside a member of an object literal
+   * that is sent (`{ body: { name: item.name } }`) builds that literal. A
+   * use inside any other expression that is sent (`body: note ?? {}`) builds
+   * a different body from the parameter, and disagrees.
    */
   private parameterBodyReading(
     fn: BuilderFunction,
@@ -6183,8 +6219,16 @@ export class TypeInferrer {
 
     let agreed: ParameterBodyReading | undefined;
     for (const use of uses) {
-      const reading = this.sentValueReading(use, hops, visited);
+      let reading = this.sentValueReading(use, hops, visited);
       if (reading.kind === 'undecided') return reading;
+      if (reading.kind === 'elsewhere') {
+        const enclosing = this.enclosingSentReading(use, body, hops, visited);
+        if (!enclosing) continue;
+        if (enclosing.kind === 'forwarded') {
+          return { kind: 'undecided', why: 'the parameter is sent inside a different body built from it' };
+        }
+        reading = enclosing;
+      }
       if (!agreed) {
         agreed = reading;
         continue;
@@ -6197,6 +6241,50 @@ export class TypeInferrer {
       }
     }
     return agreed ?? { kind: 'elsewhere' };
+  }
+
+  /**
+   * For a use that is not sent itself, the reading of the innermost
+   * enclosing expression that is sent or builds a sent literal; `undefined`
+   * when none is.
+   */
+  private enclosingSentReading(
+    use: Node,
+    body: Node,
+    hops: number,
+    visited: Set<BuilderFunction>
+  ): Extract<ParameterBodyReading, { kind: 'forwarded' | 'built' }> | undefined {
+    for (let node = use.getParent(); node && node !== body; node = node.getParent()) {
+      if (!Node.isExpression(node)) continue;
+      const reading = this.sentValueReading(node, hops, visited);
+      if (reading.kind === 'forwarded' || reading.kind === 'built') return reading;
+    }
+    return undefined;
+  }
+
+  /**
+   * The references a `const` binding's initializer is read through, when
+   * `position` is that initializer and the name is a plain identifier:
+   * every identifier in the binding's scope that names it.
+   */
+  private constBindingReferences(position: Node): Identifier[] | undefined {
+    const declaration = position.getParent();
+    if (!declaration || !Node.isVariableDeclaration(declaration)) return undefined;
+    if (declaration.getInitializer() !== position) return undefined;
+    const name = declaration.getNameNode();
+    if (!Node.isIdentifier(name)) return undefined;
+    const list = declaration.getParent();
+    if (!Node.isVariableDeclarationList(list)) return undefined;
+    if (list.getDeclarationKind() !== VariableDeclarationKind.Const) return undefined;
+    const symbol = name.getSymbol();
+    if (!symbol) return undefined;
+    const scope =
+      declaration.getFirstAncestor(
+        (n) => Node.isBlock(n) || Node.isSourceFile(n) || Node.isModuleBlock(n)
+      ) ?? declaration.getSourceFile();
+    return scope
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .filter((id) => id !== name && this.valueSymbolOf(id) === symbol);
   }
 
   /**
@@ -6241,6 +6329,27 @@ export class TypeInferrer {
     const parent = position.getParent();
     if (!parent) return { kind: 'elsewhere' };
 
+    // `const opts = { body: tags }; transport.put(url, opts)`: the value is
+    // read through every reference of the binding, which must agree.
+    const references = this.constBindingReferences(position);
+    if (references) {
+      let agreed: ParameterBodyReading | undefined;
+      for (const reference of references) {
+        const reading = this.sentValueReading(reference, hops, visited);
+        if (reading.kind === 'undecided') return reading;
+        if (reading.kind === 'elsewhere') continue;
+        if (
+          agreed &&
+          (agreed.kind !== reading.kind ||
+            (agreed.kind === 'built' && reading.kind === 'built' && agreed.literal !== reading.literal))
+        ) {
+          return { kind: 'undecided', why: 'the bound value is sent in more than one way' };
+        }
+        agreed = reading;
+      }
+      return agreed ?? { kind: 'elsewhere' };
+    }
+
     if (Node.isCallExpression(parent)) {
       const argIndex = parent.getArguments().indexOf(position);
       if (argIndex < 0) return { kind: 'elsewhere' };
@@ -6269,8 +6378,11 @@ export class TypeInferrer {
     return outer;
   }
 
-  /** True when an object literal (through transparent wrappers) is a call argument. */
-  private isHandedToCall(literal: ObjectLiteralExpression): boolean {
+  /**
+   * True when an object literal (through transparent wrappers, and through a
+   * `const` binding it initialises) is a call argument.
+   */
+  private isHandedToCall(literal: Node): boolean {
     let position: Node = literal;
     while (true) {
       const parent = position.getParent();
@@ -6283,7 +6395,9 @@ export class TypeInferrer {
         position = parent;
         continue;
       }
-      return !!parent && Node.isCallExpression(parent) && parent.getArguments().includes(position);
+      if (parent && Node.isCallExpression(parent) && parent.getArguments().includes(position)) return true;
+      const references = this.constBindingReferences(position);
+      return !!references && references.some((reference) => this.isHandedToCall(reference));
     }
   }
 

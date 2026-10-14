@@ -137,6 +137,56 @@ describe('request body through a function the repository declares (carrick#2115)
     });
   });
 
+  describe('review: reads of the parameter that send nothing do not disagree', () => {
+    it('update by id: the parameter read for the URL and sent as the body keeps its type', async () => {
+      const row = await infer('UpdateById', 'item', 'client.update(item)');
+      assert.strictEqual(row?.type_string, '{ id: string; title: string; }');
+    });
+
+    it('a guard and a log call beside the send keep the argument', async () => {
+      const row = await infer('SaveGuarded', 'kept', 'client.save(kept)');
+      assert.strictEqual(row?.type_string, '{ id: string; title: string; }');
+    });
+
+    it('a field read inside the same built literal agrees with the parameter it reads', async () => {
+      const row = await infer('Label', 'labelled', 'client.label(id, labelled)');
+      assert.strictEqual(row?.type_string, '{ labels: string[]; count: number; }');
+    });
+  });
+
+  describe('review: a body literal bound to a const before it is handed on', () => {
+    it('the body member of a const-bound request config forwards the argument', async () => {
+      const row = await infer('ReplaceTags', 'tagged', 'client.replaceTags(id, tagged)');
+      assert.strictEqual(row?.type_string, 'string[]');
+    });
+
+    it('a const-bound literal sent as the body is the body built', async () => {
+      const row = await infer('RemoveMany', 'many', 'client.removeMany(owner, many)');
+      assert.strictEqual(row?.type_string, '{ ids: string[]; }');
+    });
+  });
+
+  describe('review: callees written as arrow functions', () => {
+    it('a class field arrow builds the body', async () => {
+      const row = await infer('Retitle', "'renamed'", "client.retitle(id, 'renamed')");
+      assert.strictEqual(row?.type_string, '{ title: string; }');
+    });
+
+    it('an arrow-valued object property forwards the argument', async () => {
+      const row = await infer('NotesCreate', 'note', 'notesApi.create(note)');
+      assert.strictEqual(row?.type_string, '{ title: string; }');
+    });
+
+    it('a callee whose body cannot be found keeps the argument', async () => {
+      const row = await infer('FactorySender', 'renamed', 'sendRename(renamed)');
+      assert.strictEqual(row?.type_string, '{ title: string; }');
+    });
+
+    it('an abstract method is provably bodiless and abstains', async () => {
+      assertArgumentNotTheBody(await infer('AbstractPut', 'rev', 'store.put(project, rev)'));
+    });
+  });
+
   describe('controls that must not move', () => {
     it('an external request call keeps the argument', async () => {
       const row = await infer('AxiosLike', 'payload', 'axiosLike.post(url, payload)');
