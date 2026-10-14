@@ -59,6 +59,30 @@ export const expressionBody = (id: string) => api.one(id);
 export async function returnsAWrapper(id: string) {
   return { item: await api.one(id), at: 1 };
 }
+
+interface ClientRequest {
+  on(event: string, listener: (error: Error) => void): ClientRequest;
+  end(): void;
+}
+interface IncomingMessage {
+  on(event: 'data', listener: (chunk: string) => void): void;
+  on(event: 'end', listener: () => void): void;
+}
+declare function sendRequest(target: string, onResponse: (res: IncomingMessage) => void): ClientRequest;
+
+export function fetchText(target: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const req = sendRequest(target, (res) => {
+      let text = '';
+      res.on('data', (chunk) => {
+        text += chunk;
+      });
+      res.on('end', () => resolve(text));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
 `;
 
 interface InferShape {
@@ -154,6 +178,16 @@ describe('carrick#2282: a return statement answers only for a call of its own fu
 
   it('still reads an arrow with an expression body', async () => {
     assert.strictEqual(await callResult('Arrow', 'api.one(id)', 'expressionBody'), 'Item');
+  });
+
+  // The callback style: a request whose call returns the request object, made
+  // inside the executor of the promise the outer function returns. What the
+  // caller receives is what that promise settles with, not the request object.
+  it('reads a request made in the executor of a returned promise as what the promise settles with', async () => {
+    assert.strictEqual(
+      await callResult('Executor', 'sendRequest(target, (res) => {', 'const req = sendRequest(target'),
+      'string'
+    );
   });
 
   it('still answers the returned expression where the function the call is in returns a wrapper', async () => {
