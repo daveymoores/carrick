@@ -166,6 +166,17 @@ fn a_function_sharing_its_file_with_other_routes_is_not_mounted() {
 }
 
 #[test]
+fn a_file_another_mount_already_resolves_to_keeps_that_mount() {
+    let projection = scan();
+    assert_eq!(
+        paths_in(projection, "packages/routes/src/legacy.ts"),
+        vec!["/legacy/teams/:id/legacy"],
+        "a second binding to the file would tie and drop the prefix it has:\n{}",
+        all_rows(projection)
+    );
+}
+
+#[test]
 fn a_hand_out_of_the_plugins_own_instance_is_not_followed() {
     let projection = scan();
     assert_eq!(

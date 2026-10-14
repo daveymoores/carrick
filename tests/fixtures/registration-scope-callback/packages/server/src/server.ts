@@ -10,6 +10,7 @@ import {
   registerComputedRoutes,
   registerBuiltRoutes,
   registerSpreadRoutes,
+  registerLegacyRoutes,
 } from '@fx/routes';
 import { registerExtraRoutes } from './extra';
 
@@ -25,9 +26,14 @@ export async function start(app: any, deps: any) {
     registerExtra: async (scope: any) => {
       registerExtraRoutes(scope, deps);
       registerTagRoutes(scope);
+      registerLegacyRoutes(scope);
     },
     registerOnRoot: (root: any) => registerRootRoutes(root),
   });
+
+  // Options that never write the key: a spread in them may hold more, and
+  // cannot replace what the call above writes.
+  await app.register(routesPlugin, { ...deps.routeOptions });
 
   // Supplied twice: which call serves the scope is not one answer.
   await app.register(twicePlugin, { registerExtra: (scope: any) => registerTwiceRoutes(scope) });

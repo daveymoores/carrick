@@ -1,0 +1,14 @@
+{
+  "mounts": [
+    {
+      "line_number": 5,
+      "parent_node": "app",
+      "child_node": "legacy",
+      "mount_path": "/legacy",
+      "import_source": "./legacy",
+      "pattern_matched": "app.register("
+    }
+  ],
+  "endpoints": [],
+  "data_calls": []
+}

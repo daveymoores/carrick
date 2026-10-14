@@ -1436,7 +1436,8 @@ struct SupplierFinder<'s> {
     /// The hand-out's file, canonical.
     target: &'s Path,
     hand_out: &'s HandOut,
-    found: Vec<Supplied>,
+    /// What each call that passes the function supplies, by its line.
+    found: Vec<(u32, Supplied)>,
 }
 
 impl SupplierFinder<'_> {
@@ -1484,12 +1485,16 @@ impl SupplierFinder<'_> {
                 },
             }
         }
-        match (value, unknown_at) {
-            (Some((index, prop)), unknown) if unknown.is_none_or(|at| at < index) => {
+        // A literal that never writes the key supplies nothing this call can
+        // show, whatever a spread or a computed key in it holds: a function
+        // supplied that way only adds to the scope, and cannot make the rows
+        // another call's written key reaches wrong.
+        match value {
+            Some((index, prop)) if unknown_at.is_none_or(|at| at < index) => {
                 self.read_value(line, prop)
             }
-            (_, Some(_)) => Supplied::Unknown("a spread or a computed key may hold it"),
-            (_, None) => Supplied::Nothing,
+            Some(_) => Supplied::Unknown("a spread or a computed key after it may replace it"),
+            None => Supplied::Nothing,
         }
     }
 
@@ -1565,6 +1570,16 @@ impl Visit for SupplierFinder<'_> {
             return;
         };
         let line = self.line(call.span);
+        let supplied = self.supplied_by(line, callee, call);
+        self.found
+            .extend(supplied.into_iter().map(|supplied| (line, supplied)));
+    }
+}
+
+impl SupplierFinder<'_> {
+    /// What one call supplies under the key: nothing when it does not pass
+    /// the enclosing function.
+    fn supplied_by(&mut self, line: u32, callee: &Expr, call: &CallExpr) -> Vec<Supplied> {
         // `routesPlugin(app, opts)`: the options are the argument at the
         // enclosing function's own position.
         if self.passes_the_function(callee) {
@@ -1575,16 +1590,12 @@ impl Visit for SupplierFinder<'_> {
                 .take(position + 1)
                 .any(|arg| arg.spread.is_some())
             {
-                self.found
-                    .push(Supplied::Unknown("a spread argument may hold the options"));
-                return;
+                return vec![Supplied::Unknown("a spread argument may hold the options")];
             }
-            let supplied = match call.args.get(position) {
+            return vec![match call.args.get(position) {
                 Some(arg) => self.read_argument(line, &arg.expr),
                 None => Supplied::Nothing,
-            };
-            self.found.push(supplied);
-            return;
+            }];
         }
         // `app.register(routesPlugin, opts)`: whatever calls the function
         // passes it the options. An object literal among the other arguments
@@ -1599,12 +1610,10 @@ impl Visit for SupplierFinder<'_> {
             }
         }
         if !passes {
-            return;
+            return Vec::new();
         }
         if call.args.iter().any(|arg| arg.spread.is_some()) {
-            self.found
-                .push(Supplied::Unknown("a spread argument may hold the options"));
-            return;
+            return vec![Supplied::Unknown("a spread argument may hold the options")];
         }
         let literals: Vec<&ObjectLit> = others
             .iter()
@@ -1614,20 +1623,17 @@ impl Visit for SupplierFinder<'_> {
             })
             .collect();
         if literals.is_empty() {
-            for expr in others {
-                let supplied = self.read_argument(line, expr);
-                if !matches!(supplied, Supplied::Nothing) {
-                    self.found.push(supplied);
-                    return;
-                }
-            }
-            self.found.push(Supplied::Nothing);
-            return;
+            return others
+                .into_iter()
+                .map(|expr| self.read_argument(line, expr))
+                .find(|supplied| !matches!(supplied, Supplied::Nothing))
+                .into_iter()
+                .collect();
         }
-        for object in literals {
-            let supplied = self.read_options(line, object);
-            self.found.push(supplied);
-        }
+        literals
+            .into_iter()
+            .map(|object| self.read_options(line, object))
+            .collect()
     }
 }
 
@@ -1672,6 +1678,9 @@ struct CallbackTrace<'w> {
     /// Each hand-out's one supplier, or why there is none, by (file,
     /// enclosing function, key).
     suppliers: HashMap<(PathBuf, String, String), Result<Supplier, String>>,
+    /// The files [`CallbackTrace::candidate_files`] read for a package, by
+    /// its directory (`None` outside any package).
+    walked: HashMap<Option<PathBuf>, Vec<PathBuf>>,
     walking: Vec<(PathBuf, String, usize)>,
 }
 
@@ -1679,9 +1688,16 @@ impl CallbackTrace<'_> {
     /// The files a supplier can be written in: those of the package holding
     /// the hand-out, and of every workspace package that depends on it, as a
     /// scan of each would read them (no tests, no build output).
-    fn candidate_files(&self, hand_out_file: &Path) -> Vec<PathBuf> {
+    /// Walked once per package: every hand-out of one package searches the
+    /// same files.
+    fn candidate_files(&mut self, hand_out_file: &Path) -> Vec<PathBuf> {
+        let package = self.modules.package_holding(hand_out_file);
+        let walk_key = package.as_ref().map(|(_, dir)| dir.clone());
+        if let Some(files) = self.walked.get(&walk_key) {
+            return files.clone();
+        }
         let root = self.modules.repo_root();
-        let mut dirs: Vec<PathBuf> = match self.modules.package_holding(hand_out_file) {
+        let mut dirs: Vec<PathBuf> = match package {
             Some((name, dir)) => std::iter::once(dir)
                 .chain(self.modules.dependents_of(&name))
                 .collect(),
@@ -1712,15 +1728,17 @@ impl CallbackTrace<'_> {
             .collect();
         files.sort();
         files.dedup();
+        self.walked.insert(walk_key, files.clone());
         files
     }
 
     /// The one call in the scanned repository that supplies the hand-out's
-    /// key, or why none is decided.
+    /// key, or why none is decided, logged once at `at`.
     fn supplier(
         &mut self,
         heads: &mut FunctionHeads,
         hand_out_file: &Path,
+        at: &str,
         hand_out: &HandOut,
     ) -> Result<Supplier, String> {
         let cache_key = (
@@ -1732,6 +1750,13 @@ impl CallbackTrace<'_> {
             return known.clone();
         }
         let found = self.find_supplier(heads, hand_out_file, hand_out);
+        if let Err(why) = &found {
+            debug!(
+                "Hand-out at {at} not followed: {} '{}' ({why}); the routes it reaches keep their \
+                 paths",
+                hand_out.function, hand_out.key
+            );
+        }
         self.suppliers.insert(cache_key, found.clone());
         found
     }
@@ -1742,7 +1767,7 @@ impl CallbackTrace<'_> {
         hand_out_file: &Path,
         hand_out: &HandOut,
     ) -> Result<Supplier, String> {
-        let mut supplied: Vec<(PathBuf, Supplied)> = Vec::new();
+        let mut supplied: Vec<(PathBuf, u32, Supplied)> = Vec::new();
         for file in self.candidate_files(hand_out_file) {
             // A cost gate only: the decision below is by binding.
             let Ok(text) = std::fs::read_to_string(&file) else {
@@ -1767,15 +1792,20 @@ impl CallbackTrace<'_> {
                 found: Vec::new(),
             };
             module.visit_with(&mut finder);
-            supplied.extend(finder.found.into_iter().map(|found| (file.clone(), found)));
+            supplied.extend(
+                finder
+                    .found
+                    .into_iter()
+                    .map(|(line, found)| (file.clone(), line, found)),
+            );
         }
         let mut one: Option<(PathBuf, Supplied)> = None;
         let mut count = 0usize;
-        for (file, found) in supplied {
+        for (file, line, found) in supplied {
             match found {
                 Supplied::Nothing => {}
                 Supplied::Unknown(why) => {
-                    return Err(format!("{}:{}: {why}", file.display(), hand_out.line));
+                    return Err(format!("{}:{line}: {why}", file.display()));
                 }
                 other => {
                     count += 1;
@@ -1914,16 +1944,8 @@ impl CallbackTrace<'_> {
         hand_ons: &mut Vec<(String, MountResult)>,
     ) -> Vec<MountResult> {
         let at = format!("{file}:{}", hand_out.line);
-        let supplier = match self.supplier(&mut trace.heads, importer, hand_out) {
-            Ok(supplier) => supplier,
-            Err(why) => {
-                debug!(
-                    "Hand-out at {at} not followed: {} '{}' ({why}); the routes it reaches keep \
-                     their paths",
-                    hand_out.function, hand_out.key
-                );
-                return Vec::new();
-            }
+        let Ok(supplier) = self.supplier(&mut trace.heads, importer, &at, hand_out) else {
+            return Vec::new();
         };
         let mut reached: Vec<Reached> = Vec::new();
         for registration in &supplier.hands_on {
@@ -2064,8 +2086,10 @@ fn holds_every_row_of_its_file(rows: &FileAnalysisResult, start_line: u32, end_l
 /// * exactly one call in the hand-out's package, or in a workspace package
 ///   that depends on it, passes the enclosing function with an object
 ///   literal that writes `k` as an inline function or a function that file
-///   declares, and no call may supply `k` unseen (a spread or a computed key
-///   after it, options built elsewhere): [`CallbackTrace::supplier`];
+///   declares, nothing written after `k` in that literal (a spread, a
+///   computed key) may replace it, and no such call passes options built
+///   elsewhere: [`CallbackTrace::supplier`]. A literal that never writes `k`
+///   supplies nothing, whatever a spread in it holds;
 /// * the function is declared in this service's own files, registers on the
 ///   parameter it receives, holds every row its file states, and no other
 ///   mount already resolves to its file.
@@ -2106,6 +2130,7 @@ pub fn mount_unstated_registrations(
         modules,
         packages: BindingResolver::with_workspace(modules.clone()),
         suppliers: HashMap::new(),
+        walked: HashMap::new(),
         walking: Vec::new(),
     };
     let mut emitted = 0usize;
