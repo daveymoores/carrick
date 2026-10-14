@@ -101,6 +101,12 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
       `{ version: string; spec: { models: { name: string } | undefined } }`,
       `{ version: 'v1'; spec: { models: { name: string } | undefined } }`
     ),
+    // The same with the member optional, as an inferred return prints it.
+    ...response(
+      'P_OptionalMember',
+      `{ version: string; spec: { models?: { [key: string]: string } } }`,
+      `{ version: 'v1'; spec: { models?: { [key: string]: string } } }`
+    ),
     ...response('P_Agrees', `{ id: string; scope: string }`, SCOPE_UNION),
     ...response(
       'P_Session',
@@ -122,6 +128,7 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
     C_NoReading: SCOPE_UNION,
     C_OtherLiteral: SCOPE_UNION,
     C_MaybeMember: `{ version: 'v1'; spec: { models: { name: string } } }`,
+    C_OptionalMember: `{ version: 'v1'; spec: { models: { [key: string]: string } } }`,
     C_Agrees: `{ id: string; scope: string }`,
     C_Session: SESSION_UNION,
     C_Rank: `{ rank: -1 | 2; at: string }`,
@@ -137,6 +144,7 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
     pair('no-reading', 'P_NoReading', 'C_NoReading'),
     pair('other-literal', 'P_OtherLiteral', 'C_OtherLiteral'),
     pair('maybe-member', 'P_MaybeMember', 'C_MaybeMember'),
+    pair('optional-member', 'P_OptionalMember', 'C_OptionalMember'),
     pair('agrees', 'P_Agrees', 'C_Agrees'),
     pair('session', 'P_Session', 'C_Session'),
     pair('rank', 'P_Rank', 'C_Rank'),
@@ -183,7 +191,8 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
   });
 
   it('the control (no reading shipped) calls every widened pair incompatible', () => {
-    for (const key of ['scope', 'session', 'rank', 'maybe-member', 'other-literal']) {
+    const widened = ['scope', 'session', 'rank', 'maybe-member', 'optional-member', 'other-literal'];
+    for (const key of widened) {
       assert.strictEqual(control.get(key)!.bucket, 'incompatible', key);
     }
   });
@@ -222,9 +231,11 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
   });
 
   it('a member the handler may leave undefined keeps the pair incompatible', () => {
-    const v = verdicts.get('maybe-member')!;
-    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
-    assert.deepStrictEqual(v, control.get('maybe-member'));
+    for (const key of ['maybe-member', 'optional-member']) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'incompatible', `${key}: ${JSON.stringify(v)}`);
+      assert.deepStrictEqual(v, control.get(key), key);
+    }
   });
 
   it('a pair that agreed as published is unchanged by its reading', () => {
