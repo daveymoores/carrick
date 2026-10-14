@@ -122,16 +122,13 @@ fn explicit_config_preserves_shared_sources_and_refuses_invalid_paths() {
 }
 
 #[test]
-fn plain_repo_and_own_repo_layout() {
+fn plain_repo_layout() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "package.json", r#"{"name":"one"}"#);
     let plain = resolve(dir.path()).unwrap();
     assert_eq!(plain.services.len(), 1);
     assert!(plain.services[0].directory.is_none());
     assert!(plain.services[0].service_name.is_none());
-    let own = resolve(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
-    assert_eq!(own.reason, "carrick.json");
-    assert_eq!(own.services[0].directory.as_deref(), Some("src/sidecar"));
 }
 
 #[test]

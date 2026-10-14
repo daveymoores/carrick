@@ -1,9 +1,0 @@
-{
-  "services": [
-    {
-      "name": "type-sidecar",
-      "directory": "src/sidecar",
-      "tsconfig": "tsconfig.json"
-    }
-  ]
-}
